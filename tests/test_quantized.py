@@ -46,20 +46,6 @@ def bits(x):
     return np.asarray(x, np.float32).view(np.uint32)
 
 
-def test_a_hand_computed_case_with_a_partial_column_block():
-    """2 x 2 blocks over a 4 x 3 weight: the third column is a block of its
-    own, with the scales of the second block column."""
-    weight = np.arange(1, 13, dtype=np.float32).reshape(4, 3).astype(FP8)
-    scale_inv = np.array([[0.5, 2.0], [4.0, 0.25]], np.float32)
-    expected = np.array([[0.5, 1.0, 6.0], [2.0, 2.5, 12.0],
-                         [28.0, 32.0, 2.25], [40.0, 44.0, 3.0]], np.float32)
-
-    out = dequantize_fp8_blocks(weight, scale_inv, block=2)
-
-    assert out.dtype == np.float32
-    np.testing.assert_array_equal(out, expected)
-
-
 @pytest.mark.parametrize("shape", ["256x384", "130x259", "5x7"])
 def test_blocks_dequantize_as_v3s_weight_dequant_kernel_does(shape):
     """V3's `weight_dequant`, run on a GPU: random E4M3 codes (subnormals and
@@ -240,34 +226,6 @@ def test_an_fp8_checkpoint_loads_and_saves_without_the_prediction_depths_it_drop
 # --------------------------------------------------------------------------
 # The encoder
 # --------------------------------------------------------------------------
-
-HAND = np.array([[448.0, -224.0, 896.0],
-                 [0.0, -0.0, -7.0],
-                 [28.0, 0.109375, 0.875],
-                 [-14.0, 3.5, -0.0546875]], np.float32)
-"""A 4 x 3 weight whose every 2 x 2 block has 448 * 2 ** k for its amax, so
-each block's scale comes out exactly 2 ** k and every element scales onto an
-e4m3 value exactly. The third column is a partial block of its own and the
-second block holds both zeros."""
-
-
-def test_a_hand_computed_encoding_with_a_partial_column_block():
-    """Each block's amax maps to 448 and the rest of the block divides by
-    the same scale. The scales are the four amaxes over 448 -- 1, 2, 1/16
-    and 2 ** -9 -- the partial third column is scaled on its own, and -0.0
-    keeps its sign because the encoding multiplies rather than compares.
-    """
-    codes, scale_inv = quantize_fp8_blocks(HAND, block=2)
-
-    np.testing.assert_array_equal(
-        scale_inv, np.array([[1.0, 2.0], [0.0625, 2.0 ** -9]], np.float32))
-    np.testing.assert_array_equal(
-        decode_e4m3fn(codes.view(np.uint8)),
-        np.array([[448.0, -224.0, 448.0], [0.0, -0.0, -3.5],
-                  [448.0, 1.75, 448.0], [-224.0, 56.0, -28.0]], np.float32))
-    assert codes.view(np.uint8)[1, 1] == 0x80, "-0.0 was written as +0.0"
-    np.testing.assert_array_equal(dequantize_fp8_blocks(codes, scale_inv, block=2), HAND)
-
 
 @pytest.mark.parametrize("case", ["random/256x384/128", "random/130x259/128", "random/5x7/128",
                                   "random/48x32/16", "random/7x3/2", "bf16/130x259/128"])

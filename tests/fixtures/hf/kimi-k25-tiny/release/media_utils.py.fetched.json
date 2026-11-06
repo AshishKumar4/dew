@@ -1,0 +1,10 @@
+{
+ "bytes": 13179,
+ "kind": "release",
+ "license": "modified-mit",
+ "path": "releases/77a6b1fed3580b0562443092928a0240c2989e3950377e93893952123ae48e3d/media_utils.py",
+ "reference": "moonshotai/Kimi-K2.5@4d01dfe0332d63057c186e0b262165819efb6611/media_utils.py",
+ "repo": "dewml/fixtures",
+ "revision": "8e3e6c028bd89f695bc96e11fc413f0032611037",
+ "sha256": "77a6b1fed3580b0562443092928a0240c2989e3950377e93893952123ae48e3d"
+}

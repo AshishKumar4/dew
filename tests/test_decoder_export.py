@@ -101,6 +101,8 @@ from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     ORDERS,
+    as_given,
+    assert_as_exact,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
@@ -561,11 +563,16 @@ def test_a_failed_export_ends_with_its_own_error(tmp_path):
     assert run.returncode == 1, run.stderr[-2000:]
 
 
+FULL_ROTARY_SEEDS = 8
+"""The full-width rotary export's declared check-1 seeds against transformers' reading of it, sized by
+`seeds_for` paired."""
+
+
 def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it(tmp_path):
     """A Qwen3 decoder built with `partial_rotary_factor=1.0` rotates its whole head, as with none
     stated: written from the model and its variables alone (`PretrainedDecoder.from_model`), it
-    saves, reloads to its own logits, and transformers reads the export to logits Dew's are as
-    exact as, both from transformers' in float64."""
+    saves, reloads to its own logits, and transformers reads the export: over drawn rows Dew's logits
+    are on par with transformers' from its float64 run's (check 1)."""
     import jax.numpy as jnp
     import torch
     from transformers import AutoModelForCausalLM
@@ -582,15 +589,26 @@ def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, jnp.asarray(ids))),
                                   expected)
 
-    def theirs(dtype):
+    def read(dtype):
         with float64() if dtype == torch.float64 else torch.no_grad():
-            reference = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
-            with torch.no_grad():
-                logits = reference.to(dtype).eval()(torch.from_numpy(ids).long(), use_cache=False).logits
-        return logits.double().numpy()
+            read = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
+            return read.to(dtype).eval()
 
-    assert_as_exact_as_the_reference(expected.astype(np.float64), theirs(torch.float32),
-                                     theirs(torch.float64), "full-width rotary export logits")
+    narrow, wide = read(torch.float32), read(torch.float64)
+
+    def theirs(reference):
+        @as_given
+        def logits(tokens):
+            with float64() if reference is wide else torch.no_grad(), torch.no_grad():
+                return reference(torch.from_numpy(np.asarray(tokens)).long(), use_cache=False).logits.numpy()
+        return logits
+
+    def draw(seed):
+        rng = np.random.default_rng([0x1563, seed])
+        return (rng.integers(0, model.vocab_size, ids.shape).astype(np.int32),)
+
+    assert_as_exact(jax.jit(lambda tokens: model.apply(loaded.variables, tokens)), theirs(narrow), draw,
+                    "full-width rotary export logits", seeds=FULL_ROTARY_SEEDS, truth_fn=theirs(wide))
 
 
 def test_a_policy_transformers_cannot_hold_is_refused_not_dropped():
@@ -971,9 +989,11 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, fixtur
     save_hf_layout(tensors, config, directory)
     if not same_values:
         with pytest.raises(ValueError):
-            Pretrained.load(directory, param_dtype="bfloat16")
+            Pretrained.load(directory, param_dtype="bfloat16", text_only=True)
     else:
-        loaded = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+        # The language model alone: Kimi K2.5's head and embedding are its decoder's.
+        loaded = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla",
+                                 text_only=True)
         values = loaded.variables["params"]["embed_tokens"]["embedding"]
         assert np.asarray(values).dtype == ml_dtypes.bfloat16
         np.testing.assert_array_equal(values, np.full(shape, decoded).astype(ml_dtypes.bfloat16))
@@ -1274,47 +1294,66 @@ def test_a_model_its_family_config_cannot_carry_is_refused_at_export(fixture, ch
         PretrainedDecoder.from_model(model, loaded.variables)
 
 
-@pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
-def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
-    import jax.numpy as jnp
-
+def glm5_exported(variant: str, directory: Path):
+    """`variant`'s GLM-5 decoder (`glm5_native_export_case`), its variables and ids, written standalone to
+    `directory` with its caches' collections (`PretrainedDecoder.from_model`) and loaded back."""
     from dew.interop import PretrainedDecoder
-    from dew.sampling import Sampling, Speculative, generate
 
     model, variables, ids = glm5_native_export_case(variant)
-    expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
     cache = model.apply(variables, ids.shape[0], method="init_cache", mutable=["cache"])[1]
     if model.num_nextn_predict_layers:
-        cache = model.apply({**variables, **cache}, ids.shape[0], method="init_mtp_cache", mutable=["cache"])[
-            1
-        ]
-    PretrainedDecoder.from_model(model, {**variables, **cache}).save(tmp_path)
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+        cache = model.apply({**variables, **cache}, ids.shape[0], method="init_mtp_cache",
+                            mutable=["cache"])[1]
+    PretrainedDecoder.from_model(model, {**variables, **cache}).save(directory)
+    return model, variables, ids, Pretrained.load(directory, dtype="float32", attention_impl="reference")
+
+
+@pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
+def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
+    """A GLM-5 decoder written standalone reloads to its own logits and leaves, and transformers reads
+    the export to them; its prediction depths' logits and drafts are the next test's, apart so each fits
+    its group (ledger 4287)."""
+    import jax.numpy as jnp
+
+    model, variables, ids, restored = glm5_exported(variant, tmp_path)
+    expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
     actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=LOGITS, rtol=0)
     np.testing.assert_allclose(tool.reference_logits(CASES["glm5_next"], tmp_path, ids),
                                expected, atol=LOGITS, rtol=0)
     written = json.loads((tmp_path / "config.json").read_text())
     assert written["index_share_for_mtp_iteration"] == model.index_share_for_mtp_iteration
-    if model.num_nextn_predict_layers:
-        # Each forward compiled once, as a user runs it, not op by op.
-        prediction = jax.jit(functools.partial(prediction_logits, model))(variables, jnp.asarray(ids))
-        reloaded_prediction = jax.jit(functools.partial(prediction_logits, restored.model))(
-            restored.variables, jnp.asarray(ids))
-        np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
-        np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
-                                   prediction, atol=LOGITS, rtol=0)
-        ordinary = generate(model, variables, jnp.asarray(ids[:, :5]), 4, key=jax.random.key(0),
-                            sampling=Sampling(temperature=0)).host()
-        speculative = restored.text_generation(sampling=Sampling(temperature=0))(
-            ids[:, :5], max_new_tokens=4, key=0, strategy=Speculative(block=3)).host()
-        np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
-        np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
     for collection in ("params", "moe"):
         if collection in variables:
             actual_leaves = flat_tree(restored.variables[collection])
             for name, value in flat_tree(variables[collection]).items():
                 np.testing.assert_array_equal(actual_leaves[name], value)
+
+
+@pytest.mark.parametrize("variant", ["released", "native_geometry"])
+def test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did(variant, tmp_path):
+    """A GLM-5 decoder with prediction depths (the dense variant has none), written standalone: its
+    reloaded depths' logits are its own and transformers' over the export, and the reload drafts
+    speculatively the greedy tokens the original decodes."""
+    import jax.numpy as jnp
+
+    from dew.sampling import Sampling, Speculative, generate
+
+    model, variables, ids, restored = glm5_exported(variant, tmp_path)
+    assert model.num_nextn_predict_layers and restored.model.num_nextn_predict_layers
+    # Each forward compiled once, as a user runs it, not op by op.
+    prediction = jax.jit(functools.partial(prediction_logits, model))(variables, jnp.asarray(ids))
+    reloaded_prediction = jax.jit(functools.partial(prediction_logits, restored.model))(
+        restored.variables, jnp.asarray(ids))
+    np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
+    np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
+                               prediction, atol=LOGITS, rtol=0)
+    ordinary = generate(model, variables, jnp.asarray(ids[:, :5]), 4, key=jax.random.key(0),
+                        sampling=Sampling(temperature=0)).host()
+    speculative = restored.text_generation(sampling=Sampling(temperature=0))(
+        ids[:, :5], max_new_tokens=4, key=0, strategy=Speculative(block=3)).host()
+    np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
+    np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
 
 
 def assert_same_tensors(written: dict, expected: dict) -> None:

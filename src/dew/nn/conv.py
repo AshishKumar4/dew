@@ -63,6 +63,13 @@ ad.deflinear(_barrier_p, lambda cotangent: (_barrier_p.bind(cotangent),))
 batching.defvectorized(_barrier_p)
 
 
+def _per_axis(value: int | Sequence[int] | None, rank: int) -> tuple[int, ...]:
+    """A convolution's per-axis option (its strides or a dilation) over `rank` spatial axes: one value for
+    every axis, each axis's own, or None for one."""
+    value = 1 if value is None else value
+    return (value,) * rank if isinstance(value, int) else tuple(value)
+
+
 def _barrier(x: jax.Array) -> jax.Array:
     return _barrier_p.bind(x)
 
@@ -279,23 +286,35 @@ class Conv(nn.Conv):
 
     @nn.nowrap
     def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
-        """The native convolution's output geometry, without allocating its arrays."""
-        spatial = shape[:-1]
+        """The native convolution's output geometry, without allocating its arrays, as `__call__` computes
+        it: an input padded by wrapping, reflecting or causally first, or as stated or as 'SAME' pads it,
+        and read by the dilated kernel at its strides; an input dilated (`input_dilation`, its extent
+        `(size - 1) * rate + 1`) padded by the amounts stated, and refused padded by name, as
+        `lax.conv_general_dilated` computes none so (ledger 4399)."""
         kernel = (self.kernel_size,) if isinstance(self.kernel_size, int) else tuple(self.kernel_size)
-        strides = ((self.strides,) * len(kernel) if isinstance(self.strides, int) else
-                   (1,) * len(kernel) if self.strides is None else tuple(self.strides))
-        dilation = ((self.kernel_dilation,) * len(kernel) if isinstance(self.kernel_dilation, int) else
-                    (1,) * len(kernel) if self.kernel_dilation is None else tuple(self.kernel_dilation))
-        effective = tuple((tap - 1) * rate + 1 for tap, rate in zip(kernel, dilation, strict=True))
+        strides, rates = _per_axis(self.strides, len(kernel)), _per_axis(self.input_dilation, len(kernel))
+        effective = tuple((tap - 1) * rate + 1 for tap, rate in zip(
+            kernel, _per_axis(self.kernel_dilation, len(kernel)), strict=True))
         padding = canonicalize_padding(self.padding, len(kernel))
+        if isinstance(padding, str) and any(rate != 1 for rate in rates):
+            raise ValueError(f"a convolution over an input dilated by {rates} pads it by amounts stated, "
+                             f"not {padding!r}, as lax.conv_general_dilated pads it")
+        spatial = shape[:-1]
+        if padding in ('CIRCULAR', 'REFLECT', 'CAUSAL'):
+            # `__call__` pads the undilated input by the dilated kernel's extent less one, then reads it
+            # VALID.
+            spatial = tuple(size + tap - 1 for size, tap in zip(spatial, effective, strict=True))
+            padding = 'VALID'
+        extents = tuple((size - 1) * rate + 1 for size, rate in zip(spatial, rates, strict=True))
+        if padding == 'SAME':
+            sizes = tuple((size + step - 1) // step for size, step in zip(spatial, strides, strict=True))
+            return (*sizes, self.features)
+        if padding == 'VALID':
+            padding = ((0, 0),) * len(kernel)
         if isinstance(padding, str):
-            if padding == 'VALID':
-                padding = ((0, 0),) * len(kernel)
-            else:
-                return (*tuple((size + step - 1) // step
-                               for size, step in zip(spatial, strides, strict=True)), self.features)
-        sizes = tuple((size + sum(pad) - tap) // step + 1
-                      for size, tap, step, pad in zip(spatial, effective, strides, padding, strict=True))
+            raise ValueError(f"padding {padding!r} is none a convolution reads")
+        sizes = tuple((extent + sum(pad) - tap) // step + 1
+                      for extent, tap, step, pad in zip(extents, effective, strides, padding, strict=True))
         return (*sizes, self.features)
 
     @nn.nowrap
@@ -315,17 +334,14 @@ class Conv(nn.Conv):
     @nn.nowrap
     def _convolved(self, inputs: jax.Array, kernel_size: tuple[int, ...]) -> jax.Array:
         """Flax's shared-weight convolution of `inputs`, its bias added by `biased`."""
-        def each(value: int | Sequence[int] | None) -> tuple[int, ...]:
-            value = 1 if value is None else value
-            return (value,) * len(kernel_size) if isinstance(value, int) else tuple(value)
-
         # Every batch dimension in one, as flax convolves them.
         batch_dims = inputs.ndim - len(kernel_size) - 1
         batch_shape = inputs.shape[:batch_dims]
         if batch_dims != 1:
             inputs = jnp.reshape(inputs, (-1, *inputs.shape[batch_dims:]))
         strides, input_dilation, kernel_dilation = (
-            each(self.strides), each(self.input_dilation), each(self.kernel_dilation))
+            _per_axis(option, len(kernel_size))
+            for option in (self.strides, self.input_dilation, self.kernel_dilation))
         padding = canonicalize_padding(self.padding, len(kernel_size))
         if padding in ('CIRCULAR', 'REFLECT'):
             dilated = [(size - 1) * rate + 1 for size, rate in zip(kernel_size, kernel_dilation, strict=True)]
