@@ -58,13 +58,11 @@ def _profile_record(profiles) -> dict[str, JSON]:
     """What a step records of the profiles it keeps (`Checkpoints.profile_metadata`): the updates each
     holder's averages have taken, one count, or under DiLoCo each group's, whose rejected updates are its
     own; and their relative standard deviations, every group's alike."""
-    from jax.experimental import multihost_utils
+    from dew._coordination import collective_host
 
-    def host(value: jax.Array) -> np.ndarray:
-        # A group's clocks are on its own devices, which a pool's processes split.
-        return np.asarray(value if value.is_fully_addressable
-                          else multihost_utils.process_allgather(value, tiled=True))
-    updates, stds = host(profiles.updates), host(profiles.stds)
+    # A group's clocks are on its own devices, which a pool's processes split.
+    updates, stds = (np.asarray(value) for value in collective_host((profiles.updates, profiles.stds),
+                                                                    phase="checkpoint profiles"))
     return {'updates': int(updates) if updates.ndim == 0 else [int(count) for count in updates],
             'stds': [float(std) for std in (stds if stds.ndim == 1 else stds[0])]}
 

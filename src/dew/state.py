@@ -202,11 +202,13 @@ def without_empty_window(state: TrainState) -> TrainState:
     A window part filled is saved whole."""
     if state.window is None:
         return state
+    from dew._coordination import collective_host
+
     size = int(state.window_size)
     # The groups' clocks are stacked over the groups, which a pool's processes split.
-    filled = (int(state.microstep) % size if state.inner is None
-              else int(jnp.max(state.inner.microstep % size)))
-    return state.with_window(None) if filled == 0 else state
+    clocks = collective_host(state.microstep if state.inner is None else state.inner.microstep,
+                             phase="checkpoint window")
+    return state.with_window(None) if int(jnp.max(jnp.asarray(clocks) % size)) == 0 else state
 
 
 CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)

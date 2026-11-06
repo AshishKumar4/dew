@@ -69,6 +69,7 @@ import hashlib
 import json
 import math
 import os
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, TypedDict, overload
@@ -923,6 +924,15 @@ class _RankedSteps(preservation.PreservationPolicy):
                 for step, held in roles.items()}
 
 
+def _rmtrees(paths: Sequence[epath.Path], failures: list[OSError]) -> None:
+    """Delete each of `paths`, keeping what fails in `failures` (`Checkpoints._deleted`)."""
+    for path in paths:
+        try:
+            path.rmtree()
+        except OSError as error:
+            failures.append(error)
+
+
 class Checkpoints:
     """Manages the checkpoints of one run in one directory.
 
@@ -967,6 +977,9 @@ class Checkpoints:
         # that step's save has landed (`_project`).
         self._plan: tuple[int, dict[int, frozenset[str]]] | None = None
         self._swept = False
+        # Process 0's deletion of the items the last projection cut, run behind the pool (`_project`), and
+        # what it failed on.
+        self._deleting: tuple[threading.Thread, list[OSError]] | None = None
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
         # Why the run these checkpoints keep has no record that rebuilds it (`python_run`).
@@ -1144,18 +1157,25 @@ class Checkpoints:
                       for checkpoint in retained if key in checkpoint.metrics]
         return min(candidates)[1] if candidates else None
 
-    def pinned(self, step: int | str | None = None, *, reads: str = MODEL) -> int:
+    def pinned(self, step: int | str | None = None) -> int:
         """The exact step `step` selects: itself, the best by a ranking, or, for None or `latest`, the
-        newest committed now that holds what a reader of `reads` reads (`ROLES`): a model's reader the
-        newest model (a step kept for its model alone among them), a resume the latest (`latest`). A
-        later save does not move it."""
-        step = self.resolve(step, reads=reads)
+        newest committed now that holds a model (a step kept for its model alone among them). A later save
+        does not move it."""
+        return self._pinned(step, MODEL)
+
+    def _pinned(self, step: int | str | None, reads: str) -> int:
+        """`pinned`, None and `latest` selecting the newest step that holds what a reader of `reads` reads
+        (`ROLES`): a resume's the latest (`latest`)."""
+        step = self._resolved(step, reads)
         if step is None:
             raise FileNotFoundError(f"{self.directory} holds no checkpoint")
         return step
 
-    def resolve(self, step: int | str | None, *, reads: str = MODEL) -> int | None:
-        """The step `step` selects (`pinned`), None where it is None and no step holds what `reads` needs."""
+    def resolve(self, step: int | str | None) -> int | None:
+        """The step `step` selects (`pinned`), None where it is None and no step holds a model."""
+        return self._resolved(step, MODEL)
+
+    def _resolved(self, step: int | str | None, reads: str) -> int | None:
         if step is None or step == 'latest':
             return self._newest(reads)
         if not isinstance(step, str):
@@ -1504,7 +1524,9 @@ class Checkpoints:
         then deletes the rest, and hands every process the steps it cut; a step whose deletion was cut
         short reads as cut, and its leftovers go at the first projection of a later process. It runs where
         every process of the pool does, in `save`, `wait` and `close`, before the store's collection
-        reads the steps' references (`_frozen`)."""
+        reads the steps' references (`_frozen`). Process 0 deletes behind the pool, which waits on it for
+        the cut alone: `wait`, `close` and the next projection join the deletion (`_deleted`)."""
+        self._deleted()
         persistent = self._manager
         plan, self._plan = self._plan, None
         if persistent is None or plan is None:
@@ -1512,6 +1534,7 @@ class Checkpoints:
         persistent.wait_until_finished()
         newest, roles = plan
         cuts: dict[str, list[str]] = {}
+        doomed: list[epath.Path] = []
         if jax.process_index() == 0 and self._complete(newest):
             steps = set(persistent.all_steps())
             for step, needed in roles.items():
@@ -1525,11 +1548,15 @@ class Checkpoints:
                 if len(kept) == len(payloads) and not leftover:
                     continue
                 write_atomically(root / PROJECTED, json.dumps(kept))
-                for name in ROLES:
-                    if name not in kept and (root / name).exists():
-                        (root / name).rmtree()
+                doomed += [root / name for name in ROLES if name not in kept and (root / name).exists()]
                 cuts[str(step)] = kept
         cuts = broadcast_from_process_zero(cuts)
+        if doomed:
+            failures: list[OSError] = []
+            deleting = threading.Thread(target=_rmtrees, args=(doomed, failures),
+                                        name="checkpoint projection")
+            deleting.start()
+            self._deleting = deleting, failures
         self._swept = True
         for step, kept in cuts.items():
             if int(step) in self._committed:
@@ -1539,6 +1566,17 @@ class Checkpoints:
                 self._staged[int(step)] = self._staged[int(step)][0], tuple(kept)
         if cuts:
             self._metadata = None
+
+    def _deleted(self) -> None:
+        """Join the last projection's deletion (`_project`), raising what it failed on: a step whose
+        deletion failed reads as cut, and its leftovers go at a later process's first projection."""
+        deleting, self._deleting = self._deleting, None
+        if deleting is None:
+            return
+        thread, failures = deleting
+        thread.join()
+        if failures:
+            raise failures[0]
 
     def _frozen(self, state_tree: dict[str, StateLeaf]
                 ) -> tuple[Mapping[str, object], dict[str, dict[str, str]]]:
@@ -2028,7 +2066,7 @@ class Checkpoints:
         1552).
         """
         resumes = template is not None and not isinstance(template, Mapping)
-        step = self.pinned(step, reads=RESUME if resumes else MODEL)
+        step = self._pinned(step, RESUME if resumes else MODEL)
         from_local = step == self._local_latest()
         where = self.source(step) if from_local else self.path(step)
         if from_local and template is None and jax.process_count() > 1:
@@ -2291,7 +2329,8 @@ class Checkpoints:
         def detached():
             self._manager, self._local_manager, self._pending = None, None, None
         # The projection reads the run's steps through its own manager (`_complete`), so it runs attached.
-        cut = [] if self._manager is None else [("Checkpoint projection", self._project)]
+        cut = ([] if self._manager is None else [("Checkpoint projection", self._project)])
+        cut.append(("Checkpoint deletion", self._deleted))
         return [*(("Checkpoint wait", writer.wait_until_finished) for writer in opened), *cut,
                 ("Checkpoint detach", detached), *(("Checkpoint close", writer.close) for writer in opened)]
 
@@ -2306,6 +2345,8 @@ class Checkpoints:
                         for writer in (self._manager, self._local_manager) if writer is not None])
             self._pending = None
             self._project()
+            # Process 0's deletion of what the projection cut lands too; the pool waited for the cut alone.
+            self._deleted()
 
 
 @dataclasses.dataclass(frozen=True)

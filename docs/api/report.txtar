@@ -24,13 +24,13 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .local_path: property -> str
   .materialized(self, template: Mapping[str, Variables], placement: Mapping[str, Variables], *, step: int, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',))) -> Variables
   .path(self, step: int) -> str
-  .pinned(self, step: int | str | None = None, *, reads: str = 'model') -> int
+  .pinned(self, step: int | str | None = None) -> int
   .position(self, step: int, share: DataPartition) -> bytes | None
   .posthoc_ema(self, std: float, step: int | None = None) -> Variables
   .profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]
   .profile_steps(self) -> list[int]
   .python_run(self, reasons: Sequence[str]) -> None
-  .resolve(self, step: int | str | None, *, reads: str = 'model') -> int | None
+  .resolve(self, step: int | str | None) -> int | None
   .restore(self, template=None, step: int | str | None = None, *, share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ())
   .restore_profiles(self, step: int) -> tuple[Variables, ...]
   .resumed(self, resume: Resume = 'auto') -> int | None
