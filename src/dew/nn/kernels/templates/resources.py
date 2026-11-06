@@ -271,16 +271,23 @@ def _barrier(leaf) -> bool:
     return isinstance(leaf, (plgpu.Barrier, plgpu.ClusterBarrier))
 
 
+def _semaphore(leaf) -> bool:
+    """Whether a scope's `leaf` is a semaphore (a TPU core's DMA or regular one, `pltpu.SemaphoreType`): an
+    extended dtype held in the core's semaphore memory, no byte of its VMEM."""
+    return jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.extended)
+
+
 def scratch_bytes(family: "Family", scope: Scope) -> int:
-    """The shared memory a program of `scope` asks for besides its barriers, as Mosaic GPU's resource
-    estimate counts it (its `smem_scratch_bytes`): every array rounded up to `SMEM_ALIGNMENT`
-    (`allocated`), the walks the largest of them, the tiles scoped after the walks the larger of them and
-    the walks on a family that scopes its walks apart (`Family.walks_scoped`) and beside the program's
-    otherwise, and the family's reduction scratch where the program reduces (`Family.reduction_scratch`)
-    and its warpgroups' shares where they reduce implicitly (`Family.warpgroup_reduction_scratch`)."""
+    """The shared memory a program of `scope` asks for besides its barriers and semaphores (`_semaphore`),
+    as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every array rounded up to
+    `SMEM_ALIGNMENT` (`allocated`), the walks the largest of them, the tiles scoped after the walks the
+    larger of them and the walks on a family that scopes its walks apart (`Family.walks_scoped`) and beside
+    the program's otherwise, and the family's reduction scratch where the program reduces
+    (`Family.reduction_scratch`) and its warpgroups' shares where they reduce implicitly
+    (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
         return [math.prod(leaf.shape) * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(tree)
-                if not _barrier(leaf)]
+                if not _barrier(leaf) and not _semaphore(leaf)]
 
     sizes = arrays(scope.program)
     walks = [allocated(*arrays(walk)) for walk in scope.walks]
@@ -351,7 +358,10 @@ def register_programs(family: "Family", consumers: int, registers: int | None = 
     the most at whose share (`Family.registers` at that residency, a raise's where the family's roles raise)
     its consumers hold them, beside its producer's where its layout has one. A launch's own need sets its
     residency: two programs of a one-consumer launch at 127 registers ran its walk 1.35 times as fast as one
-    (FS-WHY3-h100)."""
+    (FS-WHY3-h100). A core whose family budgets no registers (a TPU's, `Family.budgets_registers`) runs
+    one."""
+    if not family.budgets_registers:
+        return 1
     warpgroups = family.warpgroups(consumers)
     need = family.registers(consumers) if registers is None else registers
     for programs in range(resident_warpgroups() // warpgroups, 0, -1):
@@ -508,7 +518,7 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
     block = generation.shared_budget(target)
     plans = []
     for launch in launches:
-        if launch.registers > family.registers(launch.consumers):
+        if family.budgets_registers and launch.registers > family.registers(launch.consumers):
             return None
         most = family.programs(launch.consumers, launch.registers)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
