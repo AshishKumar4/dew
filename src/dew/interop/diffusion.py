@@ -607,7 +607,9 @@ def wan_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
     """Read a published `WanTransformer3DModel` config into native model
     fields, refusing what the text-to-video port does not compute: the
     image-to-video models' image embedder and added key and value
-    projections, and a query and key norm other than across all heads."""
+    projections, and a query and key norm other than across all heads. A
+    `qk_norm` of None is normed across heads too, as Diffusers computes it from
+    0.35.0 on (`WanTransformer`)."""
     for name in ("image_dim", "added_kv_proj_dim", "pos_embed_seq_len"):
         if config.get(name) is not None:
             raise ValueError(f"{name} belongs to Wan's image-to-video models, which the port does not "
