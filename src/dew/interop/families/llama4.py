@@ -11,12 +11,18 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.decoder_config import (
+    TRAINING_ROUTER,
+    DecoderSpelling,
+    decoder_layout,
+    experts,
+    inert,
+    integer,
+)
 from dew.interop.decoder_parts import (
     MOE_SHARED,
-    TRAINING_ROUTER,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     ExportRefused,
     KindFields,
     Leaves,
@@ -24,10 +30,6 @@ from dew.interop.decoder_parts import (
     Packed,
     Renames,
     RopeSpelling,
-    decoder_layout,
-    experts,
-    inert,
-    integer,
     refuse,
     spelled,
 )

@@ -17,16 +17,14 @@ pass, so another threshold, or an `early_exit_step` before the last, is refused.
 from collections.abc import Mapping
 
 from dew import _records
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, remote_code
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     Leaves,
     Renames,
-    decoder_layout,
     native_layer_types,
     refuse,
-    remote_code,
     spelled,
 )
 from dew.interop.layouts import ConfigLayout, ConfigPart, constant

@@ -8,6 +8,7 @@ import numpy as np
 
 from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import flag, inert, integer, ungated
 from dew.interop.decoder_parts import (
     GPT_MLP,
     GPT_TRUNK,
@@ -18,12 +19,8 @@ from dew.interop.decoder_parts import (
     Renames,
     constant,
     fixed_attention_buffer,
-    flag,
-    inert,
-    integer,
     refuse,
     spelled,
-    ungated,
 )
 from dew.interop.layouts import (
     ConfigField,

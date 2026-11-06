@@ -16,6 +16,7 @@ import numpy as np
 
 from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.decoder_config import read_only
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     NO_AUDIO,
@@ -25,7 +26,6 @@ from dew.interop.decoder_parts import (
     WrapperFields,
     in_trunk,
     kind_mixers,
-    read_only,
     record_float,
     record_int,
     refuse,

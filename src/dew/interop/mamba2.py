@@ -25,7 +25,8 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from dew import _records
-from dew.interop.decoder_parts import expect, flag, in_trunk, integer, record_bool, record_int, refuse_export
+from dew.interop.decoder_config import expect, flag, integer
+from dew.interop.decoder_parts import in_trunk, record_bool, record_int, refuse_export
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Routes, Table, constant, unread
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer

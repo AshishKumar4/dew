@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 
 from dew import _records
+from dew.interop.decoder_config import flag, inert, integer
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     MEGATRON_NAMES,
@@ -10,10 +11,7 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Renames,
     constant,
-    flag,
     grouped_qkv,
-    inert,
-    integer,
     refuse,
     spelled,
 )

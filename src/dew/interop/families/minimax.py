@@ -27,18 +27,14 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.decoder_config import ROPE_APART, DecoderSpelling, decoder_layout, place_ropes, read_only
 from dew.interop.decoder_parts import (
     MOE_NAMES,
-    ROPE_APART,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     RopeSpelling,
-    decoder_layout,
     kind_mixers,
     kinds_of,
-    place_ropes,
-    read_only,
     read_partial_rope,
     refuse,
     softmax_top_k,

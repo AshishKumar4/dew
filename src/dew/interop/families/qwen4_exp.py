@@ -23,15 +23,13 @@ import numpy as np
 
 from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.decoder_config import DecoderSpelling, integer, kind_mixer
 from dew.interop.decoder_parts import (
     DELTA_NET_ROUTES,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     Renames,
     in_layer,
-    integer,
-    kind_mixer,
     refuse,
     spelled,
 )

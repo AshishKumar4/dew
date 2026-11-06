@@ -17,14 +17,8 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_parts import (
-    DecoderFamily,
-    DecoderFields,
-    DecoderSpelling,
-    decoder_layout,
-    kinds_of,
-    refuse,
-)
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout
+from dew.interop.decoder_parts import DecoderFamily, DecoderFields, kinds_of, refuse
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, constant, unread
 from dew.nn.backbones.decoder_block import NormSpec
 from dew.nn.backbones.layer_plan import LayerKind

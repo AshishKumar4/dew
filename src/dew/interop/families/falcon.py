@@ -3,18 +3,14 @@
 from collections.abc import Mapping
 
 from dew import _records
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, expect, inert, ungated
 from dew.interop.decoder_parts import (
     MEGATRON_NAMES,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     constant,
-    decoder_layout,
-    expect,
     grouped_qkv,
-    inert,
     spelled,
-    ungated,
 )
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, unread
 

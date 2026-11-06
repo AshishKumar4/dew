@@ -33,27 +33,24 @@ from types import MappingProxyType
 from dew import _records
 from dew.interop import release_pins
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, integer, plain_rope_part
 from dew.interop.decoder_parts import (
     NO_AUDIO,
     PREDICTION_INPUTS,
     PREDICTION_STEP_END,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     Ramp,
     Renames,
     SourceCode,
     WrapperFields,
     declared_depths,
-    decoder_layout,
     folder_config,
     folder_name,
     grouped_qkv,
-    integer,
     kinds_of,
     nested_ramp,
     partial_rope_entry,
-    plain_rope_part,
     prediction_routes,
     record_int,
     refuse,

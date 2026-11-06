@@ -27,7 +27,7 @@ from types import FunctionType, MethodType
 from typing import TYPE_CHECKING
 
 from dew import _records
-from dew.interop import decoder_parts, sources
+from dew.interop import decoder_config, decoder_parts, sources
 from dew.interop.code_identity import Renaming, matched_class, same_code
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import ACTIVATIONS, PLAIN_SPELLING, DecoderFields
@@ -1650,8 +1650,8 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
 
     return decoder_parts.DecoderFamily(
         (model_type,),
-        decoder_parts.read_only(translated, f"{model_type} is read through the registered families' parts "
-                                            "and is written as none of them"),
+        decoder_config.read_only(translated, f"{model_type} is read through the registered families' parts "
+                                             "and is written as none of them"),
         lambda fields: False, model_type, 'ForCausalLM',
         preserve_source_layout=True, routes=Unwritten(weight_path),
         packed=assembly.packed,

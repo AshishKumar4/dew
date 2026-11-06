@@ -1,16 +1,8 @@
 """Phi's one-norm parallel biased block, sliced rotary and affine output head."""
 
 from dew import _records
-from dew.interop.decoder_parts import (
-    DecoderFamily,
-    DecoderSpelling,
-    Renames,
-    decoder_layout,
-    inert,
-    partial_rope_part,
-    spelled,
-    ungated,
-)
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, inert, partial_rope_part, ungated
+from dew.interop.decoder_parts import DecoderFamily, Renames, spelled
 from dew.interop.layouts import ConfigField, ConfigLayout, constant
 
 _PHI_NAMES: Renames = (

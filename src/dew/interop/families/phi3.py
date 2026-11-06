@@ -5,15 +5,12 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, expect, inert
 from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     Packed,
-    decoder_layout,
-    expect,
-    inert,
     qkv_widths,
     refuse,
     rope_records,

@@ -63,6 +63,7 @@ import numpy as np
 
 from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import read_only
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
     CODEC_FIELDS,
@@ -81,7 +82,6 @@ from dew.interop.decoder_parts import (
     SituFields,
     WrapperFields,
     context_lengths,
-    read_only,
     record_float,
     record_int,
     refuse,

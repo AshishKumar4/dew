@@ -15,6 +15,7 @@ does not run, so they build the dense [S, S] logits a global layer does: at
 from collections.abc import Mapping
 
 from dew import _records
+from dew.interop.decoder_config import flag, inert, integer
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
     DecoderFamily,
@@ -25,11 +26,8 @@ from dew.interop.decoder_parts import (
     RopeSpelling,
     context_lengths,
     decoder_kinds,
-    flag,
     hf_activation,
     hf_ungated,
-    inert,
-    integer,
     read_rope,
     refuse,
     specified_layer_types,

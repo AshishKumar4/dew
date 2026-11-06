@@ -4,18 +4,14 @@ release projects it in and out, and two reserved learned-position rows."""
 from collections.abc import Mapping
 
 from dew import _records
+from dew.interop.decoder_config import expect, flag, inert, integer, ungated
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,
     constant,
     context_lengths,
-    expect,
-    flag,
-    inert,
-    integer,
     spelled,
-    ungated,
 )
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, unread
 from dew.nn.backbones.causal_transformer import CausalTransformer

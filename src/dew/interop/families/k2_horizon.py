@@ -19,18 +19,8 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_parts import (
-    DECODER_ROUTES,
-    DecoderFamily,
-    DecoderFields,
-    DecoderSpelling,
-    decoder_layout,
-    expect,
-    in_layer,
-    inert,
-    refuse,
-    remote_code,
-)
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, expect, inert, remote_code
+from dew.interop.decoder_parts import DECODER_ROUTES, DecoderFamily, DecoderFields, in_layer, refuse
 from dew.interop.layouts import ConfigLayout, ConfigPart, Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, NormSpec

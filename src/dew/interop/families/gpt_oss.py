@@ -9,19 +9,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict
 
-from dew.interop.decoder_parts import (
-    LOCAL_EXPERTS,
-    DecoderFamily,
-    DecoderFields,
-    DecoderSpelling,
-    Leaves,
-    RopeSpelling,
-    decoder_layout,
-    expect,
-    refuse,
-    rope_part,
-    spelled,
-)
+from dew.interop.decoder_config import LOCAL_EXPERTS, DecoderSpelling, decoder_layout, expect, rope_part
+from dew.interop.decoder_parts import DecoderFamily, DecoderFields, Leaves, RopeSpelling, refuse, spelled
 from dew.interop.layouts import ConfigLayout, ConfigPart, constant, unread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import YarnScaling

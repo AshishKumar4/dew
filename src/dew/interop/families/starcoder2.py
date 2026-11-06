@@ -5,15 +5,8 @@ an ungated feed-forward, every map biased under `use_bias`."""
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.decoder_parts import (
-    GPT_MLP,
-    DecoderFamily,
-    DecoderFields,
-    DecoderSpelling,
-    decoder_layout,
-    spelled,
-    ungated,
-)
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, ungated
+from dew.interop.decoder_parts import GPT_MLP, DecoderFamily, DecoderFields, spelled
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, constant, unread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 

@@ -15,24 +15,26 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import (
+    ROPE_APART,
+    DecoderSpelling,
+    decoder_layout,
+    flag,
+    integer,
+    partial_rope_part,
+)
 from dew.interop.decoder_parts import (
     DECODER_ROUTES,
     DEEPSEEK_ROUTES,
-    ROPE_APART,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     KindFields,
     MixtureFields,
     constant,
-    decoder_layout,
     fixed_fields,
-    flag,
-    integer,
     kind_mixers,
     layer_depth,
     layer_depth_routes,
-    partial_rope_part,
     record_float,
     record_int,
     refuse,

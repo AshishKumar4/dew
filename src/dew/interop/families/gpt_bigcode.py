@@ -4,7 +4,8 @@ queries, keys and values fused in one `c_attn`, multi-query by default."""
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.decoder_parts import DecoderFamily, DecoderFields, grouped_qkv, refuse, spelled, ungated
+from dew.interop.decoder_config import ungated
+from dew.interop.decoder_parts import DecoderFamily, DecoderFields, grouped_qkv, refuse, spelled
 from dew.interop.families.gpt2 import GPT2_NAMES, gpt2_layout
 from dew.interop.layouts import ConfigLayout, ConfigPart, unread
 

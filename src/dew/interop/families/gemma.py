@@ -17,6 +17,7 @@ from types import MappingProxyType
 from dew import _records
 from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, flag, inert, integer, rope_part
 from dew.interop.decoder_parts import (
     DECODER_ROUTES,
     FUSED_EXPERTS,
@@ -25,24 +26,18 @@ from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     Leaves,
     RopeSpelling,
     both,
     config_flag,
-    decoder_layout,
     fixed_fields,
-    flag,
     in_layer,
     in_trunk,
-    inert,
-    integer,
     kinds_of,
     own_routes,
     read_rope_theta,
     refuse,
     refuse_export,
-    rope_part,
     specified_layer_types,
 )
 from dew.interop.layouts import (

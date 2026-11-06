@@ -23,20 +23,22 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.decoder_parts import (
-    DecoderFamily,
-    DecoderFields,
+from dew.interop.decoder_config import (
     DecoderSpelling,
-    RopeSpelling,
     decoder_layout,
     expect,
     inert,
     integer,
     kind_mixer,
+    place_ropes,
+)
+from dew.interop.decoder_parts import (
+    DecoderFamily,
+    DecoderFields,
+    RopeSpelling,
     kinds_of,
     layer_type,
     native_fields,
-    place_ropes,
     read_rope,
     refuse,
     refuse_export,

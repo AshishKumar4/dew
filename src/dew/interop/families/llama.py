@@ -13,17 +13,14 @@ from __future__ import annotations
 import dataclasses
 
 from dew import _records
+from dew.interop.decoder_config import LOCAL_EXPERTS, DecoderSpelling, decoder_layout, inert
 from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
-    LOCAL_EXPERTS,
     MOE_NAMES,
     DecoderFamily,
-    DecoderSpelling,
     Packed,
     RopeSpelling,
-    decoder_layout,
     every_layer_windowed,
-    inert,
     spelled,
 )
 from dew.interop.families.qwen import QWEN_MOE_ROUTES

@@ -23,15 +23,14 @@ from typing import TYPE_CHECKING
 from dew import _records
 from dew.interop import mamba2
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import flag, integer
 from dew.interop.decoder_parts import (
     PREDICTION_INPUTS,
     PREDICTION_STEP_END,
     DecoderFamily,
     Packed,
     declared_depths,
-    flag,
     in_trunk,
-    integer,
     record_bool,
     record_int,
 )

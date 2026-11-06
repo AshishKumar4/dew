@@ -6,21 +6,17 @@ from types import MappingProxyType
 import numpy as np
 
 from dew import _records
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, flag, plain_rope_part, ungated
 from dew.interop.decoder_parts import (
     MEGATRON_MLP,
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     Renames,
     constant,
-    decoder_layout,
     fixed_attention_buffer,
-    flag,
     grouped_qkv,
-    plain_rope_part,
     spelled,
-    ungated,
 )
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Slot, Table, one_of, unread
 from dew.interop.unread import Stored, equal

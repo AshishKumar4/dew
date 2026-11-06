@@ -6,7 +6,8 @@ kinds carry their own rope rather than the model.
 
 from __future__ import annotations
 
-from dew.interop.decoder_parts import DecoderFamily, DecoderSpelling, RopeSpelling, decoder_layout
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout
+from dew.interop.decoder_parts import DecoderFamily, RopeSpelling
 from dew.interop.layouts import ConfigLayout, constant
 
 _SPELLING = RopeSpelling(theta=500000.0, per_kind=True, local_theta=500000.0)

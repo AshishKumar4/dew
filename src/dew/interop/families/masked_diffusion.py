@@ -12,29 +12,25 @@ from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, inert, plain_rope_part, unwritten
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
-    DecoderSpelling,
     MaskedWalk,
     Packed,
     Renames,
     RopeSpelling,
     SourceCode,
     constant,
-    decoder_layout,
-    inert,
-    plain_rope_part,
     qkv_widths,
     record_float,
     record_int,
     refuse,
     refuse_export,
     spelled,
-    unwritten,
 )
 from dew.interop.families.deepseek import deepseek_mixture
 from dew.interop.families.gemma import GEMMA4_DEFAULTS, GEMMA4_ROUTES, gemma4_layout
