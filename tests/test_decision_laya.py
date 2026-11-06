@@ -226,11 +226,13 @@ def REAL_dew(dtype, inputs) -> dict[str, np.ndarray]:
     variables = jax.tree.map(lambda value: jnp.asarray(value, dtype), checkpoint.variables)
     requests = json.loads(str(inputs["requests"]))
     found = {}
-    for layout in OUTPUTS:
-        laid = sorted(rows(checkpoint, parallel=layout == "parallel", requests=requests),
-                      key=lambda row: row[0])
-        found[layout] = np.concatenate([np.asarray(model.logits(variables, DecisionInputs.collate(
-            [encoded], checkpoint.specials.pad)))[0, 0] for _, _, encoded in laid])
+    # HIGHEST: XLA:GPU's fp32 dot is otherwise TF32's, where Laya's torch dot is fp32's.
+    with jax.default_matmul_precision("highest"):
+        for layout in OUTPUTS:
+            laid = sorted(rows(checkpoint, parallel=layout == "parallel", requests=requests),
+                          key=lambda row: row[0])
+            found[layout] = np.concatenate([np.asarray(model.logits(variables, DecisionInputs.collate(
+                [encoded], checkpoint.specials.pad)))[0, 0] for _, _, encoded in laid])
     return found
 
 
@@ -240,9 +242,11 @@ def REAL_dew(dtype, inputs) -> dict[str, np.ndarray]:
 def test_the_released_english_checkpoint_matches_laya():
     """convaiinnovations/laya at the pinned revision: its layouts token for token on the fixture's cases
     (tools/laya_reference.py --real), and its option logits over drawn requests as exact as Laya's float32
-    run against its float64 run (check 1, tools/venv_reference.py's `laya-real` recording).
+    run against its float64 run (check 1, tools/venv_reference.py's `laya-real` recording, Laya's runs on
+    the CUDA GPU the test runs Dew on).
 
-    It runs on a GPU at HIGHEST precision: XLA:CPU's fp32 dot accumulates with 2.3 times the RMS error of
+    It runs on a GPU at HIGHEST precision (`REAL_dew`): XLA:CPU's fp32 dot accumulates with 2.3 times the
+    RMS error of
     the MKL dot torch runs (a [96, 1024] x [1024, 1024] product, 5.7e-7 against 2.5e-7, equal at a
     reduction of 64), which ModernBERT-large's 1024- and 2624-long reductions carry through 28 layers."""
     checkpoint = released()
@@ -250,11 +254,10 @@ def test_the_released_english_checkpoint_matches_laya():
     for parallel in (False, True):
         for key, _, encoded in rows(checkpoint, parallel=parallel):
             assert list(encoded.tokens) == expected[key]["ids"], key
-    with jax.default_matmul_precision("highest"):
-        drawn, reference, truth = indexed_recording(recording(REAL_FIXTURE), "laya-real", REAL_SEEDS,
-                                                    inputs_of=REAL_draw,
-                                                    truth_fn=lambda inputs: REAL_dew(jnp.float64, inputs))
-        assert_as_exact(as_given(lambda index, inputs: REAL_dew(jnp.float32, inputs)), reference, drawn,
-                        "released Laya logits", seeds=REAL_SEEDS, truth_fn=truth)
+    drawn, reference, truth = indexed_recording(recording(REAL_FIXTURE), "laya-real", REAL_SEEDS,
+                                                inputs_of=REAL_draw,
+                                                truth_fn=lambda inputs: REAL_dew(jnp.float64, inputs))
+    assert_as_exact(as_given(lambda index, inputs: REAL_dew(jnp.float32, inputs)), reference, drawn,
+                    "released Laya logits", seeds=REAL_SEEDS, truth_fn=truth)
 
 

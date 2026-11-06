@@ -13,7 +13,8 @@ order (`<layout>/<case>/<id>`), for the `sequential` and the `parallel` layout, 
 SITE `laya-real` is the released English checkpoint (tools/laya_reference.py's LAYA_REPO at
 LAYA_REVISION), its weights as released, over drawn requests: IN holds each case's `<case>.requests`, a
 JSON string of requests in CASES' structure (tests/test_decision_laya.py's `drawn_requests`), which the
-worker lays out as `Agent` does; OUT as `laya`'s.
+worker lays out as `Agent` does, both precisions run on the CUDA GPU the site's test runs Dew on; OUT as
+`laya`'s.
 """
 
 from __future__ import annotations
@@ -42,18 +43,19 @@ def by_layout(logits: dict) -> dict[str, tuple[np.ndarray, np.ndarray]]:
 
 
 def released():
-    """The released checkpoint's `Agent` and its directory, read from the Hub at its revision."""
+    """The released checkpoint's `Agent`, read from the Hub at its revision onto the GPU its site's test
+    runs on, and its model in float32 and float64 (`twins`)."""
     from huggingface_hub import snapshot_download
 
     agent_module, _ = _laya()
     directory = Path(snapshot_download(LAYA_REPO, revision=LAYA_REVISION, allow_patterns=[
         "model.safetensors", "encoder/*", "tokenizer/*", "rl_agent_config.json"]))
-    return agent_module.Agent(str(directory), device="cpu"), directory
+    agent = agent_module.Agent(str(directory), device="cuda")
+    return agent, *twins(agent, directory)
 
 
-def run_released(agent, directory: Path, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def run_released(agent, model, exact, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every case's logits by layout over its drawn requests, under the released weights."""
-    model, exact = twins(agent, directory)
     out = {}
     for name in sorted({key.split(".", 1)[0] for key in cases}):
         requests = json.loads(str(cases[f"{name}.requests"]))

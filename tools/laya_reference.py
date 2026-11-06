@@ -144,6 +144,7 @@ def laid_logits(agent, model, exact, cases: dict | None = None) -> tuple[dict, d
 
     agent_module, common = _laya()
     tokenizer, config = agent.tok, agent.cfg
+    device = next(model.parameters()).device
     layouts, logits = {}, {}
     for parallel in (False, True):
         name = "parallel" if parallel else "sequential"
@@ -164,15 +165,16 @@ def laid_logits(agent, model, exact, cases: dict | None = None) -> tuple[dict, d
                 layouts[key] = {"ids": ids, "markers": markers,
                                 **({"positions": layout[0]["position_ids"], "slots": layout[0]["option_ids"]}
                                    if parallel else {})}
-                batch = common.collate_items([[item]], tokenizer.pad_token_id)
+                batch = {name: value.to(device) for name, value in
+                         common.collate_items([[item]], tokenizer.pad_token_id).items()}
                 arguments = (batch["input_ids"], batch["attention_mask"], batch["marker_pos"],
                              batch["marker_mask"], batch["qtype"])
                 extra = ({"position_ids": batch["position_ids"], "option_ids": batch["option_ids"]}
                          if parallel else {})
                 with torch.no_grad():
-                    logits[key] = model(*arguments, **extra)[0][0].numpy()
+                    logits[key] = model(*arguments, **extra)[0][0].cpu().numpy()
                 with float64(), torch.no_grad():
-                    logits[f"{key}/f64"] = exact(*arguments, **extra)[0][0].double().numpy()
+                    logits[f"{key}/f64"] = exact(*arguments, **extra)[0][0].double().cpu().numpy()
     return layouts, logits
 
 
