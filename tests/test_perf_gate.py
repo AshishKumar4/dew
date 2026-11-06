@@ -593,24 +593,19 @@ TINY = {"architecture": "causal_transformer", "dtype": "bfloat16", "batch_size":
 are, which a GPU routes to FlashAttention."""
 
 
-def test_a_step_is_planned_ahead_for_an_absent_gpu_and_a_kernel_this_host_cannot_lower_is_named(
-        gate, tmp_path):
+def test_a_step_is_planned_and_compiled_ahead_for_an_absent_gpu_with_the_gates_attention(gate, tmp_path):
     """The compile ahead's own process (`COMPILED`), run as `compile` runs it: a decoder's step planned and
     compiled for one compile-only sm90 GPU of a stated memory, here with no GPU attached, with XLA's
-    attention (`AHEAD_ATTENTION`), its planner's seconds and selected plan reported and nothing substituted;
-    with FlashAttention asked for, which lowers on no compile-only GPU (ledger 4616), a kernel runs in its
-    place, which it names as substituted, so the gate never takes that program for the GPU's."""
+    attention (`AHEAD_ATTENTION`, which lowers here: ledger 4616), its planner's seconds reported, nothing
+    substituted, and every selected field of its plan with its own value. A compile that substituted a
+    kernel is the gate's unsupported row (`compile`'s test, at its process boundary)."""
     script = gate._script(tmp_path / "compiled.json", gate.COMPILED)
-
-    def compiled(attention: str) -> dict:
-        argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), attention, ",".join(gate.SELECTED)]
-        done = gate._run(ROOT, Path(sys.executable), "", argv, ROOT / "tools", 900, tmp_path / attention)
-        assert done.returncode == 0, done.stderr[-3000:]
-        return json.loads(done.stdout.strip().splitlines()[-1])
-
-    ahead = compiled(gate.AHEAD_ATTENTION)
+    argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), gate.AHEAD_ATTENTION, ",".join(gate.SELECTED)]
+    done = gate._run(ROOT, Path(sys.executable), "", argv, ROOT / "tools", 900, tmp_path / "compiles")
+    assert done.returncode == 0, done.stderr[-3000:]
+    ahead = json.loads(done.stdout.strip().splitlines()[-1])
     assert ahead["seconds"] > 0 and ahead["substituted"] == [] and ahead["plan"]["split"] == 1
-    assert compiled("flash")["substituted"]
+    assert set(ahead["plan"]) == set(gate.SELECTED)
 
 
 def paired(rates: dict[str, list[float]], session: str = "s") -> dict[str, list[dict]]:
