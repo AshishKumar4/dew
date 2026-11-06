@@ -3,6 +3,7 @@ control policy and a DreamerV3 agent, objectives with no inference task of their
 their run's record states and load back as the model and weights the run trained, where their checkpoints
 recorded no declaration and `SavedRun.at` refused them."""
 
+import json
 from pathlib import Path
 
 import jax
@@ -14,7 +15,7 @@ from run_kinds import jepa, trained
 from test_env_runs import TEACHER, student, teacher_run
 
 from dew.checkpoints import Checkpoints
-from dew.config.release import Release
+from dew.config.release import RELEASE_FILE, Release
 from dew.inference.loading import pipeline
 from dew.inference.tasks import SavedRun
 from dew.interop.saved_sources import export_run
@@ -137,3 +138,28 @@ def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_no
     Release(max_length=64).write(tmp_path / "source")
     with pytest.raises(ValueError):
         SavedModel.from_pretrained(tmp_path / "source")
+
+
+
+def test_a_model_release_written_before_it_stated_its_run_loads_as_it_did(tmp_path):
+    """A native model release written before the release stated its run (`task` holding the objective, the
+    model's record, its settings and numerics) loads as the release of today writes it: the same model and
+    weights, the same settings (review of the run release)."""
+    from dew.inference.models import SavedModel
+
+    teacher_run(tmp_path).prepare().train("teacher")
+    run = SavedRun.pinned(str(tmp_path / "teacher"))
+    export_run(run, tmp_path / "policy", ema=False)
+    today = pipeline(str(tmp_path / "policy"))
+    release = Release.load(tmp_path / "policy")
+    assert release is not None and release.task is not None
+    record = dict(release.task["run"])
+    settings = {name: record.pop(name) for name in list(record)
+                if name not in ("objective", "model", "precision")}
+    earlier = {"objective": record["objective"], "model": record["model"], "settings": settings,
+               "numerics": record.get("precision"), "dtypes": {}}
+    (tmp_path / "policy" / RELEASE_FILE).write_text(json.dumps({"task": earlier}))
+    before = pipeline(str(tmp_path / "policy"))
+    assert isinstance(before, SavedModel) and before.model == today.model
+    assert before.settings == today.settings
+    assert_same(before.variables, today.variables)

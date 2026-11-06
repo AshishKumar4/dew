@@ -488,3 +488,22 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
     # A branch read from two collections, its trunk held frozen, is the branch its root reads.
     assert read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)}, frozen=True) == read(
         {"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)})
+
+
+
+@pytest.mark.parametrize(("recorded", "kind"),
+                         [(recorded, kind) for recorded, kind in SAVED if kind == "diffusion"],
+                         ids=lambda part: str(part))
+def test_a_diffusion_runs_release_stores_its_encoders_parameters_in_the_dtype_a_load_asks(tmp_path, recorded,
+                                                                                            kind):
+    """A diffusion run's native release loaded with a storage dtype stores every parameter its run's load does
+    in it, its condition encoders' among them, and the rest as written: leaf for leaf the dtypes of the run
+    loaded so (review of the run release)."""
+    from dew._cli.main import main
+    from dew.inference.loading import pipeline
+
+    run = extracted(tmp_path, recorded, kind)
+    assert main(["export", str(run), str(tmp_path / "release")]) == 0
+    loaded, released = (pipeline(str(path), param_dtype="bfloat16") for path in (run, tmp_path / "release"))
+    assert (jax.tree.map(lambda leaf: leaf.dtype, released.variables)
+            == jax.tree.map(lambda leaf: leaf.dtype, loaded.variables))
