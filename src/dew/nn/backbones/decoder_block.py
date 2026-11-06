@@ -109,7 +109,7 @@ def gate_flops(specs: Mapping[str, NormSpec] | None, sites, width: int, lengths,
                for site in sites if site in held and norm_gated(held[site], site, routed))
 
 
-def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
+def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float | None,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
                  dtype: Dtype | None, precision: PrecisionLike = None,
                  specs: Mapping[str, NormSpec] | None = None,
@@ -121,7 +121,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
     it runs, its gate's maps at the model's `precision`. 'layer' keeps torch's
     exact variance, the reference decoders' formula; 'fast_layer' is flax's
     E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`), whose mean and square reduce
-    in one pass, which the vision towers run."""
+    in one pass, which the vision towers run. An `epsilon` of None is an RMS
+    norm's input dtype's (`RMSNorm.epsilon`); a layer norm states its own."""
 
     def build(*, name: str) -> nn.Module:
         spec = (specs or {}).get(name, NormSpec())
@@ -135,6 +136,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                 return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, precision=precision, name=name)
             return norm(name=name)
         offset = scale_offset if spec.offset is None else spec.offset
+        if eps is None:
+            raise ValueError(f"{name}, a {kind} norm, states its epsilon; its input dtype's is an RMS norm's")
         if spec.gate_rank is not None:
             raise ValueError(f"{name}, a {kind} norm, takes no gate; a gated norm is an RMS norm's")
         if spec.groups != 1 or (offset and (kind != 'layer' or not spec.scale)):
@@ -663,7 +666,8 @@ class DecoderBlock(nn.Module):
     feedforward: Callable[..., nn.Module] | None
     emb_features: int
     wiring: BlockWiring
-    norm_eps: float = 1e-5
+    norm_eps: float | None = 1e-5
+    """None: each RMS norm's input dtype's (`RMSNorm.epsilon`)."""
     norm_type: Literal['rms', 'layer', 'fast_layer'] = 'rms'
     norm_bias: bool = False
     norms: Mapping[str, NormSpec] | None = None
@@ -789,6 +793,14 @@ class DecoderBlock(nn.Module):
             self.attn_hc = HyperConnection(**sites, name='attn_hc')
             self.ffn_hc = HyperConnection(**sites, name='ffn_hc')
 
+    def _stated_eps(self, where: str) -> float:
+        """The block's epsilon for a part of it that states one (`where`): its norms of None take each
+        input's dtype's (`RMSNorm.epsilon`), which none of these parts reads."""
+        if self.norm_eps is None:
+            raise ValueError(f"{where} states its epsilon; a block whose norms take their input's (norm_eps "
+                             "None) runs none")
+        return self.norm_eps
+
     def setup(self):
         projections = self.projections()
         norm = decoder_norm(
@@ -849,7 +861,7 @@ class DecoderBlock(nn.Module):
                     "altup runs Gemma 3n's block, which has its pre-norms and "
                     "neither a parallel branch nor a layer scalar")
             self.altup_layer = AltUpLayer(
-                spec=self.altup, emb_features=self.emb_features, norm_eps=self.norm_eps,
+                spec=self.altup, emb_features=self.emb_features, norm_eps=self._stated_eps('altup'),
                 dtype=self.dtype, precision=self.precision, name='altup')
         if self.laurel_rank is not None:
             if self.laurel_rank < 1 or not self.wiring.pre_norms:
@@ -859,7 +871,7 @@ class DecoderBlock(nn.Module):
                 f"with {self.wiring}")
             self.laurel = LaurelBlock(
                 rank=self.laurel_rank, emb_features=self.emb_features,
-                norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
+                norm_eps=self._stated_eps('laurel'), dtype=self.dtype, precision=self.precision,
                 name='laurel')
         if self.hyper_connections is not None:
             self._stream_sites(self.hyper_connections)
@@ -872,7 +884,8 @@ class DecoderBlock(nn.Module):
                     "attention residuals run Kimi K3's block, a plain pre-norm block whose "
                     "residual is the depth mixture: no output norms, layer scalar, parallel "
                     "branch, altup, laurel, per-layer inputs, hyper-connections or residual multiplier")
-            site = functools.partial(DepthAttention, emb_features=self.emb_features, norm_eps=self.norm_eps)
+            site = functools.partial(DepthAttention, emb_features=self.emb_features,
+                                     norm_eps=self._stated_eps('attention residuals'))
             self.attention_res = site(name='attention_res')
             if self.feedforward is not None:
                 self.mlp_res = site(name='mlp_res')

@@ -104,6 +104,8 @@ WRAPPERS = {
     "muse_glimmer": ("Muse Glimmer", "Images"),
     "lfm3_vl": ("LFM3-VL", "Images, video"),
     "mimo_v2": ("MiMo-V2.6", "Images, video, audio"),
+    "kimi_k25": ("Kimi K2.5", "Images, video"),
+    "kimi_k3": ("Kimi K3", "Images, video"),
     "qwen2_vl": ("Qwen2-VL", "None yet: its language model alone (`text_only`)"),
     "qwen2_5_vl": ("Qwen2.5-VL", "None yet: its language model alone (`text_only`)"),
     "qwen3_vl": ("Qwen3-VL", "None yet: its language model alone (`text_only`)"),
