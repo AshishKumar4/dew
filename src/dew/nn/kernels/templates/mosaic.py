@@ -1240,6 +1240,14 @@ class Issuer[Accumulator](abc.ABC):
     warpgroup MMA reads them ('Only f16 WGMMA supports transposes'); mma.sync's FP8 forms are Ada's and
     consumer Blackwell's, which no bundle of Dew's runs yet (row 3620)."""
 
+    takes_block_scales: bool = False
+    """Whether its products scale each 32 depths of their operands by an E8M0 scale in the instruction (an MX
+    product's, `scaled_products`): tcgen05's block-scaled MMA; no other family's products do (row 4519)."""
+
+    def scaled_products(self, acc, lhs, rhs, scales: tuple, interpret: bool):
+        """`products` of block-scaled operands (`takes_block_scales`), `scales` the step's two scale slots."""
+        raise NotImplementedError(f"{self.name}'s products take no block scales")
+
     transposes_tf32: bool = False
     """Whether its TF32 products take an operand read transposed (`takes_tf32`): mma.sync's, whose threads
     load each fragment's elements themselves; not warpgroup MMA's ('Only f16 WGMMA supports transposes'), so

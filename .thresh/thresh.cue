@@ -213,6 +213,7 @@ seams: "kernel-choices": {
 	declared: {
 		attention:          "the attention kernel, a choice a dispatch reports"
 		attention_mainloop: "the attention_mainloop kernel, a choice a dispatch reports"
+		blockwise_fp8:      "the blockwise_fp8 kernel (a blockwise-scaled FP8 product, row 4518), a choice a dispatch reports"
 		decode:             "the decode kernel, a choice a dispatch reports"
 		delta_decode:       "the delta_decode kernel, a choice a dispatch reports"
 		delta_gates:        "the delta_gates kernel, a choice a dispatch reports"
@@ -223,6 +224,7 @@ seams: "kernel-choices": {
 		grouped_matmul:     "the grouped_matmul kernel, a choice a dispatch reports"
 		local_attention:    "the local_attention kernel, a choice a dispatch reports"
 		low_rank:           "the low_rank kernel (LoRA's adapted product fused or apart, row 1304), a choice a dispatch reports"
+		mxfp8:              "the mxfp8 kernel (an MX product on block-scaled tensor cores or decoded, row 4519), a choice a dispatch reports"
 		nvfp4:              "the nvfp4 kernel (an NVFP4 matrix's product decoded in stage or once a call, row 3621), a choice a dispatch reports"
 		mla:                "the mla kernel, a choice a dispatch reports"
 		narrow_copies:      "the narrow_copies kernel, a choice a dispatch reports"

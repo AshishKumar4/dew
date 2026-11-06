@@ -36,6 +36,7 @@ import jax
 import jax.numpy as jnp
 import join_matrix
 import low_rank_matrix
+import mx_matrix
 import numpy as np
 import nvfp4_matrix
 import pytest
@@ -180,6 +181,13 @@ def test_the_nvfp4_matrix_holds_on_this_gpu():
     in the mainloop on par with it decoded once a call, at every pair of axis values the packed kernel
     serves, each cell on its own GPU."""
     run_cells(cells_of(nvfp4_matrix.an_nvfp4_products_training_step_is_on_par))
+
+
+def test_the_mx_matrix_holds_on_this_gpu():
+    """The MX product's check-1 matrix (tests/kernel_matrix.py): its forward through the template's
+    block-scaled products on par with the decoded operands' product in XLA, at every pair of axis values the
+    template serves, each cell on its own GPU."""
+    run_cells(cells_of(mx_matrix.an_mxfp8_product_is_on_par))
 
 
 def test_the_blockwise_matrix_holds_on_this_gpu():
