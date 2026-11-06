@@ -210,7 +210,7 @@ def _one_draws_program(fn, arguments):
     return fn.fn, jax.tree.map(lambda leaf: leaf[0], arguments)
 
 
-WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
+WITHOUT_YNN = {}  # census (row 4471): every arm with the fusions users run
 """XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
 ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
 dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
