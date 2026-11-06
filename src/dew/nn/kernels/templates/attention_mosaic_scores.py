@@ -26,7 +26,7 @@ class _Backward:
     """A backward launch's static choices: its program's geometry, its forward's (`spec`: the call's form, the
     logits' scale and units, its score hook and initial state), its form, its consumers, whether it is
     interpreted, the score hook's parameter kinds (`kinds`), and whether the dK/dV program adds each tile's
-    dQ too (`fused`: the hookless fast form's one launch, dQ by atomic adds, D the forward's anchored one
+    dQ too (`fused`: the fast form's one launch, dQ by atomic adds, D the forward's anchored one
     unrefined)."""
 
     program: _Program[BackwardTiles]
@@ -89,14 +89,16 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
 
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords: algebra.Coords, whole,
                  shape: tuple[int, int], *, masked: bool | None) -> tuple[jax.Array, jax.Array]:
-    """A queries-first step's tile of a hookless fast-form call (`_fused_step`'s, `_coop_step`'s): its
+    """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
+    (`_fused_step`'s, `_coop_step`'s): its
     logits from the query slot taken by its power in registers (`_Backward.scaled`) against the resident
     keys (`resident`, `[bk, D]` and `[bk, Dv]` refs, a consumer's share of them where keys are shared), dP
     from the output-cotangent slot against the values, then `_scores` under the tile's queries' statistics
     `rows` (read before its products, which their loads run under: ET-A05AB5/6-h100, 2.05 against 2.32 ms
     read past them at Qwen3-8B causal) and `coords`, masked where `masked`, or where it is None chosen at run
     time, unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
-    (`algebra.value_weights`) and its score cotangents' one part in the operands' dtype (dK's and dQ's)."""
+    (`algebra.value_weights`) and its score cotangents through the hook (`gradient.pulled`), one part in the
+    operands' dtype (dK's and dQ's)."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held = keys.transpose((1, 0))
@@ -106,8 +108,9 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
 
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
-        exponentials, weights, cotangents, _, _ = _scores(walk, coords, (), s, dp, *rows, masked=masked)
-        return exponentials, weights, cotangents
+        exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, (), s, dp, *rows,
+                                                                  masked=masked)
+        return exponentials, weights, gradient.pulled(cotangents, slopes, seen, ())[0]
 
     if masked is None:
         exponentials, weights, cotangents = lax.cond(whole, functools.partial(scores, masked=False),

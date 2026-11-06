@@ -1,6 +1,6 @@
 """The attention template's Mosaic GPU fused backward queries first (`attention_mosaic_backward`): the fast
-form's one launch of a hookless call, each consumer's keys resident over the query tiles that read them, its
-dK and dV, and each tile's dQ added into dQ."""
+form's one launch of a call whose score hook takes no parameters, each consumer's keys resident over the
+query tiles that read them, its dK and dV, and each tile's dQ added into dQ."""
 
 import functools
 from collections.abc import Callable
@@ -99,8 +99,8 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
 
 def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,
                 carry, accumulators, *, masked: bool | None = None):
-    """A fused dK/dV consumer's query tile `index`, queries first (`[bq, bk]`, the hookless fast form's
-    one launch): its scores and score cotangents from the query and output cotangent slots (`slots`) and its
+    """A fused dK/dV consumer's query tile `index`, queries first (`[bq, bk]`, the fast form's one
+    launch): its scores and score cotangents from the query and output cotangent slots (`slots`) and its
     resident keys and values (`resident`), under the tile's queries' statistics (`rows_of(slots, first
     query)`, their slots' where streamed) and
     coordinates (`coords_of(first query)`), a tile every query sees whole (`whole(index)`) unmasked, or
@@ -175,7 +175,8 @@ def _turns(family: mosaic.Family, interpret: bool, dq_tiles: tuple, dkv_tiles: t
 @tuning.lowered_once(("walk",))
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None, *,
                   walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """The fast form's one launch of a hookless call (`BackwardTiles.fused`), on the dQ launch's layout:
+    """The fast form's one launch of a call whose score hook, if any, takes no parameters
+    (`BackwardTiles.fused`), on the dQ launch's layout:
     each consumer's `block_k` keys of a query head resident, walked by the query tiles that see them,
     streamed with their output cotangents through a ring each, queries first (`_fused_step`), under the
     first pass's D and the forward's denominator (each query tile's streamed beside it, `STATISTICS`), each
