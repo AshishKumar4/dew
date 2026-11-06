@@ -374,15 +374,18 @@ def contents(name: str) -> bytes:
 
 def probed(path: Path) -> bytes:
     """What an existence or size probe (followed.py's `PROBES`) answers of `path`: missing, a directory, or a
-    file with its size and whether it executes, the stat a probe reads beside its kind. Its bytes are none
-    of it: a file's edit of the same size reruns no prober, which reads it only by opening it, its own input;
-    its times are no checkout's to keep (train 668: a helper's comment edit re-keyed its 458 probers)."""
+    file with whether it executes and, but for a Python module, its size, the stat a probe reads beside its
+    kind. Its bytes are none of it: a file's edit of the same size reruns no prober, which reads it only by
+    opening it, its own input; its times are no checkout's to keep. A module's size is what its comments
+    make it, and its code is the input of whatever runs it (`code_unit`): `inspect.getsourcefile` probes
+    each module it names (train 668: a helper's comment edit re-keyed its 458 probers)."""
     if path.is_dir():
         return b"directory"
     if not path.is_file():
         return b"missing"
     stat = path.stat()
-    return f"file {stat.st_size} {int(bool(stat.st_mode & 0o111))}".encode()
+    size = "" if path.suffix == ".py" else f" {stat.st_size}"
+    return f"file{size} {int(bool(stat.st_mode & 0o111))}".encode()
 
 
 def looked_up(looked: Path) -> bytes:
