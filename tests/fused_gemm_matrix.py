@@ -158,7 +158,15 @@ def supported(case: dict[str, str]) -> bool:
     return found.refused is None and fused and found.launch is not None and found.launch.kernel != "xla"
 
 
-CASES = ()
+CASES = (
+    ('sm90', 'epilogue', 'bias-cast', 'bfloat16'),
+    ('sm90', 'prologue', 'silu-residual', 'float16'),
+    ('sm80', 'both', 'bias-cast', 'float16'),
+    ('sm80', 'epilogue', 'silu-residual', 'bfloat16'),
+    ('sm90', 'both', 'silu-residual', 'bfloat16'),
+    ('sm80', 'prologue', 'bias-cast', 'bfloat16'),
+    ('sm90', 'epilogue', 'bias-cast', 'float16'),
+)
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("fused_gemm")`, regenerated where the axes or the route's support change)."""
 
