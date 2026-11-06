@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- FlashAttention's wrapper, `dew-flash-attn` 0.3.8, lowers its call for the GPU a host states (`targeting`), so a
+  host with no GPU, the CPU lock's `kernel-compile` extra with the CUDA runtime its library loads, compiles a
+  step ahead as the GPU's program with FlashAttention's kernel in it.
 - A distillation under a host layout (`Layout(host=("variables",))`) keeps its frozen teacher as it keeps
   a frozen stack: each scanned run of the teacher's layers, its frozen split's beside its params, is one
   bank beside the accelerator, which the teacher's forward reads a layer at a time, where the whole
