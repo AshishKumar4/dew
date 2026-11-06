@@ -90,9 +90,10 @@ def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind):
     """A kind's run saved at an earlier main rebuilds from its record, in the compute it recorded, and,
-    where its objective declares a saved task, pins its last checkpoint and loads as that task, which
-    answers a request; an objective that declares none (a JEPA encoder's) records no inference
-    declaration."""
+    where its objective declares a saved task and the run recorded the declaration, pins its last
+    checkpoint and loads as that task, which answers a request. The corpus's JEPA runs, each saved
+    before a JEPA encoder had a release (row 4313, `dew.inference.models.SavedModel`), recorded none,
+    and pinning one is refused for that."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
     seen = evidence(recorded, kind)
@@ -107,11 +108,14 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
         declared = checkpoints.artifact(last) is not None
-    assert declared == (task is not None)
-    if task is not None:
+    assert declared == (task is not None and kind != "jepa")
+    if declared:
         saved = SavedRun.pinned(str(run))
         assert saved.step == last
         answered(task.from_run(str(run)))
+    elif task is not None:
+        with pytest.raises(ValueError, match="declares no inference record"):
+            SavedRun.pinned(str(run))
 
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
