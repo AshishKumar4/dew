@@ -199,11 +199,19 @@ def recorded() -> tuple[Path, str, int]:
 
 
 @functools.cache
+def laid_out_release() -> tempfile.TemporaryDirectory:
+    """The joint head beside its Qwen 3.5 backbone (`released`), laid out once for the process: a load
+    reads its processor's files as it first lays out images."""
+    held = tempfile.TemporaryDirectory()
+    released("joint", Path(held.name) / "release")
+    return held
+
+
+@functools.cache
 def release(dtype: str) -> PretrainedDecision:
-    """The joint head beside its Qwen 3.5 backbone (`released`), loaded once for each dtype."""
-    with tempfile.TemporaryDirectory() as directory:
-        return Pretrained.load(released("joint", Path(directory) / "release"), dtype=dtype, param_dtype=dtype,
-                               attention_impl="xla")
+    """The joint release (`laid_out_release`), loaded once for each dtype."""
+    return Pretrained.load(Path(laid_out_release().name) / "release", dtype=dtype, param_dtype=dtype,
+                           attention_impl="xla")
 
 
 @functools.cache
