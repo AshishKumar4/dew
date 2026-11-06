@@ -1485,8 +1485,10 @@ class CausalSelfAttention(nn.Module):
         """Whether a decode step's query `[rows, heads, head_dim]` reads the paged pool `store` through
         its device's paged kernel (`KVStore.decode`), as the paged selector chooses it (`PAGED`), rather
         than the gathered rows through the layer's attention; a compact cache keeps no pages. A
-        `windowed` step reads each row from its window's first key; a `sunk` one has sinks."""
-        if store.layout.page_size is None:
+        `windowed` step reads each row from its window's first key; a `sunk` one has sinks. A compact
+        quantized cache's codes read as they lie where the template's decode takes them
+        (`template_quantized`), no dequantized copy of the cache a step."""
+        if store.layout.page_size is None and store.layout.quantized is None:
             return False
         case = store.case(query, value_dim=self.value_dim, softcap=self.ctx.attn_logit_softcap,
                           arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,

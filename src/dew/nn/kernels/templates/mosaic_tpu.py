@@ -339,12 +339,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def load_barriers(self, count: int):
         return pltpu.SemaphoreType.DMA((count,))
 
-    def staging(self, name: str, shaped) -> dict:
-        # Each operand a tile reads whole, staged in VMEM for its one role (the GPU's up to two roles'
-        # shape kept, so a template indexes it alike), its copy's DMA semaphores.
-        shaped = list(shaped)
-        return {f'{name}_smems': [pltpu.VMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
-                f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
+    def staged_memory(self, shape: tuple[int, ...], dtype):
+        # Its one role's staging in VMEM (`staging` keeps the GPU's up to two roles' shape, so a template
+        # indexes it alike), its copies' DMA semaphores its `load_barriers`.
+        return pltpu.VMEM(shape, dtype)
 
     def meeting(self, consumers: int):
         _one(consumers)
