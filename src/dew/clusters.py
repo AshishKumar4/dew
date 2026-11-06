@@ -227,29 +227,31 @@ def _gke_workers(environ: Mapping[str, str]) -> str | None:
 @dataclasses.dataclass(frozen=True)
 class CloudTPU:
     """A Cloud TPU's workers, which JAX's detection places whole, multislice ranks among them: on GKE a TPU
-    VM whose worker list the environment states (`GkeTpuCluster`), else on GCE one whose metadata server JAX
-    asks, TPU_SKIP_MDS_QUERY unset (`GceTpuCluster`). Its place is JAX's to read as it joins (its metadata,
-    its slices): Dew decides nothing by it before, so it states none, and `dew launch` runs every worker's
-    program in place."""
+    VM whose worker list the environment states, joined by name (`GkeTpuCluster`); any other TPU VM,
+    TPU_SKIP_MDS_QUERY unset, by JAX's own order of detections, which asks GCE's metadata server and, where
+    it names no worker, goes on to the next (a Kubernetes Job's), so Dew asks no server itself. Its place is
+    JAX's to read as it joins: Dew decides nothing by it before, so it states none, and `dew launch` runs
+    every worker's program in place."""
 
     environ: Mapping[str, str] | None = None
     name = "tpu"
 
     @functools.cached_property
     def _kind(self) -> str | None:
-        """JAX's detection of it: "gketpu", "gcetpu", or None where it runs on neither."""
+        """JAX's detection of it: "gketpu" by name, "" for JAX's own order to find (GCE's metadata, then the
+        rest), or None where it runs on no TPU VM JAX would join so."""
         environ = _environ(self.environ)
         if not _in_cloud_tpu_vm(environ):
             return None
         if _gke_workers(environ) is not None:
             return "gketpu"
-        return None if "TPU_SKIP_MDS_QUERY" in environ else "gcetpu"
+        return None if "TPU_SKIP_MDS_QUERY" in environ else ""
 
     def detected(self) -> bool:
         return self._kind is not None
 
     def joining(self) -> Joining:
-        return Joining(detection=self._kind)
+        return Joining(detection=self._kind or None)
 
     def place(self) -> Joining:
         return Joining()
