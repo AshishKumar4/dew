@@ -53,7 +53,8 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
     """A mamba mixer reads no tree (it would run the tokens as a chain), and an n-gram lookup reads the
     call's tokens in their order, so each model refuses a tree call; a tree outside a cached call,
     without the key runs that mask its attention, of another length than the call's tokens, with a parent
-    not before its child, or branching without its tokens' positions is refused."""
+    not before its child, or branching without its tokens' positions (coordinates of validity alone
+    stating none) is refused."""
     from dew.nn.engram import Engram
     from dew.nn.hyper_connections import HyperConnections
 
@@ -78,7 +79,10 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
             {"attention_tree": (-1, 0, 0), "rotary_positions": placed},
             {**tree, "attention_tree": (-1, 0)},
             {**tree, "attention_tree": (-1, 2, 0)},
-            {"attention_tree": (-1, 0, 0), "attention_key_runs": runs}]
+            {"attention_tree": (-1, 0, 0), "attention_key_runs": runs},
+            # Coordinates of validity alone state no position.
+            {"attention_tree": (-1, 0, 0), "attention_key_runs": runs,
+             "attention_mask": jnp.ones((2, BLOCK))}]
         for options in refused:
             with pytest.raises(ValueError):
                 model.apply(cache, block, mutable=["cache"], **{"decode": True, **options})
@@ -127,27 +131,29 @@ def tree_runs(rows: int, prompt: int, tree: tuple[int, ...]) -> jax.Array:
     return jnp.broadcast_to(jnp.asarray(runs)[None], (rows, *runs.shape))
 
 
-def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone():
+@pytest.mark.parametrize("tree", [TREE, (-1,)], ids=["branching", "one-token"])
+def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone(tree):
     """A gated delta net's tree call (`dew.nn.linear.tree_conv`, `tree_rule`) beside attention's, each
     token at its depth's position: each token's logits are on par with its root-to-token path decoded as
     a plain cached call from the same cache, from the float64 run's (check 1), its conv over its
-    ancestors and past the root the cache's history, its recurrence from its parent's state."""
+    ancestors and past the root the cache's history, its recurrence from its parent's state; a one-token
+    tree too, which takes the tree's path where a step would take a single token's."""
     model = hybrid_model()
     wide = float64_twin(model)
     rows = 2
 
     def draw(seed):
         key = jax.random.fold_in(jax.random.key(4527), seed)
-        ids = jax.random.randint(key, (rows, PROMPT + len(TREE)), 0, VOCAB)
+        ids = jax.random.randint(key, (rows, PROMPT + len(tree)), 0, VOCAB)
         params = nn.unbox(model.init(jax.random.fold_in(jax.random.key(1), seed), ids))
         return params, ids[:, :PROMPT], ids[:, PROMPT:]
 
     @jax.jit
     def tree_logits(params, prompt, block):
         cache = cached(model, params, prompt)
-        placed = jnp.broadcast_to(PROMPT + jnp.asarray(depths(TREE)), (rows, len(TREE)))
+        placed = jnp.broadcast_to(PROMPT + jnp.asarray(depths(tree)), (rows, len(tree)))
         logits, _ = model.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
-                                attention_tree=TREE, attention_key_runs=tree_runs(rows, PROMPT, TREE),
+                                attention_tree=tree, attention_key_runs=tree_runs(rows, PROMPT, tree),
                                 rotary_positions=placed)
         return logits
 
@@ -156,7 +162,7 @@ def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone():
         def each_path(params, prompt, block):
             cache = cached(decoder, params, prompt)
             ends = []
-            for path in paths(TREE):
+            for path in paths(tree):
                 logits, _ = decoder.apply({**params, "cache": cache}, block[:, jnp.asarray(path)],
                                           decode=True, mutable=["cache"])
                 ends.append(logits[:, -1])

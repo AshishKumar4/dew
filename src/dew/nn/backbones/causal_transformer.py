@@ -1711,8 +1711,9 @@ class CausalTransformer(LinearProducts):
                              "visibility; pass one")
         if tree is not None:  # N-gram hashes and routing blocks read the tokens in their order.
             routed = self.mixture is not None and self.mixture.routing_block is not None
+            positions = None if coordinates is None else coordinates.positions
             check_tree(tree, tokens.shape[1], decode=decode, ordered=self.engram is not None or routed,
-                       positioned=coordinates is not None or rotary_positions is not None)
+                       positioned=positions is not None or rotary_positions is not None)
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
         if decode and coordinates is not None and coordinates.max_segments > 1:

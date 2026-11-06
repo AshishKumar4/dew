@@ -1006,7 +1006,9 @@ class GatedDeltaNet(nn.Module):
         key_dim = self.key_features
         operand = mixed.dtype
         token, stepped = None, False
-        if decode and S == 1:
+        tree = None if attention_metadata is None else attention_metadata.tree_parents
+        # A one-token tree takes the tree's path (`_tree`), whose output the common norm reads.
+        if decode and S == 1 and tree is None:
             kernel = self._decode_kernel(x, operand)
             token = self._fused_token(z, b, a, valid) if kernel == 'fused' else None
             stepped = kernel == 'step'
@@ -1062,7 +1064,6 @@ class GatedDeltaNet(nn.Module):
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
-        tree = None if attention_metadata is None else attention_metadata.tree_parents
         if tree is None and attention_metadata is not None and attention_metadata.key_runs is not None:
             raise ValueError("a gated delta net reads key runs only as a tree call's attention mask, and "
                              "would run them as if unset")
