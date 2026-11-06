@@ -21,8 +21,8 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import recorded_site
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, assert_rounds_where_the_reference_does, ieee_fixture
+from reference_runs import assert_as_exact_as_recorded
 from tool_support import run_from
 
 from dew.nn.mimo_audio import (
@@ -51,12 +51,31 @@ def load():
     return towers.from_record(record), translate_mimo_audio_weights(tokenizer, encoder), refs
 
 
+MEL = FIXTURE / "mel.npz"
+"""tools/venv_reference.py's `mimo-mel` recording (tools/torchaudio_mel_worker.py)."""
+MEL_SEEDS = 8
+"""Its declared seeds, sized by `seeds_for` paired as the recording confirmed them."""
+
+
+def mel_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's half second of waveform at 24 kHz."""
+    return {"waveform": (np.random.default_rng([59, seed]).standard_normal(12000) * 0.3).astype(np.float32)}
+
+
+def mel_frames(dtype, inputs) -> dict:
+    """MiMo's log mel frames of a draw's waveform at `dtype` (`MiMoAudioTokenizer.mel`), on the host."""
+    return {"mel": MiMoAudioTokenizer().mel()(inputs["waveform"], np.dtype(dtype))}
+
+
+def pipeline_arms(_):
+    """tools/venv_reference.py's `mimo-mel` site: its recording, draw, Dew run and leaf."""
+    return MEL, mel_draw, mel_frames, ("mel",)
+
+
 def test_log_mel_frames_are_as_exact_as_torchaudio():
-    """MiMo's 24 kHz, 128-mel frames of half a second from transformers' shared STFT and filters."""
-    refs = ieee_fixture(FIXTURE / "mel.npz")
-    frames = MiMoAudioTokenizer().mel()(refs["waveform"])
-    assert frames.shape == refs["mel"].shape
-    assert_as_exact_as_the_reference(frames, refs["mel"], refs["mel_f64"], "log mel")
+    """MiMo's 24 kHz, 128-mel frames of half a second from transformers' shared STFT and filters, on par
+    with torchaudio's MelSpectrogram over drawn waveforms (check 1)."""
+    assert_as_exact_as_recorded(MEL, "mimo-mel", MEL_SEEDS, mel_draw, mel_frames, "log mel", host=True)
 
 
 RECORDING = FIXTURE / "recording.npz"

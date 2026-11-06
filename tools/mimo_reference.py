@@ -1,9 +1,8 @@
 """MiMo-V2.6's vision tower and audio path at a tiny scale, run by their references.
 
 The fixtures tests/test_vision.py and tests/test_mimo_audio.py hold Dew to. The reference is
-XiaomiMiMo/MiMo-V2.6-Pro-MOPD's `modeling_mimo_v2.py`, fetched at `MIMO_REVISION` (`mimo_module`),
-except the log mel frames, which are torchaudio's at MiMo-Audio-Tokenizer's `mel_spectrogram` settings.
-Each array file stores fp32 and float64 references, IEEE products.
+XiaomiMiMo/MiMo-V2.6-Pro-MOPD's `modeling_mimo_v2.py`, fetched at `MIMO_REVISION` (`mimo_module`); the
+log mel frames are torchaudio's, recorded by tools/torchaudio_mel_worker.py. Each array file stores fp32 and float64 references, IEEE products.
 
 - `mimo-vision-tiny`: the reference config, the ViT's and merger's tensors as the release names them,
   packed pixels with each row's grid, and `refs.npz`: the trunk (the merger's input) and the merger's
@@ -12,14 +11,11 @@ Each array file stores fp32 and float64 references, IEEE products.
   tokenize_audio_batch) and the audio encoder (MiMoAudioEncoder over the codes), with scattered
   weights: the inputs, the pooled features, the codes and the embeddings, once in the reference's one
   batch and once with its batches bounded at 30 frames, its own grouping run under that bound.
-- `mimo-audio-tiny/mel.npz` (`--mel`): torchaudio stops at torch 2.11, so this part runs in an
-  environment of torch 2.11 and torchaudio 2.11, the transform built in the dtype it computes in.
 - `mimo-vision-tiny/recording.npz` (`--record-vision`): the fixture's tower and merger over drawn pixels
   (`vision_draw`) and drawn trunk features (`merger_draw`), their evidence and float64 truths' sketches
   recorded over seeds for check 1 (`recorded_references.record_case`, summarized).
 
     python tools/mimo_reference.py
-    <torch 2.11 + torchaudio python> tools/mimo_reference.py --mel
     PYTHONPATH=src:tests python tools/mimo_reference.py --record-vision
     PYTHONPATH=src:tests python tools/mimo_reference.py --record-audio
 
@@ -343,27 +339,6 @@ def record_mimo_audio() -> None:
     print(f"{written}: {sorted(arrays)}")
 
 
-def write_mel() -> None:
-    """torchaudio's mel frames of a fixed half second at MiMo's settings, fp32 and float64."""
-    from torchaudio.transforms import MelSpectrogram
-
-    waveform = np.random.RandomState(5).randn(12000).astype(np.float32) * 0.3
-
-    from torch_precision import default_dtype
-
-    def mel(dtype):
-        # The filters and the window are built in the default dtype, so float64's are built in float64.
-        with default_dtype(dtype):
-            transform = MelSpectrogram(sample_rate=24000, n_fft=960, hop_length=240, win_length=960, f_min=0,
-                                       f_max=None, n_mels=128, power=1.0, center=True)
-        spec = transform(torch.from_numpy(waveform).to(dtype)[None, :])
-        return torch.log(torch.clip(spec, min=1e-7)).squeeze(0).T.numpy()
-
-    AUDIO_FIXTURE.mkdir(parents=True, exist_ok=True)
-    np.savez(AUDIO_FIXTURE / "mel.npz", precision="ieee", waveform=waveform, mel=mel(torch.float32),
-             mel_f64=mel(torch.float64))
-
-
 def audio_modules(modeling):
     """The release's tokenizer encoder, audio encoder and speech embeddings at the fixture's sizes."""
     tokenizer = modeling.AudioTokenizerEncoder(modeling.MiMoAudioTokenizerConfig(**TOKENIZER)).eval()
@@ -516,7 +491,6 @@ def record_mimo_images() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mel", action="store_true", help="write mimo-audio-tiny/mel.npz, under torchaudio")
     parser.add_argument("--record-vision", action="store_true",
                         help="record mimo-vision-tiny's tower and merger over seeds")
     parser.add_argument("--record-audio", action="store_true",
@@ -529,9 +503,6 @@ def main() -> None:
         return
     if arguments.record_audio:
         record_mimo_audio()
-        return
-    if arguments.mel:
-        write_mel()
         return
     if arguments.record_vision:
         record_mimo_vision()
