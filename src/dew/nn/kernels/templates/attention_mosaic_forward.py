@@ -939,8 +939,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     def dot(lhs, rhs):
         if isinstance(rhs, operands.Parts):
-            fresh = family.zeros((lhs.shape[0], rhs.shape[1]))
-            return _parted_products(family, fresh, None, lhs, rhs, interpret)
+            # Into a fresh accumulator of the family's (`Family.summed`: wgmma's a scoped ref).
+            return family.summed((lhs.shape[0], rhs.shape[1]),
+                                 lambda acc: _parted_products(family, acc, None, lhs, rhs, interpret), interpret)
         return family.registers_product(lhs, rhs, interpret)
 
     def step(index, slots, carry, accumulators):
