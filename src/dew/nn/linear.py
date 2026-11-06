@@ -44,6 +44,7 @@ from dew.batch import Coordinates, document_ranks, prefix_sum, valid_order
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
+from dew.nn.kernels.templates import scan
 
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
@@ -764,20 +765,31 @@ class DecodeCase:
     fuses: bool
 
 
+def _template_runs() -> bool:
+    """Whether a Mosaic GPU bundle claims the device the token runs on (`mainloop.family_of`)."""
+    from dew.nn.kernels.templates.recurrence import mainloop
+
+    return mainloop.family_of(jnp.float32) is not None
+
+
 _LAUNCH: tuple[Requirement[DecodeCase], ...] = (
-    Requirement('capability', lambda case: triton_runs(), "the launch needs a GPU of sm80 or later",
-                row=INHERENT),
+    Requirement('capability', lambda case: _template_runs(),
+                "the launch needs a GPU a Mosaic GPU bundle claims (`mainloop.family_of`)", row=INHERENT),
     Requirement('precision', lambda case: case.dtype in (jnp.float32, jnp.bfloat16),
                 lambda case: f"the launch holds a state in fp32 or bf16 and computes in fp32, not "
                              f"{case.dtype} (a float64 state keeps its own precision in `step_reference`)",
                 row=INHERENT),
-    Requirement('widths', lambda case: all(width > 0 and width & (width - 1) == 0
-                                           for width in case.shape[-2:]),
-                lambda case: "the launch's blocks take power-of-two widths, not {} by {}".format(
-                    *case.shape[-2:]), row='roadmap: recurrence step widths'),
+    Requirement('widths', lambda case: all(width > 0 and width % scan.THREADS == 0
+                                           for width in case.shape[-2:])
+                and not (case.fuses and case.shape[-1] != scan.THREADS),
+                lambda case: "the launch's threads take a value column each of a warpgroup's blocks and the "
+                             "key vectors a warpgroup wide (a fused step's values a block a head), not {} by "
+                             "{}".format(*case.shape[-2:]), row='roadmap: recurrence step widths'),
 )
-"""What the decode launches need of a token's state, the fused step and the step alike: a GPU Dew's Triton
-kernels run on, a state in fp32 or bf16, and power-of-two widths (Triton's blocks)."""
+"""What the decode launches need of a token's state, the fused step and the step alike, the recurrence
+template's decode step (`templates.recurrence.step`): a GPU a Mosaic GPU bundle claims, a state in fp32 or
+bf16, and widths of whole warpgroups (a thread a value column; the fused step's values one block a head, as
+its conv's history and its gated norm read a head whole)."""
 
 
 DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
@@ -790,7 +802,7 @@ DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
     named_from={('gated_delta_rule', 'xla'): 'xla'})
 """The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s), by what each
 kernel takes (no table of GPUs): the step (`recurrence.step` alone, `decode_gated_delta_rule`) between a
-caller's own conv and norm on any GPU Dew's Triton kernels run on, its preference (the fused step won at
+caller's own conv and norm on any GPU the template's step runs on, its preference (the fused step won at
 one row alone, 0.157 ms against 0.165 on an H100, and lost at 32 and 128 rows, SE-decode-h100-d5e0ebadb),
 or the portable recurrence where a caller names the rule's math (`generation.chosen`), so a reference
 decodes unfused;
