@@ -489,7 +489,7 @@ def entered_scan(mixed, taps, bias, rule, coordinates: Coordinates, state_shape:
     root = jnp.take_along_axis(root_slot, jnp.maximum(entered.entered - 1, 0), axis=1) + 1
     entering = jnp.zeros((batch, slots), jnp.int32).at[rows, jnp.where(branched, branch_slot, slots)].set(
         jnp.where(branched, root, 0), mode="drop")
-    second, _ = rule(convolved, valid=branches, starts=begins & branches, state=finals, entered=entering)
+    second, _ = rule(convolved, valid=branches, starts=begins & branches, state=jax.lax.stop_gradient(finals), entered=entering)
     out = jnp.where(roots[:, :, *([None] * (first.ndim - 2))], first, second)
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
