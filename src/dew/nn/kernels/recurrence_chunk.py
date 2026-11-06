@@ -564,7 +564,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
     if hooks.l2norm:
-        query, key = (l2norm(x.astype(work)) for x in (query, key))
+        # Normalized in fp32 and rounded once to their own dtype, as fla's in-kernel norm and the layers'
+        # conv hand them to a kernel: kept fp32, a bf16 call reached the template as an fp32 one, its final
+        # memory 30 to 41 times fla's distance from float64 in two parts (row 184's GDN cell, acb1301632c).
+        query, key = (l2norm(x.astype(work)).astype(x.dtype) for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
     g, beta = recurrence.log_gates(hooks, given, work)
     g = jnp.zeros(value.shape[:3], work) if g is None else g
