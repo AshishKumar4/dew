@@ -9,6 +9,12 @@ lowers, which is when a choice acts.
 
     {"builder": "tools/timing_cases.py:dense", "cells": [{"shape": "llama-3-8b qkv", "product": "forward"}],
      "arms": [{"name": "xla", "implementation": "xla"}, {"name": "mosaic", "implementation": "mosaic_gpu"}]}
+
+`fused`: a SwiGLU projection's two products with their biases and gating, through the program Dew compiles,
+the algebra pass's fusion on ("pass") or off ("nopass").
+
+    {"builder": "tools/timing_cases.py:fused", "cells": [{"shape": "qwen3.5-4b up"}],
+     "arms": [{"name": "pass", "implementation": "pass"}, {"name": "nopass", "implementation": "nopass"}]}
 """
 import jax
 import jax.numpy as jnp
@@ -64,3 +70,35 @@ def dense(cell: dict, implementation: str) -> tuple:
     with chosen:
         compiled = jax.jit(_products(implementation)[cell["product"]]).lower(x, w, dy).compile()
     return compiled, lambda index: (x, w, dy)
+
+
+def fused(cell: dict, implementation: str) -> tuple:
+    """A SwiGLU projection at `cell`'s shape (`cell["shape"]`, `DENSE`: each of its gate and up products),
+    each product with its bias, silu(x @ W_gate + b_gate) * (x @ W_up + b_up), compiled as Dew compiles a
+    program (`dew.nn.kernels.options.program`) under the GEMM template's launch (grouped_matmul
+    "mosaic_gpu"), the algebra pass on (`implementation` "pass": each product fused with its consumers where
+    the template takes them, `dew.algebra.fusion`) or off ("nopass"), and its one draw of inputs (seed 0).
+    The pass acts as the program traces, so every call holds its switch."""
+    from dew.algebra.program import passes
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.options import program
+
+    width_in, width_out = DENSE[cell["shape"]]
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.normal(size=(TOKENS, width_in)), jnp.bfloat16)
+    weights = [jnp.asarray(rng.normal(size=(width_in, width_out)) / np.sqrt(width_in), jnp.bfloat16)
+               for _ in range(2)]
+    biases = [jnp.asarray(rng.normal(size=(width_out,)), jnp.bfloat16) for _ in range(2)]
+    inputs = (x, weights[0], biases[0], weights[1], biases[1])
+
+    def swiglu(x, w_gate, b_gate, w_up, b_up):
+        return jax.nn.silu(jnp.dot(x, w_gate) + b_gate) * (jnp.dot(x, w_up) + b_up)
+
+    compiled = program(swiglu)
+
+    def call(*arguments):
+        with passes(on=implementation == "pass"), generation.chosen(grouped_matmul="mosaic_gpu"):
+            return compiled(*arguments)
+
+    jax.block_until_ready(call(*inputs))
+    return call, lambda index: inputs
