@@ -40,6 +40,7 @@ from unittest.mock import patch
 import numpy as np
 import requests
 import torch
+from recorded_references import token_ids
 
 # CUDA torch must load before the pinned transformers environment's CPU
 # torch can appear on sys.path. The same kernel then serves both references.
@@ -135,10 +136,8 @@ def author_weight(stored: dict[str, torch.Tensor], stem: str) -> torch.Tensor:
                                double_scale=stored[stem + ".weight_scale_2"], block_sizes={-1: 16})
 
 
-def draw(seed: int) -> dict[str, np.ndarray]:
-    """A seed's two rows of eight token ids below the tiny model's 96 (the test draws them again)."""
-    return {"ids": np.random.default_rng([2049, seed]).integers(0, 96, (2, 8)).astype(np.int32)}
-
+draw = token_ids(2049, 96, (2, 8))
+"""A seed's two rows of eight token ids below the tiny model's 96 (the test draws them again)."""
 
 def recorded_logits(reference, wide) -> dict[str, np.ndarray]:
     """The reference's logits and its float64 twin's (`wide`) over check 1's seeds of `draw`

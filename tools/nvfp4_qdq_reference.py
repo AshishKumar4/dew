@@ -30,6 +30,7 @@ from compressed_tensors.quantization.lifecycle.forward import forward_quantize
 from compressed_tensors.quantization.utils.helpers import generate_gparam
 from compressed_tensors_mxfp4_reference import TIES
 from nvfp4_storage_reference import ARGS, compress
+from recorded_references import token_ids
 from safetensors.torch import save_file
 from torch_precision import float64, float64_twin
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
@@ -37,10 +38,8 @@ from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "nvfp4_qdq"
 
 
-def draw(seed: int) -> dict[str, np.ndarray]:
-    """A seed's two rows of twelve token ids below the tiny model's 96 (the test draws them again)."""
-    return {"ids": np.random.default_rng([2038, seed]).integers(0, 96, (2, 12)).astype(np.int32)}
-
+draw = token_ids(2038, 96, (1, 12))
+"""A seed's a row of twelve token ids below the tiny model's 96 (the test draws them again)."""
 
 def recorded_logits(model, exact, directory: Path) -> dict[str, np.ndarray]:
     """The float32 read's logits (`model`) and its float64 twin's (`exact`) over check 1's seeds of `draw`

@@ -35,6 +35,7 @@ from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
 from compressed_tensors.quantization.lifecycle.forward import dequantize, set_forward_quantized
 from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
+from recorded_references import token_ids
 from safetensors.torch import save_file
 from torch_precision import float64, float64_twin
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
@@ -67,10 +68,8 @@ def compress(weight: torch.Tensor, scheme: QuantizationScheme, kind: str) -> dic
     return COMPRESSORS[kind].compress(state, scheme)
 
 
-def draw(seed: int) -> dict[str, np.ndarray]:
-    """A seed's two rows of six token ids below the tiny model's 48 (the test draws them again)."""
-    return {"ids": np.random.default_rng([2037, seed]).integers(0, 48, (2, 6)).astype(np.int32)}
-
+draw = token_ids(2037, 48, (2, 6))
+"""A seed's two rows of six token ids below the tiny model's 48 (the test draws them again)."""
 
 def checkpoint(kind: str) -> None:
     """Read the same files through transformers before recording logits or decoded weights."""
