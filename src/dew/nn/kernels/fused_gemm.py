@@ -80,6 +80,17 @@ def product(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None
     consumers, fused into the template's epilogue under `fuser.fuse`, read the product exactly as the
     program they came from does: the accumulator tile rounded to `out_dtype`, their first operation."""
     declared = (precision, jnp.dtype(lhs.dtype if out_dtype is None else out_dtype))
+    if not all(jnp.issubdtype(operand.dtype, jnp.inexact) for operand in (lhs, rhs)):
+        # An integer product (a quantized dot's) is XLA's own, nothing fused: the template sums floating
+        # products alone, so a region of one has no stage to analyse or price (`analysis`).
+        if group_sizes is None:
+            return jax.lax.dot_general(lhs, rhs, (((1,), (1 if transpose_rhs else 0,)), ((), ())),
+                                       precision=precision, preferred_element_type=declared[1])
+        matrices = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
+        return jax.lax.ragged_dot(lhs, matrices, group_sizes, precision=precision,
+                                  preferred_element_type=declared[1])
+    if (made := _FUSIBLES.get()) is not None:
+        made.append(declared)
     fusible = fuser.fusible(output_fusion_prefix=True)(
         functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None, declared))
     return fusible(lhs, rhs) if group_sizes is None else fusible(lhs, rhs, group_sizes)
@@ -89,8 +100,19 @@ def fused(region, *inputs):
     """`region(*inputs)`, a program's neighbourhood of one product written with `product` in place of its
     dot, its producer and consumers fused into the template's prologue and epilogue where the kernels take
     them tile by tile (`fuser.fuse`): the one entry a call site or a pass fuses a region through, so each
-    stage is its selector's decision and report (`EPILOGUE`, `PROLOGUE`)."""
-    return fuser.fuse(region)(*inputs)
+    stage is its selector's decision and report (`EPILOGUE`, `PROLOGUE`). A region whose products are all
+    XLA's own (integer ones) has nothing to fuse and runs as written."""
+    made: list = []
+    token = _FUSIBLES.set(made)
+    try:
+        jax.eval_shape(region, *inputs)
+    finally:
+        _FUSIBLES.reset(token)
+    return fuser.fuse(region)(*inputs) if made else region(*inputs)
+
+
+_FUSIBLES: contextvars.ContextVar[list | None] = contextvars.ContextVar('fused_gemm_fusibles', default=None)
+"""The fusible products a region makes while `fused` traces it."""
 
 
 @dataclasses.dataclass(frozen=True)

@@ -1223,6 +1223,24 @@ def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     assert plain.fused_seconds is None and plain.unfused_seconds is None
 
 
+def test_an_integer_regions_product_is_xlas_own_dot_with_nothing_to_analyse():
+    """`fused_gemm.product` of int8 operands (a quantized dot's, int32 out) is XLA's own dot, nothing fused:
+    `fused_gemm.analysis` of its region reports no stage and no price, and `fused` gives XLA's value."""
+    keys = jax.random.split(jax.random.key(3))
+    x = jax.random.randint(keys[0], (64, 128), -8, 8).astype(jnp.int8)
+    w = jax.random.randint(keys[1], (128, 96), -8, 8).astype(jnp.int8)
+
+    def region(x, w):
+        return fused_gemm.product(x, w, out_dtype=jnp.int32) * 2
+
+    with generation.assumed("sm90"):
+        found = fused_gemm.analysis(region, x, w)
+        got = fused_gemm.fused(region, x, w)
+    assert found.epilogue is None and found.launch is None and found.fused_seconds is None, found
+    expected = jax.lax.dot_general(x, w, (((1,), (0,)), ((), ())), preferred_element_type=jnp.int32) * 2
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+
+
 @INTERPRETS
 def test_a_regions_analysis_reports_what_fusing_it_would_raise():
     """Where the call names a kernel that refuses the region (the template on mma.sync, whose model counts no
