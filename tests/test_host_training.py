@@ -28,7 +28,8 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio
+from dew.objectives.base import TEACHER, Aux, EMASpec, Objective, Ratio
+from dew.objectives.distillation import DistillationObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, Trainer
@@ -547,6 +548,55 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
     equal(prefix, restored)
     resumed = updated(objective(), batch, HOST, checkpoints=Checkpoints(str(tmp_path / "mixed")))
     equal(resumed, updated(objective(), batch, HOST, steps=2))
+
+
+class Watched(LMObjective):
+    """A teacher keeping, for each forward it traces, the memory each leaf of its variables is read from."""
+    reads: list
+
+    def predict(self, params, *args, **kwargs):
+        self.reads.append({tuple(entry.key for entry in path): jax.typeof(leaf).memory_space
+                           for path, leaf in jax.tree_util.tree_leaves_with_path(params)})
+        return super().predict(params, *args, **kwargs)
+
+
+def test_a_host_distillation_streams_its_frozen_teacher_as_its_student_is_streamed(tmp_path):
+    """A distilled run's frozen teacher, under a host layout, is held as a frozen stack is: its layers banked
+    beside the accelerator, which its forward reads from there a layer at a time (`run_stack`), the rest on
+    the device; whole on the device, it is the memory the layout was asked to spare (row 4405). The step is
+    the device layout's, its loss and the student's update (plain SGD's: its gradient) within the host
+    tests' bound, and the banked teacher saves and restores as it is held."""
+    def objective():
+        teacher = Watched(decoder(emb_features=12, num_layers=3, mlp_features=24), 8, head_chunks=1,
+                          ema_decay=None)
+        teacher.reads = []
+        return DistillationObjective(LMObjective(decoder(), 8, head_chunks=1, ema_decay=None), teacher)
+
+    def run(layout):
+        distilled = objective()
+        trainer = Trainer(distilled, optax.sgd(.1), key=jax.random.key(5), layout=layout)
+        state, _, _ = trainer.place()
+        state, loss, *_ = trainer.compile(state, tokens())(state, tokens())
+        return state, loss, distilled.teacher.reads[-1]
+
+    host, host_loss, read = run(HOST)
+    resident, resident_loss, _ = run(DEVICE)
+    layers = {keys: space for keys, space in read.items() if group_layers(keys[1])}
+    assert any(len(group_layers(keys[1])) > 1 for keys in layers)
+    assert set(layers.values()) == {jax.memory.Space.Host}
+    assert {space for keys, space in read.items() if keys not in layers} == {jax.memory.Space.Device}
+
+    teacher = host.variables[TEACHER]
+    np.testing.assert_allclose(np.asarray(host_loss), np.asarray(resident_loss), atol=STREAMED_BOUND, rtol=0)
+    close(dataclasses.replace(host, variables={
+        **host.variables, TEACHER: {**teacher, "params": unbanked(teacher["params"])}}), resident)
+
+    checkpoints = Checkpoints(str(tmp_path / "distilled"))
+    checkpoints.save(int(host.step), host, None)
+    checkpoints.wait()
+    restored, _, _ = Trainer(objective(), optax.sgd(.1), key=jax.random.key(5), layout=HOST,
+                             checkpoints=Checkpoints(str(tmp_path / "distilled"))).place()
+    equal(host, restored)
 
 
 def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_path):
