@@ -419,7 +419,7 @@ def _qwen35_name(dew_name: str, config: Mapping[str, object]) -> str | None:
     parts = dew_name.split('.')
     if parts[0] != 'mtp_0':
         return hf_tensor_name(dew_name, config)
-    own = {path: name for name, path in _QWEN_MTP_FIELDS.items()}
+    own: dict[tuple[str, ...], str] = {path: name for name, path in _QWEN_MTP_FIELDS.items()}
     if tuple(parts[1:]) in own:
         return f'mtp.{own[tuple(parts[1:])]}'
     if parts[1] != 'block':
