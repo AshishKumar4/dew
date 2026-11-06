@@ -90,3 +90,20 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
                               str(tmp_path / "refused")], cwd=repo, capture_output=True, text=True)
     assert refused.returncode != 0 and "on no remote branch: push it" in refused.stderr
     assert not (tmp_path / "refused").exists()
+
+
+def test_the_dense_cells_build_every_product_for_each_implementation_on_the_cpu():
+    """The dense builder's cells compile on the CPU through XLA's dot (a GPU's own launches are its window's), and
+    every product's draw meets its call."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("timing_cases", TIMING.with_name("timing_cases.py"))
+    cases = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cases)
+    cases.TOKENS = 16
+    cases.DENSE = {"tiny": (32, 48)}
+    shapes = {"forward": (16, 48), "input_gradient": (16, 32), "kernel_gradient": (32, 48)}
+    for product, shape in shapes.items():
+        call, draw = cases.dense({"shape": "tiny", "product": product}, "xla")
+        assert call(*draw(0)).shape == shape and draw(0) is not None
+
