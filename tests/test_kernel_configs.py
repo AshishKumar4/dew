@@ -770,16 +770,18 @@ def _projected(local: bool):
 @pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
 def test_a_routes_launches_run_per_shard_with_only_their_planned_collectives(local):
     """A dense projection's forward and backward through the GEMM template, its rows split over two
-    compile-only H100s and compiled for them: run per shard (`sharding.manual_map`), its forward and both
-    gradients launch, a forward launch reads its shard's rows, and the program sums by one all-reduce over
-    the rows' axis (the weight's gradient, the loss) and moves nothing (`kernel_compile.Expected`, its
-    route evidence). Left to the partitioner, the same evidence refuses the program (a null control): an
-    opaque launch's operands gathered to every device, or no program at all."""
+    compile-only H100s and compiled for them: run per shard (`sharding.manual_map`), both gradients launch
+    (the forward's product, which no gradient reads, is the program's to drop), each reading its shard's
+    rows (the cotangent's, the input's), and the program sums by one all-reduce over the rows' axis (the
+    weight's gradient) and moves nothing (`kernel_compile.Expected`, its route evidence). Left to the
+    partitioner, the same evidence refuses the program (a null control): an opaque launch's operands
+    gathered to every device, or no program at all."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
     expected = Expected(axes=(("data", 2),), specs=(PartitionSpec("data"), None),
                         launches=frozenset({"dew_gmm", "dew_tgmm"}),
-                        shards={"dew_gmm": (ROUTED_ROWS // 2, ROUTED_DEPTH)},
+                        shards={"dew_gmm": (ROUTED_ROWS // 2, ROUTED_WIDTH), "dew_tgmm": (ROUTED_ROWS // 2,
+                                                                                     ROUTED_DEPTH)},
                         collectives=frozenset({("all-reduce", frozenset({"data"}))}))
     cases = [support.KernelCase("projection", lambda: _projected(local), expected=expected)]
     found = compile_mosaic_kernels(cases, "sm90")
