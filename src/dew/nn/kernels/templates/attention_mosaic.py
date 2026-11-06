@@ -304,7 +304,7 @@ class MosaicForward(_Mainloop[Tiles]):
             case Kept.SPLIT:
                 if scales is not None:
                     raise NotImplementedError("a quantized cache's keys are read by inference alone")
-                return _trained_forward(query, key, value, spans, hooks, parts=self.parts, **form), None
+                return _trained_forward(query, key, value, spans, hooks, **form), None
             case Kept.NONE | Kept.OUTPUT:
                 # The inference walk, its rows beside the output where it keeps them.
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
@@ -330,7 +330,7 @@ class MosaicForward(_Mainloop[Tiles]):
         rewalks at its own tiles, which must hold (rows 2621, 2647)."""
         if not self._launch_legal(ba, config, target):
             return False
-        if config.natural_form or self._unrewalked(ba.arguments["query"]):
+        if config.natural_form or self._unrewalked(ba):
             return True
         relaunch = config.relaunch
         return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
@@ -467,7 +467,7 @@ class MosaicForward(_Mainloop[Tiles]):
         tiles it spilled 2 KB at width 64); a call that keeps its logits natural rewalks nothing. None where
         no tile holds the rewalk."""
         config = dataclasses.replace(config, relaunch_k=None, relaunch_consumers=None, relaunch_columns=None)
-        if self._unrewalked(ba.arguments["query"]):
+        if self._unrewalked(ba):
             return config
         query, value = ba.arguments["query"], ba.arguments["value"]
         family = bundle_of(config, query.dtype)
@@ -503,17 +503,21 @@ class MosaicForward(_Mainloop[Tiles]):
         power, scale = prescale(query.dtype, query.shape[3], self.scale)
         return not algebra.folds(scale, power, natural=self.natural, score_mod=self.score_mod)
 
-    def _unrewalked(self, query: jax.Array) -> bool:
-        """Whether the call of `query` walks no natural rewalk: its logits natural (`_natural`), or a fold no
-        logit's reach passes (`algebra.Forward.reaches`: a subtracted fold's raw products), at the scale its
-        launch takes (`attention_mosaic_forward._prepared`)."""
+    def _unrewalked(self, ba: tokamax.BoundArguments) -> bool:
+        """Whether the call walks no natural rewalk: its logits natural (`_natural`), or a fold no logit's
+        reach passes (`algebra.Forward.reaches`: an inference walk's subtracted fold of raw products, which a
+        training forward does not take: its natural rewalk at tiles derived for it, an fp32 call's parts'
+        at width 128 a block of the value columns, where the fold's whole width staged 280,672 bytes),
+        at the scale its launch takes (`attention_mosaic_forward._prepared`)."""
+        query = ba.arguments["query"]
         if self._natural(query):
             return True
         power, scale = prescale(query.dtype, query.shape[3], self.scale)
         taken = power if self.form != "spans" else 1.0
+        subtracted = self.subtracted and ba.arguments.get("residuals") is not Kept.SPLIT
         return not algebra.Forward(self.form, self.keys, ids=False, scale=scale * taken,
                                    score_mod=self.score_mod, natural=self.natural, prescale=power / taken,
-                                   subtracted=self.subtracted).reaches
+                                   subtracted=subtracted).reaches
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `resources.shared_bytes`), at the call's
@@ -571,9 +575,11 @@ class MosaicForward(_Mainloop[Tiles]):
                       tuple(map(Param, ba.arguments["output_params"], self.output_kinds)),
                       ba.arguments["drop"])
         if self.parts > 1 and (ba.arguments["table"] is not None or ba.arguments["sources"] is not None
-                               or hooks.drop is not None):
-            return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk a call over dense operands, no "
-                           "dropout")
+                               or ba.arguments["residuals"] is Kept.SPLIT or hooks.drop is not None):
+            # A training forward's natural rewalk of parts spills past its model (an H100's at 64 x 64, width
+            # 64: 48 bytes on two consumers, 24 on one): the Pallas-Triton mainloop's.
+            return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
+                           "operands, no dropout")
         if self.parts > 1 and (family.feeds_itself or not family.pieces_of_views):
             # Its parts a copy each into a slot's rows (`mosaic.Pieces`), which a producer's loads take and
             # neither a consumer's own ring nor cp.async's pipeline, whose pieces are a table's runs
@@ -675,6 +681,12 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         step += [weights]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
+        if family.operands_in_registers:
+            # Its values' block's fragments whole beside the step, where the family's products read
+            # registers: an A100's training walk at 64 x 128, width 64, loads the step's query, key and
+            # value blocks up front, their fragments live at once beside its logits (the liveness pass at
+            # its peak, census80b), ptxas 255 registers and 48 to 56 bytes spilled where the step priced 252.
+            step.append((block_k, value_width * family.rhs_copies, dtype))
     step += _mask_places(family, block_q, block_k)
     phases = [step]
     if natural:
