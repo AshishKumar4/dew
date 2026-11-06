@@ -34,6 +34,10 @@ ROWS, FEATURES, HIDDEN = (2, 128), 256, 384
 SEEDS = 8
 GATE_MULTIPLIER = 0.75
 """A scaled gate's multiplier (Falcon-H1's `mlp_multipliers`)."""
+CHOICES = frozenset({"gate_up", "grouped_matmul", "swiglu"})
+"""The `generation.CHOICES` entries the cells run (the module's docstring): each cell asserts that the routes
+it records lie in them and that it reaches the ones its case's layer runs (`_reached`), which together are
+all."""
 
 
 def _layer(case: dict[str, str]) -> GatedMLP:
@@ -62,6 +66,12 @@ def supported(case: dict[str, str]) -> bool:
     return [route.kernel for route in routes if route.choice == "gate_up"] == ["joined"]
 
 
+def _reached(case: dict[str, str]) -> frozenset[str]:
+    """The choices `case`'s layer reports: its join, its three products' launches, and the SwiGLU product's
+    where its activation is SwiGLU (another gated product has no selector)."""
+    return frozenset({"gate_up", "grouped_matmul", *(["swiglu"] if case["activation"] == "swiglu" else [])})
+
+
 CASES = (
     ('sm90', 'swiglu', 'none', 'plain', 'bfloat16'),
     ('sm90', 'geglu', 'bias', 'scaled', 'float16'),
@@ -83,11 +93,17 @@ CASES = (
 def a_gated_mlps_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The gated MLP's training step of `case` on its GPU with its gate and up projections joined on par with
     the projections apart (check 1): the output and the gradients of the input and every parameter, from the
-    layer with them apart in float64. Drawn biases too, which init leaves at zero."""
+    layer with them apart in float64. Drawn biases too, which init leaves at zero. The routes it records are
+    within `CHOICES`, and the ones its layer runs among them (`_reached`)."""
     combination = dict(zip(AXES["gate_up"], case, strict=True))
     layer = _layer(combination)
     dtype = jnp.dtype(combination["dtype"])
     params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
                           layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype)))
-    assert_joined_as_exact("gate_up", with_gradients(layer.apply), drawing(params, (*ROWS, FEATURES), dtype),
-                           with_gradients(layer.clone(dtype=jnp.float64).apply), "-".join(case), seeds=SEEDS)
+    with generation.routes() as routes:
+        assert_joined_as_exact("gate_up", with_gradients(layer.apply),
+                               drawing(params, (*ROWS, FEATURES), dtype),
+                               with_gradients(layer.clone(dtype=jnp.float64).apply), "-".join(case),
+                               seeds=SEEDS)
+    recorded = {found.choice for found in routes}
+    assert _reached(combination) <= recorded <= CHOICES, (sorted(recorded), sorted(_reached(combination)))

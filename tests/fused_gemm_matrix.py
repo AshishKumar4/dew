@@ -34,6 +34,10 @@ from dew.nn.kernels import fused_gemm, generation
 SEEDS = 8
 REFERENCE = {"gemm_epilogue": "xla", "gemm_prologue": "xla", "grouped_matmul": "xla"}
 """The reference path's routes: both stages and the product's launch in XLA."""
+CHOICES = frozenset({"gemm_epilogue", "gemm_prologue", "grouped_matmul"})
+"""The `generation.CHOICES` entries the cells run (the module's docstring): each cell asserts that the routes
+it records lie in them and that it reaches the ones its case's region runs (`_reached`), which together are
+all."""
 
 
 def _wide(x):
@@ -158,6 +162,12 @@ def supported(case: dict[str, str]) -> bool:
     return found.refused is None and fused and found.launch is not None and found.launch.kernel != "xla"
 
 
+def _reached(case: dict[str, str]) -> frozenset[str]:
+    """The choices `case`'s region reports: its consumers' stage and its product's launch, and its producer's
+    stage where it has one."""
+    return frozenset({"gemm_epilogue", "grouped_matmul", *(["gemm_prologue"] if _produced(case) else [])})
+
+
 CASES = (
     ('sm90', 'epilogue', 'bias-cast', 'bfloat16'),
     ('sm90', 'prologue', 'silu-residual', 'float16'),
@@ -178,8 +188,12 @@ CASES = (
 def a_fused_gemm_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The fused region's training step of `case` on its GPU on par with the same region's stages in XLA
     (check 1): the output and the gradients of the rows, the matrices, the producer's weight and the
-    consumer's operand, from the plain formula in float64."""
+    consumer's operand, from the plain formula in float64; the routes it records are within `CHOICES`, and
+    the ones its region runs among them (`_reached`)."""
     combination = dict(zip(AXES["fused_gemm"], case, strict=True))
-    assert_as_exact(jax.jit(with_gradients(_call(combination, _named(combination)))),
-                    jax.jit(with_gradients(_call(combination, REFERENCE))), _drawn(combination),
-                    "-".join(case), seeds=SEEDS, truth_fn=with_gradients(_plain(combination)))
+    with generation.routes() as routes:
+        assert_as_exact(jax.jit(with_gradients(_call(combination, _named(combination)))),
+                        jax.jit(with_gradients(_call(combination, REFERENCE))), _drawn(combination),
+                        "-".join(case), seeds=SEEDS, truth_fn=with_gradients(_plain(combination)))
+    recorded = {found.choice for found in routes}
+    assert _reached(combination) <= recorded <= CHOICES, (sorted(recorded), sorted(_reached(combination)))
