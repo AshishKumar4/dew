@@ -120,6 +120,10 @@ def started(code, offset):
     write(owner(), followed.code_unit(code, root))
     if Path(name).name == "conftest.py":
         return sys.monitoring.DISABLE
+    if code.co_name == "<module>" and (module := sys.modules.get(
+            sys._getframe(1).f_globals.get("__name__", ""))) is not None:
+        # Its attributes' reads, by whichever file reads them, are that file's (`followed.Recorded`).
+        followed.recording(module, root, lambda item: write(owner(), item))
     if code.co_name == "<module>":
         # Each module body sees every reader it calls, however many bodies called it before.
         sys.monitoring.restart_events()

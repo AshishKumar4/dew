@@ -212,6 +212,14 @@ OPTIMIZED = 0x1
 body lacks: the child imports no more of the standard library than it must."""
 TOP = "<module>"
 """The unit of a module's top level: all its text but its functions' bodies (ci.py's `units`)."""
+DEFINED = ":"
+"""What parts a definition unit's name from its module's top level (`TOP`, DEFINED and the name it binds,
+`<module>:Model`): an inert definition of the top level (digests.py's `defining`), which a run reaches where
+code it executed reads its name (digests.py's `reached`) or where it read the module's attribute of that name
+(`Recorded`)."""
+EVERY = "*"
+"""A definition unit's name that stands for every definition of its module (`<module>:*`): a read of the
+module's `__dict__`, or code that calls `globals()`, may read any of them."""
 WHOLE = "<file>"
 """The unit of a test file or a conftest a run executed: its code whole, no comment, docstring or position
 of it (ci.py's `code_of`), as the run's tests are all of it; a read of its text, an `inspect` or a
@@ -406,6 +414,44 @@ def imports(write: Callable[[str], None]):
     return Imports
 
 
+class Recorded(types.ModuleType):
+    """A checkout module whose attributes a run reads are its record's (`recording`): a definition of its top
+    level the run read by its name, `m.X` or `from m import X` or a `getattr` by a name only the run knows,
+    which ci.py's keys then hold (`DEFINED`); a read of its `__dict__` reads every one (`EVERY`). A module's
+    dunder names are its own, none a definition."""
+
+    def __getattribute__(self, name: str):
+        if not name.startswith("__") or name == "__dict__":
+            file = types.ModuleType.__getattribute__(self, "__file__")
+            reading(file, EVERY if name == "__dict__" else name)
+        return types.ModuleType.__getattribute__(self, name)
+
+
+recorded_reads: Callable[[str, str], None] | None = None
+"""Where a run's reads of its checkout modules' attributes go (`Recorded`), the recorder's writer once it set
+one (`recording`)."""
+
+
+def reading(file: str, name: str) -> None:
+    """Attribute `name` of the checkout module at `file` read, passed to the recorder's writer."""
+    if recorded_reads is not None:
+        recorded_reads(file, name)
+
+
+def recording(module: types.ModuleType, root: str, write: Callable[[str], None]) -> None:
+    """Checkout module `module` made `Recorded`, as its body starts to run, its attributes' reads passed to
+    `write` as the definitions they name (`DEFINED`), each relative to the checkout at `root`; a test file and
+    a conftest, whose code is their record whole (`WHOLE`), stay as they are."""
+    global recorded_reads
+    file = getattr(module, "__file__", None) or ""
+    if type(module) is not types.ModuleType or not checkout(file, root) or Path(file).name.startswith(
+            "test_") or Path(file).name == "conftest.py":
+        return
+    if recorded_reads is None:
+        recorded_reads = lambda at, name: write(f"{at[len(root):]}{CODE}{TOP}{DEFINED}{name}")  # noqa: E731
+    module.__class__ = Recorded
+
+
 def missed(write: Callable[[str], None], root: str):
     """The import system's last finder, which an import reaches only where every other finder found nothing:
     it passes each checkout directory the import searched for the name, with the name (`LOOKUP`), to `write`,
@@ -467,6 +513,9 @@ def follow() -> None:
         name = code.co_filename
         if checkout(name, root):
             recorded(code_unit(code, root))
+            if code.co_name == "<module>" and (module := sys.modules.get(
+                    sys._getframe(1).f_globals.get("__name__", ""))) is not None:
+                recording(module, root, lambda item: write("file", item))
             if reads_backend(code):
                 write("read", f"{name[len(root):]}:{code.co_qualname}")
         return sys.monitoring.DISABLE

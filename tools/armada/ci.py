@@ -161,7 +161,7 @@ REPO = Path(__file__).resolve().parents[2]
 HASHED_BY = "3.13"
 """The Python this file runs under wherever it runs, the plan's and every task's alike (`pinned`), so a key
 the plan computes is the one a task recorded: a module's units are what this Python's parser and compiler
-make of its text (`digested`), which each release changes (2026-10-30: plans under the PC's 3.14 and a GitHub
+make of its text (`analysis`), which each release changes (2026-10-30: plans under the PC's 3.14 and a GitHub
 runner's 3.12 found none of the 3.13 tasks' records fresh, and every file took a task of its own). It is the
 Python the tasks' image runs this file under, so a task runs it as it is."""
 _CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
@@ -414,7 +414,32 @@ class Reading:
 
     parts: dict[str, bytes] = dataclasses.field(default_factory=dict)
     modules: dict[str, dict[str, bytes] | bytes] = dataclasses.field(default_factory=dict)
+    reaches: dict[tuple[str, str], frozenset[str]] = dataclasses.field(default_factory=dict)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+    def reached(self, depends: list[str]) -> set[str]:
+        """The definition units the code `depends` names reaches (digests.py's `reach`): each executed unit's
+        reads, a test file's or a conftest's every read (followed.py's `WHOLE`), and each definition a run read
+        of a module (followed.py's `Recorded`), with what each reads in turn, each start's once a reading."""
+        found: set[str] = set()
+        for name in depends:
+            module, _, executed = name.partition(followed.CODE)
+            coded = executed and module.endswith(".py") and not module.startswith(HARNESS)
+            if not coded or not Path(module).is_file() or (analysis := digests.analysed(module)) is None:
+                continue
+            if executed == followed.WHOLE:
+                chains = set().union(*analysis.reads.values())
+            elif executed.startswith(f"{followed.TOP}{followed.DEFINED}"):
+                chains = {executed.removeprefix(f"{followed.TOP}{followed.DEFINED}")}
+            else:
+                chains = set(analysis.reads.get(executed, ()))
+            for chain in chains:
+                if (module, chain) not in self.reaches:
+                    reach: set[str] = set()
+                    digests.reach(module, chain, reach, set())
+                    self.reaches[(module, chain)] = frozenset(reach)
+                found |= self.reaches[(module, chain)]
+        return found
 
     def part(self, path: str) -> bytes:
         """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`contents`)."""
@@ -448,7 +473,7 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
     one reading read each input once, however many rows name it."""
     digest = hashlib.sha256(common.encode())
     reading = Reading() if reading is None else reading
-    for path in inputs(name, depends):
+    for path in inputs(name, depends, reading):
         digest.update(path.encode() + reading.part(path))
     if SITE.fullmatch(split):
         digest.update(split.encode())
@@ -457,10 +482,13 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
     return digest.hexdigest()
 
 
-def inputs(name: str, depends: list[str]) -> list[str]:
+def inputs(name: str, depends: list[str], reading: Reading | None = None) -> list[str]:
     """What test file `name`'s key covers, given that its run executed or read `depends`: those, its own code
-    whole (followed.py's `WHOLE`), and the import lookups that found each module it executed under src/ or
-    tools/ (`lookups`): a module or package of its name added beside one it imported (which shadows it), or an
+    whole (followed.py's `WHOLE`), the definitions of each module's top level what it executed reaches
+    (`Reading.reached`: a definition no code it ran reads keys none of its rows, as an edit of a class no test
+    of a file uses reruns none of them; train 668: every sampled cold row had a widely imported module's top
+    level changed), and the import lookups that found each module it executed under src/ or tools/
+    (`lookups`): a module or package of its name added beside one it imported (which shadows it), or an
     __init__.py added to a namespace package on the way to one, which executes as the import passes, changes
     its key; a module of another name added beside it does not, unless an import its run tried and failed
     looks for that name (followed.py's `missed`). tools/ is searched so, as a test puts it, or a directory
@@ -469,7 +497,8 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     import of a test's, so their lookups are none of its inputs (the maintainer, 2026-10-29: train 296's one
     added tool reran 1,794 of 1,795; train 668: one module added to nn/backbones re-keyed 589 rows)."""
     own = f"{name}{followed.CODE}{followed.WHOLE}"
-    return sorted({own, *(path for path in depends if not built_input(path)),
+    reached = (Reading() if reading is None else reading).reached([own, *depends])
+    return sorted({own, *(path for path in depends if not built_input(path)), *reached,
                    *(looked for path in depends for looked in lookups(path.partition(followed.CODE)[0]))})
 
 
