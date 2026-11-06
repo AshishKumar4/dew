@@ -633,3 +633,32 @@ def packed[Words: (np.ndarray, jax.Array)](codes: Words, minifloat: Minifloat, x
     # The codes' bits are disjoint, so their sum is their union.
     natural = xp.sum(grouped << places, axis=-1, dtype=xp.uint32)
     return _parities(natural, NVFP4_BFLOAT16_FORM.encoder, xp) if minifloat is E2M1 else natural
+
+
+def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """An fp32 tile `x` `[depth, columns]` as NVFP4: its packed codes (`[depth / 8, columns]` uint32, the
+    stored order `nvfp4_decoded` reads), its block scales (`[depth / 16, columns]` float8_e4m3fn, one for
+    each sixteen along the depth) and its tensor scale (fp32): the tensor scale its largest magnitude over
+    6 * 448 (1 where it is zero), so every block's scale fits e4m3; a block's scale the least e4m3 at or
+    above its largest magnitude over 6 times the tensor scale, so no code saturates; each value over its
+    block's scale and the tensor scale rounded to e2m1 (`encoded`), a block of zeros codes of zero. Its
+    decode (`nvfp4_decoded`) times `NVFP4_OWED` times the tensor scale is each value's rounding, as the GEMM
+    epilogue's NVFP4 output stores it (row 4050)."""
+    magnitude = jnp.abs(x)
+    largest = jnp.max(magnitude)
+    tensor = jnp.where(largest > 0, largest / np.float32(6 * 448), np.float32(1))
+    blocks = jnp.max(magnitude.reshape(-1, 16, x.shape[-1]), axis=1)
+    ratio = blocks / (np.float32(6) * tensor)
+    nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
+
+    def value(codes: jax.Array) -> jax.Array:
+        return jax.lax.bitcast_convert_type(codes.astype(jnp.uint8), jnp.float8_e4m3fn).astype(jnp.float32)
+
+    # The nearest rounded up where it fell below the ratio, never past the largest finite (448).
+    codes = jnp.where(value(nearest) < ratio, jnp.minimum(nearest + jnp.uint32(1), jnp.uint32(E4M3.largest)),
+                      nearest)
+    scales = jax.lax.bitcast_convert_type(codes.astype(jnp.uint8), jnp.float8_e4m3fn)
+    each = jnp.repeat(value(codes), 16, axis=0) * tensor
+    quotient = jnp.where(each > 0, x / jnp.where(each > 0, each, 1), 0)
+    words = packed(encoded(jax.lax.bitcast_convert_type(quotient, jnp.uint32), E2M1).T, E2M1).T
+    return words, scales, tensor
