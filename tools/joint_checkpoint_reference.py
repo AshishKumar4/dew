@@ -266,7 +266,7 @@ def images() -> None:
     np.savez(OUT / "images.npz", **logits)
 
 
-ROWS, QUESTIONS, OPTIONS, WIDTH = 2, 3, 6, 1536
+ROWS, QUESTIONS, OPTIONS, WIDTH = 2, 3, 5, 1536
 """A parity seed's requests, the most questions a request asks and options a question offers, and the
 tokens a laid-out request is padded to."""
 PICTURES, SIDE = 2, 64
@@ -293,7 +293,7 @@ def drawn_requests(seed: int) -> list[dict]:
                     "criteria": [text(1, 3) for _ in range(int(rng.integers(2, OPTIONS + 1)))]}
         names = rng.choice(NAMES, int(rng.integers(1, OPTIONS + 1)), replace=False).tolist()
         return {"type": "choice", "instructions": text(3, 7),
-                "criteria": {name: text(1, 4) for name in names} if rng.random() < 0.5 else names}
+                "criteria": {name: text(1, 3) for name in names} if rng.random() < 0.5 else names}
 
     requests = []
     for _ in range(ROWS):
