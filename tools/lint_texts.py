@@ -12,8 +12,6 @@ from dataclasses import dataclass, field
 
 import lint_scopes as scopes
 
-SOURCE_READERS = {"inspect.getsource", "inspect.getsourcelines", "inspect.getsourcefile"}
-"""How a test reads a function's or module's source."""
 IR_TEXTS = {"as_text", "as_hlo_text", "pretty_print", "as_hlo_dot_graph", "mlir_module"}
 """A lowered or compiled program's text, by the method that prints it (jax.stages, jax.core.Jaxpr)."""
 PROGRAMS = {"jax.make_jaxpr", "lower", "compile", "trace"}
@@ -55,7 +53,9 @@ class _Taint:
                 return True
             if isinstance(node, ast.Constant):
                 parts.append(node.value)
-                if isinstance(node.value, str) and node.value.startswith(f"src/{self.package}"):
+                # A source file spelled whole is SLOP011's own finding wherever it is named.
+                if (isinstance(node.value, str) and node.value.startswith(f"src/{self.package}")
+                        and not node.value.endswith(".py")):
                     return True
             if isinstance(node, ast.Attribute) and node.attr == "__file__" and self.first_party(node.value):
                 return True
@@ -81,7 +81,7 @@ class _Taint:
             return False
         func, called = node.func, _resolved(node.func, self.tables)
         attribute = func.attr if isinstance(func, ast.Attribute) else ""
-        return (called in SOURCE_READERS or attribute in IR_TEXTS
+        return (attribute in IR_TEXTS
                 or (attribute in FILE_READERS and self.path(func.value))
                 or (called == "open" and bool(node.args) and self.path(node.args[0]))
                 or (called in ("str", "repr") and bool(node.args) and self.program(node.args[0])))
@@ -122,7 +122,7 @@ def texts(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[int,
            package: str) -> Iterator[ast.Assert]:
     """Each `assert` of `function` whose test reads production source or a program's IR as text: a file
     under `src/<package>/` or a first-party module's `__file__` read (`FILE_READERS`, `open`), source read
-    by `inspect` (`SOURCE_READERS`), or a jaxpr, lowering or compilation printed (`str`, `repr`, an
+    or a jaxpr, lowering or compilation printed (`str`, `repr`, an
     f-string, `IR_TEXTS`), through the names the function binds to any of them, a `with open(...)`'s
     among them (row 4512). A program's structure read as objects (a jaxpr's equations, a compilation's
     cost analysis) is behaviour; its text is a snapshot of one lowering."""

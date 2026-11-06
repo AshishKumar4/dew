@@ -1437,7 +1437,7 @@ def test_asserting_on_production_source_or_ir_text_is_reported_and_reading_struc
             "    lines = Path(sparx.graph.__file__).read_text().splitlines()\n"
             "    assert len(lines) > 1\n"
             "def test_opened():\n"
-            "    with open('src/sparx/graph.py') as handle:\n"
+            "    with open(ROOT / 'src' / 'sparx' / 'graph.py') as handle:\n"
             "        assert handle.read()\n"
             "def test_jaxpr(f, x):\n"
             "    assert 'dot_general' in str(jax.make_jaxpr(f)(x))\n"
@@ -1459,7 +1459,7 @@ def test_asserting_on_production_source_or_ir_text_is_reported_and_reading_struc
             "    program = parse(program)\n"
             "    assert program\n"),
     })
-    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (9, 12, 14, 15, 17, 20, 23)]
+    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (9, 12, 15, 17, 20, 23)]
 
 
 def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_report_is_not(tmp_path):

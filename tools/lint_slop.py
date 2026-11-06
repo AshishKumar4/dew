@@ -189,6 +189,7 @@ NARROWERS = {"Mapping", "MutableMapping", "dict", "Dict", "Sequence", "list", "t
 INTERPRETER_HOOKS = {"sys.excepthook", "sys.unraisablehook", "sys.displayhook", "sys.breakpointhook",
                      "threading.excepthook"}
 # The calls that hand a test a function's source text.
+SOURCE_READERS = {"inspect.getsource", "inspect.getsourcelines", "inspect.getsourcefile"}
 # What a layer's call is handed by its block, which it may not take and drop.
 CALL_ARGUMENTS = {"decode", "kv_store", "attention_metadata", "call"}
 # Process-wide state a module must not change while it is imported.
@@ -1142,8 +1143,9 @@ def _worded(node: ast.AST, caught: Set[str], raised: Set[str]) -> bool:
 def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour: an error's or a
     warning's text matched, a sentence looked for in captured output, in a caught error's text or
-    in a process's output, or source text read. A name is read through the imports of its own
-    scope, so `pytest.raises` imported under another name is `pytest.raises`."""
+    in a process's output, source text read, or an assertion on production source or a program's IR
+    text (`lint_texts.texts`). A name is read through the imports of its own scope, so `pytest.raises`
+    imported under another name is `pytest.raises`."""
     named = list(scopes.scoped(module.tree.body, {}, _parent(module)))
     raises = {id(node) for node, table in named
               if isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.raises"}
@@ -1181,7 +1183,7 @@ def wording(module: Module) -> Iterator[Finding]:
                 raised = "an error" if called == "pytest.raises" else "a warning"
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                               f"matches {raised}'s wording; assert that it is raised, not its text")
-            elif called in text_rules.SOURCE_READERS:
+            elif called in SOURCE_READERS:
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                               "reads source text; test what the code does")
         elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
