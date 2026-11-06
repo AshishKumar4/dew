@@ -398,10 +398,16 @@ def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.Com
     compile-only H100, FS-2440-CONCURRENT2). Each is then kept (`settled`) and admitted in turn, in this
     thread, in the order given, as `compiled` keeps them one after another: a spill's refusal commits,
     and its program relowers, under this thread's contexts, so the programs kept are the ones compiled in
-    turn keep. At most `COMPILE_THREADS` compile at once."""
+    turn keep: a program lowered before an earlier one's refusals committed is lowered again past them and
+    compiled in turn, as it would have been lowered after them. At most `COMPILE_THREADS` compile at once."""
     firsts = attempts([(lowered, options) for lowered, options, _ in programs])
-    return [compiled(lowered, options, relower=relower, first=first)
-            for (lowered, options, relower), first in zip(programs, firsts, strict=True)]
+    held = refused_launches()
+    kept_programs = []
+    for (lowered, options, relower), first in zip(programs, firsts, strict=True):
+        if refused_launches() != held:
+            lowered, first = relower(), None
+        kept_programs.append(compiled(lowered, options, relower=relower, first=first))
+    return kept_programs
 
 
 COMPILE_THREADS = 4
