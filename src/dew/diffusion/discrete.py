@@ -90,6 +90,12 @@ class MaskingSchedule(ABC):
     def alpha_prime(self, t) -> jax.Array:
         """Return d alpha / dt, which is negative."""
 
+    def masked_fraction(self, t) -> jax.Array:
+        """Return 1 - alpha(t), the fraction of tokens masked at t. A schedule that can states it apart
+        from alpha: near t = 0 the subtraction keeps only the last bits of alpha's rounding, and the
+        NELBO weight divides by it."""
+        return 1 - self.alpha(t)
+
 
 @dataclass(frozen=True)
 class LogLinear(MaskingSchedule):
@@ -106,6 +112,9 @@ class LogLinear(MaskingSchedule):
 
     def alpha_prime(self, t):
         return jnp.full_like(common.times(t), -(1 - self.eps))
+
+    def masked_fraction(self, t):
+        return (1 - self.eps) * common.times(t)
 
 
 @dataclass(frozen=True)
@@ -145,7 +154,7 @@ class DiscreteProcess:
 
     def masked(self, draws, tokens, t) -> tuple[jax.Array, jax.Array]:
         """`corrupt` from a uniform draw for each of the tokens: those under `1 - alpha(t)` masked."""
-        is_masked = draws < (1 - self.schedule.alpha(t))[:, None]
+        is_masked = draws < self.schedule.masked_fraction(t)[:, None]
         return jnp.where(is_masked, self.mask_id, tokens), is_masked
 
     def weight(self, t) -> jax.Array:
@@ -155,7 +164,7 @@ class DiscreteProcess:
         token contributes, and the quotient itself is undefined.
         """
         t = common.times(t)
-        return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
+        return jnp.where(t > 0, -self.schedule.alpha_prime(t) / self.schedule.masked_fraction(t), 0.0)
 
     def times(self, steps: int) -> jax.Array:
         """MDLM's sampling grid for `steps` reveal steps: `steps + 1` times from
@@ -402,8 +411,8 @@ class Unmask:
             raise ValueError(
                 f"Unmask reveals masked tokens, so it needs a DiscreteProcess and not "
                 f"{type(process).__name__}")
-        alpha_t = process.schedule.alpha(t)
-        return (process.schedule.alpha(t_next) - alpha_t) / (1 - alpha_t)
+        masked = process.schedule.masked_fraction(t)
+        return (masked - process.schedule.masked_fraction(t_next)) / masked
 
 
 @dataclass(frozen=True)
