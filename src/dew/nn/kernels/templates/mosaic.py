@@ -1816,7 +1816,7 @@ class Transport[Allocated, Opened](abc.ABC):
         TPU's VMEM)."""
         return plgpu.SMEM(shape, dtype)
 
-    def meeting(self, consumers: int) -> Any:
+    def meeting(self, consumers: int) -> object:
         """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""
         return plgpu.Barrier(num_arrivals=consumers, num_barriers=2)
 
