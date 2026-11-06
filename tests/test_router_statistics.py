@@ -21,7 +21,9 @@ from dew.objectives.routing import ExpertBalance, RoutedStatistics
 def routed(request):
     model = decoder().clone(mixture=Mixture(experts=2, top_k=1, bias=True), qk_norm=False,
                             num_nextn_predict_layers=request.param)
-    variables = unfreeze(dict(nn.unbox(LMObjective(model, 8).init(jax.random.key(0)))))
+    # Its one expert's renormalized weight is 1 (`Mixture.fixed_weights`): the balance loss trains its router.
+    drawn = LMObjective(model, 8, balance=ExpertBalance(aux_loss_alpha=0.2)).init(jax.random.key(0))
+    variables = unfreeze(dict(nn.unbox(drawn)))
     params = variables["params"]
     embedding = jnp.zeros_like(params["embed_tokens"]["embedding"])
     params["embed_tokens"]["embedding"] = (embedding.at[:, 1].set(1)
@@ -54,6 +56,29 @@ def padded(kind, extra, *, empty=False):
 
 @pytest.mark.parametrize("seq_aux", [False, True])
 @pytest.mark.parametrize("kind", ["pad_id", "attention_mask", "segments", "coordinates.valid"])
+def test_a_router_no_loss_term_reaches_is_refused_before_it_trains():
+    """A softmax top-1 router renormalized over its one expert weighs it by 1 whatever it scores
+    (`Mixture.fixed_weights`), so no term of a plain loss reaches it: an objective training it with no
+    balance loss or z-loss is refused, naming norm_topk_prob=False (ledger 4551), and every way its router
+    learns or is left alone is not: weighed by its score, a balance loss, a z-loss, its router's kernel
+    among no trained parameters, or a balancing bias beside one of those."""
+    from dew.batch import freeze
+
+    fixed = decoder().clone(mixture=Mixture(experts=2, top_k=1, bias=True))
+    with pytest.raises(ValueError, match="norm_topk_prob=False"):
+        LMObjective(fixed, 8)
+    with pytest.raises(ValueError, match="norm_topk_prob=False"):
+        LMObjective(fixed, 8, balance=ExpertBalance(balance_rate=0.05))
+    weighed = fixed.clone(mixture=Mixture(experts=2, top_k=1, bias=True, norm_topk_prob=False))
+    LMObjective(weighed, 8)
+    LMObjective(fixed, 8, balance=ExpertBalance(aux_loss_alpha=0.2))
+    LMObjective(fixed, 8, balance=ExpertBalance(router_z_loss=0.1, balance_rate=0.05))
+    drawn = nn.unbox(LMObjective(weighed, 8).init(jax.random.key(0)))
+    LMObjective(fixed, 8, variables=freeze(drawn, lambda path: "gate" not in map(str, path)))
+    for routed in ({"experts": 2, "top_k": 2}, {"experts": 2, "top_k": 1, "score_function": "sigmoid"}):
+        LMObjective(fixed.clone(mixture=Mixture(**routed)), 8)
+
+
 def test_router_terms_and_bias_updates_ignore_appended_padding(routed, seq_aux, kind):
     model, variables, depths = routed
     outcomes = []
