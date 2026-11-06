@@ -375,9 +375,13 @@ class Rows:
 def viewed(view: tuple, block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
     `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
-    `Rows`, each run's view at its table's entry."""
+    `Rows`, each run's view at its table's entry; where `ref` is `Pieces` of refs (an fp32 operand's bf16
+    parts, each its own array's), each one's tile at the indices, its share of the block's rows, in order."""
     ref, index_map = view
     indices = index_map(step)
+    if isinstance(ref, Pieces):
+        share = (block[0] // len(ref), *block[1:])
+        return Pieces(viewed((each, index_map), share, step) for each in ref)
 
     def at(indices, block):
         return ref.at[tuple(pl.ds(index * extent, extent)

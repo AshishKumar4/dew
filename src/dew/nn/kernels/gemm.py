@@ -42,7 +42,7 @@ from jax.extend import core as jax_core
 
 from dew import _cache
 from dew.algebra import bits
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, declared_tangent
+from dew.nn.derivatives import KernelGlue, Surrogate, contracted, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
@@ -451,6 +451,139 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
         summed = grouped_matmul.step_scaled(lhs.astype(jnp.bfloat16), matrices, group_sizes, row_scales,
                                             column_scales, precision=jax.lax.Precision.DEFAULT)
     return summed.astype(out_dtype)
+
+
+def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_blocks: jax.Array,
+                                  row_scales: jax.Array, column_scales: jax.Array, *, out_dtype,
+                                  interpret_on_cpu: bool = False) -> jax.Array:
+    """Each group's rows of `lhs_t` (FP8 codes, `[depth, rows]`, the rows contiguous) times its rows of
+    `rhs_t` (FP8 codes, `[width, rows]`), contracted over the rows: `[groups, depth, width]` in `out_dtype`,
+    each 128-row block's partial, summed exactly in fp32, times its depth rows' scales (`row_scales`,
+    `[rows / 128, depth]`) and its columns' (`column_scales`, `[rows / 128, width]`) before it is added to
+    its group's sum: a blockwise FP8 recipe's kernel gradient (DeepSeek-V3's, row 4518). Group `g` holds
+    `group_blocks[g]` whole 128-row blocks, in order (a recipe pads each group's rows to them, DeepGEMM's
+    contiguous layout), so no block straddles groups. Its selector (`BLOCKWISE_FP8`) runs the template's
+    rows-contiguous kernel gradient where named (`mosaic_gpu.tgmm`'s `k_major`), else XLA's."""
+    sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
+    tile = _gradient_tile(lhs_t, rhs_t, sizes, interpret_on_cpu)
+    if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic_gpu':
+        assert tile is not None, "the selector names the template where it plans a tile"
+        launched = grouped_matmul.MosaicTgmm()._launched(tile, interpret_on_cpu)
+        summed = mosaic_gpu.tgmm(lhs_t, rhs_t, sizes, tiles=tile, out_dtype=jnp.float32,
+                                 multiprocessors=launched,
+                                 interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
+                                 exact_sums=True, k_major=True, step_scales=(row_scales, column_scales))
+    else:
+        summed = _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales)
+    return summed.astype(out_dtype)
+
+
+def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
+                             interpret_on_cpu: bool = False) -> jax.Array:
+    """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`) in
+    DeepSeek-V3's blockwise FP8 recipe (row 2513): `x` quantized to E4M3 a 1 x 128 tile at a time along the
+    depth and `w` a 128 x 128 block at a time (power-of-two scales, `fake_quant.fp8_scaled_blocks`), their
+    product `blockwise_fp8_product`. Its gradients are the recipe's own FP8 products: the input's the
+    cotangent quantized 1 x 128 along the width times the blocks transposed, the matrices' the rows and the
+    cotangent each quantized 1 x 128 along the rows (`blockwise_fp8_kernel_gradient`), a surrogate of the
+    quantized product's derivative (straight through each rounding). Group `g` holds `group_blocks[g]` whole
+    128-row blocks, in order: `rows` is 128 times their sum (a recipe pads each group's rows)."""
+    return _blockwise_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
+
+
+def _rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`x` (`[..., n]`) as E4M3 codes a 1 x 128 tile at a time along its last axis and each tile's
+    power-of-two scale (`[..., n / 128]` fp32)."""
+    from dew.nn import fake_quant
+
+    blocks, scale = fake_quant.fp8_scaled_blocks(x, grouped_matmul.SCALE_DEPTH)
+    return fake_quant.fp8_codes(blocks / scale).reshape(x.shape).astype(jnp.float8_e4m3fn), scale[..., 0]
+
+
+def _blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`w` (`[groups, depth, width]`) as E4M3 codes a 128 x 128 block at a time and each block's power-of-two
+    scale (`[groups, depth / 128, width / 128]` fp32)."""
+    from dew.nn import fake_quant
+
+    groups, depth, width = w.shape
+    edge = grouped_matmul.SCALE_DEPTH
+    tiled = w.reshape(groups, depth // edge, edge, width // edge, edge).transpose(0, 1, 3, 2, 4)
+    blocks, scale = fake_quant.fp8_scaled_blocks(tiled.reshape(groups, depth // edge, width // edge, -1),
+                                                 edge * edge)
+    codes = fake_quant.fp8_codes(blocks / scale).reshape(tiled.shape).transpose(0, 1, 3, 2, 4)
+    return codes.reshape(w.shape).astype(jnp.float8_e4m3fn), scale[..., 0, 0]
+
+
+def _projection_value(x, w, group_blocks, out_dtype, interpret):
+    rows, rows_scales = _rows_quantized(x)
+    blocks, blocks_scales = _blocks_quantized(w)
+    sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
+    return blockwise_fp8_product(rows, jnp.swapaxes(blocks, 1, 2), sizes, rows_scales.T, blocks_scales,
+                                 out_dtype=out_dtype, interpret_on_cpu=interpret)
+
+
+def _projection_forward(x, w, group_blocks, out_dtype, interpret):
+    return _projection_value(x, w, group_blocks, out_dtype, interpret), (x, w, group_blocks)
+
+
+def _projection_backward(out_dtype, interpret, residuals, cotangent):
+    x, w, group_blocks = residuals
+    sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
+    dy, dy_scales = _rows_quantized(cotangent)
+    blocks, blocks_scales = _blocks_quantized(w)
+    d_x = blockwise_fp8_product(dy, blocks, sizes, dy_scales.T, jnp.swapaxes(blocks_scales, 1, 2),
+                                out_dtype=x.dtype, interpret_on_cpu=interpret)
+    rows_t, rows_t_scales = _rows_quantized(x.T)
+    dy_t, dy_t_scales = _rows_quantized(cotangent.T)
+    d_w = blockwise_fp8_kernel_gradient(rows_t, dy_t, group_blocks, rows_t_scales.T, dy_t_scales.T,
+                                        out_dtype=w.dtype, interpret_on_cpu=interpret)
+    return d_x, d_w, None
+
+
+# The recipe's gradient (`blockwise_fp8_projection`): a derivative of Dew's choosing (`Surrogate`).
+_blockwise_projection = contracted("test_a_blockwise_fp8_projection_holds_every_reverse_order")(
+    declared_derivative(Surrogate(), _projection_value, _projection_forward, _projection_backward,
+                        nondiff_argnums=(3, 4)))
+
+
+def _gradient_tile(lhs_t, rhs_t, sizes, interpret: bool) -> mosaic_gpu.Tiles | None:
+    """The template's tile for a blockwise kernel gradient (`blockwise_fp8_kernel_gradient`): the exactly
+    summed kernel gradient's derived tile for 16-bit operands of its shapes, at a 128-row step, where the
+    16-bit tile is legal at a 64-row one (an FP8 128-row step's bytes, the shared memory and registers it
+    holds: the launch takes no FP8 kernel gradient to plan, and a 16-bit step is at most a swizzled row's 64
+    elements); None where it plans none."""
+    launch = grouped_matmul.MosaicTgmm()
+    rows = lhs_t.shape[1]
+    bound = launch.bind(jax.ShapeDtypeStruct((rows, lhs_t.shape[0]), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((rows, rhs_t.shape[0]), jnp.bfloat16),
+                        jax.ShapeDtypeStruct(sizes.shape, jnp.int32), out_dtype='float32',
+                        interpret=interpret, exact_sums=True)
+    target = generation.gpu_target()
+    if not launch.eligible(bound, target) or (tile := launch.derived(bound, target)) is None:
+        return None
+    if not launch.legal(bound, dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH // 2), target):
+        return None
+    return dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH)
+
+
+def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax.Array:
+    """`blockwise_fp8_kernel_gradient`'s portable arm: each 128-row block's product in fp32 (FP8 values exact
+    in bfloat16, their products in fp32), times its scales, added in order into its group's fp32 sum."""
+    depth, width, blocks = lhs_t.shape[0], rhs_t.shape[0], row_scales.shape[0]
+    groups = group_blocks.shape[0]
+    owner = jnp.repeat(jnp.arange(groups), group_blocks, total_repeat_length=blocks)
+
+    def block(index, total):
+        rows = jax.lax.dynamic_slice_in_dim(lhs_t, index * grouped_matmul.SCALE_DEPTH,
+                                            grouped_matmul.SCALE_DEPTH, axis=1)
+        columns = jax.lax.dynamic_slice_in_dim(rhs_t, index * grouped_matmul.SCALE_DEPTH,
+                                               grouped_matmul.SCALE_DEPTH, axis=1)
+        partial = jax.lax.dot_general(rows.astype(jnp.bfloat16), columns.astype(jnp.bfloat16),
+                                      (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+        scaled = partial * row_scales[index][:, None] * column_scales[index][None, :]
+        return total.at[owner[index]].add(scaled)
+
+    return jax.lax.fori_loop(0, blocks, block, jnp.zeros((groups, depth, width), jnp.float32))
 
 
 def _step_scaled_tile(launch, bound, target, width: int, scaled: int) -> mosaic_gpu.Tiles | None:

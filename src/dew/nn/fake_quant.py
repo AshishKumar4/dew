@@ -105,11 +105,16 @@ def fp8_scaled_blocks(x, block: int):
     return blocks, _power_of_two_ceil(amax * jnp.float32(1 / _E4M3_MAX))
 
 
+def fp8_codes(values):
+    """`values` (fp32, a block over its scale) rounded to E4M3FN, ties to even, clamped to +-448: an FP8
+    block's codes (`fp8_rounded`'s, before its scale)."""
+    return _round_e4m3fn(jnp.clip(values, -_E4M3_MAX, _E4M3_MAX))
+
+
 def fp8_rounded(x, blocks, scale):
     """`x` as E4M3 of its `blocks` over their `scale` (`fp8_scaled_blocks`), clamped to +-448, times the
     scale."""
-    rounded = _round_e4m3fn(jnp.clip(blocks / scale, -_E4M3_MAX, _E4M3_MAX))
-    return straight_through(x, (rounded * scale).reshape(x.shape))
+    return straight_through(x, (fp8_codes(blocks / scale) * scale).reshape(x.shape))
 
 
 def fake_quant_fp8(x, block: int):
