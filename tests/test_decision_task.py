@@ -985,3 +985,33 @@ def test_options_knocked_out_with_no_probability_share_the_residual_evenly():
     shares = {"a": 0.75 * (1 - 0.01), "b": 0.25 * (1 - 0.01), "c": 0.01 / 2, "d": 0.01 / 2}
     total = sum(shares.values())
     assert combined == {option: share / total for option, share in shares.items()}
+
+
+def test_a_tournament_round_encodes_its_state_once_and_a_batch_takes_no_request(decide):
+    """A tournament's round lays every group's row over its state's tokens encoded once (`Layout.state`):
+    its tokenizer encodes the state's text once a round, where it encoded it once a group; and a batch of
+    requests, each its own whole request, refuses a `request` of its parts (train 658's review, rows 4604
+    and 4605)."""
+    from dew.data.text import HFTokenizer
+    from dew.decision.layout import render
+
+    request = CASES["many_options"]
+    asked = {"intent": Question.from_wire(request["questions"]["intent"])}
+    texts: list[str] = []
+
+    class Counting(HFTokenizer):
+        """The release's tokenizer, each text it encodes noted."""
+
+        def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
+            texts.append(text)
+            return super().encode(text, add_special_tokens=add_special_tokens)
+
+    tokenizer = Counting(decide.tokenizer.name, local_files_only=True)
+    counted = replace(decide, tokenizer=tokenizer)
+    # The state's text as a row encodes it alone (`QuestionLayout.state`).
+    state = render(request["state"]).replace(decide.specials.marker_text, " ")
+    counted.tournament(request["state"], asked, rounds=Knockout(group=4))
+    # Two rounds: the groups' and the final's.
+    assert texts.count(state) == 2
+    with pytest.raises(ValueError):
+        decide([(request["state"], asked)], request=asked)

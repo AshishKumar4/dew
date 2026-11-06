@@ -1,5 +1,6 @@
-"""The one precision context a JAX reference's modules run their float64 oracles under, the counterpart to
-tools/torch_precision.py's `float64`: Diffusers' Flax modules', and MaxText's (tools/maxtext_worker.py).
+"""The one precision context a reference's array code runs its float64 oracles under where a module pins a
+dtype, the counterpart to tools/torch_precision.py's `float64`: Diffusers' Flax modules', MaxText's
+(tools/maxtext_worker.py), and the NumPy of Diffusers' image processor.
 
 A Flax module built at float64 (`dtype=jnp.float64`, its parameters widened, JAX's x64 on) still computes in
 a narrower dtype wherever its code names one: Diffusers' `get_sinusoidal_embeddings` takes its frequencies'
@@ -16,35 +17,42 @@ import importlib
 from collections.abc import Iterator
 from unittest.mock import patch
 
-MODELS = ("diffusers.models.embeddings_flax", "diffusers.models.attention_flax", "diffusers.models.resnet_flax",
-          "diffusers.models.vae_flax", "diffusers.models.unets.unet_2d_blocks_flax",
-          "diffusers.models.unets.unet_2d_condition_flax")
+MODELS = ("diffusers.models.embeddings_flax", "diffusers.models.attention_flax",
+          "diffusers.models.resnet_flax", "diffusers.models.vae_flax",
+          "diffusers.models.unets.unet_2d_blocks_flax", "diffusers.models.unets.unet_2d_condition_flax")
 """Diffusers' Flax model modules: the UNet's, its blocks', the autoencoder's, attention's and the
 embeddings'."""
 
 
-class Widened:
-    """jax.numpy with each dtype in `names` read as float64, every other name its own."""
+NUMPY = {"jnp": "jax.numpy", "np": "numpy"}
+"""The array libraries a module names, by the name it imports each as."""
 
-    def __init__(self, names: tuple[str, ...]):
-        self.names = names
+
+class Widened:
+    """An array library (`base`, by import name) with each dtype in `names` read as float64, every other name
+    its own."""
+
+    def __init__(self, names: tuple[str, ...], base: str = "jax.numpy"):
+        self.names, self.base = names, base
 
     def __getattr__(self, name):
-        import jax.numpy as jnp
-
-        return jnp.float64 if name in self.names else getattr(jnp, name)
+        library = importlib.import_module(self.base)
+        return library.float64 if name in self.names else getattr(library, name)
 
 
 @contextlib.contextmanager
-def float64(modules: tuple[str, ...] = MODELS,
-            names: tuple[str, ...] = ("float32",)) -> Iterator[None]:
-    """Within the block, the dtypes in `names` that each of `modules` (by import name) names read as float64:
-    float32 by default, the dtype a module pins where it means full precision; another where a module casts
-    to a narrower one it means to keep (MaxText's tied table's bfloat16, tools/maxtext_worker.py)."""
+def float64(modules: tuple[str, ...] = MODELS, names: tuple[str, ...] = ("float32",),
+            library: str = "jnp") -> Iterator[None]:
+    """Within the block, the dtypes in `names` that each of `modules` (by import name) names through its
+    `library` (`jnp`, or `np`: NUMPY) read as float64: float32 by default, the dtype a module pins where it
+    means full precision; another where a module casts to a narrower one it means to keep (MaxText's tied
+    table's bfloat16, tools/maxtext_worker.py). NumPy's is Diffusers' image processor's, whose
+    `pil_to_numpy` and normalization pin float32 (tools/native_diffusion_worker.py)."""
     with contextlib.ExitStack() as scope:
         for name in modules:
-            scope.enter_context(patch.object(importlib.import_module(name), "jnp", Widened(names)))
+            scope.enter_context(patch.object(importlib.import_module(name), library,
+                                             Widened(names, NUMPY[library])))
         yield
 
 
-__all__ = ["MODELS", "Widened", "float64"]
+__all__ = ["MODELS", "NUMPY", "Widened", "float64"]

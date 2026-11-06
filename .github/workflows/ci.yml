@@ -113,11 +113,14 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+        # Main's whole run (the schedule's, the land queue's whole dispatch), background work (`WHOLE`).
+        WHOLE: ${{ (github.event_name == 'schedule' || inputs.whole) && '1' || '' }}
       run: |
         base=$(git merge-base HEAD origin/main)
         # A train's gates start before lanes' runs, a push to main's and a staged train's after a train's, as their
-        # suites do.
+        # suites do; main's whole run's after every lane's, as its suite's.
         case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; ci/stage-*|main) priority=--priority=5 ;; *) priority= ;; esac
+        if [ -n "$WHOLE" ]; then priority=--priority=-15; fi
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
           $priority --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
@@ -233,10 +236,10 @@ jobs:
     # of waiting holders gives a gang's ranks their containers in turn
     # (armada#49). Any other run takes `armada`, one at a time. A base/<producer>
     # promote (ci/base-*), and a push to base/kernels, take a group of their own, whether it reruns what its
-    # change reaches or the whole suite: they run no gangs, which every train runs, and take a bounded share of
-    # the fleet (`BACKGROUND_POOL`), so a train never waits on them and its gangs find their containers; on fewer
-    # containers a whole suite takes longer, so they have a longer deadline. The whole suite, daily or dispatched,
-    # takes a group of its own, so a direct push to main never waits on it.
+    # change reaches or the whole suite: they run no gangs, which every train runs. The whole suite, daily or
+    # dispatched, takes a group of its own, so a direct push to main never waits on it, and a bounded share of
+    # the fleet (`BACKGROUND_POOL`, 48 containers), with a longer deadline, as on fewer containers it takes
+    # longer.
     concurrency:
       group: >-
         ${{ ((github.event_name == 'schedule' || inputs.whole) && 'armada-daily')
@@ -248,8 +251,11 @@ jobs:
         || 'armada' }}
       cancel-in-progress: false
       queue: max
-    timeout-minutes: ${{ (startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels'
-      || needs.scope.outputs.policy == 'off') && 110 || 60 }}
+    # Main's daily whole run, below every lane's, waits for capacity within its suite's and then its release
+    # checks' 6000 s deadlines, one after the other: 210 minutes.
+    timeout-minutes: ${{ ((github.event_name == 'schedule' || inputs.whole) && 210)
+      || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels'
+      || needs.scope.outputs.policy == 'off') && 110) || 60 }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -279,19 +285,23 @@ jobs:
         # release checks (tools/armada/ci.py `selected`, `plan`, `release-plan`).
         DEW_WHOLE_SUITE: ${{ (github.event_name == 'schedule' || inputs.whole) && '1' || '' }}
         PROVEN: ${{ needs.proven.outputs.run }}
-        BACKGROUND_POOL: >-
-          ${{ ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '48') || '' }}
+        # Background work's bounded share: main's whole run, once a day, on 48 containers; a base push or promotion
+        # pools as armada does (owner, 2026-11-06).
+        BACKGROUND_POOL: ${{ (github.event_name == 'schedule' || inputs.whole) && '48' || '' }}
       # tools/ci/suite.sh, which this step reads from the ref, holds what the run takes. A base/<producer>
       # promote and a push to base/kernels run no gangs: main's trains run them. A train's jobs (ci/batch-*,
       # ci/fix-*), its gangs and its suite alike, start before any other while the fleet is full, and lanes'
       # runs at a head (verdict.sh, at -10) end their newest containers to let them in (owner, bible §4); one
       # priority for both, so the suite never recalls its own gangs' containers. A push to base/kernels and a
-      # base/<producer> promote run at a lane's whole-suite priority (-10) within their pool of 48, so they
-      # never take containers from a train, a precheck or a lane's targeted run (the maintainer, 2026-10-28).
+      # base/<producer> promote run at a lane's whole-suite priority (-10), so they never take containers from a
+      # train, a precheck or a lane's targeted run (the maintainer, 2026-10-28), on the pool armada gives them.
       # A train staged on the testing train's tip (ci/stage-*) runs beside it, at 5, on the pool its branch
       # names (its lease's suite share, the land queue's promote.sh); a push to main the queue did not grade
       # (a direct push) is its tip's only test, at 5 too, in a concurrency group of its own (the maintainer,
-      # 2026-10-29, 2026-10-31).
+      # 2026-10-29, 2026-10-31). Main's whole run (the schedule's, the queue's whole dispatch) is background
+      # work: it runs at -15, below every lane's run at a head (verdict.sh's -10, a targeted run's 0), so a head's
+      # run never queues behind it (Main, 2026-11-06: a whole run and the gates' shadow held the fleet while
+      # lanes waited at 0).
       run: |
         case "$GITHUB_REF_NAME" in ci/base-*|base/kernels) gangless=1 ;; *) gangless= ;; esac
         case "$GITHUB_REF_NAME" in
@@ -300,10 +310,13 @@ jobs:
           ci/base-*|base/kernels) priority=-10 ;;
           *) priority= ;;
         esac
+        if [ -n "$DEW_WHOLE_SUITE" ]; then priority=-15; fi
+        # A run below every lane's waits for capacity within its deadlines: background ones (train 665's review).
+        case "$priority" in -*) background=1 ;; *) background= ;; esac
         pool=$BACKGROUND_POOL
         case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) pool=${GITHUB_REF_NAME##*-p} ;; esac
         ARMADA=armada LABEL="$GITHUB_REF_NAME" PRIORITY="$priority" GANGLESS="$gangless" POOL="$pool" \
-          BACKGROUND="${BACKGROUND_POOL:+1}" OUT="$RUNNER_TEMP/ci" bash tools/ci/suite.sh ${{ github.sha }}
+          BACKGROUND="$background" OUT="$RUNNER_TEMP/ci" bash tools/ci/suite.sh ${{ github.sha }}
     - name: Cancel the armada jobs of a cancelled run
       # A client killed before it cancelled leaves its job running to its deadline, on the fleet the
       # next run needs: each job the clients named is cancelled (armada's POST /jobs/<id>/cancel, at

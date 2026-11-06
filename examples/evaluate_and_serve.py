@@ -240,7 +240,27 @@ def served(config: Config) -> dict[str, str]:
     return answers
 
 
+LANGUAGE = ("tokens", "tasks", "harness_limit", "sequence_length", "batch_size")
+"""The options only a language run reads; the prompt and its length a served endpoint reads too."""
+
+
+def dropped(config: Config) -> list[str]:
+    """The options `config` gives that nothing it scores reads: with a diffusion run and no language run,
+    those only a language run reads, the prompt and its length among them unless a served endpoint reads
+    them (`served`)."""
+    if config.run is not None or config.image_run is None:
+        return []
+    endpoint = config.openai_base_url is not None or config.ollama_host is not None
+    language = LANGUAGE if endpoint else (*LANGUAGE, "prompt", "max_new_tokens")
+    defaults = Config()
+    return [f"--{name.replace('_', '-')}" for name in language
+            if getattr(config, name) != getattr(defaults, name)]
+
+
 def main(config: Config) -> Path:
+    if unread := dropped(config):
+        raise ValueError(f"{', '.join(unread)} score a language run, which --run names; --image-run alone "
+                         "scores the diffusion run")
     if config.smoke:
         config.out.mkdir(parents=True, exist_ok=True)
         config = replace(config, sequence_length=32, batch_size=2, prompt="to be", max_new_tokens=8,
@@ -251,11 +271,12 @@ def main(config: Config) -> Path:
     if config.run is None and config.image_run is None:
         raise ValueError("--run names the language run to score, or --image-run the diffusion run")
 
+    # The language run is read first, so a run of another kind is refused before the images are scored.
+    task = None if config.run is None else dew.pipeline(str(config.run))
+    if task is not None and not isinstance(task, TextGeneration):
+        raise TypeError(f"--run holds a {type(task).__name__}; --image-run takes a diffusion run")
     report = {"images": image_metrics(config), "served": served(config)}
-    if config.run is not None:
-        task = dew.pipeline(str(config.run))
-        if not isinstance(task, TextGeneration):
-            raise TypeError(f"--run holds a {type(task).__name__}; --image-run takes a diffusion run")
+    if task is not None:
         report.update(run=str(config.run), perplexity=perplexity(task, config), harness=harness(task, config),
                       greedy=task(config.prompt, config.max_new_tokens, sampling=GREEDY, key=0).text[0])
     config.out.mkdir(parents=True, exist_ok=True)

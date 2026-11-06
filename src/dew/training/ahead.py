@@ -259,6 +259,10 @@ class AheadOfTime:
     """The kernel launch configs its compiles found spilling and refused
     (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
     lowers (`FitSearch`), so its derivations step down as the compile's did and it lowers this program."""
+    substituted: tuple[str, ...] = ()
+    """Each kernel its routes lowered another in place of, as this host lowers no such kernel (`substituted`:
+    FlashAttention without its wheel, cuDNN with no GPU attached): where any, the program is not the one the
+    target's GPU runs, which a measure of the target's compile reads as unsupported (tools/perf_gate.py)."""
 
     @property
     def peak_bytes(self) -> int:
@@ -771,4 +775,4 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices)),
-        refusals=report.refused_launches(), sampled=sampled)
+        refusals=report.refused_launches(), sampled=sampled, substituted=tuple(missing))
