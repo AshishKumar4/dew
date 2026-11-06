@@ -269,43 +269,60 @@ def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teache
                                                                                          trained_teacher):
     """A teacher trained as an environment run, then a student's DAgger stage built from its record: the
     student flies, the teacher read from its saved run labels each step with its greedy action, and the
-    stage's replay holds those labels beside the actions flown, which they differ from, its labeller the
-    saved teacher's weights bit for bit. The labelling composed in Python is test_aggregation's; this
+    student imitates the labels. It trains, every leaf of its state and of its replay bit for bit, as the
+    stage composed in Python does with the teacher's own greedy policy and weights (row 4359), its labels
+    the teacher's, not the actions flown. The labelling composed in Python is test_aggregation's; this
     stage's record wires it to the saved teacher."""
     saved, teacher = trained_teacher
     dagger = student(tmp_path, 1, teacher=TeacherConfig(str(saved)),
                      objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
     prepared = dagger.prepare()
     assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
-    assert int(prepared.train("dagger").step) == 1
+    state = prepared.train("dagger")
+    objective = DreamerV3Objective(world_model(), imitation=1.0, imitates=LABEL)
+    rollout = DreamerRollout(objective, Batched(FlightEnv(racing(), VIEWS), 8), capacity=64, batch=8,
+                             length=8, train_ratio=16.0, prefill=8,
+                             teacher=Teacher(teacher_policy().greedy, teacher.variables))
+    assert_bitwise(state, fitted(dagger, objective, rollout, 1))
     assert isinstance(prepared.rollout, DreamerRollout)
     labelled = jax.device_get(prepared.rollout.held_replay)
+    assert_bitwise(labelled, rollout.held_replay)
     filled = int(labelled.filled)
     assert filled and not np.array_equal(labelled.held[LABEL][:filled], labelled.held["action"][:filled])
-    # The labeller is the saved teacher: its weights, bit for bit.
-    labeller = prepared.rollout.teacher
-    assert labeller is not None
-    assert_bitwise(labeller.variables, teacher.variables)
+
+
+def resumable(root: Path, agent: str) -> EnvRunConfig:
+    """A run of `agent`'s, PPO or DreamerV3 with its replay in its checkpoints, to its fourth update in the
+    race, checkpointed every update."""
+    replayed = {"batch": 8, "length": 8, "train_ratio": 16.0, "prefill": 8, "capacity": 64,
+                "checkpointed_replay": True}
+    run = (teacher_run(root, 4) if agent == "ppo" else
+           student(root, 4, rollout=RolloutConfig("dreamer", replayed)))
+    return dataclasses.replace(run, trainer=dataclasses.replace(run.trainer, checkpoint_every=1))
 
 
 @pytest.mark.parametrize("agent", ["ppo", "dreamer"])
-def test_a_resumed_run_ends_as_the_run_that_never_stopped_and_keeps_what_it_trains(tmp_path, agent):
-    """A run in the race checkpointed every update, PPO or DreamerV3 with its replay in its checkpoints,
-    trained to its second update and resumed under its name to its fourth, ends where the run that never
-    stopped ends, every leaf bit for bit. Its environment is what it reads, so a resume at another difficulty
-    trains on (a curriculum); one with another discount, which says what it trains, is refused."""
-    replayed = {"batch": 8, "length": 8, "train_ratio": 16.0, "prefill": 8, "capacity": 64,
-                "checkpointed_replay": True}
-    run = (teacher_run(tmp_path, 4) if agent == "ppo" else
-           student(tmp_path, 4, rollout=RolloutConfig("dreamer", replayed)))
-    run = dataclasses.replace(run, trainer=dataclasses.replace(run.trainer, checkpoint_every=1))
+def test_a_resumed_run_ends_as_the_run_that_never_stopped(tmp_path, agent):
+    """A run in the race checkpointed every update (`resumable`), trained to its second update and resumed
+    under its name to its fourth, ends where the run that never stopped ends, every leaf bit for bit."""
+    run = resumable(tmp_path, agent)
     whole = run.prepare().train("whole")
     run.override({"trainer.steps": 2}).prepare().train("stopped")
     assert_bitwise(whole, run.prepare().train("stopped"))
-    run.override({"trainer.steps": 6, "env.difficulty": 0.5}).prepare().train("stopped")
+
+
+@pytest.mark.parametrize("agent", ["ppo", "dreamer"])
+def test_a_resumed_run_trains_on_in_another_environment_and_keeps_what_it_trains(tmp_path, agent):
+    """A run's environment is what it reads, so the run (`resumable`) trained to its second update and
+    resumed at another difficulty trains on to its fourth (a curriculum); resumed again with another
+    discount or horizon, which says what it trains, it is refused."""
+    run = resumable(tmp_path, agent)
+    run.override({"trainer.steps": 2}).prepare().train("stopped")
+    raced = run.override({"trainer.steps": 4, "env.difficulty": 0.5}).prepare().train("stopped")
+    assert int(raced.step) == 4
     trained = {"objective.discount": 0.5} if agent == "ppo" else {"objective.horizon": 100.0}
     with pytest.raises(ValueError):
-        run.override({"trainer.steps": 8, **trained}).prepare().train("stopped")
+        run.override({"trainer.steps": 6, **trained}).prepare().train("stopped")
 
 
 def test_a_dreamer_rollout_begins_its_live_state_as_its_checkpoint_restores_it(tmp_path):

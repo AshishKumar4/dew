@@ -803,7 +803,7 @@ def test_an_fp8_sources_push_has_a_collective_for_every_tensor_it_publishes():
     from dew.inference.rollouts import _published
 
     source = Pretrained.load(FP8, dtype="float32")
-    published = _published(source, source.variables, jnp.dtype("bfloat16"), phase="fp8 push gather")
+    published = _published(source, source.variables, jnp.dtype("bfloat16"))
     dtypes = {str(tensor.dtype) for tensor in published.export().values()}
     assert "float8_e4m3fn" in dtypes and dtypes <= _DTYPES.keys(), dtypes
 
@@ -867,6 +867,70 @@ def a_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, libr
     received = [(server.seen[4][0], server.seen[4][1]) for server in engines]
     assert all(started < arrived and answered < min(server.seen[5][0] for server in engines)
                for arrived, answered in received)
+
+
+def test_a_push_reads_its_export_a_chunk_ahead_of_what_it_sends():
+    """A push's publication is a table read as it is sent (row 4370): its listing and its chunks come
+    from the tensors' specs before any tensor is read, and the broadcast reads each chunk while the one
+    before it sends, never a chunk further ahead, so no more than two chunks are resident, and every
+    tensor goes out once, in the listing's order. The publication casts on its devices and gathers
+    nothing whole (`_published`)."""
+    from collections.abc import Mapping
+
+    from jax.sharding import SingleDeviceSharding
+
+    from dew._coordination import byte_groups
+    from dew.inference.nccl import _read_along
+    from dew.inference.rollouts import _published
+    from dew.interop.safetensors_io import tensor_specs
+
+    source = Pretrained.load(FIXTURE, dtype="float32")
+    published = _published(source, source.variables, jnp.dtype("bfloat16"))
+    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(published.variables))
+    exported = published.export()
+    names = sorted(exported)
+    events: list[tuple[str, int]] = []
+    sizes = {name: int(np.prod(spec.shape)) * np.dtype(spec.dtype).itemsize
+             for name, spec in tensor_specs(exported).items()}
+    chunk = max(sizes.values())
+    # The push's own chunking, from the specs alone.
+    chunks = [[names[at] for at in group] for group in byte_groups(names, chunk, nbytes=sizes.__getitem__)]
+    index = {name: number for number, members in enumerate(chunks) for name in members}
+
+    class Reading(Mapping):
+        def __getitem__(self, name):
+            events.append(("read", index[name]))
+            return exported[name]
+
+        def __iter__(self):
+            return iter(exported)
+
+        def __len__(self):
+            return len(exported)
+
+    class Recording:
+        def broadcast(self, comm, pointer, size, dtype):
+            events.append(("send", len([event for event in events if event[0] == "send"])))
+
+        def ready(self, groups, receives):
+            pass
+
+        def settled(self, groups, receives):
+            events.append(("settled", 0))
+
+    push = NCCLPush(source, ("http://replica",), lambda ordinal: Recording(), chunk=chunk)
+    push._groups["http://replica"] = 0
+    push._broadcast(Recording(), SingleDeviceSharding(jax.devices()[0]), Reading(), chunks, [])
+    sent = [event for event in events if event[0] == "send"]
+    assert len(sent) == len(names) and len(chunks) > 2
+    settles = [position for position, event in enumerate(events) if event[0] == "settled"]
+    for number in range(len(chunks) - 2):
+        # Chunk number + 2 is read only once chunk number has settled.
+        first = next(position for position, event in enumerate(events) if event == ("read", number + 2))
+        assert first > settles[number], (number, events)
+    events.clear()
+    _read_along(Reading(), chunks)
+    assert [event[1] for event in events] == [index[name] for members in chunks for name in members]
 
 
 @pytest.mark.parametrize("asked", ["a replica twice", "no library"])

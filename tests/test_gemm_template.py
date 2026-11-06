@@ -2204,6 +2204,27 @@ def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generati
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, cast=jnp.float64)))
 
 
+def test_two_consumers_tile_streams_blocks_their_copies_share():
+    """A tile's granularity (`_Mosaic._granular`) holds each block a step streams (`_streamed_rows`: the
+    rows' tile's, the matrix's 64-deep block, and the transposed matrix's block of its columns) to its
+    family's consumer shares (`Family.shares_rows`): on cp.async two consumers each copy whole 32-row shares,
+    so 64 and 128 rows split and 32 or 96 do not."""
+    launch, mma = grouped_matmul.MosaicGmm(), bundles.named("mma.sync", jnp.bfloat16)
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    deep = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family="mma.sync")
+    with generation.assumed("sm80"):
+        ba = launch.bind(bf16((512, 256)), bf16((2, 256, 384)), sizes, out_dtype="bfloat16", trans_rhs=False,
+                         interpret=True)
+        transposed = launch.bind(bf16((512, 256)), bf16((2, 384, 256)), sizes, out_dtype="bfloat16",
+                                 trans_rhs=True, interpret=True)
+        assert launch._streamed_rows(ba, deep) == (128, 64)
+        assert launch._streamed_rows(transposed, dataclasses.replace(deep, block_n=96)) == (128, 64, 96)
+    assert all(mma.shares_rows(rows, 2) for rows in (64, 128))
+    assert not any(mma.shares_rows(rows, 2) for rows in (32, 96))
+    assert grouped_matmul.MosaicTgmm()._streamed_rows(None, deep) == (64,)
+
+
 def test_a_tiles_consumers_are_the_count_whose_reads_are_least():
     """The derivation's objective over consumer counts (`mosaic_gpu._reads`): on mma.sync, whose warps load
     their operands' fragments from shared memory, one consumer's 128 x 128 tile reads less a FLOP than two
