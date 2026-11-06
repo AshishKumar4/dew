@@ -875,6 +875,16 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                begins=begins)
 
 
+def _chunked(named, laid: int, heads: int, chunks: int) -> dict[str, np.ndarray]:
+    """Each named backward record `(x, width)`, its stacked parts summed exactly, laid `[N, H, C, width]`
+    over the `laid` chunks its launches lay, the first `chunks` of them."""
+    def chunked(x, width):
+        rows = np.asarray(x, np.float64).reshape(-1, laid * CHUNK, heads * width).sum(0)
+        return rows.reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
+
+    return {name: chunked(x, width) for name, (x, width) in named.items()}
+
+
 def _laid(x: np.ndarray, table: np.ndarray) -> np.ndarray:
     """A row's `[T, ...]` laid a chunk at a time by `table` (`laid_chunks`), `[N C, ...]`: each chunk's
     tokens, its rows past them zero."""
@@ -1420,17 +1430,12 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
     # The chunks the launches lay, of the memories' rows a part (`Run.held` of them stacked).
     laid = np.shape(saved.dh)[0] // (run.held * heads * key_width)
 
-    def chunked(x, width):
-        """A record's stacked parts summed exactly, laid `[N, H, C, width]`."""
-        rows = np.asarray(x, np.float64).reshape(-1, laid * CHUNK, heads * width).sum(0)
-        return rows.reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
-
     named = {"local": (saved.local, value_width), "dv": (saved.dv, value_width), "ds": (saved.ds, CHUNK),
              "dq": (saved.dq, key_width), "dk": (saved.dk, key_width)}
     if delta:
         named |= {"dw": (saved.dw, key_width), "d_l": (saved.d_l, CHUNK),
                   "values": (saved.values, value_width), "keys": (saved.keys, key_width)}
-    records = {name: chunked(x, width) for name, (x, width) in named.items()}
+    records = _chunked(named, laid, heads, chunks)
     dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
     dh = np.asarray(saved.dh, np.float64).reshape(-1, laid, heads, key_width, value_width).sum(0)[:chunks]
     dtypes["entering"] = jnp.dtype(saved.dh.dtype)
@@ -1661,17 +1666,13 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
     key_width, chunks = k.shape[-1], run.chunks
     laid = np.shape(saved.dh)[0] // (heads * key_width)
 
-    def chunked(x, width):
-        rows = np.asarray(x, np.float64).reshape(-1, laid * CHUNK, heads * width).sum(0)
-        return rows.reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
-
     named = {"d_scores": (saved.d_scores, CHUNK), "local": (saved.local, value_width),
              "dv": (saved.dv, value_width), "dq_memory": (saved.dq_memory, key_width),
              "dk_memory": (saved.dk_memory, key_width), "values": (saved.values, value_width),
              "d_system": (saved.d_system, CHUNK), "dq_pairs": (saved.dq_pairs, key_width),
              "dk_pairs": (saved.dk_pairs, key_width), "scores": (scores, CHUNK),
              "kg": (gated_keys, key_width)}
-    records = {name: chunked(x, width) for name, (x, width) in named.items()}
+    records = _chunked(named, laid, heads, chunks)
     dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
     dh = np.asarray(saved.dh, np.float64).reshape(laid, heads, key_width, value_width)[:chunks]
     dtypes["entering"] = jnp.dtype(saved.dh.dtype)
