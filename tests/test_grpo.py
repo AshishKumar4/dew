@@ -218,6 +218,36 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     assert all(rows[IDS_KEY].shape == (4, PROMPT_WIDTH + RESPONSE_WIDTH) for rows in rolled)
 
 
+def test_a_filled_prompt_batchs_repeats_are_neither_admitted_nor_trained_on():
+    """A prompt batch a stream filled out with repeats of its own rows (`FilledBatch`, its last partial
+    batch: `VALID_ROWS` marks the real ones) rolls out and admits a group of each real row alone, where the
+    repeats' groups were admitted and trained on too (row 4408): the scheduler's record counts the real
+    rows' groups, the packed rows hold their responses alone, and a batch of no real row admits none and
+    packs no response."""
+    from dew.batch import VALID_ROWS
+
+    objective = GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
+    state = SimpleNamespace(variables=nn.unbox(objective.init(jax.random.key(0))), step=0, updates=0)
+    records = []
+    rollout = RolloutScheduler.sampled(objective, lambda *args: float(len(args[0]) % 3), groups=2,
+                                       max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0),
+                                       log=records.append)
+    info = len("other")
+    prompts = (np.arange(PROMPT_WIDTH, dtype=np.int32)[None] + np.arange(2)[:, None]) % (VOCAB - 1) + 1
+    filled = np.asarray([0, 1, 0, 1])
+    batch = {PROMPT_KEY: prompts[filled], LENGTH_KEY: np.full(4, PROMPT_WIDTH, np.int32),
+             SOURCE_KEY: np.stack([_utf8("rule", info)] * 4), TRUTH_KEY: np.stack([_utf8("1", info)] * 4),
+             INFO_KEY: np.stack([_utf8("", info)] * 4)}
+    real = np.asarray([True, True, False, False])
+    rolled = rollout(state, {**batch, VALID_ROWS: real}, jax.random.key(1))
+    whole = rollout(state, batch, jax.random.key(1))
+    assert [record.groups for record in records] == [2, 4]
+    responses = [int(np.asarray(rows[RESPONSE_MASK_KEY]).any(axis=1).sum()) for rows in (rolled, whole)]
+    assert responses == [2 * 2, 4 * 2]
+    none = rollout(state, {**batch, VALID_ROWS: np.zeros(4, bool)}, jax.random.key(2))
+    assert records[-1].groups == 0 and not np.asarray(none[RESPONSE_MASK_KEY]).any()
+
+
 K3_SEEDS = 8
 """Check 1's seeds for the k3 estimate at small log ratios, sized by `seeds_for` paired."""
 

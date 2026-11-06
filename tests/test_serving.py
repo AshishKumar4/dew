@@ -1118,6 +1118,55 @@ def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path, page
     assert (reports[1]["shared"] > 0) == paged
 
 
+def drawn_adapter(model, variables, module: str, key: int, layouts=None):
+    """A rank-2 adapter of `module` over `model`, its B drawn from `key` (its init holds B at zero, which
+    adapts nothing), as the adapter-set sites draw each of theirs."""
+    from dew.lora import LoRA
+
+    adapter = LoRA(rank=2, modules=(module,)).apply(model, variables, key=key, layouts=layouts)
+    factors = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                            if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+        adapter.variables["params"])
+    return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+
+
+def test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_rows_adapter():
+    """A speculating server (`Speculative`) over an adapter set whose adapters adapt the stream's input
+    map (`project_in`, which reseeding a block's prediction depths reads, `DecodeOps.embed`) draws each
+    request at zero temperature as the greedy walk under its own adapter, or the base, each block's
+    reseeding under the row's adapter (row 4222's review)."""
+    from dew.lora import AdapterSet
+    from dew.sampling import Sampling, Speculative
+
+    model = decoder().clone(max_seq_len=32, num_nextn_predict_layers=1, embedding_features=8)
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+
+    adapters = AdapterSet.of({"first": drawn_adapter(model, params, "project_in", 1),
+                              "second": drawn_adapter(model, params, "project_in", 2)})
+    served = TextGeneration(adapters.model, adapters.variables, RunProcessor(Digits()),
+                            sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+    server = Server.from_task(served, slots=3, capacity=32)
+    prompts, names = ([1, 2, 3], [7, 8, 9], [4, 5, 6]), ("first", None, "second")
+    tickets = [server.submit(np.asarray([prompt]), 6, key=0, adapter=name)
+               for prompt, name in zip(prompts, names, strict=True)]
+    server.run()
+    walks = []
+    for ticket, prompt, index in zip(tickets, prompts, (0, -1, 1), strict=True):
+        walked = np.asarray([prompt], np.int32)
+        for _ in range(6):
+            scores = adapters.model.apply(adapters.variables, jnp.asarray(walked),
+                                          adapters=jnp.asarray([index], jnp.int32))[:, -1]
+            walked = np.concatenate([walked, np.asarray(scores).argmax(-1)[:, None].astype(np.int32)], axis=1)
+        held = ticket.result().host()
+        # The prompt and the response it drew, which an end of sequence may stop short of six.
+        drawn_to = 3 + int(np.asarray(held.lengths)[0])
+        np.testing.assert_array_equal(np.asarray(held.tokens)[0, :drawn_to], walked[0, :drawn_to])
+        walks.append(walked[0, 3:])
+    # The adapters move the walk: the rows' adapters are what the draws read.
+    assert len({tuple(walk) for walk in walks}) > 1
+
+
 @pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])
 def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
     """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT
@@ -1211,19 +1260,14 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
     from reference_error import as_given, assert_as_exact, seeds_for
 
     from dew.interop.pretrained import Pretrained
-    from dew.lora import AdapterSet, LoRA, selected
+    from dew.lora import AdapterSet
 
     decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
                               dtype="float32", attention_impl="reference")
 
     def drawn(layer: int, key: int):
-        adapter = LoRA(rank=2, modules=(f"layers.{layer}.self_attn.q_proj",)).apply(
-            decoder.model, decoder.variables, key=key, layouts=decoder.layouts)
-        factors = jax.tree_util.tree_map_with_path(
-            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
-                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
-            adapter.variables["params"])
-        return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+        return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
+                             layouts=decoder.layouts)
 
     first, second = drawn(0, 1), drawn(1, 2)
     adapters = AdapterSet.of({"first": first, "second": second})
@@ -1233,8 +1277,8 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
 
     @as_given
     def served(tokens):
-        with selected(jnp.asarray([0, 1], jnp.int32)):
-            return np.asarray(adapters.model.apply(adapters.variables, jnp.asarray(tokens)))
+        return np.asarray(adapters.model.apply(adapters.variables, jnp.asarray(tokens),
+                                               adapters=jnp.asarray([0, 1], jnp.int32)))
 
     def alone(dtype):
         @as_given
@@ -1256,12 +1300,12 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
 
 
 def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
-    """A row naming no adapter of a set (`dew.lora.selected`'s -1) takes no branch: beside a row whose
+    """A row naming no adapter of a set (-1 in the call's `adapters`) takes no branch: beside a row whose
     adapter's factors overflow its update to inf, its logits are the base model's, bit for bit."""
     from pathlib import Path
 
     from dew.interop.pretrained import Pretrained
-    from dew.lora import AdapterSet, LoRA, selected
+    from dew.lora import AdapterSet, LoRA
 
     fixtures = Path(__file__).resolve().parent / "fixtures"
     decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
@@ -1271,11 +1315,54 @@ def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
         lambda leaf: leaf * 1e30, fixture.variables["params"])})
     adapters = AdapterSet.of({"huge": huge})
     tokens = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8]], jnp.int32)
-    with selected(jnp.asarray([0, -1], jnp.int32)):
-        served = adapters.model.apply(adapters.variables, tokens)
+    served = adapters.model.apply(adapters.variables, tokens, adapters=jnp.asarray([0, -1], jnp.int32))
     base = decoder.model.apply(decoder.variables, tokens)
     assert not np.isfinite(np.asarray(served[0])).all()
     np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
+
+
+def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():
+    """An adapter set's decode carries each row's adapter in its state (`DecoderState.adapters`, int32):
+    four prompts prefilled under the set's two adapters and the base (-1), their rows reordered,
+    duplicated and one dropped (`DecodeOps.reindex`, as a fork of a row's draws moves them) and advanced a
+    token, each row's logits are those of its prompt prefilled in that place under its own adapter and
+    advanced alike, bit for bit (row 4222)."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prefill_state
+
+    decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
+                              dtype="float32", attention_impl="reference")
+
+    def drawn(layer: int, key: int):
+        return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
+                             layouts=decoder.layouts)
+
+    adapters = AdapterSet.of({"first": drawn(0, 1), "second": drawn(1, 2)})
+    model, variables = adapters.model, adapters.variables
+    prompts = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8], [3, 7, 11, 15], [6, 2, 9, 4]], jnp.int32)
+    rows = np.asarray([0, 1, -1, 1], np.int64)
+    order = jnp.asarray([2, 0, 0, 3], jnp.int32)
+    following, active = jnp.asarray([17, 19, 21, 23], jnp.int32), jnp.ones((4,), bool)
+    ops = decode_ops(model, variables, 0, None)
+
+    def advanced(tokens, held):
+        return ops.advance(prefill_state(model, variables, ModelInputs(tokens), ops, adapters=held)[0],
+                           following, active)
+
+    state = prefill_state(model, variables, ModelInputs(prompts), ops, adapters=rows)[0]
+    assert state.adapters is not None and state.adapters.dtype == jnp.int32
+    moved = ops.reindex(state, order)
+    assert moved.adapters is not None and moved.adapters.tolist() == [-1, 0, 0, 1]
+    stepped = ops.advance(moved, following, active)
+    expected = advanced(prompts[order], rows[np.asarray(order)])
+    np.testing.assert_array_equal(np.asarray(stepped.logits), np.asarray(expected.logits))
+    # The rows' adapters change what they compute: the base row's prompt under the first adapter differs.
+    under = advanced(prompts[order], np.asarray([0, 0, 0, 1]))
+    assert not np.array_equal(np.asarray(under.logits[0]), np.asarray(stepped.logits[0]))
 
 
 @pytest.mark.mesh(devices=4)
