@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import numpy as np
@@ -15,6 +16,9 @@ import numpy as np
 from dew._coordination import read_home
 from dew.batch import Variables, merge, thaw
 from dew.nn.protocols import BankedStacks, StagedStacks
+
+if TYPE_CHECKING:
+    from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def group_name(first: int, count: int) -> str:
@@ -187,3 +191,53 @@ def _at(tree, namespace: tuple[str, ...], convert):
     if not isinstance(tree, Mapping) or namespace[0] not in tree:
         return tree
     return {**tree, namespace[0]: _at(tree[namespace[0]], namespace[1:], convert)}
+
+
+def fixed_router_owners(model: CausalTransformer) -> Mapping[str, Callable[[tuple[str, ...]], bool]]:
+    """A decoder's routers whose expert weights are fixed whatever they score, which no term of a plain
+    loss reaches (`CausalTransformer.fixed_routers`; `Mixture.fixed_weights`, `ValueExperts.fixed_weights`),
+    each by name and whether a parameter, by its layers' names in the model's own tree, is its: its
+    feed-forward's mixture (its sparse
+    layers' `mlp`, and a prediction depth's routed as its last layer), an MLP mixer's of a layer kind
+    (its layers' mixer slot, a prediction depth's or the drafter's of that kind, and the depths'
+    feed-forward kind's `mlp`), its value experts' (`v_router`); each under its score projection's
+    own scope (`Mixture.router_scope`)."""
+    from dew.nn.mixers.mlp import MLPMixer
+
+    types = model.per_layer_types
+    predicting = ("mtp_", "dspark_")
+
+    def held(layers: set[int], slot: str, scope: str, *, depths: bool):
+        def owns(path: tuple[str, ...]) -> bool:
+            run = group_layers(path[0]) if path else None
+            site = ((run is not None and bool(layers & set(run)))
+                    or (depths and path[0].startswith(predicting)))
+            return site and slot in path[1:] and scope in path[1:]
+        return owns
+
+    fixed: dict[str, Callable[[tuple[str, ...]], bool]] = {}
+    mixture = model.mixture
+    if mixture is not None and mixture.fixed_weights:
+        # A prediction depth routes like the last layer where no feed-forward kind is named.
+        # A parallel mixture's branch is the block's `moe` beside its dense `mlp`.
+        fixed["mixture"] = held(set(model.sparse_layers), "moe" if mixture.parallel else "mlp",
+                                mixture.router_scope(model.mlp),
+                                depths=model.mtp_feedforward_type is None
+                                and model.num_layers - 1 in model.sparse_layers)
+    feeding = model.mtp_feedforward_type if model.num_nextn_predict_layers else None
+    kinds = {**model.layer_kinds(types), **({} if feeding is None else {feeding: model.kind_of(feeding)})}
+    # The kinds whose mixer a prediction depth or the drafter builds (`_prediction_depths`).
+    mixing = ({model.prediction_kind(types)} if model.num_nextn_predict_layers else set()) | (
+        set() if model.dspark is None else {model.dspark.layer_type})
+    for name, kind in kinds.items():
+        mixer = kind.mixer or model.mixer
+        if isinstance(mixer, MLPMixer) and mixer.mixture is not None and mixer.mixture.fixed_weights:
+            scope = mixer.mixture.router_scope(mixer.activation)
+            trunk = held({index for index, layer in enumerate(types) if layer == name}, "self_attn",
+                         scope, depths=name in mixing)
+            depth = held(set(), "mlp", scope, depths=name == feeding)
+            fixed[f"the {name} layers' MLP mixer"] = lambda path, trunk=trunk, depth=depth: (
+                trunk(path) or depth(path))
+    if model.value_experts is not None and model.value_experts.fixed_weights:
+        fixed["value_experts"] = held(set(model.sparse_layers), "v_router", "v_router", depths=True)
+    return fixed
