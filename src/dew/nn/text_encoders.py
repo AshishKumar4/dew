@@ -129,7 +129,9 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
         CausalSelfAttention, ctx=MixerContext(
             emb_features=width, num_heads=heads, num_kv_heads=heads if kv_heads is None else kv_heads,
             head_dim=head_dim, max_seq_len=positions, causal=causal, qk_norm=qk_norm, wide_logits=wide_logits,
-            attention_bias=attention_bias, **({} if eps is None else {"norm_eps": eps}),
+            # The context's own epsilon where the block's norms take their input's: no query or key norm
+            # reads it (refused above).
+            attention_bias=attention_bias, norm_eps=MixerContext.norm_eps if eps is None else eps,
             scale_after_cast=scale_after_cast,
             rope_theta=rope_theta,
             # A window keeps the keys within `window` places: |q - k| < window + 1 (`window_sides`).
