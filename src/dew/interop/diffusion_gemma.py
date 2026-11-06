@@ -275,16 +275,27 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
     return config
 
 
-def _refuse_unreadable(config: Mapping[str, object]) -> None:
-    """The published implementation, transformers' DiffusionGemmaForBlockDiffusion
-    (5.16.1), builds a routed mixture on every layer and a vision tower: a
-    config without `text_config.num_experts` or `vision_config` is one it
-    cannot build (modeling_diffusion_gemma.py:616, 1019), so files written in
-    its layout would be read by no one."""
+def publishable(model: DiffusionGemma) -> bool:
+    """Whether transformers' DiffusionGemmaForBlockDiffusion can build the config `model` publishes
+    (`_unbuildable`): a block decoder with none of what it requires exports as its run's native release
+    (`dew.inference.models.write_run_release`)."""
+    return not _unbuildable(published_config(model))
+
+
+def _unbuildable(config: Mapping[str, object]) -> list[str]:
+    """What `config` lacks of what the published implementation, transformers'
+    DiffusionGemmaForBlockDiffusion (5.16.1), builds: a routed mixture on every layer and a vision tower
+    (modeling_diffusion_gemma.py:616, 1019), so files written in its layout without them would be read by
+    no one."""
     text = config.get("text_config")
-    missing = [name for name, present in (
+    return [name for name, present in (
         ("text_config.num_experts", isinstance(text, Mapping) and text.get("num_experts")),
         ("vision_config", config.get("vision_config"))) if not present]
+
+
+def _refuse_unreadable(config: Mapping[str, object]) -> None:
+    """Refuse a config transformers' class cannot build (`_unbuildable`)."""
+    missing = _unbuildable(config)
     if missing:
         raise ValueError(
             f"this DiffusionGemma has no {' or '.join(missing)}, and transformers' "

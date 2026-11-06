@@ -3,7 +3,6 @@ control policy and a DreamerV3 agent, objectives with no inference task of their
 their run's record states and load back as the model and weights the run trained, where their checkpoints
 recorded no declaration and `SavedRun.at` refused them."""
 
-import json
 from pathlib import Path
 
 import jax
@@ -15,7 +14,7 @@ from run_kinds import jepa, trained
 from test_env_runs import TEACHER, student, teacher_run
 
 from dew.checkpoints import Checkpoints
-from dew.config.release import RELEASE_FILE, Release
+from dew.config.release import Release
 from dew.inference.loading import pipeline
 from dew.inference.tasks import SavedRun
 from dew.interop.saved_sources import export_run
@@ -52,11 +51,9 @@ def test_a_jepa_run_exports_and_loads_as_its_encoder(tmp_path):
                                    stored(tmp_path / "runs" / "encoder", ema=True).items()
                                    if "context_encoder" in tree})
     export_run(run, tmp_path / "release", ema=True)
-    release = Release.load(tmp_path / "release")
-    assert release is not None and release.task is not None
-    assert release.task["objective"].endswith("JepaObjective") and release.task["settings"] == {}
     again = pipeline(str(tmp_path / "release"))
     assert isinstance(again, SavedModel) and again.model == loaded.model
+    assert again.objective is loaded.objective and again.settings == loaded.settings
     assert_same(again.variables, loaded.variables)
     sample = jnp.ones((2, 16, 16, 3))
     indices = jnp.arange(4, dtype=jnp.int32)[None].repeat(2, 0)
@@ -80,8 +77,6 @@ def test_a_control_policy_run_exports_with_the_observation_policy_it_acts_by(tmp
     assert loaded.settings == ControlSettings(observation_size=TEACHER, reads=("teacher",))
     assert_same(loaded.variables, stored(directory, ema=False))
     export_run(run, tmp_path / "policy", ema=False)
-    assert json.loads((tmp_path / "policy" / RELEASE_FILE).read_text())["task"]["settings"] == {
-        "observation_size": TEACHER, "reads": ["teacher"]}
     again = pipeline(str(tmp_path / "policy"), param_dtype="auto")
     assert isinstance(again, SavedModel) and again.settings == loaded.settings
     observation = jnp.linspace(-1.0, 1.0, 3 * again.settings.observation_size).reshape(3, -1)
@@ -120,7 +115,7 @@ def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_no
     """A native release stores its weights in the `param_dtype` a load asks, as every task's load does,
     and computes in the `dtype` it asks where its model declares one: a control policy, which declares
     none (its rollouts' actions are float32 throughout), is refused a bfloat16 compute. A record that
-    names no objective (a source's own files) is no native release: `SavedModel.from_pretrained` of it is
+    states no run (a source's own files) is no native release: `SavedModel.from_pretrained` of it is
     refused."""
     from dew.inference.models import SavedModel
 
@@ -131,10 +126,9 @@ def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_no
             if jnp.issubdtype(leaf.dtype, jnp.floating)} == {jnp.dtype(jnp.bfloat16)}
     with pytest.raises(ValueError):
         pipeline(str(tmp_path / "policy"), dtype="bfloat16")
-    # Its parameters' storage is no compute of its: exported again, it states none, and reloaded it acts
-    # on float32 observations in float32.
+    # Its parameters' storage is no compute of its: exported again and reloaded, it acts on float32
+    # observations in float32.
     half.save_pretrained(tmp_path / "again")
-    assert json.loads((tmp_path / "again" / RELEASE_FILE).read_text())["task"]["dtypes"] == {}
     again = pipeline(str(tmp_path / "again"))
     observation = jnp.ones((2, again.settings.observation_size), jnp.float32)
     assert {leaf.dtype for leaf in jax.tree.leaves(again.model.apply(again.variables, observation))

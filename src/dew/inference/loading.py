@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.distributed.placement import Layout, MeshSpec
+    from dew.inference.tasks import SavedRun
 
 
 def pipeline(
@@ -120,13 +121,13 @@ def pipeline(
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
     if root.is_dir() and released_model(root):
         if revision is not None or (options is not None and options != SourceOptions()) or (
-                precision is not None):
-            raise ValueError("a native model release records its own model and numerics: `dtype` and "
+                precision is not None) or ema is not None:
+            raise ValueError("a native release records its own model, numerics and average: `dtype` and "
                              "`param_dtype` are what a load may set of them")
-        from dew.inference.models import SavedModel
+        from dew.inference.models import ReleasedRun
 
-        return SavedModel.from_pretrained(str(root), mesh=mesh, layout=layout, dtype=dtype,
-                                          param_dtype=None if param_dtype == "auto" else param_dtype)
+        return _from_saved(ReleasedRun.of(str(root)), mesh=mesh, layout=layout, dtype=dtype,
+                           param_dtype=None if param_dtype == "auto" else param_dtype, ema=None)
     if precision is not None and (dtype is not None or param_dtype is not None):
         raise ValueError("precision sets a source's dtype and param_dtype; pass the numerics or the dtypes, "
                          "not both")
@@ -136,12 +137,12 @@ def pipeline(
 
 
 def released_model(root: epath.Path) -> bool:
-    """Whether `root` holds a native model release (`SavedModel.save_pretrained`): a release record that
-    names the objective that trained it, which a source's own files never state."""
+    """Whether `root` holds a native release (`dew.inference.models.write_run_release`): a release record
+    that states the run it was written of, which a source's own files never state."""
     from dew.config.release import Release
 
     release = Release.load(str(root))
-    return release is not None and release.task is not None and "objective" in release.task
+    return release is not None and release.task is not None and "run" in release.task
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
@@ -152,7 +153,14 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
     again."""
     from dew.inference.tasks import SavedRun
 
-    run = SavedRun.pinned(str(root), step, trust)
+    return _from_saved(SavedRun.pinned(str(root), step, trust), mesh=mesh, layout=layout, dtype=dtype,
+                       param_dtype=param_dtype, ema=ema)
+
+
+def _from_saved(run: SavedRun, *, mesh: MeshSpec | Mesh | None, layout: Layout | None, dtype: str | None,
+                param_dtype: str | None, ema: bool | None) -> SavedTask:
+    """The task `run`'s recorded objective declares (`Objective.saved_task`), built from it: a run's pinned
+    step or a release of one (`ReleasedRun`)."""
     task = run.objective.saved_task
     if task is None:
         raise TypeError(f"a run of {run.objective.__name__} loads as no task: its class declares no "

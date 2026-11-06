@@ -19,28 +19,28 @@ model beside other networks (a JEPA encoder beside its predictor) selects.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, ClassVar, Self
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew._records import json_value, record as named_fields, text as named
+from dew._records import integer, json_value, record as named_fields
 from dew.batch import PARAMETER_ROOTS, Variables
-from dew.inference.tasks import SavedRunTask, saved_model, saved_settings
+from dew.inference.tasks import SavedRun, SavedRunTask, saved_model, saved_settings
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, flatten, read_weights, save_sharded, unflatten
 from dew.nn.precision import Numerics
-from dew.nn.protocols import ComputesIn
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
+    from etils import epath
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
 
     from dew.distributed.placement import Layout, MeshSpec
-    from dew.inference.tasks import SavedRun
     from dew.objectives.base import Objective, SavedTask
 
 
@@ -90,57 +90,96 @@ class SavedModel(SavedRunTask):
                         param_dtype: DTypeLike | None = None) -> Self:
         """The model the release in `directory` states (`save_pretrained`), its weights read from the
         safetensors beside it and placed on `mesh` under `layout`, computing in `dtype` and stored in
-        `param_dtype` where given."""
+        `param_dtype` where given: its run's step as the release holds it (`ReleasedRun`)."""
+        return cls.from_saved(ReleasedRun.of(directory), mesh=mesh, layout=layout, dtype=dtype,
+                              param_dtype=param_dtype)
+
+    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        """Write this model as its run's native release (`write_run_release`): its variables as safetensors
+        and, in the release record, the inference declaration a run of its objective records of it (its
+        model, its settings and the numerics it traced under), which `from_pretrained` rebuilds it from."""
+        from dew.registry import ModelConfig, import_path, record_fields, to_record
+
+        record = {"objective": import_path(self.objective),
+                  "model": to_record(ModelConfig.from_model(self.model), ModelConfig),
+                  **record_fields(self.settings, type(self.settings)),
+                  **({} if self.numerics is None else {"precision": to_record(self.numerics, Numerics)})}
+        written(self.variables, record, 0, (), directory, max_shard_size=max_shard_size)
+
+
+@dataclass(frozen=True)
+class ReleasedRun(SavedRun):
+    """A run's step as its native release holds it (`write_run_release`): the step's inference declaration
+    and the files its task keeps by the step, read from the release's directory, and its variables from the
+    safetensors beside them, the average its export chose. Every task loads it as it loads its run
+    (`SavedRunTask.from_saved`), so a release reads as the run it was written of."""
+
+    @classmethod
+    def of(cls, directory: str | Path) -> Self:
+        """The run step the release in `directory` holds; a directory that holds none is refused."""
         from dew.config.release import Release
-        from dew.inference.loading import place
-        from dew.registry import ModelConfig, dtype_name, from_record, objectives, resolve_dtype
+        from dew.inference.tasks import earlier_shapes
 
         release = Release.load(directory)
         task = None if release is None else release.task
-        if task is None or "objective" not in task:
-            raise ValueError(f"{directory} holds no native model release: its release record names no "
-                             "objective (`SavedModel.save_pretrained` writes one)")
-        objective = objectives[named(task["objective"], "objective")]
-        settings = objective.settings
-        if settings is None or not issubclass(settings, ModelSettings):
-            raise TypeError(f"{objective.__name__} records {settings!r} as its task settings, not a "
-                            "ModelSettings: it declares a task of its own")
-        model = ModelConfig.from_dict(named_fields(task["model"], "model")).with_dtype(
-            dtype_name(resolve_dtype(dtype))).build()
-        stored = None if param_dtype is None else jnp.dtype(resolve_dtype(param_dtype))
-        variables = unflatten(read_weights(directory))
-        if stored is not None:
-            # Its parameters stored as asked, its other state as written, as a run's load stores them
-            # (`PARAMETER_ROOTS`, `Checkpoints.materialized`).
+        if task is None or "run" not in task:
+            raise ValueError(f"{directory} holds no native release: its release record states no run "
+                             "(`dew export` of a run writes one)")
+        return cls.declared(str(directory), earlier_shapes(named_fields(task["run"], "run")),
+                            integer(task["step"], "step"))
+
+    def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
+                  layout: Layout | None = None, param_dtype: DTypeLike | None = None,
+                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
+        """The release's variables, placed on `mesh` under `layout`, the collections `parameter_roots` names
+        stored in `param_dtype` where given and the others as written, as a run's load stores them
+        (`Checkpoints.materialized`). It holds the one average its export chose: an `ema` asked is
+        refused."""
+        from dew.inference.loading import place
+        from dew.registry import resolve_dtype
+
+        if ema is not None:
+            raise ValueError("a release holds the weights its export chose (`dew export --ema`); load the "
+                             "run itself to choose its average")
+        variables = unflatten(read_weights(self.directory))
+        if param_dtype is not None:
+            stored = jnp.dtype(resolve_dtype(param_dtype))
             variables = {name: jax.tree.map(lambda leaf: leaf.astype(stored) if jnp.issubdtype(
-                leaf.dtype, jnp.floating) else leaf, part) if (name,) in PARAMETER_ROOTS else part
+                leaf.dtype, jnp.floating) else leaf, part) if (name,) in parameter_roots else part
                          for name, part in variables.items()}
-        numerics = None if task.get("numerics") is None else from_record(
-            Numerics, named_fields(task["numerics"], "numerics"), dtypes=False)
-        return cls(model, place(variables, mesh, layout),
-                   from_record(settings, named_fields(task.get("settings", {}), "settings"), dtypes=False),
-                   objective, numerics)
+        return place(variables, mesh, layout)
 
-    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write this model as a release: its variables as safetensors, `<collection>/<path>` the name of
-        each leaf, read home a tensor at a time (`save_sharded`), and the release record beside them
-        (`dew.config.Release`): the objective that trained it, its model's record and settings, and the
-        numerics and the dtype it states it computes in, which `from_pretrained` rebuilds it from."""
-        from dew.config.release import Release
-        from dew.registry import ModelConfig, dtype_name, import_path, record_fields, to_record
 
-        root = Path(directory)
-        root.mkdir(parents=True, exist_ok=True)
-        # The dtype the model states it computes in, which its record holds too; one that states none
-        # computes in what its inputs and parameters make, which no record of its storage says.
-        compute = self.model.dtype if isinstance(self.model, ComputesIn) else None
-        save_sharded(flatten(self.variables), root, max_shard_size)
-        Release(task={
-            "objective": import_path(self.objective),
-            "model": json_value(to_record(ModelConfig.from_model(self.model), ModelConfig), "model"),
-            "settings": json_value(record_fields(self.settings, type(self.settings)), "settings"),
-            "numerics": None if self.numerics is None else to_record(self.numerics, Numerics),
-            "dtypes": {} if compute is None else {"compute": dtype_name(compute)}}).write(root)
+def write_run_release(run: SavedRun, destination: str | Path, *, ema: bool | None,
+                      mesh: MeshSpec | Mesh | None, layout: Layout | None) -> None:
+    """Write `run`'s step as its native release in `destination`: the variables its tasks read
+    (`SavedRun.variables`, its average where `ema`) as safetensors, the files its task keeps by the step
+    (`step_records`) at their places, and its inference declaration in the release record, which
+    `ReleasedRun` reads back. The export of a run whose model no family's source layout states
+    (`Pretrained.publishes`), a model's own (`SavedModel.save_pretrained`) among them."""
+    from dew.interop.saved_sources import step_records
+
+    records = step_records(json_value(run.record, "artifact"), run.directory, run.step)
+    written(run.variables(ema=ema, mesh=mesh, layout=layout), run.record, run.step,
+            [(path, path.relative_to(run.directory)) for path in records], destination)
+
+
+def written(variables: Variables, record: Mapping[str, object], step: int,
+            records: Sequence[tuple[epath.Path, PurePath]], destination: str | Path, *,
+            max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+    """A native release in `destination`: `variables` as safetensors, `<collection>/<path>` the name of each
+    leaf, read home a tensor at a time (`save_sharded`), each of `records` copied to its place, and the
+    release record of the run `record` declares at `step` (0 for a model released outside a run), whose
+    model states the dtype it computes in."""
+    from dew.config.release import Release
+
+    root = Path(destination)
+    root.mkdir(parents=True, exist_ok=True)
+    save_sharded(flatten(variables), root, max_shard_size)
+    for source, place in records:
+        (root / place).parent.mkdir(parents=True, exist_ok=True)
+        (root / place).write_bytes(source.read_bytes())
+    Release(task={"run": json_value(record, "run"), "step": step}).write(root)
 
 
 class ReleasesModel:
@@ -156,4 +195,4 @@ class ReleasesModel:
         """The facts a loader cannot read off the model: none, unless the objective states some."""
         return ModelSettings()
 
-__all__ = ["ModelSettings", "ReleasesModel", "SavedModel"]
+__all__ = ["ModelSettings", "ReleasedRun", "ReleasesModel", "SavedModel", "write_run_release"]

@@ -52,14 +52,17 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                publishes: bool = True) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release, its EMA
-    weights where `ema`: a task's own released layout (`ReleasedTask`), or the model in its family's
-    source layout (`Pretrained.from_saved`). Its weights restore where `mesh` and `layout` place them,
+    weights where `ema`: a task's own released layout (`ReleasedTask`), the model in its family's
+    source layout where one states it (`Pretrained.publishes`), or else the run's native release, its
+    step's declaration and variables, which `dew.pipeline` loads as the run (`write_run_release`). Its
+    weights restore where `mesh` and `layout` place them,
     so no device holds more of them than a load does, and the writer reads them home a tensor at a time
     as it writes them, one shard of the release at a time (`save_sharded`). On a pool every process
     runs this same writer, reading each tensor that spans the pool's processes home together
     (`reading_home`), so each host holds a shard of the release, not the model (ledger 2874). One that
     does not `publish` reads every tensor as the one that does and writes no weights to `destination`,
     only the release's small files."""
+    from dew.inference.models import write_run_release
     from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
 
@@ -68,10 +71,13 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
         released = task.from_saved(run, ema=ema, mesh=mesh, layout=layout)
         with reading_home("saved run export", writes=publishes):
             released.save_pretrained(str(destination))
-    else:
+    elif Pretrained.publishes(run):
         bundle = Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout)
         with reading_home("saved run export", writes=publishes):
             bundle.save(destination)
+    else:
+        with reading_home("saved run export", writes=publishes):
+            write_run_release(run, destination, ema=ema, mesh=mesh, layout=layout)
 
 
 def is_saved_run(name_or_dir: str | Path) -> bool:

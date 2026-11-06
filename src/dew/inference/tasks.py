@@ -379,6 +379,14 @@ class SavedRun:
         if record is None:
             raise ValueError("this checkpoint's objective declares no inference record; declare "
                              "Objective.inference_record, or call objective.pipeline(state)")
+        return cls.declared(str(directory), record, step)
+
+    @classmethod
+    def declared(cls, directory: str, record: Mapping[str, object], step: int) -> Self:
+        """The step `step` of the run in `directory` whose inference declaration is `record`, in the shapes
+        Dew writes now (`earlier_shapes`), refused where it describes no model or records fields its
+        objective does not write: the one check of a declaration, a run's (`at`) and a release's
+        (`dew.inference.models.ReleasedRun`)."""
         if 'unrecorded' in record:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
         objective = declared_objective(record)
@@ -387,7 +395,7 @@ class SavedRun:
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
-        return cls(str(directory), record, step)
+        return cls(directory, record, step)
 
     @property
     def objective(self) -> type[Objective]:

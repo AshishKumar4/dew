@@ -370,6 +370,24 @@ class Pretrained:
 
         return cls.from_saved(SavedRun.pinned(str(directory), step, trust), ema=ema)
 
+    @staticmethod
+    def publishes(run: SavedRun) -> bool:
+        """Whether a family's source layout states `run`'s model (`from_saved`): a causal decoder's, or a
+        block decoder's that transformers' class builds (`diffusion_gemma.publishable`). The export of any
+        other run is its native release (`dew.inference.models.write_run_release`)."""
+        from dew.inference.tasks import saved_model
+        from dew.registry import models
+
+        model_config = saved_model(run.record, None)
+        trained = models[model_config.name]
+        if trained is CausalTransformer:
+            return True
+        if trained is models["diffusion_gemma"]:
+            from dew.interop import diffusion_gemma
+
+            return diffusion_gemma.publishable(from_record(DiffusionGemma, model_config.fields))
+        return False
+
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
                    layout: Layout | None = None) -> Self:
