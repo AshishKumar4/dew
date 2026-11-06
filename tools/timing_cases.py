@@ -59,7 +59,8 @@ def dense(cell: dict, implementation: str) -> tuple:
     x = jnp.asarray(rng.normal(size=(TOKENS, width_in)), jnp.bfloat16)
     w = jnp.asarray(rng.normal(size=(width_in, width_out)) / np.sqrt(width_in), jnp.bfloat16)
     dy = jnp.asarray(rng.normal(size=(TOKENS, width_out)), jnp.bfloat16)
-    chosen = generation.chosen() if implementation == "xla" else generation.chosen(grouped_matmul=implementation)
+    chosen = (generation.chosen() if implementation == "xla"
+              else generation.chosen(grouped_matmul=implementation))
     with chosen:
         compiled = jax.jit(_products(implementation)[cell["product"]]).lower(x, w, dy).compile()
     return compiled, lambda index: (x, w, dy)

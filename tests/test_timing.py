@@ -93,8 +93,8 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
 
 
 def test_the_dense_cells_build_every_product_for_each_implementation_on_the_cpu():
-    """The dense builder's cells compile on the CPU through XLA's dot (a GPU's own launches are its window's), and
-    every product's draw meets its call."""
+    """The dense builder's cells compile on the CPU through XLA's dot (a GPU's own launches are its window's),
+    and every product's draw meets its call."""
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("timing_cases", TIMING.with_name("timing_cases.py"))
