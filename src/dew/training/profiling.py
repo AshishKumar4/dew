@@ -35,7 +35,11 @@ class ProfileWindow:
     """A request for one profiler window per fit.
 
     It traces `steps` steps into `directory` after `warmup` steps have run and the
-    run's first step has compiled, so the trace shows the loop and not the compile.
+    run's first step has compiled, so the trace shows the loop and not the compile, and it holds the
+    training steps alone: work between them (an evaluation, a checkpoint save, a compile, an observer, a
+    cooldown branch) runs outside its capture, which starts again at the next step's read, so a window
+    that spans such work writes a capture of each run of its steps
+    (`dew.training._fit.FitRun.outside_window`).
     A fit under JAX's AutoPGLE, which profiles programs in sessions of its own,
     refuses a window (`PGLE_CAPTURE`).
 
