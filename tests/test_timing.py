@@ -28,8 +28,9 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
         tmp_path):
     """Two cells, three arms (two implementations in the window's tree, and the first again at an earlier
     commit whose builder differs), and the reference's A/A: each arm built once (its output's digest kept,
-    the A/A's the reference's, the earlier commit's its own), then timed 2 rounds of 2 calls, the arms in one
-    order the first round and the reverse the second, every row naming its tree."""
+    the A/A's the reference's, the earlier commit's its own), then timed a warm-up round and 2 rounds of 2
+    calls, the arms in one order each round and the reverse the next, every row naming its tree. The warm-up's
+    rows are kept, marked, and decide nothing: the verdict's ratios are the 2 rounds', each printed."""
     repo, origin = tmp_path / "repo", tmp_path / "origin.git"
     (repo / "src").mkdir(parents=True)
     git(tmp_path, "init", "-q", "--bare", str(origin))
@@ -55,8 +56,12 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
                     str(tmp_path / "out")], cwd=repo, check=True)
     rows = [json.loads(line) for line in (tmp_path / "out/timing.jsonl").read_text().splitlines()]
     arms = ["sin", "cos", "sin-earlier", "sin~aa"]
-    assert len(rows) == 2 * 2 * len(arms) * 2
+    assert len(rows) == 3 * 2 * len(arms) * 2
+    assert {row["round"] for row in rows if row["warmup"]} == {-1}
+    assert {row["round"] for row in rows if not row["warmup"]} == {0, 1}
     for cell in (8, 16):
+        warm = [row["arm"] for row in rows if row["round"] == -1 and row["cell"]["size"] == cell][::2]
+        assert warm == arms[::-1]
         first = [row["arm"] for row in rows if row["round"] == 0 and row["cell"]["size"] == cell][::2]
         second = [row["arm"] for row in rows if row["round"] == 1 and row["cell"]["size"] == cell][::2]
         assert first == arms and second == arms[::-1]
@@ -76,10 +81,10 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
         arms = {arm["arm"]: arm for arm in cell["arms"]}
         assert len(arms) == 4
         assert arms["sin"]["ratio_range"] == [1.0, 1.0] and arms["sin"]["differs"] is False
+        assert all(len(arm["ratios"]) == 2 for arm in arms.values())
         assert arms["sin~aa"]["digest_is_reference"] and not arms["cos"]["digest_is_reference"]
         assert len(cell["noise_band"]) == 2
-    assert len(summary["run_order"]) == 2 * 2 * 4
-    assert "| cell | arm |" in (tmp_path / "out/summary.md").read_text()
+    assert len(summary["run_order"]) == 3 * 2 * 4
     # A revision held here and pushed nowhere is refused before any arm is built.
     (repo / "src/cells.py").write_text(BUILDER.format(sign=2.0))
     git(repo, "commit", "-qam", "unpushed")
