@@ -345,6 +345,13 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             carry = lax.fori_loop(lo, hi, body, carry)
         return carry
 
+    def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
+                    walk: Callable[..., R], *, between=None) -> R:
+        # One role a core: no partner reads a step it passes, so it walks its own steps alone.
+        del views, wg, between
+        lo, hi = own
+        return walk(streams, lo, hi, streamed[0])
+
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         # Its walk copies only the steps it reads: a passed step loads nothing.
         del streams, lo, hi, first
