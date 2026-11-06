@@ -1809,6 +1809,15 @@ class CausalTransformer(LinearProducts):
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         banked = self.banked_collections()
+        allocating = not any(group_layers(name) for name in self.variables.get('cache', {}))
+        if decode and 'params' in banked and allocating:
+            # A decode over a store banked by run keeps the cache its layers allocate banked as the store
+            # keeps the weights, each run's layers one array under the run's name, as the run's scan carries
+            # it: every later call reads and writes it there, where a cache kept a layer at a time is
+            # stacked into the run's bank and cut apart again each call (at Qwen3-30B-A3B's layer shape, 8
+            # layers of 64 rows of 512 slots on an H100, 371 and 317 us a step, OM-1342-cache-base-2474a6e4c).
+            # A cache handed in a layer at a time goes back so.
+            banked = (*banked, 'cache')
         if stages == 1:
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
@@ -1961,8 +1970,10 @@ class CausalTransformer(LinearProducts):
         variables = {}
         for collection, tree in self.variables.items():
             if collection in banked:
-                variables[collection] = jax.tree.map(
-                    functools.partial(shapes, drop=stacked), tree[first])
+                # A banked cache holds no entry for a first layer that caches nothing.
+                if first in tree:
+                    variables[collection] = jax.tree.map(
+                        functools.partial(shapes, drop=stacked), tree[first])
                 continue
             held = {}
             if stacked and first in tree:
