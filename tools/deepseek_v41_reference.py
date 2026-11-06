@@ -992,7 +992,7 @@ def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
         RECORDS[:] = [recorded]
         with torch.no_grad():
             reset(net)
-            forward(net, ids)
+            forward(net, ids.to(next(net.parameters()).device))
         RECORDS.clear()
         margins = [call["margin"] for call in recorded.calls.get("selection", [])]
         if all(bool((margin > MARGIN).all()) for margin in margins):
@@ -1043,6 +1043,108 @@ def write_recording(seed: int):
     print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
 
 
+CLOSING = tuple(range(PROMPT, LENGTH, 2))
+"""The prompt lengths after which the release's cached step computes as the paper does: odd, so the step at
+that position closes every ratio-2 group and each Full layer publishes the index keys its Reindex layers read
+(model.py:537-548). A step that closes none reads the keys the last layer to publish left, which Dew does
+not reproduce (src/dew/nn/deepseek_v4.py's `_csa2`), and every later step reads that step's window keys."""
+
+
+def release_model(name: str, kernels):
+    """The pinned model.py as released, nothing of it replaced, loaded under `name` over `kernels` as its
+    `kernel` module: the release's own tilelang kernels on a GPU (`official_kernels`), or the stand-ins
+    (`tools.deepseek_v41_kernels`) for the float64 truth, which the suite holds bit for bit to the kernels'
+    outputs on bf16 input (kernels.npz)."""
+    directory = reference_code()
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+    sys.modules["kernel"] = kernels
+    return loaded(name, directory / "model.py")
+
+
+def release_net(model_module, engram_module, stored: dict, dtype: torch.dtype | None = None):
+    """The fixture's Transformer as the release builds it on CUDA, in bf16 (its `ModelArgs.dtype`) or, with
+    `dtype` float64, its float64 twin inside `widened`: every parameter the fixture's (`stored`, under the
+    release's names) rounded to the dtype the release keeps it in, the twin's then widened, and the engram
+    table's dequantization scales one, the dense table the fixture ships."""
+    args = model_args(model_module, engram_module)
+    with torch.device("cuda"), model_module.set_dtype(dtype or torch.bfloat16):
+        net = model_module.Transformer(args, tokenizer())
+    # The twin's weights float64 where the release keeps them in its storage dtype; its rotary tables are
+    # complex, which `double` leaves as `widened` built them.
+    net = net if dtype is None else net.double()
+    for name, tensor in net.named_parameters():
+        tensor.requires_grad_(requires_grad=False)
+        tensor.copy_(torch.ones_like(tensor) if name.endswith("engram.embed.scale")
+                     else stored[name].to(tensor.dtype))
+    return net
+
+
+def release_outputs(net, ids: torch.Tensor) -> dict[str, np.ndarray]:
+    """The release's logits over `ids` `[2, LENGTH]` as its own entry points compute them: each prefix's
+    prefill's (`Transformer.forward` from position zero, its last position's logits), and the step after
+    each prompt of CLOSING (that prompt's prefill, then one cached `forward` at its next position)."""
+    with torch.no_grad():
+        prefixes, steps = [], []
+        for length in range(1, LENGTH + 1):
+            reset(net)
+            prefixes.append(forward(net, ids[:, :length])[1])
+        for prompt in CLOSING:
+            reset(net)
+            forward(net, ids[:, :prompt])
+            steps.append(forward(net, ids[:, prompt:prompt + 1], prompt)[1])
+    return {"rows": torch.stack(prefixes, 1).double().cpu().numpy(),
+            "walk": torch.stack(steps, 1).double().cpu().numpy()}
+
+
+def write_release_recording():
+    """release.npz beside the fixture, on a CUDA GPU: the release's logits (`release_outputs`) as released,
+    bf16 over its own tilelang kernels and its activation quantizers, and their float64 truth (the same code
+    over the stand-ins, widened), over drawn rows whose every selection the truth's forward clears by the
+    gate's MARGIN (`clearing_rows`, on the twin), summarized over check 1's seeds
+    (`recorded_references.record_case`), and the rows each seed drew (release_rows.npz): the reference
+    tests/test_deepseek_v41.py holds Dew's forward, its variants and its cached walk to (row 354)."""
+    from recorded_references import provenance, record_case, save
+    from safetensors.torch import load_file
+
+    stored = load_file(FIXTURE / "model.safetensors")
+    engram_module = importlib.import_module("engram")
+    native = release_model("deepseek_v41_release", official_kernels())
+    net = release_net(native, engram_module, stored)
+    twin_module = release_model("deepseek_v41_release_float64",
+                                importlib.import_module("tools.deepseek_v41_kernels"))
+    # The twin reads the parameters the release holds, widened.
+    held = {name: tensor.double() for name, tensor in net.state_dict().items()}
+    with widened(twin_module):
+        twin = release_net(twin_module, engram_module, held, torch.float64)
+    install_selection_probe()
+    rows: dict[int, np.ndarray] = {}
+
+    def draw(index: int) -> dict[str, np.ndarray]:
+        if index not in rows:
+            with widened(twin_module):
+                rows[index] = clearing_rows(twin, TINY["vocab_size"], index)
+        return {"input_ids": rows[index]}
+
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs["input_ids"].astype(np.int64)).cuda()
+        found = release_outputs(net, ids)
+        with widened(twin_module):
+            truth = release_outputs(twin, ids)
+        return found, truth
+
+    arrays = record_case("deepseek v41 release", draw, evaluate, summary=True)
+    import tilelang
+
+    written = save(FIXTURE / "release.npz", {**arrays, "provenance": provenance(
+        REPO, DEEPSEEK_V41_REVISION, torch.cuda.get_device_name(),
+        "PYTHONPATH=.:tests:tools <release python> tools/deepseek_v41_reference.py --release",
+        torch=torch.__version__, tilelang=tilelang.__version__)}, reference=f"{REPO}@{DEEPSEEK_V41_REVISION}",
+        license="mit")
+    np.savez(FIXTURE / "release_rows.npz", rows=np.stack([rows[index] for index in range(len(rows))]))
+    print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", nargs="?", choices=("orders",))
@@ -1054,6 +1156,8 @@ def main():
     parser.add_argument("--fp64", action="store_true", help="write the fixture's float64 truth")
     parser.add_argument("--vision", action="store_true", help="write the vision half beside the fixture")
     parser.add_argument("--padding", action="store_true", help="record the rows the lookup leaves untrained")
+    parser.add_argument("--release", action="store_true",
+                        help="record the release as released, its tilelang kernels on CUDA, over seeds")
     parser.add_argument("--record", action="store_true",
                         help="record the plain logits over drawn rows its selections clear, over seeds")
     options = parser.parse_args()
@@ -1075,6 +1179,8 @@ def main():
         write_padding()
     elif options.record:
         write_recording(options.seed)
+    elif options.release:
+        write_release_recording()
     elif options.search:
         search(options.seed, options.search)
     else:
