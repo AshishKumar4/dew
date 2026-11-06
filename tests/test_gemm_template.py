@@ -2120,7 +2120,8 @@ HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
     (jnp.bfloat16, HIGHEST, (jnp.float32,), True, None),
     (jnp.bfloat16, HIGHEST, (jnp.bfloat16,), False, None),
     (jnp.bfloat16, HIGHEST, (jnp.bfloat16, jnp.float32), True, None),
-    (jnp.float16, DEFAULT, (jnp.float32,), False, None),
+    (jnp.float16, DEFAULT, (jnp.float32,), True, None),
+    (jnp.bfloat16, DEFAULT, (jnp.bfloat16,), False, None),
     (jnp.float32, DEFAULT, (jnp.float32,), False, None),
     (jnp.float32, HIGHEST, (jnp.float32,), True, "TF32"),
     (jnp.int8, DEFAULT, (jnp.float32,), False, "int8"),
@@ -2129,9 +2130,9 @@ HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
 ])
 def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, precision, outputs, promoted,
                                                                    refused):
-    """A precision above the default promotes each depth step's partial where an output is fp32, and an
-    FP8 product always (testing.md, FP8 products); the kernels refuse fp32 products above the default
-    (they multiply in TF32) and a dtype they do not multiply in."""
+    """A precision above the default, or 16-bit operands at any (row 4331), promotes each depth step's
+    partial where an output is fp32, and an FP8 product always (testing.md, FP8 products); the kernels refuse
+    fp32 products above the default (they multiply in TF32) and a dtype they do not multiply in."""
     declared = product.declared(compute, precision, outputs=outputs)
     assert declared.promoted is promoted
     assert (declared.refusal is None) is (refused is None)
