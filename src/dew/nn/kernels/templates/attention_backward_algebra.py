@@ -105,14 +105,6 @@ def derived_backward(scale: float, walked: str, hooked: bool = False, dropped: b
                          accurate=accurate, saturation=SATURATION)
 
 
-def backward_derived() -> bool:
-    """Whether the backward's derived forms walk a call (behind the switch, `dew.algebra.forms.derived`), in
-    every form: its recomputation's units (`how`) and its accurate form's anchor test are declared
-    (`softmax_cotangents`), and the accurate form's keyed sums and its cotangents' parts' products are each
-    mainloop's own, through the derived step's `stepped` (`attention_portable._accurate_sums`)."""
-    return algebra.derived_on()
-
-
 def backward_declaration(*, scale: float, walked: str, hooked: bool = False, dropped: bool = False,
                          how: algebra.Recompute = algebra.PLAIN, accurate: bool = False,
                          anchored: bool = False):
