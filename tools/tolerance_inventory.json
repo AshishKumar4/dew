@@ -97,10 +97,6 @@
    "comparisons": 8,
    "lane": "Training"
   },
-  "tests/test_codec_checkpoints.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_codecs.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"

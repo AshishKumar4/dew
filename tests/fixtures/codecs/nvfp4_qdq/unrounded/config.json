@@ -72,7 +72,7 @@
   },
   "sliding_window": null,
   "tie_word_embeddings": true,
-  "transformers_version": "5.16.1",
+  "transformers_version": "5.17.0",
   "use_cache": true,
   "use_sliding_window": false,
   "vocab_size": 96
