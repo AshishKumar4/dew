@@ -56,6 +56,38 @@ def test_a_tpus_place_is_its_slices_workers_and_its_global_rank_on_a_tpu_vm_alon
     assert forced.detected() and forced.joining() == Joining(detection="gketpu")
     assert forced.place() == Joining(None, 8, 6)
     assert _tpu_vm() or not CloudTPU(gke).detected()
+    # An empty addresses path names no GKE worker list, as JAX reads it (`_get_worker_host_names_env_var`).
+    assert not CloudTPU({"TPU_PROCESS_ADDRESSES_PATH": "", "JAX_FORCE_TPU_INIT": "1",
+                         "TPU_SKIP_MDS_QUERY": "1"}).detected()
+
+
+def test_a_gke_tpus_slices_read_through_its_metadata_where_its_environment_names_none():
+    """A GKE TPU slice of one worker whose multislice topology its metadata states, not its environment, is
+    one process of a pool across the slices, as JAX reads MEGASCALE_NUM_SLICES and MEGASCALE_SLICE_ID
+    through the metadata's `tpu-env` (`get_tpu_env_value`), so `dew launch` runs it in place rather than as a
+    pool of its own (review of 4480)."""
+    import http.server
+    import threading
+
+    class Metadata(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"MEGASCALE_NUM_SLICES: '2'\nMEGASCALE_SLICE_ID: '1'\n"
+            found = self.path.endswith("/tpu-env") and self.headers.get("Metadata-Flavor") == "Google"
+            self.send_response(200 if found else 404)
+            self.end_headers()
+            self.wfile.write(body if found else b"")
+
+        def log_message(self, *_):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Metadata)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        worker = CloudTPU({"TPU_WORKER_HOSTNAMES": "w-0", "TPU_WORKER_ID": "0", "JAX_FORCE_TPU_INIT": "1",
+                           "GCE_METADATA_IP": f"127.0.0.1:{server.server_address[1]}"})
+        assert worker.place() == Joining(None, 2, 1)
+    finally:
+        server.shutdown()
 
 
 def test_a_kubernetes_job_is_found_where_jax_can_read_its_api_and_joins_in_jaxs_order():
