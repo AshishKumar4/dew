@@ -101,6 +101,7 @@ refused (`report`), its coverage partial. A target well under CI's keeps tasks s
 
 import argparse
 import ast
+import collections
 import concurrent.futures
 import contextlib
 import dataclasses
@@ -378,7 +379,27 @@ class Reading:
 
     parts: dict[str, bytes] = dataclasses.field(default_factory=dict)
     modules: dict[str, dict[str, bytes] | bytes] = dataclasses.field(default_factory=dict)
+    durations: dict[str, dict[str, float]] | None = None
+    cuts: dict[tuple[str, int], list[list[str]]] = dataclasses.field(default_factory=dict)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+    def cut(self, name: str, count: int) -> list[list[str]]:
+        """Test file `name`'s recorded tests as split.py cuts them into `count` groups (`members`), from the
+        durations record read and parted by file once a reading, and each file's cut once (train 662's plan:
+        3,620 group keys each parsed the whole record, split its every node id, 95 million splits, and read
+        its file's marks again, a minute of its two)."""
+        if self.durations is None:
+            parted: dict[str, dict[str, float]] = collections.defaultdict(dict)
+            for node, seconds in durations_record().items():
+                parted[node.split("::")[0]][node] = seconds
+            self.durations = dict(parted)
+        if (name, count) not in self.cuts:
+            held = sites(name)
+            recorded = {node: seconds for node, seconds in self.durations.get(name, {}).items()
+                        if session.test_name(node) not in held}
+            ordered = sorted(recorded)
+            self.cuts[(name, count)] = session.cut(ordered, [recorded[node] for node in ordered], count)
+        return self.cuts[(name, count)]
 
     def part(self, path: str) -> bytes:
         """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`contents`)."""
@@ -417,7 +438,7 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
     if SITE.fullmatch(split):
         digest.update(split.encode())
     elif split and split != COLLECT:
-        digest.update(split.encode() + json.dumps(members(name, split)).encode())
+        digest.update(split.encode() + json.dumps(members(name, split, reading)).encode())
     return digest.hexdigest()
 
 
@@ -685,15 +706,17 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
     one reading of the inputs (`Reading`)."""
     for each in classes:
         found = recorded(record_key(python, row(python, name, split), each, common), token)
-        if found is not None and fresh(found, name, common, reading):
+        if found is None or found["depends"] is None:
+            continue
+        # The key of the inputs the last run's record names, hashed here once: its own where it is fresh
+        # (`fresh`); else the last run is another commit's, and the key names the green run of exactly these,
+        # kept by it (`green_key`) whatever ran since.
+        key = cache_key(common, name, parsed_row(found["row"]["name"])[2], found["depends"], reading)
+        if found["key"] is not None and found["key"] == key:
             return found
-        # The last run's record is another commit's: its file's inputs, as that run found them, hashed
-        # here, name the green run of exactly these, kept by its key (`green_key`) whatever ran since.
-        if found is not None and found["depends"] is not None:
-            key = cache_key(common, name, split, found["depends"], reading)
-            kept = recorded(green_key(python, row(python, name, split), each, key), token)
-            if kept is not None and kept["key"] == key:
-                return kept
+        kept = recorded(green_key(python, row(python, name, split), each, key), token)
+        if kept is not None and kept["key"] == key:
+            return kept
     return None
 
 
@@ -756,16 +779,13 @@ def durations_record() -> dict[str, float]:
     return json.loads(session.DURATIONS.read_text()) if session.DURATIONS.is_file() else {}
 
 
-def members(name: str, split: str) -> list[str]:
+def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
     """The node ids of test file `name`'s recorded tests that split.py cuts into group `split` ("G/N"):
     the file's entries in the durations record in node-id order, but its check-1 sites', which its groups set
-    aside (`selected`), cut by their seconds (`session.cut`), a shared setup's tests together."""
-    held = sites(name)
-    recorded = {node: seconds for node, seconds in durations_record().items()
-                if node.split("::")[0] == name and session.test_name(node) not in held}
-    ordered = sorted(recorded)
+    aside (`selected`), cut by their seconds (`session.cut`), a shared setup's tests together; as `reading`
+    cuts them, once a reading (`Reading.cut`)."""
     index, count = (int(part) for part in split.split("/"))
-    return session.cut(ordered, [recorded[node] for node in ordered], count)[index - 1]
+    return (Reading() if reading is None else reading).cut(name, count)[index - 1]
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
