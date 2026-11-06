@@ -16,8 +16,7 @@ from run_kinds import KINDS, scalars, trained_by_cli
 
 from dew import registry
 from dew.config import RunConfig, TrainerConfig
-from dew.distributed.placement import Layout
-from dew.mesh import MeshSpec
+from dew.training import Layout, MeshSpec
 
 SUPPRESSED = ("data", "validation")
 """The fields a run's record writes as its chains (`dew.data.records`), which `--set` sets one setting of a
