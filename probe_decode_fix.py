@@ -11,6 +11,8 @@ from dew.nn.kernels import recurrence
 mode = sys.argv[1]
 factor = float(sys.argv[2]) if len(sys.argv) > 2 else 128.0
 reference_only = len(sys.argv) > 3 and sys.argv[3] == "reference"
+if len(sys.argv) > 3 and sys.argv[3] == "reference-forward":
+    recurrence._launched = lambda hooks, operands, *, dtype: recurrence.step_reference(hooks, operands, dtype=dtype)
 original = recurrence.update
 
 def candidate(state, query, key, value, decay, write, *, delta):
