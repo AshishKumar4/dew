@@ -502,10 +502,11 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                     # one-consumer tile's deeper ring past two consumers' rows); one consumer runs alone, a
                     # cluster being two consumers' (`mosaic_gpu.Tiles`).
                     shares = dict.fromkeys((config.block_m // config.warpgroups * consumers, config.block_m))
-                    staged = (dataclasses.replace(config, warpgroups=consumers, block_m=rows_, stages=stages,
-                                                  cluster=config.cluster if consumers > 1 else 1)
+                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, stages=stages,
+                                        cluster=config.cluster if consumers > 1 else 1)
                               for rows_ in shares for stages in range(config.stages, 1, -1))
-                    tile = next((tile for tile in staged if launch.legal(ba, tile, target)), None)
+                    tile = next((tile for tile in staged if tile is not None and launch.legal(ba, tile, target)),
+                                None)
                     if tile is not None:
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
@@ -516,6 +517,14 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                                 {kernel: _model(launch, ba, config)},
                                                 required=launch.legal(ba, config, target)))
     return cases
+
+
+def _replaced(config, **changes):
+    """`config` with `changes`, or None where its tile type refuses them (`mosaic_gpu.Tiles`' own checks)."""
+    try:
+        return dataclasses.replace(config, **changes)
+    except ValueError:
+        return None
 
 
 def _model(launch, ba, config) -> resources.RegisterModel:
