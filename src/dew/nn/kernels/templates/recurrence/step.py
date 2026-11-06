@@ -191,8 +191,9 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
         out = _epilogue(hooks, inputs, token, out, value, exchanged, interpret=interpret)
         for k, entry in enumerate(updated):
             # Held as `recurrence._held` holds it: bf16 rounded stochastically, salted by its key and value.
-            kept = (recurrence.salted_bf16(entry, _key_entry(vectors, token, 1, k), value)
-                    if state_out.dtype == jnp.bfloat16 else entry)
+            # The key's entry laid over the block as the entry is: a scalar's bit cast lowers to no vector.
+            keyed = jnp.zeros_like(entry) + _key_entry(vectors, token, 1, k)
+            kept = recurrence.salted_bf16(entry, keyed, value) if state_out.dtype == jnp.bfloat16 else entry
             token.stored(state_out, kept, k)
         token.stored(out_ref, out)
 
