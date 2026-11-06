@@ -10,7 +10,7 @@ from flax import linen as nn
 from dew import _records
 from dew.interop.weights import in_params
 from dew.nn.activations import HIDDEN_ACT
-from dew.registry import Record
+from dew.registry import Record, towers
 
 from .common import (
     ProjectorBase,
@@ -157,10 +157,11 @@ def translate_lfm3_vl_vision_config(hf_config: Mapping[str, object]) -> Record:
     if vision.get("layer_types"):
         fields["layer_types"] = _records.strings(vision["layer_types"], "layer_types")
     fields["rope_theta"] = rope_base({**vision, "rope_parameters": rope}, Lfm3VlVision.rope_theta, axial=True)
+    record: Record = {"class": "lfm3_vl", "fields": fields}
     # Built here, so a config the value refuses (a cadence of another depth, an unknown kind) is refused
     # as it is read.
-    Lfm3VlVision(**fields)
-    return {"class": "lfm3_vl", "fields": fields}
+    towers.from_record(record)
+    return record
 
 
 def translate_lfm3_vl_projector_config(hf_config: Mapping[str, object], text_width: int) -> Record:

@@ -549,7 +549,7 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     tiny = json.loads((source / "processor_config.json").read_text())["image_processor"]
     (source / "processor_config.json").unlink()
     with run_from("remote_code_reference", "tools") as reference:
-        files = reference.RELEASES["kimi-k25-tiny"][2]
+        files = reference.PROCESSORS["kimi-k25-tiny"][2]
         for file in files:
             shutil.copy(reference.release_file("kimi-k25-tiny", file), source / file)
     released = json.loads((source / "preprocessor_config.json").read_text())
