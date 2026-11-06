@@ -566,10 +566,13 @@ DECODE = Op[AttentionCase]('decode', (
     Kernel[AttentionCase]('cudnn', CUDNN_SUPPORTS),
     Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
+    Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
 ), _decode_preferred, _hosted, DECODE_DECLARED)
 """The selector of a call of few query positions over key lengths (`decodes`): the decode kernel
 (`decode_attention.attend`), cuDNN and the folded xla attention (`folded_attention`), a declared cell's
-kernel first (`DECODE_DECLARED`)."""
+kernel first (`DECODE_DECLARED`); the attention template's decode (`attention_decode.attend`, through
+`attention_route.attend`) where a call or a run's context names it (`generation.chosen(decode='template')`),
+until it measures faster than the decode kernel (rows 4042 to 4045, 4075)."""
 
 
 def decodes(case: AttentionCase) -> bool:
