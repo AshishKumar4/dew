@@ -246,7 +246,9 @@ def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
     def arm(objective, batches):
         return as_given(lambda variables: scored(objective, batches, variables))
 
-    initialized = jax.jit(packed.init)
+    # A draw of every parameter, the backbone's too: `init` alone takes the objective's held checkpoint
+    # as its tree, the same at every seed (`Objective.init`), which leaves check 1 one rounding draw.
+    initialized = jax.jit(lambda key: packed.init(key, variables={}))
     wide = copy.copy(alone)
     wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
                                alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
