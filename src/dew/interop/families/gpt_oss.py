@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict
-from functools import partial
 
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
@@ -19,8 +18,8 @@ from dew.interop.decoder_parts import (
     base_config,
     read_rope,
     refuse,
-    renamed_name,
-    renamed_path,
+    refuse_export,
+    spelled,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -64,7 +63,7 @@ _GPT_OSS_LEAVES: Leaves = {
 def _gpt_oss_export(model: CausalTransformer) -> Mapping[str, object]:
     mixture = model.mixture
     if mixture is None:
-        refuse('mixture', 'GPT OSS needs routed experts')
+        refuse_export('mixture', 'GPT OSS needs routed experts')
     # A plain rotary is written as a plain record: an omitted one reads as the class's YaRN.
     yarn = model.rope_scaling if isinstance(model.rope_scaling, YarnScaling) else None
     rope = ({'rope_type': 'default', 'rope_theta': model.rope_theta} if yarn is None
@@ -80,8 +79,7 @@ GPT_OSS = DecoderFamily(
     'gpt_oss',
     'GptOssForCausalLM',
     _gpt_oss_export,
-    weight_path=partial(renamed_path, (), layer_leaves=_GPT_OSS_LEAVES),
-    export_path=partial(renamed_name, (), layer_leaves=_GPT_OSS_LEAVES),
+    routes=spelled((), layer_leaves=_GPT_OSS_LEAVES),
     preserve_source_layout=False,
     # GptOssConfig's defaults: biased attention, its own norm epsilon and expert geometry, a window,
     # and its YaRN record where a config states none.

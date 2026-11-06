@@ -1,35 +1,21 @@
-"""The environment a `dew launch` process pool starts in.
-
-`jax.distributed.initialize` needs the coordinator's address, the process
-count and this process's rank. A TPU VM, a Slurm step and an Open MPI launch
-leave those in variables jax reads by itself. A plain set of machines leaves
-nothing, so `dew._cli.launch` sets the four variables below on every process
-and `dew.training.runtime.prepare_process` reads them back. This module is
-the contract between the two. It imports only the standard library, so
-neither side pulls in the other's dependencies; `detected_cluster` imports
-jax's cluster detection when it is asked.
+"""The machine a process pool runs on: its GPUs, as the driver counts them, a Slurm step's tasks on this
+node, and whether a process joins a pool at all (`joins_pool`), from the scheduler it runs under
+(`dew.clusters`). It imports only the standard library, so `dew launch` reads it without JAX.
 """
 
 from __future__ import annotations
 
 import ctypes
-import dataclasses
 import logging
 import os
 import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 
+from dew.clusters import COORDINATOR, ClusterEnvironment, Scheduler
+
 _log = logging.getLogger(__name__)
 
-COORDINATOR = "JAX_COORDINATOR_ADDRESS"
-"""host:port of process 0's coordinator service, which jax reads itself."""
-LOCAL_DEVICES = "JAX_LOCAL_DEVICE_IDS"
-"""The accelerators a process takes on its host, which jax reads itself."""
-PROCESS_COUNT = "DEW_PROCESS_COUNT"
-"""How many processes the pool holds; `prepare_process` passes it to jax."""
-PROCESS_ID = "DEW_PROCESS_ID"
-"""This process's rank in the pool; `prepare_process` passes it to jax."""
 PREEMPTED_EXIT = 128 + signal.SIGTERM
 """The exit status of a run stopped at a preemption, SIGTERM's as a shell
 reports it: a scheduler reads a stopped job rather than a finished one, and
@@ -37,45 +23,16 @@ Kubernetes' pod failure policy can ignore it by this code. `Trainer.fit`
 ends with it, and `dew launch` reads a rank's as that rank's preemption."""
 
 
-@dataclasses.dataclass(frozen=True)
-class Cluster:
-    """A cluster jax's own detection finds this process running in."""
-
-    name: str
-    process: int
-    count: int
-
-
-def detected_cluster() -> Cluster | None:
-    """The cluster `jax.distributed.initialize` would take, in jax's own
-    order, which reads Open MPI's ranks before a Slurm step's tasks, and
-    leaving out the opt-in mpi4py method as it does. The launcher and
-    `prepare_process` both ask here, so they cannot disagree on the order."""
-    from jax._src import clusters
-
-    for kind in clusters.ClusterEnv._cluster_types:
-        if not kind.opt_in_only_method and kind.is_env_present():
-            return Cluster(kind.name, kind.get_process_id(), kind.get_process_count())
-    return None
-
-
-def pool_cluster(multi_host: bool | None) -> Cluster | None:
-    """The cluster a process joins a pool through (`detected_cluster`), unless the run asks for none
-    (multi_host=False) or `dew launch` declared the pool itself (PROCESS_COUNT)."""
-    return None if multi_host is False or PROCESS_COUNT in os.environ else detected_cluster()
-
-
-def joins_pool(multi_host: bool | None, cluster: Cluster | None) -> bool:
+def joins_pool(multi_host: bool | None, environment: ClusterEnvironment | None) -> bool:
     """Whether a process joins a pool, read before a backend opens: the run asks for one
-    (multi_host=True), or the environment declares one (`dew launch`, a coordinator, a cluster of
-    `cluster`). A Slurm step of one task forms none unless the run asks, nor any run asking for none."""
-    one_task = (multi_host is None and cluster is not None and cluster.name == "slurm"
-                and cluster.count == 1)
+    (multi_host=True), or the environment declares one (a scheduler's `environment`, `dew launch`'s among
+    them, or a coordinator). A Slurm step of one task forms none unless the run asks, nor any run asking
+    for none."""
+    one_task = (multi_host is None and isinstance(environment, Scheduler) and environment.name == "slurm"
+                and environment.place().process_count == 1)
     if multi_host is False or one_task:
         return False
-    return multi_host is True or cluster is not None or any(
-        name in os.environ for name in (PROCESS_COUNT, COORDINATOR))
-
+    return multi_host is True or environment is not None or COORDINATOR in os.environ
 
 
 def runs_on_gpu(env: Mapping[str, str]) -> bool:

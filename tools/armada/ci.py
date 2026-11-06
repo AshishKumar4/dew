@@ -218,8 +218,8 @@ across the containers of an armada gang."""
 HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
-          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
-          "tools/armada/lifetime.py", "tools/armada/watched.py")
+          "src/dew/_cleanup.py", "tools/armada/split.py", "tools/armada/executed.py",
+          "tools/armada/followed.py", "tools/armada/lifetime.py", "tools/armada/watched.py")
 """The files every test file's key covers whole, beside every lock (a GPU node builds its environment
 from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
 and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
@@ -1693,7 +1693,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         expired, dump = True, dumped(done, stacks)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
-    if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
+    if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
+                                 settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
     # A process of the group still running may yet open a file: no record of this task keeps a key.
     closed = opens.closed()

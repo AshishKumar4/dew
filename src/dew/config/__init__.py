@@ -1466,9 +1466,11 @@ class RunConfig:
     data_seed: int = 0
     """The seed of the data's order and of its random steps."""
     data_plan_version: int | None = None
-    """The data plan version the run reads its order by (`dew.data.plan.PLAN_VERSIONS`): None for this
-    Dew's, which its record holds resolved (`pinned`), so a resume reads the order it read whatever a
-    later Dew's is (`BUILT`); a saved run that recorded none read by version 8 (`earlier_data_plan`)."""
+    """The data plan version the run reads its order by (`dew.data.plan.PLAN_VERSIONS`): None for the
+    saved run's it resumes, or else this Dew's, which `resumed` resolves on every path a run trains by and
+    its record holds, so a resume reads the order it read whatever a later Dew's is (`BUILT`); a saved run
+    that recorded none read by version 8, and one that recorded a `data_plan` of None by 9
+    (`earlier_data_plan`)."""
     source: SourceOptions = dataclasses.field(default_factory=SourceOptions)
     """What the run builds of the source it starts from (`--source.text-only`,
     `--source.prediction-depths`), where it starts from one (`pretrained`)."""
@@ -1844,8 +1846,8 @@ class RunConfig:
         earlier shape of a saved run is (`earlier_run`), and its data plan version, where it resumes no
         run that recorded one, this Dew's (`PLAN_VERSIONS`): the one place a run's version is resolved,
         on each path a run trains by (`prepare`, and `readied`, which a run trained in Python reaches
-        alone), before its data compiles or its record is written. Itself where it resumes none
-        (`TrainerConfig.resumes`) or leaves none to its build."""
+        alone), before its data compiles or its record is written. Its other fields as they are where it
+        resumes no run (`TrainerConfig.resumes`) or leaves none to its build."""
         trainer = self.trainer
         built = self.BUILT if paths is None else paths
         unset = [path for path in built if _holds(self, path) and _recorded_at(self, path) is None]
@@ -2133,7 +2135,7 @@ class RunConfig:
                 # Shown under its own name where one is given, kept under the run's either way.
                 wandb_tracker = WandbTracker(
                     trainer.wandb.project, name if trainer.wandb.name is None else trainer.wandb.name,
-                    entity=trainer.wandb.entity, offline=trainer.wandb.offline)
+                    entity=trainer.wandb.entity, offline=trainer.wandb.offline, shared=trainer.wandb.shared)
             checkpoints = trainer.checkpoints(name)
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))

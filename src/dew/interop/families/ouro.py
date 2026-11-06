@@ -15,7 +15,6 @@ pass, so another threshold, or an `early_exit_step` before the last, is refused.
 """
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.decoder_parts import (
@@ -28,8 +27,7 @@ from dew.interop.decoder_parts import (
     native_layer_types,
     read_rope,
     refuse,
-    renamed_name,
-    renamed_path,
+    spelled,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -81,8 +79,7 @@ def _ouro_export(model: CausalTransformer) -> Mapping[str, object]:
 
 OURO = DecoderFamily(
     ('ouro',), _ouro_config, lambda fields: fields.loop is not None, 'ouro', 'OuroForCausalLM', _ouro_export,
-    weight_path=partial(renamed_path, _NAMES, leaves=_GATE),
-    export_path=partial(renamed_name, _NAMES, leaves=_GATE, sandwich_norms=True),
+    routes=spelled(_NAMES, leaves=_GATE),
     preserve_source_layout=False,
     # OuroModel's table pads config.pad_token_id (modeling_ouro.py:496-500), which OuroConfig leaves
     # to the base class's None.

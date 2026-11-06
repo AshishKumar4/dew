@@ -37,7 +37,6 @@ from dew.batch import TEXT_KEY, Batch, Variables, flat_field, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.inspection import INSPECTED
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import progressed
@@ -46,7 +45,13 @@ from dew.objectives.base import OMITTED, Aux, EMASpec, Omitted, Ratio, Shown, So
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.objective import batch_text, text_preview
-from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
+from dew.objectives.routing import (
+    ExpertBalance,
+    RoutedStatistics,
+    apply_routed,
+    reduce_routed,
+    refuse_fixed_router,
+)
 from dew.sampling.walks import sample
 
 if TYPE_CHECKING:
@@ -143,6 +148,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         self.model = model
         self.process = process
         self.seq_len = seq_len
+        refuse_fixed_router(model, balance, self.variables)
         self.balance = balance
         self.use_head(head_chunks, head_tile)
         self.solver = solver
@@ -230,8 +236,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
             statistics, effects, metrics = self.balance.compose(
                 params, prediction, routing, batch, queries, fields)
             reported.update(metrics)
-        qk = sown.get("qk", {}) if step.qk_stats else None
-        inspected = sown.get(INSPECTED, {}) if step.watched is not None else None
+        qk, inspected = step.observed(sown)
         aux = Aux(metrics=reported, qk_stats=qk, effects=effects, inspected=inspected)
         return statistics, aux, TokenScores(losses * weights, real.astype(losses.dtype), correct)
 

@@ -26,8 +26,9 @@ and writes them back.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
-from functools import partial
+from types import MappingProxyType
 
 from dew import _records
 from dew.interop import release_pins
@@ -46,6 +47,7 @@ from dew.interop.decoder_parts import (
     SourceCode,
     WrapperFields,
     base_config,
+    declared_depths,
     decoder_kinds,
     folder_config,
     folder_name,
@@ -53,14 +55,14 @@ from dew.interop.decoder_parts import (
     nested_ramp,
     partial_rope_entry,
     plain_partial_rope,
-    prediction_path,
+    prediction_routes,
     record_int,
     refuse,
-    renamed_name,
-    renamed_path,
+    spelled,
     translated,
 )
 from dew.interop.families.deepseek import deepseek_layout, deepseek_mixture
+from dew.interop.layouts import INDEX, Config, Route, Slot, Spelled, Table, When
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mimo_audio import AUDIO_TOKENIZER, translate_mimo_audio_config
@@ -203,13 +205,12 @@ def _mixture(hf: Mapping[str, object], count: int, used: set[str],
     return deepseek_mixture(stated, count, used, sparse_layers=sparse)
 
 
-def _mimo_v2_flash_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The shared map under the family's names; the released checkpoints'
-    `model.mtp.*` prediction layers, which the reference never runs
-    (`_keys_to_ignore_on_load_unexpected`), have no place."""
-    if name.startswith('model.mtp.'):
-        return None
-    return renamed_path(_NAMES, name, config)
+_MIMO_V2_FLASH_ROUTES = Table(
+    # The released checkpoints' `model.mtp.*` prediction layers, which the reference never runs
+    # (`_keys_to_ignore_on_load_unexpected`), have no place.
+    Route('model.mtp.{rest}', None, MappingProxyType({'rest': Slot(r'.+')})),
+    spelled(_NAMES))
+"""MiMo-V2-Flash's names: the shared map under the family's (`_NAMES`)."""
 
 
 def _mimo_v2_flash_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -265,7 +266,7 @@ def _flash_matches(fields: CausalTransformer) -> bool:
 
 MIMO_V2_FLASH = DecoderFamily(
     ('mimo_v2_flash',), _mimo_v2_flash_config, _flash_matches, 'mimo_v2_flash', 'MiMoV2FlashForCausalLM',
-    _mimo_v2_flash_export, weight_path=_mimo_v2_flash_path, export_path=partial(renamed_name, _NAMES),
+    _mimo_v2_flash_export, routes=_MIMO_V2_FLASH_ROUTES,
     # Its experts are stored one tensor each, so a save writes them back through the source's own names.
     preserve_source_layout=True,
     padding_idx=True,
@@ -454,45 +455,25 @@ def _prediction_depth(name: str, config: Mapping[str, object]) -> int | None:
     return None
 
 
-def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The shared map under the family's names; a prediction depth's tensors under its own leaves, its
-    block's as the trunk's layer 0's (`prediction_path`), or no place for a model that builds none; and
-    no place for the towers and the audio tokenizer's folder, which the text decoder never runs."""
-    depth = _prediction_depth(name, config)
-    if depth is not None:
-        declared = _records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
-        if not declared:
-            return None
-        tail = '.'.join(name.split('.')[4:])
-
-        def block(tail: str) -> tuple[str, ...] | None:
-            for vllm, trunk in _PREDICTION_NAMES:
-                tail = tail.replace(vllm, trunk)
-            return _mimo_v2_path(f'model.layers.0.{tail}', config)
-        return prediction_path(name, 'mtp', depth, declared, tail, _PREDICTION_LEAVES, block)
-    if name.startswith(('visual.', 'audio_encoder.', 'speech_embeddings.',
-                        folder_name(_AUDIO_TOKENIZER, ''))):
-        return None
-    return renamed_path(_NAMES, name, config)
+def _builds_depths(config: Config) -> bool:
+    return bool(config.get('num_nextn_predict_layers'))
 
 
-def _mimo_v2_name(dew_name: str, config: Mapping[str, object]) -> str | None:
-    """`_mimo_v2_path` backwards: a prediction depth's leaf under its `model.mtp.layers.{d}.` name, any
-    other under the shared map's."""
-    parts = dew_name.split('.')
-    if not parts[0].startswith('mtp_'):
-        return renamed_name(_NAMES, dew_name, config)
-    stem = f"model.mtp.layers.{parts[0].removeprefix('mtp_')}."
-    own = {path: name for name, path in _PREDICTION_LEAVES.items()}.get(tuple(parts[1:]))
-    if own is not None:
-        return stem + own
-    trunk = renamed_name(_NAMES, '.'.join(('layers_0', *parts[2:])), config)
-    if trunk is None:
-        return None
-    tail = trunk.removeprefix('model.layers.0.')
-    for vllm, layer in _PREDICTION_NAMES:
-        tail = tail.replace(layer, vllm)
-    return stem + tail
+_MIMO_V2_ROUTES = Table(
+    When(_builds_depths, prediction_routes(
+        'model.mtp.layers.{depth}.', 'mtp', _PREDICTION_LEAVES, Spelled(_PREDICTION_NAMES, spelled(_NAMES)),
+        slots={'depth': INDEX}, when=declared_depths())),
+    # A model that builds no prediction depth places none of the release's.
+    When(lambda config: not _builds_depths(config),
+         Route('model.mtp.layers.{rest}', None, MappingProxyType({'rest': Slot(r'.+')}))),
+    # The towers and the audio tokenizer's folder, which the text decoder never runs.
+    Route('{media}', None, MappingProxyType({'media': Slot(
+        r'(?:visual|audio_encoder|speech_embeddings)\..+|'
+        + re.escape(folder_name(_AUDIO_TOKENIZER, '')) + '.+')})),
+    spelled(_NAMES))
+"""MiMo-V2's names: the shared map under the family's (`_NAMES`), and a prediction depth's tensors under
+`model.mtp.layers.{d}.` (vLLM's `MiMoV2MTPLayer`): its own leaves, and its block's as the trunk's layer 0's,
+its block norm under vLLM's name (`_PREDICTION_NAMES`)."""
 
 
 def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
@@ -575,7 +556,7 @@ def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
 
 MIMO_V2 = DecoderFamily(
     ('mimo_v2',), _mimo_v2_config, _matches, 'mimo_v2', 'MiMoV2ForCausalLM',
-    _mimo_v2_export, weight_path=_mimo_v2_path, export_path=_mimo_v2_name,
+    _mimo_v2_export, routes=_MIMO_V2_ROUTES,
     prediction_depth=_prediction_depth,
     packed=_FUSED_QKV, packs=lambda config: config.get('attention_projection_layout') == 'fused_qkv',
     preserve_source_layout=True, release_code=SourceCode(*release_pins.MIMO_V2),

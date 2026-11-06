@@ -86,17 +86,17 @@ jobs:
       with:
         # The merge-base with main, which the gates that hold a checkout to main read (tools/base_history.sh).
         fetch-depth: 0
-    # A pull request's gates run here, one after another (tools/ci/lint.sh): a fork's holds no armada credentials.
+    # A pull request's gates run here, all of them (tools/check.sh): a fork's holds no armada credentials.
     - if: github.event_name == 'pull_request'
       uses: astral-sh/setup-uv@v6
     - if: github.event_name == 'pull_request'
-      name: Every gate (tools/ci/lint.sh), on this runner
+      name: Every gate (tools/check.sh), on this runner
       run: |
         python=$(tr -d '\n' < .python-version)
         uv venv -q -p "$python" ".venv-$python"
         VIRTUAL_ENV=$PWD/.venv-$python sh tools/install_environment.sh cpu
         PYTHON=$PWD/.venv-$python/bin/python PATH=$PWD/.venv-$python/bin:$PATH \
-          sh tools/ci/lint.sh "$(git merge-base HEAD origin/main)"
+          BASE="$(git merge-base HEAD origin/main)" sh tools/check.sh
     - if: github.event_name != 'pull_request'
       uses: oven-sh/setup-bun@v2
     - if: github.event_name != 'pull_request'
@@ -123,8 +123,7 @@ jobs:
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
           sh "$base" '{item}'
 
-  # What a release attaches and Dew's index serves, installed the way a user installs it (tools/ci/package.sh, the
-  # land queue's package gate on armada too).
+  # What a release attaches and Dew's index serves, installed the way a user installs it (tools/ci/package.sh).
   package:
     needs: proven
     if: needs.proven.outputs.run == ''
@@ -282,16 +281,17 @@ jobs:
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
           ${{ ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '48') || '' }}
-      # tools/ci/suite.sh is the land queue's test gate too (dew-ops queue/gates.py): this step reads, from the ref,
-      # what the run takes. A base/<producer> promote and a push to base/kernels run no gangs: main's trains run them.
-      # A train's jobs (ci/batch-*, ci/fix-*), its gangs and its suite alike, start before any other while the fleet
-      # is full, and lanes' runs at a head (verdict.sh, at -10) end their newest containers to let them in (owner,
-      # bible §4); one priority for both, so the suite never recalls its own gangs' containers. A push to base/kernels
-      # and a base/<producer> promote run at a lane's whole-suite priority (-10) within their pool of 48, so they
-      # never take containers from a train, a precheck or a lane's targeted run (the maintainer, 2026-10-28). A
-      # train staged on the testing train's tip (ci/stage-*) runs beside it, at 5, on the pool its branch names (its
-      # lease's suite share, the land queue's promote.sh); a push to main the queue did not grade (a direct push) is
-      # its tip's only test, at 5 too, in a concurrency group of its own (the maintainer, 2026-10-29, 2026-10-31).
+      # tools/ci/suite.sh, which this step reads from the ref, holds what the run takes. A base/<producer>
+      # promote and a push to base/kernels run no gangs: main's trains run them. A train's jobs (ci/batch-*,
+      # ci/fix-*), its gangs and its suite alike, start before any other while the fleet is full, and lanes'
+      # runs at a head (verdict.sh, at -10) end their newest containers to let them in (owner, bible §4); one
+      # priority for both, so the suite never recalls its own gangs' containers. A push to base/kernels and a
+      # base/<producer> promote run at a lane's whole-suite priority (-10) within their pool of 48, so they
+      # never take containers from a train, a precheck or a lane's targeted run (the maintainer, 2026-10-28).
+      # A train staged on the testing train's tip (ci/stage-*) runs beside it, at 5, on the pool its branch
+      # names (its lease's suite share, the land queue's promote.sh); a push to main the queue did not grade
+      # (a direct push) is its tip's only test, at 5 too, in a concurrency group of its own (the maintainer,
+      # 2026-10-29, 2026-10-31).
       run: |
         case "$GITHUB_REF_NAME" in ci/base-*|base/kernels) gangless=1 ;; *) gangless= ;; esac
         case "$GITHUB_REF_NAME" in

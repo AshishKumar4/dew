@@ -1,7 +1,7 @@
 """GPT-NeoX's parallel biased LayerNorm block and head-interleaved qkv storage."""
 
 from collections.abc import Mapping
-from functools import partial
+from types import MappingProxyType
 
 import numpy as np
 
@@ -13,15 +13,14 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Renames,
     base_config,
-    decoder_tensors,
     fixed_attention_buffer,
     grouped_qkv,
     hf_ungated,
     partial_rope,
-    renamed_name,
-    renamed_path,
+    spelled,
     ungated_mlp,
 )
+from dew.interop.layouts import Route, Slot, Table, one_of
 from dew.interop.unread import Stored, equal
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import inverse_frequencies
@@ -84,11 +83,12 @@ _GPT_NEOX_NAMES: Renames = (
     ('attention.dense', 'self_attn.o_proj'), *MEGATRON_MLP)
 
 
-def _gpt_neox_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    # Alias inspection sees raw names before preparation, which validates and drops the buffers.
-    if name.endswith(('.attention.bias', '.attention.masked_bias', '.attention.rotary_emb.inv_freq')):
-        return None
-    return renamed_path(_GPT_NEOX_NAMES, name, config)
+_GPT_NEOX_ROUTES = Table(
+    # The fixed attention buffers, which a load checks and drops (`_gpt_neox_buffers`): no leaf.
+    Route('{module}.attention.{buffer}', None, MappingProxyType({
+        'module': Slot(r'.+'), 'buffer': one_of('bias', 'masked_bias', 'rotary_emb.inv_freq')})),
+    spelled(_GPT_NEOX_NAMES))
+"""GPT-NeoX's names (`_GPT_NEOX_NAMES`) onto the shared decoder's."""
 
 
 def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -115,11 +115,9 @@ GPT_NEOX = DecoderFamily(
     'gpt_neox',
     'GPTNeoXForCausalLM',
     _gpt_neox_export,
-    weight_path=_gpt_neox_path,
-    export_path=partial(renamed_name, _GPT_NEOX_NAMES),
+    routes=_GPT_NEOX_ROUTES,
     prepare=_gpt_neox_buffers,
     packed=grouped_qkv('.attention.query_key_value'),
-    export_weights=decoder_tensors,
     preserve_source_layout=False,
     tied_head_names=('embed_out.weight', 'gpt_neox.embed_in.weight'),
     defaults={'max_position_embeddings': 2048},

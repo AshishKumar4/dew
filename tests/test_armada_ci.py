@@ -1360,6 +1360,10 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     armada.mkdir(parents=True)
     for tool in (ROOT / "tools/armada").glob("*.py"):
         (armada / tool.name).write_text(tool.read_text())
+    # The group ownership child_groups.py loads, which every test process is started through.
+    owner = ci.child_groups.SOURCE.relative_to(ROOT)
+    (tmp_path / owner).parent.mkdir(parents=True)
+    (tmp_path / owner).write_text((ROOT / owner).read_text())
     (tmp_path / "tests/fixtures").mkdir(parents=True, exist_ok=True)
     (tmp_path / "tests/fixtures/data.json").write_text("{}\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
@@ -1367,7 +1371,8 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
                ("tests/fixtures/data.json", "{}\n", 2), ("tests/conftest.py", "VALUE = 1\n", 3),
                ("src/package/__init__.py", "", 4), ("tests/more/test_added.py", "VALUE = 2\n", 4),
-               ("tools/armada/child_groups.py", "# its process group\n", 5)]
+               ("tools/armada/child_groups.py", "# its process group\n", 5),
+               (str(owner), "# the group's lifetime\n", 6)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
@@ -1564,6 +1569,9 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     # The harness as a checkout holds it, under the checkout's root, beside the project it reads.
     shutil.copytree(ROOT / "tools/armada", tmp_path / "tools/armada",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    owner = load("child_groups", "tools/armada").SOURCE.relative_to(ROOT)
+    (tmp_path / owner).parent.mkdir(parents=True)
+    shutil.copy(ROOT / owner, tmp_path / owner)
     shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
     module = load("ci", str(tmp_path / "tools/armada"))
     monkeypatch.chdir(tmp_path)
@@ -1630,29 +1638,6 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
             (tmp_path / path).write_text(source)
         assert run() == runs, path
         assert run() == runs, path
-
-
-def test_stopping_a_group_spends_one_settle_budget_and_reports_a_leader_that_will_not_reap(monkeypatch):
-    """A group is stopped within one settle budget after SIGKILL, the leader's reaping and the other
-    members' ending together, and a leader still unreapable then is reported among the members that
-    outlived it, never raised: CI writes its verdict either way."""
-    groups = load("child_groups", "tools/armada")
-
-    class Stuck:
-        pid = 4242
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            time.sleep(timeout)
-            raise subprocess.TimeoutExpired("stuck", timeout)
-
-    monkeypatch.setattr(groups, "signal_group", lambda leader, number: None)
-    monkeypatch.setattr(groups, "members", lambda group: [group])
-    began = time.monotonic()
-    assert groups.stop(Stuck(), settle=0.5) == [4242]
-    assert time.monotonic() - began < 0.9, "the leader's wait and the members' share one budget"
 
 
 def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):

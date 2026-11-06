@@ -249,6 +249,25 @@ def test_an_export_folds_the_operands_a_layer_multiplies_in():
     np.testing.assert_array_equal(in_float32[rows], (-(2 ** -9) * kernel[rows]).astype(np.float32))
 
 
+def test_a_folded_kernel_rounds_once_to_the_dtype_its_read_asks_for():
+    """A narrower kernel's fold (`dew.nn.dex.folded`) is computed in float64 and rounded once, to the
+    kernel's dtype by default or to the dtype a read asks for: a float32 read of a float16 kernel's fold
+    keeps what rounding to float16 first would lose (review of ledger 4573)."""
+    width = 4
+    projection = np.eye(width, dtype=np.float32)[None] * np.float32(0.0001)
+    layer = {"o_proj": {"kernel": np.ones((2 * width, 3), np.float16)}, "dex_lambda": np.float32(1.0),
+             "dex_projection": projection}
+    variables = {"params": {"self_attn": layer},
+                 DEX_COLLECTION: {"self_attn": {"dex_heads": np.asarray([1], np.int32),
+                                                "dex_lambda_init": np.float32(0.2)}}}
+    leaf = dew.nn.dex.folded(variables, None)["params"]["self_attn"]["o_proj"]["kernel"]
+    rows, wide = slice(width, 2 * width), 1.0 - np.float64(np.float32(0.0001))
+    assert np.asarray(leaf).dtype == np.float16
+    np.testing.assert_array_equal(np.asarray(leaf)[rows], np.full((width, 3), wide, np.float16))
+    np.testing.assert_array_equal(np.asarray(leaf, np.float32)[rows], np.full((width, 3), wide, np.float32))
+    assert np.float32(np.float16(wide)) != np.float32(wide)
+
+
 def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
     """Passed a run's step's progress (`dew.nn.progress`), the layer reads lambda annealed over the run's
     updates: at update 0 the extended decoder computes its source's logits whatever its extension holds,

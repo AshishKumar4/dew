@@ -8,7 +8,6 @@ adapters below own only their configuration and tensor spellings.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
@@ -18,6 +17,7 @@ from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
+    ExportRefused,
     MaskedWalk,
     Packed,
     Renames,
@@ -25,25 +25,18 @@ from dew.interop.decoder_parts import (
     RopeSpelling,
     SourceCode,
     base_config,
-    decoder_tensors,
     plain_partial_rope,
     qkv_widths,
     record_float,
     record_int,
     refuse,
-    renamed_name,
-    renamed_path,
+    refuse_export,
+    spelled,
 )
 from dew.interop.families.deepseek import deepseek_mixture
-from dew.interop.families.gemma import (
-    GEMMA4_DEFAULTS,
-    gemma4_config,
-    gemma4_export_path,
-    gemma4_export_weights,
-    gemma4_path,
-    parallel_experts,
-)
+from dew.interop.families.gemma import GEMMA4_DEFAULTS, GEMMA4_ROUTES, gemma4_config, parallel_experts
 from dew.interop.families.qwen import qwen2_config
+from dew.interop.layouts import Table, When
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 
@@ -526,15 +519,10 @@ _LLADA2_PACKED = tuple(
     for leaf in ('weight', 'bias'))
 
 
-def _llada_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Read dense LLaDA's OLMo envelope or the MoE release's decoder names."""
-    return renamed_path(_LLADA_NAMES if name.startswith('model.transformer.') else _LLADA_MOE_NAMES,
-                         name, config)
-
-
-def _llada_export_path(name: str, config: Mapping[str, object]) -> str | None:
-    names = _LLADA_MOE_NAMES if 'num_experts' in config else _LLADA_NAMES
-    return renamed_name(names, name, config)
+_LLADA_ROUTES = Table(When(lambda config: config.get('mixture') is None, spelled(_LLADA_NAMES)),
+                      spelled(_LLADA_MOE_NAMES), spelled(_LLADA_NAMES))
+"""LLaDA's names: dense LLaDA's OLMo envelope, which a dense model writes, or the MoE release's decoder
+names; a load reads either."""
 
 
 def _llada_moe_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -561,14 +549,14 @@ def _llada_moe_export(model: CausalTransformer) -> Mapping[str, object]:
 def _llada2_export(model: CausalTransformer) -> Mapping[str, object]:
     mixture = model.mixture
     if mixture is None:
-        refuse('mixture', 'the LLaDA2 source format describes a routed decoder')
+        refuse_export('mixture', 'the LLaDA2 source format describes a routed decoder')
     layers = mixture.layers if mixture.layers is not None else tuple(range(model.num_layers))
     first = layers[0]
     if layers != tuple(range(first, model.num_layers)):
-        refuse('mixture.layers', 'LLaDA2 routes every layer after first_k_dense_replace')
+        refuse_export('mixture.layers', 'LLaDA2 routes every layer after first_k_dense_replace')
     width = mixture.expert_features or model.hidden_features
     if mixture.shared_features % width:
-        refuse('mixture.shared_features', 'LLaDA2 counts whole shared experts of the routed width')
+        refuse_export('mixture.shared_features', 'LLaDA2 counts whole shared experts of the routed width')
     return {
         **_mask_token_export(model), 'num_experts': mixture.experts,
         'num_experts_per_tok': mixture.top_k,
@@ -594,7 +582,7 @@ def _mask_token_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _diffusion_gemma_export(model: CausalTransformer) -> Mapping[str, object]:
-    raise ValueError(
+    raise ExportRefused(
         "diffusion_gemma_text is a cache-reading view; export the complete native DiffusionGemma wrapper"
     )
 
@@ -613,11 +601,8 @@ DIFFUSION_GEMMA_TEXT = DecoderFamily(
     'diffusion_gemma_text',
     'DiffusionGemmaForBlockDiffusion',
     _diffusion_gemma_export,
-    sandwich_norms=True,
-    weight_path=gemma4_path,
-    export_path=gemma4_export_path,
+    routes=GEMMA4_ROUTES,
     packed=FUSED_EXPERTS,
-    export_weights=gemma4_export_weights,
     preserve_source_layout=False,
     bidirectional=True,
     defaults=GEMMA4_DEFAULTS,
@@ -661,9 +646,7 @@ LLADA = DecoderFamily(
     'llada',
     'LLaDAModelLM',
     _llada_moe_export,
-    weight_path=_llada_path,
-    export_path=_llada_export_path,
-    export_weights=decoder_tensors,
+    routes=_LLADA_ROUTES,
     export_nulls=_LLADA_MOE_NULLS,
     preserve_source_layout=True,
     bidirectional=True,
@@ -674,8 +657,7 @@ LLADA_MOE_V2 = DecoderFamily(
     lambda fields: bool(not fields.causal and (mixture := fields.mixture) is not None
                         and mixture.score_function == 'softmax' and mixture.norm_topk_prob),
     'llada_moe_v2', 'LLaDAMoEv2ModelLM', _llada_moe_export,
-    weight_path=partial(renamed_path, _LLADA_MOE_NAMES),
-    export_path=partial(renamed_name, _LLADA_MOE_NAMES), export_weights=decoder_tensors,
+    routes=spelled(_LLADA_MOE_NAMES),
     export_nulls=_LLADA_MOE_NULLS,
     preserve_source_layout=True,
     bidirectional=True,
@@ -686,8 +668,7 @@ LLADA2_MOE = DecoderFamily(
     lambda fields: bool(not fields.causal and (mixture := fields.mixture) is not None
                         and mixture.score_function == 'sigmoid'),
     'llada2_moe', 'LLaDA2MoeModelLM', _llada2_export,
-    weight_path=partial(renamed_path, _LLADA2_NAMES),
-    export_path=partial(renamed_name, _LLADA2_NAMES), export_weights=decoder_tensors,
+    routes=spelled(_LLADA2_NAMES),
     packed=_LLADA2_PACKED, tied_head_names=('lm_head.weight', 'model.word_embeddings.weight'),
     export_nulls=('num_shared_experts',),
     preserve_source_layout=True,

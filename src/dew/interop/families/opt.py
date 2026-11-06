@@ -2,7 +2,6 @@
 release projects it in and out, and two reserved learned-position rows."""
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
@@ -13,8 +12,7 @@ from dew.interop.decoder_parts import (
     context_lengths,
     hf_ungated,
     refuse,
-    renamed_name,
-    renamed_path,
+    spelled,
     ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -98,8 +96,7 @@ OPT = DecoderFamily(
     'opt',
     'OPTForCausalLM',
     _opt_export,
-    weight_path=partial(renamed_path, _OPT_NAMES, leaves=_OPT_LEAVES),
-    export_path=partial(renamed_name, _OPT_NAMES, leaves=_OPT_LEAVES),
+    routes=spelled(_OPT_NAMES, leaves=_OPT_LEAVES),
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'model.decoder.embed_tokens.weight'),
     defaults={'pad_token_id': 1},

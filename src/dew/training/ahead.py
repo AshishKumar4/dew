@@ -478,22 +478,31 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     only loads and runs (`AheadPrograms.loaded`, ledger 2716). Arguments and results are placed whole on that
     GPU, whatever the function reads. A function takes and returns arrays (a backward is a program of its own
     over its residuals); one whose program holds arrays it closed over is refused, named, as no executable
-    serializes them."""
+    serializes them. Each is lowered in turn and all compile at once (`report.compiled_at_once`)."""
     target = built_target(generation, multiprocessors)
     devices = compile_only_gpus(generation, multiprocessors=multiprocessors)
     mesh = jax.sharding.Mesh(np.asarray(devices), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-    built = {}
+    lowerings, taken = [], {}
     for name, (function, arguments) in programs.items():
         shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed)
                        for argument in arguments)
-        # Through Dew's compile point, as a run compiles it: a launch whose kernel spills there is derived
-        # again at its next config.
-        program = owned_program(function, out_shardings=placed)
-        with (assumed(target), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)), uncached(),
-              routes() as taken):
-            compiled = program.compiled(*shapes)
-        if missing := substituted(taken):
+
+        def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
+            """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
+            with (assumed(target), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
+                  routes() as routed):
+                program = owned_program(function, out_shardings=placed).lower(*shapes)
+            taken[name] = routed
+            return program
+        lowerings.append((lowered(), None, lowered))
+    # Through Dew's compile point, as a run compiles them, at once (`report.compiled_at_once`): a launch
+    # whose kernel spills there is derived again at its next config.
+    with uncached():
+        executables = report.compiled_at_once(lowerings)
+    built = {}
+    for name, compiled in zip(programs, executables, strict=True):
+        if missing := substituted(taken[name]):
             _log.warning("program %r compiled ahead for %s with kernels this host cannot lower: %s", name,
                          generation, "; ".join(missing))
         try:

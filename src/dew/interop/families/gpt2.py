@@ -2,7 +2,7 @@
 them."""
 
 from collections.abc import Mapping
-from functools import partial
+from types import MappingProxyType
 
 import numpy as np
 
@@ -13,17 +13,16 @@ from dew.interop.decoder_parts import (
     GPT_TRUNK,
     DecoderFamily,
     DecoderFields,
+    HeadRows,
     Packed,
     Renames,
-    decoder_tensors,
     fixed_attention_buffer,
     hf_ungated,
     refuse,
-    renamed_name,
-    renamed_path,
+    spelled,
     ungated_mlp,
 )
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.layouts import Route, Slot, Spelled, Table, one_of
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -129,27 +128,34 @@ def _gptj_order(head_dim: int, rotated: int) -> np.ndarray:
                            np.arange(rotated, head_dim)))
 
 
+def _gptj_rotary(config: Mapping[str, object]) -> np.ndarray:
+    """A GPT-J head's rows as the shared rotate-half arithmetic reads them (`_gptj_order`), by the record."""
+    head_dim = _records.integer(config['head_dim'], 'head_dim')
+    rotated = int(head_dim * _records.number(config['partial_rotary_factor'], 'partial_rotary_factor'))
+    return _gptj_order(head_dim, rotated)
+
+
+_GPTJ_ROWS = HeadRows(('.attn.q_proj.weight', '.attn.k_proj.weight'), _gptj_rotary)
+"""GPT-J's queries' and keys' rows, each head's rotary pairs interleaved where the shared arithmetic
+rotates halves."""
+
+
 def _gptj_prepare(tensors: Mapping[str, Stored],
                   config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
-    if config is None:
-        raise ValueError('GPT-J rotary storage requires translated head geometry')
-    head_dim = _records.integer(config['head_dim'], 'head_dim')
-    heads = _records.integer(config['num_heads'], 'num_heads')
-    rotated = int(head_dim * _records.number(config['partial_rotary_factor'], 'partial_rotary_factor'))
-    prepared = dict(tensors)
-    for name, tensor in tensors.items():
-        if name.endswith(('.attn.q_proj.weight', '.attn.k_proj.weight')):
-            grouped = tensor.reshape(heads, head_dim, *tensor.shape[1:])
-            prepared[name] = grouped[:, _gptj_order(head_dim, rotated)].reshape(tensor.shape)
-        elif fixed_attention_buffer(name, tensor, 'attn', (-1e9,)):
-            del prepared[name]
-    return prepared
+    """Check and drop the fixed attention buffers."""
+    return {name: tensor for name, tensor in tensors.items()
+            if not fixed_attention_buffer(name, tensor, 'attn', (-1e9,))}
 
 
-def _gptj_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if name.endswith(('.attn.bias', '.attn.masked_bias')):
-        return None
-    return renamed_path(_GPTJ_NAMES, name, config)
+def _buffers(*names: str) -> Route:
+    """A release's fixed attention buffers, by their names' last parts (`names`), which a load checks and
+    drops (`fixed_attention_buffer`): no leaf."""
+    return Route('{module}.{buffer}', None,
+                 MappingProxyType({'module': Slot(r'.+'), 'buffer': one_of(*names)}))
+
+
+_GPTJ_ROUTES = Table(_buffers('attn.bias', 'attn.masked_bias'), spelled(_GPTJ_NAMES))
+"""GPT-J's names: GPT-2's trunk, its own block's (`_GPTJ_NAMES`); its buffers fill no leaf."""
 
 
 def _gptj_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -159,22 +165,6 @@ def _gptj_export(model: CausalTransformer) -> Mapping[str, object]:
         'pad_token_id': None,
     })
     return fields
-
-
-def _gptj_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
-                         config: Mapping[str, object]) -> LazyTensors:
-    tensors = decoder_tensors(family, model, variables, config)
-    rotated = int(model.features_per_head * (model.partial_rotary_factor or 1.))
-    order = np.argsort(_gptj_order(model.features_per_head, rotated))
-
-    def build(name: str) -> np.ndarray:
-        tensor = tensors[name]
-        if name.endswith(('.attn.q_proj.weight', '.attn.k_proj.weight')):
-            grouped = tensor.reshape(model.num_heads, model.features_per_head, *tensor.shape[1:])
-            return grouped[:, order].reshape(tensor.shape)
-        return tensor
-
-    return LazyTensors(tensors.specs, build)
 
 
 def gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -246,12 +236,13 @@ _GPT2_PACKED = (
       for conv in ('attn.c_proj', 'mlp.c_fc', 'mlp.c_proj')))
 
 
-def _gpt2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    name = _nested(name)
-    # Alias inspection sees raw names before preparation, which validates and drops the buffers.
-    if name.endswith(('.attn.bias', '.attn.masked_bias')):
-        return None
-    return renamed_path(GPT2_NAMES, name, config)
+_GPT2_ROUTES = Table(
+    _buffers('attn.bias', 'attn.masked_bias'), spelled(GPT2_NAMES),
+    # The bare GPT2Model's names, which a load nests under the causal LM's `transformer.`.
+    Spelled((('h', 'transformer.h'), ('wte', 'transformer.wte'), ('wpe', 'transformer.wpe'),
+             ('ln_f', 'transformer.ln_f')), spelled(GPT2_NAMES)))
+"""GPT-2's names: the causal LM's, which an export writes, and the bare model's, which a load reads too;
+the old persistent causal buffers fill no leaf."""
 
 
 def gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -277,8 +268,7 @@ GPT_NEO = DecoderFamily(
     lambda fields: fields.position_embedding == 'learned' and fields.attention_scale == 1.0
                    and fields.attention_bias is False and fields.o_proj_bias is True,
     'gpt_neo', 'GPTNeoForCausalLM', _gpt_neo_export,
-    weight_path=partial(renamed_path, _GPT_NEO_NAMES),
-    export_path=partial(renamed_name, _GPT_NEO_NAMES), preserve_source_layout=False,
+    routes=spelled(_GPT_NEO_NAMES), preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )
 
@@ -286,8 +276,7 @@ GPTJ = DecoderFamily(
     ('gptj',), _gptj_config,
     lambda fields: fields.shared_parallel_norm and fields.head_bias and not fields.attention_bias,
     'gptj', 'GPTJForCausalLM', _gptj_export,
-    weight_path=_gptj_path, export_path=partial(renamed_name, _GPTJ_NAMES),
-    prepare=_gptj_prepare, export_weights=_gptj_export_weights, preserve_source_layout=False,
+    routes=_GPTJ_ROUTES, head_rows=_GPTJ_ROWS, prepare=_gptj_prepare, preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )
 
@@ -343,12 +332,13 @@ OPENAI_GPT_NAMES: Renames = (
 attention joins it and `ln_2` after the MLP (`post_residual_norms`), as OPT-350m's norms do."""
 
 
-def _openai_gpt_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    name = _openai_nested(name)
-    # Alias inspection sees raw names before preparation, which validates and drops the masks.
-    if name.endswith('.attn.bias'):
-        return None
-    return renamed_path(OPENAI_GPT_NAMES, name, config)
+_OPENAI_GPT_ROUTES = Table(
+    _buffers('attn.bias'), spelled(OPENAI_GPT_NAMES),
+    # The bare OpenAIGPTModel's names, which the original release stores.
+    Spelled((('h', 'transformer.h'), ('tokens_embed', 'transformer.tokens_embed'),
+             ('positions_embed', 'transformer.positions_embed')), spelled(OPENAI_GPT_NAMES)))
+"""GPT-1's names: the causal LM's, which an export writes, and the bare model's, which a load reads too;
+the fixed causal masks fill no leaf."""
 
 
 OPENAI_GPT = DecoderFamily(
@@ -359,8 +349,7 @@ OPENAI_GPT = DecoderFamily(
     'openai-gpt',
     'OpenAIGPTLMHeadModel',
     _openai_gpt_export,
-    weight_path=_openai_gpt_path,
-    export_path=partial(renamed_name, OPENAI_GPT_NAMES),
+    routes=_OPENAI_GPT_ROUTES,
     prepare=_openai_gpt_prepare,
     spelling=_openai_nested,
     packed=_GPT2_PACKED,
@@ -375,8 +364,7 @@ GPT2 = DecoderFamily(
     'gpt2',
     'GPT2LMHeadModel',
     gpt2_export,
-    weight_path=_gpt2_path,
-    export_path=partial(renamed_name, GPT2_NAMES),
+    routes=_GPT2_ROUTES,
     prepare=_gpt2_prepare,
     spelling=_nested,
     packed=_GPT2_PACKED,

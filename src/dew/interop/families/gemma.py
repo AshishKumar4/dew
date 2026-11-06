@@ -12,36 +12,39 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-
-from flax.traverse_util import flatten_dict
+from types import MappingProxyType
 
 from dew import _records
 from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
+    DECODER_ROUTES,
     FUSED_EXPERTS,
     GEMMA3_MODEL_TYPE,
     MOE_SHARED,
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
+    Leaves,
     MixtureFields,
     Ropes,
     RopeSpelling,
     base_config,
+    both,
     decoder_kinds,
-    decoder_tensors,
-    dew_path,
     fixed_fields,
     hf_activation,
-    hf_tensor_name,
+    in_layer,
+    in_trunk,
     kinds_of,
+    own_routes,
     read_rope,
     read_rope_theta,
     refuse,
+    refuse_export,
     specified_layer_types,
 )
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.layouts import Condition, Config, Route, Table, one_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -65,14 +68,17 @@ release may store (google/gemma-4-E4B-it @ee0ef60 does, layers 24-41) but never 
 layer reads its provider's keys and values (modeling_gemma4.py, Gemma4TextAttention.forward)."""
 
 
-def _shared_unused(name: str, config: Mapping[str, object]) -> bool:
-    """Whether `name` is one of a kv-shared layer's unused tensors (`_SHARED_UNUSED`), which a load
-    leaves unplaced and a save writes back as stored."""
-    parts = name.split('.')
+def _kv_shared(config: Config, slots: Mapping[str, str]) -> bool:
+    """Whether a route's `layer` is a kv-shared one (`kv_shared_layers`)."""
     sharing = config.get('kv_shared_layers') or ()
-    return (len(parts) == 6 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
-            and parts[3] == 'self_attn' and parts[4] in _SHARED_UNUSED and parts[5] == 'weight'
-            and isinstance(sharing, (tuple, list)) and int(parts[2]) in sharing)
+    return isinstance(sharing, (tuple, list)) and int(slots['layer']) in sharing
+
+
+def _shared_unused() -> Route:
+    """A kv-shared layer's unused keys, values and key norm (`_SHARED_UNUSED`), which a load leaves
+    unplaced and a save writes back as stored."""
+    return in_layer('self_attn.{projection}.weight', None, {'projection': one_of(*_SHARED_UNUSED)},
+                    _kv_shared)
 
 
 def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
@@ -272,37 +278,6 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     return config
 
 
-def _gemma3n_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the variables-tree path for one Gemma 3n tensor name.
-
-    Gemma 3n adds the AltUp and LAuReL leaves beside a Gemma 4 style layer.
-    The copies' projections are indexed modules (altup_projections.{i}), which
-    land as altup_projections_{i} the way the layers do; the coefficient maps
-    are Linears, so they transpose like any kernel. A kv-shared layer's unused
-    keys, values and key norm land nowhere (`_shared_unused`).
-    """
-    if _shared_unused(name, config):
-        return None
-    parts = name.split('.')
-    if len(parts) == 4 and parts[0] == 'model' and parts[2].isdigit() and parts[3] == 'weight' \
-            and parts[1] in ('altup_projections', 'altup_unembed_projections'):
-        return ('params', f'{parts[1]}_{parts[2]}', 'kernel')
-    if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit() \
-            and parts[3] in ('altup', 'laurel'):
-        layer = ('params', f'layers_{parts[2]}', parts[3])
-        tail = parts[4:]
-        if tail == ['correct_output_scale']:
-            return (*layer, 'correct_output_scale')
-        if len(tail) == 2 and tail[1] == 'weight':
-            if tail[0] in ('router_norm', 'post_laurel_norm'):
-                return (*layer, tail[0], 'scale')
-            if tail[0] in ('correction_coefs', 'prediction_coefs', 'modality_router',
-                           'linear_left', 'linear_right'):
-                return (*layer, tail[0], 'kernel')
-        raise ValueError(f"unknown tensor name {name!r}")
-    return dew_path(name, config)
-
-
 def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
                    k_eq_v: bool = False) -> DecoderFields:
     layer_types = _gemma_layer_types(hf_config, used, last_full=True)
@@ -448,36 +423,36 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
     for name in ('output_gate', 'attention_sinks', 'attn_logit_softcap', 'altup',
                  'laurel_rank', 'activation_sparsity_pattern', 'num_nextn_predict_layers', 'dropout_rate'):
         if getattr(model, name):
-            refuse(name, 'the standalone Gemma4 reference has no such computation')
+            refuse_export(name, 'the standalone Gemma4 reference has no such computation')
     if model.partial_rotary_factor is not None and model.partial_rotary_type != 'proportional':
-        refuse('partial_rotary_type', 'Gemma4 full layers use proportional rotary')
+        refuse_export('partial_rotary_type', 'Gemma4 full layers use proportional rotary')
     if model.layer_scalar not in ('frozen', 'trainable'):
-        refuse('layer_scalar', 'Gemma4 exports an explicit frozen or trainable scalar value')
+        refuse_export('layer_scalar', 'Gemma4 exports an explicit frozen or trainable scalar value')
     types = model.per_layer_types
     if not types or set(types) - {'sliding_attention', 'full_attention'}:
-        refuse('layer_types', 'Gemma4 has only sliding and full attention')
+        refuse_export('layer_types', 'Gemma4 has only sliding and full attention')
     if types[-1] != 'full_attention':
-        refuse('layer_types', 'Gemma4TextConfig forces the final layer to full attention')
+        refuse_export('layer_types', 'Gemma4TextConfig forces the final layer to full attention')
     for name in set(types):
         kind = model.kind_of(name)
         mixer = kind.mixer or model.mixer
         if mixer is not None and not isinstance(mixer, AttentionMixer):
-            refuse(f'kinds.{name}.mixer', 'Gemma4 uses ordinary attention')
+            refuse_export(f'kinds.{name}.mixer', 'Gemma4 uses ordinary attention')
         if isinstance(mixer, AttentionMixer) and (
             mixer.bidirectional_images or mixer.bidirectional_blocks or mixer.mrope_section is not None
         ):
-            refuse(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
+            refuse_export(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
         if kind.rope_scaling is not None:
-            refuse(f'kinds.{name}.rope', 'Gemma4 uses plain local and proportional global rotary')
+            refuse_export(f'kinds.{name}.rope', 'Gemma4 uses plain local and proportional global rotary')
     full = model.kind_of('full_attention')
     local = model.kind_of('sliding_attention') if 'sliding_attention' in types else full
     if full.window is not None:
-        refuse('kinds.full_attention.window', 'full attention is unwindowed')
+        refuse_export('kinds.full_attention.window', 'full attention is unwindowed')
     if 'sliding_attention' in types and (local.window is None or local.window < 1):
-        refuse('kinds.sliding_attention.window', 'sliding attention needs a positive window')
+        refuse_export('kinds.sliding_attention.window', 'sliding attention needs a positive window')
     sharing = model.sharing_layers
     if sharing != tuple(range(model.num_layers - len(sharing), model.num_layers)):
-        refuse('kv_shared_layers', 'Gemma4 can express only a trailing run of shared-KV layers')
+        refuse_export('kv_shared_layers', 'Gemma4 can express only a trailing run of shared-KV layers')
     mixture = model.mixture
     fields: dict[str, object] = {
         'hidden_act': None, 'hidden_activation': hf_activation(model.mlp),
@@ -503,39 +478,10 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
     }
     if mixture is not None:
         if not mixture.parallel or tuple(model.sparse_layers) != tuple(range(model.num_layers)):
-            refuse('mixture', 'Gemma4 routes a parallel expert branch on every layer')
+            refuse_export('mixture', 'Gemma4 routes a parallel expert branch on every layer')
         fields.update(num_experts=mixture.experts, top_k_experts=mixture.top_k,
                       moe_intermediate_size=mixture.expert_features or model.hidden_features)
     return fields
-
-
-def gemma4_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
-                           config: Mapping[str, object]) -> LazyTensors:
-    """Return the Gemma 4 checkpoint tensors for `model` and `variables`.
-
-    This is the one text inverse standalone Gemma 4 and DiffusionGemma share.
-    Every layer scalar must sit in the collection `model.layer_scalar` names,
-    and nothing else in `constants`, before the shared writer reads them.
-    """
-    mode = model.layer_scalar
-    if mode not in LAYER_SCALAR_COLLECTIONS:
-        raise ValueError('Gemma4 tensor export requires an explicit layer_scalar mode')
-    found: dict[str, set[str]] = {}
-    for each, collection in LAYER_SCALAR_COLLECTIONS.items():
-        # A bare parameter tree is its own `params`.
-        tree = variables.get(collection, variables if collection == 'params' else {})
-        if not isinstance(tree, Mapping):
-            raise ValueError('params and constants must contain native variable trees')
-        found[each] = set(flatten_dict(dict(tree), sep='.'))
-    scalars = {f'layers_{index}.layer_scalar' for index in range(model.num_layers)}
-    if found['frozen'] - scalars:
-        raise ValueError(f'unrepresented Gemma4 constants: {sorted(found["frozen"] - scalars)}')
-    held = found[mode] & scalars
-    stray = set().union(*(names & scalars for each, names in found.items() if each != mode))
-    if held != scalars or stray:
-        raise ValueError(f"layer_scalar={mode} keeps every layer scalar in "
-                         f"{LAYER_SCALAR_COLLECTIONS[mode]} alone")
-    return decoder_tensors(family, model, variables, config)
 
 
 def _gemma2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -544,54 +490,59 @@ def _gemma2_export(model: CausalTransformer) -> Mapping[str, object]:
 
 # Gemma 4's routed branch, named for what each norm normalises, as the
 # block's own sandwich norms are.
-_GEMMA4_MOE: dict[tuple[str, ...], tuple[str, ...]] = {
-    ('router', 'proj', 'weight'): ('moe', 'router', 'proj', 'kernel'),
-    ('router', 'scale'): ('moe', 'router', 'scale'),
-    ('router', 'per_expert_scale'): ('moe', 'router', 'per_expert_scale'),
-    ('post_feedforward_layernorm_1', 'weight'): ('moe', 'mlp_branch_norm', 'scale'),
-    ('pre_feedforward_layernorm_2', 'weight'): ('moe', 'experts_input_norm', 'scale'),
-    ('post_feedforward_layernorm_2', 'weight'): ('moe', 'experts_output_norm', 'scale'),
-    ('layer_scalar',): ('layer_scalar',),
+_GEMMA4_MOE: Leaves = {
+    'router.proj.weight': ('moe', 'router', 'proj', 'kernel'),
+    'router.scale': ('moe', 'router', 'scale'),
+    'router.per_expert_scale': ('moe', 'router', 'per_expert_scale'),
+    'post_feedforward_layernorm_1.weight': ('moe', 'mlp_branch_norm', 'scale'),
+    'pre_feedforward_layernorm_2.weight': ('moe', 'experts_input_norm', 'scale'),
+    'post_feedforward_layernorm_2.weight': ('moe', 'experts_output_norm', 'scale'),
 }
 
 
-def gemma4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The variables-tree path of one Gemma 4 tensor: its routed branch's (`_GEMMA4_MOE`), its layer
-    scalar's collection, the shared names' otherwise; a kv-shared layer's unused keys, values and key
-    norm land nowhere (`_shared_unused`)."""
-    if _shared_unused(name, config):
-        return None
-    parts = name.split('.')
-    if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
-        tail = tuple(parts[3:])
-        if tail == ('layer_scalar',):
-            mode = config.get("layer_scalar")
-            if not isinstance(mode, str) or mode not in LAYER_SCALAR_COLLECTIONS:
-                return refuse("layer_scalar", "the source scalar requires a frozen or trainable model mode")
-            return (LAYER_SCALAR_COLLECTIONS[mode], f'layers_{parts[2]}', 'layer_scalar')
-        layer = ('params', f'layers_{parts[2]}')
-        if tail in _GEMMA4_MOE:
-            return (*layer, *_GEMMA4_MOE[tail])
-        if len(tail) == 2 and tail[0] == 'experts' and tail[1] in MOE_SHARED:
-            return (*layer, 'moe', 'experts', tail[1], 'kernel')
-    return dew_path(name, config)
+def _scalar_mode(collection: str) -> Condition:
+    """A layer scalar's route held where the record keeps the scalars in `collection` (`layer_scalar`),
+    refused where it names no mode."""
+    def held(config: Config, slots: Mapping[str, str]) -> bool:
+        mode = config.get('layer_scalar')
+        if not isinstance(mode, str) or mode not in LAYER_SCALAR_COLLECTIONS:
+            return refuse('layer_scalar', 'the source scalar requires a frozen or trainable model mode')
+        return LAYER_SCALAR_COLLECTIONS[mode] == collection
+    return held
 
 
-_GEMMA4_MOE_NAMES = {path: name for name, path in _GEMMA4_MOE.items()}
+GEMMA4_ROUTES = Table(
+    _shared_unused(),
+    # Each layer scalar in the collection its mode names (`LAYER_SCALAR_COLLECTIONS`).
+    *(Route('model.layers.{layer}.layer_scalar', f'{collection}/layers_{{layer}}/layer_scalar',
+            when=both(in_trunk, _scalar_mode(collection)))
+      for collection in LAYER_SCALAR_COLLECTIONS.values()),
+    *own_routes(_GEMMA4_MOE),
+    # Each stacked expert kernel under the name its fused tensor is packed from (`FUSED_EXPERTS`).
+    in_layer('experts.{projection}', 'moe/experts/{projection}/kernel', {'projection': one_of(*MOE_SHARED)}),
+    DECODER_ROUTES)
+"""Gemma 4's names: its routed branch's (`_GEMMA4_MOE`) and its layer scalars' beside the shared decoder's;
+a kv-shared layer's unused keys, values and key norm land nowhere."""
+
+GEMMA3N_ROUTES = Table(
+    _shared_unused(),
+    # The copies' projections are indexed modules (altup_projections.{i}), which land as
+    # altup_projections_{i} the way the layers do; the coefficient maps are Linears, so they transpose
+    # like any kernel.
+    Route('model.{module}.{index}.weight', 'params/{module}_{index}/kernel',
+          MappingProxyType({'module': one_of('altup_projections', 'altup_unembed_projections')})),
+    in_layer('{module}.correct_output_scale', '{module}/correct_output_scale',
+             {'module': one_of('altup', 'laurel')}),
+    in_layer('{module}.{norm}.weight', '{module}/{norm}/scale',
+             {'module': one_of('altup', 'laurel'), 'norm': one_of('router_norm', 'post_laurel_norm')}),
+    in_layer('{module}.{linear}.weight', '{module}/{linear}/kernel',
+             {'module': one_of('altup', 'laurel'), 'linear': one_of(
+                 'correction_coefs', 'prediction_coefs', 'modality_router', 'linear_left', 'linear_right')}),
+    DECODER_ROUTES)
+"""Gemma 3n's names: the AltUp and LAuReL leaves beside a Gemma 4 style layer; a kv-shared layer's unused
+keys, values and key norm land nowhere."""
 
 
-def gemma4_export_path(name: str, config: Mapping[str, object]) -> str | None:
-    """`gemma4_path` backwards; each stacked expert kernel takes the name its
-    fused tensor is packed from (`FUSED_EXPERTS`)."""
-    layer, _, rest = name.partition('.')
-    tail = tuple(rest.split('.'))
-    if layer.startswith('layers_'):
-        stem = f"model.layers.{layer.removeprefix('layers_')}."
-        if tail in _GEMMA4_MOE_NAMES:
-            return stem + '.'.join(_GEMMA4_MOE_NAMES[tail])
-        if len(tail) == 4 and tail[:2] == ('moe', 'experts') and tail[3] == 'kernel':
-            return f'{stem}experts.{tail[2]}'
-    return hf_tensor_name(name, config, sandwich_norms=True)
 
 
 GEMMA3N_TEXT = DecoderFamily(
@@ -601,8 +552,7 @@ GEMMA3N_TEXT = DecoderFamily(
     'gemma3n_text',
     'Gemma3nForCausalLM',
     _gemma3_export,
-    sandwich_norms=True,
-    weight_path=_gemma3n_path,
+    routes=GEMMA3N_ROUTES,
     preserve_source_layout=True,
     # Gemma3nTextConfig's window, which an omitted sliding_window means.
     defaults={'max_position_embeddings': 32768, 'hidden_activation': 'gelu_pytorch_tanh',
@@ -620,11 +570,8 @@ GEMMA4_TEXT = DecoderFamily(
     'gemma4_text',
     'Gemma4ForCausalLM',
     _gemma4_export,
-    sandwich_norms=True,
-    weight_path=gemma4_path,
-    export_path=gemma4_export_path,
+    routes=GEMMA4_ROUTES,
     packed=FUSED_EXPERTS,
-    export_weights=gemma4_export_weights,
     preserve_source_layout=True,
     defaults={**GEMMA4_DEFAULTS, 'hidden_size_per_layer_input': 256,
               'vocab_size_per_layer_input': 262144},
@@ -656,7 +603,6 @@ GEMMA3_TEXT = DecoderFamily(
     GEMMA3_MODEL_TYPE,
     'Gemma3ForCausalLM',
     _gemma3_export,
-    sandwich_norms=True,
     preserve_source_layout=False,
     # Gemma3TextConfig's defaults for the fields its decoder reads.
     defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256, 'pad_token_id': 0,
@@ -671,7 +617,6 @@ GEMMA2 = DecoderFamily(
     'gemma2',
     'Gemma2ForCausalLM',
     _gemma2_export,
-    sandwich_norms=True,
     preserve_source_layout=False,
     # Gemma2Config's defaults for the fields its decoder reads.
     defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256, 'pad_token_id': 0,

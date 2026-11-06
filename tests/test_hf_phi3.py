@@ -232,7 +232,9 @@ def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
     ids = np.load(DIRECTORY / 'input_ids.npy').astype(np.int32)
     prompts = (ids[0, :4], ids[1, :2])
     server = Server.from_task(task, slots=2, capacity=64, admission=2)
-    assert server.mixed_refusal is not None
+    # The model's own refusal, its LongRoPE crossing's, not one of the placement's or another reader's.
+    assert loaded.model.cache_rebuild_position is not None
+    assert server.mixed_refusal == loaded.model.mixed_admission_refusal()
     tickets = [server.submit(prompt, 8, key=index) for index, prompt in enumerate(prompts)]
     server.run()
     for index, (ticket, prompt) in enumerate(zip(tickets, prompts, strict=True)):

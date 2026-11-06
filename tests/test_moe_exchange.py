@@ -11,6 +11,7 @@ import math
 from pathlib import Path
 
 import jax
+import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -60,6 +61,37 @@ def test_exchange_retains_outputs_and_all_differentiable_inputs(
     if skewed:
         for projection in actual[1][0]['params'].values():
             np.testing.assert_array_equal(projection['kernel'][top_k:], 0)
+
+
+def primitives(jaxpr: jax.extend.core.Jaxpr) -> list[str]:
+    """Every primitive `jaxpr` runs, its sub-jaxprs' (a shard_map's body, a scan's) included."""
+    names = []
+    for equation in jaxpr.eqns:
+        names.append(equation.primitive.name)
+        for value in equation.params.values():
+            for held in value if isinstance(value, (tuple, list)) else (value,):
+                if isinstance(held, jax.extend.core.ClosedJaxpr):
+                    names += primitives(held.jaxpr)
+                elif isinstance(held, jax.extend.core.Jaxpr):
+                    names += primitives(held)
+    return names
+
+
+@pytest.mark.parametrize("skewed", [False, True], ids=["even", "skewed"])
+def test_a_dropless_exchange_moves_its_rows_in_one_ragged_all_to_all_each_way(skewed):
+    """An expert mesh's dropless exchange sends each shard its rows in one `lax.ragged_all_to_all` and
+    takes them back in one more, the collective XLA runs, whatever the routing's skew: no rounds of
+    equal buckets, no loop over them (ledger 1711); its gradient moves its rows by the same collective."""
+    x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, skewed))
+    layer = ExpertMLP(8, 12, 8).clone(dispatch='exchange')
+    parameters = nn.unbox(ExpertMLP(8, 12, 8).init(jax.random.key(19), x, weights, indices))
+    with jax.set_mesh(MeshSpec(expert=4, fsdp=2).build()):
+        forward = primitives(jax.make_jaxpr(layer.apply)(parameters, x, weights, indices).jaxpr)
+        backward = primitives(jax.make_jaxpr(jax.grad(functools.partial(objective, layer, indices),
+                                                      has_aux=True))(parameters, x, weights).jaxpr)
+    assert forward.count("ragged_all_to_all") == 2 and "all_to_all" not in forward and "scan" not in forward
+    # JAX's transpose of the collective exchanges its offsets by an all_to_all of its own.
+    assert "ragged_all_to_all" in backward and "scan" not in backward
 
 
 def test_exchange_preserves_placed_expert_and_width_gradients():

@@ -122,18 +122,6 @@ SITES = {"gpt3": gpt3, "engram": engram}
 _BUILT: dict[tuple[str, str], Applied] = {}
 
 
-class _Widened:
-    """`jax.numpy` with the dtypes in `names` read as float64, everything else its own."""
-
-    def __init__(self, names: frozenset[str]):
-        self.names = names
-
-    def __getattr__(self, name: str):
-        import jax.numpy as jnp
-
-        return jnp.float64 if name in self.names else getattr(jnp, name)
-
-
 @contextlib.contextmanager
 def float64_casts(dtype: str):
     """While a float64 program builds and traces, the casts MaxText makes whatever its dtype carried in
@@ -143,12 +131,10 @@ def float64_casts(dtype: str):
     if dtype != "float64":
         yield
         return
-    from unittest import mock
+    import flax_precision
 
-    from maxtext.layers import embeddings, normalizations
-
-    with (mock.patch.object(normalizations, "jnp", _Widened(frozenset({"float32"}))),
-          mock.patch.object(embeddings, "jnp", _Widened(frozenset({"bfloat16"})))):
+    with (flax_precision.float64(("maxtext.layers.normalizations",)),
+          flax_precision.float64(("maxtext.layers.embeddings",), names=("bfloat16",))):
         yield
 
 

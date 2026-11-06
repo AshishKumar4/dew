@@ -20,10 +20,10 @@ from dew.interop import mamba2
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
-    decoder_tensors,
     record_bool,
     record_int,
     refuse,
+    refuse_export,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba import MambaMixer
@@ -37,7 +37,6 @@ LAYER: Mapping[str, tuple[str, ...]] = {
     "mixer.x_proj.weight": ("self_attn", "x_proj", "kernel"),
     **{f"mixer.conv1d.{kind}": ("self_attn", "conv1d", kind) for kind in ("weight", "bias")},
 }
-_LAYER_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in LAYER.items()}
 
 
 def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -86,8 +85,9 @@ def _export(model: CausalTransformer) -> Mapping[str, object]:
     assert isinstance(mixer, MambaMixer), "the family matches a mamba mixer alone"
     expand, remainder = divmod(mixer.intermediate_size, model.emb_features)
     if remainder:
-        refuse(f"intermediate_size {mixer.intermediate_size}",
-               f"MambaConfig states the inner width as a whole multiple of hidden_size {model.emb_features}")
+        refuse_export(f"intermediate_size {mixer.intermediate_size}",
+                      "MambaConfig states the inner width as a whole multiple of hidden_size "
+                      f"{model.emb_features}")
     return {
         "expand": expand, "state_size": mixer.state_size, "time_step_rank": mixer.time_step_rank,
         "conv_kernel": mixer.conv_kernel, "use_bias": mixer.use_bias, "use_conv_bias": mixer.use_conv_bias,
@@ -106,10 +106,8 @@ MAMBA = DecoderFamily(
     "mamba",
     "MambaForCausalLM",
     _export,
-    weight_path=partial(mamba2.weight_path, layer=LAYER, family="Mamba"),
-    export_path=partial(mamba2.export_path, layer_names=_LAYER_NAMES, family="Mamba"),
+    routes=mamba2.backbone_routes(LAYER),
     # The path map names every leaf of the mixer, so the shared writer writes it whole.
-    export_weights=decoder_tensors,
     preserve_source_layout=True,
     tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
 )
@@ -121,8 +119,7 @@ MAMBA2 = DecoderFamily(
     "mamba2",
     "Mamba2ForCausalLM",
     lambda model: {},
-    weight_path=mamba2.weight_path,
-    export_path=mamba2.export_path,
+    routes=mamba2.ROUTES,
     preserve_source_layout=True,
     tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
 )

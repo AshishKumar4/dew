@@ -124,12 +124,29 @@ class ShardManifest:
 
     `index_ordered` states that the shards, one after another, read the
     records in their index order, as a store read by index streams them
-    (`_indexed_manifest`)."""
+    (`_indexed_manifest`).
+
+    `counted`, where the shards state no rows that their store can count,
+    returns each one's rows, given the reads it may make at once, which a read
+    that needs them reads then (`sized`): a streamed Parquet store's files'
+    from their footers, which a read that needs none never reads."""
 
     shards: tuple[Shard, ...]
     reader: ShardOpener
     subdivide: Callable[[int], tuple[Shard, ...]] | None = None
     index_ordered: bool = False
+    counted: Callable[[int], tuple[int, ...]] | None = None
+
+    def sized(self, reads: int) -> ShardManifest:
+        """The manifest with each shard's rows its store counts (`counted`), `reads` at once (its reading's
+        `Loading.threads`), as a read that needs them reads them (a bound in examples dealt by its shards'
+        rows, a read placed by index, a pass's count); itself where its store counts none."""
+        if self.counted is None:
+            return self
+        rows = self.counted(reads)
+        return dataclasses.replace(self, shards=tuple(
+            dataclasses.replace(shard, rows=count) for shard, count in zip(self.shards, rows, strict=True)),
+            counted=None)
 
 
 @runtime_checkable
@@ -157,8 +174,10 @@ class Source(Protocol):
         """The records by index, for a memory or an indexed read."""
         ...
 
-    def manifest(self) -> ShardManifest:
-        """The shards and their reader, for a streamed read."""
+    def manifest(self, version: int) -> ShardManifest:
+        """The shards and their reader, for a streamed read of data plan `version`
+        (`dew.data.plan.PLAN_VERSIONS`), which decides a store's shards where
+        versions shard it otherwise (a Parquet store's, `dew.data.plan.FILE_SHARDS`)."""
         ...
 
     def metadata(self) -> Mapping[str, object]:
@@ -252,8 +271,8 @@ class View[S: Source]:
     def records(self, read: Read) -> Records:
         return self.source.records(read)
 
-    def manifest(self) -> ShardManifest:
-        return self.source.manifest()
+    def manifest(self, version: int) -> ShardManifest:
+        return self.source.manifest(version)
 
     def lengths(self) -> np.ndarray | None:
         return self.source.lengths()

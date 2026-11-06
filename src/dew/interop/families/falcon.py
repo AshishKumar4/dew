@@ -1,7 +1,6 @@
 """Falcon-7B's one-norm parallel block and fused multi-query projection."""
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.decoder_parts import (
@@ -10,12 +9,10 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     base_config,
-    decoder_tensors,
     grouped_qkv,
     hf_ungated,
     refuse,
-    renamed_name,
-    renamed_path,
+    spelled,
     ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -73,8 +70,8 @@ FALCON = DecoderFamily(
     lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact'
                    and fields.partial_rotary_factor is None,
     'falcon', 'FalconForCausalLM', _falcon_export,
-    weight_path=partial(renamed_path, MEGATRON_NAMES), export_path=partial(renamed_name, MEGATRON_NAMES),
-    packed=grouped_qkv('.self_attention.query_key_value'), export_weights=decoder_tensors,
+    routes=spelled(MEGATRON_NAMES),
+    packed=grouped_qkv('.self_attention.query_key_value'),
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
     defaults={'max_position_embeddings': 2048},

@@ -24,7 +24,6 @@ no release has, is refused by name.
 """
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
@@ -32,15 +31,16 @@ from dew.interop.decoder_parts import (
     MOE_NAMES,
     DecoderFamily,
     DecoderFields,
+    ExportRefused,
     RopeSpelling,
     base_config,
     kind_mixers,
     kinds_of,
     read_partial_rope,
     refuse,
-    renamed_path,
     softmax_top_k,
     specified_layer_types,
+    spelled,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -173,9 +173,9 @@ def _lightning(model: CausalTransformer) -> list[LightningAttentionMixer]:
 def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
     """No config: no runtime outside Dew computes this family as its release does (the module docstring),
     so a Hugging Face checkpoint of it would open as another model."""
-    raise ValueError("MiniMax-Text-01 and M1 write no Hugging Face checkpoint: transformers' MiniMax turns "
-                     "every dimension of a head and scales its lightning rates otherwise, and the release's "
-                     "own code does not import under transformers 5 (ledgers 2534, 2535)")
+    raise ExportRefused("MiniMax-Text-01 and M1 write no Hugging Face checkpoint: transformers' MiniMax "
+                        "turns every dimension of a head and scales its lightning rates otherwise, and the "
+                        "release's own code does not import under transformers 5 (ledgers 2534, 2535)")
 
 
 MINIMAX = DecoderFamily(
@@ -185,7 +185,7 @@ MINIMAX = DecoderFamily(
     'minimax',
     'MiniMaxForCausalLM',
     _minimax_export,
-    weight_path=partial(renamed_path, MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
+    routes=spelled(MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
     preserve_source_layout=False,
     padding_idx=True,
     # MiniMaxConfig's defaults (configuration_minimax.py), the releases' own class's too.
