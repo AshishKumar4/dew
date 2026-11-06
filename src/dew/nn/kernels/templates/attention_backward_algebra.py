@@ -34,7 +34,9 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     e = gradient.below(logits, per_query(peak if accurate else gradient.safe_peak(peak)), how,
                        safe=not accurate)
     over = per_query(1.0 / jnp.where(total == 0, 1.0, total))
-    dropped = products if keep is None else products * keep
+    # The dropped products rounded once before any centre reads them (`gradient.dropped_products`), as the
+    # mainloop's dropout centre takes them: where kept products agree its D is exactly their product.
+    dropped = gradient.dropped_products(products, keep)
     about = dropped - per_query(anchor)
     if at_anchor is not None:
         about = jnp.where(at_anchor, 0.0, about)
