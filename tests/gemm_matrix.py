@@ -1,5 +1,6 @@
-"""GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the
-reference.
+"""GEMM's check-1 matrix (tests/kernel_matrix.py): each grouped-matmul kernel's training step on par with the
+reference: the template's Mosaic GPU launches, Dew's Triton launch, CUTLASS's grouped GEMM on Hopper (the GPU
+tier's dew-cutlass) and the TPU's Mosaic launches (the TPU tier), a case's `kernel` (`KERNELS`).
 
 Each cell runs `gemm.gemm` as a user's training step does, the forward and its reverse mode in one program,
 so the products' launches and the hooks' VJPs run in the program a step builds around them. The output and
@@ -9,15 +10,16 @@ formula in float64: a product masked by each row's group, its hook applied. The 
 `generation.CHOICES` entry the call reports, `grouped_matmul`; the epilogue hooks are the call's own
 arguments, not `gemm_epilogue`, which is the fuser route's (`fused_gemm`).
 
-The route is the template's where its Mosaic launches take every product of the step, named
-(`generation.chosen(grouped_matmul="mosaic_gpu")`: the selector's own pick of a dense product is XLA's dot
-where it measured faster, and of an H100's grouped one CUTLASS's, so the default route would hold those
-against XLA); a named kernel that refuses any product raises, so where one does (a hook whose cotangent is
-wider than the rows, a row scale's or a SwiGLU's, whose input and kernel gradients multiply it by the matrix
-in fp32, which no Mosaic launch takes) the selector's own pick is the route, and the case is served where its
-forward is the template's. What the route serves is read from the selector, not listed (`supported`): the
-step traced abstractly as the generation a case names, which the selector's requirements of each product
-answer.
+The route is the case's kernel where it takes every product of the step, named
+(`generation.chosen(grouped_matmul=kernel)`: the selector's own pick of a dense product is XLA's dot where it
+measured faster, and of an H100's grouped one CUTLASS's, so the default route would hold those against XLA);
+a named kernel that refuses any product raises, so where one does (a hook whose cotangent is wider than the
+rows, a row scale's or a SwiGLU's, whose input and kernel gradients multiply it by the matrix in fp32, which
+no Mosaic launch takes) the selector's own pick is the route, and the case is served where its forward is the
+kernel's. What the route serves is read from the selector, not listed (`supported`): the step traced
+abstractly as the generation a case names, which the selector's requirements of each product answer; for
+CUTLASS, whose library only the Hopper node installs, from the support table's declared cells and its
+kernels' contract (`_cutlass_takes`).
 """
 
 import contextlib
@@ -27,24 +29,25 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from gpu_flow import cell
-from jax.sharding import Mesh
+from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from kernel_matrix import AXES
 from reference_error import assert_as_exact, with_gradients
 
-from dew.nn.kernels import gemm, generation, selection
+from dew.nn.kernels import gemm, generation, grouped_matmul, selection
 
 ROWS, DEPTH, WIDTH = 256, 256, 384
 SIZES = (100, 0, 156)
 """A grouped call's three groups' rows: an empty one between two, covering every row."""
 SEEDS = 8
-TEMPLATE = "mosaic_gpu"
-"""The grouped selector's name for the template's launches, which the cells name where they run them."""
 REFERENCE = "xla"
 """The selector's name for XLA's ragged dot, the reference path's route."""
 CHOICES = frozenset({"grouped_matmul"})
-"""The `generation.CHOICES` entries the cells run, the kernel under test the template's launches (the module's
-docstring): each cell asserts that its routes run them (`TEMPLATE`) and that any choice outside `CHOICES` runs
-at XLA, which none does."""
+"""The `generation.CHOICES` entries the cells run: each cell asserts that its routes run its case's kernel
+(`KERNELS`) and that any choice outside `CHOICES` runs at XLA, which none does."""
+KERNELS = {"grouped_matmul": frozenset({"mosaic_gpu", "triton", "cutlass", "mosaic_tpu"})}
+"""The kernels under test of each choice the cells run, a cell its case's `kernel`: the template's Mosaic GPU
+launches, Dew's Triton launch, CUTLASS's grouped GEMM (the Hopper GPU tier's dew-cutlass) and the TPU's Mosaic
+launches (the TPU tier)."""
 
 
 def _matrices(case: dict[str, str]) -> tuple[int, ...]:
@@ -167,15 +170,23 @@ def _drawn(case: dict[str, str]):
     return draw
 
 
+def _mesh(name: str) -> AbstractMesh:
+    """An abstract mesh of one of `name`'s devices, which a GPU's and a TPU's lowering read their target from
+    on any host."""
+    if generation.capability(name) is not None:
+        return generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), name)
+    device = AbstractDevice(device_kind=generation.gpu_target(name).device_kind, num_cores=1, platform="tpu")
+    return AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+
+
 def _reported(case: dict[str, str], kernel: str | None, *,
               forward: bool) -> list[str] | selection.KernelRefused:
     """The kernels the grouped selector reports, in order, for `case`'s call (its training step, unless
     `forward`) named `kernel`, traced abstractly as `case`'s generation within an abstract mesh of one of its
     devices (`generation.assumed`); the refusal where the named kernel refuses a product."""
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), case["generation"])
     call = _call(case, kernel)
     spec = _spec(case)
-    with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(mesh),
+    with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(_mesh(case["generation"])),
           generation.routes() as routes):
         try:
             jax.eval_shape(call if forward else with_gradients(call), *(spec[:-1] if forward else spec))
@@ -184,32 +195,64 @@ def _reported(case: dict[str, str], kernel: str | None, *,
     return [route.kernel for route in routes if route.choice == "grouped_matmul"]
 
 
+def _cutlass_takes(case: dict[str, str]) -> bool:
+    """Whether CUTLASS's launches take each product of `case`'s training step (`_Cutlass.takes`: its kernels'
+    contract, wherever dew-cutlass holds them) on a generation whose instruction family declares a CUTLASS
+    cell (`grouped_matmul.DECLARED`): read from that table and contract, since only the GPU tier's Hopper node
+    installs the library a selection would ask for."""
+    family = generation.family(case["generation"])
+    declared = grouped_matmul.DECLARED.items()
+    if not any(cell[0] == family and kernel == "cutlass" for cell, (kernel, _) in declared):
+        return False
+    if case["form"] != "grouped":
+        return False
+    x, matrix, *_, dout = _spec(case)
+    sizes = jax.ShapeDtypeStruct((len(SIZES),), jnp.int32)
+    transposed = case["matrix"] == "k-major"
+    options = {"out_dtype": case["dtype"], "interpret": False}
+    binds = (grouped_matmul.CutlassGmm().bind(x, matrix, sizes, trans_rhs=transposed, **options),
+             grouped_matmul.CutlassGmm().bind(dout, matrix, sizes, trans_rhs=not transposed, **options),
+             grouped_matmul.CutlassTgmm().bind(x, dout, sizes, **options))
+    return case["hook"] == "plain" and all(grouped_matmul.CutlassGmm.takes(ba) for ba in binds)
+
+
 def route_of(case: dict[str, str]) -> str | None:
-    """The kernel the cell names for `case`'s route (`TEMPLATE`), or None where the selector decides: the
-    template where it takes every product of the training step, the forward, the input gradient and the
-    kernel gradient (one that does not, named, raises)."""
-    reported = _reported(case, TEMPLATE, forward=False)
-    return TEMPLATE if isinstance(reported, list) and set(reported) == {TEMPLATE} else None
+    """The kernel the cell names for `case`'s route (its `kernel`), or None where the selector decides: the
+    case's kernel where it takes every product of the training step, the forward, the input gradient and the
+    kernel gradient (one that does not, named, raises); CUTLASS's where its contract takes them
+    (`_cutlass_takes`)."""
+    if case["kernel"] == "cutlass":
+        return "cutlass" if _cutlass_takes(case) else None
+    reported = _reported(case, case["kernel"], forward=False)
+    return case["kernel"] if isinstance(reported, list) and set(reported) == {case["kernel"]} else None
 
 
 def supported(case: dict[str, str]) -> bool:
-    """Whether the route serves `case` (tests/kernel_matrix.py): its forward is a launch of the template's
+    """Whether the route serves `case` (tests/kernel_matrix.py): its forward is a launch of its kernel's
     (`route_of`: the whole step's, or the selector's own pick of the forward, which is no declared cell's old
-    route, and not the paired product's two apart)."""
+    route, and not the paired product's two apart); CUTLASS's wherever its contract takes the whole step."""
+    if case["kernel"] == "cutlass":
+        return _cutlass_takes(case)
     forward = _reported(case, route_of(case), forward=True)
-    return isinstance(forward, list) and forward[:1] == [TEMPLATE]
+    return isinstance(forward, list) and forward[:1] == [case["kernel"]]
 
 
 CASES = (
-    ('sm90', 'dense', 'n-major', 'plain', 'bfloat16'),
-    ('sm90', 'grouped', 'k-major', 'bias', 'float16'),
-    ('sm80', 'grouped', 'n-major', 'paired', 'bfloat16'),
-    ('sm80', 'dense', 'k-major', 'plain', 'float16'),
-    ('sm90', 'grouped', 'n-major', 'row-scale', 'float16'),
-    ('sm90', 'dense', 'n-major', 'bias', 'bfloat16'),
-    ('sm90', 'grouped', 'k-major', 'row-scale', 'bfloat16'),
-    ('sm90', 'grouped', 'k-major', 'paired', 'float16'),
-    ('sm90', 'grouped', 'n-major', 'plain', 'bfloat16'),
+    ('sm90', 'mosaic_gpu', 'dense', 'n-major', 'plain', 'bfloat16'),
+    ('sm90', 'triton', 'grouped', 'k-major', 'bias', 'float16'),
+    ('v5e', 'mosaic_tpu', 'dense', 'k-major', 'row-scale', 'bfloat16'),
+    ('sm80', 'mosaic_gpu', 'grouped', 'n-major', 'paired', 'float16'),
+    ('sm80', 'triton', 'dense', 'n-major', 'bias', 'bfloat16'),
+    ('sm90', 'cutlass', 'grouped', 'k-major', 'plain', 'bfloat16'),
+    ('v5e', 'mosaic_tpu', 'grouped', 'n-major', 'plain', 'bfloat16'),
+    ('sm90', 'mosaic_gpu', 'grouped', 'n-major', 'row-scale', 'float16'),
+    ('sm80', 'mosaic_gpu', 'dense', 'k-major', 'plain', 'float16'),
+    ('sm90', 'mosaic_gpu', 'grouped', 'k-major', 'paired', 'bfloat16'),
+    ('sm80', 'triton', 'grouped', 'n-major', 'row-scale', 'bfloat16'),
+    ('v5e', 'mosaic_tpu', 'dense', 'n-major', 'bias', 'bfloat16'),
+    ('sm90', 'mosaic_gpu', 'dense', 'n-major', 'bias', 'bfloat16'),
+    ('sm90', 'triton', 'dense', 'n-major', 'plain', 'bfloat16'),
+    ('sm90', 'cutlass', 'grouped', 'n-major', 'plain', 'bfloat16'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("gemm")`, regenerated where the axes or the route's support change)."""
@@ -217,12 +260,12 @@ CASES = (
 
 @cell("gemm", covers=lambda case: dict(zip(AXES["gemm"], case, strict=True)))
 @pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own accelerator alone"))
     for case in CASES], ids="-".join)
 def a_gemm_training_step_is_on_par(case: tuple[str, ...]) -> None:
-    """The template route's training step of `case` on its GPU on par with the reference path's (check 1):
+    """The route's training step of `case` on its accelerator on par with the reference path's (check 1):
     the output and the gradients of the rows, the matrix and the hook's operands, from the plain formula in
-    float64; its routes run the template's launches (`CHOICES`)."""
+    float64; its routes run its case's kernel (`KERNELS`)."""
     combination = dict(zip(AXES["gemm"], case, strict=True))
     route = route_of(combination)
     with generation.routes() as routes:
@@ -231,4 +274,4 @@ def a_gemm_training_step_is_on_par(case: tuple[str, ...]) -> None:
                         "-".join(case), seeds=SEEDS, truth_fn=with_gradients(_plain(combination)))
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
-    assert ("grouped_matmul", TEMPLATE) in recorded and not unnamed, (sorted(recorded), unnamed)
+    assert ("grouped_matmul", combination["kernel"]) in recorded and not unnamed, (sorted(recorded), unnamed)
