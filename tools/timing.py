@@ -329,61 +329,90 @@ def profiled(case: dict, out: Path, repo: Path) -> None:
                            cwd=tree, env=variables, check=True)
 
 
+LEVEL = 0.95
+"""The level a window judges an arm at (`dew.telemetry.benchmark.judged`), unless its case names its own."""
+
+
 def summarized(manifest: dict, out: Path) -> None:
     """The window's verdict, out/summary.json and its table out/summary.md, from its rows, so every window
     decides alike. Per case, cell and arm: the median of its measure (device ms, or wall ms where the case's
-    clock is the wall's); its paired ratio to the reference each round past the warm-up (the arm's round
-    median over the reference's), each round's in order, their median, least and most; the A/A arm's least
-    and most ratio, the window's noise band; `differs` only where the arm's whole range of ratios lies
-    outside the band; and whether its digest is the reference's. Beside them, the window's run order (each
+    clock is the wall's); its ratio to the reference call by call past the warm-up (each of its calls over the
+    reference's of the same round and repeat), judged against the A/A arm's at the case's level by Dew's one
+    judgment (`dew.telemetry.benchmark.judged`: the ratios' median and interval beside the A/A's, the
+    window's noise band, `differs` where neither chance nor the band accounts for it); each round's median
+    ratio in order beside it; and whether its digest is the reference's. A window with too few calls to reach
+    an interval at its level says so in place of a verdict. Beside them, the window's run order (each
     `order`'s case, cell and arm) and each round's GPU."""
     import statistics
+
+    from dew.telemetry import benchmark
 
     rows = [json.loads(line) for line in (out / "timing.jsonl").read_text().splitlines()]
     cases, lines = [], []
     for case in manifest["cases"]:
         measure = "wall_ms" if case.get("clock", manifest.get("clock", "device")) == "wall" else "device_ms"
         reference = case.get("reference", case["arms"][0]["name"])
-        lines += [f"### {case['name']} ({measure}, reference {reference})", "",
-                  "| cell | arm | median | ratio median | ratio range | ratio by round | differs | digest |",
+        level = case.get("level", LEVEL)
+        lines += [f"### {case['name']} ({measure}, reference {reference}, level {level})", "",
+                  "| cell | arm | median | ratio median | ratio interval | ratio by round | differs "
+                  "| digest |",
                   "|---|---|---|---|---|---|---|---|"]
         cells = []
         for index, cell in enumerate(case["cells"]):
             mine = [row for row in rows if row["case"] == case["name"] and row["cell"] == cell
                     and not row["warmup"]]
 
-            def by_round(arm: str, mine: list[dict] = mine, measure: str = measure) -> dict[int, float]:
-                found: dict[int, list[float]] = {}
-                for row in mine:
-                    if row["arm"] == arm and row[measure] is not None:
-                        found.setdefault(row["round"], []).append(row[measure])
-                return {round_: statistics.median(values) for round_, values in found.items()}
+            def calls(arm: str, mine: list[dict] = mine, measure: str = measure) -> dict:
+                """`arm`'s timed calls, by their round and repeat."""
+                return {(row["round"], row["repeat"]): row[measure] for row in mine
+                        if row["arm"] == arm and row[measure] is not None}
 
-            base = by_round(reference)
+            def paired(arm: str, base: dict) -> dict[tuple[int, int], float]:
+                """`arm`'s calls each over the reference's of its round and repeat."""
+                return {call: value / base[call] for call, value in sorted(calls(arm).items())
+                        if call in base}
+
+            base = calls(reference)
+            alone = list(paired(f"{reference}~aa", base).values())
             digest = next(row["digest"] for row in mine if row["arm"] == reference)
-            aa = [value / base[round_] for round_, value in by_round(f"{reference}~aa").items()]
-            band = (min(aa), max(aa)) if aa else None
+            band, why = None, None
             arms = []
             for arm in [found["name"] for found in arms_of(case)]:
-                rounds = by_round(arm)
-                ratios = [rounds[round_] / base[round_] for round_ in sorted(rounds)]
-                values = [row[measure] for row in mine if row["arm"] == arm and row[measure] is not None]
+                each_call = paired(arm, base)
+                ratios = list(each_call.values())
+                rounds: dict[int, list[float]] = {}
+                for (round_, _), ratio in each_call.items():
+                    rounds.setdefault(round_, []).append(ratio)
+                by_round = [statistics.median(rounds[round_]) for round_ in sorted(rounds)]
+                values = list(calls(arm).values())
+                judgment = None
                 # The reference and its A/A are the band's own ends, never judged against it.
-                differs = bool(band and ratios and arm not in (reference, f"{reference}~aa")
-                               and (min(ratios) > band[1] or max(ratios) < band[0]))
+                if arm not in (reference, f"{reference}~aa") and ratios and alone:
+                    try:
+                        judgment = benchmark.judged(ratios, alone, level=level)
+                    except ValueError as refused:
+                        why = str(refused)
+                    else:
+                        band = judgment.alone
                 same = next(row["digest"] for row in mine if row["arm"] == arm) == digest
                 arms.append({"arm": arm, "median": statistics.median(values) if values else None,
                              "ratio_median": statistics.median(ratios) if ratios else None,
-                             "ratio_range": [min(ratios), max(ratios)] if ratios else None, "ratios": ratios,
-                             "differs": differs, "digest_is_reference": same})
-                ranged = f"{min(ratios):.4f}-{max(ratios):.4f}" if ratios else "-"
+                             "ratio_interval": list(judgment.interval) if judgment else None,
+                             "ratios": by_round, "differs": judgment.differs if judgment else None,
+                             "digest_is_reference": same})
+                interval = f"{judgment.interval[0]:.4f}-{judgment.interval[1]:.4f}" if judgment else "-"
                 median = f"{arms[-1]['median']:.4f}" if values else "-"
                 ratio = f"{arms[-1]['ratio_median']:.4f}" if ratios else "-"
-                each = " ".join(f"{value:.4f}" for value in ratios) or "-"
-                lines.append(f"| {index}: {json.dumps(cell)} | {arm} | {median} | {ratio} | {ranged} | "
-                             f"{each} | {'yes' if differs else 'no'} | {'same' if same else 'differs'} |")
-            cells.append({"cell": cell, "noise_band": list(band) if band else None, "arms": arms})
-        cases.append({"case": case["name"], "measure": measure, "reference": reference, "cells": cells})
+                each = " ".join(f"{value:.4f}" for value in by_round) or "-"
+                verdict = "-" if judgment is None else "yes" if judgment.differs else "no"
+                lines.append(f"| {index}: {json.dumps(cell)} | {arm} | {median} | {ratio} | {interval} | "
+                             f"{each} | {verdict} | {'same' if same else 'differs'} |")
+            cells.append({"cell": cell, "noise_band": list(band) if band else None, "unjudged": why,
+                          "arms": arms})
+            if why:
+                lines.append(f"| {index}: {json.dumps(cell)} | unjudged: {why} | | | | | | |")
+        cases.append({"case": case["name"], "measure": measure, "reference": reference, "level": level,
+                      "cells": cells})
         lines.append("")
     order = [{"order": row["order"], "case": row["case"], "cell": row["cell"], "arm": row["arm"]}
              for row in rows if row["repeat"] == 0]

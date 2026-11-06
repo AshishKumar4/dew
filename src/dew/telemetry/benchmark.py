@@ -20,7 +20,7 @@ import html
 import math
 import statistics
 import time
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from fractions import Fraction
 from typing import NamedTuple
 
@@ -294,14 +294,22 @@ def carried[S](step: Callable[[S], S], state: S, count: int, *, each: bool = Fal
 
 @dataclasses.dataclass(frozen=True)
 class Comparison:
-    """What `compared` measured: each pair's ratio of the first call's seconds to the second's, the median
-    ratio and its interval (`_median_rank`), and the second call against itself (its A/A), whose interval is
-    the placement's own noise: a difference is one where `interval` lies apart from 1 and outside `alone`."""
+    """A call's paired ratios to its reference judged (`judged`): each pair's ratio of the call's seconds to
+    the reference's, the median ratio and its interval (`_median_rank`), and the reference against itself
+    (its A/A), whose interval is the placement's own noise: a difference is one where `interval` lies apart
+    from 1 and outside `alone` (`differs`)."""
 
     ratios: tuple[float, ...]
     ratio: float
     interval: tuple[float, float]
     alone: tuple[float, float]
+
+    @property
+    def differs(self) -> bool:
+        """Whether the call's time differs from its reference's: its interval apart from 1 and outside the
+        A/A's, so neither chance nor the placement's own noise accounts for it."""
+        low, high = self.interval
+        return (low > 1 or high < 1) and (low > self.alone[1] or high < self.alone[0])
 
 
 def _median_rank(count: int, level: float) -> int:
@@ -322,6 +330,22 @@ def _median_rank(count: int, level: float) -> int:
     return rank
 
 
+def judged(ratios: Sequence[float], alone: Sequence[float], *, level: float = 0.95) -> Comparison:
+    """Paired ratios of a call to its reference (each pair's seconds of the call over the reference's), judged
+    against the reference's own A/A ratios at `level`: their median and the interval the pairs' order
+    statistics give it (`_median_rank`), beside the A/A's, the placement's noise (`Comparison.differs`). The
+    one judgment of a time against another: `compared`'s, and the timing harness's windows'
+    (tools/timing.py), whose pairs a window's interleaved rounds make. Raises `ValueError` where `ratios` or
+    `alone` hold too few pairs to reach an interval at `level`."""
+
+    def bounds(values: Sequence[float]) -> tuple[float, float]:
+        rank, ordered = _median_rank(len(values), level), sorted(values)
+        return float(ordered[rank - 1]), float(ordered[len(ordered) - rank])
+
+    interval, noise = bounds(ratios), bounds(alone)
+    return Comparison(tuple(float(ratio) for ratio in ratios), float(np.median(ratios)), interval, noise)
+
+
 def compared[T](first: Callable[[], T], second: Callable[[], T], *, pairs: int = 400, warmup: int = 3,
                 level: float = 0.95) -> Comparison:
     """`first` against `second`, each timed as `samples` times one call, in `pairs` interleaved pairs whose
@@ -334,7 +358,7 @@ def compared[T](first: Callable[[], T], second: Callable[[], T], *, pairs: int =
     at least `level`, exactly; the pair's holds its median ratio so where its pairs are independent. The
     caller binds each call to fresh inputs where its time depends on its data (a MoE's routing). Raises
     `ValueError` where `pairs` reach no interval at `level`."""
-    rank = _median_rank(pairs, level)
+    _median_rank(pairs, level)
     coins = np.random.default_rng()
     for _ in range(warmup):
         jax.block_until_ready(first())
@@ -355,13 +379,8 @@ def compared[T](first: Callable[[], T], second: Callable[[], T], *, pairs: int =
             ratios.append(left_seconds / right_seconds)
         return np.asarray(ratios)
 
-    def bounds(ratios: np.ndarray) -> tuple[float, float]:
-        ordered = np.sort(ratios)
-        return float(ordered[rank - 1]), float(ordered[len(ordered) - rank])
-
     ratios = paired(first, second)
-    return Comparison(tuple(float(ratio) for ratio in ratios), float(np.median(ratios)), bounds(ratios),
-                      bounds(paired(second, second)))
+    return judged(ratios.tolist(), paired(second, second).tolist(), level=level)
 
 
 def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
