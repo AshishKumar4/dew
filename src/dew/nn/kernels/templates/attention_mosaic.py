@@ -44,6 +44,7 @@ from dew.nn.kernels.templates.attention_mosaic_coop import _coop_allocations
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_allocations
 from dew.nn.kernels.templates.attention_mosaic_forward import (
+    _codes_of,
     _forward_allocations,
     _plain_forward,
     _trained_forward,
@@ -51,7 +52,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     guarded_columns,
     guarded_tiles,
 )
-from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations
+from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, stores_typed
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     Tiles,
@@ -266,8 +267,8 @@ class MosaicForward(_Mainloop[Tiles]):
     its grid is resident at once (`resident`), as its waits on the other slices need."""
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
-             drop=None, table=None, sources=None, *, residuals: Kept, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+             drop=None, table=None, sources=None, scales=None, *, residuals: Kept, interpret: bool,
+             config: Tiles, return_residuals: bool = False):
         hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
                       self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop)
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False,
@@ -277,13 +278,15 @@ class MosaicForward(_Mainloop[Tiles]):
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret}
         match residuals:
             case Kept.SPLIT:
+                if scales is not None:
+                    raise NotImplementedError("a quantized cache's keys are read by inference alone")
                 return _trained_forward(query, key, value, spans, hooks, **form), None
             case Kept.NONE | Kept.OUTPUT:
                 # The inference walk, its rows beside the output where it keeps them.
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
                                       table=table, sources=sources, subtracted=self.subtracted,
-                                      merges=self.merges, **form), None
+                                      merges=self.merges, scales=scales, **form), None
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -315,6 +318,12 @@ class MosaicForward(_Mainloop[Tiles]):
         if not super().legal(ba, config, target):
             return False
         query, value = ba.arguments["query"], ba.arguments["value"]
+        # A quantized call's codes converted where the device converts them (`mosaic.converts`: an FP8 cache
+        # on sm_89 on), its call the gathered keys' path elsewhere.
+        codes = _codes_of(ba.arguments["key"], ba.arguments.get("scales"))
+        # Its values' converted tile one buffer a consumer, which no deferred P·V may still read (`_Codes`).
+        if codes is not None and (config.deferred or not mosaic.converts(codes)):
+            return False
         family = bundle_of(config, query.dtype)
         # Its key tiles (the launch's, its natural rewalk's) split among the consumers that copy them
         # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts, so no 32-key tile
@@ -338,11 +347,12 @@ class MosaicForward(_Mainloop[Tiles]):
         page = _page(ba)
         if page is not None and not all(_pages_hold(page, tile, family) for tile in tiles):
             return False
-        if ba.arguments["residuals"] is Kept.SPLIT or not algebra.headroom(value.dtype):
+        computed = _computed(ba)
+        if ba.arguments["residuals"] is Kept.SPLIT or not algebra.headroom(computed):
             return True
-        columns = guarded_columns(family, value.shape[3], value.dtype)
+        columns = guarded_columns(family, value.shape[3], computed)
         width = _width(query.shape[3], family, query.dtype)
-        return guarded_tiles(family, config, columns, value.dtype, width) is not None
+        return guarded_tiles(family, config, columns, computed, width) is not None
 
     def resident(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
@@ -482,9 +492,10 @@ class MosaicForward(_Mainloop[Tiles]):
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
-                                           min(config.stages, steps), out_dtype=out_dtype)
+                                           min(config.stages, steps), out_dtype=out_dtype,
+                                           codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")))
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
-        guarded = algebra.headroom(value.dtype) and ba.arguments.get("residuals") is not Kept.SPLIT
+        guarded = algebra.headroom(_computed(ba)) and ba.arguments.get("residuals") is not Kept.SPLIT
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
             family, config.consumers, self.score_mod, self.output_mod, guarded=guarded)))
 
@@ -665,6 +676,13 @@ def _keys(ba: tokamax.BoundArguments) -> int:
     return ba.arguments["key"].shape[1] if page is None else ba.arguments["table"].shape[1] * page
 
 
+def _computed(ba: tokamax.BoundArguments):
+    """The dtype a call's values are read in: the query's where they are quantized codes (their `scales`
+    given, `_codes_of`), their own otherwise."""
+    query, value = ba.arguments["query"], ba.arguments["value"]
+    return query.dtype if ba.arguments.get("scales") is not None else value.dtype
+
+
 def _page(ba: tokamax.BoundArguments) -> int | None:
     """A paged call's keys a page, its pools' own (`forward`'s `table`); None for a call of rows of keys."""
     return None if ba.arguments.get("table") is None else ba.arguments["key"].shape[2]
@@ -675,7 +693,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False, out_dtype=None,
             masked: bool = False, splits: int = 1, table: jax.Array | None = None,
-            sources: jax.Array | None = None, subtracted: bool = False, merges: bool = False) -> jax.Array:
+            sources: jax.Array | None = None, subtracted: bool = False, merges: bool = False,
+            scales: tuple[jax.Array, jax.Array] | None = None) -> jax.Array:
     ...
 
 
@@ -684,7 +703,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.SPLIT, Kept.OUTPUT], interpret: bool = False,
             out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
-            sources: jax.Array | None = None, subtracted: bool = False, merges: bool = False
+            sources: jax.Array | None = None, subtracted: bool = False, merges: bool = False,
+            scales: tuple[jax.Array, jax.Array] | None = None
             ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
@@ -693,7 +713,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False, out_dtype=None, masked: bool = False, splits: int = 1,
             table: jax.Array | None = None, sources: jax.Array | None = None, subtracted: bool = False,
-            merges: bool = False):
+            merges: bool = False, scales: tuple[jax.Array, jax.Array] | None = None):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -711,10 +731,13 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     an inference walk's fold of raw products (`MosaicForward.subtracted`). With `splits` and `merges`, the
     launch merges its slices (`MosaicForward.merges`), `hooks`' initial state among them: the rows' output
     `[B, Q, H, Dv]` in `out_dtype`, and with `Kept.OUTPUT` their finished maxima and denominators `[B, H, Q]`.
+    With `scales` (an inference walk's), `key` and `value` are quantized codes, int8 or an FP8, and `scales`
+    the keys' and the values' `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads
+    the keys and values they dequantize to, each converted to the query's dtype in its program (`_Codes`).
     """
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
-                             subtracted=subtracted, merges=merges)
+                             subtracted=subtracted, merges=merges, scales=scales)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -744,7 +767,8 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
                   splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None,
-                  subtracted: bool = False, merges: bool = False) -> tuple[MosaicForward, tuple]:
+                  subtracted: bool = False, merges: bool = False,
+                  scales: tuple[jax.Array, jax.Array] | None = None) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
@@ -761,7 +785,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,
-                table, sources)
+                table, sources, scales)
 
 
 DQ_ROWS = 7
@@ -1110,7 +1134,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             # The fused launch reduces across no warps, its statistics and D its operands and its sums its
             # products' (an A100's at 64 x 64 reserves no reduction scratch, its lowering's 114,688 bytes the
             # model's without it, et-fused80).
-            launches = [(family, config, allocations(family, config, width, dtype, q_stages),
+            # The fused launch's dK and dV in the operands' dtype where it stores them so (`stores_typed`).
+            typed = {} if config.shared_keys else {"typed": stores_typed(
+                family, config, width, dtype, q_stages, grouped=query.shape[2] != key.shape[2])}
+            launches = [(family, config, allocations(family, config, width, dtype, q_stages, **typed),
                          config.shared_keys)]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(

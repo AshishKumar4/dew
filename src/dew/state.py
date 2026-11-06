@@ -271,22 +271,24 @@ def drawn_in[LossT, EffectsT](variables: Variables, dtype: DTypeLike | None,
 
 
 def apart[State: TrainState](state: State, at: Sequence[Sequence[str]] = ((FROZEN,),)
-                             ) -> tuple[State, dict[tuple[str, ...], Variables]]:
+                             ) -> tuple[State, dict[str, Variables]]:
     """`state` less its frozen trees, and those trees by their paths, of the paths `at` names the ones it
     holds: by default its frozen collection (`variables[FROZEN]`), and on a host run every tree it keeps
     beside the accelerator (`dew.training.execution.frozen_trees`), a distillation's teacher too. A step
     donates the first and reads the second, so the frozen arrays are one set of buffers a run shares
     with the tree its objective holds (`together`), and a host run's compiled commit reads none of
-    them. A state's shardings or shapes split the same way."""
-    held = {tuple(path): tree for path in at if (tree := at_path(state.variables, path)) is not None}
+    them. A state's shardings or shapes split the same way, each tree named by its path joined by "/", as
+    a program's placements name a tree's entries."""
+    held = {"/".join(path): tree for path in at if (tree := at_path(state.variables, path)) is not None}
     if not held:
         return state, held
-    return dataclasses.replace(state, variables=without(state.variables, list(held))), held
+    paths = [tuple(path.split("/")) for path in held]
+    return dataclasses.replace(state, variables=without(state.variables, paths)), held
 
 
-def together[State: TrainState](moving: State, held: Mapping[tuple[str, ...], Variables]) -> State:
+def together[State: TrainState](moving: State, held: Mapping[str, Variables]) -> State:
     """The state `apart` split, its frozen trees the very arrays given."""
     variables = moving.variables
     for path, tree in held.items():
-        variables = placed_at(variables, path, tree)
+        variables = placed_at(variables, path.split("/"), tree)
     return moving if not held else dataclasses.replace(moving, variables=variables)

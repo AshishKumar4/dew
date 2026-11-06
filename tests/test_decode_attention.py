@@ -772,7 +772,7 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
     if ON_GPU:
         case = PagedCase(heads=query.shape[1], kv_heads=key_pages.shape[0], head_dim=query.shape[2],
                          value_dim=query.shape[2], dtype=query.dtype, pool=key_pages.dtype,
-                         page_size=page_size, quantized=False, groups=1, head_shards=1, softcap=None,
+                         page_size=page_size, quantized=None, groups=1, head_shards=1, softcap=None,
                          arithmetic=False, named="auto", windowed=windowed)
         assert PAGED.kernel("triton").failed(case) == []
     config = decode_attention.Split(splits)
