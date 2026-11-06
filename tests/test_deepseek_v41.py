@@ -199,11 +199,11 @@ def test_a_packed_documents_engram_lookback_stops_at_its_start_whatever_its_posi
 def released():
     """The released bundle's config, its wrapper record, the model it builds
     and its tree's shapes."""
-    from dew.interop.pretrained import _wrapper_model
+    from dew.interop.wrappers import wrapper_model
 
     config = json.loads((RELEASED / "config.json").read_text())
     record = translate_wrapper_config(config)
-    model = _wrapper_model(
+    model = wrapper_model(
         config, record, models.build("causal_transformer", record["text"]), dtype="float32"
     )
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
