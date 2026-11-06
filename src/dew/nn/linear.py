@@ -458,25 +458,30 @@ def entered_scan(mixed, taps, bias, rule, coordinates: Coordinates, state_shape:
     documents, count, width = entered.documents, entered.count, taps.shape[1] - 1
     turned = documents[:, 1:] != documents[:, :-1]
     begins = jnp.concatenate([jnp.ones_like(documents[:, :1], bool), turned], axis=1)
-    zero = jnp.zeros((documents.shape[0], count, *state_shape), state_dtype or mixed.dtype)
+    # One slot past the documents, for a row's first slot beginning a document where none of a call does.
+    zero = jnp.zeros((documents.shape[0], count + 1, *state_shape), state_dtype or mixed.dtype)
     convolved = causal_conv1d(mixed, taps, bias=bias, valid=roots, segments=documents, parts=parts,
                               dtype=dtype)
     first, finals = rule(convolved, valid=roots, starts=begins & roots, state=zero,
-                         entered=jnp.zeros_like(entered.entered))
+                         entered=jnp.zeros((documents.shape[0], count + 1), jnp.int32))
     held = document_tails(mixed, roots, documents, width, count)
     convolved = entered_conv1d(mixed, taps, branches, documents, held, entered.entered, bias=bias,
                                parts=parts, dtype=dtype)
-    # A call numbers its documents by their starts, in order: the first call's finals are its roots' in
-    # theirs, and the second's documents its branches in theirs, each entering its root's rank.
-    exists = jnp.zeros(entered.entered.shape, bool).at[jnp.arange(documents.shape[0])[:, None],
-                                                       jnp.maximum(documents - 1, 0)].max(documents > 0)
+    # A call numbers its documents by its starts in order, a row's first slot beginning one whatever it
+    # holds (`dew.batch.document_firsts`): the first call's finals are its roots' in theirs, after one its
+    # row's first slot begins where no root does, and the second's documents its branches in theirs, after
+    # one likewise, each entering its root's place among the first call's.
+    rows = jnp.arange(documents.shape[0])[:, None]
+    exists = jnp.zeros(entered.entered.shape, bool).at[rows, jnp.maximum(documents - 1, 0)].max(documents > 0)
     rooted = exists & (entered.entered == 0)
-    rank = jnp.cumsum(rooted, axis=1)
     branched = exists & ~rooted
-    order = jnp.where(branched, jnp.cumsum(branched, axis=1) - 1, count)
-    root_rank = jnp.take_along_axis(rank, jnp.maximum(entered.entered - 1, 0), axis=1)
-    slots = jnp.zeros_like(entered.entered).at[jnp.arange(documents.shape[0])[:, None], order].set(
-        jnp.where(branched, root_rank, 0), mode="drop")
+    ahead_of_roots = (~(begins & roots)[:, :1]).astype(jnp.int32)
+    ahead_of_branches = (~(begins & branches)[:, :1]).astype(jnp.int32)
+    place = jnp.cumsum(rooted, axis=1) + ahead_of_roots
+    order = jnp.where(branched, jnp.cumsum(branched, axis=1) - 1 + ahead_of_branches, count)
+    root_place = jnp.take_along_axis(place, jnp.maximum(entered.entered - 1, 0), axis=1)
+    slots = jnp.zeros((documents.shape[0], count + 1), jnp.int32).at[rows, order].set(
+        jnp.where(branched, root_place, 0), mode="drop")
     second, _ = rule(convolved, valid=branches, starts=begins & branches, state=finals, entered=slots)
     out = jnp.where(roots[:, :, *([None] * (first.ndim - 2))], first, second)
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
