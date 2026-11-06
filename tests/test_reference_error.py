@@ -2451,7 +2451,8 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
     arm = run_to_run(bits_apart(), "atomic adds") if declared else bits_apart()
     truth, draw = jnp.matmul, a_product_draw
     if windowed:
-        arm, truth, draw = over_windows(arm), over_windows(jnp.matmul), windows(a_product_draw, 2)
+        # Three windows a draw, so a rerun's calls alternate out of phase with the first run's.
+        arm, truth, draw = over_windows(arm), over_windows(jnp.matmul), windows(a_product_draw, 3)
     if refused:
         with pytest.raises(UnpairedDraw):
             null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
