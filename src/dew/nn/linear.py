@@ -443,49 +443,55 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
 def entered_scan(mixed, taps, bias, rule, coordinates: Coordinates, state_shape: tuple[int, ...], *,
                  parts=None, dtype=None, state_dtype=None):
     """The conv and scan of a recurrent mixer over packed documents of which some enter another
-    (`Coordinates.entered`), each token read once, in two calls: the documents that enter none, from a zero
-    memory and no history, each one's final memory and last `K - 1` tokens kept (`document_tails`); then the
-    documents that enter one, each from that one's memory and after its history (`entered_conv1d`). `rule(
-    convolved, *, valid, starts, state, entered)` runs a call's scan over the tokens `valid` marks, a
-    document's memory a slot of `state` `[B, D, *state_shape]` (`chunk_gated_delta_rule`'s `entered`),
-    returning `(output, finals)`. The gradient of a memory or history entered sums over the documents
-    entering it."""
+    (`Coordinates.entered`), in two calls over the whole row: the documents that enter none, from a zero
+    memory and no history, each one's final memory and last `K - 1` tokens kept (`document_tails`); then
+    the documents that enter one, each from that one's memory and after its history (`entered_conv1d`).
+    Each call's scan lays the row's documents out one a row (`chunk_gated_delta_rule`'s `entered`), so a
+    layer's work is twice a per-document scan's over its row: the price of reading a shared part once and
+    each document from it. `rule(convolved, *, valid, starts, state, entered)` runs a call's scan over
+    the tokens `valid` marks, a document's memory a slot of `state` `[B, D, *state_shape]`, returning
+    `(output, finals)`. The gradient of a memory or history entered sums over the documents entering it."""
     entered = coordinates.entered
     assert entered is not None
     real = jnp.ones(entered.documents.shape, bool) if coordinates.valid is None else coordinates.valid
     roots = entered.roots & real
     branches = real & (entered.documents > 0) & ~roots
     documents, count, width = entered.documents, entered.count, taps.shape[1] - 1
+    batch, length = documents.shape
     turned = documents[:, 1:] != documents[:, :-1]
     begins = jnp.concatenate([jnp.ones_like(documents[:, :1], bool), turned], axis=1)
-    # One slot past the documents, for a row's first slot beginning a document where none of a call does.
-    zero = jnp.zeros((documents.shape[0], count + 1, *state_shape), state_dtype or mixed.dtype)
+    # A call's scan numbers its documents by their first slots in the row, the row's first slot beginning
+    # one whatever it holds (`dew.batch.document_firsts`): as many as the row has slots, and one past its
+    # documents where no root of it begins there.
+    slots = min(count + 1, length)
+    zero = jnp.zeros((batch, slots, *state_shape), state_dtype or mixed.dtype)
     convolved = causal_conv1d(mixed, taps, bias=bias, valid=roots, segments=documents, parts=parts,
                               dtype=dtype)
     first, finals = rule(convolved, valid=roots, starts=begins & roots, state=zero,
-                         entered=jnp.zeros((documents.shape[0], count + 1), jnp.int32))
+                         entered=jnp.zeros((batch, slots), jnp.int32))
     held = document_tails(mixed, roots, documents, width, count)
     convolved = entered_conv1d(mixed, taps, branches, documents, held, entered.entered, bias=bias,
                                parts=parts, dtype=dtype)
-    # A call numbers its documents by its starts in order, a row's first slot beginning one whatever it
-    # holds (`dew.batch.document_firsts`): the first call's finals are its roots' in theirs, after one its
-    # row's first slot begins where no root does, and the second's documents its branches in theirs, after
-    # one likewise, each entering its root's place among the first call's.
-    rows = jnp.arange(documents.shape[0])[:, None]
-    exists = jnp.zeros(entered.entered.shape, bool).at[rows, jnp.maximum(documents - 1, 0)].max(documents > 0)
-    rooted = exists & (entered.entered == 0)
-    branched = exists & ~rooted
-    ahead_of_roots = (~(begins & roots)[:, :1]).astype(jnp.int32)
-    ahead_of_branches = (~(begins & branches)[:, :1]).astype(jnp.int32)
-    place = jnp.cumsum(rooted, axis=1) + ahead_of_roots
-    order = jnp.where(branched, jnp.cumsum(branched, axis=1) - 1 + ahead_of_branches, count)
-    root_place = jnp.take_along_axis(place, jnp.maximum(entered.entered - 1, 0), axis=1)
-    slots = jnp.zeros((documents.shape[0], count + 1), jnp.int32).at[rows, order].set(
-        jnp.where(branched, root_place, 0), mode="drop")
-    second, _ = rule(convolved, valid=branches, starts=begins & branches, state=finals, entered=slots)
+    # Each document's slot in its call, its first slot's rank among the call's beginnings: a branch enters
+    # the finals of its root's slot in the first.
+    rows = jnp.arange(batch)[:, None]
+    positions = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
+    firsts = jnp.full((batch, count), length, jnp.int32).at[rows, jnp.maximum(documents - 1, 0)].min(
+        jnp.where(documents > 0, positions, length))
+    at = jnp.minimum(firsts, length - 1)
+
+    def ranked(begun):
+        begun = begun.at[:, 0].set(True).astype(jnp.int32)
+        return jnp.take_along_axis(jnp.cumsum(begun, axis=1) - begun, at, axis=1)
+
+    root_slot, branch_slot = ranked(begins & roots), ranked(begins & branches)
+    branched = (firsts < length) & (entered.entered > 0)
+    root = jnp.take_along_axis(root_slot, jnp.maximum(entered.entered - 1, 0), axis=1) + 1
+    entering = jnp.zeros((batch, slots), jnp.int32).at[rows, jnp.where(branched, branch_slot, slots)].set(
+        jnp.where(branched, root, 0), mode="drop")
+    second, _ = rule(convolved, valid=branches, starts=begins & branches, state=finals, entered=entering)
     out = jnp.where(roots[:, :, *([None] * (first.ndim - 2))], first, second)
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
-
 
 def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
     """`local(*tokens, *whole)` on shards (`on_shards`) that split the rows and the sequence of each of

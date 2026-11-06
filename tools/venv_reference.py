@@ -33,8 +33,11 @@ NATIVE = {**{f"{task}-{group}": (task, group) for task in _WORKER.TASKS for grou
 of leaves (tools/native_diffusion_worker.py's `groups`), and the SD pipeline's walk over each source
 scheduler's grid."""
 
-NATIVE_PIPELINES = "huggingface/diffusers 0.39.0 with huggingface/transformers 4.49.0"
-"""The diffusers-pipelines cohort (tools/reference_releases.py) the saved tiny pipelines' own calls run in."""
+PIPELINES = importlib.import_module("reference_releases").RELEASES["diffusers-pipelines"]
+NATIVE_PIPELINES = (f"huggingface/diffusers {PIPELINES['diffusers']} with huggingface/transformers "
+                    f"{PIPELINES['transformers']}")
+"""The diffusers-pipelines cohort (tools/reference_releases.py) the saved tiny pipelines' own calls run in,
+as a recording names it."""
 SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py",
                   "reference": "danijar/dreamerv3 e01491fad6434b2245a3b8ca201dd7faedcc458c",
                   "license": "MIT"},
@@ -56,7 +59,8 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                          "license": "MIT", "distribution": ("fla-core", "0.4.0")},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
-                               "license": "Apache-2.0", "distribution": ("transformers", "4.49.0"),
+                               "license": "Apache-2.0",
+                               "distribution": ("transformers", PIPELINES["transformers"]),
                                "host": True, "outputs": True}
             for name, arms in NATIVE.items()}}
 """Each site's test module (its `FIXTURE`, `draw`, `dew` and `OUTPUTS`, or, with `arms`, its

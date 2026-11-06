@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post60,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post61,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post60's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
@@ -125,6 +125,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A compile-only Mosaic GPU target, one that states its compute capability or, stating none, another GPU's kind (an H100 lowered on an A100's host), is held to its own default shared memory limit, not the attached device's.
 - A transformation keeps a wide dtype its trace already holds, while a Python type asked of a wide value still narrows as a user's request.
 - Pallas's Mosaic GPU interpreter transfers a thread map's constants and inputs to the device once, shared by its threads.
+- Pallas's Mosaic GPU interpreter runs a thread map's role body with every argument it was traced with, so a Blackwell causal forward's role threads compile there.
 - Pallas's Mosaic GPU slices, applies pointwise ops to and broadcasts a unit row or column of a tiled array.
 - Mosaic GPU's CP_ASYNC copies a head's `[S, D]` block of `[B, S, H, D]`, a squeezed dimension between sliced ones, under a tile transform.
 - Mosaic GPU's `emit_pipeline` carries its ring slots rather than recomputing them each step.
@@ -245,10 +246,11 @@ CI runs on CPUs. Two diagnostics read a new JAX release on a GPU when you want t
 
 ## XLA:CPU open items
 
-Two quirks of XLA's CPU backend that Dew records rather than works around (CONTRIBUTING.md's one exception): the same computation in float64 shows Dew's own arithmetic right in both.
+Quirks of XLA's CPU backend that Dew records rather than works around (CONTRIBUTING.md's one exception): the same computation in float64 shows Dew's own arithmetic right in each.
 
 - A reduction split across CPU devices, a bias gradient summed over the positions a layout splits among them, takes none of the YNNPACK fusion the same reduction takes on one device: each shard sums with XLA's own reduction, so the split result is the unfused one's, 1.57 times one device's error from float64 for a `[8192, 3]` float32 sum and 5.7 times for a split `Dense` bias gradient. With `xla_cpu_experimental_ynn_fusion_type=""` the two agree (ledger row 4520).
 - A float32 dot whose output is narrower than 16 runs through YNNPACK's generic `dot_1x1x1`, which rounds each product before it adds it; from width 16, and in XLA's own dot, each product is fused into its sum (ledger row 4522).
+- An attention's weighted sum over many keys is one plain float32 dot (`dot_f32_f32_f32`), where PyTorch's CPU kernel sums in blocks: over the 1,296 keys of a decision head's evidence cross-attention, Dew's CPU error at that sum is 2.4 to 2.9 times PyTorch's, and the same products summed in float64 are 0.55 times (ledger row 4610).
 
 ## Compilation cache
 

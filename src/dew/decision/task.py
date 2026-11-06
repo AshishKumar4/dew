@@ -628,10 +628,13 @@ class Decide(SavedRunTask, InItsForm):
         (`RequestSummary`), where they are a part of it: a tournament's rounds (`tournament`).
         """
         if questions is None:
+            if request is not None:
+                raise ValueError("each of a batch's requests is its own whole request; ask a part of one "
+                                 "with questions= and request=")
             return [answers for answers, _ in self._answered(self.rows(state, contexts=contexts),
                                                              [asked for _, asked in state])]
         if images:
-            return self._seen(state, questions, images, context)[0]
+            return self._seen(state, questions, images, context, request=request)[0]
         return self._answered([self._encoded(state, questions, context=context, request=request)],
                               [questions])[0][0]
 
@@ -770,17 +773,20 @@ class Decide(SavedRunTask, InItsForm):
         return self.layout.rows(self.tokenizer, self.specials, "", {"q": Choice("x", ["0"])})
 
     def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
-              context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:
-        """One request's answers and usage, its images laid out in its one row."""
-        return self._looked(questions, *self._shown(state, questions, images, context))
+              context: JSON | None = None, *, request: Mapping[str, Question] | None = None
+              ) -> tuple[dict[str, Answer], Usage]:
+        """One request's answers and usage, its images laid out in its one row, its questions asked from
+        `request` where they are a part of it."""
+        return self._looked(questions, *self._shown(state, questions, images, context, request=request))
 
     def _shown(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
-               context: JSON | None = None) -> tuple[Encoded, Images]:
+               context: JSON | None = None, *, request: Mapping[str, Question] | None = None
+               ) -> tuple[Encoded, Images]:
         """A request's one row with its images laid out before the state, and the images."""
         if self.processor is None or not self.layout.images:
             raise ValueError("images need a backbone with a vision encoder, which this task does not have")
         media = Images.of(self.processor, images, self.processor.image_text())
-        rows = self._encoded(state, questions, media.tokens, context=context)
+        rows = self._encoded(state, questions, media.tokens, context=context, request=request)
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")
         return rows[0], media
@@ -809,8 +815,10 @@ class Decide(SavedRunTask, InItsForm):
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None,
-                 request: Mapping[str, Question] | None = None) -> list[Encoded]:
-        laid = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media, request=request)
+                 request: Mapping[str, Question] | None = None,
+                 tokens: Sequence[int] | None = None) -> list[Encoded]:
+        laid = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media, request=request,
+                                tokens=tokens)
         for row in laid:
             # A row whose declared budgets cut its options alike is answered as its release answers it,
             # the cut in its usage; training leaves such a row out (`Layout.refusal`).
@@ -941,7 +949,9 @@ class Decide(SavedRunTask, InItsForm):
         `<name>` of the whole `request`, its row summarizing that request with it current
         (`RequestSummary`), every group scored in one call."""
         names = {key: key.rsplit("/", 1)[0] for key in played}
-        encoded = [self._encoded(state, {names[key]: question}, request=request)
+        # The state's tokens encoded once for every group's row (`Layout.state`).
+        tokens = self.layout.state(self.tokenizer, self.specials, state)
+        encoded = [self._encoded(state, {names[key]: question}, request=request, tokens=tokens)
                    for key, question in played.items()]
         answered = self._answered(encoded, [{names[key]: question} for key, question in played.items()])
         return {key: answers[names[key]] for key, (answers, _) in zip(played, answered, strict=True)}
