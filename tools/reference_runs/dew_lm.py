@@ -303,8 +303,9 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
         "hlo_flops_per_step": (run.trainer.step_flops and run.trainer.step_flops.hardware),
         "mfu": None if peak_rate is None else run.work.training_flops_per_step * curves.timed_steps
             / curves.window_seconds / (peak_rate * devices),
-        "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats],
-                   "bytes_limit": [int(s.get("bytes_limit", 0)) for s in stats]},
+        # A device's figure it does not state is None, never a 0 it did not measure.
+        "memory": {"peak_allocated_bytes": [s.get("peak_bytes_in_use") for s in stats],
+                   "bytes_limit": [s.get("bytes_limit") for s in stats]},
     }
     for name in (curves.extras[0] if curves.extras else {}):
         result[name] = np.asarray(jax.device_get([entry[name] for entry in curves.extras]),
