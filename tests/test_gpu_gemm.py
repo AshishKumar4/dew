@@ -10,10 +10,13 @@ one process (`gpu_flow`), each cell its own file's property:
   (test_gemm_blackwell).
 - The toolkit's warpgroup scan walks a linear recurrence forward and reversed, each position's state or
   the one before it, as float64 does (test_warpgroup_scan).
+- GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the reference
+  path's, dense and grouped, each matrix layout, hook and dtype its served pairs name (gemm_matrix).
 """
 
 import functools
 
+import gemm_matrix as matrix
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -123,3 +126,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for positions in warpgroup_scan.POSITIONS for reverse in (False, True)
           for exclusive in (False, True)),
     ])
+
+
+def test_the_gemm_matrix_holds_on_this_gpu():
+    """GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the
+    reference path's (XLA's ragged dot) at every pair of axis values the route serves, each cell on its own
+    GPU."""
+    run_cells(cells_of(matrix.a_gemm_training_step_is_on_par))
