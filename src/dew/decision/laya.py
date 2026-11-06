@@ -12,10 +12,12 @@ onto `DecisionHead`.
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dew import _records
 from dew._files import write_atomically
 from dew.config.release import RELEASE_FILE
 from dew.decision.calibration import Calibration
@@ -82,6 +84,24 @@ refusing any other value of `option_layout` (`uses_parallel_layout`)."""
 LAYA_REQUIRED = ("encoder", "head_layers")
 """The keys Laya's agent refuses a config without (`_verify_compatibility`'s `required_cfg`)."""
 
+LAYA_BUDGETS = {"head_max_len": 192, "option_tokens": 48}
+"""The question budgets Laya's release declares where its config states none: the tokens its question
+and options share, and the most one option keeps (`QuestionLayout.head_max_len`, `option_tokens`)."""
+
+
+def laya_layout(config: Mapping[str, object]) -> tuple[MarkerLayout, frozenset[str]]:
+    """The layout Laya's `rl_agent_config.json` (`config`) states, which its readers lay rows out by, its
+    budgets Laya's own where it states none (`LAYA_BUDGETS`), and the budgets so assumed: what
+    `DecisionSource.describe` reads a release's file as, and what `head_files` holds a task's layout to.
+    A budget it states as null keeps that part of the question whole."""
+    head_max_len, option_tokens = (
+        None if (value := config.get(name, default)) is None else _records.integer(value, name)
+        for name, default in LAYA_BUDGETS.items())
+    layout = MarkerLayout(max_len=_records.integer(config.get("max_len", 512), "max_len"),
+                          head_max_len=head_max_len, option_tokens=option_tokens,
+                          parallel=config.get("option_layout", "sequential") == "parallel")
+    return layout, frozenset(name for name in LAYA_BUDGETS if name not in config)
+
 
 def head_files(bundle: "PretrainedDecision") -> HeadFiles:
     """Laya's head in its release (`dew.decision.formats`): its tensors under Laya's names beside the
@@ -97,18 +117,19 @@ def head_files(bundle: "PretrainedDecision") -> HeadFiles:
     layout = bundle.layout
     if not isinstance(layout, QuestionLayout):
         raise ValueError(f"Laya's head reads rows a QuestionLayout lays out, not a {type(layout).__name__}")
-    stated = MarkerLayout(max_len=layout.max_len, head_max_len=layout.head_max_len,
-                          option_tokens=layout.option_tokens, parallel=layout.parallel,
-                          order="question_first" if layout.order == "question_first" else None)
-    beyond = layout != stated or beyond_temperatures(bundle.calibration) is not None
     applied = bundle.calibration.temperatures.applied()
     config = {
         # The encoder Laya's agent names (its tokenizer's, which the release holds under tokenizer/).
         "encoder": bundle.decision_tokenizer.name, "head_layers": head.layers, "max_len": layout.max_len,
         "head_max_len": layout.head_max_len, "option_tokens": layout.option_tokens,
-        "option_layout": RELEASE_FILE if beyond else "parallel" if layout.parallel else "sequential",
+        "option_layout": "parallel" if layout.parallel else "sequential",
         "temperature": [applied.types.get(kind, applied.default) for kind in ("choice", "score", "noul")],
         "temperature_by_options": dict(applied.buckets)}
+    # What Laya's file states of a layout, read as its readers read it; a layout that names Laya's own
+    # order, question first, lays rows out as one that names none.
+    held = replace(layout, order=None) if layout.order == "question_first" else layout
+    if held != laya_layout(config)[0] or beyond_temperatures(bundle.calibration) is not None:
+        config["option_layout"] = RELEASE_FILE
     written = json.dumps(config, indent=2) + "\n"
     return HeadFiles(_head_tensors(bundle.head_variables["params"]), merged=True,
                      files={CONFIG_FILE: lambda path: write_atomically(str(path), written)})
