@@ -1,15 +1,17 @@
 """Scratch instrumentation for the packed-stream check's CPU programs."""
 
 import collections
+import dataclasses
 import json
 import os
 import re
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import test_decision_context as context
-from arm_arithmetic import summed_as_run, unrewritten
+from arm_arithmetic import summed_as_run, unrewritten, widened
 from test_decision_streams import LETTERED, examples, in_streams
 
 
@@ -71,3 +73,20 @@ def test_diagnostic():
                 "ratio": float(np.sqrt(np.sum(ed ** 2) / np.sum(er ** 2)))}), flush=True)
         print("TOTAL", mode, total, "ratio", np.sqrt(total[0] / total[1]), flush=True)
     context.without_ynn = original
+
+
+def test_fixed_float64():
+    packed, alone = in_streams(LETTERED, segments=3), in_streams(LETTERED, segments=1)
+    dew, reference, _, _ = context.packed_arms(packed, alone, examples(LETTERED))
+    variables = packed.init(jax.random.key(0))
+    for objective in (packed, alone):
+        objective.model = dataclasses.replace(
+            objective.model, backbone=objective.model.backbone.clone(dtype=jnp.float64),
+            head=objective.model.head.clone(dtype=jnp.float64))
+    context.COMPILED.clear()
+    context.without_ynn = jax.jit
+    with jax.enable_x64(new_val=True):
+        d, r = unrewritten(dew)(widened(variables)), unrewritten(reference)(widened(variables))
+    for key in d:
+        print("FLOAT64", repr(key.split("Which")[0]),
+              float(np.max(np.abs(d[key] - r[key]))), flush=True)
