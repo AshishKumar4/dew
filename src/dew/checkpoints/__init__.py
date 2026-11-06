@@ -734,6 +734,12 @@ class _RankedSteps(preservation.PreservationPolicy):
     def should_preserve(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo], *,
                         context: preservation.PreservationContext) -> Sequence[bool]:
         held = self.roles(checkpoints, context)
+        deleting = self.checkpoints._deleting
+        # Orbax deletes a step no reader keeps once this save lands (its `_finalize`): one the last cut's
+        # deletion is still in waits for it first, any other leaves it running.
+        if deleting is not None and any(not held[checkpoint.step] and checkpoint.step in deleting[2]
+                                        for checkpoint in checkpoints):
+            self.checkpoints._deleted()
         newest = max((checkpoint.step for checkpoint in checkpoints), default=None)
         self.checkpoints._plan = None if newest is None else (newest, held)
         return [bool(held[checkpoint.step]) for checkpoint in checkpoints]
@@ -857,7 +863,7 @@ class Checkpoints:
         self._swept = False
         # Process 0's deletion of the items the last projection cut, run behind the pool (`_project`), and
         # what it failed on.
-        self._deleting: tuple[threading.Thread, list[OSError]] | None = None
+        self._deleting: tuple[threading.Thread, list[OSError], frozenset[int]] | None = None
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
         # Why the run these checkpoints keep has no record that rebuilds it (`python_run`).
@@ -1362,8 +1368,6 @@ class Checkpoints:
         # a save Orbax refuses leaves the step's committed record as it was, and one it takes replaces it.
         self._staged[step] = (copy.deepcopy(custom),
                               tuple(name for name in (*ROLES, ONE_ITEM) if name in payloads))
-        # Orbax may delete a step the cut's deletion is still in (its retention's `_finalize`): one at a time.
-        self._deleted()
         try:
             with region("checkpoint.submit"):
                 persistent.save(step, args=ocp.args.Composite(**{
@@ -1405,13 +1409,14 @@ class Checkpoints:
         short reads as cut, and its leftovers go at the first projection of a later process. It runs where
         every process of the pool does, in `save`, `wait` and `close`, before the store's collection
         reads the steps' references (`_frozen`). Process 0 deletes behind the pool, which waits on it for
-        the cut alone: `wait`, `close`, the next projection and the next save's submission, which may
-        delete a step the deletion is in, join it (`_deleted`)."""
-        self._deleted()
+        the cut alone: the next projection and `close` join it (`_deleted`), and a save whose retention
+        drops a step the deletion is still in waits for it there (`_RankedSteps.should_preserve`)."""
         persistent = self._manager
         plan, self._plan = self._plan, None
         if persistent is None or plan is None:
             return
+        # One deletion at a time: a new cut waits for the last.
+        self._deleted()
         persistent.wait_until_finished()
         newest, roles = plan
         cuts: dict[str, list[str]] = {}
@@ -1437,7 +1442,7 @@ class Checkpoints:
             deleting = threading.Thread(target=_rmtrees, args=(doomed, failures),
                                         name="checkpoint projection")
             deleting.start()
-            self._deleting = deleting, failures
+            self._deleting = deleting, failures, frozenset(int(step) for step in cuts)
         self._swept = True
         for step, kept in cuts.items():
             if int(step) in self._committed:
@@ -1454,7 +1459,7 @@ class Checkpoints:
         deleting, self._deleting = self._deleting, None
         if deleting is None:
             return
-        thread, failures = deleting
+        thread, failures, _ = deleting
         thread.join()
         if failures:
             raise failures[0]
@@ -2226,8 +2231,6 @@ class Checkpoints:
                         for writer in (self._manager, self._local_manager) if writer is not None])
             self._pending = None
             self._project()
-            # Process 0's deletion of what the projection cut lands too; the pool waited for the cut alone.
-            self._deleted()
 
 
 @dataclasses.dataclass(frozen=True)
