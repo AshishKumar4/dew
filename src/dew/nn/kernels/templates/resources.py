@@ -460,7 +460,7 @@ def placed(launches_of: Callable, layouts: tuple["Family", ...], target, *,
     (`launches_of(layout)`, None where the layout takes none of them; `plan`). A program whose consumers'
     registers a producer's layout holds keeps its producer, whose loads overlap no consumer's issue; one
     whose consumers need more than a producer leaves them runs on a layout without it, its first consumer
-    issuing the loads (`mosaic.ConsumerFed`). None where no layout holds them."""
+    issuing the loads (`fed.ConsumerFed`). None where no layout holds them."""
     for layout in layouts:
         launches = launches_of(layout)
         planned = None if launches is None else plan(launches, layout, target, programs=programs)
