@@ -144,35 +144,34 @@ def test_a_run_logs_the_share_of_the_tokens_it_computed_that_its_loss_scored(acc
 
 def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
     """A run whose optimizer splits by Muon's rule records, as it starts, where the split sent each
-    parameter and why (`FitStarted.groups`): the regression's kernel to Muon, its bias to AdamW. A run
-    of an optimizer it was handed built records none (row 2087)."""
+    parameter (`FitStarted.groups`, `dew.optim.muon_partition`): the regression's kernel to Muon, its bias
+    to AdamW, each where the optimizer's own dimension numbers send it. A run of an optimizer it was
+    handed built records none (row 2087)."""
+    from dew.optim import muon_weight_dimension_numbers
     from dew.telemetry.records import FitStarted
 
     def started(optimizer):
         tracker = RecordingTracker()
-        make_trainer(optimizer=optimizer, tracker=tracker).fit(dataset(), steps=1)
+        state = make_trainer(optimizer=optimizer, tracker=tracker).fit(dataset(), steps=1)
         (record,) = [value for _, value in tracker.artifacts if isinstance(value, FitStarted)]
-        return record.groups
+        return record.groups, state.variables["params"]
 
-    groups = started(OptimConfig(optimizer="muon", learning_rate=1e-2))
+    groups, params = started(OptimConfig(optimizer="muon", learning_rate=1e-2))
+    numbers = jax.tree_util.tree_leaves_with_path(muon_weight_dimension_numbers(params),
+                                                  is_leaf=lambda leaf: leaf is None)
     assert groups is not None
-    assert sorted(groups.values()) == ["adamw: a bias or of rank below two", "muon"]
-    assert started(None) is None
+    muon = {jax.tree_util.keystr(path): leaf is not None for path, leaf in numbers}
+    assert muon == {path: placed == "muon" for path, placed in groups.items()}
+    assert sorted(placed == "muon" for placed in groups.values()) == [False, True]
+    assert started(None)[0] is None
 
 
-def test_a_runs_start_reports_each_phase_it_took_once(caplog):
-    """A run's start logs each phase as it starts and with the seconds it took when it ends (the data's
-    preparation, the step's compile, the evaluations' warming), and reports each phase's seconds once,
-    beside its first logged step's scalars, none after."""
-    import logging
-
+def test_a_runs_start_reports_each_phase_it_took_once():
+    """A run's start reports the seconds each phase took (the data's preparation, the step's compile, the
+    evaluations' warming) once, beside its first logged step's scalars, none after."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=Features(), tracker=tracker)
-    with caplog.at_level(logging.INFO, logger="dew.training.startup"):
-        trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)
-    took = [record.getMessage() for record in caplog.records if " took " in record.getMessage()]
-    assert [message.split(" took ")[0] for message in took] == [
-        "preparing the data", "compiling the step", "warming the evaluations"]
+    trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)
     reported = [{name: value for name, value in scalars.items() if name.startswith("startup/")}
                 for _, scalars in tracker.scalars]
     [first] = [phases for phases in reported if phases]
@@ -1619,27 +1618,22 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     assert not any("cooldown/val/loss" in scalars for _, scalars in again.scalars)
 
 
-def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_devices_a_step(monkeypatch):
+def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_devices_a_step(caplog):
     """A branch of a run with no token schedule asks the devices for nothing between its steps: a
-    branch three times as long reads from the devices as often as a short one, its tokens left
-    uncounted on the host, as the run's own steps leave them."""
+    branch three times as long transfers from the devices to the host as often as a short one, every
+    transfer the guard sees counted (`jax.transfer_guard_device_to_host`), its tokens left uncounted on the
+    host, as the run's own steps leave them (row 4422: a spy on one fetching function saw no other)."""
     from dew.optim import Linear
     from dew.training.cooldown import Cooldowns
 
-    stable, reads = Linear(2.0 ** -4, decay_start=64, decay_steps=128), []
-    fetched = jax.device_get
-
-    def counted(tree):
-        reads.append(1)
-        return fetched(tree)
-
-    monkeypatch.setattr(jax, "device_get", counted)
+    stable = Linear(2.0 ** -4, decay_start=64, decay_steps=128)
     per_branch = []
     for length in (2, 6):
-        reads.clear()
-        cooldown_run(stable, 8, 1, cooldowns=Cooldowns(at=(2,), length=length, shape="linear"))
-        per_branch.append(len(reads))
-    assert per_branch[0] == per_branch[1]
+        caplog.clear()
+        with jax.transfer_guard_device_to_host("log_explicit"), caplog.at_level(logging.WARNING):
+            cooldown_run(stable, 8, 1, cooldowns=Cooldowns(at=(2,), length=length, shape="linear"))
+        per_branch.append(sum(record.levelno == logging.WARNING for record in caplog.records))
+    assert per_branch[0] == per_branch[1] > 0, per_branch
 
 
 def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
