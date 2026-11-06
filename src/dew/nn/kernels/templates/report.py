@@ -457,7 +457,7 @@ def reads_binaries(lowered: jax.stages.Lowered) -> bool:
     kinds' binaries are read (`binaries`, a Triton launch's by its custom kernel's tag), so a launch's
     feedback is the same whatever kernels share its program (row 3960: a Triton-only program's
     15,752-byte frame went unread)."""
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     return any(call.kind in ("mosaic_gpu", "triton") for call in kernel_calls(lowered))
 
