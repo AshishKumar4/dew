@@ -18,7 +18,7 @@ from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
-from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, selection, tuning
 from dew.nn.kernels.templates import bundles, mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import mosaic_gpu, mosaic_tpu, triton_dense
 
@@ -1195,6 +1195,25 @@ def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     assert found.fused_seconds is not None and found.unfused_seconds is not None, found
     assert found.unfused_seconds - found.fused_seconds >= 2 * 8192 * 4096 * 2 / rate, found
     assert plain.fused_seconds is None and plain.unfused_seconds is None
+
+
+@INTERPRETS
+def test_a_regions_analysis_reports_what_fusing_it_would_raise():
+    """Where the call names a kernel that refuses the region (the template on mma.sync, whose model counts no
+    side operand, under `generation.chosen`), `fused_gemm.analysis` reports the refusal `fused` raises, so a
+    pass never takes a region whose fusion fails."""
+    sizes = jnp.asarray([100, 156], jnp.int32)
+    x, w = jnp.ones((256, 512), jnp.bfloat16), jnp.ones((2, 512, 256), jnp.bfloat16)
+    bias = jnp.ones((256,), jnp.float32)
+
+    def region(x, w, sizes, bias):
+        return fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True) + bias
+
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        found = fused_gemm.analysis(region, x, w, sizes, bias)
+        assert found.refused is not None and found.launch is None, found
+        with pytest.raises(selection.KernelRefused):
+            jax.jit(functools.partial(fused_gemm.fused, region))(x, w, sizes, bias)
 
 
 def _moved_columns(columns: int, block: int):

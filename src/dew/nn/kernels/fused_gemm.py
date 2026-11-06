@@ -51,7 +51,7 @@ from dew import algebra
 from dew.algebra import cost as algebra_cost
 from dew.nn import programs
 from dew.nn.kernels import gemm, generation
-from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
+from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost
 
 FUSION_ROW = 'ledger 1295'
@@ -106,6 +106,9 @@ class Analysis:
     launch: generation.Route | None
     fused_seconds: float | None = None
     unfused_seconds: float | None = None
+    refused: str | None = None
+    """Why a kernel the call names (`generation.chosen`) refuses the region, as `fused` would raise
+    (`selection.KernelRefused`); None where nothing named refuses."""
 
 
 def analysis(region, *inputs) -> Analysis:
@@ -116,6 +119,8 @@ def analysis(region, *inputs) -> Analysis:
     try:
         with generation.routes() as found:
             jax.eval_shape(functools.partial(fused, region), *inputs)
+    except KernelRefused as refusal:
+        return Analysis(None, None, None, refused=str(refusal))
     finally:
         _PRICED.reset(token)
 
