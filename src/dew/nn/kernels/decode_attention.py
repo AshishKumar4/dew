@@ -52,6 +52,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.decode_geometry import grouped_query
 from dew.nn.kernels import launches
+from dew.nn.precision import precision_names
 
 from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
@@ -115,6 +116,30 @@ def _power_width(case: "AttentionCase") -> bool:
 _Need = Requirement["AttentionCase"]
 """A requirement of an `AttentionCase`, the decode selector's case."""
 
+
+def run_products(case: "AttentionCase") -> bool:
+    """Whether a decode kernel computes the products the run declares where the call states none
+    (`jax_default_matmul_precision`, a run's `Numerics.matmul`; a call's own non-default precision is its
+    `arithmetic`). JAX's default leaves them to the backend, which any kernel's are. A declaration names
+    them: fp32 operands in IEEE fp32 (`highest`, F32_F32_F32), which the decode kernels compute (the decode
+    kernel's highest precision, the template's exact parts), not TF32's or bf16 passes', which xla's
+    attention honors; 16-bit operands summed in fp32, every declaration but an algorithm summing narrower."""
+    names = precision_names(jax.config.jax_default_matmul_precision) - {"DEFAULT"}
+    if not names:
+        return True
+    if jnp.dtype(case.dtype) == jnp.dtype(jnp.float32):
+        return names <= {"HIGHEST", "F32_F32_F32"}
+    return not any(name.endswith(("_BF16", "_F16")) for name in names)
+
+
+PRODUCTS = _Need('products', run_products,
+                 lambda case: f"the run declares products ({jax.config.jax_default_matmul_precision}) the "
+                              f"decode kernels do not compute for {case.dtype} operands: xla's attention "
+                              "honors them", row=INHERENT)
+"""The run's declared products a decode kernel computes (`run_products`), the decode selector's kernels'
+requirement beside the call's own `arithmetic`: no kernel replaces a declaration with its own products."""
+
+
 SUPPORTS = (
     _Need('capability', lambda case: triton_runs(), "the decode kernel needs a GPU of sm80 or later",
           row=INHERENT),
@@ -134,10 +159,12 @@ SUPPORTS = (
                        "fp32, bf16 and fp16 on both, float64 going to the reference path", row=INHERENT),
     _Need('arithmetic', lambda case: not case.arithmetic,
           "the call asks for arithmetic only the reference path computes", row=INHERENT),
+    PRODUCTS,
 )
 """The decode kernel's requirements of a call the decode selector serves (`dew.nn.attention_kernels.DECODE`,
 over an `AttentionCase`): a GPU Dew's Triton kernels run on, at most `QUERIES` positions, a
-power-of-two width from 16 to 256, a capacity of whole blocks and one of its dtypes on both sides."""
+power-of-two width from 16 to 256, a capacity of whole blocks, one of its dtypes on both sides and the
+run's declared products (`PRODUCTS`)."""
 
 
 def _spec(scale: float, power: float, softcap: float | None, natural: bool | None, dtype, sinks: bool
