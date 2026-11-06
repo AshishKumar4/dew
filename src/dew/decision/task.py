@@ -1601,7 +1601,7 @@ def _knocked_out(final: Mapping[str, float], first: Mapping[str, float], residua
     rest = [option for option in first if option not in final]
     mass = sum(first[option] for option in rest)
     spread = {option: float(value) * (1 - residual) for option, value in final.items()}
-    spread |= {option: residual * (first[option] / mass if mass else 1 / len(rest)) for option in rest}
+    spread |= {option: residual * first[option] / mass if mass else residual / len(rest) for option in rest}
     total = sum(spread.values())
     return {option: value / total for option, value in spread.items()}
 
