@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import tuning
@@ -67,12 +66,12 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     out_width = (mosaic.staged_columns(width // columns, (jnp.float32,)) if config.shared_dq
                  else width // columns)
     outputs = [] if split else [
-        plgpu.SMEM((holders, max(block_q, block_k), out_width), jnp.float32),
+        family.staged_memory((holders, max(block_q, block_k), out_width), jnp.float32),
         *([] if value_width == width
-          else [plgpu.SMEM((holders, block_k, value_width // columns), jnp.float32)]),
-        plgpu.SMEM((holders, block_k), jnp.float32)]
-    scoped = [mosaic.staged((holders, block_k, width), dtype, swizzle),
-              mosaic.staged((holders, block_k, value_width), dtype, swizzle), *outputs,
+          else [family.staged_memory((holders, block_k, value_width // columns), jnp.float32)]),
+        family.staged_memory((holders, block_k), jnp.float32)]
+    scoped = [family.staged_memory((holders, block_k, width), dtype, swizzle),
+              family.staged_memory((holders, block_k, value_width), dtype, swizzle), *outputs,
               family.load_barriers(holders), family.load_barriers(holders)]
     blocks: dict[str, tuple] = {"queries": ((block_q, width), dtype),
                                 "douts": ((block_q, value_width), dtype)}
@@ -84,20 +83,20 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         share = width // consumers if config.shared_dq else width
         # Its dQ stage the producer's outbox where the producer adds it (`BackwardTiles.producer_dq`).
         stage = (mosaic.outbox((rows, share), jnp.float32, consumers) if config.producer_dq
-                 else [plgpu.SMEM((consumers, rows, share), jnp.float32)])
-        scoped += [plgpu.SMEM((consumers, block_k, rows), dtype), *stage,
+                 else [family.staged_memory((consumers, rows, share), jnp.float32)])
+        scoped += [family.staged_memory((consumers, block_k, rows), dtype), *stage,
                    *(family.exchange(consumers) if config.shared_dq else [])]
     if config.staged_logits:
         # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
         # and the two turns that order its writes against their products' reads (`_staged_logits`): the
         # logits' product reads that stage transposed, at the swizzle a transposed read takes.
         staged = transposed_swizzles(config, "logits").get("logits", swizzle) if swizzle is None else swizzle
-        scoped += [mosaic.staged((block_q, width), dtype, staged), family.schedule(consumers),
+        scoped += [family.staged_memory((block_q, width), dtype, staged), family.schedule(consumers),
                    family.schedule(consumers)]
     else:
         blocks["logits"] = ((block_q, width), dtype)
     if tiled:
-        scoped.append(plgpu.SMEM((consumers, block_k, rows), jnp.float32))
+        scoped.append(family.staged_memory((consumers, block_k, rows), jnp.float32))
     scoped += _relay_tiles(family, consumers, block_k, rows, dtype)
     if config.shared_dq:
         # Its queries' statistics streamed beside them, read from their stage where a step uses each
@@ -462,8 +461,8 @@ def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: 
             mosaic.summed_across(value, scratch, lax.axis_index("wg"), consumers,
                                  lambda summed: written(summed, stage))
 
-        pl.run_scoped(total, plgpu.SMEM(value.shape, jnp.float32), **mosaic.summing(value.shape, consumers),
-                      collective_axes="wg")
+        pl.run_scoped(total, family.staged_memory(value.shape, jnp.float32),
+                      **mosaic.summing(value.shape, consumers), collective_axes="wg")
 
 def _dkv_scoped(refs, *, widths: bool, split: bool) -> tuple:
     """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, dK's output
