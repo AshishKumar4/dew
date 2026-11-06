@@ -75,7 +75,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post61: Pallas's Mosaic GPU interpreter runs a thread map's role body with
+- Dew requires its JAX build 0.12.0.1.post62: Pallas's Mosaic GPU interpreter runs a block-scaled tcgen05 MMA,
+  its scales applied per block before the product, and copies scales to TMEM undoing their SMEM tiling; post61:
+  Pallas's Mosaic GPU interpreter runs a thread map's role body with
   every argument it was traced with, so a Blackwell causal forward's role threads compile there; post60: Mosaic
   GPU's SMEM transfer check answers once per target, so one process compiling a kernel for two GPUs reads each
   one's answer (a kernel body still unplaced reads the device's), and `lax.ragged_all_to_all`'s gradient keeps
