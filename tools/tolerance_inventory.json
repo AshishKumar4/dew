@@ -418,7 +418,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_mdlm_reference.py": {
-   "comparisons": 5,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_mesh_axes.py": {

@@ -2983,7 +2983,7 @@
      "runs": "torch"
     }
    ],
-   "note": "Diffusion._loss (SUBS, continuous time, antithetic times floored at 1e-3) and _ddpm_update's categorical, around a hidden @ head stand-in backbone; rows, weights and uniforms are inputs."
+   "note": "Diffusion._loss (SUBS, continuous time, antithetic times floored at 1e-3) and _ddpm_update's categorical, around a hidden @ head stand-in backbone; rows, weights and uniforms are inputs. The same loss over seeded draws of rows, weights and uniforms is seeds.npz (`draw`)."
   },
   "meanflow": {
    "tool": "tools/meanflow_reference.py",
