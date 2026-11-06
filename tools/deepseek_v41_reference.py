@@ -1043,6 +1043,10 @@ def write_recording(seed: int):
     print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
 
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+"""Where the release runs: its tilelang kernels are CUDA's; the float64 truth beside them."""
+
+
 def release_model(name: str, kernels):
     """The pinned model.py as released, nothing of it replaced, loaded under `name` over `kernels` as its
     `kernel` module: the release's own tilelang kernels on a GPU (`official_kernels`), or the stand-ins
@@ -1065,7 +1069,7 @@ def release_net(model_module, engram_module, stored: dict, dtype: torch.dtype | 
     args = model_args(model_module, engram_module)
     for field, value in VISION.items() if vision else ():
         setattr(args, field, value)
-    with torch.device("cuda"), model_module.set_dtype(dtype or torch.bfloat16):
+    with torch.device(DEVICE), model_module.set_dtype(dtype or torch.bfloat16):
         net = model_module.Transformer(args, tokenizer())
     # The twin's weights float64 where the release keeps them in its storage dtype; its rotary tables are
     # complex, which `double` leaves as `widened` built them.
@@ -1169,7 +1173,7 @@ def write_release_recording():
 
     @functools.cache
     def logits(row: bytes) -> tuple[np.ndarray, np.ndarray]:
-        ids = torch.from_numpy(np.frombuffer(row, np.int32).reshape(2, LENGTH).astype(np.int64)).cuda()
+        ids = torch.from_numpy(np.frombuffer(row, np.int32).reshape(2, LENGTH).astype(np.int64)).to(DEVICE)
         found = release_rows(net, ids)
         with widened(twin_module):
             return found, release_rows(twin, ids)
@@ -1193,7 +1197,7 @@ def write_release_recording():
     import tilelang
 
     written = save(FIXTURE / "release.npz", {**arrays, "provenance": provenance(
-        REPO, DEEPSEEK_V41_REVISION, torch.cuda.get_device_name(),
+        REPO, DEEPSEEK_V41_REVISION, torch.cuda.get_device_name() if DEVICE == "cuda" else "cpu",
         "PYTHONPATH=.:tests:tools <release python> tools/deepseek_v41_reference.py --release",
         torch=torch.__version__, tilelang=tilelang.__version__)}, reference=f"{REPO}@{DEEPSEEK_V41_REVISION}",
         license="mit")
