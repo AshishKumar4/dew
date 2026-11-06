@@ -199,10 +199,11 @@ DELTA_NET_FIELDS: ConfigLayout[GatedDeltaNetMixer] = ConfigLayout(
 """The hybrid Qwen block's delta net's geometry, both ways."""
 
 
-def qwen_hybrid(*, fixed: Mapping[str, object] | None = None, spelling: DecoderSpelling | None = None
+def qwen_hybrid(*, fixed: Mapping[str, object] | None = None, spelling: DecoderSpelling | None = None,
+                delta_net: ConfigLayout[GatedDeltaNetMixer] = DELTA_NET_FIELDS
                 ) -> ConfigLayout[CausalTransformer]:
     """The hybrid Qwen block qwen3_5_text, qwen3_next and qwen4_exp share, both ways: gated delta net layers
-    (`DELTA_NET_FIELDS`, beside what the family `fixed` of the mixer) every `full_attention_interval` but
+    (`delta_net`'s keys, beside what the family `fixed` of the mixer) every `full_attention_interval` but
     one, gated full attention with a 'default'-convention partial rope (`QWEN35_ROPE`), and (1 + w) norms
     from a zero init (Qwen3_5RMSNorm, modeling_qwen3_5.py:727, 736; modeling_qwen3_next.py:137, 146), the
     q/k norms included, under `spelling` (the block's own where None)."""
@@ -211,7 +212,7 @@ def qwen_hybrid(*, fixed: Mapping[str, object] | None = None, spelling: DecoderS
         decoder_layout(spelling or DecoderSpelling(qk_norm=True, scale_after_cast=False), rope=QWEN35_ROPE),
         kinds_among(('linear_attention', 'full_attention'),
                     'a hybrid Qwen layer is linear_attention or full_attention'),
-        kind_mixer('linear_attention', 'gated_delta_net', GatedDeltaNetMixer, DELTA_NET_FIELDS, fixed=fixed),
+        kind_mixer('linear_attention', 'gated_delta_net', GatedDeltaNetMixer, delta_net, fixed=fixed),
         constant('scale_offset', value=True), constant('output_gate', value=True))
 
 

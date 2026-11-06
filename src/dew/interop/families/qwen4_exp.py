@@ -25,28 +25,26 @@ from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DELTA_NET_ROUTES,
-    LINEAR_FIELDS,
     DecoderFamily,
     DecoderFields,
-    ExportRefused,
+    DecoderSpelling,
     Renames,
     in_layer,
-    kinds_of,
-    reads,
+    integer,
+    kind_mixer,
     refuse,
     spelled,
 )
 from dew.interop.families.qwen import (
     _QWEN_MOE_LEAVES,
+    DELTA_NET_FIELDS,
     FUSED_EXPERTS,
-    _qwen_hybrid_config,
-    _qwen_moe_mixture,
-    qwen_hybrid_export,
+    qwen_experts,
+    qwen_hybrid,
 )
-from dew.interop.layouts import ConfigLayout, ConfigPart, Route, Slot, Table, one_of
+from dew.interop.layouts import ConfigLayout, ConfigPart, Nested, Route, Slot, Table, constant, one_of, unread
 from dew.interop.unread import Stored, equal
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.engram import Engram
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers.attention import QSAAttentionMixer
@@ -81,77 +79,101 @@ _HEAD = {**{f'model.hyper_connection_mixer.{name}.weight': ('hc_head', name, 'ke
 _BUFFERS = ('layer_multipliers', 'ngram_heads_vocab_sizes', 'ngram_heads_offsets')
 
 
-def _engram(hf: Mapping[str, object], used: set[str], layers: int) -> NativeFields[Engram] | None:
-    """The n-gram lookups `ple_layer_ids` names, as `Engram` fields, or None for none."""
+def _engram(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    """The n-gram lookups `ple_layer_ids` names, as `Engram` fields; none where it names none."""
     used.update(('ple_layer_ids', 'ple_embed_dim', 'ple_conv_kernel_size', 'ngram_size', 'heads_per_ngram',
                  'ngram_vocab_size_base', 'make_ngram_vocab_size_divisible_by', 'seed', 'split_ngram_parts'))
-    named = _records.integers(hf.get('ple_layer_ids') or [], 'ple_layer_ids')
+    named = _records.integers(hf_config.get('ple_layer_ids') or [], 'ple_layer_ids')
     if not named:
-        return None
+        return record
+    layers = _records.integer(record['num_layers'], 'num_layers')
     if min(named) < 1 or max(named) > layers:
         refuse(f'ple_layer_ids {list(named)}', f'they name layers one-indexed, 1 to {layers}')
-    size = _records.integer(hf.get('ngram_size', 3), 'ngram_size')
-    heads = _records.integer(hf.get('heads_per_ngram', 8), 'heads_per_ngram')
-    width = _records.integer(hf.get('ple_embed_dim') or hf['hidden_size'], 'ple_embed_dim')
+    size = _records.integer(hf_config.get('ngram_size', 3), 'ngram_size')
+    heads = _records.integer(hf_config.get('heads_per_ngram', 8), 'heads_per_ngram')
+    width = _records.integer(hf_config.get('ple_embed_dim') or hf_config['hidden_size'], 'ple_embed_dim')
     if width % ((size - 1) * heads):
         refuse(f'ple_embed_dim {width}', f'each of the {(size - 1) * heads} n-gram heads takes an equal part')
-    eos = hf.get('eos_token_id')
+    eos = hf_config.get('eos_token_id')
     if eos is None:
         refuse('eos_token_id', 'the n-gram lookups stop at the end of a sequence and fill with its id')
     eos = _records.integer(eos[0] if isinstance(eos, list) else eos, 'eos_token_id')
-    return native_fields(Engram)(
+    record['engram'] = native_fields(Engram)(
         layer_ids=tuple(layer - 1 for layer in named), num_embeddings=(), max_ngram_size=size,
-        vocab_size=_records.integer(hf.get('ngram_vocab_size_base', 20000000), 'ngram_vocab_size_base'),
+        vocab_size=_records.integer(hf_config.get('ngram_vocab_size_base', 20000000),
+                                    'ngram_vocab_size_base'),
         n_heads=heads, head_dim=width // ((size - 1) * heads),
-        compressed_vocab_size=_records.integer(hf['vocab_size'], 'vocab_size'), pad_token_id=eos,
-        multiplier_seed=_records.integer(hf.get('seed', 1234), 'seed'), stop_token_id=eos,
-        row_multiple=_records.integer(hf.get('make_ngram_vocab_size_divisible_by', 128),
+        compressed_vocab_size=_records.integer(hf_config['vocab_size'], 'vocab_size'), pad_token_id=eos,
+        multiplier_seed=_records.integer(hf_config.get('seed', 1234), 'seed'), stop_token_id=eos,
+        row_multiple=_records.integer(hf_config.get('make_ngram_vocab_size_divisible_by', 128),
                                       'make_ngram_vocab_size_divisible_by'),
-        ple_conv_kernel_size=_records.integer(hf.get('ple_conv_kernel_size', 4), 'ple_conv_kernel_size'),
-        table_parts=_records.integer(hf.get('split_ngram_parts', 1), 'split_ngram_parts'), media_stops=False)
+        ple_conv_kernel_size=_records.integer(hf_config.get('ple_conv_kernel_size', 4),
+                                              'ple_conv_kernel_size'),
+        table_parts=_records.integer(hf_config.get('split_ngram_parts', 1), 'split_ngram_parts'),
+        media_stops=False)
+    return record
 
 
-def _qwen4_exp_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    layers = _records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
-    # Qwen4ExpTextConfig spells its attention layers either way (configuration_qwen4_exp.py:180-184).
-    types = hf.get('layer_types')
-    # Every layer routes its MLP, so the block's width is the experts'.
-    spelled = {**hf, 'intermediate_size': hf['moe_intermediate_size'], **({} if types is None else {
-        'layer_types': ['full_attention' if kind == 'qwen_sparse_attention' else kind
-                        for kind in _records.strings(types, 'layer_types')]})}
-    gate = _records.text(hf.get('output_gate_type') or hf.get('hidden_act', 'silu'), 'output_gate_type')
+def _engram_written(model: CausalTransformer) -> Mapping[str, object]:
+    engram = model.engram
+    if engram is None:
+        return {'ple_layer_ids': []}
+    return {'ple_layer_ids': [layer + 1 for layer in engram.layer_ids], 'ngram_size': engram.max_ngram_size,
+            'heads_per_ngram': engram.n_heads,
+            'ple_embed_dim': engram.head_dim * engram.n_heads * (engram.max_ngram_size - 1),
+            'ple_conv_kernel_size': engram.ple_conv_kernel_size, 'ngram_vocab_size_base': engram.vocab_size,
+            'make_ngram_vocab_size_divisible_by': engram.row_multiple, 'seed': engram.multiplier_seed,
+            'split_ngram_parts': engram.table_parts, 'eos_token_id': engram.stop_token_id}
+
+
+def _output_gate(hf_config: Mapping[str, object], used: set[str],
+                 record: NativeFields[GatedDeltaNetMixer]) -> NativeFields[GatedDeltaNetMixer]:
+    """The delta net's output gate, both ways: `output_gate_type`, else the model's `hidden_act`."""
+    used.add('output_gate_type')
+    gate = _records.text(hf_config.get('output_gate_type') or hf_config.get('hidden_act', 'silu'),
+                         'output_gate_type')
     if gate not in ('sigmoid', 'silu'):
         refuse(f'output_gate_type {gate!r}', 'the delta net gates its output by a sigmoid or a SiLU')
-    used.add('output_gate_type')
-    config = _qwen_hybrid_config(spelled, used, mixer={'output_gate_type': gate})
-    stated = [hf.get(name) for name in (*_QSA_FIELDS, 'indexer_kv_heads')]
-    used.update((*_QSA_FIELDS, 'indexer_kv_heads'))
-    if 'full_attention' in _records.strings(config['layer_types'], 'layer_types'):
-        if None in stated or stated[-1] != 1:
-            refuse('indexer_*', 'every Qwen4-Exp attention layer runs QSA, its indexer one key head wide')
-        kinds = dict(kinds_of(config))
-        kinds['full_attention'] = native_fields(LayerKind)(mixer=None)
-        kinds['full_attention']['mixer'] = {'class': 'qsa_attention', 'fields': {
-            name: _records.integer(hf[name], name) for name in _QSA_FIELDS}}
-        config['kinds'] = kinds
-    used.update(('hc_count', 'hc_lowrank'))
-    config['hyper_connections'] = native_fields(HyperConnections)(
-        hc_mult=_records.integer(hf.get('hc_count', 4), 'hc_count'),
-        hc_lowrank=_records.integer(hf.get('hc_lowrank', 320), 'hc_lowrank'), head='gated')
-    config['mixture'] = _qwen_moe_mixture(hf, used, tuple(range(layers)),
-                                          _records.integer(hf['num_experts'], 'num_experts'),
-                                          normalized=True, shared=True)
-    used.update(('num_experts', 'output_router_logits', 'router_aux_loss_coef'))
-    engram = _engram(hf, used, layers)
-    if engram is not None:
-        config['engram'] = engram
+    record['output_gate_type'] = gate
+    return record
+
+
+def _indexer_heads(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    used.add('indexer_kv_heads')
+    attends = 'full_attention' in _records.strings(record['layer_types'], 'layer_types')
+    if attends and (hf_config.get('indexer_kv_heads') != 1
+                    or any(hf_config.get(name) is None for name in _QSA_FIELDS)):
+        refuse('indexer_*', 'every Qwen4-Exp attention layer runs QSA, its indexer one key head wide')
+    return record
+
+
+QWEN4_EXP_CONFIG = ConfigLayout(
+    # Every layer routes its MLP, so the block's width is the experts'. Qwen4ExpTextConfig spells its
+    # attention layers either way (configuration_qwen4_exp.py:180-184).
+    qwen_hybrid(spelling=DecoderSpelling(qk_norm=True, scale_after_cast=False,
+                                         keys={'intermediate_size': 'moe_intermediate_size'},
+                                         kinds={'qwen_sparse_attention': 'full_attention'}),
+                delta_net=ConfigLayout(DELTA_NET_FIELDS, ConfigPart(_output_gate, lambda mixer: {
+                    'output_gate_type': mixer.output_gate_type}))),
+    ConfigPart(_indexer_heads, lambda model: {'indexer_kv_heads': 1}),
+    kind_mixer('full_attention', 'qsa_attention', QSAAttentionMixer,
+               ConfigLayout(*(integer(name, name) for name in _QSA_FIELDS))),
+    Nested('hyper_connections', HyperConnections,
+           ConfigLayout(integer('hc_count', 'hc_mult', 4), integer('hc_lowrank', 'hc_lowrank', 320),
+                        constant('head', value='gated')),
+           lambda model: model.hyper_connections),
+    qwen_experts(experts=512, top_k=10, width=512, shared=512, normalized=True, scheduled=False),
+    ConfigPart(_engram, _engram_written),
     # The prediction layer's fields, which transformers reads nowhere (the module doc), the cache's slot
     # count it derives from the PLE (configuration_qwen4_exp.py:172), and the delta net's state dtype,
-    # Dew's fp32 already (as Qwen3.5's, `_qwen35_config`).
-    used.update(('mtp', 'mtp_num_hidden_layers', 'mtp_use_dedicated_embeddings', 'number_of_conv_states',
-                 'mamba_ssm_dtype'))
-    config.update(pre_norms=False, final_norm=False)
-    return config
+    # Dew's fp32 already (as Qwen3.5's, `QWEN35_TEXT`).
+    ConfigPart(lambda hf_config, used, record: record, lambda model: {'mtp_num_hidden_layers': 0}),
+    unread('mtp', 'mtp_num_hidden_layers', 'mtp_use_dedicated_embeddings', 'number_of_conv_states',
+           'mamba_ssm_dtype'),
+    # Its streams carry the residual with no norms around them and none at the end.
+    constant('pre_norms', value=False), constant('final_norm', value=False))
+"""Qwen4-Exp's config, both ways: the hybrid Qwen block under its streams, its QSA indexer, its experts
+on every layer and its n-gram lookups."""
 
 
 def _lookups(config: Mapping[str, object]) -> dict[str, np.ndarray]:
@@ -213,49 +235,9 @@ def _qwen4_exp_constants(directory, record: Mapping[str, object]) -> Mapping[str
                                                      dtype=np.int32)}}
 
 
-def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
-    """The `qwen4_exp_text` config of a model of this family: its layers' kinds as Qwen4ExpTextConfig
-    spells them, the streams, the indexer, the delta net's gate, the experts and the n-gram lookups."""
-    streams = model.hyper_connections
-    assert streams is not None and streams.hc_lowrank is not None
-    mixers = {kind: model.kind_of(kind).mixer for kind in dict.fromkeys(model.per_layer_types)}
-    qsa = [mixer for mixer in mixers.values() if isinstance(mixer, QSAAttentionMixer)]
-    delta = [mixer for mixer in mixers.values() if isinstance(mixer, GatedDeltaNetMixer)]
-    mixture = model.mixture
-    # The hybrid block's own fields (`qwen_hybrid_export`), its delta net's and its rotary's fraction.
-    hybrid = qwen_hybrid_export(model)
-    if len(qsa) + len(delta) != len(mixers) or len(qsa) > 1 or len(delta) > 1 or mixture is None:
-        raise ExportRefused("a qwen4_exp_text config states one QSA attention, one gated delta net and "
-                            f"routed experts in every layer; this model's layers are {list(mixers.values())}")
-    fields: dict[str, object] = {
-        'layer_types': ['qwen_sparse_attention' if isinstance(mixers[kind], QSAAttentionMixer)
-                        else 'linear_attention' for kind in model.per_layer_types],
-        'hc_count': streams.hc_mult, 'hc_lowrank': streams.hc_lowrank,
-        **({name: getattr(qsa[0], name) for name in _QSA_FIELDS} if qsa else {}), 'indexer_kv_heads': 1,
-        **({'output_gate_type': delta[0].output_gate_type,
-            **{name: hybrid[name] for name in LINEAR_FIELDS}} if delta else {}),
-        'num_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
-        'moe_intermediate_size': mixture.expert_features,
-        'shared_expert_intermediate_size': mixture.shared_features, 'norm_topk_prob': mixture.norm_topk_prob,
-        'mtp_num_hidden_layers': 0, 'ple_layer_ids': [],
-        # The class reads its rotary's width from its rope record (`_qwen35_rope`).
-        'rope_parameters': {'rope_type': 'default', 'rope_theta': model.rope_theta,
-                            'partial_rotary_factor': hybrid['partial_rotary_factor']}}
-    engram = model.engram
-    if engram is not None:
-        fields.update(
-            ple_layer_ids=[layer + 1 for layer in engram.layer_ids], ngram_size=engram.max_ngram_size,
-            heads_per_ngram=engram.n_heads,
-            ple_embed_dim=engram.head_dim * engram.n_heads * (engram.max_ngram_size - 1),
-            ple_conv_kernel_size=engram.ple_conv_kernel_size, ngram_vocab_size_base=engram.vocab_size,
-            make_ngram_vocab_size_divisible_by=engram.row_multiple, seed=engram.multiplier_seed,
-            split_ngram_parts=engram.table_parts, eos_token_id=engram.stop_token_id)
-    return fields
-
-
 QWEN4_EXP_TEXT = DecoderFamily(
     ('qwen4_exp_text',),
-    ConfigLayout(ConfigPart(reads(_qwen4_exp_config), _qwen4_exp_export)),
+    QWEN4_EXP_CONFIG,
     lambda fields: bool(fields.hyper_connections is not None and fields.hyper_connections.gated),
     'qwen4_exp_text',
     'Qwen4ExpForCausalLM',

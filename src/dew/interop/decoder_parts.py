@@ -1014,6 +1014,9 @@ class DecoderSpelling:
     tie_embeddings: bool = False
     qk_norm: bool = False
     scale_after_cast: bool = True
+    kinds: Mapping[str, str] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
+    """The class's own names for the shared layer kinds, own to shared, its layer_types read and written
+    under them (Qwen4ExpTextConfig's `qwen_sparse_attention`, its full attention)."""
 
 
 def _layer_kinds(spelling: DecoderSpelling) -> ConfigPart[CausalTransformer]:
@@ -1031,7 +1034,8 @@ def _layer_kinds(spelling: DecoderSpelling) -> ConfigPart[CausalTransformer]:
         if pattern is None and spelling.windowed and hf_config.get('sliding_window') is not None:
             pattern = ('sliding_attention',)
         if 'layer_types' in reads:
-            layer_types = specified_layer_types(hf_config, used, pattern)
+            layer_types = tuple(spelling.kinds.get(kind, kind)
+                                for kind in specified_layer_types(hf_config, used, pattern))
         else:
             layers = _records.integer(record['num_layers'], 'num_layers')
             cycle = pattern or ('full_attention',)
@@ -1051,7 +1055,8 @@ def _layer_kinds(spelling: DecoderSpelling) -> ConfigPart[CausalTransformer]:
         types = model.per_layer_types
         written: dict[str, object] = {}
         if 'layer_types' in reads and any(layer != 'full_attention' for layer in types):
-            written['layer_types'] = list(types)
+            own = {shared: kind for kind, shared in spelling.kinds.items()}
+            written['layer_types'] = [own.get(layer, layer) for layer in types]
         sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
         if 'sliding_window' in reads and sliding is not None and sliding.window is not None:
             written['sliding_window'] = sliding.window
