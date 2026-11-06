@@ -254,7 +254,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_flux_source.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
   "tests/test_gate_findings.py": {
@@ -598,7 +598,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {
-   "comparisons": 18,
+   "comparisons": 17,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sequence_parallel.py": {
@@ -698,7 +698,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_source.py": {
-   "comparisons": 12,
+   "comparisons": 11,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_vae.py": {
