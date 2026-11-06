@@ -30,9 +30,12 @@ cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA,
 accumulator only where the epilogue's VJP reads it.
 """
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -525,6 +528,23 @@ def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array
     return _blockwise_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
+_RECIPE_PROJECTION: contextvars.ContextVar[Callable | None] = contextvars.ContextVar(
+    "dew_recipe_projection", default=None)
+
+
+@contextlib.contextmanager
+def recipe_projected(projection: Callable):
+    """Every run's recipe projection traced in the block (`recipe_projection`) multiplied by
+    `projection(rows, matrices, group_blocks, *, out_dtype)` in `blockwise_fp8_projection`'s stead: a
+    reference emulating the recipe (its fake-quantized float32 or float64 twin) held against the recipe a
+    run trains in. JAX keys no cache on it: trace a function anew inside the block."""
+    token = _RECIPE_PROJECTION.set(projection)
+    try:
+        yield
+    finally:
+        _RECIPE_PROJECTION.reset(token)
+
+
 def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None = None, *,
                       out_dtype, bias: jax.Array | None = None) -> jax.Array | None:
     """`rows @ matrix` in the run's low-precision recipe (`dew.nn.precision.recipe_role`), where the
@@ -567,7 +587,8 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     laid = jnp.zeros((padded, depth), rows.dtype).at[place].set(rows, mode="drop")
     # The run's slack, zero rows, as the last group's further blocks: the recipe's rows are whole blocks.
     group_blocks = blocks.at[-1].add(padded // edge - blocks.sum())
-    product = blockwise_fp8_projection(laid, stacked, group_blocks, out_dtype=out_dtype)
+    project = _RECIPE_PROJECTION.get() or blockwise_fp8_projection
+    product = project(laid, stacked, group_blocks, out_dtype=out_dtype)
     out = product.at[place].get(mode="fill", fill_value=0)
     if bias is not None:
         out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(out.dtype), out)

@@ -1,7 +1,6 @@
 """The 'fp8' run numerics (`dew.nn.precision.FP8`, row 2513): DeepSeek-V3's blockwise FP8 recipe on the
 projections whose role it takes, the rest in the run's dtypes."""
 
-from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -229,7 +228,7 @@ def test_a_training_step_in_the_fp8_preset_is_on_par_with_its_fake_quantized_ref
             stepped = with_gradients(lambda params: step(model)(params, tokens))
             if projection is None:
                 return stepped(params, cotangent)
-            with mock.patch.object(gemm, "blockwise_fp8_projection", projection):
+            with gemm.recipe_projected(projection):
                 return stepped(params, cotangent)
         return run
 
