@@ -702,7 +702,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             matrix_gmems=dict(zip(streamed, matrix_gmems, strict=True)), prologue_gmems=prologue_gmems,
             shape=(m, steps, g), grid=grid, tiles=tiles, dense=dense, tail=tail, programs=multiprocessors,
             transpose_rhs=transpose_rhs, axes_of={i: prologue_axes[i] for i in stepped},
-            interpreted=bool(interpret), transpose_lhs=transpose_lhs)
+            interpreted=bool(interpret), transpose_lhs=transpose_lhs, traced=exact_sums)
 
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, decoded, *, streams):
             def issue(wg, tile, walk, *, active):
@@ -835,13 +835,18 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
 def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_gmems, shape: tuple,
                    grid: tuple, tiles: Tiles, dense: bool, tail: tail_of.Tail | None, programs: int,
                    transpose_rhs: bool, axes_of: dict, interpreted: bool,
-                   transpose_lhs: bool = False, splits: int = 1) -> tuple:
+                   transpose_lhs: bool = False, splits: int = 1, traced: bool = False) -> tuple:
     """Dew: `gmm`'s tile at the persistent walk's `index` (`mosaic.Family.persist`'s schedule): whether it
     multiplies any row, its steps, its streams' views (`_gmm_views`) and its group, row block and column
     tile: its pair's but for this multiprocessor's row block; in a balanced tail, the first of the tile's
     steps its program walks and how many, its partials' gatherer and its program (`tail.Tail.segment`);
     with `splits`, its depth's run: the walk every tile's first run, then every tile's second (as many
-    launches of a run each would walk them), each run a share of the steps, the last's the rest.
+    launches of a run each would walk them), each run a share of the steps, the last's the rest; `traced`,
+    its steps a count the compiler cannot see (`mosaic.opaque`), which a walk takes as a loop's bound (an
+    exactly summed walk's: cp.async's pipeline unrolled a static walk's drain, each drain step's fresh
+    product its own, and at five stages the A100 forward's 128 x 128 x 64 tile spilled 40 bytes beside the
+    running sum; an opaque count's drain, a loop, spilled none, and a merely traced constant left ptxas
+    spilling 32 bytes at the input gradient's 64 x 160 x 32 at five stages, NSDBG-5, NSDBG-DR1).
     `shape` is the padded rows, the steps and the groups."""
     m, steps, groups = shape
     pair = tiles.cluster
@@ -850,7 +855,7 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
     if tail is not None:
         snaked, start, count, gathered = tail.segment(index, programs, grid[0] * grid[1])
     elif splits == 1:
-        snaked, start, count, gathered = index[0], 0, steps, None
+        snaked, start, count, gathered = index[0], 0, mosaic.opaque(steps) if traced else steps, None
     else:
         share = -(-steps // splits)
         split, snaked = index[0] // (grid[0] * grid[1]), index[0] % (grid[0] * grid[1])
