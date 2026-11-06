@@ -753,7 +753,8 @@ class Pretrained:
         folders = {decoder_parts.folder_config(folder): folder for folder in _folders(self.config)
                    if decoder_parts.folder_config(folder) in self.config}
         root = {key: value for key, value in self.config.items() if key not in folders}
-        parts = {"": (root, _folder_part(tensors, "") if folders else tensors)}
+        parts: dict[str, tuple[Mapping[str, object], Mapping[str, np.ndarray]]] = {
+            "": (root, _folder_part(tensors, "") if folders else tensors)}
         for key, folder in folders.items():
             parts[folder] = (dict(_records.record(self.config[key], key)),
                              _folder_part(tensors, decoder_parts.folder_name(folder, "")))
