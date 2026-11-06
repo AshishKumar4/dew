@@ -961,7 +961,6 @@ def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: D
     keep = slots < count[:, None]
 
     following, again, seen = verify(state, emitted, keep)
-    assert seen is not None
     last = jnp.maximum(count - 1, 0)
     # A row whose replay rebuilt its caches across a positional table change was reseeded over its
     # whole history, the emitted tokens among it (`DecoderState.rebuilt`): its stretch is not written
@@ -969,9 +968,10 @@ def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: D
     rebuilt = (jnp.zeros(keep.shape[0], bool) if following.rebuilt is None else following.rebuilt)
     stretch = keep & ~rebuilt[:, None]
     if ops.record is not None:
+        assert seen is not None, "a block drafter records the states the replay returns"
         following = ops.record(following, seen, stretch)
-    else:
-        assert ops.embed is not None
+    elif ops.embed is not None:
+        assert seen is not None, "prediction depths reseed from the states the replay returns"
         # The tails reseed hands back are every depth's predecessor at the
         # last emitted slot, the target's own state first; a row that
         # emitted nothing keeps what it had.
