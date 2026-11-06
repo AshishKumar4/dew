@@ -100,17 +100,20 @@ def test_a_projection_the_recipe_takes_under_a_product_wrapper_is_refused():
             layer.apply(params, x)
 
 
-def test_an_adapted_projection_the_recipe_takes_is_refused_on_its_fused_product():
-    """An adapter's projection the 'fp8' numerics take by role, its update fused into the base product
-    (`generation.chosen(low_rank='fused')`, `gemm.low_rank`), would train unquantized, silently, as the
-    unfused branch would: refused where the fused product is traced."""
-    from dew.lora import LoRA
+def test_an_adapters_fused_product_refuses_a_projection_the_recipe_takes():
+    """An adapter's update fused into its projection's product (`gemm.low_rank`, LoRA's fused site under
+    `generation.chosen(low_rank='fused')`, which returns before the layer's own product) on a projection
+    the 'fp8' numerics take by role would train it unquantized, silently: refused, and a role the recipe
+    keeps is not."""
+    from dew.nn.precision import projection_role
 
-    model = mixed(jnp.float32).clone(mixture=None)
-    tokens = jnp.ones((1, 8), jnp.int32)
-    adapter = LoRA(rank=4, modules=("up_proj",)).apply(model, model.init(jax.random.key(0), tokens), key=0)
-    with generation.run_precision(FP8), generation.chosen(low_rank="fused"), pytest.raises(RecipeRefused):
-        adapter.model.apply(adapter.variables, tokens)
+    rows, rank = jnp.ones((4, WIDTH), jnp.float32), 4
+    kernel, a, b = jnp.ones((WIDTH, WIDTH)), jnp.ones((WIDTH, rank)), jnp.zeros((rank, WIDTH))
+    with generation.run_precision(FP8):
+        with projection_role("mlp"), pytest.raises(RecipeRefused):
+            gemm.low_rank(rows, kernel, a, b, 1.0, out_dtype=jnp.float32)
+        with projection_role("router"):
+            gemm.low_rank(rows, kernel, a, b, 1.0, out_dtype=jnp.float32)
 
 
 def test_the_experts_kernel_gradient_keeps_the_master_dtype():
