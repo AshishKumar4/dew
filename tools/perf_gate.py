@@ -2,26 +2,30 @@
 """The performance gate: one fixed battery, two Dew trees, one machine.
 
     python tools/perf_gate.py run --base main=/content/main --head head=/content/head \\
-        --rounds 3 --model /content/hf/Qwen3-0.6B --flowers /content/flowers --out gate.json
-    python tools/perf_gate.py report gate.json --table gate.md
+        --model /content/hf/Qwen3-0.6B --flowers /content/flowers --out gate.json
+    python tools/perf_gate.py report gate.json --table gate.md --verdicts verdicts.json
+    python tools/perf_gate.py compile --base main=/content/main --head head=/content/head --kind h100 \\
+        --out compile.json
 
-`run` measures every row of `BATTERY` in each tree, in alternating rounds (base
-then head, then head then base), each row a process of its own in the tree's
-own locked environment (tools/environments.py), so a change of a locked
-wheel is measured with the code. A row runs a tree's own copy of its tool
-where the tree has one and the head's otherwise, with the tree's `src` first
-on the path, so a tree from before a tool existed is measured by the newer
-tool, and a row a tree cannot run (a tree older than its tool, or than the
-locks) is reported, not gated. `report` gates each row by its own noise: a
-row regresses when the head's median is worse than the base's by more than
-the larger of the two trees' spreads across rounds (and at least `FLOOR`), and
-the head's best sample is worse than the base's worst. It writes the table and exits 1 on a
-regression.
+`run` measures every row of `BATTERY` in three arms, the base, the head and the base again
+(`<base>~aa`, its A/A), in `ROUNDS` rounds, each round's arms in an order drawn at random and kept
+(`orders`), each row a process of its own in the tree's own locked environment
+(tools/environments.py), so a change of a locked wheel is measured with the code. A row runs a tree's
+own copy of its tool where the tree has one and the head's otherwise, with the tree's `src` first on the
+path, so a tree from before a tool existed is measured by the newer tool, and a row a tree cannot run (a
+tree older than its tool, or than the locks) is reported, not gated. `report` judges each row by Dew's
+one judgment of a time against another (`dew.telemetry.benchmark.judged`): each round's head over its
+base, against each round's A/A over its base, at `LEVEL`; a row regresses when that judgment differs
+and its median ratio is worse by more than the row's floor, the change the gate acts on (`verdict`). It
+writes the table, and each row's verdict for a runner (`--verdicts`), and exits 1 on a failed row.
+`compile` judges each step's planning and compile, ahead of its run, for a GPU none of which is attached
+(`dew.training.ahead.compile_ahead`), on any host, the same way.
 
 The battery is the training step (a dense and an MoE decoder, a DiT, an
 MM-DiT, FLUX.2 and Wan), the forward pass of three vision towers and the SD
 VAE's decoder, LM serving at 32 and 128 slots, a full-depth Dory server's warm compile,
-attention forward and backward, the image input pipeline and a checkpoint's save and restore.
+attention forward and backward, the image input pipeline, a checkpoint's save and restore, and the
+Qwen3.5 training step against PyTorch's, a judged pairing of its own run once a gate.
 docs/performance.md, "The performance gate", says how it runs before main
 takes a commit.
 """
@@ -32,6 +36,7 @@ import functools
 import json
 import math
 import os
+import secrets
 import shutil
 import statistics
 import subprocess
@@ -47,11 +52,25 @@ from benchmark_cases import DIT_B, FINETUNE_1_7B, FINETUNE_4B, FORWARD, LM_DENSE
 from environments import CACHE, Unlocked, environment, machine_lock
 
 FLOOR = 0.02
-"""The smallest band a row is gated by, as a fraction of the base's median."""
+"""The least change of a row the gate acts on, as a fraction of the base's: a change the judgment finds
+smaller than this is reported (`different, below floor`) and passes. Not a noise allowance: the A/A's
+interval is the noise (`verdict`)."""
 COMPILE_FLOOR = 0.25
-"""The least growth of a step's compile time the gate fails a head for: not a noise allowance (the rounds'
-spread still widens the band as for any row) but the materiality of the project's rule that compile time is
-performance and a head that grows it materially gives the reason: a quarter."""
+"""The least growth of a compile the gate fails a head for: the materiality of the project's rule that
+compile time is performance and a head that grows it materially gives the reason, a quarter."""
+ROUNDS = 6
+"""A run's rounds unless it names its own: the fewest whose ratios reach an interval at `LEVEL`
+(`dew.telemetry.benchmark.judged`); five reach 0.9375 at most."""
+LEVEL = 0.95
+"""The level each row is judged at."""
+ALONE = "~aa"
+"""The A/A arm's suffix: the base measured again, in processes and a compile cache of its own."""
+PASSING = ("level", "faster", "different, below floor")
+"""The states that pass a row and move a runner's baseline on: no change past its floor, judged."""
+FAILING = ("regressed", "broken")
+"""The states that fail a head: a change past its floor for the worse, or a row the head cannot run."""
+UNQUALIFIED = ("incomplete", "partial", "unjudged", "unsupported")
+"""The states that judge nothing and fail the gate: the gate's own (Platform's), never a head's."""
 
 # FLUX.2 and Wan 2.1 1.3B at their head width over a few of their blocks: the
 # rotary, the joint attention and the modulated feed-forwards of the hot path.
@@ -145,10 +164,7 @@ class Row:
     head_only: bool = False
     """Compare the head with an external reference, not with the base tree."""
     floor: float = FLOOR
-    """The smallest band the row is gated by (`FLOOR`, a compile's `COMPILE_FLOOR`)."""
-    first_round: bool = False
-    """Measured in the first round alone: a compile, cold there, which later rounds load from the tree's
-    cache."""
+    """The least change the row is failed for (`FLOOR`, a compile's `COMPILE_FLOOR`)."""
 
 
 @dataclass(frozen=True)
@@ -181,12 +197,13 @@ def peak(record: dict) -> float | None:
 
 
 def _stepped(out: Path) -> tuple:
-    """A step's time, the time its program took to compile, its measured peak and its model FLOPs utilization
-    (benchmark_step's train/mfu, in percent), all from the one invocation; a tree whose tool predates the MFU
-    wrote none, which the gate shows unmeasured."""
+    """A step's time, its measured peak and its model FLOPs utilization (benchmark_step's train/mfu, in
+    percent), all from the one invocation; a tree whose tool predates the MFU wrote none, which the gate
+    shows unmeasured. Its compile, which an arm's cache holds from its first round on, is judged ahead of
+    the run on any host (`compile`)."""
     [step] = json.loads(out.read_text())
     mfu = step.get("mfu")
-    return step["ms_per_step"], step["compile_seconds"], peak(step), None if mfu is None else 100.0 * mfu
+    return step["ms_per_step"], peak(step), None if mfu is None else 100.0 * mfu
 
 
 def _forwarded(out: Path, name: str) -> tuple:
@@ -214,11 +231,13 @@ def _attended(out: Path) -> tuple:
 
 
 def _qwen35_comparison(out: Path) -> tuple:
-    """Translate the paired tool's record into an external-reference row's result."""
+    """The paired tool's judgment (its rounds against the reference's A/A) as an external-reference row's
+    result (`reference_verdict`)."""
     record = json.loads(out.read_text())
     comparison = record["comparison"]
     return ({"value": comparison["dew_tokens_per_s"], "ratio": comparison["dew_over_torch"],
-             "tolerance": comparison["tolerance"], "passed": comparison["performance_claim_passed"]}
+             **{key: comparison[key] for key in ("interval", "alone", "differs", "rounds")},
+             "passed": comparison["performance_claim_passed"]}
             if comparison is not None else {"error": record.get("error", "incomplete pair")},)
 
 
@@ -228,10 +247,8 @@ dtype, optimizer) and measured on its own kind alone."""
 
 
 PROBES = [
-    # Each step's time, and the time its program took to compile in that process (`COMPILE_FLOOR`).
+    # Each step's time, peak and MFU; its compile is judged ahead of the run (`compile`).
     *[Probe((Row(name, "ms", "benchmark_step.py", hardware=STEP_HARDWARE.get(name)),
-             Row(f"compile {name.removeprefix('step ')}", "s", "benchmark_step.py", floor=COMPILE_FLOOR,
-                 first_round=True, hardware=STEP_HARDWARE.get(name)),
              Row(f"peak {name}", "GiB", "benchmark_step.py", hardware=STEP_HARDWARE.get(name)),
              Row(f"mfu {name}", "% mfu", "benchmark_step.py", hardware=STEP_HARDWARE.get(name))),
             lambda _, out, case=case: ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30",
@@ -256,12 +273,12 @@ PROBES = [
     # construction's decode step, then each admission width's prefill. XLA's fusion of nGPT's per-layer
     # normalization grew the prefill's compile quadratically with depth at the released width, a warm of
     # 3012 s on an A100, where a narrow width showed none of it (ledger 635); the whole warm is shown
-    # beside them.
+    # beside them. The tool reads and writes no compile cache, so every round's sample is a cold compile.
     Probe((*(Row(f"compile serve dory-1.0-4b {program}", "s", "benchmark_serving_compile.py",
-                 floor=COMPILE_FLOOR, first_round=True)
+                 floor=COMPILE_FLOOR)
              for program in ("construction", *(f"admission {rows}" for rows in (1, 2, 4, 8)))),
            Row("compile serve dory-1.0-4b warm 16 slots", "s", "benchmark_serving_compile.py",
-               gated=False, first_round=True)),
+               gated=False)),
           lambda _, out: ["--family", "dory-1.0-4b", "--slots", "16", "--json-out", str(out)],
           lambda _, out: (lambda record: (record["construction_seconds"],
                                           *record["by_admission_width"].values(),
@@ -318,13 +335,15 @@ def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path, time
     tools = _tools(tree, tool or "benchmark_step.py", newer)
     env = {**os.environ, **(settings or {}), "PYTHONPATH": f"{tree / 'src'}:{tools}"}
     if cache is not None:
-        # The tree's own compile cache, empty at the gate's start: its first round compiles cold (the compile
-        # rows), its later rounds load what that round compiled, and neither tree loads the other's programs.
-        # Every program is kept, however quickly it compiled or small it is (the cache's write thresholds,
-        # which Dew's own cache setup clears too); a later round still traces and lowers, then loads.
+        # The arm's own compile cache, empty at the gate's start: its first round compiles cold, its later
+        # rounds load what that round compiled, and no arm loads another's programs. Every program is kept,
+        # however quickly it compiled or small it is (the cache's write thresholds, which Dew's own cache
+        # setup clears too); a later round still traces and lowers, then loads. Its measured peaks' processes
+        # keep a cache of their own across its rounds too (tools/peak_memory.py's PEAK_CACHE).
         env.update(JAX_ENABLE_COMPILATION_CACHE="true", JAX_COMPILATION_CACHE_DIR=str(cache),
                    JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="0",
-                   JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="-1")
+                   JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="-1",
+                   DEW_PEAK_CACHE=str(cache.with_name(f"{cache.name}-peaks")))
     command = [str(python), *([str(tools / tool)] if tool else []), *argv]
     return subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
 
@@ -343,9 +362,10 @@ def hardware_status(row: Row, device_kind: str) -> str | None:
 
 
 def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_head: bool = True,
-            cache: Path | None = None, first: bool = True, settings: dict[str, str] | None = None) -> dict:
+            cache: Path | None = None, settings: dict[str, str] | None = None) -> dict:
     """One sample of every row in `tree`, run by `python` with `settings` in its environment: a number, or
-    why the row could not run there."""
+    why the row could not run there. The head's external references (`Row.head_only`), each a judged
+    pairing of its own, run in its first round alone (`is_head`)."""
     sample = {}
 
     @functools.cache
@@ -365,8 +385,6 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
             claiming = args.claim and any(map(claimed, probe.rows))
             if args.only and not claiming and not any(word in name for name in names for word in args.only):
                 continue
-            if not first and all(row.first_round for row in probe.rows):
-                continue  # every row it measures is a first round's compile
             done = None
             try:
                 unsupported = {row.name: hardware_status(row, hardware()) for row in probe.rows
@@ -380,13 +398,11 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                 if done.returncode != 0 and not external:
                     raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
                 values = probe.read(done.stdout, out)
-                # A later round's compile is a load from the tree's cache, not a compile: not a sample.
                 # A peak the tree's tool did not measure (`peak`) is unmeasured, its row's sample None,
                 # beside the rows it did measure.
                 sample.update({row.name: {**value, "exit_code": done.returncode} if external
                                else None if value is None else float(value)
-                               for row, value in zip(probe.rows, values, strict=True)
-                               if first or not row.first_round})
+                               for row, value in zip(probe.rows, values, strict=True)})
             except Exception as error:  # a row that cannot run in this tree is reported, not gated
                 failure = ({"error": str(error)[-400:],
                             "exit_code": None if done is None else done.returncode}
@@ -403,46 +419,161 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
 
 
 def run(args: argparse.Namespace) -> int:
-    from dew._files import write_atomically
-
+    """Every row of the battery (`--only`'s) in the three arms (`arms`), `--rounds` rounds of them (`rounds`);
+    the machine's lock recorded (`lock`), which the run's compile ahead installs (`compile`)."""
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
     settings = dict(setting.split("=", 1) for setting in getattr(args, "head_env", None) or [])
-    # Each tree in the environment its own lock names, so a change of a locked wheel is measured too. A
-    # tree that holds no such lock (one older than the locks) cannot run a row, which its samples say.
-    lock, pythons, unbuilt = machine_lock(), {}, {}
-    for name, path in ((base, base_path), (head, head_path)):
-        try:
-            pythons[name] = environment(path, lock, Path(args.environments or CACHE))
-        except Unlocked as missing:
-            unbuilt[name] = f"not run: {missing}"
+    lock = machine_lock()
+    pythons, unbuilt = environments(((base, base_path), (head, head_path)), lock, args.environments)
     claiming = getattr(args, "claim", False)
     rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)
             or (claiming and claimed(row))]
-    results = {"base": base, "head": head, "rounds": args.rounds, "rows": [row.__dict__ for row in rows],
-               "samples": {base: [], head: []}, "claim": claiming, "head settings": settings,
+    # The A/A arm is the base again: its tree, environment and settings.
+    arms = arms_of(base, head, base_path, head_path)
+    results = {"base": base, "head": head, "alone": f"{base}{ALONE}", "rounds": args.rounds,
+               "rows": [row.__dict__ for row in rows], "samples": {arm: [] for arm in arms}, "orders": [],
+               "claim": claiming, "head settings": settings, "lock": lock,
                "environments": {name: str(python.parent.parent) for name, python in pythons.items()},
                "seconds": {"first round": 0.0, "later rounds": 0.0}}
-    # Each tree's compile cache, for this run alone: removed at its end, so no run loads another's programs.
-    Path(args.out).resolve().parent.mkdir(parents=True, exist_ok=True)
-    caching = tempfile.TemporaryDirectory(prefix="perf-gate-cache-", dir=Path(args.out).resolve().parent)
-    with caching as caches:
-        for round_ in range(args.rounds):
-            order = [(base, base_path), (head, head_path)]
-            began = time.perf_counter()
-            for name, path in order if round_ % 2 == 0 else order[::-1]:
-                kept = (row.name for row in rows if not row.head_only or name == head)
-                results["samples"][name].append(
-                    dict.fromkeys(kept, unbuilt[name]) if name in unbuilt
-                    else measure(path, pythons[name], args, head_path / "tools", name == head,
-                                 Path(caches) / ("head" if name == head else "base"), first=round_ == 0,
-                                 settings=settings if name == head else None))
-                write_atomically(args.out, json.dumps(results, indent=2))
-                print(f"round {round_ + 1}: {name} measured", flush=True)
-            spent = time.perf_counter() - began
-            results["seconds"]["first round" if round_ == 0 else "later rounds"] += spent
-            write_atomically(args.out, json.dumps(results, indent=2))
+    beside = Path(args.out).resolve().parent
+    beside.mkdir(parents=True, exist_ok=True)
+    # Each arm's compile cache, for this run alone: removed at its end, so no run loads another's programs.
+    with tempfile.TemporaryDirectory(prefix="perf-gate-cache-", dir=beside) as caches:
+
+        def sample(arm: str, round_: int) -> dict:
+            tree, path = arms[arm]
+            if tree in unbuilt:
+                return dict.fromkeys((row.name for row in rows if not row.head_only), unbuilt[tree])
+            return measure(path, pythons[tree], args, head_path / "tools", arm == head and round_ == 0,
+                           Path(caches) / ("head" if arm == head else "alone" if arm != base else "base"),
+                           settings=settings if arm == head else None)
+
+        rounds(args, results, sample)
     return report(argparse.Namespace(results=args.out, table=None, claim=True)) if claiming else 0
+
+
+def arms_of(base: str, head: str, base_path: Path, head_path: Path) -> dict[str, tuple[str, Path]]:
+    """A run's three arms by name, each its tree's name and path: the base, the head, and the base again
+    (`<base>~aa`), whose ratios to the base each round are the run's own noise (`verdict`)."""
+    return {base: (base, base_path), head: (head, head_path), f"{base}{ALONE}": (base, base_path)}
+
+
+def environments(trees: tuple[tuple[str, Path], ...], lock: str, cache: str) -> tuple[dict, dict]:
+    """Each tree's Python, in the environment its own `lock` names, so a change of a locked wheel is measured
+    too; and why a tree that holds no such lock (one older than the locks) cannot run a row."""
+    pythons, unbuilt = {}, {}
+    for name, path in trees:
+        try:
+            pythons[name] = environment(path, lock, Path(cache or CACHE))
+        except Unlocked as missing:
+            unbuilt[name] = f"not run: {missing}"
+    return pythons, unbuilt
+
+
+def rounds(args: argparse.Namespace, results: dict, sample: Callable[[str, int], dict]) -> None:
+    """`results`' arms sampled `--rounds` rounds (`sample` of an arm and a round), each round's arms in an
+    order drawn at random and kept (`orders`), so no arm holds one place in every round and the rounds'
+    ratios fall either side of their medians as the judgment reads them (`verdict`); the results written
+    after each arm, so an interrupted run reports what it measured, partial."""
+    from dew._files import write_atomically
+
+    places = secrets.SystemRandom()
+    for round_ in range(args.rounds):
+        order = places.sample(list(results["samples"]), len(results["samples"]))
+        results["orders"].append(order)
+        began = time.perf_counter()
+        for arm in order:
+            results["samples"][arm].append(sample(arm, round_))
+            write_atomically(args.out, json.dumps(results, indent=2))
+            print(f"round {round_ + 1}: {arm} measured", flush=True)
+        results["seconds"]["first round" if round_ == 0 else "later rounds"] += time.perf_counter() - began
+        write_atomically(args.out, json.dumps(results, indent=2))
+
+
+COMPILE_TARGETS = {"a100": ("sm80", 40, "A100"), "h100": ("sm90", 80, "H100")}
+"""Each GPU kind dew-ops' perf runs measure, as `compile` plans its steps for it: its CUDA generation, whose
+multiprocessors `dew.training.ahead.built_target` states, its memory in GiB, the planner's capacity, and the
+device its sized steps run on (`STEP_HARDWARE`). A declared target, not the live run's program: a live run
+plans on its allocator's own pool, which its record keeps."""
+UNSUPPORTED = "unsupported: "
+"""A compile's sample whose program is not the target's: a kernel this host cannot lower ran as another
+(`AheadOfTime.substituted`), so the row is not judged (`verdict`)."""
+COMPILED = """
+import json, sys
+from benchmark_cases import Case
+from benchmark_models import build_trainer, global_batch
+from dew.training.ahead import compile_ahead, compile_only_gpus
+case = Case(**json.loads(sys.argv[1]))
+generation, capacity = sys.argv[2], int(sys.argv[3])
+trainer = build_trainer(case)
+trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, trainer.device_mesh.devices.size,
+                                                                capacity)))
+ahead = compile_ahead(trainer, global_batch(case), capacity)
+print(json.dumps({"seconds": ahead.planned_seconds, "substituted": list(ahead.substituted),
+                  "plan": {key: value for key, value in (ahead.plan or {}).items()
+                           if not isinstance(value, (list, dict))}}))
+"""
+"""A step's planning and compile ahead of its run, for compile-only GPUs of a generation (`compile`): the
+seconds the planner took, its derivations and every compile (`AheadOfTime.planned_seconds`), the kernels it
+lowered in place of the target's, and the plan it selected, a diagnostic beside the row."""
+
+
+def compile_battery(args: argparse.Namespace) -> int:
+    """Each step of `--kind`'s planned and compiled ahead of its run, for one compile-only GPU of its
+    generation (`COMPILE_TARGETS`), XLA's autotuning off as no GPU is attached to time a candidate
+    (docs/design/training.md), in the three arms and their rounds as `run` measures (`arms_of`, `rounds`),
+    every arm's every round a process of its own with an empty compile cache: each sample a cold plan and
+    compile, which the GPU's rounds load from their caches. Each tree compiles in the environment of
+    `--lock`, the lock of the GPU run it stands beside (its `lock`), whose compiler the GPU run's programs
+    come from. A sample whose program substituted a kernel is unsupported; each sample's selected plan is
+    kept (`plans`), so a head that plans otherwise shows it beside its time, which is judged all the same:
+    the planner's own work is what a run spends."""
+    if "xla_gpu_autotune_level" in os.environ.get("XLA_FLAGS", ""):
+        raise SystemExit("compile: XLA_FLAGS sets the autotuning level, which planning ahead keeps off; a "
+                         "gate compiles as a run does with no GPU attached, so unset it")
+    generation, gib, device = COMPILE_TARGETS[args.kind]
+    trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
+    (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
+    pythons, unbuilt = environments(((base, base_path), (head, head_path)), args.lock, args.environments)
+    cases = {f"compile {name.removeprefix('step ')}": case for name, case in STEP_CASES.items()
+             if (not args.only or any(word in name for word in args.only))
+             and device in STEP_HARDWARE.get(name, device)}
+    rows = [Row(name, "s", "", floor=COMPILE_FLOOR) for name in cases]
+    arms = arms_of(base, head, base_path, head_path)
+    results = {"base": base, "head": head, "alone": f"{base}{ALONE}", "rounds": args.rounds,
+               "rows": [row.__dict__ for row in rows], "samples": {arm: [] for arm in arms}, "orders": [],
+               "plans": {arm: [] for arm in arms}, "target": {"kind": args.kind, "generation": generation,
+                                                              "capacity_gib": gib, "lock": args.lock},
+               "seconds": {"first round": 0.0, "later rounds": 0.0}}
+    beside = Path(args.out).resolve().parent
+    beside.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="perf-gate-compile-", dir=beside) as work:
+        script = _script(Path(work) / "compiled.json", COMPILED)
+
+        def sample(arm: str, round_: int) -> dict:
+            tree, path = arms[arm]
+            taken, plans = {}, {}
+            for name, case in cases.items():
+                if tree in unbuilt:
+                    taken[name] = unbuilt[tree]
+                    continue
+                with tempfile.TemporaryDirectory(dir=work) as cache:
+                    done = _run(path, pythons[tree], "", [str(script), json.dumps(case), generation,
+                                                          str(gib << 30)], head_path / "tools", 3600,
+                                Path(cache) / "compiles")
+                if done.returncode != 0:
+                    taken[name] = f"not run: {done.stderr[-400:]}"
+                    continue
+                compiled = json.loads(done.stdout.strip().splitlines()[-1])
+                plans[name] = compiled["plan"]
+                taken[name] = (f"{UNSUPPORTED}{'; '.join(compiled['substituted'])}" if compiled["substituted"]
+                               else float(compiled["seconds"]))
+            results["plans"][arm].append(plans)
+            return taken
+
+        rounds(args, results, sample)
+    return 0
 
 
 def measured(sample: object) -> bool:
@@ -452,53 +583,56 @@ def measured(sample: object) -> bool:
 
 
 def reference_verdict(head: list) -> tuple[str, dict]:
-    """A reference row keeps its own exit status and ratio, even when it fails.
-
-    No base sample is needed: a head that reaches the reference can qualify
-    while its parent still trails it. A nonzero child exit is a measured
-    failure, not an unmeasured row. Missing rounds never qualify a claim.
-    """
-    unmeasured = [isinstance(sample, str) and sample.startswith("not measured on this hardware")
-                  for sample in head]
-    taken = [sample for sample in head if isinstance(sample, dict)]
-    codes = [sample.get("exit_code") for sample in taken]
-    ratios = [sample.get("ratio") for sample in taken]
-    values = [sample.get("value") for sample in taken]
-    bands = [sample.get("tolerance") for sample in taken]
-    numbers = {"exit_codes": codes}
-    if taken and all(map(measured, ratios)):
-        numbers["ratio"] = statistics.median(ratios)
-    if taken and all(map(measured, values)):
-        numbers["head"] = statistics.median(values)
-    if taken and all(isinstance(band, float) and math.isfinite(band) and band >= 0 for band in bands):
-        numbers["band"] = max(bands)
-    if any(code != 0 for code in codes) or any(sample.get("passed") is False for sample in taken):
-        return "failed", numbers
-    if head and all(unmeasured):
+    """A reference row's verdict: its pairing's own judgment (tools/reference_runs/qwen35_pair.py: its rounds,
+    its A/A, `dew.telemetry.benchmark.judged`), read from the head's first round, which alone runs it, its
+    exit status kept even where it failed. No base sample is needed: a head that reaches the reference can
+    qualify while its parent still trails it. A nonzero child exit is a measured failure, not an unmeasured
+    row; a pairing of fewer than `ROUNDS` rounds, or with no judgment, qualifies nothing."""
+    sample = head[0] if head else None
+    if isinstance(sample, str) and sample.startswith("not measured on this hardware"):
         return "not measured on this hardware", {}
-    if (not head or len(taken) != len(head) or not all(sample.get("passed") is True for sample in taken)
-            or not {"ratio", "head", "band"} <= numbers.keys()):
+    if not isinstance(sample, dict):
+        return "incomplete", {}
+    numbers = {"exit_codes": [sample.get("exit_code")],
+               **{key: sample[key] for key in ("value", "ratio", "interval", "alone", "differs", "rounds")
+                  if key in sample}}
+    if sample.get("exit_code") != 0 or sample.get("passed") is False:
+        return "failed", numbers
+    if (sample.get("passed") is not True or not isinstance(sample.get("rounds"), int)
+            or sample["rounds"] < ROUNDS or not {"ratio", "interval", "alone"} <= numbers.keys()):
         return "incomplete", numbers
     return "passed", numbers
 
 
-def verdict(row: Row, base: list, head: list, noise: float = 0.0) -> tuple[str, dict]:
-    """Whether `row` regressed from the `base` samples to the `head` ones, and the numbers that say so.
+def verdict(row: Row, base: list, head: list, alone: list) -> tuple[str, dict]:
+    """Whether `row` moved from the `base` samples to the `head` ones, judged against the base's A/A
+    (`alone`), each a sample a round, and the numbers that say so.
 
-    A row moves when its median moves by more than the larger of the two trees' spreads (at
-    least FLOOR, and at least the row's calibrated `noise`) and the two trees' samples do not
-    overlap at all. With three rounds each, the
-    samples separate by chance 1 time in 20 when nothing changed (1 / C(6, 3)), and the band
-    lowers that further; it is also the smallest change the row can see. A row the base cannot
-    run in any round (a tree older than its tool) is not compared; one the base runs and the head
-    runs in no round is broken; one neither runs leaves the battery incomplete. A row either tree
-    measured in some rounds and not in others, or measured as NaN, an infinity or zero, is
-    partial: the rounds that ran would be judged as if they were all, so it is not judged."""
+    Each round's head over its base is a ratio, and so is each round's A/A over its base; Dew's one judgment
+    of a time against another (`dew.telemetry.benchmark.judged`) reads the head's ratios' median and its
+    interval at `LEVEL` beside the A/A's, the noise of this run's own placement, and says whether they
+    differ. A row that differs and whose median ratio is worse by more than its floor regresses, better by
+    more is faster, and within it is different below its floor, which passes: the floor is the change the
+    gate acts on, not a noise allowance. A row whose A/A interval reaches past its floor could not see a
+    change of that size, and says so (`insensitive`). The judgment's interval holds each ratio's median
+    where the rounds' ratios are independent draws of one distribution, each falling either side of its
+    median as a fair coin, which the rounds' random order supports and does not prove.
+
+    A row the base cannot run in any round (a tree older than its tool) is not compared; one the base runs
+    and the head runs in no round is broken; one neither runs leaves the battery incomplete. A row any arm
+    measured in some rounds and not in others, or measured as NaN, an infinity or zero, is partial: the
+    rounds that ran are not judged as if they were all, nor are the rounds every arm measured picked out.
+    Too few rounds to reach an interval are unjudged."""
+    from dew.telemetry import benchmark
+
     if row.head_only:
         return reference_verdict(head)
     if row.hardware and any(isinstance(x, str) and x.startswith("not measured on this hardware")
-                            for x in [*base, *head]):
+                            for x in [*base, *head, *alone]):
         return "not measured on this hardware", {}
+    if unsupported := next((x for x in [*base, *head, *alone] if isinstance(x, str)
+                            and x.startswith(UNSUPPORTED)), None):
+        return "unsupported", {"why": unsupported}
     if not any(measured(x) for x in base) and not any(measured(x) for x in head):
         return "incomplete", {}
     if not any(measured(x) for x in base):
@@ -506,39 +640,39 @@ def verdict(row: Row, base: list, head: list, noise: float = 0.0) -> tuple[str, 
     if not any(measured(x) for x in head):
         return "broken", {}
     missing = {name: sum(not measured(x) for x in samples)
-               for name, samples in (("base", base), ("head", head)) if not all(map(measured, samples))}
-    if missing:
+               for name, samples in (("base", base), ("head", head), ("A/A", alone))
+               if not samples or not all(map(measured, samples))}
+    if missing or not len(base) == len(head) == len(alone):
         return "partial", {"unmeasured rounds": missing}
-    worse = -1.0 if row.unit in HIGHER_IS_BETTER else 1.0
-
-    def spread(xs):
-        return (max(xs) - min(xs)) / statistics.median(xs)
-    band = max(spread(base), spread(head), row.floor, noise)
-    change = worse * (statistics.median(head) - statistics.median(base)) / statistics.median(base)
-    separated = (min(head) > max(base)) if worse > 0 else (max(head) < min(base))
-    faster = (max(head) < min(base)) if worse > 0 else (min(head) > max(base))
-    state = "regressed" if change > band and separated else "faster" if -change > band and faster else "level"
-    return state, {"base": statistics.median(base), "head": statistics.median(head), "change": change,
-                   "band": band}
+    numbers = {"base": statistics.median(base), "head": statistics.median(head)}
+    try:
+        judged = benchmark.judged([after / before for before, after in zip(base, head, strict=True)],
+                                  [again / before for before, again in zip(base, alone, strict=True)],
+                                  level=LEVEL)
+    except ValueError as few:
+        return "unjudged", {**numbers, "why": str(few)}
+    worse = (lambda ratio: ratio < 1) if row.unit in HIGHER_IS_BETTER else (lambda ratio: ratio > 1)
+    low, high = judged.interval
+    material = abs(judged.ratio - 1) > row.floor
+    state = ("level" if not judged.differs else "different, below floor" if not material
+             else "regressed" if worse(low) and worse(high) else "faster")
+    insensitive = judged.alone[0] < 1 - row.floor or judged.alone[1] > 1 + row.floor
+    return state, {**numbers, "ratio": judged.ratio, "interval": list(judged.interval),
+                   "alone": list(judged.alone), "differs": judged.differs, "insensitive": insensitive}
 
 
 def report(args: argparse.Namespace) -> int:
-    """The verdict table of a run's results, 1 when the head failed a row. With `--calibration`, each row's
-    band is at least its null noise, how far one tree's median moved against itself; a row whose noise
-    passes its floor cannot see a change of the floor's size and says so (insensitive), never widened in
-    silence. With `--verdicts`, each row's state and numbers as JSON, for a runner to act on; with
-    `--anchors` too, each row's head against its anchor (a run's samples the runner keeps,
-    `{"rows": {row: samples}}`), judged as against the base."""
+    """The verdict table of a run's results (`run`'s or `compile`'s), 1 when the head failed a row: a gated
+    row that regressed, a row the head broke, or one the gate could not judge (UNQUALIFIED). With
+    `--verdicts`, each row's state and numbers as JSON, which a runner acts on where the gate ran, in the
+    head's environment (dew-ops' perf runs)."""
     results = json.loads(Path(args.results).read_text())
-    calibrated = (json.loads(Path(args.calibration).read_text())["noise"]
-                  if getattr(args, "calibration", None) else {})
-    anchors = json.loads(Path(args.anchors).read_text())["rows"] if getattr(args, "anchors", None) else {}
-    base, head = results["base"], results["head"]
+    base, head, alone = results["base"], results["head"], results["alone"]
     # A round a run never reached counts as unmeasured, so an interrupted run is partial.
     rounds = results.get("rounds", max(map(len, results["samples"].values())))
     samples = {name: [*taken, *[{}] * (rounds - len(taken))] for name, taken in results["samples"].items()}
-    lines = [f"| row | unit | {base} | {head} | change | band | verdict |",
-             "|---|---|---:|---:|---:|---:|---|"]
+    lines = [f"| row | unit | {base} | {head} | ratio | interval | A/A interval | verdict |",
+             "|---|---|---:|---:|---:|---|---|---|"]
     failed, verdicts = [], {}
     claiming = getattr(args, "claim", False) or results.get("claim", False)
     if claiming:
@@ -547,35 +681,31 @@ def report(args: argparse.Namespace) -> int:
                       if claimed(row) and row.name not in included)
     for spec in results["rows"]:
         row = Row(**spec)
-        taken = 1 if row.first_round else rounds
-        noise = calibrated.get(row.name, 0.0)
-        state, numbers = verdict(row, [s.get(row.name) for s in samples[base][:taken]],
-                                 [s.get(row.name) for s in samples[head][:taken]], noise)
-        verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated,
-                              "insensitive": noise > row.floor, **numbers}
-        if row.name in anchors:
-            drift, moved = verdict(row, anchors[row.name][:taken],
-                                   [s.get(row.name) for s in samples[head][:taken]], noise)
-            verdicts[row.name]["anchor"] = {"state": drift, **moved}
-        if (state in ("broken", "incomplete", "partial", "failed") or (state == "regressed" and row.gated)
+        state, numbers = verdict(row, *([sample.get(row.name) for sample in samples[arm]]
+                                        for arm in (base, head, alone)))
+        verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated, **numbers}
+        if (state in (*UNQUALIFIED, "broken", "failed") or (state == "regressed" and row.gated)
                 or (claiming and claimed(row) and state in
                     ("not measured on this hardware", "not compared"))):
             failed.append(f"{row.name} ({state})")
         if not row.gated:
             state = f"{state}, not gated"
         if state.startswith("partial"):
-            state += " (" + ", ".join(f"{tree} {count} of {rounds} rounds unmeasured"
-                                      for tree, count in numbers["unmeasured rounds"].items()) + ")"
-        if noise > row.floor:
-            state = f"{state}, insensitive (null noise {noise:.1%} over its {row.floor:.0%} floor)"
-        cells = (["-"] * 4 if "base" not in numbers else
-                 [f"{numbers['base']:.2f}", f"{numbers['head']:.2f}", f"{numbers['change']:+.1%}",
-                  f"{numbers['band']:.1%}"])
+            state += " (" + ", ".join(f"{arm} {count} of {rounds} rounds unmeasured"
+                                      for arm, count in numbers["unmeasured rounds"].items()) + ")"
+        if numbers.get("insensitive"):
+            state += f", insensitive (its A/A reaches past its {row.floor:.0%} floor)"
+        if "why" in numbers:
+            state += f" ({numbers['why']})"
+        cells = (["-"] * 5 if "ratio" not in numbers else
+                 [f"{numbers['base']:.2f}", f"{numbers['head']:.2f}", f"{numbers['ratio']:.4f}",
+                  *(f"{low:.4f}-{high:.4f}" for low, high in (numbers["interval"], numbers["alone"]))])
         if row.head_only and "exit_codes" in numbers:
             state += " (exit codes " + ", ".join(str(code) for code in numbers["exit_codes"]) + ")"
-            cells = ["-", f"{numbers['head']:.2f}" if "head" in numbers else "-",
-                     f"{numbers['ratio']:.3f}x reference" if "ratio" in numbers else "-",
-                     f"{numbers['band']:.1%}" if "band" in numbers else "-"]
+            cells = ["-", f"{numbers['value']:.2f}" if "value" in numbers else "-",
+                     f"{numbers['ratio']:.4f}x reference" if "ratio" in numbers else "-",
+                     *(f"{low:.4f}-{high:.4f}" if key in numbers else "-"
+                       for key in ("interval", "alone") for low, high in [numbers.get(key) or (0, 0)])]
         lines.append(f"| {row.name} | {row.unit} | " + " | ".join(cells) + f" | {state} |")
     if "seconds" in results:
         # The two budgets apart: the first round's cold compiles, the later rounds' timing on cached programs.
@@ -603,7 +733,7 @@ def main() -> int:
     running = operations.add_parser("run")
     running.add_argument("--base", required=True, help="name=path of the tree to compare against")
     running.add_argument("--head", required=True, help="name=path of the tree under test")
-    running.add_argument("--rounds", type=int, default=3)
+    running.add_argument("--rounds", type=int, default=ROUNDS)
     running.add_argument("--model", required=True, help="a local Qwen3-0.6B snapshot")
     running.add_argument("--flowers", required=True, help="the TFDS oxford_flowers102 directory")
     running.add_argument("--out", required=True)
@@ -623,15 +753,23 @@ def main() -> int:
     reporting.add_argument("--table")
     reporting.add_argument("--claim", action="store_true",
                            help="fail if a reference row was unmeasured on its hardware")
-    reporting.add_argument("--calibration",
-                           help='JSON {"noise": {row: fraction}}: each row\'s null noise, the least band it '
-                                "is judged by")
     reporting.add_argument("--verdicts", help="where each row's state and numbers are written as JSON")
-    reporting.add_argument("--anchors", help='JSON {"rows": {row: samples}}: each row\'s anchor, which its '
-                                             "head is judged against too, in --verdicts")
+    compiling = operations.add_parser("compile", help="each step planned and compiled ahead of its run for a "
+                                                      "GPU kind, on any host (`compile_battery`)")
+    compiling.add_argument("--base", required=True, help="name=path of the tree to compare against")
+    compiling.add_argument("--head", required=True, help="name=path of the tree under test")
+    compiling.add_argument("--kind", required=True, choices=sorted(COMPILE_TARGETS))
+    compiling.add_argument("--lock", required=True,
+                           help="the lock whose compiler the GPU run used (its results' `lock`)")
+    compiling.add_argument("--rounds", type=int, default=ROUNDS)
+    compiling.add_argument("--out", required=True)
+    compiling.add_argument("--environments", default="",
+                           help="where each tree's locked environment is built (environments.py's cache)")
+    compiling.add_argument("--only", nargs="*", default=[],
+                           help="compile only the steps whose names hold one of these words")
     args = parser.parse_args()
     with contextlib.suppress(BrokenPipeError):
-        return run(args) if args.operation == "run" else report(args)
+        return {"run": run, "compile": compile_battery, "report": report}[args.operation](args)
     return 0
 
 
