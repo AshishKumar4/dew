@@ -1576,7 +1576,7 @@ def _weighted_values(v, a, beta, taken, call: Call):
     return launch_kernel(program, call, out_type=held.shape(call.heads * call.value_width),
                          grid=(call.chunks, call.heads, call.value_width // vb),
                          grid_names=("chunks", "heads", "values"), blocks=blocks, stages=1,
-                         live=chunk_liveness(2), work=work,
+                         live=chunk_liveness(3), work=work,
                          held=_weighted_values_held(call),
                          hardware=issued_flops(call, work.flops, held, call.given),
                          staging=staging_tiles(held, (CHUNK, vb)),
