@@ -336,33 +336,41 @@ def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
 def test_a_document_that_enters_a_history_convolves_as_if_it_followed_it(taps):
     """`entered_conv1d` of packed documents, each entering one of the histories `held` holds or none, gives
     each document's tokens what `xla_conv1d` gives them where the history stands right before the document
-    in a row of its own, bit for bit; a document entering none, what it gives a document alone. The
-    histories are the documents' own last tokens as `document_tails` reads them, zeros in front of a
+    in a row of its own (check 1); a document entering none, what it gives a document alone; padding none.
+    The histories are the documents' own last tokens as `document_tails` reads them, zeros in front of a
     document shorter than the conv reads behind."""
     from dew.nn.linear import document_tails, entered_conv1d
 
-    rng = np.random.default_rng(taps)
     channels, width = 6, taps - 1
     lengths = [(5, 0), (3, 1), (1, 1), (2, 0), (4, 4)]
     tokens = sum(length for length, _ in lengths)
-    x = jnp.asarray(rng.standard_normal((1, tokens + 2, channels)), jnp.float32)
-    kernel = jnp.asarray(rng.standard_normal((channels, taps)), jnp.float32)
     documents = np.concatenate([*(np.full(length, number, np.int32)
                                   for number, (length, _) in enumerate(lengths, start=1)),
                                 np.zeros(2, np.int32)])
     valid = documents > 0
-    held = jnp.asarray(rng.standard_normal((1, len(lengths), width, channels)), jnp.float32)
     entered = jnp.asarray([[slot - 1 if slot else -1 for _, slot in lengths]], jnp.int32)
-    out = entered_conv1d(x, kernel, valid[None], documents[None], held, entered)
-    begin = 0
-    for number, (length, slot) in enumerate(lengths):
-        own = x[:, begin:begin + length]
-        behind = held[:, slot - 1] if slot else jnp.zeros((1, width, channels), jnp.float32)
-        alone = xla_conv1d(jnp.concatenate([behind, own], axis=1), kernel)[:, width:]
-        np.testing.assert_array_equal(np.asarray(out[:, begin:begin + length]), np.asarray(alone),
-                                      err_msg=str(number))
-        begin += length
-    assert not np.any(np.asarray(out[:, tokens:]))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal((1, tokens + 2, channels)), jnp.float32),
+                jnp.asarray(rng.standard_normal((channels, taps)), jnp.float32),
+                jnp.asarray(rng.standard_normal((1, len(lengths), width, channels)), jnp.float32))
+
+    def entering(x, kernel, held):
+        return entered_conv1d(x, kernel, valid[None], documents[None], held, entered)
+
+    def apart(x, kernel, held):
+        pieces, begin = [], 0
+        for length, slot in lengths:
+            behind = held[:, slot - 1] if slot else jnp.zeros((1, width, channels), x.dtype)
+            pieces.append(xla_conv1d(jnp.concatenate([behind, x[:, begin:begin + length]], axis=1),
+                                     kernel)[:, width:])
+            begin += length
+        return jnp.concatenate([*pieces, jnp.zeros((1, 2, channels), x.dtype)], axis=1)
+
+    assert_as_exact(jax.jit(entering), jax.jit(apart), draw, f"documents entering histories, {taps} taps",
+                    seeds=FP32_SEEDS)
+    x, _, _ = draw(0)
     tails = np.asarray(document_tails(x, valid[None], documents[None], width, len(lengths)))
     begin = 0
     for number, (length, _) in enumerate(lengths):
