@@ -17,6 +17,16 @@ SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
+def dotted(node: ast.expr | None) -> str:
+    """The dotted spelling of a name or attribute, or "" for anything else."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = dotted(node.value)
+        return f"{head}.{node.attr}" if head else node.attr
+    return ""
+
+
 def own(scope: ast.AST) -> Iterator[ast.AST]:
     """Every node in one scope, a nested scope's own node but not its contents."""
     for node in ast.iter_child_nodes(scope):

@@ -1,7 +1,7 @@
 # The files ruff reads: tools/check.sh lints all of them, and tools/pre-commit the staged Python
 # files among them, so the gate and the hook read one list. A directory is every Python file under
 # it. tools/lint_slop.py owns its own roots (`--print-roots`).
-ruff_inputs="src/dew tests tools/lint_slop.py tools/lint_scopes.py tools/lint_layers.py tools/changelog_released.py tools/complexity.py examples recipes"
+ruff_inputs="src/dew tests tools/lint_slop.py tools/lint_scopes.py tools/lint_assertions.py tools/lint_layers.py tools/changelog_released.py tools/complexity.py examples recipes"
 
 # The roots the duplicate-code gate reads (tools/duplicates.py), as text and as structure (tools/check_gates).
 duplicate_roots="src/dew tools tests examples site"
