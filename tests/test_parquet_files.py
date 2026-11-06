@@ -316,35 +316,51 @@ def test_dew_data_publish_publishes_a_parquet_stream_at_the_plan_version_it_name
     assert made[9] != made[10]
 
 
-def test_a_parquet_stream_read_by_more_shares_than_files_publishes_its_fill(tmp_path):
-    """A cached stream of a Parquet store of one file, read whole by two shares, fills it by its row groups
-    and publishes them as the store's own shards (`ShardManifest.parts`), so a later read of the store
-    through the cache reads the generation back, running no step, where it refilled every run (train 654's
-    review, row 4581)."""
+@pytest.mark.parametrize("stores", [1, 2], ids=["one store", "two concatenated"])
+def test_a_parquet_stream_read_by_more_shares_than_files_publishes_its_fill(tmp_path, stores):
+    """A cached stream of Parquet stores of one file each, alone or concatenated, read whole by more shares
+    than files, fills them by their row groups and publishes them as the stores' own shards
+    (`ShardManifest.parts`), so a later read of them through the cache reads the generation back, running
+    no step, where it refilled every run (train 654's review, row 4581; a concatenation's, train 666's,
+    row 4656)."""
     from test_data_cache import Offset
 
     from dew.data.cache import Cache
     from dew.data.compile import iterate
 
-    root = tmp_path / "store"
-    root.mkdir()
-    pq.write_table(pa.Table.from_pylist([{"id": row} for row in range(GROUPS * ROWS)]),
-                   root / "part-00.parquet", row_group_size=ROWS)
+    def files() -> list[Files]:
+        made = []
+        for store in range(stores):
+            root = tmp_path / f"store{store}"
+            if not root.is_dir():
+                root.mkdir()
+                pq.write_table(pa.Table.from_pylist([{"id": store * GROUPS * ROWS + row}
+                                                     for row in range(GROUPS * ROWS)]),
+                               root / "part-00.parquet", row_group_size=ROWS)
+            made.append(Files(str(root), format="parquet"))
+        return made
+
+    def store():
+        held = files()
+        return held[0] if stores == 1 else Concatenate(tuple(held))
+
+    total = stores * GROUPS * ROWS
     cache = Cache(str(tmp_path / "cache"))
     filled, reading = Offset(10), Offset(10)
-    read = compile(Pipeline(Files(str(root), format="parquet")).map(filled).cache(cache).batch(4),
-                   read="streamed", loading=READ, epochs=1)
-    read_ids = set()
-    for share in range(2):
-        stream = read.train(DataPartition(share, 2))
+    read = compile(Pipeline(store()).map(filled).cache(cache).batch(4), read="streamed", loading=READ,
+                   epochs=1)
+    read_ids = []
+    shares = stores + 1
+    for share in range(shares):
+        stream = read.train(DataPartition(share, shares))
         try:
-            read_ids |= set(ids(stream))
+            read_ids += ids(stream)
         finally:
             stream.close()
-    assert read_ids == set(range(GROUPS * ROWS))
-    rows = iterate(Pipeline(Files(str(root), format="parquet")).map(reading).cache(cache), read="streamed")
-    assert sorted(int(row["value"]) for row in rows) == [row + 10 for row in range(GROUPS * ROWS)]
-    assert sorted(filled.calls) == list(range(GROUPS * ROWS)) and reading.calls == []
+    assert sorted(read_ids) == list(range(total))
+    rows = iterate(Pipeline(store()).map(reading).cache(cache), read="streamed")
+    assert sorted(int(row["value"]) for row in rows) == [row + 10 for row in range(total)]
+    assert sorted(filled.calls) == list(range(total)) and reading.calls == []
 
 
 def test_a_parquet_store_reads_each_footer_once_however_many_reads_count_its_rows():
