@@ -1764,23 +1764,24 @@ def test_an_ampere_kernel_gradient_at_a_two_row_warp_step_holds_check_1(generati
     along its rows (`mosaic_sm80.MmaIssuer.specialized` at 128 x 128) stepping 32 rows, its transposed stage's
     row atom (`Mma.transposed_rows`), which the launch's legality takes: each group a tile of its own, groups
     of no whole step, an empty one and one of a row among them, on par with XLA's over the draws (check 1),
-    truth float64's."""
+    truth float64's. Its output is bf16, whose one rounding hides the tensor cores' in-order sums, so they
+    are not promoted and the tile's one accumulator fills its registers (an fp32 output's running sum beside
+    it holds no 128 x 128 tile: `templates.product.promoted`)."""
     tiles = mosaic_gpu.Tiles(128, 128, 32, 2, 1, warpgroups=1, family="mma.sync")
 
     def ampere(x, dy):
-        # The default precision's sums, which mma.sync's launches take (exact sums are warpgroup MMA's).
-        return gemm.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision="default",
+        return gemm.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.bfloat16, precision="default",
                                interpret_on_cpu=True)
 
     def plain(x, dy):
         # XLA's product at the same precision, its fp32 operands' products a tensor core's on a GPU.
         with jax.default_matmul_precision("default"):
-            return _kernel_gradient(x, dy, SIZES)
+            return _kernel_gradient(x, dy, SIZES).astype(jnp.bfloat16)
 
     with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"), \
             tuning.pinned({grouped_matmul.MosaicTgmm: tiles}):
         assert_as_exact(ampere, jax.jit(plain), _gradient_rows_draw, "ampere kernel gradient, 32-row steps",
-                        seeds=SEEDS)
+                        seeds=SEEDS, truth_fn=lambda x, dy: _kernel_gradient(x, dy, SIZES))
 
 
 def _gradient_rows_draw(seed):
@@ -2054,7 +2055,8 @@ HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
     (jnp.bfloat16, HIGHEST, (jnp.float32,), True, None),
     (jnp.bfloat16, HIGHEST, (jnp.bfloat16,), False, None),
     (jnp.bfloat16, HIGHEST, (jnp.bfloat16, jnp.float32), True, None),
-    (jnp.float16, DEFAULT, (jnp.float32,), False, None),
+    (jnp.float16, DEFAULT, (jnp.float32,), True, None),
+    (jnp.bfloat16, DEFAULT, (jnp.bfloat16,), False, None),
     (jnp.float32, DEFAULT, (jnp.float32,), False, None),
     (jnp.float32, HIGHEST, (jnp.float32,), True, "TF32"),
     (jnp.int8, DEFAULT, (jnp.float32,), False, "int8"),
@@ -2063,9 +2065,9 @@ HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
 ])
 def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, precision, outputs, promoted,
                                                                    refused):
-    """A precision above the default promotes each depth step's partial where an output is fp32, and an
-    FP8 product always (testing.md, FP8 products); the kernels refuse fp32 products above the default
-    (they multiply in TF32) and a dtype they do not multiply in."""
+    """A precision above the default, or 16-bit operands at any (row 4331), promotes each depth step's
+    partial where an output is fp32, and an FP8 product always (testing.md, FP8 products); the kernels refuse
+    fp32 products above the default (they multiply in TF32) and a dtype they do not multiply in."""
     declared = product.declared(compute, precision, outputs=outputs)
     assert declared.promoted is promoted
     assert (declared.refusal is None) is (refused is None)

@@ -377,7 +377,11 @@ PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "inp
 FP8_FORMS = ("forward fp8",)
 """The FP8 forms a family whose products take FP8 operands emits (`Family.takes_fp8`)."""
 
-HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "normed biased input gradient",
+EXACT_FORMS = ("kernel gradient exact fp32", "forward exact fp32", "input gradient exact fp32")
+"""The exactly summed forms a family whose model counts a running sum emits (`Family.counts_sums`): an fp32
+output of 16-bit products (`templates.product.promoted`)."""
+
+HOOKED_FORMS = ("normed biased forward", "normed biased input gradient",
                 "normed kernel gradient", "exact normed kernel gradient", "fp16 normed biased forward",
                 "cast forward", "gated forward", "gated kernel gradient", "residual forward",
                 "two bf16 outputs forward", "scaled forward", "row scaled forward")
@@ -431,6 +435,9 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
         ("kernel gradient fp32", tgmm, (x, dy, sizes), backward),
         ("kernel gradient fp16", tgmm, (x16, dy16, sizes), backward),
         ("kernel gradient exact fp32", tgmm, (x, dy, sizes), {**backward, "exact_sums": True}),
+        ("forward exact fp32", gmm, (x, w, sizes), {**forward, "out_dtype": "float32", "exact_sums": True}),
+        ("input gradient exact fp32", gmm, (dy, w, sizes),
+         {**backward, "trans_rhs": True, "exact_sums": True}),
         ("normed biased forward", gmm,
          (x, w, sizes, (vector((rows,)), vector((depth,))), (vector((width,)),)),
          {**forward, "hooks": hooks(normed, (("rows",), ("depth",)), biased, (("columns",),))}),
@@ -564,15 +571,17 @@ def _derived_and_refused(launch, ba, target) -> tuple:
 
 
 def _emitted_forms(family, shape: str | None = None) -> set[str]:
-    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`): none without a
-    bundle, the hooked and exactly summed ones where its register model counts what they hold
-    (`Family.counts_hooks`), the FP8 ones where its products take FP8 (`Family.takes_fp8`);
+    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `EXACT_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`):
+    none without a bundle, the exactly summed ones where its register model counts a running sum
+    (`Family.counts_sums`), the hooked ones where it counts what they hold (`Family.counts_hooks`), the FP8
+    ones where its products take FP8 (`Family.takes_fp8`);
     at a projection `shape`, each whose output's width steps by the family's column unit, whose stores take
     it (`Family.stores_columns`: a grouped product's rows ragged to one, a kernel gradient's whole role's)
     and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
     forms = {*PLAIN_FORMS, *(PAIRED_FORMS if family.counts_hooks or not family.feeds_itself else ()),
+             *(EXACT_FORMS if family.counts_sums else ()),
              *(HOOKED_FORMS if family.counts_hooks else ()),
              *(FP8_FORMS if family.takes_fp8 else ())}
     if shape is None:
