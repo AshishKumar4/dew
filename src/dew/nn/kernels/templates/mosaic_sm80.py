@@ -600,7 +600,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             # its `Rows` view, each staged plain for its join's register copy.
             specs = []
             for name in names:
-                shape, dtype = blocks[name]
+                shape = blocks[name][0]
                 index_map = streams.views[name][1]
                 if name not in copies:
                     staging = _staging(blocks[name], streams.pipeline.swizzles.get(name))
@@ -614,7 +614,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             threads = {} if streams.pipeline.consumers == 1 else {"thread_axis": "wg"}
             operands = [streams.views[name][0] for name in names for _ in range(copies.get(name, 1))]
 
-            def piped(*joined, body=body, specs=specs, carry=carry, hi=hi, lo=lo, operands=operands):
+            def piped(*joined, body=body, specs=specs, carry=carry, hi=hi, lo=lo, operands=operands,
+                      threads=threads):
                 pipeline = plgpu.emit_pipeline(
                     functools.partial(body, joins=dict(zip(copies, joined, strict=True))), grid=(hi - lo,),
                     in_specs=specs, max_concurrent_steps=streams.pipeline.stages, init_carry=carry, **threads)

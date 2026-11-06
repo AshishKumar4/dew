@@ -960,8 +960,8 @@ def _paged_products(p, pool, table, *, interpret):
     pieces = PAGED_BLOCK // PAGE
 
     def body(p_gmem, pool_gmem, table_gmem, out_gmem):
-        allocated = family.streams({'p': ((FED_ROWS, PAGED_BLOCK), jnp.bfloat16),
-                                    'x': ((PAGED_BLOCK, FED_WIDTH), jnp.bfloat16)}, 2, 1, copies={'x': pieces})
+        blocks = {'p': ((FED_ROWS, PAGED_BLOCK), jnp.bfloat16), 'x': ((PAGED_BLOCK, FED_WIDTH), jnp.bfloat16)}
+        allocated = family.streams(blocks, 2, 1, copies={'x': pieces})
 
         def walked(*, streams):
             views = {'p': (p_gmem, lambda j: (0, j)),
