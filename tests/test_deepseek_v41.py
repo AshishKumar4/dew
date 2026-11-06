@@ -129,6 +129,24 @@ def test_the_quantizers_round_fp32_input_as_the_stand_ins(source):
                                       reference[f"qat_{site}_out"].view(np.uint32), err_msg=site)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_the_quantizers_pass_their_gradient_straight_through_and_round_their_value(dtype):
+    """Each quantizer's derivative is the identity (straight through), the estimator a quantization-aware
+    run trains through, which the release, an inference program, states none of (row 354); and its value
+    is what it rounds to however far a block's lead sits past its scale's clamp, compiled in either dtype:
+    a block led by 1e5 or 1e10 saturates its E4M3 scale at 448, so the lead stores the largest code,
+    6 * 448, and the 3.0s store 0, where `x + (rounded - x)` rounds its correction far from x."""
+    x = jnp.linspace(-3.0, 3.0, 64, dtype=dtype).reshape(2, 32)
+    for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, e4m3_scale=True)):
+        np.testing.assert_array_equal(jax.grad(lambda v, quant=quant: jnp.sum(quant(v) * v))(x),
+                                      quant(x) + x)
+    big = jnp.asarray([[lead] + [3.0] * 15 for lead in (1e5, 1e10)], dtype)
+    expected = np.zeros(big.shape, np.float32)
+    expected[:, 0] = 6 * 448
+    np.testing.assert_array_equal(np.asarray(jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))(big),
+                                             np.float32), expected)
+
+
 def test_the_engram_hash_is_the_releases_int64_arithmetic():
     """At the release's sizes (a compressed vocabulary of 99092, buckets
     above 16M, 8 heads over 2- to 4-grams) the limb arithmetic equals
@@ -433,10 +451,11 @@ def test_dsparks_draft_is_the_releases(as_run, recorded_rows):
                     reference, draw, "dspark's draft", seeds=seeds, truth_fn=truth)
 
 
-def held_to_the_release_images(model, variables, label: str) -> None:
-    """`model` over `variables` (the vision bundle's) on par with the release's image prompts (check 1, the
-    recording's 'deepseek v41 release vision'): every position's logits from the prompt's last on, one
-    forward with the image, its float64 twin's the truth, held to the recording's sketch."""
+def held_to_the_release_images(model, variables, label: str, arm=None) -> None:
+    """`model` over `variables` (the vision bundle's), or over `arm`'s where given, on par with the
+    release's image prompts (check 1, the recording's 'deepseek v41 release vision'): every position's
+    logits from the prompt's last on, one forward with the image, the truth its float64 twin over
+    `variables`, held to the recording's sketch."""
     from model_support import float64_twin
     from reference_error import indexed_recording, recording
 
@@ -465,7 +484,8 @@ def held_to_the_release_images(model, variables, label: str) -> None:
     draw, reference, truth = indexed_recording(
         recording(RELEASE), site, seeds, truth_fn=truth,
         inputs_of=lambda seed: {name: value[int(seed)] for name, value in prompts.items()})
-    assert_as_exact(as_given(lambda index, inputs: logits(model, variables, inputs)), reference, draw, label,
+    held = variables if arm is None else arm
+    assert_as_exact(as_given(lambda index, inputs: logits(model, held, inputs)), reference, draw, label,
                     seeds=seeds, truth_fn=truth)
 
 
@@ -568,8 +588,36 @@ def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(as_run, 
                                 if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
             return wide(held, jnp.asarray(ids))
 
-    def draw(seed):
-        return (recorded_rows[seed],)
+    import selection_margins
+    from interop_support import token_draw
+
+    twin = float64_twin(model)
+
+    @jax.jit
+    def chosen(variables, ids):
+        """The float64 unpadded draft's block and every selection its trunk and its drafter make."""
+        _, trunk = selection_margins.capturing(twin, variables, ids[:, :prompt],
+                                               mutable=["prediction_inputs"])
+        whole = twin.apply(variables, trunk["prediction_inputs"], method="draft_context")
+        (_, block, _), drafter = selection_margins.capturing(
+            twin, variables, whole, ids[:, prompt],
+            method=lambda module, whole, token: module.draft(whole, token, decode=False))
+        return block, (trunk, drafter)
+
+    def clears(inputs):
+        """The float64 draft's choices, its block's greedy tokens and every selection of its trunk and
+        drafter, clear of MARGIN, so both arms choose alike."""
+        with jax.enable_x64(new_val=True):
+            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
+            block, captured = chosen(held, jnp.asarray(inputs[0]))
+        smallest = float(np.min(selection_margins.top_margin(np.asarray(block)[..., :-1, :], 1)))
+        for selections in captured:
+            smallest = min(smallest, selection_margins.margin(as_run.model_config, selections,
+                                                              "a padded context's draft"))
+        return smallest > selection_margins.MARGIN
+
+    draw = selection_margins.clearing(token_draw(0x1122, model.vocab_size, recorded_rows.shape[1:]), clears)
 
     assert_as_exact(as_given(lambda ids: {"logits": drafted(jnp.asarray(ids), by_validity)}),
                     jax.jit(functools.partial(alone, model, variables)), draw, "a padded context's draft",
@@ -1029,8 +1077,8 @@ def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path
     routers.update({path: routers[(*path[:-1], "e_score_correction_bias")]
                     for path in routers if path[-1] == "media_bias"})
     with pytest.raises(GateFailure) as failed:
-        held_to_the_release_images(loaded.model, {**loaded.variables, "moe": unflatten_dict(routers)},
-                                   "the image span routed by the text bias")
+        held_to_the_release_images(loaded.model, loaded.variables, "the image span routed by the text bias",
+                                   arm={**loaded.variables, "moe": unflatten_dict(routers)})
     assert not isinstance(failed.value, Inconclusive)
     ids = jnp.asarray(reference["input_ids"])
     media = jnp.asarray(reference["token_types"] >= 0)
