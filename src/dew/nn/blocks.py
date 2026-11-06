@@ -3,6 +3,7 @@
 import functools
 from collections.abc import Callable
 from functools import partial
+from typing import overload
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +13,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
 from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.derivatives import contracted
 from dew.nn.dropout import Dropout
 
 from . import activations
@@ -58,7 +60,8 @@ def _rows(dtype: jnp.dtype) -> Callable:
     def forward(table, ids):
         return _table_rows(table, ids, dtype), (table, ids)
 
-    return linear_tangent(forward, _table_rows_backward, lambda table, ids: _table_rows(table, ids, dtype))
+    return contracted("test_an_embedding_lookup_holds_every_order")(
+        linear_tangent(forward, _table_rows_backward, lambda table, ids: _table_rows(table, ids, dtype)))
 
 
 def _table_rows_backward(saved: tuple[jax.Array, jax.Array], operands: tuple, cotangent: jax.Array
@@ -266,16 +269,43 @@ def torch_nearest_resize(x, height: int, width: int):
     return jnp.take(jnp.take(x, rows, axis=1), columns, axis=2)
 
 
-def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.ndarray:
+@overload
+def torch_cubic_weights(t: np.ndarray) -> np.ndarray: ...
+
+
+@overload
+def torch_cubic_weights(t: jax.Array) -> jax.Array: ...
+
+
+def torch_cubic_weights(t: np.ndarray | jax.Array) -> np.ndarray | jax.Array:
+    """The weights of torch's bicubic interpolation (a = -0.75, `upsample_bicubic2d`) on the four taps
+    around a source coordinate whose distance past its floor is `t` (NumPy or JAX, its dtype kept): the
+    taps at floor - 1, floor, floor + 1 and floor + 2, in that order, on a new last axis."""
+    a = -0.75
+
+    def near(x):
+        return ((a + 2) * x - (a + 3)) * x * x + 1
+
+    def far(x):
+        return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+
+    taps = [far(t + 1), near(t), near(1 - t), far(2 - t)]
+    return np.stack(taps, axis=-1) if isinstance(t, np.ndarray) else jnp.stack(taps, axis=-1)
+
+
+def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool, dtype: np.dtype) -> np.ndarray:
     """The `[size_out, size_in]` matrix of torch's bicubic interpolation along
-    one axis, `align_corners=False`.
+    one axis, `align_corners=False`, in `dtype`, the dtype its input computes in.
 
     Without antialiasing each output reads four taps at half-pixel source
     coordinates, clamped at the border, with the cubic's a = -0.75; the
-    coordinate is computed in float32 as torch's CPU kernel computes it, since
-    at 256 pixels its rounding moves a weight by 1e-5. With antialiasing the
-    kernel is a = -0.5, widened by the scale when shrinking, and normalized."""
-    scale = np.float32(size_in) / np.float32(size_out)
+    coordinate and the weights are computed in `dtype` as torch's CPU kernel
+    computes them in its input's (float32 for a float32 input, float64 for a
+    float64 one), since at 256 pixels float32's rounding moves a weight by
+    1e-5. With antialiasing the kernel is a = -0.5, widened by the scale when
+    shrinking, and normalized."""
+    real = np.dtype(dtype).type
+    scale = real(size_in) / real(size_out)
     matrix = np.zeros((size_out, size_in), np.float64)
     if antialias:
         stretch = max(float(scale), 1.0)
@@ -287,24 +317,14 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
                 x < 1, (1.5 * x - 2.5) * x * x + 1, np.where(x < 2, ((-0.5 * x + 2.5) * x - 4) * x + 2, 0)
             )
             matrix[i, low:high] = weights / weights.sum()
-        return matrix.astype(np.float32)
-    a, one = np.float32(-0.75), np.float32(1)
-
-    def near(x):
-        return ((a + 2) * x - (a + 3)) * x * x + one
-
-    def far(x):
-        return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
-
+        return matrix.astype(dtype)
     for i in range(size_out):
-        source = scale * (np.float32(i) + np.float32(0.5)) - np.float32(0.5)
+        source = scale * (real(i) + real(0.5)) - real(0.5)
         index = int(np.floor(source))
-        t = np.float32(source - np.float32(index))
-        for tap, weight in zip(
-            range(index - 1, index + 3), (far(t + one), near(t), near(one - t), far(2 * one - t)), strict=True
-        ):
+        t = real(source - real(index))
+        for tap, weight in zip(range(index - 1, index + 3), torch_cubic_weights(np.asarray(t)), strict=True):
             matrix[i, min(max(tap, 0), size_in - 1)] += weight
-    return matrix.astype(np.float32)
+    return matrix.astype(dtype)
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -323,9 +343,11 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
     `jax.image.resize`'s cubic is Keys' a = -0.5 and always antialiases a
     shrink; torch's is a = -0.75 and antialiases only when asked, so a vision
     encoder that resizes its input or its position table reproduces its
-    reference only through this arithmetic."""
-    rows = _torch_bicubic_weights(x.shape[1], height, antialias)
-    columns = _torch_bicubic_weights(x.shape[2], width, antialias)
+    reference only through this arithmetic, its weights in the dtype `x`
+    computes in, at least float32, as torch's are in its input's."""
+    dtype = np.dtype(at_least_fp32(x.dtype))
+    rows = _torch_bicubic_weights(x.shape[1], height, antialias, dtype)
+    columns = _torch_bicubic_weights(x.shape[2], width, antialias, dtype)
     return float32_einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
 
 

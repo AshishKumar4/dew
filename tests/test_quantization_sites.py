@@ -162,33 +162,27 @@ def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(case):
 
 def test_packed_projections_carry_their_members_shared_scale(case):
     """The query, key and value read one input, and the checkpoint scales it
-    once for all three, so their packed product quantizes it once."""
+    once for all three, so their packed product quantizes it once: the
+    packed tree computes the quantized logits."""
     _, loaded, reference = case
-    groups = projection_groups(loaded.model, loaded.variables)
-    assert groups
+    assert projection_groups(loaded.model, loaded.variables)
     packed = inference_projections(loaded.model, loaded.variables)
-    for group in groups:
-        node = packed[QUANTIZATION]
-        for part in group.path:
-            node = node[part]
-        assert group.packed in node and not set(group.members) & set(node)
     assert_view(lambda ids: loaded.model.apply(packed, ids), loaded.model, loaded.variables, reference,
                 "packed")
 
 
-def test_members_scaled_apart_stay_unpacked(case):
-    """Members whose input scales differ cannot share one quantized input, so
-    their group stays unpacked and each keeps its own."""
-    _, loaded, _ = case
-    groups = projection_groups(loaded.model, loaded.variables)
-    group = groups[0]
+def scaled_apart(loaded):
+    """The loaded tree with its first projection group's second member's input scale doubled: members
+    that no longer share one quantized input."""
+    group = projection_groups(loaded.model, loaded.variables)[0]
     variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
     node = variables[QUANTIZATION]
     for part in group.path:
         node = node[part]
-    leaf = next(iter(node[group.members[1]]))
-    node[group.members[1]] = {leaf: np.float32(2) * node[group.members[1]][leaf]}
-    assert group not in projection_groups(loaded.model, variables)
+    member = node[group.members[1]]
+    leaf = next(iter(member))
+    node[group.members[1]] = {**member, leaf: np.float32(2) * member[leaf]}
+    return variables
 
 
 def test_the_served_pipeline_quantizes_as_the_loaded_model(case):
@@ -204,7 +198,8 @@ def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call
     """A task over the loaded model's own tree, its query, key and value apart, packs them inside
     its compiled generation, under the one input scale `pending` finds on the loaded scales before
     the call: it draws, bit for bit, what a task over the tree packed beforehand draws. The
-    pipeline's task, packed at its load, generates too."""
+    pipeline's task, packed at its load, generates too. Members whose input scales differ compute
+    each its own input's quantization, served or generating, as the loaded tree computes them apart."""
     directory, loaded, reference = case
     ids = reference["ids"].astype(np.int32)[:1, :4]
     borrowed = loaded.text_generation()
@@ -216,6 +211,19 @@ def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call
     assert drawn.lengths[0] == 3 and np.isfinite(drawn.raw_log_probs).all()
     generated = dew.pipeline(str(directory), dtype=jnp.float32)(ids, 3, key=0).host()
     assert generated.lengths[0] == 3 and np.isfinite(generated.raw_log_probs).all()
+    # Members scaled apart quantize their input each at its own scale (row 4401): the tree prepared to
+    # serve computes the logits the loaded tree's members do apart, bit for bit, and a generation over the
+    # loaded tree draws what one over the prepared tree draws.
+    apart = scaled_apart(loaded)
+    full = reference["ids"].astype(np.int32)
+    np.testing.assert_array_equal(
+        np.asarray(loaded.model.apply(inference_projections(loaded.model, apart), full)),
+        np.asarray(loaded.model.apply(apart, full)))
+    drawn, expected = (task(ids, 3, key=0).host() for task in (
+        borrowed.bind(apart), borrowed.bind(inference_projections(loaded.model, apart))))
+    np.testing.assert_array_equal(drawn.tokens, expected.tokens)
+    np.testing.assert_array_equal(drawn.raw_log_probs, expected.raw_log_probs)
+    assert np.isfinite(drawn.raw_log_probs).all()
 
 
 def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
@@ -233,16 +241,8 @@ def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
     for again, before in zip(jax.tree.leaves(server.variables), jax.tree.leaves(served), strict=True):
         np.testing.assert_array_equal(np.asarray(again), before)
 
-    group = projection_groups(loaded.model, loaded.variables)[0]
-    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
-    node = variables[QUANTIZATION]
-    for part in group.path:
-        node = node[part]
-    member = node[group.members[1]]
-    leaf = next(iter(member))
-    node[group.members[1]] = {**member, leaf: np.float32(2) * member[leaf]}
     with pytest.raises(ValueError):
-        server.reload(variables)
+        server.reload(scaled_apart(loaded))
 
 
 def test_every_entry_method_quantizes_the_sites_it_reaches(case):

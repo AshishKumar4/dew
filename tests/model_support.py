@@ -30,6 +30,16 @@ TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_featur
 its own vocabulary and any field its claim turns on."""
 
 
+def recorded_site(path: Path, site: str, inputs_of, truth_fn):
+    """A summarized recording's `site` at `path` (`tools/recorded_references.record_case`): its draw,
+    recorded reference and truth over its declared seeds, Dew's float64 run `truth_fn` its truth, held to
+    the recording's sketch (`indexed_recording`), and the seed count."""
+    from reference_error import declared_seeds, indexed_recording, recording
+
+    seeds = declared_seeds(path)[site]
+    return (*indexed_recording(recording(path), site, seeds, inputs_of=inputs_of, truth_fn=truth_fn), seeds)
+
+
 def model_draw(model, shape: tuple[int, ...], vocab: int):
     """Check 1's draw for `model` (tests/reference_error.py): a seed's variables and `shape` tokens below
     `vocab`, the variables initialized compiled."""

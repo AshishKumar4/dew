@@ -13,10 +13,12 @@ dropout in training, run by PEFT 0.20.0 on tests/fixtures/hf/llama-tiny.
   training loss (`dew_masks`), torch's `nn.Dropout` with its random bits
   fixed to Dew's: `x * mask / (1 - p)`.
 
-Each case writes PEFT's adapter directory, the fixture's input ids, the
-base and adapted logits, the mean next-token cross entropy and its
-gradient with respect to every adapter factor, and every factor after two
-torch AdamW steps (`ADAMW`) on that loss, in float32 and in float64.
+Each case writes PEFT's adapter directory, and the fixture's input ids and
+the mean next-token cross entropy in float32 and in float64, which the
+residual orders read. tests/test_lora_peft.py runs PEFT itself (`run`, the
+adapted logits, that loss's gradient in every adapter factor, and every
+factor after two torch SGD steps, `SGD`) over drawn token ids, factors
+and masks.
 
 The loss is one number, so one run of it against PEFT's is one rounding draw
 against another. `orders.npz` beside each case holds PEFT's float32 loss's
@@ -48,6 +50,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch_precision import float64, float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]
 LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
@@ -97,8 +100,12 @@ def adapter(case: str, settings: dict, out: Path):
 MASKS = "masks.npz"
 """The dropout case's keep masks, Dew's own (`dew_masks`), which the PEFT run reads."""
 
-ADAMW = {"lr": 1e-3, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 0.01}
-"""The optimizer of the two training steps each case records: torch's AdamW, its decay decoupled."""
+SGD = {"lr": 0.1}
+"""The optimizer of the two training steps a case runs: torch's SGD, at a rate that moves the factors. Not
+AdamW: its second step divides by the root of its second moment, so a gradient entry that cancels
+carries its whole relative error into the step in both runs alike, and the factors it trained did not
+resolve within 512 seeds (armada, 11-06); tests/test_optim.py's
+test_adamw_steps_land_as_near_float64_as_torchs holds Dew's AdamW against torch's."""
 
 
 def branch_dropout(adapter, context) -> str | None:
@@ -309,7 +316,6 @@ def widened(model):
     import copy
 
     from peft import get_peft_model
-    from torch_precision import float64, float64_twin
     from transformers import AutoModelForCausalLM
 
     def build():
@@ -331,7 +337,7 @@ def run(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | No
 
 def run_at(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | None, rate: float) -> dict:
     """The adapted logits, the loss and every factor's gradient of `model` as it stands at `dtype`,
-    and every factor after two AdamW steps from there, which leave `model`'s factors as they were."""
+    and every factor after two SGD steps from there, which leave `model`'s factors as they were."""
     if drawn is None:
         model.eval()
     else:
@@ -353,7 +359,7 @@ def run_at(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] |
     for key, parameter in factors.items():
         arrays[f"grad/{key}{tail}"] = parameter.grad.numpy().copy()
     initial = {key: parameter.detach().clone() for key, parameter in factors.items()}
-    optimizer = torch.optim.AdamW(factors.values(), **ADAMW)
+    optimizer = torch.optim.SGD(factors.values(), **SGD)
     optimizer.step()
     model.zero_grad(set_to_none=True)
     next_token_loss(model, input_ids)[1].backward()
@@ -376,12 +382,8 @@ def main() -> None:
     from reference_releases import require
 
     require("peft")
-    from transformers import AutoModelForCausalLM
 
     input_ids = torch.from_numpy(np.load(LLAMA / "input_ids.npy")).long()
-    with torch.no_grad():
-        base = AutoModelForCausalLM.from_pretrained(LLAMA, dtype=torch.float32)
-        base_logits = base(input_ids).logits.numpy()
     for case, settings in CASES.items():
         model = adapter(case, settings, FIXTURE)
         rate = settings["lora_dropout"]
@@ -389,13 +391,12 @@ def main() -> None:
         if rate:
             with np.load(FIXTURE / case / MASKS) as saved:
                 drawn = {key: saved[key] for key in saved}
-        arrays = {"input_ids": input_ids.numpy(), "base_logits": base_logits}
+        arrays = {"input_ids": input_ids.numpy()}
         for dtype in (torch.float32, torch.float64):
-            arrays.update(run(model, input_ids, dtype, drawn, rate))
+            tail = "_f64" if dtype == torch.float64 else ""
+            arrays[f"loss{tail}"] = run(model, input_ids, dtype, drawn, rate)[f"loss{tail}"]
         np.savez(FIXTURE / case / "reference.npz", **arrays)
-        moved = np.abs(arrays["adapted_logits_f64"] - base_logits).max()
-        print(f"{FIXTURE / case}: logits moved {moved:.3f}, "
-              f"{sum(1 for key in arrays if key.startswith('grad/') and key.endswith('_f64'))} gradients")
+        print(f"{FIXTURE / case}: loss {float(arrays['loss_f64']):.6f}")
 
 
 if __name__ == "__main__":

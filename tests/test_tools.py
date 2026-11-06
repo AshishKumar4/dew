@@ -1953,6 +1953,73 @@ def test_a_mosaic_gpu_kernel_outside_the_launch_point_is_reported(tmp_path):
     assert _linted(tmp_path / "suite", {"tests/test_bundle.py": bundle, "tools/bundle.py": bundle}) == []
 
 
+def test_each_form_of_a_custom_derivative_is_a_seam():
+    """SLOP028's scan (`derivative_seams`) on each form a seam takes, and what makes it: a decorator, one
+    within functools.partial, an assignment of a call, an annotated one, a nested function's, a
+    linear_tangent call within an expression, a surrogate's declaration, assigned or decorating, a
+    declaring builder's, its kind read from its first argument, and a maker's call returned and called
+    at once or passed on (row 4450); a plain function is none."""
+    import ast
+
+    rules = load("lint_derivatives")
+    text = (
+        "import functools\nimport jax\n"
+        "@jax.custom_jvp\ndef a(x): return x\n"
+        "@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))\ndef b(x, n): return x\n"
+        "c = jax.custom_jvp(lambda x: x)\n"
+        "d: Callable = jax.custom_vjp(lambda x: x)\n"
+        "def outer(x):\n    @jax.custom_vjp\n    def inner(x): return x\n    return inner(x)\n"
+        "def tangent(x):\n    return linear_tangent(f, g, h)(x)\n"
+        "e = surrogate(lambda x: x, lambda primals, tangents, value: tangents[0])\n"
+        "@functools.partial(surrogate, derivative=lambda primals, tangents, value: tangents[0])\n"
+        "def f(x): return x\n"
+        "g = declared_derivative(Surrogate(), p, forward, backward)\n"
+        "h = derivatives.declared_tangent(derivatives.Protected(), p, rule, nondiff_argnums=(1,))\n"
+        "@functools.partial(declared_tangent, KernelGlue(), tangent=rule)\n"
+        "def k(x): return x\n"
+        "def returned(x):\n    return surrogate(f, g)(x)\n"
+        "nested = functools.partial(functools.partial(jax.custom_jvp, nondiff_argnums=(1,)))(f)\n"
+        "tangent_partial = functools.partial(linear_tangent(f, g, h))\n"
+        "wrapped = contracted('test_ok')(functools.partial(jax.custom_jvp(p)))\n"
+        "def passed(p):\n    return wrap(jax.custom_jvp(p))\n"
+        "def plain(x): return x\n")
+    found = [seam for seam, _, _, _ in rules.derivative_seams("m.py", ast.parse(text))]
+    assert len(found) == len(set(found)), f"a seam counted twice: {found}"
+    assert {seam: maker for seam, maker, _, _ in rules.derivative_seams("m.py", ast.parse(text))} == {
+        "m.py::a": "custom_jvp", "m.py::b": "custom_vjp", "m.py::c": "custom_jvp", "m.py::d": "custom_vjp",
+        "m.py::outer.inner": "custom_vjp", "m.py::tangent.linear_tangent": "linear_tangent",
+        "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "declared_derivative:Surrogate",
+        "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue",
+        "m.py::returned.surrogate": "surrogate", "m.py::passed.custom_jvp": "custom_jvp",
+        "m.py::nested": "custom_jvp", "m.py::linear_tangent": "linear_tangent", "m.py::wrapped": "custom_jvp"}
+
+
+def test_a_custom_derivative_without_its_contract_is_reported(tmp_path):
+    """SLOP028: in `src/<package>`, a custom derivative with no `contracted(test)` at its seam, or one
+    naming no test function of tests/test_contracts_*.py or one two of those files define, is reported;
+    each form declared with a contract its checkout holds once is not, nor a seam in the tests or the
+    tools."""
+    contracts = "def test_a_seam_holds(): pass\ndef test_twice(): pass\n"
+    seams = ("import functools\nimport jax\n"
+             "from sparx.nn.derivatives import contracted, linear_tangent, surrogate\n"
+             "@jax.custom_jvp\ndef bare(x): return x\n"
+             "@contracted('test_a_missing_one')\n@jax.custom_jvp\ndef unknown(x): return x\n"
+             "@contracted('test_twice')\n@jax.custom_jvp\ndef shared(x): return x\n"
+             "@contracted('test_a_seam_holds')\n@jax.custom_vjp\ndef held(x): return x\n"
+             "wrapped = contracted('test_a_seam_holds')(surrogate(f, g))\n"
+             "plain = surrogate(f, g)\n"
+             "def step(x):\n"
+             "    return contracted('test_a_seam_holds')(linear_tangent(f, g, h))(x)\n"
+             "def loose(x):\n    return linear_tangent(f, g, h)(x)\n")
+    files = {"tests/test_contracts_seams.py": contracts, "src/sparx/nn/seams.py": seams,
+             "tests/test_contracts_more.py": "def test_twice(): pass\n"}
+    assert [found for found in _linted(tmp_path / "source", files) if found[2] == "SLOP028"] == [
+        ("src/sparx/nn/seams.py", line, "SLOP028") for line in (5, 8, 11, 16, 20)]
+    suite = {"tests/test_contracts_seams.py": contracts, "tests/test_seams.py": seams,
+             "tools/seams.py": seams}
+    assert [found for found in _linted(tmp_path / "suite", suite) if found[2] == "SLOP028"] == []
+
+
 def test_an_outer_program_built_outside_the_compile_point_is_reported(tmp_path):
     """SLOP025: a program built as an `OuterProgram` of its own, by a call, a `functools.partial` over it, a
     decorator or an alias of its name, takes no compiler option, so it is reported in any package of

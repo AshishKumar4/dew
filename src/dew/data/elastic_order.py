@@ -13,6 +13,7 @@ import grain.python as pygrain
 
 from dew._records import integer, record
 from dew.batch import Batch
+from dew.data.storage import MIRRORS, carried_mirrors
 
 type Grouping = Callable[[], Callable[[Sequence], Batch]]
 """What makes a worker's group of inputs one element (`lowering._Grouped`): called once a read opens."""
@@ -57,7 +58,8 @@ class _InputOrderIterator(pygrain.DatasetIterator):
         return group
 
     def get_state(self) -> Mapping[str, object]:
-        return {"next_input": self._next}
+        # Beside the next input, what its workers' mirrors did, which their positions carry (row 4339).
+        return {"next_input": self._next, MIRRORS: _workers_mirrors(self._reads)}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self.close()
@@ -67,6 +69,12 @@ class _InputOrderIterator(pygrain.DatasetIterator):
         if self._reads is not None:
             self._reads.close()
             self._reads = None
+
+
+def _workers_mirrors(reads: pygrain.DatasetIterator | None) -> dict[str, dict[str, float]]:
+    """The mirror counters an elastic read's open loading workers' positions carry (`carried_mirrors`),
+    which its own position, its input's alone, keeps beside it for the run's metrics."""
+    return {} if reads is None else carried_mirrors(reads.get_state())
 
 
 class _StreamOrder(pygrain.IterDataset):
@@ -145,7 +153,7 @@ class _StreamOrderIterator(pygrain.DatasetIterator):
         return element
 
     def get_state(self) -> Mapping[str, object]:
-        return {"stream": self._position, "taken": self._taken}
+        return {"stream": self._position, "taken": self._taken, MIRRORS: _workers_mirrors(self._reads)}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self.close()

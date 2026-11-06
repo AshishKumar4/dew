@@ -47,7 +47,7 @@ from dew.nn.kernels import recurrence, short_conv
 
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
-from .derivatives import Protected, declared_derivative
+from .derivatives import Protected, contracted, declared_derivative
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .joined import joined_dense, joins
@@ -449,7 +449,8 @@ def _shard_bias_backward(_, cotangent):
     return (jnp.where(jax.lax.axis_index(SEQUENCE_AXIS) == 0, total, jnp.zeros_like(total)),)
 
 
-_shards_summed = declared_derivative(Protected(), _shard_bias, _shard_bias_forward, _shard_bias_backward)
+_shards_summed = contracted("test_a_split_convs_bias_holds_its_orders")(
+    declared_derivative(Protected(), _shard_bias, _shard_bias_forward, _shard_bias_backward))
 
 
 def sequence_halo(mixed, valid, segments, width: int):

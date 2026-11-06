@@ -35,7 +35,7 @@ from jax.sharding import PartitionSpec as P
 from dew.batch import leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
-from dew.nn.derivatives import KernelGlue, declared_tangent
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
@@ -807,8 +807,9 @@ def _stored_primal_jvp(run, primals, tangents):
                    tuple(directions[index] for index in live))
 
 
-_stored_primal = declared_tangent(KernelGlue(), _stored, _stored_primal_jvp, nondiff_argnums=(0,),
-                                  symbolic_zeros=True)
+_stored_primal = contracted("test_a_stored_expert_primal_holds_every_order")(
+    declared_tangent(KernelGlue(), _stored, _stored_primal_jvp, nondiff_argnums=(0,),
+                     symbolic_zeros=True))
 
 
 def _dispatched[Parameters](

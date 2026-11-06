@@ -413,16 +413,21 @@ def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path
         np.testing.assert_array_equal(np.asarray(held), np.asarray(expected))
 
 
+def saved_twice(directory, keep: Keep):
+    """A run under `keep` with its fit's step 1 and a save of step 2 landed, and the state it saved."""
+    run = trainer(directory, keep=keep)
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    run.checkpoints.save(2, state.replace(step=jnp.int32(2)), None)
+    run.checkpoints.wait()
+    return run, state
+
+
 def test_a_step_cut_at_its_own_save_is_read_as_cut(tmp_path):
     """A step its retention cuts the moment its save lands (no latest kept whole) is read as cut by every
     selector at once: a resume reads the step a rule keeps whole (the fit's own, the run's best by its
     training loss), and a model's reader the newest model, the cut step's."""
-    directory = tmp_path / 'run'
-    run = trainer(directory, keep=Keep(latest=0, every=1, weights_only=True))
-    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    run, _ = saved_twice(tmp_path / 'run', Keep(latest=0, every=1, weights_only=True))
     checkpoints = run.checkpoints
-    checkpoints.save(2, state.replace(step=jnp.int32(2)), None)
-    checkpoints.wait()
     assert {kept.step: kept.kind for kept in checkpoints.kept()} == {1: 'state', 2: 'weights'}
     assert checkpoints.latest == 1
     assert checkpoints.pinned() == 2
@@ -432,21 +437,20 @@ def test_a_step_cut_at_its_own_save_is_read_as_cut(tmp_path):
 
 def test_a_step_whose_projection_was_cut_short_reads_as_projected_and_finishes_later(tmp_path, monkeypatch):
     """A step's dropped payload is recorded beside it before it is deleted, so a process killed between the
-    two leaves a step every reader takes as projected, the deletion finishing at the next save."""
+    two leaves a step every reader takes as projected, the deletion finishing at a later process's first
+    projection. The failed deletion is raised where the run joins it, at its close."""
     directory = tmp_path / 'run'
     keep = Keep(latest=1, every=2, weights_only=True)
-    run = trainer(directory, keep=keep)
-    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    run, state = saved_twice(directory, keep)
     checkpoints = run.checkpoints
-    checkpoints.save(2, state.replace(step=jnp.int32(2)), None)
-    checkpoints.wait()
     import shutil
     rmtree = shutil.rmtree
     monkeypatch.setattr(shutil, 'rmtree', lambda path, *args, **kwargs: (_ for _ in ()).throw(
         OSError('killed before the deletion')))
     checkpoints.save(3, state.replace(step=jnp.int32(3)), None)
+    checkpoints.wait()
     with pytest.raises(OSError):
-        checkpoints.wait()
+        checkpoints.close()
     monkeypatch.setattr(shutil, 'rmtree', rmtree)
     assert 'resume' in _items(directory, 2)
 
@@ -457,9 +461,72 @@ def test_a_step_whose_projection_was_cut_short_reads_as_projected_and_finishes_l
     with pytest.raises(ValueError):
         reopened.restore(run.initial_state(), 2)
     reopened.save(4, state.replace(step=jnp.int32(4)), None)
-    reopened.wait()
+    # The leftovers go behind the run, which its close joins.
+    reopened.close()
     assert _items(directory, 2) == ['model']
-    assert {kept.step: kept.kind for kept in reopened.kept()} == {1: 'state', 2: 'weights', 4: 'state'}
+    kept = Checkpoints(str(directory), keep=keep).kept()
+    assert {entry.step: entry.kind for entry in kept} == {1: 'state', 2: 'weights', 4: 'state'}
+
+
+def test_a_save_returns_while_the_last_cuts_deletion_runs(tmp_path, monkeypatch):
+    """Process 0 deletes a cut step's dropped payload behind the run (row 4453): `wait` and a later save
+    return while it still runs, a save whose retention drops no step the deletion is in never waits on
+    it, and `close` joins it."""
+    import shutil
+    import threading
+
+    directory = tmp_path / 'run'
+    run, state = saved_twice(directory, Keep(latest=1, every=2, weights_only=True))
+    checkpoints = run.checkpoints
+    released, rmtree = threading.Event(), shutil.rmtree
+
+    def held(path, *args, **kwargs):
+        released.wait(60)
+        rmtree(path, *args, **kwargs)
+    monkeypatch.setattr(shutil, 'rmtree', held)
+    checkpoints.save(3, state.replace(step=jnp.int32(3)), None)
+    checkpoints.wait()
+    assert checkpoints._deleting is not None and checkpoints._deleting[0].is_alive()
+    checkpoints.save(4, state.replace(step=jnp.int32(4)), None)
+    assert checkpoints._deleting is not None and checkpoints._deleting[0].is_alive()
+    released.set()
+    checkpoints.close()
+    assert _items(directory, 2) == ['model']
+
+
+def test_a_failed_deletion_is_raised_where_the_run_joins_it_not_inside_a_save(tmp_path, monkeypatch):
+    """A cut step's deletion that failed is raised at the run's next projection, its `wait`, never inside
+    the save whose retention drops that step: Orbax asks the retention after it dispatches the save's
+    write, which a raise there would leave behind (row 4462). That save lands, the steps it drops go,
+    and the run's next wait still cuts the steps it keeps to their readers' items."""
+    import shutil
+
+    directory = tmp_path / 'run'
+    keep = Keep(latest=1, every=3, weights_only=True)
+    run = trainer(directory, keep=keep)
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    checkpoints = run.checkpoints
+    # Step 2 is the run's best by its training loss, kept as its model once step 3 is the latest.
+    checkpoints.save(2, state.replace(step=jnp.int32(2)), None,
+                     ranking=Ranking('train/loss', .5, 'min', weights_only=True))
+    checkpoints.wait()
+    rmtree, failure = shutil.rmtree, OSError('the deletion failed')
+    monkeypatch.setattr(shutil, 'rmtree', lambda path, *args, **kwargs: (_ for _ in ()).throw(failure))
+    checkpoints.save(3, state.replace(step=jnp.int32(3)), None)
+    checkpoints.wait()
+    monkeypatch.setattr(shutil, 'rmtree', rmtree)
+    # Step 4 ranks better, so its retention drops step 2, whose cut's deletion failed, and keeps step 3
+    # for its periodic model alone.
+    checkpoints.save(4, state.replace(step=jnp.int32(4)), None,
+                     ranking=Ranking('train/loss', .1, 'min', weights_only=True))
+    with pytest.raises(OSError) as raised:
+        checkpoints.wait()
+    assert raised.value is failure
+    checkpoints.wait()
+    checkpoints.close()
+    assert {kept.step: kept.kind for kept in Checkpoints(str(directory), keep=keep).kept()} == {
+        3: 'weights', 4: 'state'}
+    assert _items(directory, 3) == ['model']
 
 
 def test_ranked_ties_keep_the_older_steps(tmp_path):
