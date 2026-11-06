@@ -998,11 +998,15 @@ class MosaicGmm(_Mosaic):
         """The dense product `ba` as its swapped tile runs it: its matrix `[width, depth]` the rows, however
         it lies, and its rows a matrix of them, padded to whole column units of every family the target
         runs, read transposed (`mosaic_gpu.gmm`'s `transpose_lhs` where the matrix lies `[depth, width]`).
-        None where it runs as it is: a call with hooks, a paired, FP8 or grouped one, or one whose rows fill
-        a role (`Family.role_rows`)."""
+        None where it runs as it is: a call with hooks, a paired, FP8 or grouped one, one whose rows fill
+        a role (`Family.role_rows`), or one on a family whose products read shared memory themselves (not
+        `operands_in_registers`, warpgroup MMA's: its swapped tile ran 1.606x the unswapped one's time on an
+        H100, geomean of 24 decode rows, NS-SWAP2-h100, where mma.sync's ran 0.48-0.63x on an A100's narrow
+        outputs, NS-SWAP-a100)."""
         families = self._families(ba, target)
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
-        if (not families or not ba.arguments.get('dense') or ba.arguments['hooks'] != NO_HOOKS
+        if (not families or not all(family.operands_in_registers for family in families)
+                or not ba.arguments.get('dense') or ba.arguments['hooks'] != NO_HOOKS
                 or ba.arguments.get('paired') is not None or jnp.dtype(tokens.dtype).itemsize != 2
                 or tokens.shape[0] >= min(family.role_rows for family in families)):
             return None
