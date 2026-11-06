@@ -19,6 +19,7 @@ pins between two correct kernels.
 import functools
 
 import attention_kernels_matrix as kernels_matrix
+import decode_matrix
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -486,3 +487,11 @@ def test_the_attention_kernels_matrix_holds_on_this_tpu():
     step through the public call on par with the reference path at every pair of axis values it serves,
     each cell on its own TPU (`attention_kernels_matrix`)."""
     run_cells(cells_of(kernels_matrix.a_kernels_training_step_is_on_par))
+
+
+@on_tpu
+def test_the_decode_matrix_holds_on_this_tpu():
+    """Decode's check-1 matrix (tests/kernel_matrix.py) on the TPU tier: a paged pool's decode step through
+    jax's Pallas paged attention on par with the reference path at every pair of axis values it serves, each
+    cell on its own TPU (`decode_matrix`)."""
+    run_cells(cells_of(decode_matrix.a_decode_step_is_on_par))
