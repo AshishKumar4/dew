@@ -204,6 +204,23 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
         np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
 
 
+NARROW = {recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8,
+          recurrence.Hooks(decay='scalar'): 8}
+"""Mamba2's step (its rated decay and skip) and the gated delta rule's, over heads of 64 values, and their
+declared seeds."""
+
+
+@pytest.mark.parametrize('hooks', NARROW, ids=str)
+def test_heads_narrower_than_a_warpgroup_step_as_their_float64_form(hooks):
+    """A decode token over value heads 64 wide (Mamba2's, its state 128 keys by 64 values a head), two heads a
+    program's warpgroup (`templates.recurrence.step._block`): its output and state within
+    tests/reference_error.py's rule of the XLA form's fp32 run against its float64 run, each head's gates and
+    skip its own."""
+    assert_as_exact(jax.jit(functools.partial(recurrence.step, hooks)), summed(hooks),
+                    functools.partial(draw, hooks, value_width=64), f'{hooks} 64 wide', seeds=NARROW[hooks],
+                    truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
+
+
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=str)
 def test_a_bf16_state_steps_as_its_float64_form(hooks):
     """A bf16 state is read and stepped in fp32 and written once, rounded stochastically by

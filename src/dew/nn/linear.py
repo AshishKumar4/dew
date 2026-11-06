@@ -44,7 +44,6 @@ from dew.batch import Coordinates, document_ranks, prefix_sum, valid_order
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
-from dew.nn.kernels.templates import scan
 
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
@@ -765,6 +764,13 @@ class DecodeCase:
     fuses: bool
 
 
+def _step_fits(case: DecodeCase) -> bool:
+    """Whether the template's step takes `case`'s state (`templates.recurrence.step.fits`)."""
+    from dew.nn.kernels.templates.recurrence import step
+
+    return step.fits(case.shape, case.fuses)
+
+
 def _template_runs() -> bool:
     """Whether a Mosaic GPU bundle claims the device the token runs on (`mainloop.family_of`)."""
     from dew.nn.kernels.templates.recurrence import mainloop
@@ -779,12 +785,10 @@ _LAUNCH: tuple[Requirement[DecodeCase], ...] = (
                 lambda case: f"the launch holds a state in fp32 or bf16 and computes in fp32, not "
                              f"{case.dtype} (a float64 state keeps its own precision in `step_reference`)",
                 row=INHERENT),
-    Requirement('widths', lambda case: all(width > 0 and width % scan.THREADS == 0
-                                           for width in case.shape[-2:])
-                and not (case.fuses and case.shape[-1] != scan.THREADS),
-                lambda case: "the launch's threads take a value column each of a warpgroup's blocks and the "
-                             "key vectors a warpgroup wide (a fused step's values a block a head), not {} by "
-                             "{}".format(*case.shape[-2:]), row='roadmap: recurrence step widths'),
+    Requirement('widths', lambda case: _step_fits(case),
+                lambda case: "the launch's warpgroup takes a value column a thread over key vectors a "
+                             "warpgroup wide (a fused step's values a warpgroup a head), not {} keys by {} "
+                             "values".format(*case.shape[-2:]), row='roadmap: recurrence step widths'),
 )
 """What the decode launches need of a token's state, the fused step and the step alike, the recurrence
 template's decode step (`templates.recurrence.step`): a GPU a Mosaic GPU bundle claims, a state in fp32 or

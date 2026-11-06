@@ -45,21 +45,25 @@ def _block(value_width: int) -> _Block:
     return _Block(scan.THREADS // columns, columns)
 
 
-def serves(hooks: recurrence.Hooks, operands: recurrence.Step) -> bool:
-    """Whether a token of `hooks` and `operands` steps here: its key dimension the key vectors' (a whole
-    number of a warpgroup's), its value heads a whole number of programs' blocks (`_block`: a power of two
-    narrower than a warpgroup, as many heads as fill one dividing the heads, or a whole number of
-    warpgroups); a conv in its prologue (the fused step's) or a gated norm over a head a warpgroup wide, each
-    reading a head whole; a one-tap conv's taken before any launch (`recurrence.step`)."""
-    rows, value_heads, key_width, value_width = operands.state.shape
-    del rows
-    if hooks.conv is not None and (operands.held is None or operands.held.shape[1] == 0):
-        return False
+def fits(shape: tuple[int, ...], whole: bool) -> bool:
+    """Whether a state of `shape` `[rows, Hv, Dk, Dv]` steps here: its key dimension the key vectors' (a
+    whole number of a warpgroup's), its value heads a whole number of programs' blocks (`_block`: a power of
+    two narrower than a warpgroup, as many heads as fill one dividing the heads, or a whole number of
+    warpgroups); a head a warpgroup wide where a hook reads it `whole` (a conv in the prologue, the fused
+    step's, or a gated norm)."""
+    _, value_heads, key_width, value_width = shape
     block = _block(value_width)
     tiles = (value_width % block.columns == 0 and value_heads % block.heads == 0
              and scan.THREADS % block.columns == 0)
-    whole = (hooks.output is None and hooks.conv is None) or value_width == scan.THREADS
-    return key_width % scan.THREADS == 0 and tiles and whole
+    return key_width % scan.THREADS == 0 and tiles and (not whole or value_width == scan.THREADS)
+
+
+def serves(hooks: recurrence.Hooks, operands: recurrence.Step) -> bool:
+    """Whether a token of `hooks` and `operands` steps here (`fits`); a one-tap conv's is taken before any
+    launch (`recurrence.step`)."""
+    if hooks.conv is not None and (operands.held is None or operands.held.shape[1] == 0):
+        return False
+    return fits(operands.state.shape, hooks.output is not None or hooks.conv is not None)
 
 
 def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: mosaic.Family,
