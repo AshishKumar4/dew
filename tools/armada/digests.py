@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import types
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -433,19 +434,21 @@ def module_name(path: str) -> str:
     return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
 
-def reach(path: str, chain: str, found: set[str], visited: set[tuple[str, str]]) -> None:
+def reach(path: str, chain: str, found: set[str], visited: set[tuple[str, str]],
+          analysed_of: Callable[[str], Analysis | None] = lambda path: analysed(path)) -> None:
     """What reading dotted name `chain` in module `path` reaches, added to `found`: the definition of its
     first name there (`followed.DEFINED`), or its absence, and what that definition reads in turn; through an
     import, the module it binds and what the rest of the chain names there; a package's submodule of the name
     and the rest of the chain in it; through a star import, the name in each module it takes names from; every
-    definition where `chain` is `followed.EVERY`. `visited` holds each module's chains read already."""
-    if (path, chain) in visited or not Path(path).is_file() or (analysis := analysed(path)) is None:
+    definition where `chain` is `followed.EVERY`. `visited` holds each module's chains read already, and
+    `analysed_of` gives a module's analysis (ci.py's reading, which reads each module once)."""
+    if (path, chain) in visited or not Path(path).is_file() or (analysis := analysed_of(path)) is None:
         return
     visited.add((path, chain))
     root, _, rest = chain.partition(".")
     if root == followed.EVERY:
         for name in analysis.defined:
-            reach(path, name, found, visited)
+            reach(path, name, found, visited, analysed_of)
         return
     if root in analysis.defined:
         found.add(f"{path}{followed.CODE}{followed.TOP}{followed.DEFINED}{root}")
@@ -454,11 +457,11 @@ def reach(path: str, chain: str, found: set[str], visited: set[tuple[str, str]])
             taken = module if name is None else f"{module}.{name}"
             if (submodule := module_path(taken)) is not None:
                 if rest:
-                    reach(submodule, rest, found, visited)
+                    reach(submodule, rest, found, visited, analysed_of)
             elif name is not None and (origin := module_path(module)) is not None:
-                reach(origin, f"{name}.{rest}" if rest else name, found, visited)
+                reach(origin, f"{name}.{rest}" if rest else name, found, visited, analysed_of)
         for read in analysis.reads.get(f"{followed.TOP}{followed.DEFINED}{root}", ()):
-            reach(path, read, found, visited)
+            reach(path, read, found, visited, analysed_of)
         return
     if root in analysis.bound or root in BUILTINS:
         # Bound by the top level's own statements, which every importer keys (`followed.TOP`), or a builtin.
@@ -468,10 +471,10 @@ def reach(path: str, chain: str, found: set[str], visited: set[tuple[str, str]])
     found.add(f"{path}{followed.CODE}{followed.TOP}{followed.DEFINED}{root}")
     submodule = module_path(f"{module_name(path)}.{root}") if Path(path).name == "__init__.py" else None
     if submodule is not None and rest:
-        reach(submodule, rest, found, visited)
+        reach(submodule, rest, found, visited, analysed_of)
     for star in analysis.stars:
         if (origin := module_path(star)) is not None:
-            reach(origin, chain, found, visited)
+            reach(origin, chain, found, visited, analysed_of)
 
 
 def compiled(source: bytes, path: str) -> types.CodeType | str:

@@ -133,9 +133,9 @@ def test_what_runs_after_the_last_test_is_every_files_input(ci, tmp_path, monkey
     reruns them all."""
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {"conftest.py": ON_SRC + late,
                                                                      **PASSING},
-                           {"late.py": "VALUE = 1\n"})
+                           {"late.py": "VALUE = int('1')\n"})
     assert reused() == [True, True]
-    (tmp_path / "src/late.py").write_text("VALUE = 2\n")
+    (tmp_path / "src/late.py").write_text("VALUE = int('2')\n")
     assert reused() == [False, False]
 
 
@@ -153,9 +153,9 @@ def test_what_a_session_fixtures_post_finalizer_hook_runs_is_every_files_input(c
     (tmp_path / "conftest.py").write_text(
         ON_SRC + "import pytest\n@pytest.fixture(scope='session', autouse=True)\ndef held():\n    yield\n"
         + hook)
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, PASSING, {"late.py": "VALUE = 1\n"})
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, PASSING, {"late.py": "VALUE = int('1')\n"})
     assert reused() == [True, True]
-    (tmp_path / "src/late.py").write_text("VALUE = 2\n")
+    (tmp_path / "src/late.py").write_text("VALUE = int('2')\n")
     assert reused() == [False, False]
 
 

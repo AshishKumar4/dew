@@ -413,19 +413,34 @@ class Reading:
     first task)."""
 
     parts: dict[str, bytes] = dataclasses.field(default_factory=dict)
-    modules: dict[str, dict[str, bytes] | bytes] = dataclasses.field(default_factory=dict)
+    modules: dict[str, digests.Analysis | bytes] = dataclasses.field(default_factory=dict)
     reaches: dict[tuple[str, str], frozenset[str]] = dataclasses.field(default_factory=dict)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
+    def analysis(self, module: str) -> digests.Analysis | bytes:
+        """Code module `module`'s analysis (digests.py's `analysis`), or its text's digest where it does not
+        compile, read once a reading."""
+        if module not in self.modules:
+            data = Path(module).read_bytes()
+            found = digests.analysis(data, module)
+            self.modules[module] = hashlib.sha256(data).digest() if found is None else found
+        return self.modules[module]
+
+    def analysed(self, module: str) -> digests.Analysis | None:
+        """Code module `module`'s analysis, None where it does not compile (`analysis`)."""
+        found = self.analysis(module)
+        return found if isinstance(found, digests.Analysis) else None
+
     def reached(self, depends: list[str]) -> set[str]:
         """The definition units the code `depends` names reaches (digests.py's `reach`): each executed unit's
-        reads, a test file's or a conftest's every read (followed.py's `WHOLE`), and each definition a run read
-        of a module (followed.py's `Recorded`), with what each reads in turn, each start's once a reading."""
+        reads, a test file's or a conftest's every read (followed.py's `WHOLE`), and each definition a run
+        read of a module (followed.py's `Recorded`), with what each reads in turn, each start's once a
+        reading."""
         found: set[str] = set()
         for name in depends:
             module, _, executed = name.partition(followed.CODE)
             coded = executed and module.endswith(".py") and not module.startswith(HARNESS)
-            if not coded or not Path(module).is_file() or (analysis := digests.analysed(module)) is None:
+            if not coded or not Path(module).is_file() or (analysis := self.analysed(module)) is None:
                 continue
             if executed == followed.WHOLE:
                 chains = set().union(*analysis.reads.values())
@@ -436,7 +451,7 @@ class Reading:
             for chain in chains:
                 if (module, chain) not in self.reaches:
                     reach: set[str] = set()
-                    digests.reach(module, chain, reach, set())
+                    digests.reach(module, chain, reach, set(), self.analysed)
                     self.reaches[(module, chain)] = frozenset(reach)
                 found |= self.reaches[(module, chain)]
         return found
@@ -455,10 +470,8 @@ class Reading:
         module, _, executed = path.partition(followed.CODE)
         if not executed or executed == followed.WHOLE or not Path(module).is_file():
             return contents(path)
-        if module not in self.modules:
-            self.modules[module] = units(module)
-        found = self.modules[module]
-        return found.get(executed, b"missing") if isinstance(found, dict) else found
+        found = self.analysis(module)
+        return found.digests.get(executed, b"missing") if isinstance(found, digests.Analysis) else found
 
 
 def cache_key(common: str, name: str, split: str, depends: list[str],
