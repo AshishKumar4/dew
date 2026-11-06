@@ -8,6 +8,8 @@ one process (`gpu_flow`), each cell its own file's property:
   H100 (test_mosaic_toolkit).
 - The Blackwell grouped matmul holds check 1 on a B200 or a B300, sm100 and sm103 alike
   (test_gemm_blackwell).
+- The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
+  H100 and an A100 (test_contracts_gemm).
 - The toolkit's warpgroup scan walks a linear recurrence forward and reversed, each position's state or
   the one before it, as float64 does (test_warpgroup_scan).
 - GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the reference
@@ -28,7 +30,9 @@ import jax.numpy as jnp
 import join_matrix
 import low_rank_matrix
 import numpy as np
+import nvfp4_matrix
 import pytest
+import test_contracts_gemm as contracts_gemm
 import test_gemm_blackwell as gemm_blackwell
 import test_gemm_template as gemm_template
 import test_grouped_gemm as grouped_gemm
@@ -127,6 +131,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
                                  consumers, lo), "sm90")
           for consumers, lo in ((1, 0), (2, 0), (2, 3))),
         *cells_of(gemm_blackwell.the_blackwell_gmm_holds_check_1_on_blackwell),
+        *(Cell(f"the NVFP4 product's packed kernel holds every order: {name} {edge}",
+               functools.partial(contracts_gemm.test_an_nvfp4_products_kernels_hold_every_order, edge,
+                                 "packed"), name)
+          for name in ("sm90", "sm80") for edge in contracts_gemm.EDGES),
         *(Cell(f"the warpgroup scan walks the recurrence: {positions} positions"
                f"{' reversed' if reverse else ''}{' exclusive' if exclusive else ''}",
                functools.partial(warpgroup_scan.the_scan_walks_the_recurrence_on_this_gpu, positions, reverse,
@@ -148,6 +156,13 @@ def test_the_fused_gemm_matrix_holds_on_this_gpu():
     and consumers fused into the template's stages on par with the same region's stages and product in XLA at
     every pair of axis values the fusion serves, each cell on its own GPU."""
     run_cells(cells_of(fused_matrix.a_fused_gemm_training_step_is_on_par))
+
+
+def test_the_nvfp4_matrix_holds_on_this_gpu():
+    """The NVFP4 product's check-1 matrix (tests/kernel_matrix.py): its training step with the matrix decoded
+    in the mainloop on par with it decoded once a call, at every pair of axis values the packed kernel
+    serves, each cell on its own GPU."""
+    run_cells(cells_of(nvfp4_matrix.an_nvfp4_products_training_step_is_on_par))
 
 
 def test_the_low_rank_matrix_holds_on_this_gpu():
