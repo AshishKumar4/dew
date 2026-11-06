@@ -4,14 +4,19 @@
 
 import dataclasses
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 from flax import linen as nn
 
 from dew import _records
 from dew._model_types import _QWEN35_VISION_TYPES
+from dew.batch import Variables
 from dew.interop.weights import in_params
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
+
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
 
 from .common import (
     ProjectorBase,
@@ -21,11 +26,19 @@ from .common import (
     TowerLayout,
     _vision_section,
     activation_name,
+    block_tensor_name,
     block_tensor_path,
     head_width,
     merger_projector,
 )
-from .vit import LearnedPositions, MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
+from .vit import (
+    LearnedPositions,
+    MergeProjector,
+    VisionTransformer,
+    ViTLayout,
+    native_vit_layouts,
+    translate_vit_weights,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,6 +114,42 @@ def qwen35_vision_path(hf_name: str) -> tuple[str, ...] | None:
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
+
+
+def qwen35_vision_name(path: tuple[str, ...]) -> str:
+    """The Qwen 3.5 vision tensor name of the leaf at `path`, its collection then its trunk path:
+    `qwen35_vision_path`'s inverse, for a trunk built natively rather than read."""
+    trunk = path[1:]
+    named = (next((name for name, known in _QWEN35_VISION_TENSORS.items() if known == trunk), None)
+             or block_tensor_name(trunk, _BLOCK_MAPS))
+    if named is None:
+        raise ValueError(f"unknown vision parameter {path!r}")
+    return named
+
+
+def qwen35_tower_layouts(variables: Variables, tower: TowerBase) -> "tuple[WeightLayout, ...]":
+    """The layouts that write a natively built Qwen 3.5 trunk's tensors back from its collections
+    (`qwen35_vision_name`), its patch map as the `[out, in, time, h, w]` convolution the release stores;
+    a read trunk's come from its reading (`Qwen35Vision.checkpoint`)."""
+    assert isinstance(tower, Qwen35Vision)
+    return native_vit_layouts(variables, qwen35_vision_name, in_params(qwen35_vision_path), (
+        tower.hidden_size, tower.in_channels, tower.temporal_patch_size, tower.patch_size, tower.patch_size))
+
+
+def export_qwen35_vision_config(tower: TowerBase, projector: ProjectorBase) -> Mapping[str, object]:
+    """The vision_config `translate_qwen35_vision_config` and `translate_qwen35_projector_config` read
+    back as `tower` and `projector`: the trunk's fields under the reference's names, and the merger's
+    output width (`out_hidden_size`)."""
+    assert isinstance(tower, Qwen35Vision) and isinstance(projector, Qwen35Projector)
+    return {"model_type": "qwen3_5_vision",
+            **{field: getattr(tower, field) for field in _QWEN35_VISION_FIELDS},
+            "out_hidden_size": projector.out_width}
+
+
+_QWEN35_VISION_FIELDS = ("depth", "hidden_size", "hidden_act", "intermediate_size", "num_heads",
+                         "in_channels", "patch_size", "spatial_merge_size", "temporal_patch_size",
+                         "num_position_embeddings")
+"""The Qwen3_5VisionConfig fields a trunk's geometry is (`Qwen35Vision`)."""
 
 
 def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:

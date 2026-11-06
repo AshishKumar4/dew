@@ -107,6 +107,7 @@ __all__ = [
     "Logits",
     "LogitsFromHidden",
     "Looping",
+    "MediaWrapped",
     "ModelKwarg",
     "OutputTable",
     "Predicting",
@@ -570,6 +571,19 @@ class HiddenStates(Protocol):
 
     def hidden_states(self, tokens: jax.Array, *, train: bool = False,
                       **fields: ModelKwarg) -> jax.Array: ...
+
+
+@runtime_checkable
+class MediaWrapped(Protocol):
+    """A decoder its family's release wraps with media (`dew.nn.multimodal.MultimodalTransformer`): the
+    family it is released as and the language model it wraps, by which a release's layout writes it back
+    (`dew.interop.pretrained.wrapper_writes`)."""
+
+    @property
+    def family(self) -> str: ...
+
+    @property
+    def language_model(self) -> nn.Module: ...
 
 
 @runtime_checkable

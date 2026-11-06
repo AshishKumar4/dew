@@ -28,7 +28,6 @@ from flax.traverse_util import unflatten_dict
 from jax.typing import DTypeLike
 
 from dew import _records
-from dew._model_types import QWEN35_TYPES
 from dew.batch import Variables, unboxed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid, SourceSchedule
@@ -68,27 +67,18 @@ from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
 from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
+from dew.interop.wrappers import wrapper_config, wrapper_model, wrapper_text_fields, wrapper_weights
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_names import group_layers
-from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
 from dew.nn.sharding import boxed, current_boxes, drawn_axes
 from dew.objectives.base import SavedTask
-from dew.registry import (
-    ModelConfig,
-    from_record,
-    projectors,
-    record_fields,
-    resolve_dtype,
-    towers,
-    trust_sources,
-    trusts_source,
-)
+from dew.registry import ModelConfig, from_record, record_fields, trust_sources, trusts_source
 from dew.sampling.text import Sampling, with_ids_of
 
 if TYPE_CHECKING:
@@ -412,13 +402,19 @@ class Pretrained:
                           if isinstance(held, MaskedSettings) else
                           generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
                           else None)
-            bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
-                                                          generation_config=generation), processor=processor)
+            bundle = PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
+                                                  generation_config=generation, processor=processor)
             if isinstance(held, MaskedSettings):
                 bundle = PretrainedMaskedDecoder(
                     decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
                     bundle.model_config, bundle.generation_config,
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
+        elif trained is MultimodalTransformer and not isinstance(held, MaskedSettings):
+            # A wrapper's release in its family's layout (`wrapper_config`), its text generation's.
+            bundle = PretrainedDecoder.from_model(
+                from_record(MultimodalTransformer, model), variables, tokenizer=tokenizer,
+                processor=processor, generation_config=generation_config_of(held.sampling, budget)
+                if isinstance(held, TextSettings) else None)
         elif trained is models["diffusion_gemma"]:
             from dew.interop import diffusion_gemma
             if not isinstance(held, BlockSettings):
@@ -812,7 +808,8 @@ class PretrainedDecoder(Pretrained):
     @classmethod
     def from_model(cls, model: nn.Module, variables: Variables, *,
                    tokenizer: str | decoders.ExportTokenizer | None = None,
-                   generation_config: Mapping[str, object] | None = None) -> PretrainedDecoder:
+                   generation_config: Mapping[str, object] | None = None,
+                   processor: Processor | None = None) -> PretrainedDecoder:
         """Wrap a decoder trained in Dew as a bundle that `save` writes in its family's Hugging Face layout.
 
         The config is derived from the native computation, and every variable
@@ -821,15 +818,31 @@ class PretrainedDecoder(Pretrained):
         weights. Gemma 4 writes frozen or trainable layer-scalar values into HF
         buffers; reloading that layout reproduces the computation, but not which
         scalars were trainable. The config is derived from a `causal_transformer`'s
-        fields, so any other model is refused. A decoder with cross-attention or DEX takes the
+        fields, or a multimodal wrapper's of a family Dew writes (Qwen 3.5's: its
+        text_config, vision_config and placeholder ids, `wrapper_config`), so any
+        other model is refused. A decoder with cross-attention or DEX takes the
         config of the decoder they extend and runs as a bundle, but `save` refuses it.
 
         `tokenizer` is the vocabulary the weights were trained with, as an object or
         by name. `save` writes its files next to the weights, so the directory that
         `Pretrained.load` reads back includes its processor. `generation_config` is
         what generation_config.json records; None uses the native defaults with
-        the exported model's cache mode.
+        the exported model's cache mode. `processor` is the host processing the
+        model's prompts were made with, which `save` writes where no `tokenizer`
+        is given; a wrapper's config states the video placeholder id it marks.
         """
+        from dew.nn.protocols import MediaWrapped
+
+        if isinstance(model, MediaWrapped):
+            wrapper = from_record(MultimodalTransformer, model)
+            # As a decoder's below: the config is the wrapper's the extensions extend.
+            config = wrapper_config(wrapper.with_cross_attention(None).with_dex(None), processor)
+            text = _records.record(config["text_config"], "text_config")
+            built = record_fields(wrapper, MultimodalTransformer)
+            return cls(wrapper, variables, processor, config, None, built,
+                       {**decoders.GENERATION_DEFAULTS, 'use_cache': text.get('use_cache', True)}
+                       if generation_config is None else generation_config,
+                       export_adapter=wrapper_weights, tokenizer=tokenizer)
         try:
             decoder = from_record(CausalTransformer, model)
         except ValueError as error:
@@ -838,7 +851,7 @@ class PretrainedDecoder(Pretrained):
         # extend, and `export` refuses the extensions themselves.
         config = decoders.export_config(decoder.with_cross_attention(None).with_dex(None))
         built = record_fields(decoder, CausalTransformer)
-        return cls(decoder, variables, None, config, None, built,
+        return cls(decoder, variables, processor, config, None, built,
                    {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
                    if generation_config is None else generation_config,
                    export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer,
@@ -1242,82 +1255,6 @@ def pipeline_axes(loaded: PretrainedPipeline) -> dict[tuple[str, ...], tuple[str
     # trains nothing (`DiffusionObjective`), and draws here alone.
     objective = DiffusionObjective(replace(loaded, variables={**loaded.variables, "encoders": encoders}))
     return {**objective.tower_axes(), **objective.denoiser_axes(encoders)}
-
-
-def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str],
-                        fields: Mapping[str, object]) -> None:
-    """Compose a wrapper's attention metadata with each kind's source-declared mixer fields."""
-    kinds = decoder_parts.kinds_of(config).copy()
-    for name in names:
-        kind = kinds.get(name, {})
-        mixer = _records.record(kind.get("mixer") or config.get("mixer")
-                               or {"class": "attention", "fields": {}}, "mixer")
-        held = _records.record(mixer.get("fields", {}), "mixer.fields")
-        kinds[name] = NativeFields(LayerKind, {
-            **kind, "mixer": {**mixer, "fields": {**held, **fields}}})
-    config["kinds"] = kinds
-
-
-def _layer_kinds(config: decoder_parts.DecoderFields) -> tuple[str, ...]:
-    """Each layer kind a decoder's `layer_types` names, once, in order."""
-    return tuple(dict.fromkeys(_records.strings(config["layer_types"], "layer_types")))
-
-
-def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.WrapperFields,
-                         max_seq_len: int | None) -> decoder_parts.DecoderFields:
-    """Read the decoder fields a wrapper's text_config states, with the corrections
-    its own family makes to them.
-
-    Gemma 3 projects its logits without the causal-LM class's final tanh cap
-    and attends its image spans both ways; Gemma 4 does the same on its
-    sliding layers when the config asks for it; Gemma 4 Unified reads each
-    vision block whole on every attention layer; Qwen3.5 splits its rotary
-    into the three mrope sections its wrapper positions rows with.
-    """
-    family = config.get("model_type")
-    text_config = decoders.text_scope(config)
-    text_fields = record["text"].copy()
-    if max_seq_len is not None:
-        text_fields["max_seq_len"] = max_seq_len
-    if family == "gemma3":
-        text_fields["final_logit_softcap"] = None
-        _wrapper_attention(text_fields, _layer_kinds(text_fields), {"bidirectional_images": True})
-    if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
-        _wrapper_attention(text_fields, ("sliding_attention",), {"bidirectional_images": True})
-    # Unified states vision unless its config says otherwise, and reads each vision block whole on
-    # every layer kind, past the sliding window.
-    if family == "gemma4_unified" and text_config.get("use_bidirectional_attention", "vision") == "vision":
-        _wrapper_attention(text_fields, _layer_kinds(text_fields), {"bidirectional_blocks": True})
-    if family in QWEN35_TYPES:
-        rope = _records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
-        sections = rope.get("mrope_section", [11, 11, 10])
-        if (not isinstance(sections, (list, tuple)) or len(sections) != 3
-                or any(type(value) is not int or value < 0 for value in sections)):
-            raise ValueError("mrope_section must contain three nonnegative integer widths")
-        _wrapper_attention(text_fields, ("full_attention",), {"mrope_section": list(sections)})
-    return text_fields
-
-
-def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFields,
-                   language_model: CausalTransformer, *, dtype: str) -> MultimodalTransformer:
-    """Build the wrapper its record describes: the decoder above, the towers and
-    projectors it names, and the placeholder ids its prompts carry."""
-    family = _records.text(config["model_type"], "model_type")
-    text_config = decoders.text_scope(config)
-    audio_record = record["audio"]
-    audio_projector = record["audio_projector"]
-    return MultimodalTransformer(
-        language_model, None if record["tower"] is None else towers.from_record(record["tower"]),
-        None if record["projector"] is None else projectors.from_record(record["projector"]), family,
-        record["image_token_id"], dtype=resolve_dtype(dtype),
-        # A text_config that states a null pad id states none, and the
-        # wrapper's own field defaults to 0 for exactly that.
-        pad_token_id=_records.integer(text_config.get("pad_token_id") or 0, "pad_token_id"),
-        extra_placeholder_ids=record["extra_placeholder_ids"],
-        audio=None if audio_record is None else towers.from_record(audio_record),
-        audio_projection=(None if audio_projector is None
-                          else projectors.from_record(audio_projector)),
-        audio_soft_tokens=record["audio_soft_tokens"])
 
 
 def source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
@@ -1780,7 +1717,7 @@ def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperF
                     checked: decoders.Checked) -> _Built:
     """A multimodal wrapper, `record` its translated config: the decoder under its text_config and the
     towers beside it; `checked` the spellings the load checked equal before decoding."""
-    text_fields = _wrapper_text_fields(config, record, max_seq_len)
+    text_fields = wrapper_text_fields(config, record, max_seq_len)
     parts, language, media = decoders.read_wrapper(tensors, record, param_dtype=param_dtype, lazy=lazy,
                                                    checked=checked)
     for fields in (text_fields, record['text']):
@@ -1788,7 +1725,7 @@ def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperF
     text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
     wrapper: decoder_parts.WrapperFields = {**record, "text": text}
     language_model = from_record(CausalTransformer, wrapper["text"])
-    model = _wrapper_model(config, record, language_model, dtype=dtype)
+    model = wrapper_model(config, record, language_model, dtype=dtype)
     variables = native_variables({**parts, "language_model": decoders.with_constants(
         parts["language_model"], record["text"], directory)})
     # Every component the record builds holds every leaf it computes with: a tower, projector or
