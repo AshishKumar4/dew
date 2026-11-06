@@ -29,7 +29,11 @@ from test_recurrence_chunk import (
     chunk_on,
     draw as hooked_draw,
     formed,
+    hosted,
+    sigmoid,
+    softplus,
     token_by_token,
+    unit,
 )
 
 from dew.nn.kernels import generation, recurrence
@@ -152,32 +156,26 @@ def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_head
     """A draw's operands from `seed`, its keys' and values' dimensions each permuted by an order the seed
     draws (an exact symmetry of every head's recurrence): unit queries and keys, normal values, a log decay a
     head in (-inf, 0) or a key dimension's in (`FLOOR`, 0) (Kimi delta attention's bounded gate), a write
-    gate in (0, 1), a memory entering; the queries, keys, values and write gate in `dtype`."""
-    keys = jax.random.split(jax.random.key(seed), 6)
+    gate in (0, 1), a memory entering; the queries, keys, values and write gate in `dtype` (`hosted`)."""
     rng = np.random.default_rng(seed)
     key_order, value_order = rng.permutation(key_width), rng.permutation(value_width)
-
-    def unit(key):
-        x = jax.random.normal(key, (rows, length, key_heads, key_width))
-        return jnp.take(x / jnp.linalg.norm(x, axis=-1, keepdims=True), key_order, axis=-1)
-
-    query, key = unit(keys[0]), unit(keys[1])
-    value = jax.random.normal(keys[2], (rows, length, value_heads, value_width))
-    decays = (rows, length, value_heads) + ((key_width,) if per_key else ())
-    log_decay = -jax.nn.softplus(jax.random.normal(keys[3], decays) - 1.0)
-    if per_key:
-        log_decay = FLOOR * jax.nn.sigmoid(jax.random.normal(keys[3], decays) - 1.0)
-        log_decay = jnp.take(log_decay, key_order, axis=-1)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, value_heads)))
-    state = 0.3 * jax.random.normal(keys[5], (rows, value_heads, key_width, value_width))
-    state = jnp.take(jnp.take(state, key_order, axis=2), value_order, axis=3)
+    normal = np.random.default_rng([seed, 1]).standard_normal
+    query = unit(normal((rows, length, key_heads, key_width)))[..., key_order]
+    key = unit(normal((rows, length, key_heads, key_width)))[..., key_order]
+    value = normal((rows, length, value_heads, value_width))[..., value_order]
+    decays = normal((rows, length, value_heads) + ((key_width,) if per_key else ()))
+    log_decay = (FLOOR * sigmoid(decays - 1.0))[..., key_order] if per_key else -softplus(decays - 1.0)
+    beta = sigmoid(normal((rows, length, value_heads)))
+    state = (0.3 * normal((rows, value_heads, key_width, value_width)))[:, :, key_order][..., value_order]
     starts = None
     if packed:
-        starts = jnp.zeros((rows, length), bool).at[0, jnp.array([0, 23, 40, 128, length - 10])].set(True)
+        starts = np.zeros((rows, length), bool)
+        starts[0, [0, 23, 40, 128, length - 10]] = True
         if rows > 1:
-            starts = starts.at[1, jnp.array([9, 64])].set(True)
-    return (Chunk(query.astype(dtype), key.astype(dtype), jnp.take(value, value_order, axis=-1).astype(dtype),
-                  log_decay=log_decay, beta=beta.astype(dtype), state=state, starts=starts),)
+            starts[1, [9, 64]] = True
+        starts = jnp.asarray(starts)
+    return (Chunk(hosted(query, dtype), hosted(key, dtype), hosted(value, dtype), log_decay=hosted(log_decay),
+                  beta=hosted(beta, dtype), state=hosted(state), starts=starts),)
 
 
 def template_call(given: Chunk, hooks: recurrence.Hooks):
@@ -651,12 +649,11 @@ def near_two(seed: int) -> Chunk:
     """Unit keys within 1e-3 of one direction over 64 tokens under write gates near two, as queries too, bf16;
     no decay, no memory entering."""
     tokens, width = 64, 64
-    keys = jax.random.split(jax.random.key(53 + seed), 4)
-    base = jax.random.normal(keys[0], (1, 1, 1, width))
-    key = base + 1e-3 * jax.random.normal(keys[1], (1, tokens, 1, width))
-    key = (key / jnp.linalg.norm(key, axis=-1, keepdims=True)).astype(jnp.bfloat16)
-    value = jax.random.normal(keys[2], (1, tokens, 1, width)).astype(jnp.bfloat16)
-    beta = (2.0 * jax.nn.sigmoid(6.0 + jax.random.normal(keys[3], (1, tokens, 1)))).astype(jnp.bfloat16)
+    normal = np.random.default_rng([seed, 53]).standard_normal
+    base = normal((1, 1, 1, width))
+    key = hosted(unit(base + 1e-3 * normal((1, tokens, 1, width))), jnp.bfloat16)
+    value = hosted(normal((1, tokens, 1, width)), jnp.bfloat16)
+    beta = hosted(2.0 * sigmoid(6.0 + normal((1, tokens, 1))), jnp.bfloat16)
     return Chunk(key, key, value, log_decay=jnp.zeros((1, tokens, 1), jnp.float32), beta=beta,
                  state=jnp.zeros((1, 1, width, width), jnp.float32))
 

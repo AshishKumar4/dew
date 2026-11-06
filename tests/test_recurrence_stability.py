@@ -32,7 +32,19 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, widened, with_gradients
-from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, chunk_on, draw, token_by_token
+from test_recurrence_chunk import (
+    CHUNK,
+    KEY_WIDTH,
+    VALUE_HEADS,
+    chunk_on,
+    cotangents as drawn_cotangents,
+    draw,
+    hosted,
+    sigmoid,
+    softplus,
+    token_by_token,
+    unit,
+)
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -55,21 +67,21 @@ few tokens' terms, so a draw averages more of them (at the draw's 70 the gated d
 compared with itself did not resolve within 512 seeds)."""
 
 
-def _decayed(operands: Chunk, hooks, log_decay: float, spread: float, key) -> Chunk:
+def _decayed(operands: Chunk, hooks, log_decay: float, spread: float, rng: np.random.Generator) -> Chunk:
     """`operands` with every token's log decay near `log_decay` (within `spread` of it), formed through
     whichever operand the hooks read it from: the log decay itself, the gate's pre-activation (`gated`'s
     `-exp(log_a) softplus(gate + bias)`), or a rated decay's write gate (`rate * dt`)."""
-    noise = spread * jax.random.uniform(key, operands.value.shape[:3], minval=-1.0, maxval=1.0)
-    return _formed(operands, hooks, jnp.minimum(log_decay + noise, 0.0))
+    noise = spread * rng.uniform(-1.0, 1.0, operands.value.shape[:3])
+    return _formed(operands, hooks, hosted(np.minimum(log_decay + noise, 0.0)))
 
 
-def _steep(operands: Chunk, hooks, key) -> Chunk:
+def _steep(operands: Chunk, hooks, rng: np.random.Generator) -> Chunk:
     """Every eighth token's log decay steep, -1000, so the memory passes it all but nothing, and every other
     token's mild, near -0.02: after a steep token a chunk's prefix is large and each mild pair's decay a
     difference of two nearly equal prefixes (a decay a key dimension clipped to its floor, `stressed`)."""
-    steep = jnp.arange(operands.value.shape[1]) % 8 == 0
-    mild = -0.02 + 0.01 * jax.random.uniform(key, operands.value.shape[:3], minval=-1.0, maxval=1.0)
-    return _formed(operands, hooks, jnp.where(steep[None, :, None], -1000.0, mild))
+    steep = np.arange(operands.value.shape[1]) % 8 == 0
+    mild = -0.02 + 0.01 * rng.uniform(-1.0, 1.0, operands.value.shape[:3])
+    return _formed(operands, hooks, hosted(np.where(steep[None, :, None], -1000.0, mild)))
 
 
 def _formed(operands: Chunk, hooks, target) -> Chunk:
@@ -94,12 +106,11 @@ def _formed(operands: Chunk, hooks, target) -> Chunk:
     return dataclasses.replace(operands, log_decay=target)
 
 
-def _aligned(operands: Chunk, hooks, key) -> Chunk:
+def _aligned(operands: Chunk, hooks, rng: np.random.Generator) -> Chunk:
     """Every token's key within 1e-3 of one unit vector a row and head, the write gate near one: 0.999,
     or its logit where the gates form it through a sigmoid; a write the hooks take as one stays so."""
-    base = operands.key[:, :1]
-    keys = base + 1e-3 * jax.random.normal(key, operands.key.shape)
-    keys = keys / jnp.linalg.norm(keys, axis=-1, keepdims=True)
+    base = np.asarray(operands.key, np.float64)[:, :1]
+    keys = hosted(unit(base + 1e-3 * rng.standard_normal(operands.key.shape)))
     near_one = np.log(0.999 / 0.001) if hooks.gates is not None else 0.999
     beta = None if operands.beta is None else jnp.full_like(operands.beta, near_one)
     return dataclasses.replace(operands, key=keys, beta=beta)
@@ -114,42 +125,42 @@ def _reset(operands: Chunk) -> Chunk:
                                starts=jnp.broadcast_to(jnp.asarray(starts), operands.value.shape[:2]))
 
 
-def _saturated(operands: Chunk, hooks, key) -> Chunk:
+def _saturated(operands: Chunk, hooks, rng: np.random.Generator) -> Chunk:
     """Write gates at the extremes: sigmoid's pre-activation at plus and minus 30 a token at random, or
     Mamba's step through softplus at 30 (a rated decay's 30 e-folds with the rate at -1)."""
-    signs = jnp.where(jax.random.bernoulli(key, 0.5, operands.value.shape[:3]), 30.0, -30.0)
+    signs = np.where(rng.random(operands.value.shape[:3]) < 0.5, 30.0, -30.0)
     if hooks.rated:
         return dataclasses.replace(operands, beta=jnp.full_like(operands.beta, 30.0),
                                    rate=-jnp.ones_like(operands.rate))
     if hooks.gates is not None:
-        return dataclasses.replace(operands, beta=signs)
+        return dataclasses.replace(operands, beta=hosted(signs))
     if operands.beta is None:
         return operands
-    return dataclasses.replace(operands, beta=jax.nn.sigmoid(signs))
+    return dataclasses.replace(operands, beta=hosted(sigmoid(signs)))
 
 
-def _spread(operands: Chunk, hooks, key) -> Chunk:
+def _spread(operands: Chunk, hooks, rng: np.random.Generator) -> Chunk:
     """Write gates spread through the transition: sigmoid's pre-activation uniform on [-20, 20], so the
     fp32 reference keeps gates near 0 and 1 apart, or Mamba's step through softplus of the same."""
-    raw = jax.random.uniform(key, operands.value.shape[:3], minval=-20.0, maxval=20.0)
+    raw = rng.uniform(-20.0, 20.0, operands.value.shape[:3])
     if hooks.rated:
-        return dataclasses.replace(operands, beta=jax.nn.softplus(raw))
+        return dataclasses.replace(operands, beta=hosted(softplus(raw)))
     if hooks.gates is not None:
-        return dataclasses.replace(operands, beta=raw)
-    return dataclasses.replace(operands, beta=jax.nn.sigmoid(raw))
+        return dataclasses.replace(operands, beta=hosted(raw))
+    return dataclasses.replace(operands, beta=hosted(sigmoid(raw)))
 
 
 REGIMES = {
-    'decays near one': (lambda operands, hooks, key: _decayed(operands, hooks, -1e-4, 5e-5, key), None),
-    'decays near zero': (lambda operands, hooks, key: _decayed(operands, hooks, -30.0, 5.0, key), NEAR_ZERO),
-    'the decay bound': (lambda operands, hooks, key: _decayed(operands, hooks, -5.0, 0.0, key), None),
-    'aligned keys': (lambda operands, hooks, key: _aligned(operands, hooks, key), None),
-    'resets on chunk edges': (lambda operands, hooks, key: _reset(operands), None),
-    'saturated gates': (lambda operands, hooks, key: _saturated(operands, hooks, key), None),
-    'spread gates': (lambda operands, hooks, key: _spread(operands, hooks, key), None),
-    'a long sequence': (lambda operands, hooks, key: _decayed(operands, hooks, -1e-3, 5e-4, key), LONG),
-    'a fading memory': (lambda operands, hooks, key: _decayed(operands, hooks, -0.1, 0.05, key), LONG),
-    'steep then mild': (lambda operands, hooks, key: _steep(operands, hooks, key), None),
+    'decays near one': (lambda operands, hooks, rng: _decayed(operands, hooks, -1e-4, 5e-5, rng), None),
+    'decays near zero': (lambda operands, hooks, rng: _decayed(operands, hooks, -30.0, 5.0, rng), NEAR_ZERO),
+    'the decay bound': (lambda operands, hooks, rng: _decayed(operands, hooks, -5.0, 0.0, rng), None),
+    'aligned keys': (lambda operands, hooks, rng: _aligned(operands, hooks, rng), None),
+    'resets on chunk edges': (lambda operands, hooks, rng: _reset(operands), None),
+    'saturated gates': (lambda operands, hooks, rng: _saturated(operands, hooks, rng), None),
+    'spread gates': (lambda operands, hooks, rng: _spread(operands, hooks, rng), None),
+    'a long sequence': (lambda operands, hooks, rng: _decayed(operands, hooks, -1e-3, 5e-4, rng), LONG),
+    'a fading memory': (lambda operands, hooks, rng: _decayed(operands, hooks, -0.1, 0.05, rng), LONG),
+    'steep then mild': (lambda operands, hooks, rng: _steep(operands, hooks, rng), None),
 }
 """Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
 
@@ -283,7 +294,7 @@ def stressed(hooks, regime: str, seed: int, *, value_heads: int = VALUE_HEADS) -
     transform, length = REGIMES[regime]
     (operands,) = draw(hooks, packed=False, seed=seed, value_heads=value_heads,
                        **({} if length is None else {'length': length}))
-    operands = transform(operands, hooks, jax.random.fold_in(jax.random.key(seed), 99))
+    operands = transform(operands, hooks, np.random.default_rng([seed, 99]))
     if hooks.decay == 'vector':
         operands = dataclasses.replace(operands, log_decay=jnp.maximum(operands.log_decay, floor(regime)))
     return (operands,)
@@ -295,11 +306,7 @@ def cotangents(hooks, regime: str, seed: int) -> tuple[Chunk, tuple[jax.Array, j
     and final memory `[B, Hv, Dk, Dv]` from the seed's own key, which the float64 truth takes as they
     are."""
     (operands,) = stressed(hooks, regime, seed, value_heads=RATED_HEADS if hooks.rated else GRADIENT_HEADS)
-    batch, length, heads, width = operands.value.shape
-    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
-    return dataclasses.replace(operands, starts=None), (
-        jax.random.normal(keys[0], (batch, length, heads, width)),
-        jax.random.normal(keys[1], (batch, heads, operands.key.shape[-1], width)))
+    return dataclasses.replace(operands, starts=None), drawn_cotangents(operands, seed)
 
 
 GRADIENT_HEADS = 16

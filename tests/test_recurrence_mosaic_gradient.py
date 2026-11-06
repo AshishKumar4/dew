@@ -16,7 +16,7 @@ import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
 from reference_error import with_gradients
-from test_recurrence_chunk import chunk_on
+from test_recurrence_chunk import chunk_on, cotangents
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -59,12 +59,9 @@ GRADIENT_GRID = [(case, dtype, remat) for remat in REMATS for dtype in DTYPES fo
 def drawn(dtype, seed: int, **shape) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
     """A draw's operands (`draw`), its documents' starts taken out (`restarted` puts them back: they are not
     differentiable), and cotangents of its output, in `dtype`, and its final memory, fp32, from the seed's
-    own key."""
+    own stream (`cotangents`)."""
     (operands,) = draw(dtype, seed, **shape)
-    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
-    return dataclasses.replace(operands, starts=None), (
-        jax.random.normal(keys[0], operands.value.shape).astype(dtype),
-        jax.random.normal(keys[1], operands.state.shape))
+    return dataclasses.replace(operands, starts=None), cotangents(operands, seed)
 
 
 def restarted(fn, case: str):

@@ -88,12 +88,13 @@ def ruled(rule: Callable[[Chunk], tuple], arrays: dict, leaves: tuple[str, ...] 
 
 def _with_cotangents(draw: Callable[[int], Chunk]) -> Callable[[int], tuple[Chunk, tuple]]:
     """A draw of operands with cotangents of their output, in its dtype, and their final memory, fp32,
-    from the seed's own key (test_recurrence_mosaic_gradient's `drawn`)."""
+    from the seed's own stream (`test_recurrence_chunk.cotangents`, test_recurrence_mosaic_gradient's
+    `drawn`'s)."""
+    from test_recurrence_chunk import cotangents
+
     def drawn(seed: int):
         operands = draw(seed)
-        keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
-        return operands, (jax.random.normal(keys[0], operands.value.shape).astype(operands.value.dtype),
-                          jax.random.normal(keys[1], operands.state.shape))
+        return operands, cotangents(operands, seed)
 
     return drawn
 
