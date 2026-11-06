@@ -44,6 +44,7 @@ from .kernels import gemm, generation
 from .precision import (
     at_least_fp32,
     capped_logits,
+    divided,
     exact_float32,
     float32_dot_general,
     float32_einsum,
@@ -85,12 +86,20 @@ EXPERT_BIAS = 'e_score_correction_bias'
 WEIGHT_SUM_EPSILON = 1e-20
 
 
+def expert_softmax(logits: jax.Array) -> jax.Array:
+    """The softmax over the experts, the last axis, each exponential over their sum by IEEE division
+    (`divided`), as the references' routers divide: `jax.nn.softmax`'s division by the broadcast sum XLA
+    takes as a product with its rounded reciprocal, a second rounding."""
+    shifted = jnp.exp(logits - jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True)))
+    return divided(shifted, jnp.sum(shifted, axis=-1, keepdims=True))
+
+
 def renormalized_softmax(logits: jax.Array, indices: jax.Array) -> jax.Array:
     """The softmax's probabilities at `indices` renormalized to sum to one,
     `[..., k]`: the softmax of the chosen logits alone. Renormalizing the full
     softmax's probabilities instead underflows where a replayed choice
     (`chosen_experts`) sits far below the router's own, to 0 / 0."""
-    return jax.nn.softmax(jnp.take_along_axis(logits, indices, axis=-1), axis=-1)
+    return expert_softmax(jnp.take_along_axis(logits, indices, axis=-1))
 
 
 def chosen_experts(selected: Callable[[], jax.Array], shape: tuple[int, ...],
@@ -426,7 +435,7 @@ class Router(nn.Module):
 
     def _activated(self, logits):
         if self.score_function == 'softmax':
-            return jax.nn.softmax(logits, axis=-1)
+            return expert_softmax(logits)
         if self.score_function == 'sqrtsoftplus':
             return sqrt_softplus(logits)
         return jax.nn.sigmoid(logits)

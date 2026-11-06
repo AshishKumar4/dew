@@ -236,14 +236,13 @@ def dew(dtype, inputs) -> dict:
         {}, images) for name, norm in (("dinov2", None), ("zscore", 0.6))}
 
 
-@pytest.mark.parametrize("leaf", OUTPUTS)
-def test_the_encoders_input_is_repas_and_irepas_dinov2_preprocessing(leaf):
+def test_the_encoders_input_is_repas_and_irepas_dinov2_preprocessing():
     """256-pixel images to an encoder of 224: REPA's `preprocess_raw_image` ("dinov2") and iREPA's
     `DINOv2Encoder.preprocess`, which agree (the reference checks), /255, ImageNet's normalization and
     torch's bicubic resize, and under iREPA its `spatial_zscore` (gamma 0.6) of the features, on par with
     the published code over drawn images (check 1, tools/repa_worker.py's recording)."""
     assert_as_exact_as_recorded(FIXTURE, "repa-preprocessing", PREPROCESSED_SEEDS, draw, dew,
-                                f"DINOv2 preprocessing {leaf}", leaves=(leaf,))
+                                "DINOv2 preprocessing")
 
 
 def test_a_layer_the_model_lacks_is_refused():
