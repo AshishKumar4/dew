@@ -1977,7 +1977,11 @@ def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """`merge` by the derived forms (`_stated`'s), over the states' rows whatever their leading axes
     (`_rows`): a guarded state's sums joined as the template joins them (`_guarded_merge`) over the
     factors the forms evaluate, through the forms' merge hook."""
-    flat, other = _rows(first), _rows(second)
+    # A state's maximum at the forms' floor (`LEAST`): a residual's row of no key gives it back -inf
+    # (`finished_rows`), the forms' arithmetic NaN from it, as `resumed` takes an initial state's.
+    floored = [state._replace(m=jnp.maximum(state.m, LEAST).astype(state.m.dtype))
+               for state in (first, second)]
+    flat, other = _rows(floored[0]), _rows(floored[1])
     key, shapes = _stated(spec, flat)
     fields = _slotted(key, shapes)
     joined: list[Partial] = []
