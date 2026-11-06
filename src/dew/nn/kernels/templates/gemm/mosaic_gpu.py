@@ -434,7 +434,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
               else {'matrix': (rhs_block, rhs_dtype)})
     blocks = {'rows': (lhs_block, dtype), **matrix,
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
-              **({'row_scales': ((1, block_m), jnp.float32)} if step_scaled else {}),
+              **(_scale_blocks(block_m, block_n) if step_scaled else {}),
               # An MX product's rows' and matrix's E8M0 scales, a step's tiles of each (`gmm`'s `mx_scales`).
               **({'a_scales': ((block_m // 128, block_k // 128, 32, 16), jnp.float8_e8m0fnu),
                   'b_scales': ((block_n // 128, block_k // 128, 32, 16), jnp.float8_e8m0fnu)}
@@ -452,6 +452,17 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                        tuple((part, jnp.dtype(out)) for out in dtypes))
 
 
+def _scale_blocks(block_m: int, block_n: int) -> dict:
+    """Dew: a step-scaled call's scale streams (`gmm`'s and `tgmm`'s `step_scales`): a step's row of its
+    rows' scales at the tile's rows and of its columns' at the tile's columns (a row of the matrix's coarser
+    ones holding the tile's, `_column_scales`), unswizzled (`SCALE_SWIZZLES`)."""
+    return {'row_scales': ((1, block_m), jnp.float32), 'column_scales': ((1, block_n), jnp.float32)}
+
+
+SCALE_SWIZZLES = {'row_scales': mosaic.UNSWIZZLED, 'column_scales': mosaic.UNSWIZZLED}
+"""Dew: the scale streams' swizzles (`_scale_blocks`): rows of fp32 a step, read a row at a time."""
+
+
 def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dtype,
                      prologue_axes: tuple, prologue_dtypes: tuple, out_dtype, k_major: bool = False,
                      step_scaled: bool = False) -> Allocations:
@@ -464,7 +475,7 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
     # A rows-contiguous call's blocks lie depth (or width) by rows, the rows their minor axis.
     blocks = {'ring_0': ((block_m, block_k) if k_major else (block_k, block_m), lhs_dtype),
               'ring_1': ((block_n, block_k) if k_major else (block_k, block_n), rhs_dtype),
-              **({'row_scales': ((1, block_m), jnp.float32)} if step_scaled else {}),
+              **(_scale_blocks(block_m, block_n) if step_scaled else {}),
               **{f'ring_{2 + position}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i])
                  for position, i in enumerate(stepped)}}
     held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
@@ -570,8 +581,10 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     extent = (m if family_of(tiles, lhs.dtype).bounded_loads and not interpret
               else -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile))
     lhs = rows_extended(lhs, row_axis, extent)
+    per = 1
     if step_scales is not None:
-        step_scales = (rows_extended(rows_padded(step_scales[0], 1, TMA_ROWS), 1, extent), step_scales[1])
+        column_scales, per = _column_scales(step_scales[1], n, block_n)
+        step_scales = (rows_extended(rows_padded(step_scales[0], 1, TMA_ROWS), 1, extent), column_scales)
     prologue_operands = sides_extended(prologue_operands, prologue_axes, extent)
     epilogue_operands = sides_extended(epilogue_operands, epilogue_axes, extent)
     # A dense product's last wave balanced over the programs (`tail.balanced`), as the kernel gradient's: one
@@ -591,7 +604,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
                          sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired, tail=tail,
                          exact_sums=exact_sums, transpose_lhs=transpose_lhs, scales=scales,
-                         step_scales=step_scales, mx_scales=mx_scales)
+                         step_scales=step_scales, scale_per=per, mx_scales=mx_scales)
     if tiles.splits > 1:
         # Each run's fp32 partial, summed in its order (the same sums every call) and rounded once.
         total = functools.reduce(jnp.add, tuple(outs[0]))
@@ -659,13 +672,14 @@ def launched(family: mosaic.Family, multiprocessors: int, walked: int, tail: tai
 
 
 @tuning.lowered_once(('shape', 'tiles', 'transpose_rhs', 'dtypes', 'multiprocessors', 'interpret', 'hooks',
-                      'dense', 'tail', 'exact_sums', 'transpose_lhs'))
+                      'dense', 'tail', 'exact_sums', 'transpose_lhs', 'scale_per'))
 def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple, dense: bool = False,
                   transpose_lhs: bool = False,
                   paired: jax.Array | None = None, tail: tail_of.Tail | None = None,
                   exact_sums: bool = False, scales: jax.Array | None = None,
-                  step_scales: tuple | None = None, mx_scales: tuple | None = None) -> tuple:
+                  step_scales: tuple | None = None, scale_per: int = 1,
+                  mx_scales: tuple | None = None) -> tuple:
     """Dew: `gmm` on its instruction family's bundle (`family_of`): `tiles.warpgroups` consumer roles, each
     its share of the rows by all the columns, one MMA a step (two: CUTLASS's cooperative split, 2-7% faster
     on every H100 scoreboard row than halving the columns), persistent over the tiles in a planar snake,
@@ -717,11 +731,11 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             shape=(m, steps, g), grid=grid, tiles=tiles, dense=dense, tail=tail, programs=multiprocessors,
             transpose_rhs=transpose_rhs, axes_of={i: prologue_axes[i] for i in stepped},
             interpreted=bool(interpret), transpose_lhs=transpose_lhs, traced=exact_sums,
-            row_scales_gmem=scale_gmems[0], mx_gmems=mx_gmems)
+            scale_gmems=scale_gmems, scale_per=scale_per, mx_gmems=mx_gmems)
 
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, decoded, *, streams):
             def issue(wg, tile, walk, *, active):
-                group, row_start, ni, start, *_ = tile
+                _, row_start, ni, start, *_ = tile
                 if tail is not None and not active:
                     return None  # past its program's range: another program walks the tile
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
@@ -736,8 +750,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          matrices=matrices, interpret=bool(interpret), first=start,
                                          transpose_lhs=transpose_lhs,
                                          decoded=decoded[0].at[wg] if decoded else None,
-                                         scaling=_gmm_scaling(scale_gmems[1], (n, g, block_n, share),
-                                                              group, ni, wg, start),
+                                         scaling=_gmm_scaling(step_scales is not None, scale_per, block_n,
+                                                              ni, pl.ds(wg * share, share)),
                                          block_scaled=mx_scales is not None)
                 # The unrouted rows, and a slot past the last tile, multiply nothing: zeros.
                 return _walked_products(family, walk, step, part, len(matrices), exact_sums)
@@ -760,8 +774,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(blocks, tiles.stages, consumers,
                                              multicast=matrices if pair > 1 else (),
-                                             swizzles={'row_scales': mosaic.UNSWIZZLED}
-                                             if step_scales is not None else None))
+                                             swizzles=SCALE_SWIZZLES if step_scales is not None
+                                             else None))
 
     # A depth split's outputs: each run's partial, a `[m, n]` slice of its own.
     out_type = tuple(jax.ShapeDtypeStruct((m, n) if tiles.splits == 1 else (tiles.splits, m, n), dtype)
@@ -769,9 +783,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     # A balanced tail's partials: each program's, a consumer's share of a tile each.
     workspace = () if tail is None else (
         jax.ShapeDtypeStruct((multiprocessors, consumers, *part), jnp.float32),)
-    operands = (lhs, rhs) if paired is None else (lhs, rhs, paired)
-    operands = operands if scales is None else (*operands, scales)
-    operands = (*operands, *(step_scales or ()), *(mx_scales or ()))
+    operands = (lhs, rhs, *(() if paired is None else (paired,)), *(() if scales is None else (scales,)),
+                *(step_scales or ()), *(mx_scales or ()))
     kernel = family.kernel(body, out_type=(*out_type, *workspace),
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
@@ -852,7 +865,7 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
                    grid: tuple, tiles: Tiles, dense: bool, tail: tail_of.Tail | None, programs: int,
                    transpose_rhs: bool, axes_of: dict, interpreted: bool,
                    transpose_lhs: bool = False, splits: int = 1, traced: bool = False,
-                   row_scales_gmem=None, mx_gmems=None) -> tuple:
+                   scale_gmems=None, scale_per: int = 1, mx_gmems=None) -> tuple:
     """Dew: `gmm`'s tile at the persistent walk's `index` (`mosaic.Family.persist`'s schedule): whether it
     multiplies any row, its steps, its streams' views (`_gmm_views`) and its group, row block and column
     tile: its pair's but for this multiprocessor's row block; in a balanced tail, the first of the tile's
@@ -886,7 +899,8 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
     row_start = pl.multiple_of(group.block_start + mosaic.cluster_index(pair) * tiles.block_m, TMA_ROWS)
     views = _gmm_views(lhs_gmem, matrix_gmems, prologue_gmems, group, row_start, ni, tiles=tiles,
                        groups=groups, transpose_rhs=transpose_rhs, axes_of=axes_of, first=start,
-                       transpose_lhs=transpose_lhs, row_scales_gmem=row_scales_gmem, mx_gmems=mx_gmems)
+                       transpose_lhs=transpose_lhs, scale_gmems=scale_gmems, scale_per=scale_per,
+                       mx_gmems=mx_gmems)
     active = (count > 0 if tail is not None else jnp.ones((), jnp.bool_) if dense
               else (group.group_id < groups) & (group.actual_size > 0))
     return active, count, views, (group, row_start, ni, start, gathered, index[-1], split)
@@ -942,8 +956,8 @@ def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs
 
 def _scale_refs(refs: tuple, step_scales, mx_scales) -> tuple:
     """Dew: a `gmm` kernel's step scales' and MX scales' references (each two, leading the rest, or None
-    where the call has none: `(None, None)` and None), and the references after them."""
-    step, refs = (refs[:2], refs[2:]) if step_scales is not None else ((None, None), refs)
+    where the call has none), and the references after them."""
+    step, refs = (refs[:2], refs[2:]) if step_scales is not None else (None, refs)
     mx, refs = (refs[:2], refs[2:]) if mx_scales is not None else (None, refs)
     return (step, mx), refs
 
@@ -1019,56 +1033,72 @@ def _dtypes_of(arrays) -> tuple:
 
 def _scales_apart(refs: list, scaled: bool) -> tuple:
     """Dew: a step-scaled kernel's two scale references, which lead its side operands' (`tgmm`'s
-    `step_scales`), and the rest; none and all of them where it has no step scales."""
-    return (tuple(refs[:2]), refs[2:]) if scaled else ((None, None), refs)
+    `step_scales`), and the rest; None and all of them where it has no step scales."""
+    return (tuple(refs[:2]), refs[2:]) if scaled else (None, refs)
 
 
-def _tgmm_scaling(column_scales, column, mine_depth, first) -> Callable | None:
-    """Dew: a step-scaled `tgmm` tile's `_step_scaling` (`tgmm`'s `step_scales`): its depth rows' scales
-    streamed, its columns' from `column` read from global memory, a scale a column, a step's from `first`;
-    none where the call has no step scales (`column_scales` None)."""
-    if column_scales is None:
+def _column_scales(column_scales: jax.Array, width: int, block_n: int) -> tuple[jax.Array, int]:
+    """Dew: a step-scaled `gmm`'s column scales (`[groups, depth / 128, width / per]`) as its stream reads
+    them (`_scale_blocks`), and the columns `per` a scale covers: as they are where each covers a column;
+    else each step's row of them padded to whole `block_n`s, a block of which holds a tile's scale
+    (`_column_block`)."""
+    per = width // column_scales.shape[-1]
+    if per == 1:
+        return column_scales, per
+    return jnp.pad(column_scales, ((0, 0), (0, 0), (0, -column_scales.shape[-1] % block_n))), per
+
+
+def _column_block(column_tile, block_n: int, per: int) -> tuple:
+    """Dew: the block of a step's column scales `column_tile`'s stream reads (`_column_scales`'), and where
+    in it the tile's own scale lies: its columns' block, at its first, where a scale covers a column; else
+    the block holding the tile's one scale, `per` columns (whole tiles of them) a scale."""
+    if per == 1:
+        return column_tile, 0
+    scale = column_tile * block_n // per
+    return scale // block_n, scale % block_n
+
+
+def _tgmm_scaling(scaled: bool, mine_depth) -> Callable | None:
+    """Dew: a step-scaled `tgmm` tile's `_step_scaling` (`tgmm`'s `step_scales`), its depth rows' and its
+    columns' scales streamed, a scale a column; none where the call has no step scales."""
+    if not scaled:
         return None
-    return functools.partial(_step_scaling, column_scales=column_scales, per=1, matrix=None, column=column,
-                             mine_rows=mine_depth, first=first)
+    return functools.partial(_step_scaling, per=1, offset=0, mine_rows=mine_depth)
 
 
-def _gmm_scaling(column_scales, extents: tuple, group, column_tile, wg, start) -> Callable | None:
-    """Dew: a step-scaled `gmm` tile's `_step_scaling` for consumer `wg` (its share of the rows), none where
-    the call has no step scales (`column_scales` None): the tile's matrix's column scales from its column
-    tile, a scale every `width / scales` columns. `extents` are the width, the groups, `block_n` and a
-    consumer's share of the rows."""
-    if column_scales is None:
+def _gmm_scaling(scaled: bool, per: int, block_n: int, column_tile, mine_rows) -> Callable | None:
+    """Dew: a step-scaled `gmm` tile's `_step_scaling` for a consumer's share of the rows (`mine_rows`), its
+    matrix's column scales a scale every `per` columns (`_column_block`); none where the call has no step
+    scales."""
+    if not scaled:
         return None
-    width, groups, block_n, share = extents
-    return functools.partial(_step_scaling, column_scales=column_scales, per=width // column_scales.shape[-1],
-                             matrix=_matrix_of(group, groups), column=column_tile * block_n,
-                             mine_rows=pl.ds(wg * share, share), first=start)
+    return functools.partial(_step_scaling, per=per, offset=_column_block(column_tile, block_n, per)[1],
+                             mine_rows=mine_rows)
 
 
-def _step_scaling(index, slots, *, column_scales, per: int, matrix, column, mine_rows, first) -> Callable:
-    """Dew: a step-scaled `gmm` step's multiplier of its exactly summed partial (`gmm`'s `step_scales`,
-    `mosaic.Issuer.summed_apart`'s `scale`): this consumer's rows' scales at step `first + index` (the step's
-    row of them streamed, `row_scales`) times the tile's matrix's scales of its columns from `column`
-    (`column_scales`, read from global memory, a scale every `per` columns: one a column, or one the tile's
-    whole columns, `per` a multiple of its width)."""
+def _step_scaling(index, slots, *, per: int, offset, mine_rows) -> Callable:
+    """Dew: a step-scaled walk's multiplier of a step's exactly summed partial (`gmm`'s and `tgmm`'s
+    `step_scales`, `mosaic.Issuer.summed_apart`'s `scale`): this consumer's rows' scales (the step's row of
+    them streamed, `row_scales`) times the tile's columns' (streamed beside them, `column_scales`: the step's
+    row of them at the tile's columns, one a column, or the block holding the tile's one, at `offset`, `per`
+    columns a scale), in shared memory as the step's operands land: read from global memory, a step's
+    scaling waited on its load (M-NS-13: the blockwise FP8 template 1.24-1.42x its unscaled exact product).
+    `index` is the step's, whose scales are its streams'."""
+    del index
     rows = slots['row_scales'].at[0, mine_rows][...]
-    step = first + index
+    column_scales = slots['column_scales']
 
     def scale(start: int, columns: int):
         if per == 1:
-            # A kernel gradient's are its rows' blocks' alone (`tgmm`'s `step_scales`), no matrix's.
-            at = (step,) if matrix is None else (matrix, step)
-            scales = column_scales.at[(*at, pl.ds(column + start, columns))][...]
-            return rows[:, None] * scales[None, :]
-        return rows[:, None] * column_scales[matrix, step, lax.div(column + start, per)]
+            return rows[:, None] * column_scales.at[0, pl.ds(start, columns)][...][None, :]
+        return rows[:, None] * column_scales[0, offset]
 
     return scale
 
 
 def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, column_tile, *, tiles: Tiles,
                groups: int, transpose_rhs: bool, axes_of: dict, first=0, transpose_lhs: bool = False,
-               row_scales_gmem=None, mx_gmems=None) -> dict:
+               scale_gmems=None, scale_per: int = 1, mx_gmems=None) -> dict:
     """Dew: `gmm`'s streams' views at a tile (`group`'s rows from `row_start`, `column_tile`;
     `mosaic.viewed`): its rows', its group's matrix's (each of `matrix_gmems`, by stream: a paired
     product's two), and each prologue side operand's that follows the depth (`axes_of`, by operand), step
@@ -1091,9 +1121,13 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
         words = matrices.pop('matrix')[0]
         matrices |= {f'words_{q}': (words, lambda j, q=q: (0, groups_of * (first + j) + q))
                      for q in range(groups_of)}
-    if row_scales_gmem is not None:
-        # Its rows' scales, a step's row of them (`step_scales`, `[depth / 128, rows]`).
-        matrices['row_scales'] = (row_scales_gmem.at[:, rows], lambda j: (first + j, 0))
+    if scale_gmems is not None:
+        # Its rows' scales and its matrix's columns', a step's row of each (`step_scales`): the rows' at the
+        # tile's rows, the columns' at its columns or the block of them holding its one (`_column_block`).
+        row_scales, column_scales = scale_gmems
+        block, _ = _column_block(column_tile, tiles.block_n, scale_per)
+        matrices['row_scales'] = (row_scales.at[:, rows], lambda j: (first + j, 0))
+        matrices['column_scales'] = (column_scales.at[matrix], lambda j: (first + j, block))
     if mx_gmems is not None:
         # An MX product's scale tiles at step j: its rows' 128-row tiles from the tile's (whole tiles: a
         # group's rows are whole 128s) and its matrix's at the tile's columns.
@@ -1377,14 +1411,14 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
             _tgmm_scheduled, groups=(sizes_gmem, blocks_gmem, block_starts_gmem, order_gmem),
             operands=(lhs_gmem, rhs_gmem, side_gmems), tail=tail, programs=multiprocessors, grid=grid,
             tiles=tiles, stepped=stepped, prologue_axes=prologue_axes, interpreted=bool(interpret),
-            k_major=k_major, row_scales_gmem=scale_gmems[0])
+            k_major=k_major, scale_gmems=scale_gmems)
 
         def scope(fixed_smems, fixed_barriers, *meeting, streams):
             halves = meeting[0] if meeting else None
             names = tuple(allocations.blocks)
 
             def issue(wg, tile, walk, *, active):
-                g_i, depth, columns, steps, start, *_ = tile
+                g_i, depth, _, steps, start, *_ = tile
                 if tail is not None and not active:
                     return None  # past its program's range: another program walks the tile
                 mine_depth = pl.ds(wg * depth_half, depth_half)
@@ -1414,7 +1448,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                           halves)
 
                 # An empty group's tile reads none and stores zeros.
-                scaling = _tgmm_scaling(scale_gmems[1], columns.start, mine_depth, start + first)
+                scaling = _tgmm_scaling(step_scales is not None, mine_depth)
                 return _walked_gradient(family, walk, staged_at, part, exact_sums, bool(interpret), scaling,
                                         family.summed_window(tiles.block_k))
 
@@ -1437,8 +1471,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
-                                             swizzles={'row_scales': mosaic.UNSWIZZLED}
-                                             if step_scales is not None else None))
+                                             swizzles=SCALE_SWIZZLES if step_scales is not None else None))
 
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
     # A balanced tail's partials: each program's, a consumer's share of a tile each.
@@ -1456,7 +1489,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
 def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail | None, programs: int,
                     grid: tuple, tiles: Tiles, stepped: tuple, prologue_axes: tuple,
-                    interpreted: bool, k_major: bool = False, row_scales_gmem=None) -> tuple:
+                    interpreted: bool, k_major: bool = False, scale_gmems=None) -> tuple:
     """Dew: a streamed kernel gradient's tile at the persistent walk's `index` (`mosaic.Family.persist`'s
     schedule): whether its program walks any of its rows, how many steps, its streams' views (step `j` its
     group's `j`-th row block from the program's first, at the tile's depth and columns), and its group,
@@ -1483,8 +1516,10 @@ def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail
     views = ({'ring_0': (lhs_gmem.at[depth], rows_block), 'ring_1': (rhs_gmem.at[columns], rows_block)}
              if k_major else
              {'ring_0': (lhs_gmem.at[:, depth], row_block), 'ring_1': (rhs_gmem.at[:, columns], row_block)})
-    if row_scales_gmem is not None:
-        views['row_scales'] = (row_scales_gmem.at[:, depth], row_block)
+    if scale_gmems is not None:
+        # Its depth rows' scales and its columns', a step's row of each at the tile's (`step_scales`).
+        views['row_scales'] = (scale_gmems[0].at[:, depth], row_block)
+        views['column_scales'] = (scale_gmems[1].at[:, columns], row_block)
     views = {**views,
              **{f'ring_{2 + position}': (
                  side_gmems[i].at[axes.placed(prologue_axes[i], {'rows': axes.WHOLE}, depth)],
