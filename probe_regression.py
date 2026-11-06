@@ -9,7 +9,7 @@ sys.path.insert(0, "tests")
 import pyarrow as pa
 import pyarrow.parquet as pq
 from dew.data import Loading
-from dew.data.cache import Cache, _Writer
+from dew.data.cache import Cache, _Writer, _CachedIterator
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
@@ -21,6 +21,9 @@ original = lowering._Build.sharded
 changed = textwrap.dedent(inspect.getsource(original)).replace(
     "dropping = (cache is not None and not transparent) or any(_drops(stage) for stage in ran)",
     "dropping = any(_drops(stage) for stage in ran)",
+).replace(
+    "ran = (*stages[:cache], *local) if transparent else local",
+    "ran = (*stages[:cache], *local) if cache is not None else local",
 )
 assert changed != textwrap.dedent(inspect.getsource(original))
 namespace = {}
@@ -55,11 +58,19 @@ def trace_process(self, row_id, ordinal, value, transform):
     return result
 _Writer.process = trace_process
 
-for case, implementation in (
-    ("original", original),
-    ("without_blanket_cache_dropping", without_blanket_cache_dropping),
+original_close = _CachedIterator.close
+def finish_complete_shard_on_close(self):
+    if self.writer is not None and self.ordinal is not None and self.ordinal == self.shard.rows:
+        self.writer.finish()
+    original_close(self)
+
+for case, implementation, finish_on_close in (
+    ("original", original, False),
+    ("without_blanket_cache_dropping", without_blanket_cache_dropping, False),
+    ("correct_bound_and_finish_complete_shard", without_blanket_cache_dropping, True),
 ):
     lowering._Build.sharded = implementation
+    _CachedIterator.close = finish_complete_shard_on_close if finish_on_close else original_close
     tmp = Path(tempfile.mkdtemp())
     root = tmp / "store"
     root.mkdir()
@@ -91,10 +102,10 @@ for case, implementation in (
         )
         try:
             target(Path(tempfile.mkdtemp()))
-        except AssertionError:
-            assert case == "original"
-            print("TARGET_TEST", case, "RED", flush=True)
+        except AssertionError as error:
+            assert case != "correct_bound_and_finish_complete_shard"
+            print("TARGET_TEST", case, "RED", error.__traceback__.tb_next.tb_lineno, flush=True)
         else:
-            assert case != "original"
+            assert case == "correct_bound_and_finish_complete_shard"
             print("TARGET_TEST", case, "GREEN", flush=True)
 print("RED_GREEN_CONFIRMED", flush=True)
