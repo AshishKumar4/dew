@@ -718,30 +718,32 @@ Their draws are fp32, whose delta-rule and per-key calls the template refuses (a
 per-key decay's factoring): the cases that run check 1 are the fp32 calls without the delta rule, a decay a
 head or none, natively (template numerics review 2026-10-26, P2-3: the other forms, the delta rule without
 a decay, the gated linear attentions, the rated scan in bf16 and the formed hooks, hold no float64
-evidence on the template; their reference arm in a 16-bit call is open). Under the run's own forms: a call
-without the delta rule takes three parts under either (`recurrence_chunk.chunk_rounding`)."""
+evidence on the template; their reference arm in a 16-bit call is open)."""
 
 
 def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
-    """The chunked op on the mainloop under the run's own forms (the fast forms), each hook combination it
-    takes, its output and final memory on par with the recurrence a token at a time's from float64 over the
-    site's declared draws (check 1), as test_recurrence_chunk holds the portable math; a call the template
-    refuses (a launch's registers past a thread's) is checked refused, its arithmetic the forward check's
-    (`on_the_mainloop`). The draws are fp32; a call without the delta rule, whose bar is the portable math,
-    takes its products in three bf16 parts, an fp32 product's accuracy, under the fast forms too
-    (`recurrence_chunk.chunk_rounding`): in two (`mainloop.FAST_PARTS`, the delta rule's, held to recorded
-    fla-core, `the_mosaic_forward_is_as_exact_as_its_reference`) this check put the template 42 to 83 times
-    the fp32 recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu,
-    gpuflow-a), and row 184's write gate cell 30 to 69 times the portable math's on every leaf."""
+    """The chunked op on the mainloop, each hook combination it takes, its output and final memory on par with
+    the recurrence a token at a time's from float64 over the site's declared draws (check 1), as
+    test_recurrence_chunk holds the portable math; a call the template refuses (a launch's registers past a
+    thread's) is checked refused, its arithmetic the forward check's (`on_the_mainloop`). The draws are fp32:
+    a form whose bar is the portable math (no delta rule, no rated decay) runs under the run's own forms, its
+    products in three bf16 parts under the fast forms too (`recurrence_chunk.chunk_rounding`; in two, row
+    184's write gate cell was 30 to 69 times the portable math's distance on every leaf); a form with a port
+    (the delta rule's fla, the rated scan's mamba_ssm) under the accurate forms, its fast forms' two parts
+    (`mainloop.FAST_PARTS`) held to the recorded port instead
+    (`the_mosaic_forward_is_as_exact_as_its_reference`): there they put the template 42 to 83 times the
+    fp32 recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a)."""
+    forms = 'accurate' if hooks.delta or hooks.rated else generation.numerics().forms
     (sample,) = hooked_draw(hooks, packed, 0)
-    if not taken(sample, hooks):
+    if not formed(forms, taken)(sample, hooks):
         with pytest.raises(REFUSED):
-            jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
+            formed(forms, jax.eval_shape)(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
         return
-    dew = jax.jit(functools.partial(chunk_on, 'mosaic_gpu', hooks))
+    dew = jax.jit(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
-                    f'the mosaic forward, {hooks} packed={packed}', seeds=HOOK_SEEDS[hooks, packed])
+                    f'the mosaic forward, {hooks} packed={packed} under the {forms} forms',
+                    seeds=HOOK_SEEDS[hooks, packed])
 
 
 HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
