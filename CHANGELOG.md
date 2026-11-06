@@ -46,8 +46,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post59: Mosaic GPU's SMEM transfer check answers once per target, so one
-  process compiling a kernel for two GPUs reads each one's answer, and `lax.ragged_all_to_all`'s gradient keeps
+- Dew requires its JAX build 0.12.0.1.post60: Mosaic GPU's SMEM transfer check answers once per target, so one
+  process compiling a kernel for two GPUs reads each one's answer (post60: a kernel body still unplaced reads the
+  device's), and `lax.ragged_all_to_all`'s gradient keeps
   its `axis_index_groups`; post58: a `custom_jvp` whose primal makes and frees its own refs
   discharges them inside a `jit`, its custom JVP kept (a grouped paged-KV decode's in-place kernel); post57: a
   `checkify` check reaching a partially manual `shard_map` partitions its errors over the manual axes alone;
@@ -67,7 +68,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   refused its kernels; and a Pallas kernel's body may call a call primitive, a span Dew marks, which lowers as
   its body on every Pallas backend and is checked within its body under `checkify`; and a step compiled ahead
   for an A100 on a host with no GPU lowers its Mosaic kernels for the A100, not an H100 (docs/installation.md
-  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post59
+  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post60
   changed Python alone, and their native code is the same.
 - FlashAttention's wrapper, `dew-flash-attn` 0.3.7, folds a mapped kernel call (`jax.vmap` over attention,
   as a batched model's step maps it) into the kernel's own batch, one launch a group of calls within its
