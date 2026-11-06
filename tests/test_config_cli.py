@@ -19,7 +19,7 @@ from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
 from dew.data import Files
 from dew.data.dataset import Loader
-from dew.diffusion.presets import Flow
+from dew.diffusion.presets import CosineContinuous, CosineGeneral, Exp, Flow
 from dew.optim import ScheduleSpec
 from dew.registry import import_path, record_argument
 from dew.sampling import Heun
@@ -297,6 +297,27 @@ def test_a_run_config_round_trips_through_its_json_record(name):
     assert RunConfig.read(record).record() == record
     preset = "lm" if name == "lm" else "images"
     assert record["fields"]["data"]["stages"][-1]["pipe"] == f"dew.data.presets:{preset}"
+
+
+@pytest.mark.parametrize("args, preset", [
+    (["preset:cosine_general", "--preset.kappa", "2.0"], CosineGeneral(kappa=2.0)),
+    (["preset:cosine_continuous", "--preset.min-snr-gamma", "5.0"], CosineContinuous(min_snr_gamma=5.0)),
+    (["preset:exp", "--preset.timesteps", "500"], Exp(timesteps=500)),
+], ids=["cosine_general", "cosine_continuous", "exp"])
+def test_flaxdiffs_schedules_are_a_runs_presets_rebuilt_from_its_record(args, preset):
+    """FlaxDiff's tangent grid, continuous cosine and exponential table are a configured run's presets
+    (row 1928): named on the command line, their arguments in the run's record, and the run read back
+    from that record builds the process they describe, the tangent grid at its kappa running from
+    sigma_min / kappa^2 to sigma_max / kappa^2, FlaxDiff's `sigma_range`."""
+    config = dataclasses.replace(parse(DiffusionRunConfig, [*args, "--trainer.steps", "5"]),
+                                 data=images_of("tfds://oxford_flowers102", 32))
+    record = json.loads(json.dumps(config.record()))
+    rebuilt = RunConfig.read(record)
+
+    assert config.preset == rebuilt.preset == preset
+    schedule = rebuilt.preset().schedule
+    if isinstance(preset, CosineGeneral):
+        assert schedule.sigma_range == pytest.approx((0.02 / 4, 80.0 / 4))
 
 
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
