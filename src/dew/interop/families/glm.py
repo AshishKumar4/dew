@@ -22,6 +22,7 @@ from dew.interop.decoder_config import (
     flag,
     integer,
     partial_rope_part,
+    single_depth,
 )
 from dew.interop.decoder_parts import (
     DECODER_ROUTES,
@@ -69,6 +70,7 @@ def _glm5_refusals(hf_config: Mapping[str, object], used: set[str], layers: int)
             refuse(name, f'GLM-5.3-Flash requires {expected!r}')
     if hf_config.get('qk_head_dim', hf_config['qk_nope_head_dim']) != hf_config['qk_nope_head_dim']:
         refuse('qk_head_dim', 'NoPE uses qk_nope_head_dim alone')
+    used.add('num_key_value_heads')
     kv_heads = hf_config.get('num_key_value_heads')
     if kv_heads is not None and kv_heads != hf_config['num_attention_heads']:
         refuse('num_key_value_heads', 'the reference requires one KV head per query head')
@@ -188,7 +190,6 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str],
             hc_sinkhorn_iters=record_int(hf_config, "hc_sinkhorn_iters"), head="mean"),
         swiglu_limit=record_float(hf_config, "swiglu_limit"),
         index_share_for_mtp_iteration=bool(hf_config.get("index_share_for_mtp_iteration", False)),
-        num_nextn_predict_layers=_single_depth(hf_config),
     )
     # Native NextN uses normalized trunk states and a plain NoPE depth, not
     # trunk mHC (SGLang 97c6978 deepseek_nextn.py:177-187,247-298). The
@@ -201,13 +202,6 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str],
                  'swiglu_limit', 'index_kpool_always_select_tail', 'output_router_logits',
                  'router_aux_loss_coef', 'index_share_for_mtp_iteration', 'indexer_rope_interleave'))
     return config
-
-
-def _single_depth(hf_config: Mapping[str, object]) -> int:
-    depth = hf_config.get('num_nextn_predict_layers', 0)
-    if type(depth) is not int or depth not in (0, 1):
-        refuse('num_nextn_predict_layers', 'only a single shared prediction layer is supported')
-    return depth
 
 
 def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -253,7 +247,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         'rope_theta': None, 'rope_scaling': None, 'rope_parameters': None,
         'mhc': True, 'mla_use_nope': True, 'index_kpool_compress': True,
         'hc_mult': hc.hc_mult, 'hc_eps': hc.hc_eps, 'hc_sinkhorn_iters': hc.hc_sinkhorn_iters,
-        'swiglu_limit': model.swiglu_limit, 'num_nextn_predict_layers': model.num_nextn_predict_layers,
+        'swiglu_limit': model.swiglu_limit,
         'indexer_types': ['full'] * model.num_layers,
         'index_share_for_mtp_iteration': model.index_share_for_mtp_iteration,
         'linear_attn_config': {
@@ -397,7 +391,7 @@ GLM_MOE_DSA_CONFIG = ConfigLayout(
 
 
 GLM5_NEXT_CONFIG = ConfigLayout(
-    ConfigPart(_glm5_pattern, lambda model: {}),
+    ConfigPart(_glm5_pattern, lambda model: {}), single_depth('num_nextn_predict_layers'),
     # Its heads are as wide as its NoPE latent's, and each attends its own key/value head; it rotates
     # nothing (`_glm5_next_config` states the base the reference never turns).
     decoder_layout(DecoderSpelling(reads=frozenset({'sliding_window', 'attention_bias'}),

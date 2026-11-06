@@ -510,7 +510,7 @@ def _v2_kinds(hf_config: Mapping[str, object], used: set[str], record: DecoderFi
     if ((hf_config.get('scoring_func') or 'sigmoid', hf_config.get('topk_method') or 'noaux_tc')
             != ('sigmoid', 'noaux_tc')):
         refuse('scoring_func and topk_method', "MiMoV2MoEGate implements sigmoid scores under 'noaux_tc'")
-    window = hf_config.get('sliding_window')
+    window = hf_config.get('sliding_window') or hf_config.get('sliding_window_size')
     factor = _records.number(record['partial_rotary_factor'] or 1.0, 'partial_rotary_factor')
     local_theta = _records.number(hf_config.get('swa_rope_theta') or record['rope_theta'], 'swa_rope_theta')
     kinds = kinds_of(record)
@@ -588,6 +588,7 @@ MIMO_V2_CONFIG = ConfigLayout(
     # MiMoV2Config's geometry and its defaults (configuration_mimo_v2.py:156-197): the epsilon under its
     # own name, the window under either.
     decoder_layout(DecoderSpelling(reads=frozenset({'sliding_window', 'attention_bias'}),
+                                   windows=('sliding_window', 'sliding_window_size'),
                                    keys={'rms_norm_eps': 'layernorm_epsilon'},
                                    defaults={'layernorm_epsilon': 1e-6, 'num_attention_heads': 32}),
                    rope=plain_rope_part(default_factor=1.0, reference='MiMoV2RotaryEmbedding')),
@@ -603,6 +604,4 @@ MIMO_V2 = DecoderFamily(
     packed=_FUSED_QKV, packs=lambda config: config.get('attention_projection_layout') == 'fused_qkv',
     preserve_source_layout=True, release_code=SourceCode(*release_pins.MIMO_V2),
     wrapper=_mimo_v2_wrapper, wrapper_folders=(_AUDIO_TOKENIZER,),
-    # MiMoV2Config reads its window under either name.
-    aliases={'sliding_window_size': 'sliding_window'},
 )

@@ -516,7 +516,7 @@ class ConfigField[Model]:
         used.update(keys)
         key = next((key for key in keys if key in hf_config), None)
         if key is None and self.default is REQUIRED:
-            raise KeyError(self.key)
+            raise ValueError(f"{self.key} is required: the config states none, and its class has no default")
         stated = configured(self.default if key is None else hf_config[key])
         record[self.field] = stated if self.parse is None else self.parse(stated, key or self.key)
         return record
@@ -587,7 +587,8 @@ class Nested[Model, Part]:
 class Restated[Model]:
     """`layout` under a family's own keys: each shared key read from and written to the family's
     (`own`, shared to own), and the keys a family's class fixes (`fixed`, shared to value) read at their
-    value and written as nothing (DeepSeek's one key/value head of its latent attention)."""
+    value whatever a config states of them (a family's own part refuses a statement its reference would
+    not compute) and written as nothing (DeepSeek's one key/value head of its latent attention)."""
 
     layout: ConfigLayout[Model]
     own: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
@@ -608,6 +609,8 @@ class Restated[Model]:
         read: set[str] = set()
         record = self.layout.read(view, read, record)
         used.update(self.own.get(key, key) for key in read if key not in self.fixed)
+        # The class computes a fixed key's value whatever a config states of it.
+        used.update(key for key in self.fixed if key in hf_config)
         return record
 
     def write(self, model: Model) -> Mapping[str, object]:

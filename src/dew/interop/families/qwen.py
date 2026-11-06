@@ -24,6 +24,7 @@ from dew.interop.decoder_config import (
     kind_mixer,
     kinds_among,
     partial_rope_part,
+    single_depth,
 )
 from dew.interop.decoder_parts import (
     DECODER_ROUTES,
@@ -44,7 +45,7 @@ from dew.interop.decoder_parts import (
     specified_layer_types,
     spelled,
 )
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Routes, Table, constant, unread
+from dew.interop.layouts import ConfigLayout, ConfigPart, Routes, Table, constant, unread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
@@ -107,7 +108,7 @@ def _even_layer_window() -> ConfigPart[CausalTransformer]:
         used.update(('use_sliding_window', 'max_window_layers'))
         enabled = config_flag(hf_config, 'use_sliding_window', default=False)
         first = _records.integer(hf_config.get('max_window_layers', 28), 'max_window_layers')
-        layers = _records.integer(record['num_layers'], 'num_layers')
+        layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
         types = specified_layer_types(hf_config, used, tuple(
             'sliding_attention' if enabled and index % 2 == 0 and index < first else 'full_attention'
             for index in range(layers)))
@@ -217,15 +218,6 @@ def qwen_hybrid(*, fixed: Mapping[str, Configured] | None = None, spelling: Deco
                     'a hybrid Qwen layer is linear_attention or full_attention'),
         kind_mixer('linear_attention', 'gated_delta_net', GatedDeltaNetMixer, delta_net, fixed=fixed),
         constant('scale_offset', value=True), constant('output_gate', value=True))
-
-
-def single_depth(key: str) -> ConfigField[CausalTransformer]:
-    """An optional single shared-embedding prediction depth under `key`, both ways."""
-    def parse(value: Configured, key: str) -> int:
-        if type(value) is not int or value not in (0, 1):
-            refuse(key, 'only a single shared prediction layer is supported')
-        return value
-    return ConfigField(key, 'num_nextn_predict_layers', 0, parse=parse)
 
 
 QWEN35_TEXT = ConfigLayout(

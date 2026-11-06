@@ -139,9 +139,18 @@ def _read_context(hf_config: Mapping[str, object], used: set[str], record: Decod
 
 def _read_widths(hf_config: Mapping[str, object], used: set[str], record: DecoderFields
                  ) -> DecoderFields:
+    """The feed-forward's width where the config states one; a class whose width is its own key's (Falcon's
+    `ffn_hidden_size`, four times the model's where unstated) sets it in a part of its own."""
     used.add('intermediate_size')
-    record['mlp_features'] = _mlp_features(hf_config)
+    if 'intermediate_size' in hf_config:
+        record['mlp_features'] = _mlp_features(hf_config)
     return record
+
+
+def _widths_written(model: CausalTransformer) -> Mapping[str, object]:
+    """The feed-forward's width, or one a layer as Gemma 3n's config writes them (`_mlp_features`)."""
+    widths = model.mlp_features
+    return {'intermediate_size': list(widths) if isinstance(widths, tuple) else model.hidden_features}
 
 
 DECODER_FIELDS: ConfigLayout[CausalTransformer] = ConfigLayout(
@@ -151,7 +160,7 @@ DECODER_FIELDS: ConfigLayout[CausalTransformer] = ConfigLayout(
     ConfigField('num_attention_heads', 'num_heads', parse=_records.integer),
     ConfigPart(_read_heads, lambda model: {'num_key_value_heads': model.kv_heads,
                                            'head_dim': model.features_per_head}),
-    ConfigPart(_read_widths, lambda model: {'intermediate_size': model.hidden_features}),
+    ConfigPart(_read_widths, _widths_written),
     ConfigPart(_read_context,
                lambda model: {'max_position_embeddings': model.context_length or model.max_seq_len}),
     ConfigField('rms_norm_eps', 'norm_eps', 1e-6, parse=_records.number),
@@ -250,6 +259,9 @@ class DecoderSpelling:
     tie_embeddings: bool = False
     qk_norm: bool = False
     scale_after_cast: bool = True
+    windows: tuple[str, ...] = ('sliding_window',)
+    """The keys the class states its window under, the first a config states (not null) read, written as
+    the first (MiMoV2Config's `sliding_window`, else its `sliding_window_size`)."""
     kinds: Mapping[str, str] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
     """The class's own names for the shared layer kinds, own to shared, its layer_types read and written
     under them (Qwen4ExpTextConfig's `qwen_sparse_attention`, its full attention)."""
@@ -276,9 +288,10 @@ def _layer_kinds(spelling: DecoderSpelling) -> ConfigPart[CausalTransformer]:
             layers = _records.integer(record['num_layers'], 'num_layers')
             cycle = pattern or ('full_attention',)
             layer_types = tuple(cycle[index % len(cycle)] for index in range(layers))
-        stated = hf_config.get('sliding_window') if 'sliding_window' in reads else None
+        stated = (next((hf_config[key] for key in spelling.windows if hf_config.get(key) is not None), None)
+                  if 'sliding_window' in reads else None)
         if 'sliding_window' in reads:
-            used.add('sliding_window')
+            used.update(spelling.windows)
         if 'sliding_attention' in layer_types and stated is None:
             refuse("layer_types with sliding attention",
                    "sliding_window is not set, so the window has no size")
@@ -369,9 +382,10 @@ def partial_rope_part(spelling: RopeSpelling = PLAIN_SPELLING, *, default_factor
                       whole_is_none: bool = False) -> ConfigPart[CausalTransformer]:
     """A rotary turning a fraction of each head, both ways: read as its one record states it
     (`read_partial_rope`: the record's fraction, else the config's flat one, else `default_factor`, the
-    class's), the ramp over the rotated width under the `kind` convention; written as its base, ramp and
-    fraction (`written_ropes`). `layout` names the record's fields that place the rotated pairs without
-    changing their angles (Qwen 3.5's mRoPE sections), which its wrapper reads (`hf_decoders`)."""
+    class's), the ramp over the rotated width under the `kind` convention; written as that one record, its
+    base and fraction beside its ramp, as transformers 5 writes a config. `layout` names the record's
+    fields that place the rotated pairs without changing their angles (Qwen 3.5's mRoPE sections), which
+    its wrapper reads (`hf_decoders`)."""
     def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
         ropes, factor = read_partial_rope(hf_config, used, spelling, default_factor=default_factor,
                                           layout=layout)
@@ -382,7 +396,11 @@ def partial_rope_part(spelling: RopeSpelling = PLAIN_SPELLING, *, default_factor
         return record
 
     def write(model: CausalTransformer) -> Mapping[str, object]:
-        return {**written_ropes(model, spelling), 'partial_rotary_factor': model.partial_rotary_factor or 1.0}
+        ramp = model.rope_scaling
+        entry = ({'rope_type': 'default'} if ramp is None
+                 else {key: value for key, value in dataclasses.asdict(ramp).items() if value is not None})
+        return {'rope_parameters': {**entry, 'rope_theta': model.rope_theta,
+                                    'partial_rotary_factor': model.partial_rotary_factor or 1.0}}
     return ConfigPart(read, write)
 
 
@@ -405,6 +423,15 @@ def plain_rope_part(spelling: RopeSpelling | None = PLAIN_SPELLING, *, default_f
         return record
     return ConfigPart(read, lambda model: {theta_field: model.rope_theta,
                                            factor_field: model.partial_rotary_factor or 1.0})
+
+
+def single_depth(key: str) -> ConfigField[CausalTransformer]:
+    """An optional single shared-embedding prediction depth under `key`, both ways."""
+    def parse(value: Configured, key: str) -> int:
+        if type(value) is not int or value not in (0, 1):
+            refuse(key, 'only a single shared prediction layer is supported')
+        return value
+    return ConfigField(key, 'num_nextn_predict_layers', 0, parse=parse)
 
 
 def biases(key: str, *, default: bool) -> ConfigPart[CausalTransformer]:

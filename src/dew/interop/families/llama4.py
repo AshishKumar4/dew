@@ -104,7 +104,14 @@ def _kinds_written(model: CausalTransformer) -> Mapping[str, object]:
     return {'attention_chunk_size': chunks.pop() if chunks else None,
             'use_qk_norm': bool(rotated) and model.kind_of(rotated[0]).qk_norm,
             'attn_temperature_tuning': tuning is not None,
-            **({} if tuning is None else {'floor_scale': tuning[0], 'attn_scale': tuning[1]})}
+            **({} if tuning is None else {'floor_scale': _floor_scale(tuning[0]), 'attn_scale': tuning[1]})}
+
+
+def _floor_scale(floor: float) -> int:
+    """The temperature tuning's floor as Llama4TextConfig states it, a whole number of positions."""
+    if floor != int(floor):
+        raise ExportRefused(f"Llama 4 states its temperature tuning's floor in whole positions, not {floor}")
+    return int(floor)
 
 
 def _expert_widths(hf_config: Mapping[str, object], used: set[str], record: MixtureFields) -> MixtureFields:
@@ -195,7 +202,8 @@ LLAMA4_TEXT = DecoderFamily(
     packed=_LLAMA4_PACKED,
     preserve_source_layout=True,
     # Llama4TextConfig's defaults for the fields its decoder reads.
-    defaults={'rms_norm_eps': 1e-5, 'num_experts_per_tok': 1, 'use_qk_norm': True,
+    defaults={'rms_norm_eps': 1e-5, 'num_experts_per_tok': 1, 'num_local_experts': 16, 'use_qk_norm': True,
+              'intermediate_size': 8192, 'intermediate_size_mlp': 16384,
               'attn_temperature_tuning': True, 'floor_scale': 8192, 'attn_scale': 0.1,
               'attention_chunk_size': 8192, 'num_key_value_heads': 8, 'head_dim': 128,
               'max_position_embeddings': 131072},
