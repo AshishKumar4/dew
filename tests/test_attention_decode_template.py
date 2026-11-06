@@ -317,7 +317,7 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
         initial = template.Initial(sink, jnp.ones_like(sink), jnp.zeros((*sink.shape, values.shape[-1])))
         spec = algebra.Forward("spans", 40, ids=False, scale=1.0, natural=True, initial=True)
         out, maximum, total = _states(logits, values, cuts)
-        return attention_decode.merged(spec, out, maximum, total, initial)
+        return algebra.merged_slices(spec, out, maximum, total, initial)
 
     def whole(logits, values, sink):
         scores = jnp.concatenate([logits, jnp.transpose(sink, (0, 2, 1))[..., None]], axis=-1)

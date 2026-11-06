@@ -12,9 +12,9 @@ tile's keys with the algebra's online softmax; two builders shape the step for i
   template forward's grid (`MosaicForward.splits`), as many as the GPU holds at once (the derived
   config's resident programs a multiprocessor, from its registers and its shared memory, times the
   multiprocessors; no fitted table), so one row's long cache fills the GPU. No query or span is copied.
-- `merged`: the slices' softmax states, each its output normalized in fp32, its maximum and its
+- the merge: the slices' softmax states, each its output normalized in fp32, its maximum and its
   denominator, combined with the call's initial state (a sink, `Initial`) as one more by the algebra's
-  fold over states (`algebra.merged`, `finish`), one sum a row, deterministic.
+  fold over states (`algebra.merged_slices`), one sum a row, deterministic.
 
 No arithmetic of its own past the merge: the walk, the hooks and the guards are the template forward's.
 """
@@ -164,33 +164,6 @@ def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale:
     return None if config is None else (op.streaming(ba, config, target), op, ba)
 
 
-def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
-           initial: Initial | None = None) -> jax.Array:
-    """The slices' outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural `spec`'s
-    units, `algebra.finished_rows`', a fold's `algebra.unfolded`) and denominators `[B, KV, S, Q]`, and the
-    call's `initial` state `[B, KV, Q]` (its sums `acc` unnormalized) merged by the algebra's fold over
-    states (`algebra.merged`, then `finish`): the rows' output `[B, Q, KV, Dv]` fp32. Each state enters as
-    its normalized output and its mass, its denominator folded into its maximum (`m + log(total)`), so no
-    output multiplied back by its denominator passes fp32's largest; a state of no mass adds nothing, and a
-    row of none is zero, as the reference's."""
-    if not (spec.natural or spec.raw):
-        raise ValueError("the template's decode merges natural states or a raw fold's")
-    m, mass = (jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total))
-    if initial is not None:
-        held = initial.total > 0
-        own = jnp.where(held[..., None], initial.acc / jnp.where(held, initial.total, 1.0)[..., None], 0.0)
-        out = jnp.concatenate([out, jnp.swapaxes(own, 1, 2)[:, None]], axis=1)
-        # The initial maximum natural, the slices' in `spec`'s units (raw products where it keeps them).
-        start = initial.m / spec.scale if spec.raw else initial.m
-        m = jnp.concatenate([m, jnp.swapaxes(start, 1, 2)[:, None]], axis=1)
-        mass = jnp.concatenate([mass, jnp.swapaxes(initial.total, 1, 2)[:, None]], axis=1)
-    seen = mass > 0
-    units = spec.scale if spec.raw else 1.0
-    folded = jnp.where(seen, m + jnp.log(jnp.where(seen, mass, 1.0)) / units, -jnp.inf)
-    state = algebra.merged(spec, algebra.Partial(out, folded, seen.astype(jnp.float32)), axis=1)
-    return algebra.finish(spec, state, initial=True)[0]
-
-
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
     """The call's form as the template's forward takes it (`attention_mosaic_forward._prepared`), its fold of
     raw products (`algebra.Forward.subtracted`): the units its finished rows' maxima are in
@@ -248,5 +221,6 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
             rows, key, value, row_spans, walked, scale=scale, natural=False, residuals=Kept.OUTPUT,
             interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, table=table,
             sources=sources, subtracted=True)[:3]
-    merged_rows = merged(_spec(rows, row_spans, walked, scale=scale), out, maximum, total, initial)
+    merged_rows = algebra.merged_slices(_spec(rows, row_spans, walked, scale=scale), out, maximum, total,
+                                        initial)
     return ungrouped_rows(merged_rows, heads).astype(query.dtype)
