@@ -44,6 +44,7 @@ from dew.batch import Variables
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
+    DECODER_FIELDS,
     NO_AUDIO,
     SLICED,
     AudioFields,
@@ -57,7 +58,6 @@ from dew.interop.decoder_parts import (
     decoder_tensors,
     folder_config,
     held_parts,
-    hf_activation,
     modeling_overrides,
     part_plan,
     record_float,
@@ -480,8 +480,7 @@ def _lfm3_vl_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
                  "projector_layer_norm_eps", "video_token_id", "vision_start_token_id", "vision_end_token_id",
                  "auto_map", "bos_token_id", "eos_token_id", "pad_token_id", "dtype"))
     # Lfm3VlConfig's placeholders where a config leaves them out (configuration_lfm3_vl.py).
-    image = _records.integer(WRAPPER_LAYOUTS["lfm3_vl"].keys.read(hf_config, used, {})["image_token_id"],
-                             "image_token_id")
+    image = _defaulted_token_id(hf_config, used, "image_token_id", 125030)
     video = _defaulted_token_id(hf_config, used, "video_token_id", 125029)
     fields = _wrapper_fields("lfm3_vl", used, text, tower, projector, image, None, video=video)
     fields["text_model_type"] = _records.text(_text_config(hf_config)["model_type"], "text_config.model_type")
@@ -619,31 +618,19 @@ WRAPPER_LAYOUTS: Mapping[str, WrapperLayout] = {
                                     _states_vision),)),
     **{family: WrapperLayout(
         architecture, _QWEN35_KEYS, tied_default=False,
+        # The merger's output width, which Qwen 3.5's vision_config states (`merger_projector`).
+        vision_keys=ConfigLayout(ConfigField("out_hidden_size", "out_hidden_size",
+                                             value=_projected("out_width"))),
         corrections=(TextCorrection(("full_attention",), ("mrope_section",), _qwen35_mrope, _qwen35_rope),))
        for family, architecture in (("qwen3_5", "Qwen3_5ForConditionalGeneration"),
                                     ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
                                     ("qwen4_exp", "Qwen4ExpForConditionalGeneration"))},
-    "lfm3_vl": WrapperLayout(
-        "Lfm3VlForConditionalGeneration", ConfigLayout(
-            _token("image_token_id", "image_token_id", default=125030),
-            # The projector's geometry, at Lfm3VlConfig's defaults (`translate_lfm3_vl_projector_config`).
-            ConfigField("downsample_factor", "downsample_factor", 2,
-                        value=_projected("spatial_merge_size")),
-            ConfigField("projector_hidden_size", "projector_hidden_size", 4096,
-                        value=_projected("width")),
-            ConfigField("projector_bias", "projector_bias", default=True,
-                        value=_projected("bias")),
-            ConfigField("projector_layer_norm_eps", "projector_layer_norm_eps", 1e-6,
-                        value=_projected("norm_eps")),
-            ConfigField("projector_hidden_act", "projector_hidden_act", "gelu",
-                        value=_projected("activation"))),
-        text_type="lfm3"),
 }
 """Each wrapper's release layout (`dew.interop.wrappers.WrapperLayout`), by its model_type: the writer of
 a wrapper built in Dew (`wrappers.wrapper_layout`) and its reader's text corrections and placeholder keys
-(`_wrapper_text_fields`, the readers above) read the same declaration. A wrapper absent here (Muse
-Glimmer's, whose language model holds its placeholders; Gemma 3n's MobileNet; the audio towers) is read
-and not yet written."""
+(`_wrapper_text_fields`, the readers above) read the same declaration. A wrapper absent here is read and
+not written: Muse Glimmer's, whose language model holds its placeholders; Gemma 3n's MobileNet; LFM3-VL's,
+whose release is its own code; and an audio tower."""
 
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
@@ -1455,18 +1442,9 @@ def export_config(model) -> Mapping[str, object]:
         'architectures': [family.architecture],
         # The release's own code, which `PretrainedDecoder.from_model` writes beside the export.
         **({} if family.release_code is None else {'auto_map': dict(family.release_code.auto_map)}),
-        'hidden_size': model.emb_features,
-        'num_hidden_layers': model.num_layers,
-        'num_attention_heads': model.num_heads,
-        'num_key_value_heads': model.kv_heads,
-        'head_dim': model.features_per_head,
-        'intermediate_size': model.hidden_features,
-        'vocab_size': model.vocab_size,
-        'max_position_embeddings': _RESOLVED['context_length'](model),
-        'rms_norm_eps': model.norm_eps,
+        **DECODER_FIELDS.write(model),
         'attention_bias': model.attention_bias,
         'tie_word_embeddings': model.tie_embeddings,
-        'hidden_act': hf_activation(model.mlp),
         'use_cache': model.causal,
     }
     from dew.nn.mixers import AttentionMixer

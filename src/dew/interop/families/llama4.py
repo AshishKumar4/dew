@@ -132,7 +132,15 @@ def _llama4_export(model: CausalTransformer) -> Mapping[str, object]:
     rotated = [name for name in types if not _mixer(model, name).nope]
     unrotated = [name for name in types if _mixer(model, name).nope]
     tuning = _mixer(model, unrotated[0]).temperature_tuning if unrotated else None
+    mixture = model.mixture
+    if mixture is None:
+        raise ExportRefused("a Llama 4 decoder routes experts, which this model holds none of")
     return {'attention_chunk_size': chunks.pop() if chunks else None,
+            # The experts and the shared expert take intermediate_size, the dense layers
+            # intermediate_size_mlp, as `_llama4_config` reads them.
+            'num_local_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
+            'intermediate_size': mixture.expert_features or model.hidden_features,
+            'intermediate_size_mlp': model.hidden_features, 'moe_layers': list(model.sparse_layers),
             'no_rope_layers': [int(not _mixer(model, name).nope) for name in types],
             'use_qk_norm': bool(rotated) and model.kind_of(rotated[0]).qk_norm,
             'attn_temperature_tuning': tuning is not None,

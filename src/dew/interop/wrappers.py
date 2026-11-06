@@ -60,6 +60,9 @@ class WrapperLayout:
     vision_type: str | None = None
     corrections: tuple[TextCorrection, ...] = ()
     tied_default: bool = True
+    vision_keys: ConfigLayout | None = None
+    """Keys the wrapper states in its vision_config beside its tower's own: its merger's, which the tower
+    holds in its vision_config (Qwen 3.5's `out_hidden_size`)."""
 
     def language_name(self, name: str) -> str:
         """The wrapper's name of its text family's tensor `name` (`model.*`, `lm_head.*`, `mtp.*`)."""
@@ -152,7 +155,8 @@ def wrapper_layout(model, *, config: Mapping[str, object] | None = None) -> Sour
     try:
         language, text = _text(layout, wrapper)
         vision = {**tower.vision_config(wrapper.vision),
-                  **({} if layout.vision_type is None else {"model_type": layout.vision_type})}
+                  **({} if layout.vision_type is None else {"model_type": layout.vision_type}),
+                  **({} if layout.vision_keys is None else layout.vision_keys.write(wrapper))}
         written = {"model_type": wrapper.family, "architectures": [layout.architecture], "text_config": text,
                    "vision_config": vision, "tie_word_embeddings": wrapper.language_model.tie_embeddings,
                    **layout.keys.write(wrapper)}

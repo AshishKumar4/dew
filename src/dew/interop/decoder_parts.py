@@ -29,6 +29,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.layouts import (
     Condition,
     Config,
+    ConfigField,
     ConfigLayout,
     ConfigPart,
     ConfigRead,
@@ -839,6 +840,64 @@ def context_lengths(hf_config: Mapping[str, object], default: int | None = None)
     return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
 
 
+def _read_heads(hf_config: Mapping[str, object], used: set[str],
+                record: dict[str, object]) -> dict[str, object]:
+    """The key/value heads, the query heads' count where unstated, and each head's width, the residual's
+    over the heads where unstated."""
+    used.update(('num_key_value_heads', 'head_dim'))
+    heads = _records.integer(record['num_heads'], 'num_heads')
+    kv_heads = hf_config.get('num_key_value_heads')
+    record['num_kv_heads'] = heads if kv_heads is None else _records.integer(kv_heads, 'num_key_value_heads')
+    width = _records.integer(record['emb_features'], 'hidden_size')
+    record['head_dim'] = _records.integer(hf_config.get('head_dim') or width // heads, 'head_dim')
+    return record
+
+
+def _read_activation(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]
+                     ) -> dict[str, object]:
+    """The gated MLP's activation, `hidden_act` (or Gemma's `hidden_activation`) as transformers names it,
+    refused outside the ones the gated MLP computes (`ACTIVATIONS`)."""
+    used.update(('hidden_act', 'hidden_activation'))
+    activation = _records.text(hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu')),
+                               'hidden_act/hidden_activation')
+    mapped = ACTIVATIONS.get(activation)
+    if mapped is None:
+        refuse(f"hidden_act {activation!r}", f"the gated MLP supports {sorted(ACTIVATIONS)}")
+    record['mlp'] = mapped
+    return record
+
+
+def _read_context(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]
+                  ) -> dict[str, object]:
+    used.add('max_position_embeddings')
+    record['max_seq_len'], record['context_length'] = context_lengths(hf_config)
+    return record
+
+
+def _read_widths(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]
+                 ) -> dict[str, object]:
+    used.add('intermediate_size')
+    record['mlp_features'] = _mlp_features(hf_config)
+    return record
+
+
+DECODER_FIELDS: ConfigLayout[CausalTransformer] = ConfigLayout(
+    ConfigField('vocab_size', 'vocab_size', parse=_records.integer),
+    ConfigField('hidden_size', 'emb_features', parse=_records.integer),
+    ConfigField('num_hidden_layers', 'num_layers', parse=_records.integer),
+    ConfigField('num_attention_heads', 'num_heads', parse=_records.integer),
+    ConfigPart(_read_heads, lambda model: {'num_key_value_heads': model.kv_heads,
+                                           'head_dim': model.features_per_head}),
+    ConfigPart(_read_activation, lambda model: {'hidden_act': hf_activation(model.mlp)}),
+    ConfigPart(_read_widths, lambda model: {'intermediate_size': model.hidden_features}),
+    ConfigPart(_read_context,
+               lambda model: {'max_position_embeddings': model.context_length or model.max_seq_len}),
+    ConfigField('rms_norm_eps', 'norm_eps', 1e-6, parse=_records.number),
+)
+"""The decoder's geometry every family's config states under transformers' shared names, both ways:
+`base_config` reads them and `hf_decoders.export_config` writes them."""
+
+
 def base_config(hf_config: Mapping[str, object], used: set[str], *,
                  rope: Ropes | RopeSpelling,
                  layer_types: tuple[str, ...] | None = None,
@@ -862,19 +921,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     for unread in _OPTIONAL_FIELDS - reads:
         if unread in hf_config and _neutral(hf_config, unread):
             used.add(unread)
-    hidden = _records.integer(hf_config['hidden_size'], 'hidden_size')
-    heads = _records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
-    kv_heads = hf_config.get('num_key_value_heads')
-    head_dim = _records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
-    used.update(('hidden_size', 'num_attention_heads', 'num_key_value_heads', 'head_dim'))
-
-    activation = _records.text(hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu')),
-                      'hidden_act/hidden_activation')
-    used.update(('hidden_act', 'hidden_activation'))
-    mapped = ACTIVATIONS.get(activation)
-    if mapped is None:
-        refuse(f"hidden_act {activation!r}",
-                f"the gated MLP supports {sorted(ACTIVATIONS)}")
+    shared = DECODER_FIELDS.read(hf_config, used, {})
 
     ropes = read_rope(hf_config, used, rope) if isinstance(rope, RopeSpelling) else rope
     rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
@@ -894,22 +941,11 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
                       if 'sliding_attention' in layer_types else None)
 
     kinds = decoder_kinds(layer_types, sliding_window, rope_local_theta, None, None)
-    capacity, context = context_lengths(hf_config)
-    config: DecoderFields = native_fields(CausalTransformer)(
-        vocab_size=_records.integer(hf_config['vocab_size'], 'vocab_size'),
-        emb_features=hidden,
-        num_layers=_records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'),
-        num_heads=heads,
-        num_kv_heads=heads if kv_heads is None else _records.integer(kv_heads, 'num_key_value_heads'),
-        head_dim=head_dim,
-        mlp=mapped,
-        mlp_features=_mlp_features(hf_config),
-        max_seq_len=capacity,
-        context_length=context,
+    config: DecoderFields = NativeFields(CausalTransformer, dict(
+        **shared,
         rope_theta=rope_theta,
         layer_types=layer_types,
         kinds={},
-        norm_eps=_records.number(hf_config.get('rms_norm_eps', 1e-6), 'rms_norm_eps'),
         # LlamaRMSNorm, Qwen3RMSNorm and DeepseekV3RMSNorm multiply the scale
         # into the activations after casting them (modeling_qwen3.py:61-64,
         # modeling_deepseek_v3.py:47-52); Gemma3's, Gemma4's and Qwen3.5's
@@ -923,10 +959,9 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         # others do not, so a config that omits the field (gemma-3-1b-pt
         # does) takes its family's default.
         tie_embeddings=config_flag(hf_config, 'tie_word_embeddings', default=tie_embeddings),
-    )
+    ))
     config['kinds'] = kinds
-    used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
-                 'rms_norm_eps', 'tie_word_embeddings'))
+    used.add('tie_word_embeddings')
     used.update(reads & {'attention_bias', 'mlp_bias'})
 
     # A ramp both kinds share is the model's. Where the kinds' ramps differ, each lands on its own

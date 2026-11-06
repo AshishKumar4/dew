@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew.batch import Variables
-from dew.interop.layouts import ConfigLayout, Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Table
 from dew.interop.unread import Stored, held
 from dew.interop.weights import checkpoint_array
 from dew.nn.dense import Dense
@@ -183,7 +183,10 @@ _SIGLIP_CONFIG = ConfigLayout(
     *TRUNK_FIELDS, side_field("image_size", 224), side_field("patch_size", 16),
     integer_field("num_channels", default=3),
     activation_field(TOWER_ACTIVATIONS, "gelu_pytorch_tanh", "hidden_act", "hidden_activation"),
-    number_field("layer_norm_eps", default=1e-6))
+    number_field("layer_norm_eps", default=1e-6),
+    # The pooling head some releases carry, which the trunk does not compute with: a written tower has none.
+    ConfigPart(lambda vision, used, record: (used.add("vision_use_head"), record)[1],
+               lambda tower: {"vision_use_head": False}))
 """A SiglipVisionConfig's fields, both ways."""
 
 
