@@ -656,6 +656,157 @@ def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax
     return jax.lax.fori_loop(0, blocks, block, jnp.zeros((groups, depth, width), jnp.float32))
 
 
+
+
+MX_BLOCK = 32
+"""The depths one MXFP8 scale covers (OCP MX, tcgen05's block-scaled MMA's `scale_vec::1X`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class MxFp8:
+    """An MXFP8 operand (OCP MX: E4M3 codes, a power-of-two E8M0 scale every `MX_BLOCK` depths; row 4519):
+    `codes` float8_e4m3fn `[..., depth]`, the depth K-major (last), and `scales` float8_e8m0fnu
+    `[..., depth / 32]`, each value its code times its block's scale. Rows `[rows, depth]` or a grouped
+    product's matrices `[groups, width, depth]`, as Blackwell's block-scaled tensor cores read both."""
+
+    codes: jax.Array
+    scales: jax.Array
+
+    @classmethod
+    def quantized(cls, x: jax.Array) -> "MxFp8":
+        """`x` (`[..., depth]`) as MXFP8, by OCP MX's rule: each 32 depths' scale 2 to the power of its
+        largest magnitude's exponent less E4M3's largest's (8), so that magnitude over the scale lies in
+        [256, 512); each value over its scale rounded to E4M3, ties to even, saturating at +-448. A block of
+        zeros takes the least scale. (A scale the ceiling of the largest magnitude over 448, DeepSeek's
+        rule, rounds a code up past the largest float32 at float32's top binade: 256 x 2^120.)"""
+        from dew.nn import fake_quant
+
+        x = jnp.asarray(x, jnp.float32)
+        blocks = x.reshape(*x.shape[:-1], x.shape[-1] // MX_BLOCK, MX_BLOCK)
+        largest = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True)
+        exponent = jnp.where(largest > 0, jnp.floor(jnp.log2(jnp.where(largest > 0, largest, 1.0))), -119.0)
+        scale = jnp.exp2(jnp.clip(exponent - 8, -127, 127))
+        codes = fake_quant.fp8_codes(blocks / scale).reshape(x.shape)
+        return cls(codes.astype(jnp.float8_e4m3fn), scale[..., 0].astype(jnp.float8_e8m0fnu))
+
+    def decoded(self) -> jax.Array:
+        """Its values, exactly, in float32 (`[..., depth]`): each code times its block's scale."""
+        scale = jnp.repeat(self.scales.astype(jnp.float32), MX_BLOCK, axis=-1)
+        return self.codes.astype(jnp.float32) * scale
+
+
+MXFP8_ROW = 'ledger 4519'
+"""The MX product on Blackwell's block-scaled tensor cores (K51)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class MxCase:
+    """An MX product as its selector reads it (`MXFP8`): the tile the template's launch plans for it on the
+    target (`grouped_matmul.MosaicMxGmm`), None where it plans none."""
+
+    tile: mosaic_gpu.Tiles | None
+
+
+MXFP8: selection.Op[MxCase] = selection.Op('mxfp8', (
+    selection.Kernel('mosaic_gpu', (
+        selection.Requirement(
+            'planned', lambda case: case.tile is not None, "the template plans no block-scaled tile here: "
+            "an MX product on a family whose products take block scales (tcgen05's), whole 128s of rows, "
+            "columns and depth", MXFP8_ROW),
+        selection.Requirement(
+            'measured', lambda case: False, "no receipt yet has the block-scaled template beat the decoded "
+            "operands' product", MXFP8_ROW, kind='measured'))),
+    selection.Kernel('xla', (), generic=True)))
+"""An MX product's selector (`mxfp8_product`): the template's products scaling each block in the instruction
+(`mosaic_gpu.gmm`'s `mx_scales`) where named (`generation.chosen(mxfp8='mosaic_gpu')`) and planned, past the
+measured requirement no receipt has met yet; else the decoded operands' product in XLA."""
+
+
+def mxfp8_product(lhs: MxFp8, matrices: MxFp8, group_blocks: jax.Array, *, out_dtype,
+                  interpret_on_cpu: bool = False) -> jax.Array:
+    """Each group's rows of `lhs` (`[rows, depth]`) times its matrix of `matrices` (`[groups, width, depth]`,
+    K-major), both MXFP8 (`MxFp8`): each value its code times its 32 depths' scale, every product exact in
+    fp32, summed in fp32 and rounded once to `out_dtype` (row 4519). Group `g` holds `group_blocks[g]` whole
+    128-row blocks, in order (the block scales' tiles), the rows past them zero. Its selector (`MXFP8`) runs
+    the template on Blackwell's block-scaled tensor cores where named (`mosaic_gpu.gmm`'s `mx_scales`), else
+    the decoded operands' product in XLA."""
+    sizes = (group_blocks * mosaic_gpu.STEP_SCALE_DEPTH).astype(jnp.int32)
+    launch = grouped_matmul.MosaicMxGmm()
+    abstract = jax.ShapeDtypeStruct
+    tile = _planned(launch, launch.bind(abstract(lhs.codes.shape, lhs.codes.dtype),
+                                        abstract(matrices.codes.shape, matrices.codes.dtype),
+                                        abstract(sizes.shape, jnp.int32), out_dtype='float32', trans_rhs=True,
+                                        interpret=interpret_on_cpu))
+    if selection.select(MXFP8, MxCase(tile)).kernel == 'mosaic_gpu':
+        assert tile is not None, "the selector names the template where it plans a tile"
+        summed = mosaic_gpu.gmm(lhs.codes, matrices.codes, sizes, tiles=tile, transpose_rhs=True,
+                                out_dtype=jnp.float32,
+                                multiprocessors=launch._launched(tile, interpret_on_cpu),
+                                interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
+                                mx_scales=(_scales_tiled(lhs.scales), _scales_tiled(matrices.scales)))
+        assert isinstance(summed, jax.Array), "an unpaired product has one output"
+    else:
+        # The decoded values in fp32 (each exact in bfloat16 and in TF32, so DEFAULT's products are
+        # exact), summed as XLA sums fp32 products.
+        summed = grouped_matmul.xla_ragged_dot(lhs.decoded(), jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
+                                               precision=jax.lax.Precision.DEFAULT,
+                                               preferred_element_type=jnp.float32)
+    return summed.astype(out_dtype)
+
+
+def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
+                     interpret_on_cpu: bool = False) -> jax.Array:
+    """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`) in the
+    MXFP8 recipe (row 2513; OCP MX, arXiv 2506.08027: E4M3 every tensor, a power-of-two scale every 32 of each
+    product's contraction): `x` quantized along the depth and `w` along it too, their product
+    `mxfp8_product`. Its gradients are the recipe's own MX products, a surrogate of the quantized product's
+    derivative (straight through each rounding): the input's the cotangent quantized along the width times
+    `w` quantized along it (`mxfp8_product`); the matrices' each group's rows and cotangent quantized along
+    its tokens, their decoded values (exact in bfloat16) contracted over the group's rows in fp32 (`gemm_t`).
+    Group `g` holds `group_blocks[g]` whole 128-row blocks, in order: `rows` is 128 times their sum."""
+    return _mx_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
+
+
+def _mx_value(x, w, group_blocks, out_dtype, interpret):
+    return mxfp8_product(MxFp8.quantized(x), MxFp8.quantized(jnp.swapaxes(w, 1, 2)), group_blocks,
+                         out_dtype=out_dtype, interpret_on_cpu=interpret)
+
+
+def _mx_forward(x, w, group_blocks, out_dtype, interpret):
+    return _mx_value(x, w, group_blocks, out_dtype, interpret), (x, w, group_blocks)
+
+
+def _mx_backward(out_dtype, interpret, residuals, cotangent):
+    del out_dtype
+    x, w, group_blocks = residuals
+    d_x = mxfp8_product(MxFp8.quantized(cotangent), MxFp8.quantized(w), group_blocks, out_dtype=x.dtype,
+                        interpret_on_cpu=interpret)
+    sizes = (group_blocks * mosaic_gpu.STEP_SCALE_DEPTH).astype(jnp.int32)
+    # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 32 of them a
+    # scale: a 128-row group's blocks hold whole 32s.
+    rows = MxFp8.quantized(x.T).decoded().T.astype(jnp.bfloat16)
+    cotangents = MxFp8.quantized(cotangent.T).decoded().T.astype(jnp.bfloat16)
+    d_w = gemm_t(rows, cotangents, sizes, out_dtype=w.dtype, precision=jax.lax.Precision.DEFAULT,
+                 interpret_on_cpu=interpret)
+    return d_x, d_w, None
+
+
+# The MXFP8 recipe's gradient (`mxfp8_projection`): a derivative of Dew's choosing (`Surrogate`).
+_mx_projection = contracted("test_an_mxfp8_projection_holds_every_reverse_order")(
+    declared_derivative(Surrogate(), _mx_value, _mx_forward, _mx_backward, nondiff_argnums=(3, 4)))
+
+
+def _scales_tiled(scales: jax.Array) -> jax.Array:
+    """MX scales `[..., rows, depth / 32]` tiled as `tcgen05.scales_layout` lays them out in shared memory,
+    `[..., rows / 128, depth / 128, 32, 16]`: row `i` and scale `j` at `[i // 128, j // 4, i % 32,
+    (i // 32) % 4 * 4 + j % 4]` (`mosaic_gpu.gmm`'s `mx_scales`)."""
+    *lead, rows, columns = scales.shape
+    tiled = scales.reshape(*lead, rows // 128, 4, 32, columns // 4, 4)
+    order = tuple(range(len(lead)))
+    tiled = jnp.transpose(tiled, (*order, *(len(lead) + axis for axis in (0, 3, 2, 1, 4))))
+    return tiled.reshape(*lead, rows // 128, columns // 4, 32, 16)
+
+
 def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scale, *, out_dtype,
              precision: PrecisionLike = None, interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs · kernel + scale · (lhs · a) · b`, LoRA's adapted product (Appendix C row 26, strategy (b)), as

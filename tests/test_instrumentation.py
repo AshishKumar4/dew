@@ -287,6 +287,29 @@ def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
         steps * 2 * rows * width * width)
 
 
+def test_a_loop_bounded_by_a_counter_beside_a_predicate_counts_at_most_its_trips():
+    """A loop whose condition is a counted bound and another predicate, `(i < 1) & taken`
+    (`attention_algebra.once`, the guards' rare walk), runs its body at most the counted trips: its
+    matmul counted once, as a conditional's every branch is; a loop whose condition holds no counted
+    bound beside its predicate counts no FLOPs, unbounded."""
+    rows, width = 8, 32
+
+    def counted(kernel, values, taken):
+        return jax.lax.while_loop(lambda state: (state[0] < 1) & taken,
+                                  lambda state: (state[0] + 1, state[1] @ kernel),
+                                  (jnp.int32(0), values))[1]
+
+    def uncounted(kernel, values, taken):
+        return jax.lax.while_loop(lambda state: state[0] & taken,
+                                  lambda state: (jnp.zeros((), bool), state[1] @ kernel),
+                                  (taken, values))[1]
+
+    arguments = (jnp.ones((width, width)), jnp.ones((rows, width)), jnp.ones((), bool))
+    assert compiled_flops(jax.jit(counted).lower(*arguments).compile()) == pytest.approx(
+        2 * rows * width * width)
+    assert compiled_flops(jax.jit(uncounted).lower(*arguments).compile()) is None
+
+
 def test_fit_reports_throughput_to_the_tracker():
     """The logging tick carries the throughput numbers along with the loss."""
     tracker = RecordingTracker()

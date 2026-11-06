@@ -64,6 +64,12 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "groups": ("1", "4"),
         "out_dtype": ("float32", "bfloat16"),
     },
+    "mxfp8": {
+        "generation": ("sm100",),
+        "width": ("128", "256"),
+        "groups": ("1", "4"),
+        "out_dtype": ("float32", "bfloat16"),
+    },
     "nvfp4": {
         "generation": ("sm90", "sm80"),
         "width": ("128", "256"),
@@ -147,7 +153,9 @@ projections with no bias or one; a gate times its multiplier or not (`plain` for
 dtype. The adapted product's (the choice `low_rank`): the GPU; the adapter's rank; a projection with no bias
 or one; the operands' dtype. The blockwise-scaled FP8 product's (the choice `blockwise_fp8`): the GPU (an
 H100's FP8 tensor cores); the columns a column scale covers (a weight block's 128, or one); the groups;
-the output's dtype. The NVFP4 product's (the choice `nvfp4`): the GPU; the matrix's width and depth;
+the output's dtype. The MX product's (the choice `mxfp8`): the GPU (a B200's block-scaled tensor
+cores); the matrix's width; the groups; the output's dtype. The NVFP4 product's (the choice `nvfp4`): the
+GPU; the matrix's width and depth;
 the output's dtype. The recurrence's (the choices `gated_delta_rule` and `ssd`): the GPU; the form
 (tests/recurrence_matrix.py's `FORMS`); the kernel under test (the template, the portable math and its derived
 forms, each held to its form's port; each port held to the portable math); the operands' dtype; one sequence
@@ -181,6 +189,7 @@ CELLS: dict[str, tuple[str, str]] = {
     "low_rank": ("low_rank_matrix", "an_adapted_projections_training_step_is_on_par"),
     "nvfp4": ("nvfp4_matrix", "an_nvfp4_products_training_step_is_on_par"),
     "blockwise_fp8": ("blockwise_matrix", "a_blockwise_fp8_product_is_on_par"),
+    "mxfp8": ("mx_matrix", "an_mxfp8_product_is_on_par"),
     "recurrence": ("recurrence_matrix", "a_recurrences_training_step_is_on_par"),
     "recurrence_tpu": ("recurrence_matrix", "a_recurrences_training_step_on_a_tpu_is_on_par"),
     "short_conv": ("short_conv_matrix", "a_short_convs_training_step_is_on_par"),
@@ -201,6 +210,7 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_gemm.py::test_the_low_rank_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_nvfp4_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_blockwise_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_mx_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_selective_scan_matrix_holds_on_this_gpu",

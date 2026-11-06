@@ -1240,6 +1240,14 @@ class Issuer[Accumulator](abc.ABC):
     warpgroup MMA reads them ('Only f16 WGMMA supports transposes'); mma.sync's FP8 forms are Ada's and
     consumer Blackwell's, which no bundle of Dew's runs yet (row 3620)."""
 
+    takes_block_scales: bool = False
+    """Whether its products scale each 32 depths of their operands by an E8M0 scale in the instruction (an MX
+    product's, `scaled_products`): tcgen05's block-scaled MMA; no other family's products do (row 4519)."""
+
+    def scaled_products(self, acc, lhs, rhs, scales: tuple, interpret: bool):
+        """`products` of block-scaled operands (`takes_block_scales`), `scales` the step's two scale slots."""
+        raise NotImplementedError(f"{self.name}'s products take no block scales")
+
     transposes_tf32: bool = False
     """Whether its TF32 products take an operand read transposed (`takes_tf32`): mma.sync's, whose threads
     load each fragment's elements themselves; not warpgroup MMA's ('Only f16 WGMMA supports transposes'), so
@@ -1496,6 +1504,11 @@ class Issuer[Accumulator](abc.ABC):
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
         return plgpu.load(ref, layout=self.layout, optimized=False)
 
+    def scalar_of(self, ref) -> jax.Array:
+        """The scalar at `ref[0]` (a block's index a launch reads from global memory): a GPU thread's load, a
+        TPU core's copy into its scalar memory."""
+        return ref[0]
+
     def key_magnitudes(self, tile) -> jax.Array:
         """Each key's largest value magnitude, fp32, from a values tile `tile` `[keys, columns]` in shared
         memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,
@@ -1590,6 +1603,11 @@ class Transport[Allocated, Opened](abc.ABC):
     its own rows of the slot, awaited at the slot's one barrier; cp.async's each a block of its pipeline's
     own, joined into one tile through registers (`mosaic_sm80.CpAsync.walk`): a paged call's key tile of
     several pages takes a copy a page."""
+
+    pieces_of_views: bool = True
+    """Whether a block's pieces (`copies_in_pieces`) may be pieces of any view (a TMA ring's: an fp32
+    operand's parts, `Pieces`), where cp.async's are a table's runs alone (`mosaic.Rows`, a paged call's
+    pages: `mosaic_sm80._run`)."""
 
     copies_vectors: bool = True
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
@@ -1831,10 +1849,11 @@ class Transport[Allocated, Opened](abc.ABC):
         return {f'{name}_smems': [self.staged_memory((2, *shape), gmem.dtype) for shape, gmem in shaped],
                 f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
 
-    def staged_memory(self, shape: tuple[int, ...], dtype):
-        """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory (a
-        TPU's VMEM)."""
-        return plgpu.SMEM(shape, dtype)
+    def staged_memory(self, shape: tuple[int, ...], dtype, swizzle: int | None = None):
+        """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory, its
+        rows at `swizzle` bytes (`staged`: the widest that fits where None, plain where `UNSWIZZLED`); a
+        TPU's VMEM, which its compiler tiles."""
+        return staged(shape, dtype, swizzle)
 
     def meeting(self, consumers: int) -> plgpu.Barrier:
         """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""

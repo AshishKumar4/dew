@@ -124,10 +124,18 @@ def _walked(operation: ir.Operation, times: float) -> Iterator[tuple[ir.Operatio
 def _trips(loop: ir.Operation) -> float:
     """The trip count of a `stablehlo.while` that counts one integer it carries from a constant start, by a
     constant positive step, while it is below a constant bound: the loop every `scan` and `fori_loop` with
-    static bounds lowers to, by the rule an executable's loop is read by (`instrumentation.counted_trips`).
-    Infinite for any other loop."""
+    static bounds lowers to, by the rule an executable's loop is read by (`instrumentation.counted_trips`);
+    where that bound is one side of an `and`, at most its trips, a bound as a branch's every side counted is
+    (a loop of at most one trip, `attention_algebra.once`). Infinite for any other loop."""
     condition, body = (region.blocks[0] for region in loop.regions)
-    compare = _result_of(_terminator(condition).operands[0])
+    root = _result_of(_terminator(condition).operands[0])
+    sides = ([_result_of(side) for side in root.operands] if root is not None and root.name == "stablehlo.and"
+             else [root])
+    return min((_compared_trips(loop, body, compare) for compare in sides), default=math.inf)
+
+
+def _compared_trips(loop: ir.Operation, body: ir.Block, compare: ir.Operation | None) -> float:
+    """`_trips` of `loop` by `compare`, its condition's counted bound, or infinite where it is none."""
     if compare is None or compare.name != "stablehlo.compare" or stablehlo.ComparisonDirectionAttr(
             compare.attributes["comparison_direction"]).value != "LT":
         return math.inf

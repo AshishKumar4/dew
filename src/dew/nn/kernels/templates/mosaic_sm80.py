@@ -122,14 +122,12 @@ class Slots:
 @dataclasses.dataclass(frozen=True)
 class Pipeline:
     """A program's operand streams as `Mma.streams` describes them: each stream's tile `(shape, dtype)` by
-    name, the tiles `emit_pipeline` keeps in flight (`stages`) and the consumer warpgroups that run it
-    together (`consumers`, its thread axis 'wg' where two); it allocates their slots itself."""
+    name and the tiles `emit_pipeline` keeps in flight (`stages`); it allocates their slots itself."""
 
     blocks: dict
     stages: int
     swizzles: dict = dataclasses.field(default_factory=dict)
     """The swizzle a stream's tiles stage at where `Mma.streams` names one (`mosaic.swizzle_for`)."""
-    consumers: int = 1
     copies: dict = dataclasses.field(default_factory=dict)
     """The copies a stream's step arrives in where more than one (`mosaic.Pieces`, a `Rows` view's runs):
     each copied into a slot of its own, then joined into the stream's one tile a step reads (`walk`)."""
@@ -435,11 +433,10 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
 
 class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
-    """The execution policy before Hopper (`mosaic.Transport`): one or two compute warpgroups a program
-    and no producer, its loads `emit_pipeline`'s cp.async copies into each walk's own slots (two consumers
-    run one pipeline over their thread axis 'wg', each copying its share of every block, FlashAttention 2's
-    eight warps), its accumulators in the pipeline's carry (a register home), its output stored through
-    registers. A family whose issuer half an issuer composed with it gives (`Mma`)."""
+    """The execution policy before Hopper (`mosaic.Transport`): one compute warpgroup a program and no
+    producer, its loads `emit_pipeline`'s cp.async copies into each walk's own slots, its accumulators in
+    the pipeline's carry (a register home), its output stored through registers. A family whose issuer half
+    an issuer composed with it gives (`Mma`)."""
 
     walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
 
@@ -454,6 +451,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
 
+    pieces_of_views = False  # its pieces are a table's runs (`_run`), a paged call's pages alone
+
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
 
     adds_through_shared = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
@@ -466,21 +465,19 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def registers(self, consumers: int, programs: int = 1) -> int:
         # Each role at its thread's share of the multiprocessor's 64K registers: two programs' 256 threads
         # hold 255 each.
-        _most(self, consumers)
+        _one(consumers)
         return resources.entry_registers(consumers, programs)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0) -> Callable:
-        # Its warpgroups are its consumers, no producer beside them (two a thread axis 'wg'), and no
-        # cluster; its kernels' default parameters reserve the scratch an implicit reduction takes
-        # (`reduction_scratch`).
+        # Its one warpgroup its consumer, no producer beside it, and no cluster; its kernels' default
+        # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         del reducing_warpgroups, scalars  # its programs read a table from global memory as any operand
-        _most(self, consumers, clustered=cluster > 1)
-        threads = {} if consumers == 1 else {"num_threads": consumers, "thread_name": "wg"}
+        _one(consumers, clustered=cluster > 1)
         built = launches.kernel(mosaic.dependent(entry, interpret), name=name or self.name,
-                                out_type=out_type, grid=grid, grid_names=grid_names, **threads,
+                                out_type=out_type, grid=grid, grid_names=grid_names,
                                 compiler_params=plgpu.CompilerParams(approx_math=approx_math,
                                                                      min_blocks_per_sm=resident),
                                 interpret=mosaic.interpreted(interpret),
@@ -488,48 +485,34 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         return mosaic.checked(built, name or self.name, resident, model_flops)
 
     def program_scoped(self, body, *allocations, streams):
-        # Collective where any of its pipelines (`streams`, one or a tree of them) runs on two consumers.
-        return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations,
-                             **_collective(_consumers(streams)))
+        return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
 
     def roles(self, consumers: int, consumer, producer) -> None:
-        _most(self, consumers)
+        _one(consumers)
         del producer
-        consumer(0 if consumers == 1 else lax.axis_index("wg"))
+        consumer(0)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None):
-        _most(self, consumers, clustered=bool(multicast))
-        # A stream's pieces each a block of `emit_pipeline`'s own, in whole 8-row tiles, joined by one
-        # consumer (two would each join their share of the rows: no caller asks it).
+        _one(consumers, clustered=bool(multicast))
+        # A stream's pieces each a block of `emit_pipeline`'s own, in whole 8-row tiles, joined by its
+        # consumer.
         copies = {name: count for name, count in (copies or {}).items() if count > 1}
         for name, count in copies.items():
             rows = blocks[name][0][0]
-            if rows % (count * mosaic.TILE_ROWS) or consumers > 1:
+            if rows % (count * mosaic.TILE_ROWS):
                 raise ValueError(f"{name}'s {rows} rows arrive in no {count} pieces of whole "
-                                 f"{mosaic.TILE_ROWS}-row tiles joined by one consumer")
-        return Pipeline(blocks, stages, dict(swizzles or {}), consumers, copies)
+                                 f"{mosaic.TILE_ROWS}-row tiles")
+        return Pipeline(blocks, stages, dict(swizzles or {}), copies)
 
-    def shares_rows(self, rows: int, consumers: int) -> bool:
-        # Two consumers copy a block by cp.async, each an equal share of its rows, a warpgroup's copy
-        # spreading whole 8-row tiles over its four warps (the fork's pipeline-thread-axis refuses others).
-        return consumers == 1 or rows % (consumers * 4 * mosaic.TILE_ROWS) == 0
-
-    def output_staging(self, outputs: tuple, consumers: int) -> list:
-        # Each output's tile staged whole: two consumers' rows of it side by side (`persist`).
-        return [plgpu.SMEM(shape if consumers == 1 else (consumers, *shape), dtype)
-                for shape, dtype in outputs]
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
-        # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps,
-        # and where two consumers run it together the two barriers they meet at in turn (its thread axis).
+        # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps.
         slots = streams.stages if steps is None else min(streams.stages, steps)
-        meet = (() if streams.consumers == 1
-                else (plgpu.Barrier(num_arrivals=streams.consumers, num_barriers=2),))
         tiles = tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in streams.blocks.values())
         # A stream in pieces: its slots the same bytes in pieces, and the one tile they join into (`walk`).
         joins = tuple(plgpu.SMEM(*streams.blocks[name]) for name in streams.copies)
-        return (), ((*tiles, *joins, *meet),)
+        return (), ((*tiles, *joins),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -543,11 +526,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = ()) -> None:
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
-        # boundary so the output's shared memory can reuse the pipeline's slots; two consumers stage their
-        # rows' share of it side by side, in one collective scope.
-        _most(self, consumers)
+        # boundary so the output's shared memory can reuse the pipeline's slots.
         del in_flight, unrolled, accumulators  # its walk carries its accumulators
-        index = 0 if consumers == 1 else lax.axis_index("wg")
         staging = self.output_staging(outputs, consumers)
 
         def store(output, value, ref, place):
@@ -555,14 +535,13 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             if not interpret:
                 plgpu.wait_gmem_to_smem(0)
 
-            def copied(staged):
+            def copied(smem):
                 # The row-copy ladder needs strided layouts, not optimized-only transfers.
-                smem = staged if consumers == 1 else staged.at[index]
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
                 mosaic.store_rows(smem, ref, *place, copy=mosaic.copied,
                                   widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
-            pl.run_scoped(copied, staging[output], **_collective(consumers))
+            pl.run_scoped(copied, staging[output])
             if not interpret:
                 plgpu.wait_gmem_to_smem(0)
 
@@ -575,7 +554,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             return walk
 
-        mosaic.consumed(self, tiles, schedule, issue, finish, store, index, walking, axis=axis)
+        mosaic.consumed(self, tiles, schedule, issue, finish, store, 0, walking, axis=axis)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
@@ -617,15 +596,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 run = (shape[0] // copies[name], *shape[1:])
                 specs += [plgpu.BlockSpec(run, functools.partial(_run, index_map, lo, each))
                           for each in range(copies[name])]
-            # Two consumers run one pipeline, each copying its share of every block (`thread_axis`).
-            threads = {} if streams.pipeline.consumers == 1 else {"thread_axis": "wg"}
             operands = [streams.views[name][0] for name in names for _ in range(copies.get(name, 1))]
 
-            def piped(*joined, body=body, specs=specs, carry=carry, hi=hi, lo=lo, operands=operands,
-                      threads=threads):
+            def piped(*joined, body=body, specs=specs, carry=carry, hi=hi, lo=lo, operands=operands):
                 pipeline = plgpu.emit_pipeline(
                     functools.partial(body, joins=dict(zip(copies, joined, strict=True))), grid=(hi - lo,),
-                    in_specs=specs, max_concurrent_steps=streams.pipeline.stages, init_carry=carry, **threads)
+                    in_specs=specs, max_concurrent_steps=streams.pipeline.stages, init_carry=carry)
                 return pipeline(*operands)
 
             # The joined tiles staged as the stream's whole tiles are (`lifetimes`' walk scope).
@@ -636,18 +612,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         del streams, lo, hi, first, between
-
-    def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None) -> R:
-        # Two consumers run one collective pipeline (`thread_axis`), whose barriers pair their steps: each
-        # walks every streamed step, its step masking those outside its own range, as a consumer-fed
-        # family's do (`ConsumerFed.walk_own`; a causal attention program's two consumers reach different
-        # diagonals, and their own walks hung, M-ET-15b). One consumer walks its own.
-        if streams.pipeline.consumers == 1:
-            return super().walk_own(streams, views, own, streamed, wg, walk, between=between)
-        del views, own, wg, between
-        lo, hi = streamed
-        return walk(streams, lo, hi, lo)
 
     def loaded(self, copies, *, issued: jax.Array | bool = True, axes: tuple | None = None) -> None:
         # Through registers (no TMA before Hopper), in a layout of the tile's rank: a side vector's the
@@ -704,10 +668,11 @@ class Mma(MmaIssuer, CpAsync):
 
     name = "mma.sync"
 
-    # One consumer warpgroup a program or two, the two running one cp.async pipeline, each copying its share
-    # of every block (`emit_pipeline`'s thread_axis, jax 0.12.0.1.post54); which a launch runs its
-    # objective decides (the GEMM's reads, `gemm.mosaic_gpu._reads`).
-    consumers = 2
+    # One consumer warpgroup a program. Two running one cp.async pipeline (`emit_pipeline`'s thread_axis)
+    # hung on an A100 at every attention forward, one 64-key step among them (FS-C2HANG-a100, M-ET-15),
+    # spilled where the forward derived them (sm80 width 64, split residuals), and no GEMM derived them;
+    # FlashAttention 2's rows come from one warpgroup's wider tiles, not a second warpgroup.
+    consumers = 1
 
     def column_unit(self, dtype) -> int:
         # Its stores move rows through registers, a row's columns over a warp's lanes at least
@@ -721,22 +686,10 @@ class Mma(MmaIssuer, CpAsync):
         return tuple(mosaic.swizzle_columns(dtype, swizzle) for swizzle in (mosaic.SWIZZLE_BYTES, 64))
 
 
-def _most(family: "CpAsync", consumers: int, *, clustered: bool = False) -> None:
-    """A cp.async family's programs take one compute warpgroup up to its bundle's own (`consumers`), no
-    producer, and no cluster (`clustered`: cp.async loads its own program's shared memory alone)."""
-    if consumers not in range(1, family.consumers + 1) or clustered:
-        raise NotImplementedError(f"an mma.sync program takes one to {family.consumers} consumer warpgroups, "
-                                  f"not {consumers}, and no cluster")
-
-
-def _consumers(streams) -> int:
-    """The most consumers any of `streams`' pipelines (one or a tree of them) runs on."""
-    pipelines = jax.tree.leaves(streams, is_leaf=lambda leaf: isinstance(leaf, Pipeline))
-    return max((pipeline.consumers for pipeline in pipelines if isinstance(pipeline, Pipeline)), default=1)
-
-
-def _collective(consumers: int) -> dict:
-    """A scope's allocations collective over the consumers' thread axis where two run (a threaded kernel's
-    scoped allocations are its warpgroups' together)."""
-    return {} if consumers == 1 else {"collective_axes": "wg"}
+def _one(consumers: int, *, clustered: bool = False) -> None:
+    """A cp.async family's programs take one compute warpgroup, no producer, and no cluster (`clustered`:
+    cp.async loads its own program's shared memory alone)."""
+    if consumers != 1 or clustered:
+        raise NotImplementedError(f"an mma.sync program takes one consumer warpgroup, not {consumers}, "
+                                  "and no cluster")
 

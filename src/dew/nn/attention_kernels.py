@@ -13,14 +13,7 @@ import numpy as np
 from dew._devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
-from .kernels.generation import (
-    INHERENT,
-    bf16_dot_runs,
-    capability,
-    cuda_lowered,
-    device_generation,
-    gpu_placed,
-)
+from .kernels.generation import INHERENT, bf16_dot_runs, capability, device_generation, gpu_placed
 from .kernels.selection import Kernel, Op, Requirement
 from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
@@ -59,6 +52,29 @@ def flash_architectures() -> tuple[str, ...] | None:
     if importlib.util.find_spec('dew_flash_attn') is None:
         return None
     return importlib.import_module('dew_flash_attn').ARCHITECTURES
+
+
+def flash_lowered() -> bool:
+    """Whether FlashAttention's call lowers here for the call's target: the installed wheel holds code for
+    it, on this process's own GPU (`gpu_placed`) or, within `assumed`, for the assumed GPU's compile-only
+    devices, attached or not: the wheel's FFI targets lower and compile for them on any host, the target
+    stated to it (`flash_target`: FlashAttention-3 or -2, and the forward's split of its keys, by the
+    target's generation and multiprocessors, not the host's)."""
+    architectures = flash_architectures()
+    if architectures is None:
+        return False
+    found = generation.assumption()
+    return gpu_placed() or (found is not None and generation.backend() == 'gpu'
+                            and flash_built_for(found.generation, architectures))
+
+
+def flash_target() -> tuple[str, int] | None:
+    """The GPU a FlashAttention call lowers for, as the wheel takes it (`dew_flash_attn.targeting`): an
+    assumed one's generation and multiprocessors, None for this process's own."""
+    if generation.assumption() is None:
+        return None
+    target = generation.gpu_target()
+    return None if target.multiprocessors is None else (target.generation, target.multiprocessors)
 
 
 def flash_built_for(device: str, architectures: tuple[str, ...]) -> bool:
@@ -504,14 +520,15 @@ def _attention_preferred(case: AttentionCase) -> str:
 
 def _hosted(kernel: str) -> str:
     """What this host runs for the target's `kernel`: FlashAttention's where its call lowers for the target
-    (`cuda_lowered`: on its own GPU, or a compile ahead's on a host of the target's GPU, whose FFI targets
-    lower for its compile-only devices: a step compiled ahead for an H100 on an H100 ran XLA's attention, its
-    fp32 scores 4.3 GB the run's step never holds, row 3792), cuDNN's or tokamax's Triton kernel where this
+    (`flash_lowered`: on its own GPU, or for an assumed GPU's compile-only devices on any host holding the
+    wheel, a GPU of the target's or none: a step compiled ahead for an H100 on an H100 ran XLA's attention,
+    its fp32 scores 4.3 GB the run's step never holds, row 3792; on a CPU every compile ahead did, row 4616),
+    cuDNN's or tokamax's Triton kernel where this
     process places the call on its own GPU (`gpu_placed`), else jax.nn's xla attention, as a step traced for
     an assumed GPU on a CPU lowers; Dew's own Pallas kernels lower for the target on any host. The route
     reports a substitution (`Route.ran`), which a compile ahead names (`dew.training.ahead.substituted`)."""
     if kernel == 'flash':
-        return kernel if cuda_lowered() else 'xla'
+        return kernel if flash_lowered() else 'xla'
     return 'xla' if kernel in ('cudnn', 'triton') and not gpu_placed() else kernel
 
 
