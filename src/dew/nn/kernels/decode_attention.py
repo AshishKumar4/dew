@@ -52,6 +52,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.decode_geometry import grouped_query
 from dew.nn.kernels import launches
+from dew.nn.precision import precision_names
 
 from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
@@ -117,15 +118,17 @@ _Need = Requirement["AttentionCase"]
 
 
 def run_products(case: "AttentionCase") -> bool:
-    """Whether a decode kernel's products are the ones the run declares where the call states none
+    """Whether a decode kernel computes the products the run declares where the call states none
     (`jax_default_matmul_precision`, a run's `Numerics.matmul`; a call's own non-default precision is its
-    `arithmetic`): fp32 operands multiplied in IEEE fp32 (the decode kernel's highest precision, the
-    template's exact parts), which a run declares by `highest` or the F32_F32_F32 algorithm, not by the
-    default a GPU runs as TF32; 16-bit operands summed in fp32, which every declaration but an algorithm
-    summing narrower takes."""
-    names = precision_names(jax.config.jax_default_matmul_precision)
+    `arithmetic`). JAX's default leaves them to the backend, which any kernel's are. A declaration names
+    them: fp32 operands in IEEE fp32 (`highest`, F32_F32_F32), which the decode kernels compute (the decode
+    kernel's highest precision, the template's exact parts), not TF32's or bf16 passes', which xla's
+    attention honors; 16-bit operands summed in fp32, every declaration but an algorithm summing narrower."""
+    names = precision_names(jax.config.jax_default_matmul_precision) - {"DEFAULT"}
+    if not names:
+        return True
     if jnp.dtype(case.dtype) == jnp.dtype(jnp.float32):
-        return bool(names & {"HIGHEST", "F32_F32_F32"})
+        return names <= {"HIGHEST", "F32_F32_F32"}
     return not any(name.endswith(("_BF16", "_F16")) for name in names)
 
 
