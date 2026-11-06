@@ -33,6 +33,7 @@ groups of at most `dew._coordination.GATHER_BYTES`.
 from __future__ import annotations
 
 import base64
+import contextvars
 import ctypes
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -255,26 +256,27 @@ class NCCLPush:
 
     - `source` is the `Pretrained` the replicas were launched from; its
       `export` gives the tensors, of the trained tree and of every other tree
-      the source exports (a decision release's readout), each gathered from
-      the pool to process 0 first.
+      the source exports (a decision release's readout), each read home by
+      the pool as process 0 sends it (`reading_home`).
     - `engines` are the replicas' root URLs, not their `/v1` API URLs.
     - `library` is the engine's own libnccl.so.2, because NCCL refuses a
       peer of another version when the group opens; or a maker of the
       push's `Collectives` from the sending device's CUDA ordinal, which
       makes its calls instead (an emulation of NCCL over the host).
     - `chunk` bounds the bytes of tensors placed on the sender device beside
-      the trainer's state. The next chunk is copied over while the current
-      one broadcasts, so a push holds at most two chunks there, or two of its
-      largest tensor.
+      the trainer's state. The first chunk is read before any replica
+      pauses, and each next one is read and copied over on a reader thread
+      while the current one broadcasts, so a push holds at most two chunks
+      there, or two of its largest tensor.
 
     Floating-point leaves are cast to `dtype` before the push, and `timeout`
     bounds each HTTP call in seconds. Groups open on the first push and stay
     open until `close`. Every process of a pool calls the push.
 
-    `timings` holds the seconds each phase of the last push took: `gather`
-    (the cast and the gather to process 0's host, on every process), and on
-    process 0, which sends, `export`, `send` (copies and broadcasts until
-    every replica has loaded the tensors) and `total`.
+    `timings` holds the seconds each phase of the last push took: `export`
+    (the publication's specs and chunks, before any tensor is read, on every
+    process), and on process 0, which sends, `send` (reads, copies and
+    broadcasts until every replica has loaded the tensors) and `total`.
     """
 
     source: Pretrained
@@ -345,14 +347,18 @@ class NCCLPush:
               version: int) -> None:
         library = self._opened(target, ordinal)
         began = time.perf_counter()
+        # The first chunk read and placed before any replica pauses: a pause spans the transfers and the
+        # reads they overlap alone. Held in a list `_broadcast` takes it from, so none of these frames
+        # keeps it past its broadcast.
+        first = [jax.device_put([exported[name] for name in chunks[0]], target)]
         _vllm_publication(self.engines, version, self.timeout,
-                          lambda: self._deliver(library, target, exported, specs, chunks, version),
+                          lambda: self._deliver(library, target, exported, specs, chunks, first, version),
                           stamped=True)
         self.timings["send"] = time.perf_counter() - began
 
     def _deliver(self, library: Collectives, target: SingleDeviceSharding, exported: Mapping[str, np.ndarray],
                  specs: Mapping[str, jax.ShapeDtypeStruct], chunks: Sequence[Sequence[str]],
-                 version: int) -> Mapping[str, BaseException]:
+                 first: list[list[jax.Array]], version: int) -> Mapping[str, BaseException]:
         """Load `tensors` into every paused replica over its group and finish the update under `version`.
 
         Each replica's `/update_weights` waits for the broadcast this side
@@ -381,7 +387,8 @@ class NCCLPush:
             receives = [(root, pool.submit(_post, root, "/update_weights", listing, self.timeout))
                         for root in self.engines]
             try:
-                self._broadcast(library, target, exported, chunks, [receive for _, receive in receives])
+                self._broadcast(library, target, exported, chunks, first,
+                                [receive for _, receive in receives])
             except BaseException:
                 self.close()
                 raise
@@ -424,31 +431,37 @@ class NCCLPush:
 
     def _broadcast(
         self, library: Collectives, target: SingleDeviceSharding, exported: Mapping[str, np.ndarray],
-        chunks: Sequence[Sequence[str]], receives: Sequence[Future[httpx.Response]],
+        chunks: Sequence[Sequence[str]], first: list[list[jax.Array]],
+        receives: Sequence[Future[httpx.Response]],
     ) -> None:
-        """Broadcast the `exported` tensors `chunks` name, in order, to every group, a chunk of at most
-        `chunk` bytes read and resident at a time.
+        """Broadcast the `exported` tensors `chunks` name, in order, to every group, the first chunk's
+        placed taken from `first` (which it empties, so the chunk is released once it has sent), a chunk
+        of at most `chunk` bytes read and resident at a time beside the one sending.
 
-        The next chunk is read and its copies issued before the current chunk
-        broadcasts, so the reads and host-to-device copies overlap the
-        transfers; a chunk is released only after the default stream has
-        finished with it, or a replica's receive (`receives`) has failed. Each
-        tensor goes to every group, and the next waits until each group has
-        issued it (`_Library.ready`).
+        The next chunk is read and its copies issued on a reader thread while
+        the current chunk broadcasts, so the reads and host-to-device copies
+        overlap the transfers, the reads home in the caller's scope
+        (`reading_home`) and in the order every process reads them; a chunk is
+        released only after the default stream has finished with it, or a
+        replica's receive (`receives`) has failed. Each tensor goes to every
+        group, and the next waits until each group has issued it
+        (`_Library.ready`).
         """
-        def read(chunk: Sequence[str]) -> list[np.ndarray]:
-            return [exported[name] for name in chunk]
+        def placed_chunk(chunk: Sequence[str]) -> list[jax.Array]:
+            return jax.device_put([exported[name] for name in chunk], target)
 
         groups = list(self._groups.values())
-        placed = jax.device_put(read(chunks[0]), target)
-        for index in range(len(chunks)):
-            following = (jax.device_put(read(chunks[index + 1]), target) if index + 1 < len(chunks)
-                         else None)
-            for buffer in jax.block_until_ready(placed):
-                for comm in groups:
-                    library.broadcast(comm, buffer.unsafe_buffer_pointer(), buffer.size, str(buffer.dtype))
-                library.ready(groups, receives)
-            library.settled(groups, receives)
-            if following is not None:
-                placed = following
+        placed = first.pop()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="dew-weight-read") as reader:
+            for index in range(len(chunks)):
+                following = (reader.submit(contextvars.copy_context().run, placed_chunk, chunks[index + 1])
+                             if index + 1 < len(chunks) else None)
+                for buffer in jax.block_until_ready(placed):
+                    for comm in groups:
+                        library.broadcast(comm, buffer.unsafe_buffer_pointer(), buffer.size,
+                                          str(buffer.dtype))
+                    library.ready(groups, receives)
+                library.settled(groups, receives)
+                if following is not None:
+                    placed = following.result()
 
