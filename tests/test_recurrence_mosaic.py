@@ -764,7 +764,6 @@ def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_inte
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed)
 
 
-@pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_a_bf16_gated_delta_nets_training_step_with_its_norm_is_on_par_interpreted():
     """Row 184's gated delta net cell (tests/recurrence_matrix.py: the template, bf16, one sequence)
     interpreted off a GPU, its reference the portable math there (fla's Triton kernels run on a GPU alone):
