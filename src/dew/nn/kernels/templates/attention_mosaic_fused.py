@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import generation, tuning
@@ -90,16 +89,17 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     229,424 bytes held whole against its 166,912); where dK and dV leave `typed` (`stores_typed`), in `dtype`
     through a stage of their own after the walks, rounded once there."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
-    stage = plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32)
+    stage = family.staged_memory((consumers, max(block_q, block_k), width), jnp.float32)
     held = family.adds_through_shared
-    scoped = [plgpu.SMEM((consumers, block_k, width), dtype), plgpu.SMEM((consumers, block_k, width), dtype),
-              plgpu.SMEM((consumers, 2, block_q, block_k), dtype), *([stage] if held else []),
+    scoped = [family.staged_memory((consumers, block_k, width), dtype),
+              family.staged_memory((consumers, block_k, width), dtype),
+              family.staged_memory((consumers, 2, block_q, block_k), dtype), *([stage] if held else []),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     if streamed is None:
         streamed = streams_statistics(family, config, width, dtype, stages, reduced=reduced)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
               **({name: ((block_q,), kind) for name, kind in STATISTICS.items()} if streamed else {})}
-    out = plgpu.SMEM((consumers, block_k, width), dtype) if typed else stage
+    out = family.staged_memory((consumers, block_k, width), dtype) if typed else stage
     return scoped, family.streams(blocks, stages, consumers), [] if held and not typed else [out]
 
 def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,
@@ -218,7 +218,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         # The output stage where the walks' adds read it; else the epilogue's own, scoped after the walks.
         k_smem, v_smem, staged, *out_smem, k_loaded, v_loaded = refs
         out_smem = out_smem[0] if out_smem else None
-        row, head = lax.axis_index("batch"), lax.axis_index("heads")
+        row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, group)
         statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
         dq_ready, dkv_ready = _turns(family, walk.interpret, (batch, heads, q_steps),
@@ -226,7 +226,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                                      grouped=grouped)
         views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
-        pair_first = lax.axis_index("k_tiles") * pair
+        pair_first = family.program_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(consumers)])
 

@@ -471,6 +471,34 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
     _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True)
 
 
+TPU_PASSES = {"fold": {"natural": False}, "natural": {"natural": True},
+              "sinks": {"natural": False, "sinks": True},
+              "training": {"natural": False, "training": template.Kept.SPLIT}}
+"""The forward passes a TPU core's launches run (`mosaic_tpu.MXU`): the base-2 fold, the natural form, an
+initial state, and the training forward's output beside its residuals."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("forward", TPU_PASSES)
+@pytest.mark.parametrize("call", CALLS)
+def test_a_tpu_cores_forward_is_on_par_interpreted(call, forward):
+    """The forward on a v5e's MXU (`mosaic_tpu.MXU`), the one mainloop's launches through the family's
+    seams (its staging, reads, grid coordinates and turns), in each pass, under Pallas TPU's interpreter: on
+    par with the reference (check 1)."""
+    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], interpret=True,
+                   target=generation.gpu_target("v5e"), **TPU_PASSES[forward])
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", CALLS)
+def test_a_tpu_cores_backward_is_on_par_interpreted(call):
+    """The backward on a v5e's MXU, its fused launch's dQ adds each program's in turn on the core's one
+    TensorCore (`mosaic_tpu.VmemRings.added`), under Pallas TPU's interpreter: every gradient on par with
+    the reference (check 1)."""
+    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True,
+                    target=generation.gpu_target("v5e"))
+
+
 @INTERPRETS
 @pytest.mark.parametrize("call", CALLS)
 def test_a_dropping_backward_is_on_par_over_every_call_interpreted(call):
@@ -1893,26 +1921,27 @@ def _forward_kernels(op, ba, config) -> dict:
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("stored", ["bfloat16", "int8"])
+@pytest.mark.parametrize("stored", ["bfloat16", "int8", "float32"])
 @pytest.mark.parametrize("width", [64, 128])
 @pytest.mark.parametrize("generation_name", GATED)
 def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, width, stored):
     """A decode step (`attention_decode.attend`: its plain launch at the plan's streaming key tile and
     slices, `MosaicForward.streaming`, and its masked rewalk's launches), 32 query heads over 8 key heads
-    `width` wide, two rows of 4096 keys, its cache bf16 or int8 codes with their scales (each slot converted
-    in registers, `_Codes`), lowered and compiled by ptxas for `generation_name` on this CPU
-    (tests/kernel_compile.py): every launch within its shared memory and spilling nothing (`mosaic_failures`),
-    where the forward gate's prefill calls derive their own tiles."""
+    `width` wide, two rows of 4096 keys, its cache bf16, int8 codes with their scales (each slot converted
+    in registers, `_Codes`) or float32 under a float32 query (its parts, `MosaicForward.parts`), lowered
+    and compiled by ptxas for `generation_name` on this CPU (tests/kernel_compile.py): every launch within
+    its shared memory and spilling nothing (`mosaic_failures`), where the forward gate's prefill calls
+    derive their own tiles."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels.templates import attention_decode
 
     rows, keys = 2, 4096
-    query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.bfloat16)
+    query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.float32 if stored == "float32" else jnp.bfloat16)
     key = jax.ShapeDtypeStruct((rows, keys, 8, width), jnp.dtype(stored))
     scale = jax.ShapeDtypeStruct((rows, 8, keys), jnp.float32)
-    quantized = stored != "bfloat16"
+    quantized = stored == "int8"
     spans = template.spans(1, keys, rows, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
 
     def decode(query, key, value, *scales):
