@@ -4,6 +4,8 @@ one process (`gpu_flow`), each cell its own file's property:
 - A dense product's exact sums survive one row tile through Triton's MMA accumulation (test_gemm_template).
 - CUTLASS runs the grouped projection as exactly as XLA wherever it is chosen, over every grouping that
   routes a row (test_grouped_gemm).
+- The blockwise FP8 kernel gradient (rows contiguous, step scales) holds check 1 on an H100
+  (test_gemm_blockwise).
 - The template takes gpt-oss's 2880-wide projection, its ragged stores' one-row rungs, as exactly as XLA's
   (test_grouped_gemm; row 4474).
 - A ring streams tiles of their own trip counts, and consumers feeding their own ring split a step, on an
@@ -38,6 +40,7 @@ import numpy as np
 import nvfp4_matrix
 import pytest
 import test_contracts_gemm as contracts_gemm
+import test_gemm_blockwise as gemm_blockwise
 import test_gemm_tcgen05 as gemm_tcgen05
 import test_gemm_template as gemm_template
 import test_grouped_gemm as grouped_gemm
@@ -128,6 +131,8 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for depth in (128, 512)),
         Cell("the template takes a gpt-oss width as exactly as XLA",
              grouped_gemm.the_template_takes_a_gpt_oss_width_as_exactly_as_xla),
+        Cell("the blockwise FP8 kernel gradient is on par",
+             gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90"),
         *(Cell(f"CUTLASS runs a mapped projection as exactly as XLA where chosen: "
                f"{'shared' if shared else 'mapped'} matrices",
                functools.partial(grouped_gemm.cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen,
