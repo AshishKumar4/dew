@@ -217,11 +217,11 @@ PACKED_SCHEMA_SEEDS = 128
 """Check 1's declared seeds for packed rows reading their own schemas against each row alone, sized
 paired (`seeds_for` with the packed windows as `dew_fn`, 2026-10-28 on armada). The check reads 128
 draws of windows of 1,024 tokens beside 2,048 of contexts, 1,004 s on a CI core, so CI's map tasks draw
-them eight a task (`check1_shards`, row 3907)."""
+them four a task (`check1_shards`, row 3907): eight took 90 to 124 s under armada's load (11-06)."""
 
 
 # PACKED_SCHEMA_SEEDS, as literal counts, which the plan reads from the source (tools/armada/ci.py `sites`).
-@pytest.mark.check1_shards(seeds=128, per_task=8)
+@pytest.mark.check1_shards(seeds=128, per_task=4)
 def test_packed_rows_decide_each_schema_in_context_as_each_row_alone():
     """Rows whose schemas are their contexts, packed several a window, decide each row's options as the
     row does in a window of its own, through the unmodified objective, its cross-attention open (every
