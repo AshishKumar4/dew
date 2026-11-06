@@ -6,8 +6,7 @@ the one switch the templates take their derived forms behind (`derived`)."""
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
@@ -16,7 +15,6 @@ from egglog import get_callable_args
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
-from dew._cache import DERIVED
 from dew.algebra import program, terms
 from dew.nn import programs
 from dew.nn.precision import float32_dot_general
@@ -230,21 +228,6 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
     return [read(atom) for atom in jaxpr.outvars]
 
 
-@contextlib.contextmanager
-def derived(on: bool = True) -> Iterator[None]:
-    """Within the block, the templates take their algebra's derived forms (`derive`, `scan`) where they hold
-    them in place of their hand-written ones (`on`), or the hand-written ones: a context of JAX's trace
-    (`dew._cache.DERIVED`), so a program held across the switch traces afresh. The one switch the derived and
-    hand-written forms swap behind, which check 1 drives both ways (docs/design/algebra.md §6.9)."""
-    with DERIVED(on):
-        yield
-
-
-def derived_on() -> bool:
-    """Whether the templates take their derived forms here (`derived`)."""
-    return bool(DERIVED.value)
-
-
 def evaluated(region: terms.Region, form: terms.Term, leaves: Sequence,
               known: Mapping[Hashable, jax.Array]) -> jax.Array:
     """A form's value (`evaluator`'s)."""
@@ -253,6 +236,16 @@ def evaluated(region: terms.Region, form: terms.Term, leaves: Sequence,
 
 PLAIN_PRODUCT = (((1,), (0,)), ((), ()))
 """A matrix product's dimension numbers, `a @ b`: the left's last axis with the right's first, no batch."""
+
+
+def _oriented(numbers, ranks: tuple[int, int]) -> tuple[bool, bool] | None:
+    """Whether each operand of a contraction of one axis of each of two matrices (`ranks` 2), no batch axis,
+    is taken transposed to make it `[m, k] @ [k, n]` (`PLAIN_PRODUCT`'s): the left's where it contracts its
+    first axis, the right's where it contracts its second; None for any other contraction."""
+    (left, right), batch = numbers
+    if batch != ((), ()) or len(left) != 1 or ranks != (2, 2):
+        return None
+    return left[0] == 0, right[0] == 1
 
 
 class Operand(NamedTuple):
@@ -320,11 +313,16 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
             left, right, index = args
             _, params = region.params[terms.integer(index)]
             numbers = jax.tree.map(int, params["dimension_numbers"])
-            if product is not None and numbers == PLAIN_PRODUCT:
-                made = (product(value(left), value(right)) if named is None
-                        else product(named(left, right), value(left), value(right)))
+            a, b = value(left), value(right)
+            oriented = _oriented(numbers, (a.ndim, b.ndim)) if product is not None else None
+            if oriented is not None:
+                # Any one-axis contraction of two matrices is the mainloop's product of them oriented as it
+                # takes them, `[m, k] @ [k, n]`: a transposed operand's product its own, never Dew's.
+                a, b = (operand.T if flip else operand
+                        for operand, flip in zip((a, b), oriented, strict=True))
+                made = product(a, b) if named is None else product(named(left, right), a, b)
             else:
-                made = float32_dot_general(value(left), value(right), params["dimension_numbers"],
+                made = float32_dot_general(a, b, params["dimension_numbers"],
                                            precision=params.get("precision"),
                                            preferred_element_type=params.get("preferred_element_type"))
         elif (exponential is not None and (args := get_callable_args(term, terms.Term.unary)) is not None

@@ -1,6 +1,6 @@
 """The derived forms' stability (bible §6; docs/design/testing.md, a template's stability suite): every
-derived form behind the switch (`dew.algebra.forms.derived`) under the stability families that broke
-derived forms before, generated over the template suites' own families and the edges each pass found:
+derived form under the stability families that broke derived forms before, generated over the template
+suites' own families and the edges each pass found:
 
 - attention's: the template suite's every family (fp32 and bf16 as drawn, and in fp16, the dtype the derived
   forward walks), on the plain-JAX mainloop, forward and backward, its output and gradients finite wherever
@@ -31,7 +31,6 @@ import test_recurrence_stability as recurrence_suite
 from reference_error import widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 
-from dew.algebra import forms as algebra_forms
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_portable
 
@@ -41,7 +40,7 @@ def derived(forms: str = "fast"):
     """Within the block, the run's `forms` (the fast ones, or the accurate ones: natural logits, the anchor's
     split, the keyed sums) with the template's walks the derived ones."""
     numerics = dataclasses.replace(generation.numerics(), forms=forms)
-    with generation.run_precision(numerics), algebra_forms.derived():
+    with generation.run_precision(numerics):
         yield
 
 
