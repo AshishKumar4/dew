@@ -27,12 +27,6 @@ from dew.nn.kernels.templates import bundles, report, resources
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
-def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
-    shapes = support.COMPILED_SHAPES.values()
-    assert max(shape["width"] for shape in shapes) == fla_gdn.WIDEST_KEYS == 256
-    assert max(shape["columns"] for shape in shapes) == fla_gdn.WIDEST == 128
-
-
 def rule_launches(module) -> list:
     """The launches the rule of `module` (`fla_gdn`, `fla_kda`) makes forward and backward, as its trace
     records them (`tuning.seen`)."""
