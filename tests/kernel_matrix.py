@@ -33,6 +33,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "hook": ("plain", "sinks", "softcap"),
         "dtype": ("bfloat16", "float16", "float32"),
         "width": ("64", "128"),
+        "kernel": ("decode", "cudnn", "triton", "template"),
     },
     "gemm": {
         "generation": ("sm90", "sm80"),
