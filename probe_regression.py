@@ -34,6 +34,27 @@ def trace_dealt(self, pipeline, partition, consumed):
     return result
 lowering._Build.dealt_examples = trace_dealt
 
+original_streamed = lowering._Build.streamed
+def trace_streamed(self, manifest, pipeline, partition, places=None, quota=None):
+    print("ROOT", partition, "epochs", self.lowering.epochs, "places", places, "quota", quota,
+          flush=True)
+    return original_streamed(self, manifest, pipeline, partition, places, quota)
+lowering._Build.streamed = trace_streamed
+
+original_stage = lowering._Build.stage
+def trace_stage(self, rows, stage, pipeline, partition, at):
+    if isinstance(stage, lowering.Limit):
+        print("LIMIT", partition, stage.count, flush=True)
+    return original_stage(self, rows, stage, pipeline, partition, at)
+lowering._Build.stage = trace_stage
+
+original_process = _Writer.process
+def trace_process(self, row_id, ordinal, value, transform):
+    result = original_process(self, row_id, ordinal, value, transform)
+    print("WRITER", row_id, "input", value, "output", result, flush=True)
+    return result
+_Writer.process = trace_process
+
 for case, implementation in (
     ("original", original),
     ("without_blanket_cache_dropping", without_blanket_cache_dropping),
@@ -63,4 +84,17 @@ for case, implementation in (
         assert sorted(observed) != list(range(12)), "the known repro must be red"
     else:
         assert sorted(observed) == list(range(12)), "each row exactly once"
+    if hasattr(__import__("test_parquet_files"),
+               "test_a_parquet_stream_read_by_more_shares_than_files_publishes_its_fill"):
+        from test_parquet_files import (
+            test_a_parquet_stream_read_by_more_shares_than_files_publishes_its_fill as target,
+        )
+        try:
+            target(Path(tempfile.mkdtemp()))
+        except AssertionError:
+            assert case == "original"
+            print("TARGET_TEST", case, "RED", flush=True)
+        else:
+            assert case != "original"
+            print("TARGET_TEST", case, "GREEN", flush=True)
 print("RED_GREEN_CONFIRMED", flush=True)
