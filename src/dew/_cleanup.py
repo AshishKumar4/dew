@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from pathlib import Path
 
@@ -178,7 +178,7 @@ class _Starting:
     undoing, by whichever of the two holds the group then: the hand-over is one step under `lock`. `done`
     is set once the start has handed its group over, raised, or undone what it started."""
 
-    def __init__(self, command: Sequence[str], options: dict[str, object]) -> None:
+    def __init__(self, command: Sequence[str], options: Mapping[str, object]) -> None:
         self.command, self.options = command, options
         self.lock = threading.Lock()
         self.done = threading.Event()
