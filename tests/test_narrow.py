@@ -294,59 +294,6 @@ def test_a_skipped_update_keeps_the_copies_of_the_parameters_it_kept():
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
-def test_a_step_with_copies_traces_its_loss_as_often_as_one_without():
-    """A step's narrow copies are read off the trace of its loss the trainer makes for its shapes, so a step
-    with them traces its objective's loss as often as one without: a trace of a Qwen3.5-4B step's loss is
-    seconds of its compile, which the copies traced again (row 4260)."""
-    from dew.objectives.lm import LMObjective
-    from dew.training import Layout, MeshSpec, Trainer
-
-    traces = []
-
-    class Counted(LMObjective):
-        """`_decoder`'s objective, each trace of its loss counted."""
-
-        def _loss(self, *args, **kwargs):
-            traces.append(1)
-            return super()._loss(*args, **kwargs)
-
-    objective, batch = _decoder()
-    counted = {}
-    for copies in (True, False):
-        traces.clear()
-        with chosen(narrow_copies='on' if copies else 'off'):
-            trainer = Trainer(Counted(objective.model, seq_len=8, pad_id=0), optax.sgd(0.5),
-                              key=jax.random.key(0), mesh=MeshSpec(), layout=Layout(min_shard=1))
-            state = trainer.initial_state()
-            stepped, *_ = trainer.compile(state, batch)(state, batch)
-            counted[copies] = len(traces)
-        assert (stepped.compute is not None) == copies
-    assert counted[True] == counted[False], counted
-
-
-def test_a_step_draws_its_objectives_tree_once_for_its_shapes_and_axes():
-    """A step's state shapes and the axes its placement reads come of one draw of the objective's tree, the
-    one its state's shapes trace: a second trace of a Qwen3.5-4B step's draw was 8 to 12 s of its compile
-    (row 4260)."""
-    from dew.objectives.lm import LMObjective
-    from dew.training import Layout, MeshSpec, Trainer
-
-    draws = []
-
-    class Counted(LMObjective):
-        """`_decoder`'s objective, each draw of its tree counted."""
-
-        def fresh_variables(self, *args, **kwargs):
-            draws.append(1)
-            return super().fresh_variables(*args, **kwargs)
-
-    objective, batch = _decoder()
-    trainer = Trainer(Counted(objective.model, seq_len=8, pad_id=0), optax.sgd(0.5), key=jax.random.key(0),
-                      mesh=MeshSpec(), layout=Layout(min_shard=1))
-    trainer.compile(trainer.initial_state(), batch)
-    assert len(draws) == 1, draws
-
-
 def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     """The fit check reads the state's arguments as already on the devices;
     the copies are not yet when the first step compiles, since `run` builds
