@@ -15,6 +15,7 @@ import contextlib
 import dataclasses
 import itertools
 import math
+from fractions import Fraction
 from pathlib import Path
 
 import jax
@@ -25,7 +26,6 @@ import pytest
 from certified import assert_certified
 from flax import linen as nn
 from model_support import moved
-from one_draw import assert_as_exact_as_the_reference
 from recording import RecordingTracker
 from reference_error import (
     as_given,
@@ -1097,41 +1097,38 @@ def _held_by_its_roundings(found, truth, magnitude, fn, *arguments):
                                 chain_roundings(jax.make_jaxpr(fn)(*arguments)))
 
 
-def _kl_truth(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
-    """The KL, its JVP and its VJP to the mean and the variance in float64, on the float32 inputs."""
-    wide = [value.astype(np.float64) for value in
-            (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)]
-    difference, moving = wide[0] - wide[1], wide[3] - wide[4]
-    divergence = np.sum(difference**2, axis=1) / (2 * wide[2])
-    return {"KL": divergence,
-            "JVP": np.sum(difference * moving, axis=1) / wide[2] - divergence * wide[5] / wide[2],
-            "VJP to the mean": wide[6][:, None] * difference / wide[2][:, None],
-            "VJP to the variance": -wide[6] * divergence / wide[2]}
-
-
-def _plain_kl(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
-    """The reference arm (the gate's ruling on rows 1722 and 1778): the KL, its JVP along every tangent at
-    once and its VJPs as the plain float32 textbook formulas compute them, `|m - r|**2 / (2 v)` as
-    written, `sum((m - r) * (t_m - t_r)) / v - KL * t_v / v`, `c (m - r) / v` and `-c KL / v`, with no
-    alignment or scaling of any kind, compiled as Dew's arm is."""
-    def plain(m, r, v, tm, tr, tv, ct):
-        d = m - r
-        axes = tuple(range(1, d.ndim))
-        kl = jnp.square(d).sum(axis=axes) / (2 * v)
-        return {"KL": kl, "JVP": (d * (tm - tr)).sum(axis=axes) / v - kl * tv / v,
-                "VJP to the mean": ct[:, None] * d / v[:, None], "VJP to the variance": -ct * kl / v}
-
-    inputs = (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)
-    return {name: np.asarray(value) for name, value in jax.jit(plain)(*map(jnp.asarray, inputs)).items()}
+def _kl_oracle(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
+    """The KL, its JVP and its VJP to the mean and the variance exactly: each element the rational value
+    of its formula over the float32 inputs' own values (`Fraction`), rounded once to float64, whose range
+    holds every one of them (the largest, 2**639, a VJP to the variance at float32's largest cotangent
+    over its least variance; the least, 2**-635)."""
+    exact = [[[Fraction(float(value)) for value in np.atleast_1d(row)] for row in operand] for operand in
+             (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)]
+    divergences, moved, to_means, to_variances = [], [], [], []
+    for m, r, (v,), tm, tr, (tv,), (c,) in zip(*exact, strict=True):
+        difference = [a - b for a, b in zip(m, r, strict=True)]
+        divergence = sum(d * d for d in difference) / (2 * v)
+        divergences.append(divergence)
+        moved.append(sum(d * (a - b) for d, a, b in zip(difference, tm, tr, strict=True)) / v
+                     - divergence * tv / v)
+        to_means.append([c * d / v for d in difference])
+        to_variances.append(-c * divergence / v)
+    return {name: np.asarray(values, np.float64) for name, values in
+            (("KL", divergences), ("JVP", moved), ("VJP to the mean", to_means),
+             ("VJP to the variance", to_variances))}
 
 
 def _kl_bounds(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
-    """Each output's derived bound where the plain float32 arm overflows and has no reference (the
-    gate's ruling), check 2's form (`assert_fp32_reduction_bound`): the float64 magnitude of its terms
-    and the rounding count of its plain formula, a KL of n coordinates n + 2 (each difference, each
-    square, the n - 1 additions, the division), a VJP to the mean three, the variance's the KL's and
-    two more, and a JVP twice the KL's and six more over its terms' absolute sum, so a sum that
-    cancels is bounded by what it cancelled. Each as `(magnitudes, roundings)`."""
+    """Each output's derived bound, check 2's form (`assert_fp32_reduction_bound`, 2 gamma_n of its
+    terms' float64 magnitude): the magnitude of its terms and n, the roundings of the plain formula.
+    Dew forms each output by the plain formula's operations on operands scaled by powers of two, exact
+    while every scaled value is normal (`_scaled`, `_split`), so each output rounds as often as the plain
+    formula does: a KL of n coordinates n + 2 times (each difference, each square, the n - 1 additions,
+    the division); a VJP to the mean three (the difference, the product, the division); the variance's
+    the KL's and two more (the product, the division); and a JVP at most twice the KL's and six more (the
+    tangents' differences, the products, the sum and a quotient, the variance's term's product and
+    quotient, and the join), over its terms' absolute sum, so a sum that cancels is bounded by what it
+    cancelled. Each as `(magnitudes, roundings)`."""
     wide = [np.asarray(value, np.float64) for value in
             (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)]
     difference, moving = wide[0] - wide[1], wide[3] - wide[4]
@@ -1180,51 +1177,29 @@ def _below_normal(values):
     return (values.astype(np.float32).view(np.uint32) >> 23 & 0xFF) == 0
 
 
-BAND = 16
-"""The binades one check-1 leaf of the KL's outputs spans: rows whose truths lie further apart are
-judged as leaves of their own, so a small row is not read as a large one's float64 zero."""
-
-
-def _assert_kl_outputs(dew, plain, truth, bounds, label):
-    """Each output of `_kl_derivatives` against the float64 truth, element by element as the gate rules
-    (rows 1722 and 1778): where the plain float32 arm (`_plain_kl`) is finite, on par with it (the grid's
-    one-draw rule, `assert_as_exact_as_the_reference` at FACTOR until the gate's switch-over to PARITY;
-    unscaled, its rows whole and its zero rows included, each band of `BAND` binades of the rows' sizes a
-    leaf of its own, an element the plain arm leaves out of a row taking the truth in both arms); where
-    it overflows, finite wherever the truth is a normal float32 and within the derived bound of the
-    truth (`_kl_bounds`); infinite of its sign past the largest float32, zero or subnormal below the
-    least, by the truth's place in float32's range (`_kinds`); and near either end (`edge`), the bound's
-    or the end's: infinite of its sign above, zero or subnormal below."""
-    for name, exact in truth.items():
-        value, reference, kinds = np.asarray(dew[name]), np.asarray(plain[name]), _kinds(exact)
-        # A truth below float32's least normal, or near either end, is held by its kind below.
-        held = np.isfinite(reference) & ((kinds == "normal") | (exact == 0))
-        mine, theirs = np.where(held, value, exact), np.where(held, reference, exact)
-        axes = tuple(range(1, exact.ndim))
-        size = np.max(np.abs(exact), axis=axes) if axes else np.abs(exact)
-        band = np.frexp(size)[1] // BAND
-        # Where the plain arm and Dew both give the float64 value there is no error to compare.
-        apart = (mine != exact) | (theirs != exact)
-        measured = np.any(apart, axis=axes) if axes else apart
-        for level in np.unique(band[measured]):
-            rows = measured & (band == level)
-            assert_as_exact_as_the_reference(mine[rows], theirs[rows], exact[rows],
-                                             f"{label}: {name}, rows near 2**{level * BAND}")
+def _assert_kl_outputs(dew, exact, bounds, label):
+    """Each output of `_kl_derivatives` against its exact value (`_kl_oracle`), element by element, by
+    the exact value's place in float32's range (`_kinds`): inside it, finite and within the derived
+    bound (`_kl_bounds`); past the largest float32, infinite of its sign; below the least, zero or
+    subnormal; and near either end (`edge`), the bound's or the end's: infinite of its sign above, zero
+    or subnormal below."""
+    for name, truth in exact.items():
+        value, kinds = np.asarray(dew[name]), _kinds(truth)
         magnitudes, roundings = bounds[name]
-        unheld = ~np.isfinite(reference) & ((kinds == "normal") | (exact == 0))
-        assert np.all(np.isfinite(value[unheld])), name
-        assert_fp32_reduction_bound(value[unheld], exact[unheld], magnitudes[unheld], roundings)
+        inside = (kinds == "normal") | (truth == 0)
+        assert np.all(np.isfinite(value[inside])), f"{label}: {name}"
+        assert_fp32_reduction_bound(value[inside], truth[inside], magnitudes[inside], roundings)
         over = kinds == "over"
-        assert np.all(np.isinf(value[over]) & (np.sign(value[over]) == np.sign(exact[over]))), name
+        assert np.all(np.isinf(value[over]) & (np.sign(value[over]) == np.sign(truth[over]))), name
         assert np.all(_below_normal(value[kinds == "below"])), name
         edge = kinds == "edge"
-        top = edge & (np.abs(exact) > 1)
-        bounded = top & ~(np.isinf(value) & (np.sign(value) == np.sign(exact)))
+        top = edge & (np.abs(truth) > 1)
+        bounded = top & ~(np.isinf(value) & (np.sign(value) == np.sign(truth)))
         assert np.all(np.isfinite(value[bounded])), name
-        assert_fp32_reduction_bound(value[bounded], exact[bounded], magnitudes[bounded], roundings)
+        assert_fp32_reduction_bound(value[bounded], truth[bounded], magnitudes[bounded], roundings)
         bottom = edge & ~top & ~_below_normal(value)
         assert np.all(np.isfinite(value[bottom])), name
-        assert_fp32_reduction_bound(value[bottom], exact[bottom], magnitudes[bottom], roundings)
+        assert_fp32_reduction_bound(value[bottom], truth[bottom], magnitudes[bottom], roundings)
 
 
 KL_LEVELS = (-126, -125, -100, -63, -26, -1, 0, 1, 26, 63, 100, 126, 127)
@@ -1304,8 +1279,8 @@ def test_a_transitions_kl_and_its_derivatives_hold_over_float32s_exponent_range(
     as the gate rules (`_assert_kl_outputs`), eagerly and compiled."""
     inputs = _kl_grid()
     run = jax.jit(_kl_derivatives) if compiled else _kl_derivatives
-    _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _plain_kl(*inputs),
-                       _kl_truth(*inputs), _kl_bounds(*inputs), "a KL over float32's exponents")
+    _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _kl_oracle(*inputs),
+                       _kl_bounds(*inputs), "a KL over float32's exponents")
 
 
 REVIEWED = {
@@ -1334,8 +1309,8 @@ def test_a_transitions_kl_and_its_derivatives_hold_at_each_reviewed_input(case):
     gate rules (`_assert_kl_outputs`)."""
     inputs = tuple(np.asarray(value, np.float32) for value in REVIEWED[case])
     for run in (_kl_derivatives, jax.jit(_kl_derivatives)):
-        _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _plain_kl(*inputs),
-                           _kl_truth(*inputs), _kl_bounds(*inputs), case)
+        _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _kl_oracle(*inputs),
+                           _kl_bounds(*inputs), case)
 
 
 
