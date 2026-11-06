@@ -1,0 +1,7 @@
+16|8|2|70|formed|0|held32
+16|8|2|70|formed|0|exact-write
+16|8|2|70|formed|0|exact-corrected
+16|8|2|70|formed|0|exact-apply_u,apply_w
+16|8|2|70|formed|0|exact-merge
+16|8|2|70|formed|1|base
+16|8|2|70|formed|1|held32

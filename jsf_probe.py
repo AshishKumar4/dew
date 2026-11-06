@@ -22,6 +22,23 @@ if mode == 'merge2':
 if mode == 'held32':
     plain = ML._parts
     ML._parts = lambda dtype, family, fast=False: 3
+if mode.startswith('exact-'):
+    from dew.nn.kernels.templates.operands import Issuer, Parts
+    from dew.nn.kernels.templates import product
+    plain = Issuer.__call__
+    selected = mode[6:].split(',')
+    def value(x):
+        if isinstance(x, Parts):
+            return x.value()
+        if isinstance(x, product.Transposed):
+            return value(x.value).T
+        return x
+    def exact(self, name, lhs, rhs):
+        if name in selected:
+            return jnp.dot(value(lhs).astype(jnp.float32), value(rhs).astype(jnp.float32),
+                           precision=jax.lax.Precision.HIGHEST)
+        return plain(self, name, lhs, rhs)
+    Issuer.__call__ = exact
 
 def run(kernel):
     def f(x):
