@@ -753,14 +753,13 @@ def _projected(local: bool):
     from dew.nn import sharding
     from dew.nn.kernels import gemm
 
-    def forward(x, w):
+    def projected(x, w):
         return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
 
-    if local:
-        forward = sharding.manual_map(forward, (PartitionSpec("data"), PartitionSpec()),
-                                      PartitionSpec("data"))
-
     def step(x, w):
+        # Mapped as it traces, on the mesh its program lowers for (`manual_map` reads the mesh in context).
+        specs = (PartitionSpec("data"), PartitionSpec())
+        forward = sharding.manual_map(projected, specs, PartitionSpec("data")) if local else projected
         with generation.chosen(grouped_matmul="mosaic_gpu"):
             return jax.grad(lambda x, w: forward(x, w).astype(jnp.float32).sum(), argnums=(0, 1))(x, w)
 
