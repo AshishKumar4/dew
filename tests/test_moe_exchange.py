@@ -121,18 +121,16 @@ def test_a_config_built_runs_step_exchanges_on_an_expert_mesh_by_default(tmp_pat
     and with none where the mesh has no expert axis (ledger 1711's flow, row 4615)."""
     import dataclasses
 
-    from run_kinds import lm
+    from run_kinds import lm, trained
 
     from dew.training._lowering import Lowered
 
     run = lm(tmp_path, drawn=False)
     fields = {**run.model.fields, "mixture": {"experts": 8, "top_k": 2, "expert_features": 16}}
-    run = dataclasses.replace(run, model=dataclasses.replace(run.model, fields=fields),
-                              trainer=dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"),
-                                                          mesh=MeshSpec(expert=expert, fsdp=8 // expert),
-                                                          lower_for="sm90"))
+    run = dataclasses.replace(run, model=dataclasses.replace(run.model, fields=fields))
     with pytest.raises(Lowered) as lowered:
-        run.run()
+        trained(run, tmp_path, "lowered", trainer={"mesh": MeshSpec(expert=expert, fsdp=8 // expert),
+                                                   "lower_for": "sm90"})
     assert ("ragged_all_to_all" in lowered.value.lowered.as_text()) == exchanged
 
 
