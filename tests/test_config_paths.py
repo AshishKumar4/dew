@@ -12,9 +12,12 @@ import typing
 
 import pytest
 from option_witness import alternatives, flag, held_at, replaced
+from run_kinds import KINDS, scalars, trained_by_cli
 
 from dew import registry
-from dew.config import RunConfig
+from dew.config import RunConfig, TrainerConfig
+from dew.distributed.placement import Layout
+from dew.mesh import MeshSpec
 
 SUPPRESSED = ("data", "validation")
 """The fields a run's record writes as its chains (`dew.data.records`), which `--set` sets one setting of a
@@ -84,3 +87,31 @@ def test_each_path_that_sets_an_option_sets_the_same_run(kind, path, index, tmp_
         assert type(run) is type(python), name
         assert held_at(run, path) == held, name
         assert run.record() == record, name
+
+
+
+SET = ("optim.learning_rate=0.0123", "data_seed=3", "trainer.key=5")
+"""Options a run trained both ways is set with, each beside its default."""
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_a_run_trained_from_python_trains_as_dew_train_trains_it(kind, tmp_path):
+    """A kind's run with options set, trained one step from Python (`prepare().train`) and by `dew train`
+    over its run.json with the same trainer on the command line, on one mesh and layout: both steps log
+    one loss, and the run.json each writes reads back as one run, but for the name each trains under."""
+    run = KINDS[kind](tmp_path, drawn=False).assigned(list(SET))
+    hints = typing.get_type_hints(TrainerConfig)
+    given = {"mesh": MeshSpec(fsdp=2), "layout": Layout(min_shard=64), "log_every": 1,
+             "checkpoint_final": False}
+    trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"), steps=1,
+                                  eval_every=None, checkpoint_every=None, multi_host=False,
+                                  compilation_cache_dir=None, **given)
+    dataclasses.replace(run, trainer=trainer).prepare().train("python")
+    trained_by_cli(run, tmp_path, "cli", {f"trainer.{name}": flag(value, hints[name])
+                                          for name, value in given.items()})
+    runs = tmp_path / "runs"
+    assert scalars(runs / "python")[1]["train/loss"] == scalars(runs / "cli")[1]["train/loss"]
+    python, cli = (RunConfig.load(str(runs / name)) for name in ("python", "cli"))
+    renamed = dataclasses.replace(python, trainer=dataclasses.replace(python.trainer, name=cli.trainer.name))
+    assert renamed.record() == cli.record()
