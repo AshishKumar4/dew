@@ -297,9 +297,10 @@ class CausalSelfAttention(nn.Module):
     `kv_store`, post rope and norm, and keeps no cache.
     """
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
-                                                 "position_bias", "admitted"})
+                                                 "position_bias", "admitted", "tree"})
     """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask or key
-    runs, places keys, adds a position bias and runs a server's mixed step."""
+    runs, places keys, adds a position bias and runs a server's mixed step; a tree's mask is its key
+    runs, which a tree call carries."""
 
     ctx: MixerContext
     """The layer's geometry and attention policies, as the backbone resolves
