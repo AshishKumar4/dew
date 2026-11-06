@@ -92,8 +92,9 @@ def block_of(family: mosaic.Family) -> int:
     call's products take too."""
     return family.depths(jnp.bfloat16)[0]
 
-PARTS = 3
-"""The bf16 parts of an fp32 operand: 8 of its significand's 24 bits each."""
+PARTS = -(-(jnp.finfo(jnp.float32).nmant + 1) // (jnp.finfo(jnp.bfloat16).nmant + 1))
+"""The bf16 parts of an fp32 operand: its significand's 24 bits (23 stored and the implicit one) a bf16
+part's 8 at a time, each part the rounding error of those before it, three."""
 
 
 @dataclasses.dataclass(frozen=True)

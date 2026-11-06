@@ -1174,6 +1174,29 @@ def test_a_fused_regions_consumer_reads_its_product_as_the_dot_rounds_it(generat
     assert np.any(np.asarray(once.astype(jnp.bfloat16), np.float32) != expected)
 
 
+def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
+    """`fused_gemm.analysis` prices a region both ways from one model (`fused_gemm.priced`, the shared
+    `templates.cost`): a bf16 product of 8192 x 4096 x 4096 with a bias and a SiLU after it costs less fused
+    than its launch writing the product and XLA's fusion reading it back, by at least that round trip's
+    bytes at the H100's device memory rate; a region with no consumer is not priced. Shapes only."""
+    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((4, 4096, 4096), jnp.bfloat16)
+    bias = jax.ShapeDtypeStruct((4096,), jnp.float32)
+
+    def region(x, w, sizes, bias):
+        product = fused_gemm.product(x, w, sizes, out_dtype=jnp.bfloat16)
+        return jax.nn.silu(product.astype(jnp.float32) + bias).astype(jnp.bfloat16)
+
+    with generation.assumed("sm90"):
+        found = fused_gemm.analysis(region, x, w, sizes, bias)
+        plain = fused_gemm.analysis(lambda x, w, sizes: fused_gemm.product(x, w, sizes), x, w, sizes)
+        rate = generation.gpu_target().memory_rate
+    assert found.fused_seconds is not None and found.unfused_seconds is not None, found
+    assert found.unfused_seconds - found.fused_seconds >= 2 * 8192 * 4096 * 2 / rate, found
+    assert plain.fused_seconds is None and plain.unfused_seconds is None
+
+
 def _moved_columns(columns: int, block: int):
     """A consumer adding to the product a residual's column block `c * c - c` at the product's column block
     `c` (blocks of `block` columns), as a custom fusion whose pull rule says so: block 1 reads block 0, while

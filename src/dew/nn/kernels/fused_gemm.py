@@ -34,8 +34,10 @@ kernels take, the reference a fused route is checked against, and 'fused' raises
 take it rather than run XLA (`selection.KernelRefused`).
 """
 
+import contextvars
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -46,9 +48,11 @@ from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
 from dew import algebra
+from dew.algebra import cost as algebra_cost
 from dew.nn import programs
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
+from dew.nn.kernels.templates import cost
 
 FUSION_ROW = 'ledger 1295'
 """The fusion analysis's limits."""
@@ -93,21 +97,97 @@ def fused(region, *inputs):
 class Analysis:
     """What `fused` makes of a region (`analysis`): each stage's route as its selector reported it
     (`generation.Route`: the kernel it takes, its refusal's reason where the kernels cannot take it
-    tile by tile), and the product's launch's."""
+    tile by tile), and the product's launch's; and the region's seconds both ways on the target
+    (`priced`): fused, its consumers in the launch's epilogue, and unfused, the product's launch then
+    XLA's fusion of its consumers. None where the region has no consumer, or the target states no rate."""
 
     epilogue: generation.Route | None
     prologue: generation.Route | None
     launch: generation.Route | None
+    fused_seconds: float | None = None
+    unfused_seconds: float | None = None
 
 
 def analysis(region, *inputs) -> Analysis:
-    """`fused(region, *inputs)` traced for its shapes alone, nothing run: what its selectors decide."""
-    with generation.routes() as found:
-        jax.eval_shape(functools.partial(fused, region), *inputs)
+    """`fused(region, *inputs)` traced for its shapes alone, nothing run: what its selectors decide, and
+    its two prices (`priced`), so a pass fuses where the fused one is the less and no stage refused."""
+    priced_calls: list = []
+    token = _PRICED.set(priced_calls)
+    try:
+        with generation.routes() as found:
+            jax.eval_shape(functools.partial(fused, region), *inputs)
+    finally:
+        _PRICED.reset(token)
 
     def last(choice):
         return next((route for route in reversed(found) if route.choice == choice), None)
-    return Analysis(last(EPILOGUE.choice), last(PROLOGUE.choice), last('grouped_matmul'))
+    seconds = priced(priced_calls[-1], generation.gpu_target()) if priced_calls else (None, None)
+    return Analysis(last(EPILOGUE.choice), last(PROLOGUE.choice), last('grouped_matmul'), *seconds)
+
+
+@dataclasses.dataclass(frozen=True)
+class Region:
+    """A traced region's product and consumers as `priced` reads them: the product's extents (rows, depth,
+    width), its operands' and its result's dtypes, the consumers' elementwise work on the whole product
+    (`_chain`), and the bytes of the arrays they capture and of their outputs."""
+
+    rows: int
+    depth: int
+    width: int
+    operands: jnp.dtype
+    result: jnp.dtype
+    chain: cost.Work
+    captured_bytes: float
+    output_bytes: float
+
+
+_PRICED: contextvars.ContextVar[list | None] = contextvars.ContextVar('fused_gemm_priced', default=None)
+"""The regions `_product` traces while `analysis` collects them."""
+
+
+def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, float | None]:
+    """`region`'s seconds on `target`, fused and unfused, from one model (`templates.cost`): the launch's
+    units overlapped at the whole device's rates (its products in their tensor mode, its operands, captured
+    arrays and outputs in device memory), plus its fixed launch (`GpuTarget.launch_seconds`), with its
+    consumers' work in it; and the plain launch writing the product at its result dtype, then XLA's fusion
+    of the consumers reading it (`algebra.cost.fused`). None where the target states no tensor rate."""
+    rates = cost.rates(target, device=True)
+    if rates[0] is None:
+        return None, None
+    product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands)
+    operands = (region.rows + region.width) * region.depth * jnp.dtype(region.operands).itemsize
+    written = region.rows * region.width * jnp.dtype(region.result).itemsize
+    launch = target.launch_seconds or 0.0
+
+    def launched(work: cost.Work) -> float:
+        return max(cost.units(work, rates)[0]) + launch
+
+    fused_seconds = launched(product + region.chain + cost.Work(
+        device_bytes=operands + region.captured_bytes + region.output_bytes))
+    chain = region.chain + cost.Work(device_bytes=written + region.captured_bytes + region.output_bytes,
+                                     kernels=1.0)
+    unfused_seconds = (launched(product + cost.Work(device_bytes=operands + written))
+                       + algebra_cost.fused(target)(chain))
+    return fused_seconds, unfused_seconds
+
+
+TRANSCENDENTAL = frozenset({'exp', 'exp2', 'log', 'log1p', 'tanh', 'logistic', 'erf', 'sin', 'cos', 'pow',
+                            'rsqrt', 'sqrt'})
+"""The consumers' operations the special-function units take (`_chain`)."""
+
+
+def _chain(consumer, values, acc) -> cost.Work:
+    """The consumers' elementwise work on the whole product: each equation of their program an operation an
+    element of its result, a transcendental's on the special-function units, a conversion's apart."""
+    closed = jax.make_jaxpr(consumer)(values, acc)
+    work = cost.Work()
+    for eqn in closed.jaxpr.eqns:
+        elements = float(sum(math.prod(var.aval.shape) for var in eqn.outvars if hasattr(var.aval, 'shape')))
+        name = eqn.primitive.name
+        work = work + (cost.Work(exponentials=elements) if name in TRANSCENDENTAL
+                       else cost.Work(conversions=elements) if name == 'convert_element_type'
+                       else cost.Work(operations=elements))
+    return work
 
 
 def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared: tuple, *fusions):
@@ -127,6 +207,13 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     leaves, treedef = jax.tree.flatten(values)
+    if (collected := _PRICED.get()) is not None:
+        depth = lhs.shape[-1]
+        outs = jax.tree.leaves(jax.eval_shape(consumer, values, acc))
+        collected.append(Region(
+            lhs.shape[0], depth, width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype),
+            _chain(consumer, values, acc), float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
+            float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs))))
     axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
