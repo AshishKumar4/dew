@@ -8,26 +8,23 @@ adapters below own only their configuration and tensor spellings.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, inert, plain_rope_part, unwritten
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
-    ExportRefused,
     MaskedWalk,
     Packed,
     Renames,
-    Ropes,
     RopeSpelling,
     SourceCode,
-    base_config,
-    plain_partial_rope,
     qkv_widths,
-    reads,
     record_float,
     record_int,
     refuse,
@@ -35,9 +32,9 @@ from dew.interop.decoder_parts import (
     spelled,
 )
 from dew.interop.families.deepseek import deepseek_mixture
-from dew.interop.families.gemma import GEMMA4_DEFAULTS, GEMMA4_ROUTES, gemma4_config, parallel_experts
-from dew.interop.families.qwen import qwen2_config
-from dew.interop.layouts import ConfigLayout, ConfigPart, Table, When
+from dew.interop.families.gemma import GEMMA4_DEFAULTS, GEMMA4_ROUTES, gemma4_layout
+from dew.interop.families.qwen import QWEN2_CONFIG
+from dew.interop.layouts import Choice, ConfigLayout, ConfigPart, Table, When, constant
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 
@@ -45,43 +42,18 @@ from dew.nn.backbones.decoder_block import Mixture
 _MOE_MASK_ID = 156895
 
 
-def _mask_token(hf_config: Mapping[str, object], used: set[str]) -> int:
-    """Return the mask id a masked-diffusion release reserves, under either spelling.
-
-    The releases write it as `mask_token_id` or as `mask_id`.
-    """
-    mask = hf_config.get('mask_token_id', hf_config.get('mask_id'))
-    if mask is None:
-        refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
-    used.update(('mask_token_id', 'mask_id'))
-    return _records.integer(mask, 'mask_token_id/mask_id')
-
-
-def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a LLaDA-8B config into `CausalTransformer` fields.
-
-    GSAI-ML/LLaDA-8B-Base (model_type 'llada', architectures ['LLaDAModelLM'])
-    computes a Llama block: RMSNorm pre-norms, rotate-half rope, SwiGLU. It
-    carries no causal mask anywhere (modeling_llada.py, LLaDAModel
-    bidirectional bias, LLaDALlamaBlock is_causal=False) and trains masked
-    diffusion on the id in mask_token_id.
-
-    The checkpoint names its tensors OLMo-style
-    (model.transformer.blocks.N.{attn_norm,q_proj,k_proj,v_proj,attn_out,
-    ff_norm,ff_proj,up_proj,ff_out}, wte, ln_f, ff_out for the head), so
-    `_llada_path` renames them onto the llama layout the shared map reads.
-    """
-    if 'num_experts' in hf_config:
-        return _llada_moe_config(hf_config, used)
-    std = _llada_geometry(hf_config)
-    layers = _records.integer(std['num_hidden_layers'], 'num_hidden_layers/n_layers')
-    config = base_config(std, set(), layer_types=('full_attention',) * layers,
-                          rope=Ropes(_records.number(std['rope_theta'], 'rope_theta')))
-    used.update(key for aliases in _LLADA_ALIASES for key in aliases if key in hf_config)
-    mask = _mask_token(hf_config, used)
-    _llada_refusals(hf_config, used, std)
-    config.update(causal=False, mask_token_id=mask)
-    return config
+def _mask(default: int | None = None) -> ConfigPart[CausalTransformer]:
+    """The mask id a masked-diffusion release reserves, both ways: `mask_token_id` or `mask_id` as the
+    releases write it, `default` where neither is (refused where it has none); written as mask_token_id.
+    LLaDA and Dream declare the reserved id and nothing else of their own."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        mask = hf_config.get('mask_token_id', hf_config.get('mask_id', default))
+        if mask is None:
+            refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
+        used.update(('mask_token_id', 'mask_id'))
+        record['mask_token_id'] = _records.integer(mask, 'mask_token_id/mask_id')
+        return record
+    return ConfigPart(read, lambda model: {'mask_token_id': model.mask_token_id})
 
 
 # The standard spelling wins over the release's aliases, but every present
@@ -104,7 +76,7 @@ _LLADA_ALIASES = (
 
 
 def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
-    """Rewrite LLaDA's own config spellings under the standard names `base_config` reads.
+    """Rewrite LLaDA's own config spellings under the standard names the shared decoder reads.
 
     The first present spelling in each alias group wins, even when its
     value is null, as the release's nested get calls do.
@@ -156,6 +128,31 @@ def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
         "hidden_act": values.get("hidden_act", "silu"),
     }
     return std
+
+
+_LLADA_DECODER = decoder_layout(DecoderSpelling(reads=frozenset({'attention_bias'})))
+"""Dense LLaDA's decoder under the standard spellings its geometry resolves (`_llada_geometry`)."""
+
+
+def _read_llada(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    """GSAI-ML/LLaDA-8B-Base's geometry, its own spellings resolved under the standard ones the shared
+    decoder reads, and its own flags checked (`_llada_refusals`); written under the standard spellings,
+    which win over its aliases on a read."""
+    std = _llada_geometry(hf_config)
+    used.update(key for aliases in _LLADA_ALIASES for key in aliases if key in hf_config)
+    _llada_refusals(hf_config, used, std)
+    return _LLADA_DECODER.read(std, set(), record)
+
+
+LLADA_DENSE = ConfigLayout(ConfigPart(_read_llada, _LLADA_DECODER.write), _mask(),
+                           constant('causal', value=False))
+"""Dense LLaDA's config, both ways.
+
+GSAI-ML/LLaDA-8B-Base (model_type 'llada', architectures ['LLaDAModelLM']) computes a Llama block: RMSNorm
+pre-norms, rotate-half rope, SwiGLU. It carries no causal mask anywhere (modeling_llada.py, LLaDAModel
+bidirectional bias, LLaDALlamaBlock is_causal=False) and trains masked diffusion on the id in
+mask_token_id. The checkpoint names its tensors OLMo-style, which its routes rename onto the llama
+layout the shared map reads (`_LLADA_ROUTES`)."""
 
 
 def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
@@ -234,32 +231,24 @@ def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
         refuse('embedding_size', f'it names {embedding} rows for a {vocab} vocabulary')
 
 
-def _moe_decoder(hf_config: Mapping[str, object], used: set[str], *, qk_norm: bool, intermediate: int,
-                 rope_defaults: tuple[RopeSpelling, float] | None) -> DecoderFields:
-    """The released MoE decoders' shared pre-norm GQA and sliced rotate-half rope.
-
-    `rope_defaults` is the config class's base and factor for a config that states neither, or None
-    for a class whose defaults are no rotary at all: LLaDA-MoE's and LLaDA-MoE v2's default both to
-    -1 (configuration_lladamoe.py:32-33), so their configs state them."""
-    if hf_config.get('rope_scaling') is not None:
-        refuse('rope_scaling', 'the released MoE checkpoints use plain rotary positions')
-    spelling, rotary = (None, None) if rope_defaults is None else rope_defaults
-    theta, factor = plain_partial_rope(hf_config, spelling, default_factor=rotary,
-                                       reference='LLaDA MoE rotary')
-    used.update(('rope_theta', 'rope_scaling', 'rope_parameters', 'partial_rotary_factor'))
-    layers = record_int(hf_config, 'num_hidden_layers')
-    config = base_config({'rms_norm_eps': 1e-5, **hf_config, 'intermediate_size': intermediate}, used,
-                          rope=Ropes(theta), qk_norm=qk_norm,
-                          layer_types=('full_attention',) * layers,
-                          reads=frozenset({'attention_bias'}))
-    config.update(causal=False, partial_rotary_factor=None if factor == 1 else factor,
-                  partial_rotary_type='default',
-                  mask_token_id=_mask_token({
-                      'mask_token_id': hf_config.get('mask_id', _MOE_MASK_ID), **hf_config}, used))
-    return config
+def _moe_decoder(*, keys: Mapping[str, str], spelling: RopeSpelling | None,
+                 default_factor: float | None) -> ConfigLayout[CausalTransformer]:
+    """The released MoE decoders' shared pre-norm GQA and sliced rotate-half rope, both ways (RMS norms
+    at 1e-5 unless stated, the dense width under the family's own key, `keys`), bidirectional, and the
+    mask id (156895 where unstated). `spelling` and `default_factor` are the config class's base and
+    factor for a config that states neither, or None for a class whose defaults are no rotary at all:
+    LLaDA-MoE's and LLaDA-MoE v2's default both to -1 (configuration_lladamoe.py:32-33), so their configs
+    state them."""
+    return ConfigLayout(
+        inert('rope_scaling', 'the released MoE checkpoints use plain rotary positions'),
+        decoder_layout(DecoderSpelling(reads=frozenset({'attention_bias'}), keys=keys,
+                                       defaults={'rms_norm_eps': 1e-5}),
+                       rope=plain_rope_part(spelling, default_factor=default_factor,
+                                            reference='LLaDA MoE rotary')),
+        constant('causal', value=False), _mask(_MOE_MASK_ID))
 
 
-def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], *,
+def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], config: DecoderFields, *,
                        v2: bool = False) -> DecoderFields:
     """OLMoE's softmax experts, per-head QK norms and optional shared branch.
 
@@ -272,8 +261,7 @@ def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], *,
     config classes default to 1. Read here rather than by the family, since
     model_type 'llada' also names dense LLaDA, whose table pads nothing.
     """
-    config = _moe_decoder(hf_config, used, qk_norm=bool(hf_config.get('qk_layernorm')),
-                           intermediate=record_int(hf_config, 'dense_intermediate_size'), rope_defaults=None)
+    config['qk_norm'] = bool(hf_config.get('qk_layernorm'))
     pad = hf_config.get('pad_token_id', 1)
     config['padding_idx'] = None if pad is None else _records.integer(pad, 'pad_token_id')
     used.update(('dense_intermediate_size', 'expert_intermediate_size',
@@ -308,8 +296,12 @@ def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], *,
     return config
 
 
-def _llada_moe_v2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    return _llada_moe_config(hf_config, used, v2=True)
+def _llada_moe(*, v2: bool) -> ConfigLayout[CausalTransformer]:
+    """LLaDA-MoE's config (`v2`: LLaDA-MoE v2's), both ways."""
+    return ConfigLayout(
+        _moe_decoder(keys={'intermediate_size': 'dense_intermediate_size'}, spelling=None,
+                     default_factor=None),
+        ConfigPart(partial(_llada_moe_config, v2=v2), _llada_moe_export))
 
 
 def _llada2_walk(config: Mapping[str, object], generation: Mapping[str, object],
@@ -377,7 +369,7 @@ def _dream_walk(config: Mapping[str, object], generation: Mapping[str, object],
         reads=frozenset(DREAM_GENERATION))
 
 
-def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+def _llada2_config(hf_config: Mapping[str, object], used: set[str], config: DecoderFields) -> DecoderFields:
     """DeepSeek's grouped sigmoid router, or 2.2's block-level expert shortlist.
 
     The 2.0 forward requires a 4-D additive block mask. 2.1 and 2.2 accept
@@ -397,10 +389,7 @@ def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     """
     block = (record_int(hf_config, 'block_size', 32)
              if 'block_size' in hf_config or 'expert_capacity' in hf_config else None)
-    config = _moe_decoder(hf_config, used, qk_norm=bool(hf_config.get('use_qk_norm', block is None)),
-                           intermediate=record_int(hf_config, 'intermediate_size'),
-                           # LLaDA2MoeConfig's defaults (configuration_llada2_moe.py:29, :46).
-                           rope_defaults=(PLAIN_SPELLING, 0.5))
+    config['qk_norm'] = bool(hf_config.get('use_qk_norm', block is None))
     config.update(attention_bias=bool(hf_config.get('use_qkv_bias', False)),
                   o_proj_bias=bool(hf_config.get('use_bias', True)))
     used.update(('use_qkv_bias', 'use_qk_norm', 'use_bias', 'num_experts', 'num_shared_experts',
@@ -429,66 +418,35 @@ def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     return config
 
 
-def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a Dream-v0 config into `CausalTransformer` fields.
-
-    Dream-org/Dream-v0-Base-7B (model_type 'Dream', architectures
-    ['DreamModel']) is a 28-layer Qwen2.5-7B geometry: 3584 wide, 28 heads, 4
-    kv heads. Its attention hard-codes is_causal=False over biased q/k/v and a
-    bias-free o_proj (modeling_dream.py, DreamAttention/DreamSdpaAttention),
-    and its MLP is bias-free SwiGLU. Tensor names are the qwen2 layout, so the
-    shared map reads them with no new table. use_mrope=False is the only
-    Dream-only flag and changes nothing at that value.
-    """
-    if hf_config.get('use_mrope'):
-        refuse('use_mrope=True', 'the backbone rotates plain positions')
-    used.add('use_mrope')
-    config = qwen2_config(hf_config, used)
-    mask = _mask_token(hf_config, used)
+DREAM_CONFIG = ConfigLayout(
+    inert('use_mrope', 'the backbone rotates plain positions', neutral=False),
+    QWEN2_CONFIG, _mask(), constant('causal', value=False),
     # Dream continues Qwen2.5's next-token head, so its reference reads position i from logits i-1
     # (`torch.cat([logits[:, :1], logits[:, :-1]], dim=1)` in its generation and training code).
-    config.update(causal=False, mask_token_id=mask, shifted_logits=True)
-    return config
+    constant('shifted_logits', value=True))
+"""Dream-v0's config, both ways.
+
+Dream-org/Dream-v0-Base-7B (model_type 'Dream', architectures ['DreamModel']) is a 28-layer Qwen2.5-7B
+geometry: 3584 wide, 28 heads, 4 kv heads. Its attention hard-codes is_causal=False over biased q/k/v and a
+bias-free o_proj (modeling_dream.py, DreamAttention/DreamSdpaAttention), and its MLP is bias-free SwiGLU.
+Tensor names are the qwen2 layout, so the shared map reads them with no new table. use_mrope=False is the
+only Dream-only flag and changes nothing at that value."""
 
 
-def _diffusion_gemma_text_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a DiffusionGemma text config into `CausalTransformer` fields.
-
-    google/diffusiongemma-26B-A4B-it (model_type 'diffusion_gemma_text') is the
-    Gemma 4 text geometry with canvas denoising around it. A causal encoder
-    over the prompt fills a KV cache, a bidirectional decoder over the canvas
-    attends to that cache, and a self-conditioning MLP folds the previous
-    step's logits into the input embeddings
-    (TF/models/diffusion_gemma/modeling_diffusion_gemma.py:281, :383, :790-823,
-    :1326-1440).
-
-    The parameter tree is the same either way, since `causal` changes the mask
-    and not the parameters. So this entry maps the weights onto the Gemma 4
-    table and marks the record decoder-mode (causal=False). The encoder cache,
-    the canvas positions and the self-conditioning loop need a block-diffusion
-    Process and objective, which live outside this module.
-    """
+DIFFUSION_GEMMA_TEXT_CONFIG = ConfigLayout(
     # The reference builds no v_proj on full layers whatever the config says
-    # (modeling_diffusion_gemma.py, DiffusionGemmaEncoderTextAttention: v_proj
-    # only if the layer slides), so the record always reads values off keys
-    # there; the sliding layers keep their own v_proj. The family declares it
-    # rather than setting it afterwards, because the global key count is read
-    # under it: gemma4 spells the same regime as an attention_k_eq_v field,
-    # and DiffusionGemma carries the behaviour in its modules instead.
-    config = gemma4_config(hf_config, used, k_eq_v=True)
-    if config.get("mixture") is None and all(
-            hf_config.get(field) is not None
-            for field in ("num_experts", "top_k_experts", "moe_intermediate_size")):
-        # DiffusionGemma names no enable_moe_block flag; a config carrying the
-        # three routed widths routes every layer beside its dense MLP, which
-        # is what its encoder and decoder layers both build.
-        config["mixture"] = parallel_experts(hf_config)
-    # final_logit_softcapping is a class attribute of the reference text
-    # config, not an instance field a config.json carries; the head always
-    # divides by 30 under tanh.
-    config["final_logit_softcap"] = 30.0
-    config.update(causal=False)
-    return config
+    # (modeling_diffusion_gemma.py, DiffusionGemmaEncoderTextAttention: v_proj only if the layer slides),
+    # so the record always reads values off keys there; the sliding layers keep their own v_proj. The
+    # family declares it rather than setting it afterwards, because the global key count is read under
+    # it. DiffusionGemma names no enable_moe_block flag; a config carrying the three routed widths routes
+    # every layer beside its dense MLP. final_logit_softcapping is a class attribute of the reference text
+    # config, not an instance field a config.json carries; the head always divides by 30 under tanh.
+    gemma4_layout(k_eq_v=True, flagged=False, softcap=False),
+    constant('final_logit_softcap', value=30.0), constant('causal', value=False),
+    unwritten('diffusion_gemma_text is a cache-reading view; export the complete native DiffusionGemma '
+              'wrapper'))
+"""DiffusionGemma's text config: google/diffusiongemma-26B-A4B-it (model_type 'diffusion_gemma_text') is
+the Gemma 4 text geometry with canvas denoising around it, read here and written whole as its bundle."""
 
 
 # LLaDA's own names beside the llama-layout spellings the shared map reads.
@@ -529,9 +487,9 @@ names; a load reads either."""
 def _llada_moe_export(model: CausalTransformer) -> Mapping[str, object]:
     mixture = model.mixture
     if mixture is None:
-        return _mask_token_export(model)
+        return {'mask_token_id': model.mask_token_id}
     return {
-        **_mask_token_export(model),
+        'mask_token_id': model.mask_token_id,
         **({} if mixture.norm_topk_prob else {'architectures': ['LLaDAMoEModelLM']}),
         'dense_intermediate_size': model.hidden_features,
         'expert_intermediate_size': mixture.expert_features or model.hidden_features,
@@ -559,7 +517,7 @@ def _llada2_export(model: CausalTransformer) -> Mapping[str, object]:
     if mixture.shared_features % width:
         refuse_export('mixture.shared_features', 'LLaDA2 counts whole shared experts of the routed width')
     return {
-        **_mask_token_export(model), 'num_experts': mixture.experts,
+        'mask_token_id': model.mask_token_id, 'num_experts': mixture.experts,
         'num_experts_per_tok': mixture.top_k,
         'num_shared_experts': mixture.shared_features // width or None,
         'moe_intermediate_size': width, 'first_k_dense_replace': first,
@@ -574,23 +532,9 @@ def _llada2_export(model: CausalTransformer) -> Mapping[str, object]:
     }
 
 
-def _mask_token_export(model: CausalTransformer) -> Mapping[str, object]:
-    """Return the config field a masked-diffusion export writes: its mask id.
-
-    LLaDA and Dream both declare the reserved id and nothing else of their own.
-    """
-    return {'mask_token_id': model.mask_token_id}
-
-
-def _diffusion_gemma_export(model: CausalTransformer) -> Mapping[str, object]:
-    raise ExportRefused(
-        "diffusion_gemma_text is a cache-reading view; export the complete native DiffusionGemma wrapper"
-    )
-
-
 DIFFUSION_GEMMA_TEXT = DecoderFamily(
     ('diffusion_gemma_text',),
-    ConfigLayout(ConfigPart(reads(_diffusion_gemma_text_config), _diffusion_gemma_export)),
+    DIFFUSION_GEMMA_TEXT_CONFIG,
     lambda fields: bool(
         fields.causal is False
         and (
@@ -611,7 +555,7 @@ DIFFUSION_GEMMA_TEXT = DecoderFamily(
 
 DREAM = DecoderFamily(
     ('dream', 'Dream'),
-    ConfigLayout(ConfigPart(reads(_dream_config), _mask_token_export)),
+    DREAM_CONFIG,
     lambda fields: bool(
         fields.causal is False
         and fields.attention_bias
@@ -630,7 +574,8 @@ DREAM = DecoderFamily(
 
 LLADA = DecoderFamily(
     ('llada',),
-    ConfigLayout(ConfigPart(reads(_llada_config), _llada_moe_export)),
+    ConfigLayout(Choice(lambda hf_config: 'num_experts' in hf_config, lambda model: model.mixture is not None,
+                        _llada_moe(v2=False), LLADA_DENSE)),
     lambda fields: bool(
         fields.causal is False
         and not fields.attention_bias
@@ -651,7 +596,7 @@ LLADA = DecoderFamily(
 )
 
 LLADA_MOE_V2 = DecoderFamily(
-    ('llada_moe_v2',), ConfigLayout(ConfigPart(reads(_llada_moe_v2_config), _llada_moe_export)),
+    ('llada_moe_v2',), _llada_moe(v2=True),
     lambda fields: bool(not fields.causal and (mixture := fields.mixture) is not None
                         and mixture.score_function == 'softmax' and mixture.norm_topk_prob),
     'llada_moe_v2', 'LLaDAMoEv2ModelLM',
@@ -662,7 +607,9 @@ LLADA_MOE_V2 = DecoderFamily(
 )
 
 LLADA2_MOE = DecoderFamily(
-    ('llada2_moe',), ConfigLayout(ConfigPart(reads(_llada2_config), _llada2_export)),
+    # LLaDA2MoeConfig's rotary defaults (configuration_llada2_moe.py:29, :46).
+    ('llada2_moe',), ConfigLayout(_moe_decoder(keys={}, spelling=PLAIN_SPELLING, default_factor=0.5),
+                                  ConfigPart(_llada2_config, _llada2_export)),
     lambda fields: bool(not fields.causal and (mixture := fields.mixture) is not None
                         and mixture.score_function == 'sigmoid'),
     'llada2_moe', 'LLaDA2MoeModelLM',

@@ -90,7 +90,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                                 "dew.sampling.decoding"]),
     ("Inference and interop", ["dew.inference", "dew.inference.banks", "dew.inference.tasks",
                               "dew.inference.models", "dew.interop", "dew.interop.releases",
-                              "dew.interop.diffusion_gemma"]),
+                              "dew.interop.diffusion_gemma", "dew.interop.layouts", "dew.interop.wrappers"]),
     ("Decision models", ["dew.decision", "dew.decision.config", "dew.decision.data", "dew.decision.objective",
                          "dew.decision.rows", "dew.decision.layout", "dew.decision.task",
                          "dew.decision.formats"]),

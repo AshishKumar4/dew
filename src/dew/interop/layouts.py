@@ -24,8 +24,15 @@ from pathlib import Path as FilePath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
+from dew.interop.config_records import NativeFields
+from dew.registry import Configured, configured
+
 if TYPE_CHECKING:
+    import numpy as np
+    from flax import linen as nn
+
     from dew.interop.decoder_parts import SourceCode
+    from dew.nn.backbones.causal_transformer import CausalTransformer
 
 type Config = Mapping[str, object]
 """The native record a route reads its conditions from (`DecoderFields`): the translated config on a load,
@@ -294,16 +301,19 @@ class Table:
         object.__setattr__(self, 'entries', entries)
 
     def read(self, name: str, config: Config) -> Leaf | None:
-        return next((found for entry in self.entries if (found := entry.read(name, config)) is not None),
-                    None)
+        return _first(entry.read(name, config) for entry in self.entries)
 
     def write(self, path: Path, config: Config) -> str | None:
-        return next((name for entry in self.entries if (name := entry.write(path, config)) is not None),
-                    None)
+        return _first(entry.write(path, config) for entry in self.entries)
 
     def copies(self, config: Config) -> Iterator[tuple[str, Path]]:
         for entry in self.entries:
             yield from entry.copies(config)
+
+
+def _first[Found](found: Iterator[Found | None]) -> Found | None:
+    """The first of `found` that is not None, None where none is: the first entry of a table that routes."""
+    return next((one for one in found if one is not None), None)
 
 
 @dataclass(frozen=True, eq=False)
@@ -437,14 +447,27 @@ class Rebased:
         return iter(())
 
 
-type ConfigRead = Callable[[Mapping[str, object], set[str], dict[str, object]], dict[str, object]]
+type ConfigRead[Model] = Callable[[Mapping[str, object], set[str], NativeFields[Model]], NativeFields[Model]]
 """A config part's read: the source config, the keys read so far (`used`, which it adds its own to), and the
-record its earlier parts filled, which it returns filled further (a reader of a whole record its own,
-typed as it builds it: `NativeFields`)."""
+model's record its earlier parts filled (`NativeFields`), which it returns filled further (a reader of a
+whole record its own, as it builds it)."""
 
 type ConfigWrite[Model] = Callable[[Model], Mapping[str, object]]
 """A config part's write: a model's keys in the family's config, refusing a model it cannot spell
 (`decoder_parts.ExportRefused`)."""
+
+
+class ConfigEntry[Model](Protocol):
+    """One entry of a family's config layout (`ConfigLayout`), both ways: its keys read into the model's
+    record (`read`), the record's fields written back as keys (`write`), and the keys it states by name
+    (`keys`), which a layout that reads none of them marks read (`Nested.present`, a kind no layer holds)."""
+
+    def read(self, hf_config: Mapping[str, object], used: set[str], record: NativeFields[Model], /
+             ) -> NativeFields[Model]: ...
+
+    def write(self, model: Model, /) -> Mapping[str, object]: ...
+
+    def names(self) -> tuple[str, ...]: ...
 
 
 @dataclass(frozen=True, eq=False)
@@ -454,11 +477,21 @@ class ConfigPart[Model]:
     records, its layer kinds. A family composes its parts (`ConfigLayout`), and its reader and its writer
     are theirs (`DecoderFamily.translate_config`, `export_fields`)."""
 
-    read: ConfigRead
+    read: ConfigRead[Model]
     write: ConfigWrite[Model]
 
+    def names(self) -> tuple[str, ...]:
+        """None by name: a part's keys are its read's own, which it marks read (`used`)."""
+        return ()
 
-_MISSING = object()
+
+@dataclass(frozen=True)
+class Required:
+    """The default of a key a config must state, whose class has none (`REQUIRED`)."""
+
+
+REQUIRED = Required()
+"""A key a config must state: its class has no default for it."""
 
 
 @dataclass(frozen=True, eq=False)
@@ -470,21 +503,21 @@ class ConfigField[Model]:
 
     key: str
     field: str
-    default: object = _MISSING
-    parse: Callable[[object, str], object] | None = None
+    default: Configured | Required = REQUIRED
+    parse: Callable[[Configured, str], Configured] | None = None
     value: Callable[[Model], object] | None = None
     spell: Callable[[object], object] | None = None
     aliases: tuple[str, ...] = ()
     """Other keys a config may state it under, read where `key` is absent, in order; written as `key`."""
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
-             record: dict[str, object]) -> dict[str, object]:
+             record: NativeFields[Model]) -> NativeFields[Model]:
         keys = (self.key, *self.aliases)
         used.update(keys)
         key = next((key for key in keys if key in hf_config), None)
-        if key is None and self.default is _MISSING:
-            raise KeyError(self.key)
-        stated = self.default if key is None else hf_config[key]
+        if key is None and self.default is REQUIRED:
+            raise ValueError(f"{self.key} is required: the config states none, and its class has no default")
+        stated = configured(self.default if key is None else hf_config[key])
         record[self.field] = stated if self.parse is None else self.parse(stated, key or self.key)
         return record
 
@@ -492,23 +525,144 @@ class ConfigField[Model]:
         held = getattr(model, self.field) if self.value is None else self.value(model)
         return {self.key: held if self.spell is None else self.spell(held)}
 
+    def names(self) -> tuple[str, ...]:
+        return (self.key, *self.aliases)
+
+
+def constant[Model](field: str, *, value: Configured) -> ConfigPart[Model]:
+    """A field a family's reference fixes, which its config states nowhere: read as `value`, written as
+    nothing (the family matches only a model that holds it, `DecoderFamily.matches`)."""
+    def read(hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        record[field] = value
+        return record
+    return ConfigPart(read, lambda model: {})
+
+
+def unread[Model](*keys: str) -> ConfigPart[Model]:
+    """Keys a family's config states that its reference reads to no effect (a version stamp, an
+    initializer's range), marked read and written as nothing."""
+    def read(hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        used.update(keys)
+        return record
+    return ConfigPart(read, lambda model: {})
+
+
+@dataclass(frozen=True, eq=False)
+class Nested[Model, Part]:
+    """A record a model holds under one field (`field`: its routed experts, its mixer), its own config
+    keys `layout`'s: read into a record of `kind` beside the model's (`build` makes the field's value of
+    it, a registry record where the field holds one of several classes), written from the value the
+    model holds (`held`; nothing where it holds none)."""
+
+    field: str
+    kind: type[Part]
+    layout: ConfigLayout[Part]
+    held: Callable[[Model], Part | None]
+    build: Callable[[NativeFields[Part]], Configured] | None = None
+    present: Callable[[Mapping[str, object]], bool] | None = None
+    """Whether the source config builds one (a Qwen MoE whose schedule routes no layer builds none), its
+    keys then read as nothing; always where None."""
+
+    def read(self, hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        if self.present is not None and not self.present(hf_config):
+            used.update(self.layout.names())
+            record[self.field] = None
+            return record
+        part = self.layout.read(hf_config, used, NativeFields(self.kind, {}))
+        record[self.field] = part if self.build is None else self.build(part)
+        return record
+
+    def write(self, model: Model) -> Mapping[str, object]:
+        part = self.held(model)
+        return {} if part is None else self.layout.write(part)
+
+    def names(self) -> tuple[str, ...]:
+        return self.layout.names()
+
+
+@dataclass(frozen=True, eq=False)
+class Restated[Model]:
+    """`layout` under a family's own keys: each shared key read from and written to the family's
+    (`own`, shared to own), and the keys a family's class fixes (`fixed`, shared to value) read at their
+    value whatever a config states of them (a family's own part refuses a statement its reference would
+    not compute) and written as nothing (DeepSeek's one key/value head of its latent attention)."""
+
+    layout: ConfigLayout[Model]
+    own: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    fixed: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+    defaults: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+    """Shared keys at the class's own default where the config states none."""
+    undeclared: frozenset[str] = frozenset()
+    """Shared keys the family's class declares none of: read where a config states them, written as
+    nothing."""
+
+    def read(self, hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        view = {**self.defaults, **hf_config}
+        for shared, own in self.own.items():
+            if own in view:
+                view[shared] = view[own]
+        view.update(self.fixed)
+        read: set[str] = set()
+        record = self.layout.read(view, read, record)
+        used.update(self.own.get(key, key) for key in read if key not in self.fixed)
+        # The class computes a fixed key's value whatever a config states of it.
+        used.update(key for key in self.fixed if key in hf_config)
+        return record
+
+    def write(self, model: Model) -> Mapping[str, object]:
+        return {self.own.get(key, key): value for key, value in self.layout.write(model).items()
+                if key not in self.fixed and key not in self.undeclared}
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(self.own.get(key, key) for key in self.layout.names() if key not in self.fixed)
+
+
+@dataclass(frozen=True, eq=False)
+class Choice[Model]:
+    """One of two layouts a family's config takes, both ways: `routed` where the source config states it
+    (`reads`) and where the model holds it (`writes`), `plain` otherwise (LLaDA's dense release beside its
+    MoE one under one model_type)."""
+
+    reads: Callable[[Mapping[str, object]], bool]
+    writes: Callable[[Model], bool]
+    routed: ConfigLayout[Model]
+    plain: ConfigLayout[Model]
+
+    def read(self, hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Model]) -> NativeFields[Model]:
+        return (self.routed if self.reads(hf_config) else self.plain).read(hf_config, used, record)
+
+    def write(self, model: Model) -> Mapping[str, object]:
+        return (self.routed if self.writes(model) else self.plain).write(model)
+
+    def names(self) -> tuple[str, ...]:
+        return (*self.routed.names(), *self.plain.names())
+
 
 @dataclass(frozen=True, eq=False)
 class ConfigLayout[Model]:
-    """A family's config, its parts in order (`ConfigPart`, `ConfigField`, or another layout): read, each
-    filling the record (`read`), and written, each stating its keys (`write`, a later part's keys over an
-    earlier's)."""
+    """A family's config, its entries in order (`ConfigEntry`: a `ConfigPart`, a `ConfigField`, another
+    layout): read, each filling the record (`read`), and written, each stating its keys (`write`, a later
+    entry's keys over an earlier's)."""
 
-    parts: tuple[ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model], ...]
+    parts: tuple[ConfigEntry[Model], ...]
 
-    def __init__(self, *parts: ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model]) -> None:
+    def __init__(self, *parts: ConfigEntry[Model]) -> None:
         object.__setattr__(self, 'parts', parts)
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
-             record: dict[str, object]) -> dict[str, object]:
+             record: NativeFields[Model]) -> NativeFields[Model]:
         for part in self.parts:
             record = part.read(hf_config, used, record)
         return record
+
+    def names(self) -> tuple[str, ...]:
+        """The config keys its entries state by name, each under every spelling it reads."""
+        return tuple(key for part in self.parts for key in part.names())
 
     def write(self, model: Model) -> Mapping[str, object]:
         written: dict[str, object] = {}
@@ -537,11 +691,11 @@ class SourceLayout:
 
     config: Mapping[str, object]
     folders: Mapping[str, Mapping[str, object]]
-    writer: Callable[[Mapping[str, object]], Mapping[str, object]]
+    writer: Callable[[Mapping[str, object]], Mapping[str, np.ndarray]]
     code: SourceCode | None = None
     """The family's `SourceCode`, whose modules `assets` writes; None for a family transformers implements."""
 
-    def tensors(self, variables: Mapping[str, object]) -> Mapping[str, object]:
+    def tensors(self, variables: Mapping[str, object]) -> Mapping[str, np.ndarray]:
         """`variables` (the model's, every collection) as the release's tensors, by their names, each built
         when it is read (`safetensors_io.LazyTensors`)."""
         return self.writer(variables)
@@ -558,7 +712,8 @@ class SourceLayout:
             written.write_bytes(module.read_bytes())
 
 
-def source_layout(model: object, *, config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
+def source_layout(model: nn.Module, *,
+                  config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
     """The layout `model` is written in as its family's release, or what it cannot write (`Unwritable`):
     the one answer every writer asks (a run's export, a bundle's save, a decision's release). A decoder's
     family is the one its fields match (`hf_decoders.export_config`; a differential extension's or a low-rank
@@ -569,11 +724,18 @@ def source_layout(model: object, *, config: Mapping[str, object] | None = None) 
     from dew.interop import hf_decoders
     from dew.lora import unadapted
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.protocols import MediaWrapper
     from dew.registry import from_record
 
-    if not isinstance(model, CausalTransformer):
-        return Unwritable(f"no family writes a {type(model).__name__}")
-    decoder = from_record(CausalTransformer, unadapted(model))
+    if isinstance(model, MediaWrapper):
+        from dew.interop.wrappers import wrapper_layout
+
+        return wrapper_layout(from_record(MultimodalTransformer, model), config=config)
+    try:
+        decoder = from_record(CausalTransformer, unadapted(model))
+    except ValueError as error:
+        return Unwritable(f"no family writes a {type(model).__name__}: {error}")
     if decoder.cross_attention is not None:
         return Unwritable("cross-attention has no layout in any family")
     # A differential extension is folded into each layer's output projection and an adapter's factors
@@ -584,7 +746,7 @@ def source_layout(model: object, *, config: Mapping[str, object] | None = None) 
     if isinstance(held, Unwritable):
         return held
 
-    def tensors(variables: Mapping[str, object]) -> Mapping[str, object]:
+    def tensors(variables: Mapping[str, object]) -> Mapping[str, np.ndarray]:
         # The bundle's own export: its storage read as layers, the extension folded, the factors merged,
         # the family's writer.
         from dew.interop.pretrained import PretrainedDecoder
@@ -594,7 +756,7 @@ def source_layout(model: object, *, config: Mapping[str, object] | None = None) 
     return SourceLayout(held if config is None else config, {}, tensors, hf_decoders.release_code(base))
 
 
-def _decoder_layout(decoder: object) -> Mapping[str, object] | Unwritable:
+def _decoder_layout(decoder: CausalTransformer) -> Mapping[str, object] | Unwritable:
     """The config a plain decoder (`source_layout`'s) is written with, or what its family's layout cannot
     hold of it: its config refused, or a parameter or router state no route writes, its leaves' paths
     abstract (`jax.eval_shape`: no weight is drawn)."""
@@ -602,9 +764,7 @@ def _decoder_layout(decoder: object) -> Mapping[str, object] | Unwritable:
     import jax.numpy as jnp
 
     from dew.interop import decoder_parts, hf_decoders
-    from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    assert isinstance(decoder, CausalTransformer)
     try:
         written = hf_decoders.export_config(decoder)
     except decoder_parts.ExportRefused as refusal:
@@ -620,7 +780,42 @@ def _decoder_layout(decoder: object) -> Mapping[str, object] | Unwritable:
     return written
 
 
-__all__ = ["INDEX", "Condition", "Config", "ConfigField", "ConfigLayout", "ConfigPart", "ConfigRead",
-           "ConfigWrite", "Copy", "Leaf", "Path", "Prefixed", "Rebased", "Renames", "Route", "Routes", "Slot",
-           "SourceLayout", "Spelled", "Table", "Unwritable", "When", "after", "mapped", "nested", "one_of",
-           "renamed", "source_layout"]
+__all__ = [
+    "INDEX",
+    "REQUIRED",
+    "Choice",
+    "Condition",
+    "Config",
+    "ConfigEntry",
+    "ConfigField",
+    "ConfigLayout",
+    "ConfigPart",
+    "ConfigRead",
+    "ConfigWrite",
+    "Copy",
+    "Leaf",
+    "Nested",
+    "Path",
+    "Prefixed",
+    "Rebased",
+    "Renames",
+    "Required",
+    "Restated",
+    "Route",
+    "Routes",
+    "Slot",
+    "SourceLayout",
+    "Spelled",
+    "Table",
+    "Unwritable",
+    "Unwritten",
+    "When",
+    "after",
+    "constant",
+    "mapped",
+    "nested",
+    "one_of",
+    "renamed",
+    "source_layout",
+    "unread",
+]

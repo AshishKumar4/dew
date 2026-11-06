@@ -16,18 +16,16 @@ import numpy as np
 
 from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.decoder_config import read_only
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     NO_AUDIO,
     DecoderFamily,
     DecoderFields,
     KindFields,
-    Ropes,
     WrapperFields,
-    base_config,
     in_trunk,
     kind_mixers,
-    reads,
     record_float,
     record_int,
     refuse,
@@ -35,6 +33,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.families.deepseek import (
     DSPARK_LEAVES,
+    V4_DECODER,
     V4_SCORES,
     dspark_fields,
     dspark_kept,
@@ -43,7 +42,8 @@ from dew.interop.families.deepseek import (
     v4_prepare,
     v4_routes,
 )
-from dew.interop.layouts import ConfigLayout, ConfigPart, Route, mapped, one_of
+from dew.interop.layouts import Route, mapped, one_of
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
@@ -195,11 +195,8 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
     kinds, layer_types, shared = _v41_kinds(text, layers, ratios[:layers], modes, fields,
                                           compressed, index, seen)
     moe = record_int(text, 'moe_intermediate_size')
-    base_used: set[str] = set()
-    config = base_config({**text, 'intermediate_size': moe, 'num_key_value_heads': 1,
-                           'tie_word_embeddings': text.get('tie_word_embeddings', False)},
-                          base_used, layer_types=tuple(layer_types), rope=Ropes(main_theta))
-    seen.update(base_used - {'intermediate_size'})
+    config = V4_DECODER.read(text, seen, NativeFields(CausalTransformer, {'layer_types': tuple(layer_types)}))
+    config['rope_theta'] = main_theta
     scoring = text.get('scoring_func', 'sqrtsoftplus')
     if scoring not in V4_SCORES:
         refuse(f"scoring_func {scoring!r}", f"the router scores with one of {sorted(V4_SCORES)}")
@@ -369,7 +366,9 @@ def _deepseek_v41_constants(directory, record: Mapping[str, object]) -> Mapping[
 # V4.1 is V4's block under CSA2's compressor, which names the family; the
 # hub's table registers it.
 DEEPSEEK_V41 = DecoderFamily(
-    ('deepseek_v41',), ConfigLayout(ConfigPart(reads(_deepseek_v41_config), lambda model: {})),
+    ('deepseek_v41',),
+    read_only(_deepseek_v41_config, "a V4.1 model is written as its release, whose text_config no exporter "
+              "of Dew's states"),
     lambda fields: any(isinstance(mixer, DeepseekV4Mixer) and mixer.compressor == 'csa2'
                        for mixer in kind_mixers(fields)),
     'deepseek_v41', 'DeepseekV41ForCausalLM',

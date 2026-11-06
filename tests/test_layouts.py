@@ -14,12 +14,15 @@ from dew.interop import Pretrained, PretrainedDecoder, decoder_parts, hf_decoder
 from dew.interop.codecs import SIDECARS
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.layouts import (
+    Choice,
     ConfigField,
     ConfigLayout,
     ConfigPart,
     Copy,
+    Nested,
     Prefixed,
     Rebased,
+    Restated,
     Route,
     Spelled,
     Table,
@@ -30,15 +33,16 @@ from dew.interop.safetensors_io import header_specs
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 ROUTES = (Route, Copy, Table, Spelled, Prefixed, Rebased, When)
-CONFIGS = (ConfigLayout, ConfigPart, ConfigField)
+CONFIGS = (ConfigLayout, ConfigPart, ConfigField, Nested, Restated, Choice)
 
 
 def declared(node: object):
-    """Every node of a family's route table or config layout, the node first."""
+    """Every node of a family's route table or config layout, the node first: a nested record's, a
+    restated layout's and both of a choice's among them."""
     yield node
     for child in (*getattr(node, "entries", ()), *getattr(node, "parts", ())):
         yield from declared(child)
-    for attribute in ("routes", "route"):
+    for attribute in ("routes", "route", "layout", "routed", "plain"):
         if hasattr(node, attribute):
             yield from declared(getattr(node, attribute))
 
@@ -136,13 +140,18 @@ def test_a_routed_or_hybrid_model_writes_its_release_from_its_own_fields_and_rea
 
 def test_a_model_its_layout_cannot_hold_is_unwritable_with_its_reason():
     """A model no family's layout holds is `Unwritable`, falsy and naming why, before any file is written:
-    a decoder with cross-attention, and a model of no decoder class."""
+    a decoder with cross-attention, one whose family's config cannot state its computation (GPT-J's
+    layout under a gated MLP, `hf_ungated`), and a model of no decoder class."""
+    from flax import linen as nn
+
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.cross_attention import CrossAttention
 
     decoder = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2,
                                 head_dim=8, mlp_features=32, max_seq_len=16)
     assert source_layout(decoder)
-    for model in (decoder.clone(cross_attention=CrossAttention((1,), 4)), object()):
+    gated_gptj = decoder.clone(parallel_residual=True, shared_parallel_norm=True, head_bias=True,
+                               attention_bias=False, mlp="swiglu")
+    for model in (decoder.clone(cross_attention=CrossAttention((1,), 4)), gated_gptj, nn.Dense(4)):
         layout = source_layout(model)
         assert not layout and layout.reason

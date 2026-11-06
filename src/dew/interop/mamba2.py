@@ -1,9 +1,9 @@
 """Read a Hugging Face `Mamba2ForCausalLM` checkpoint as a `CausalTransformer`.
 
-`config_from_hf` reads `Mamba2Config`'s fields (configuration_mamba2.py)
-into the backbone's: the SSD geometry onto the `mamba2` mixer value, the
-block without a feed-forward as `mlp_features=0`, the final norm's epsilon
-and the head's tying. `ROUTES` names the checkpoint's tensors
+`CONFIG` reads `Mamba2Config`'s fields (configuration_mamba2.py) into the
+backbone's and writes them back: the SSD geometry onto the `mamba2` mixer
+value, the block without a feed-forward as `mlp_features=0`, the final norm's
+epsilon and the head's tying. `ROUTES` names the checkpoint's tensors
 (`backbone.layers.N.mixer.*`, `backbone.norm_f`, `lm_head`) both ways
 (`backbone_routes`): a load reads them onto the variables tree and an
 export writes them back.
@@ -25,16 +25,15 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from dew import _records
-from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import expect, flag, integer
 from dew.interop.decoder_parts import in_trunk, record_bool, record_int, refuse_export
-from dew.interop.layouts import Route, Routes, Table
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Routes, Table, constant, unread
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 if TYPE_CHECKING:
     from dew.interop.decoder_parts import DecoderFields
-    from dew.nn.mixer_base import MixerBase
 
 MODEL_TYPE = "mamba2"
 
@@ -51,62 +50,67 @@ LAYER: Mapping[str, tuple[str, ...]] = {
 }
 
 
-def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None) -> DecoderFields:
-    """Read `Mamba2Config` fields into `CausalTransformer` kwargs.
+def _one_head(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    record.update(num_heads=1, num_kv_heads=1,
+                  head_dim=_records.integer(record['emb_features'], 'emb_features'))
+    return record
 
-    `used` collects the config keys read, the set `hf_decoders.translate_config`
-    checks the rest against. The backbone's attention geometry is
-    `mixer_decoder`'s; the SSD layer reads its own heads from the mixer value.
-    """
-    read = {"model_type", "num_hidden_layers"} if used is None else used
-    integer, boolean = partial(record_int, hf_config, used=read), partial(record_bool, hf_config, used=read)
 
-    hidden, expand = integer("hidden_size", 4096), integer("expand", 2)
+def backbone_layout(*, vocab: int, hidden: int, layers: int, tied: bool) -> ConfigLayout[CausalTransformer]:
+    """The decoder of a Mamba family's model, both ways, at its class's defaults: every layer its mixer
+    alone (the family's own part), `hidden_size` wide, its norms at `layer_norm_epsilon`, its residual's
+    dtype. The attention geometry the backbone validates is one head of the model width, with no
+    feed-forward and no query and key norm, none of which a layer reads; written as nothing. The mixer's
+    conv activates with SiLU whatever else `hidden_act` names."""
+    return ConfigLayout(
+        integer('vocab_size', 'vocab_size', vocab), integer('hidden_size', 'emb_features', hidden),
+        integer('num_hidden_layers', 'num_layers', layers),
+        ConfigField('layer_norm_epsilon', 'norm_eps', 1e-5, parse=_records.number),
+        flag('tie_word_embeddings', 'tie_embeddings', default=tied),
+        flag('residual_in_fp32', 'residual_in_fp32', default=True),
+        ConfigPart(_one_head, lambda model: {}), constant('mlp_features', value=0),
+        constant('qk_norm', value=False),
+        expect('hidden_act', "the mixer's conv activates with silu", value='silu'))
+
+
+def _time_step_limit(hf_config: Mapping[str, object]) -> tuple[float, float]:
+    """The step's (lower, upper) clamp. The reference leaves the upper bound open by default.
+    transformers 5.x writes an infinite bound as the {"__float__": "Infinity"} record `records` reads, and
+    every published port (AntonV/mamba2-130m-hf, Mamba-Codestral-7B) writes JSON's bare `Infinity`, which
+    json.loads (and so transformers) reads as float('inf'); the default is this module's own value and is
+    not read from one."""
+    if "time_step_limit" not in hf_config:
+        return 0.0, float("inf")
+    limit = hf_config["time_step_limit"]
+    if not isinstance(limit, (list, tuple)) or len(limit) != 2:
+        raise ValueError(f"time_step_limit is a (lower, upper) pair, got {limit!r}")
+    lower, upper = (math.inf if isinstance(bound, float) and bound == math.inf
+                    else _records.number(bound, "time_step_limit") for bound in limit)
+    return lower, upper
+
+
+def _ssd(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    """`Mamba2Config`'s SSD layer (configuration_mamba2.py), every layer's mixer: its heads, whose width the
+    model's `expand` times over, as the reference's validate_architecture requires."""
+    integer, boolean = partial(record_int, hf_config, used=used), partial(record_bool, hf_config, used=used)
+    hidden, expand = _records.integer(record['emb_features'], 'emb_features'), integer("expand", 2)
     heads, head_dim = integer("num_heads", 128), integer("head_dim", 64)
     if hidden * expand != heads * head_dim:
         raise ValueError(
             f"hidden_size * expand ({hidden * expand}) must equal num_heads * head_dim "
             f"({heads * head_dim}), as the reference's validate_architecture requires")
-    read.add("hidden_act")
-    activation = hf_config.get("hidden_act", "silu")
-    if activation != "silu":
-        raise ValueError(f"hidden_act {activation!r} is not expressible: the SSD conv activates with silu")
-    # Init-time fields of the reference, nothing the forward reads.
-    read.update(("time_step_rank", "time_step_min", "time_step_max", "time_step_floor",
-                 "rescale_prenorm_residual", "time_step_limit", "layer_norm_epsilon"))
-    # The reference leaves the upper bound open by default. transformers
-    # 5.x writes an infinite bound as the {"__float__": "Infinity"} record
-    # `records` reads, and every published port (AntonV/mamba2-130m-hf,
-    # Mamba-Codestral-7B) writes JSON's bare `Infinity`, which json.loads
-    # (and so transformers) reads as float('inf'); the default is this
-    # module's own value and is not read from one.
-    lower, upper = 0.0, float("inf")
-    if "time_step_limit" in hf_config:
-        limit = hf_config["time_step_limit"]
-        if not isinstance(limit, (list, tuple)) or len(limit) != 2:
-            raise ValueError(f"time_step_limit is a (lower, upper) pair, got {limit!r}")
-        lower, upper = (math.inf if isinstance(bound, float) and bound == math.inf
-                        else _records.number(bound, "time_step_limit") for bound in limit)
-    mixer = Mamba2Mixer(
-        num_heads=heads, head_dim=head_dim,
-        state_size=integer("state_size", 128),
-        n_groups=integer("n_groups", 8),
-        conv_kernel=integer("conv_kernel", 4),
-        chunk_size=integer("chunk_size", 256),
-        use_bias=boolean("use_bias", default=False),
-        use_conv_bias=boolean("use_conv_bias", default=True),
-        time_step_limit=(lower, upper))
-    return mixer_decoder(hf_config, hidden, mixer, vocab_size=integer("vocab_size", 32768),
-                         num_layers=integer("num_hidden_layers", 64),
-                         tie_embeddings=boolean("tie_word_embeddings", default=False),
-                         residual_in_fp32=boolean("residual_in_fp32", default=True))
+    used.add("time_step_limit")
+    record['mixer'] = Mamba2Mixer(
+        num_heads=heads, head_dim=head_dim, state_size=integer("state_size", 128),
+        n_groups=integer("n_groups", 8), conv_kernel=integer("conv_kernel", 4),
+        chunk_size=integer("chunk_size", 256), use_bias=boolean("use_bias", default=False),
+        use_conv_bias=boolean("use_conv_bias", default=True), time_step_limit=_time_step_limit(hf_config))
+    return record
 
 
-def export_fields(model: CausalTransformer) -> Mapping[str, object]:
-    """`config_from_hf` backwards: the SSD layer's geometry (its width over the model's as `expand`, whole
-    as the reference's validate_architecture requires), its bounds and biases, the norms' epsilon, the
-    residual's dtype, and the shared decoder's attention fields cleared, which `Mamba2Config` declares
-    none of (its `head_dim` and `num_heads` are the SSD's)."""
+def _ssd_written(model: CausalTransformer) -> Mapping[str, object]:
+    """`_ssd` backwards: the SSD layer's geometry (its width over the model's as `expand`, whole as the
+    reference's validate_architecture requires), its bounds and biases."""
     mixer = model.mixer
     assert isinstance(mixer, Mamba2Mixer), "the family matches a Mamba-2 mixer alone"
     expand, remainder = divmod(mixer.num_heads * mixer.head_dim, model.emb_features)
@@ -117,25 +121,14 @@ def export_fields(model: CausalTransformer) -> Mapping[str, object]:
         'expand': expand, 'num_heads': mixer.num_heads, 'head_dim': mixer.head_dim,
         'state_size': mixer.state_size, 'n_groups': mixer.n_groups, 'conv_kernel': mixer.conv_kernel,
         'chunk_size': mixer.chunk_size, 'use_bias': mixer.use_bias, 'use_conv_bias': mixer.use_conv_bias,
-        'time_step_limit': list(mixer.time_step_limit), 'hidden_act': 'silu',
-        'layer_norm_epsilon': model.norm_eps, 'residual_in_fp32': model.residual_in_fp32,
-        'num_attention_heads': None, 'num_key_value_heads': None, 'intermediate_size': None,
-        'rms_norm_eps': None, 'attention_bias': None, 'rope_theta': None, 'max_position_embeddings': None,
-    }
+        'time_step_limit': list(mixer.time_step_limit)}
 
 
-def mixer_decoder(hf_config: Mapping[str, object], hidden: int, mixer: MixerBase, *, vocab_size: int,
-                  num_layers: int, tie_embeddings: bool, residual_in_fp32: bool) -> DecoderFields:
-    """The decoder fields of a Mamba family's model, every layer `mixer`
-    alone, `hidden` wide, its norms at the config's `layer_norm_epsilon`. The
-    attention geometry the backbone validates is one head of the model width,
-    with no feed-forward and no query and key norm, none of which a layer
-    reads."""
-    return native_fields(CausalTransformer)(
-        vocab_size=vocab_size, emb_features=hidden, num_layers=num_layers, num_heads=1, num_kv_heads=1,
-        head_dim=hidden, mlp_features=0, qk_norm=False,
-        norm_eps=_records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
-        tie_embeddings=tie_embeddings, residual_in_fp32=residual_in_fp32, mixer=mixer)
+CONFIG = ConfigLayout(
+    backbone_layout(vocab=32768, hidden=4096, layers=64, tied=False), ConfigPart(_ssd, _ssd_written),
+    # Init-time fields of the reference, nothing the forward reads.
+    unread("time_step_rank", "time_step_min", "time_step_max", "time_step_floor", "rescale_prenorm_residual"))
+"""`Mamba2Config`'s fields (configuration_mamba2.py), both ways."""
 
 
 def backbone_routes(layer: Mapping[str, tuple[str, ...]], *own: Routes) -> Table:

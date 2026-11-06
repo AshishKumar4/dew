@@ -1,6 +1,6 @@
 """The parts a decoder family is built from, which imports no family.
 
-The config readers (`base_config`, `translated`), the shared decoder's tensor
+The config's shared parts (`decoder_layout`, `translated`), the shared decoder's tensor
 names both ways (`DECODER_ROUTES`, `spelled`, `prediction_routes`; a family's
 own through `dew.interop.layouts`), tensors a checkpoint stores packed (`Packed`),
 the shared export writer (`decoder_tensors`, `leaf_layouts`) and the entry type
@@ -15,7 +15,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -30,8 +30,6 @@ from dew.interop.layouts import (
     Condition,
     Config,
     ConfigLayout,
-    ConfigPart,
-    ConfigRead,
     Copy,
     Rebased,
     Renames,
@@ -90,7 +88,7 @@ def hf_activation(activation: GatedActivation) -> str:
     """The `hidden_act` a family's config names an activation by; Kimi K3's
     SiTU carries its betas in fields of its own and has no such name."""
     if isinstance(activation, Situ):
-        refuse('mlp', "SiTU is named only by Kimi K3's own config fields")
+        refuse_export('mlp', "SiTU is named only by Kimi K3's own config fields")
     return _HF_ACTIVATIONS[activation]
 
 
@@ -128,7 +126,7 @@ def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new')
     by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
     if isinstance(mlp, str) and mlp in {ours for ours, _, _ in _UNGATED}:
         return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
-    return refuse('mlp', f'{family} writes only an ungated GELU or ReLU')
+    return refuse_export('mlp', f'{family} writes only an ungated GELU or ReLU')
 
 
 GEMMA3_MODEL_TYPE = 'gemma3_text'
@@ -230,6 +228,15 @@ def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
                                                     frozenset())
     return (set(hf_config) - used - IGNORED_FIELDS - CODEC_FIELDS - inert
             - {key for key in hf_config if str(key).startswith('_')})
+
+
+def context_lengths(hf_config: Mapping[str, object], default: int | None = None) -> tuple[int, int | None]:
+    """The decode cache's capacity (`CausalTransformer.max_seq_len`), capped at
+    `DEFAULT_MAX_SEQ_LEN`, and the context (`max_position_embeddings`, its `context_length`): the
+    stated one, else `default`, the source config class's own, None where neither is."""
+    stated = hf_config.get('max_position_embeddings', default)
+    context = None if stated is None else _records.integer(stated, 'max_position_embeddings')
+    return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
 
 
 def refuse(field: str, detail: str) -> NoReturn:
@@ -364,8 +371,8 @@ def folder_name(folder: str, name: str) -> str:
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
-    """Return the kind records of a translated config, which `base_config` always
-    sets, for a family that adds its own to them."""
+    """Return the kind records of a translated config, which the shared decoder's layer kinds always
+    set (`decoder_layout`), for a family that adds its own to them."""
     kinds = config.get('kinds')
     if kinds is None:
         refuse('kinds', 'the shared decoder fields carry one record per named kind')
@@ -498,8 +505,8 @@ def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None,
     `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
     `rotary_emb_base` and `rotary_pct`), else the config class's defaults: its `spelling`'s base, as
     `rope_records` reads it, and `default_factor`. A None default is a class that has none, whose
-    config states the value or is refused. The rest is the entry without its factor, which a family
-    whose rotary may scale hands `base_config`'s rope reader."""
+    config states the value or is refused. The rest is the entry without its factor, which
+    `plain_partial_rope` holds to the plain rotary."""
     entry = _records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
 
     def stated(key: str, field: str, default: float | None) -> float:
@@ -514,11 +521,13 @@ def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None,
 
 def plain_partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None, *,
                        default_factor: float | None, reference: str,
-                       layout: tuple[str, ...] = ()) -> tuple[float, float]:
-    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`), with
-    `layout` the entry's fields that place the rotated pairs. A scaled type or any other field
-    refuses, naming `reference`'s rotary."""
-    theta, factor, rest = partial_rope(hf_config, spelling, default_factor=default_factor)
+                       layout: tuple[str, ...] = (), factor_field: str = 'partial_rotary_factor',
+                       theta_field: str = 'rope_theta') -> tuple[float, float]:
+    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`, its flat
+    fields `factor_field` and `theta_field`), with `layout` the entry's fields that place the rotated
+    pairs. A scaled type or any other field refuses, naming `reference`'s rotary."""
+    theta, factor, rest = partial_rope(hf_config, spelling, default_factor=default_factor,
+                                       factor_field=factor_field, theta_field=theta_field)
     rope_type = rest.get('rope_type', rest.get('type', 'default'))
     if rope_type not in ('default', 'none'):
         refuse(f"rope_parameters (rope_type {rope_type!r})", f"{reference} is the plain rotary")
@@ -802,148 +811,6 @@ def yarn_record(entry: Mapping[str, object], field: str, max_pos: int | None) ->
     )
 
 
-def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
-    """Return one feed-forward width, or Gemma 3n's list of one per layer.
-
-    configuration_gemma3n.py expands an int to a list, so a config it wrote
-    carries the list. A list of one repeated value is that value.
-    """
-    stated = hf_config['intermediate_size']
-    if isinstance(stated, (list, tuple)):
-        widths = _records.integers(stated, 'intermediate_size')
-        return widths[0] if len(set(widths)) == 1 else widths
-    return _records.integer(stated, 'intermediate_size')
-
-
-_OPTIONAL_FIELDS = frozenset({'layer_types', 'sliding_window', 'rope_local_base_freq', 'attention_bias',
-                              'mlp_bias'})
-"""Fields `base_config` reads for a family whose reference reads them, and
-accepts unread at a value that computes nothing. rope_local_base_freq is
-read by the families whose class reads it, through their `RopeSpelling`."""
-
-
-def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
-    """Whether the config's `field` computes what leaving it out computes."""
-    value = hf_config[field]
-    if field == 'layer_types' and isinstance(value, (list, tuple)):
-        return all(layer == 'full_attention' for layer in value)
-    return value is None or value is False
-
-
-def context_lengths(hf_config: Mapping[str, object], default: int | None = None) -> tuple[int, int | None]:
-    """The decode cache's capacity (`CausalTransformer.max_seq_len`), capped at
-    `DEFAULT_MAX_SEQ_LEN`, and the context (`max_position_embeddings`, its `context_length`): the
-    stated one, else `default`, the source config class's own, None where neither is."""
-    stated = hf_config.get('max_position_embeddings', default)
-    context = None if stated is None else _records.integer(stated, 'max_position_embeddings')
-    return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
-
-
-def base_config(hf_config: Mapping[str, object], used: set[str], *,
-                 rope: Ropes | RopeSpelling,
-                 layer_types: tuple[str, ...] | None = None,
-                 qk_norm: bool = False, scale_after_cast: bool = True,
-                 tie_embeddings: bool = False,
-                 reads: frozenset[str] = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
-                 ) -> DecoderFields:
-    """Read the projection geometry and decoder fields every family shares.
-
-    A ramp both kinds share is the model's; a ramp the full layers alone
-    carry (OLMo 3's spelling) lands on the full kind, because a kind's None
-    rides the model's value and cannot turn a ramp off.
-
-    `reads` names the `_OPTIONAL_FIELDS` the family's reference reads.
-    LlamaConfig, for one, declares neither layer_types nor sliding_window,
-    and LlamaAttention attends every key, so a Llama config that states a
-    window is refused rather than read as one transformers never applies.
-    An unread field at the value it would compute anyway (a null window,
-    attention_bias false, every layer full) is accepted.
-    """
-    for unread in _OPTIONAL_FIELDS - reads:
-        if unread in hf_config and _neutral(hf_config, unread):
-            used.add(unread)
-    hidden = _records.integer(hf_config['hidden_size'], 'hidden_size')
-    heads = _records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
-    kv_heads = hf_config.get('num_key_value_heads')
-    head_dim = _records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
-    used.update(('hidden_size', 'num_attention_heads', 'num_key_value_heads', 'head_dim'))
-
-    activation = _records.text(hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu')),
-                      'hidden_act/hidden_activation')
-    used.update(('hidden_act', 'hidden_activation'))
-    mapped = ACTIVATIONS.get(activation)
-    if mapped is None:
-        refuse(f"hidden_act {activation!r}",
-                f"the gated MLP supports {sorted(ACTIVATIONS)}")
-
-    ropes = read_rope(hf_config, used, rope) if isinstance(rope, RopeSpelling) else rope
-    rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
-    if 'layer_types' in reads:
-        layer_types = specified_layer_types(hf_config, used, layer_types)
-    elif layer_types is None:
-        layer_types = ("full_attention",) * _records.integer(
-            hf_config["num_hidden_layers"], "num_hidden_layers"
-        )
-    stated_window = hf_config.get('sliding_window') if 'sliding_window' in reads else None
-    if 'sliding_window' in reads:
-        used.add('sliding_window')
-    if 'sliding_attention' in layer_types and stated_window is None:
-        refuse("layer_types with sliding attention",
-                "sliding_window is not set, so the window has no size")
-    sliding_window = (_records.integer(stated_window, 'sliding_window')
-                      if 'sliding_attention' in layer_types else None)
-
-    kinds = decoder_kinds(layer_types, sliding_window, rope_local_theta, None, None)
-    capacity, context = context_lengths(hf_config)
-    config: DecoderFields = native_fields(CausalTransformer)(
-        vocab_size=_records.integer(hf_config['vocab_size'], 'vocab_size'),
-        emb_features=hidden,
-        num_layers=_records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'),
-        num_heads=heads,
-        num_kv_heads=heads if kv_heads is None else _records.integer(kv_heads, 'num_key_value_heads'),
-        head_dim=head_dim,
-        mlp=mapped,
-        mlp_features=_mlp_features(hf_config),
-        max_seq_len=capacity,
-        context_length=context,
-        rope_theta=rope_theta,
-        layer_types=layer_types,
-        kinds={},
-        norm_eps=_records.number(hf_config.get('rms_norm_eps', 1e-6), 'rms_norm_eps'),
-        # LlamaRMSNorm, Qwen3RMSNorm and DeepseekV3RMSNorm multiply the scale
-        # into the activations after casting them (modeling_qwen3.py:61-64,
-        # modeling_deepseek_v3.py:47-52); Gemma3's, Gemma4's and Qwen3.5's
-        # norms scale in fp32 and cast the product (modeling_gemma3.py:147-150,
-        # modeling_gemma4.py:197-215, modeling_qwen3_5.py:732-737).
-        scale_after_cast=scale_after_cast,
-        qk_norm=qk_norm,
-        attention_bias='attention_bias' in reads and config_flag(hf_config, 'attention_bias', default=False),
-        mlp_bias='mlp_bias' in reads and config_flag(hf_config, 'mlp_bias', default=False),
-        # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
-        # others do not, so a config that omits the field (gemma-3-1b-pt
-        # does) takes its family's default.
-        tie_embeddings=config_flag(hf_config, 'tie_word_embeddings', default=tie_embeddings),
-    )
-    config['kinds'] = kinds
-    used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
-                 'rms_norm_eps', 'tie_word_embeddings'))
-    used.update(reads & {'attention_bias', 'mlp_bias'})
-
-    # A ramp both kinds share is the model's. Where the kinds' ramps differ, each lands on its own
-    # kind: a kind inherits the model's ramp, so a model-level one beside a kind's own would give
-    # that kind two (transformers dispatches each kind's record on its own).
-    apart = ropes.scaling is not None and (ropes.full_only or ropes.local_scaling is not None)
-    if ropes.scaling is not None:
-        if apart and 'sliding_attention' in layer_types:
-            full = kinds.setdefault('full_attention', native_fields(LayerKind)())
-            full['rope_scaling'] = ropes.scaling
-        else:
-            config['rope_scaling'] = ropes.scaling
-    if ropes.local_scaling is not None:
-        kinds['sliding_attention']['rope_scaling'] = ropes.local_scaling
-    return config
-
-
 def nested_ramp(ramp: Ramp | None) -> Ramp | None:
     """A ramp read from one layer type's record of nested rope_parameters, as transformers 5.16.1
     computes it: its YaRN truncation is the config's top-level `rope_parameters.get("truncate", True)`
@@ -954,36 +821,12 @@ def nested_ramp(ramp: Ramp | None) -> Ramp | None:
     return native_fields(YarnScaling)(**{**ramp, 'truncate': True})
 
 
-
-
-
 def softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
     """Read the top-k count without treating training-only routing controls
     as model fields. Each family's native Mixture owns its routing options."""
     used.update(('num_experts_per_tok', 'output_router_logits',
                  'router_aux_loss_coef'))
     return _records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok')
-
-
-def _read_local_experts(hf_config: Mapping[str, object], used: set[str],
-                        record: dict[str, object]) -> dict[str, object]:
-    used.add('num_local_experts')
-    record['mixture'] = native_fields(Mixture)(
-        experts=_records.integer(hf_config['num_local_experts'], 'num_local_experts'),
-        top_k=softmax_top_k(hf_config, used))
-    return record
-
-
-def _write_local_experts(model: CausalTransformer) -> Mapping[str, object]:
-    mixture = model.mixture
-    if mixture is None:
-        refuse_export('mixture', 'this family routes every layer')
-    return {'num_local_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k}
-
-
-LOCAL_EXPERTS = ConfigPart(_read_local_experts, _write_local_experts)
-"""Mixtral's routed experts, which GraniteMoE's share: `num_local_experts` softmax experts on every layer,
-the top `num_experts_per_tok` of them renormalized (`softmax_top_k`), both ways."""
 
 
 def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> DecoderFields:
@@ -1286,19 +1129,6 @@ def spelled(renames: Renames, *, leaves: Leaves | None = None, layer_leaves: Lea
                                   DECODER_ROUTES if routes is None else routes))
 
 
-def reads(translate: Callable[[Mapping[str, object], set[str]], DecoderFields]) -> ConfigRead:
-    """A reader of a whole record (`translate`, the source config and the keys read) as a config part's
-    read (`ConfigPart`)."""
-    def read(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> dict[str, object]:
-        # The reader's own record where it is the first part, kept typed as it builds it (`NativeFields`).
-        translated = cast(dict[str, object], translate(hf_config, used))
-        if not record:
-            return translated
-        record.update(translated)
-        return record
-    return read
-
-
 def declared_depths(field: str = 'num_nextn_predict_layers') -> Condition:
     """A route's `depth` slot held to one of the depths the record declares in `field`, a model building
     no others."""
@@ -1556,7 +1386,7 @@ DEEPSEEK_ROUTES = layer_depth_routes(DECODER_ROUTES)
 releases share."""
 
 
-def model_record(model: CausalTransformer) -> dict[str, object]:
+def model_record(model: CausalTransformer) -> Mapping[str, object]:
     """The record a family's routes read an export's conditions from, as a load reads them from the
     translated config (`DecoderFields`): the model's own fields, its layer kinds resolved
     (`per_layer_types`)."""
@@ -1680,7 +1510,7 @@ def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
         order = stored_order(path, 2 if fold else len(shape), len(shape))
         stored: tuple[int, ...] = shape if order is None else tuple(shape[axis] for axis in order)
         if fold:
-            stored = (math.prod(stored[:-1]), stored[-1])
+            stored = (math.prod(stored[:-1]), *stored[-1:])
         for target, expert in slices:
             if target in layouts:
                 raise ValueError(f"{'.'.join(path)} and {layouts[target].paths[0]} both write {target}")
@@ -2259,7 +2089,7 @@ class DecoderFamily:
     def translate_config(self, hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
         """The record `hf_config`, the family's own spelling of its fields (`translated` reads its aliases,
         defaults and repeats first), states (`config`), each key read added to `used`."""
-        return cast(DecoderFields, self.config.read(hf_config, used, {}))
+        return self.config.read(hf_config, used, NativeFields(CausalTransformer, {}))
 
     def export_fields(self, model: CausalTransformer) -> Mapping[str, object]:
         """The family's own keys `model`'s fields state (`config`), beside the shared ones

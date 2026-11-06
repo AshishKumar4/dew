@@ -253,7 +253,7 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     ours = np.asarray(loaded.model.apply(loaded.variables, ids))
     loaded.save(tmp_path / "export")
     # Written from the model and its variables alone too, as a trained run exports: Nemotron-H's hybrid
-    # pattern among its fields (`nemotron_h.export_fields`).
+    # pattern among its fields (`nemotron_h.CONFIG`).
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
     exports = [tmp_path / "export", tmp_path / "from_model"]
     for export in exports:

@@ -1,86 +1,44 @@
 """Translate Llama, Mistral and Mixtral, the dense block the other families vary.
 
-Llama's own translation is the shared `base_config` over the fields
-LlamaConfig declares, so what stands here is only what the variants add to
-it. Mistral adds a sliding window on every layer and drops the attention
-biases. Ministral names a pattern of sliding and full layers. Mixtral adds a
-softmax-routed feed-forward and the expert tensor names that routing brings.
+Llama's own config is the shared decoder's layout (`decoder_layout`) over
+the fields LlamaConfig declares, so what stands here is only what the
+variants add to it, each read and written by one declaration. Mistral adds a
+sliding window on every layer and drops the attention biases. Ministral names
+a pattern of sliding and full layers. Mixtral adds a softmax-routed
+feed-forward and the expert tensor names that routing brings.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import dataclasses
 
 from dew import _records
+from dew.interop.decoder_config import LOCAL_EXPERTS, DecoderSpelling, decoder_layout, inert
 from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
-    LOCAL_EXPERTS,
     MOE_NAMES,
-    PLAIN_SPELLING,
     DecoderFamily,
-    DecoderFields,
     Packed,
     RopeSpelling,
-    base_config,
     every_layer_windowed,
-    read_rope,
-    reads,
-    refuse,
     spelled,
 )
 from dew.interop.families.qwen import QWEN_MOE_ROUTES
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Spelled
+from dew.interop.layouts import ConfigField, ConfigLayout, Spelled, unread
 
-
-def llama_config(hf_config, used):
-    # LlamaConfig declares attention_bias, mlp_bias and no window: LlamaAttention
-    # attends every key, and LlamaMLP's projections carry mlp_bias's biases.
-    # LlamaRotaryEmbedding builds any rope_type the rope utilities do, YaRN
-    # among them (modeling_llama.py:82-86).
-    rope = read_rope(hf_config, used, PLAIN_SPELLING)
-    return base_config(hf_config, used, rope=rope, reads=frozenset({'attention_bias', 'mlp_bias'}))
-
-
-def ministral_config(hf_config, used):
-    # MinistralConfig declares layer_types and sliding_window, and its
-    # attention builds no biases. Without layer_types every layer attends the
-    # window where there is one (configuration_ministral.py).
-    windowed = hf_config.get('sliding_window') is not None
-    return base_config(hf_config, used, rope=PLAIN_SPELLING,
-                       layer_types=('sliding_attention' if windowed else 'full_attention',),
-                       reads=frozenset({'layer_types', 'sliding_window'}))
+# LlamaConfig declares attention_bias, mlp_bias and no window: LlamaAttention attends every key, and
+# LlamaMLP's projections carry mlp_bias's biases. LlamaRotaryEmbedding builds any rope_type the rope
+# utilities do, YaRN among them (modeling_llama.py:82-86).
+LLAMA_DECODER = DecoderSpelling(reads=frozenset({'attention_bias', 'mlp_bias'}))
 
 
 # MixtralConfig's default_theta (configuration_mixtral.py:45), the base an omitted rope_theta means.
 _MIXTRAL_SPELLING = RopeSpelling(theta=1000000.0)
 
 
-def _mixtral_config(hf_config, used):
-    """Mixtral's decoder, Mistral's under its own rope base; its experts are `LOCAL_EXPERTS`."""
-    used.add('router_jitter_noise')
-    if hf_config.get('router_jitter_noise', 0.0):
-        refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
-    return _mistral_config(hf_config, used, _MIXTRAL_SPELLING)
-
-
-def _mistral_config(hf_config, used, spelling: RopeSpelling = PLAIN_SPELLING):
-    """MistralConfig's decoder, under `spelling`, the class's rope (Mixtral's base differs)."""
-    layers = int(hf_config['num_hidden_layers'])
-    window = hf_config.get('sliding_window')
-    # MistralConfig declares sliding_window alone; MistralAttention builds
-    # no biases.
-    return base_config(hf_config, used, rope=spelling, layer_types=(
-        'full_attention' if window is None else 'sliding_attention',) * layers,
-        reads=frozenset({'sliding_window'}))
-
-
-def _granitemoe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read Granite's decoder: Llama's, ordinary GQA under a normalized softmax MoE on every layer
-    (`LOCAL_EXPERTS`), without shared experts or a balancing bias, and its multipliers
-    (`_GRANITE_MULTIPLIERS`). The reference reads hidden_act, not the released activation_function beside
-    it, and applies no router_jitter_noise, so both are read as the reference reads them: not at all."""
-    used.update(('activation_function', 'router_jitter_noise'))
-    return llama_config(hf_config, used)
+# MistralConfig declares sliding_window alone, which every layer attends where it is set;
+# MistralAttention builds no biases.
+_MISTRAL_DECODER = DecoderSpelling(reads=frozenset({'sliding_window'}), windowed=True)
 
 
 _GRANITE_MULTIPLIERS = tuple(
@@ -89,6 +47,8 @@ _GRANITE_MULTIPLIERS = tuple(
                            ('residual_multiplier', 'residual_multiplier'),
                            ('logits_scaling', 'logits_scaling'), ('attention_multiplier', 'attention_scale')))
 """Granite's embedding, residual, head and attention multipliers, each one field both ways."""
+
+_NO_JITTER = inert('router_jitter_noise', 'training-time input jitter has no counterpart', neutral=0.0)
 
 
 _GRANITEMOE_NAMES = (
@@ -106,8 +66,11 @@ _GRANITEMOE_PACKED = (
 
 GRANITEMOE = DecoderFamily(
     ('granitemoe',),
-    ConfigLayout(ConfigPart(reads(_granitemoe_config), lambda model: {}), *_GRANITE_MULTIPLIERS,
-                 LOCAL_EXPERTS),
+    # GraniteMoE's reference reads hidden_act, not the released activation_function beside it, and
+    # applies no router_jitter_noise: ordinary GQA under a normalized softmax MoE on every layer, without
+    # shared experts or a balancing bias.
+    ConfigLayout(decoder_layout(LLAMA_DECODER), *_GRANITE_MULTIPLIERS, LOCAL_EXPERTS,
+                 unread('activation_function', 'router_jitter_noise')),
     lambda fields: bool(fields.mixture is not None and not fields.qk_norm
                         and (fields.embedding_multiplier != 1.0 or fields.residual_multiplier != 1.0
                              or fields.logits_scaling != 1.0 or fields.attention_scale is not None)),
@@ -122,7 +85,8 @@ GRANITEMOE = DecoderFamily(
 
 MIXTRAL = DecoderFamily(
     ('mixtral',),
-    ConfigLayout(ConfigPart(reads(_mixtral_config), lambda model: {'layer_types': None}), LOCAL_EXPERTS),
+    ConfigLayout(decoder_layout(dataclasses.replace(_MISTRAL_DECODER, rope=_MIXTRAL_SPELLING)), LOCAL_EXPERTS,
+                 _NO_JITTER),
     lambda fields: fields.mixture is not None,
     'mixtral',
     'MixtralForCausalLM',
@@ -138,8 +102,7 @@ MIXTRAL = DecoderFamily(
 # MistralConfig has no layer_types: its window is on every layer.
 MISTRAL = DecoderFamily(
     ('mistral',),
-    ConfigLayout(ConfigPart(reads(_mistral_config), lambda model: {
-        'layer_types': None, 'sliding_window': model.kind_of('sliding_attention').window})),
+    ConfigLayout(decoder_layout(_MISTRAL_DECODER)),
     every_layer_windowed,
     'mistral',
     'MistralForCausalLM',
@@ -154,7 +117,10 @@ MISTRAL = DecoderFamily(
 
 MINISTRAL = DecoderFamily(
     ("ministral",),
-    ConfigLayout(ConfigPart(reads(ministral_config), lambda model: {})),
+    # MinistralConfig declares layer_types and sliding_window, and its attention builds no biases. Without
+    # layer_types every layer attends the window where there is one (configuration_ministral.py).
+    ConfigLayout(decoder_layout(DecoderSpelling(reads=frozenset({'layer_types', 'sliding_window'}),
+                                                windowed=True))),
     lambda fields: "sliding_attention" in (fields.layer_types or ()),
     "ministral",
     "MinistralForCausalLM",
@@ -166,7 +132,7 @@ MINISTRAL = DecoderFamily(
 
 LLAMA = DecoderFamily(
     ("llama",),
-    ConfigLayout(ConfigPart(reads(llama_config), lambda model: {"mlp_bias": True} if model.mlp_bias else {})),
+    ConfigLayout(decoder_layout(LLAMA_DECODER)),
     lambda fields: True,
     "llama",
     "LlamaForCausalLM",

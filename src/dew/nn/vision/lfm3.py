@@ -9,7 +9,8 @@ from types import MappingProxyType
 from flax import linen as nn
 
 from dew import _records
-from dew.interop.layouts import Route, Table, mapped
+from dew.interop.config_records import NativeFields
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Table, mapped
 from dew.nn.activations import HIDDEN_ACT
 from dew.registry import Record, towers
 
@@ -135,6 +136,37 @@ _INTEGERS = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_atten
 """The Lfm3VlVision fields an Lfm3VlVisionConfig states as integers under the same names."""
 
 
+def _stated(key: str, parse) -> ConfigField:
+    """A key the config states or leaves null, the value's own default where it is null or absent."""
+    default = getattr(Lfm3VlVision, key)
+    return ConfigField(key, key, None,
+                       parse=lambda value, key: default if value is None else parse(value, key))
+
+
+def _read_rope(vision: Mapping[str, object], used: set[str],
+               record: NativeFields[Lfm3VlVision]) -> NativeFields[Lfm3VlVision]:
+    """The axial rotary's base: LFM3-VL's trunk turns no other."""
+    used.update(("rope_parameters", "rope_theta"))
+    rope = _records.record(vision.get("rope_parameters") or {"rope_type": "axial"}, "rope_parameters")
+    if rope.get("rope_type", "axial") != "axial":
+        raise ValueError(f"LFM3-VL's trunk turns its axial rotary alone, not {rope.get('rope_type')!r}")
+    record["rope_theta"] = rope_base({**vision, "rope_parameters": rope}, Lfm3VlVision.rope_theta, axial=True)
+    return record
+
+
+def _write_rope(tower: Lfm3VlVision) -> Mapping[str, object]:
+    return {"rope_parameters": {"rope_type": "axial", "rope_theta": tower.rope_theta}}
+
+
+_LFM3_CONFIG = ConfigLayout(
+    *(_stated(name, _records.integer) for name in _INTEGERS), _stated("norm_eps", _records.number),
+    ConfigField("layer_types", "layer_types", None,
+                parse=lambda value, key: _records.strings(value, key) if value else None),
+    ConfigPart(_read_rope, _write_rope))
+"""An Lfm3VlVisionConfig's fields, both ways: those it states, the value's own defaults for the rest
+(its cadence over the depth among them, `Lfm3VlVision.kinds`)."""
+
+
 def translate_lfm3_vl_vision_config(hf_config: Mapping[str, object]) -> Record:
     """An Lfm3VlVisionConfig into an Lfm3VlVision value's fields: those it states, checked, the value's
     own defaults for the rest (its cadence over the depth among them, `Lfm3VlVision.kinds`); the rotary
@@ -143,16 +175,7 @@ def translate_lfm3_vl_vision_config(hf_config: Mapping[str, object]) -> Record:
     vision = _vision_section(hf_config)
     if vision.get("model_type", "lfm3_vl_vision") != "lfm3_vl_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not LFM3-VL's trunk")
-    rope = _records.record(vision.get("rope_parameters") or {"rope_type": "axial"}, "rope_parameters")
-    if rope.get("rope_type", "axial") != "axial":
-        raise ValueError(f"LFM3-VL's trunk turns its axial rotary alone, not {rope.get('rope_type')!r}")
-    fields: dict[str, object] = {name: _records.integer(vision[name], name) for name in _INTEGERS
-                                 if vision.get(name) is not None}
-    if vision.get("norm_eps") is not None:
-        fields["norm_eps"] = _records.number(vision["norm_eps"], "norm_eps")
-    if vision.get("layer_types"):
-        fields["layer_types"] = _records.strings(vision["layer_types"], "layer_types")
-    fields["rope_theta"] = rope_base({**vision, "rope_parameters": rope}, Lfm3VlVision.rope_theta, axial=True)
+    fields = _LFM3_CONFIG.read(vision, set(), NativeFields(Lfm3VlVision, {}))
     record: Record = {"class": "lfm3_vl", "fields": fields}
     # Built here, so a config the value refuses (a cadence of another depth, an unknown kind) is refused
     # as it is read.
@@ -182,7 +205,8 @@ def translate_lfm3_vl_projector_config(hf_config: Mapping[str, object], text_wid
     }}
 
 
-Lfm3VlVision.checkpoint = TowerLayout("vision_tower.", _LFM3_ROUTES)
+Lfm3VlVision.checkpoint = TowerLayout("vision_tower.", _LFM3_ROUTES, config=_LFM3_CONFIG,
+                                      model_type="lfm3_vl_vision")
 Lfm3VlProjector.checkpoint = ProjectorLayout("multi_modal_projector.", {
     "layer_norm.weight": ("norm", "scale"), "layer_norm.bias": ("norm", "bias"),
     "linear_1.weight": ("fc1", "kernel"), "linear_1.bias": ("fc1", "bias"),

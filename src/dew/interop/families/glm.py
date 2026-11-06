@@ -15,22 +15,26 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import (
+    ROPE_APART,
+    DecoderSpelling,
+    decoder_layout,
+    flag,
+    integer,
+    partial_rope_part,
+    single_depth,
+)
 from dew.interop.decoder_parts import (
     DECODER_ROUTES,
     DEEPSEEK_ROUTES,
-    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     KindFields,
     MixtureFields,
-    Ropes,
-    base_config,
     fixed_fields,
     kind_mixers,
     layer_depth,
     layer_depth_routes,
-    read_partial_rope,
-    reads,
     record_float,
     record_int,
     refuse,
@@ -39,13 +43,11 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.families.deepseek import (
     LAYOUT_FIELDS,
-    deepseek_config,
-    deepseek_export,
+    deepseek_layout_of,
     deepseek_mixture,
     deepseek_moe_export,
 )
-from dew.interop.families.qwen import single_prediction_depth
-from dew.interop.layouts import ConfigLayout, ConfigPart, Copy, Route, Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Copy, Route, Table, constant
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
@@ -68,6 +70,7 @@ def _glm5_refusals(hf_config: Mapping[str, object], used: set[str], layers: int)
             refuse(name, f'GLM-5.3-Flash requires {expected!r}')
     if hf_config.get('qk_head_dim', hf_config['qk_nope_head_dim']) != hf_config['qk_nope_head_dim']:
         refuse('qk_head_dim', 'NoPE uses qk_nope_head_dim alone')
+    used.add('num_key_value_heads')
     kv_heads = hf_config.get('num_key_value_heads')
     if kv_heads is not None and kv_heads != hf_config['num_attention_heads']:
         refuse('num_key_value_heads', 'the reference requires one KV head per query head')
@@ -133,8 +136,24 @@ def _glm5_mixture(hf_config: Mapping[str, object], used: set[str],
     return deepseek_mixture(hf_config, layers, used, sparse_layers=routed, reads_norm_topk=True), routed
 
 
-def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a GLM-5.3-Flash text config into `CausalTransformer` fields.
+def _glm5_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
+    """A GLM-5.3-Flash config's layers: linear attention, and its k-pool sparse attention as full."""
+    layers = record_int(hf_config, 'num_hidden_layers')
+    types = specified_layer_types(hf_config, used, ('linear_attention',) * 3 + ('deepseek_sparse_attention',))
+    types = tuple('full_attention' if kind == 'deepseek_sparse_attention' else kind for kind in types)
+    if len(types) != layers or set(types) - {'linear_attention', 'full_attention'}:
+        refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
+    return types
+
+
+def _glm5_pattern(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    record['layer_types'] = _glm5_types(hf_config, used)
+    return record
+
+
+def _glm5_next_config(hf_config: Mapping[str, object], used: set[str],
+                      config: DecoderFields) -> DecoderFields:
+    """Read a GLM-5.3-Flash text config's own fields beside the shared decoder's (`GLM5_NEXT_CONFIG`).
 
     The block is NoPE pooled MLA, KDA and mHC
     (modeling_glm5_next.py:1259-1329). The reader builds four things from the
@@ -144,10 +163,7 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     than dropped.
     """
     layers = record_int(hf_config, 'num_hidden_layers')
-    types = specified_layer_types(hf_config, used, ('linear_attention',) * 3 + ('deepseek_sparse_attention',))
-    types = tuple('full_attention' if kind == 'deepseek_sparse_attention' else kind for kind in types)
-    if len(types) != layers or set(types) - {'linear_attention', 'full_attention'}:
-        refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
+    types = _glm5_types(hf_config, used)
     _glm5_refusals(hf_config, used, layers)
     linear = _glm5_linear_fields(hf_config, types)
     sparse_fields = ('q_lora_rank', 'kv_lora_rank', 'qk_nope_head_dim', 'v_head_dim',
@@ -155,9 +171,7 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     sparse = {name: record_int(hf_config, name) for name in sparse_fields}
     if sparse['index_kpool'] < 1 or sparse['index_topk'] % sparse['index_kpool']:
         refuse('index_topk / index_kpool', 'the budget must contain whole positive-sized pools')
-    config = base_config({**hf_config, 'layer_types': types, 'head_dim': sparse['qk_nope_head_dim'],
-                          'num_key_value_heads': hf_config['num_attention_heads']},
-                          used, rope=Ropes(10000.0))
+    config['rope_theta'] = 10000.0
     kinds: dict[str, KindFields] = {}
     if 'linear_attention' in types:
         kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
@@ -176,7 +190,6 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
             hc_sinkhorn_iters=record_int(hf_config, "hc_sinkhorn_iters"), head="mean"),
         swiglu_limit=record_float(hf_config, "swiglu_limit"),
         index_share_for_mtp_iteration=bool(hf_config.get("index_share_for_mtp_iteration", False)),
-        num_nextn_predict_layers=single_prediction_depth(hf_config, used, "num_nextn_predict_layers"),
     )
     # Native NextN uses normalized trunk states and a plain NoPE depth, not
     # trunk mHC (SGLang 97c6978 deepseek_nextn.py:177-187,247-298). The
@@ -234,7 +247,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         'rope_theta': None, 'rope_scaling': None, 'rope_parameters': None,
         'mhc': True, 'mla_use_nope': True, 'index_kpool_compress': True,
         'hc_mult': hc.hc_mult, 'hc_eps': hc.hc_eps, 'hc_sinkhorn_iters': hc.hc_sinkhorn_iters,
-        'swiglu_limit': model.swiglu_limit, 'num_nextn_predict_layers': model.num_nextn_predict_layers,
+        'swiglu_limit': model.swiglu_limit,
         'indexer_types': ['full'] * model.num_layers,
         'index_share_for_mtp_iteration': model.index_share_for_mtp_iteration,
         'linear_attn_config': {
@@ -266,48 +279,24 @@ leaves named as a trunk layer's and its final norm as `shared_head.norm`, and mH
 `hc_{site}_{leaf}`."""
 
 
-def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a glm4_moe config into `CausalTransformer` fields.
-
-    GLM 4.5 and 5 bias q/k/v over a bias-free o_proj and rotate half the head
-    in the 'default' convention. Routing is DeepSeek V3's, with the shared
-    experts and the dense first layers. The MTP depths are the checkpoint's.
-    """
-    # The released configs spell the rotary flat (rope_theta beside
-    # partial_rotary_factor); a config transformers wrote nests both under
-    # rope_parameters. Glm4MoeRotaryEmbedding builds any rope_type over the
-    # rotated half (modeling_glm4_moe.py:55-59), YaRN among them, and
-    # Glm4MoeConfig sets an absent factor to half the head (configuration_glm4_moe.py:123).
-    ropes, factor = read_partial_rope(hf_config, used, PLAIN_SPELLING, default_factor=0.5)
-    used.update(('use_qk_norm', 'num_nextn_predict_layers'))
-    config = base_config(hf_config, used, rope=ropes,
-                          qk_norm=bool(hf_config.get('use_qk_norm', False)))
-    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    config.update(
-        o_proj_bias=False,
-        partial_rotary_factor=None if factor == 1.0 else factor,
-        partial_rotary_type="default",
-        mixture=deepseek_mixture(hf_config, layers, used),
-        num_nextn_predict_layers=_records.integer(
-            hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
-        ),
-    )
-    return config
+def _glm_experts(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    layers = _records.integer(record['num_layers'], 'num_layers')
+    record['mixture'] = deepseek_mixture(hf_config, layers, used)
+    return record
 
 
-def _glm4_moe_export(model: CausalTransformer) -> Mapping[str, object]:
-    """`_glm4_moe_config` backwards: the rotated fraction of a head (half where none is stated), the q/k
-    norms, the routed experts (`deepseek_moe_export`) and the prediction depths past the trunk."""
-    return {'partial_rotary_factor': model.partial_rotary_factor or 1.0, 'use_qk_norm': model.qk_norm,
-            **deepseek_moe_export(model), 'num_nextn_predict_layers': model.num_nextn_predict_layers}
-
-
-def _glm_moe_dsa_export(model: CausalTransformer) -> Mapping[str, object]:
-    """`_glm_moe_dsa_config` backwards: DeepSeek V3.2's block (`deepseek_export`), each layer's indexer
-    as a full one or one sharing the previous full layer's (`indexer_types`, its kv-shared layers)."""
-    shared = set(model.kv_shared_layers or ())
-    return {**deepseek_export(model),
-            'indexer_types': ['shared' if index in shared else 'full' for index in range(model.num_layers)]}
+GLM4_MOE_CONFIG = ConfigLayout(
+    # The released configs spell the rotary flat (rope_theta beside partial_rotary_factor); a config
+    # transformers wrote nests both under rope_parameters. Glm4MoeRotaryEmbedding builds any rope_type
+    # over the rotated half (modeling_glm4_moe.py:55-59), YaRN among them, and Glm4MoeConfig sets an
+    # absent factor to half the head (configuration_glm4_moe.py:123).
+    decoder_layout(rope=partial_rope_part(default_factor=0.5, whole_is_none=True)),
+    flag('use_qk_norm', 'qk_norm', default=False), constant('o_proj_bias', value=False),
+    # Routing is DeepSeek V3's, with the shared experts and the dense first layers.
+    ConfigPart(_glm_experts, deepseek_moe_export),
+    integer('num_nextn_predict_layers', 'num_nextn_predict_layers', 0))
+"""GLM 4.5's and 5's MoE config, both ways: q/k/v biased over a bias-free o_proj, half the head rotated in
+the 'default' convention, DeepSeek V3's routing, and the checkpoint's MTP depths."""
 
 
 def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[str]) -> tuple[str, ...]:
@@ -352,8 +341,9 @@ def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[s
     return tuple(types)
 
 
-def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a glm_moe_dsa config into `CausalTransformer` fields.
+def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str],
+                        config: DecoderFields) -> DecoderFields:
+    """Read a glm_moe_dsa config's own fields beside DeepSeek V3.2's (`GLM_MOE_DSA_CONFIG`).
 
     GLM-5, 5.1, 5.2 and 5.3 are DeepSeek V3.2's sparse MLA block under GLM's
     choices. The indexer rotates interleaved pairs like the main rope head
@@ -362,10 +352,6 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     ships past num_hidden_layers as GLM 4.5's does.
     """
     layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    # GlmMoeDsaConfig.__post_init__:152 points head_dim at the rope slice
-    # whatever the config says (GLM-5.2 ships 192 over a rope width of 64),
-    # so the field describes nothing the reference computes.
-    config = deepseek_config({**hf_config, 'head_dim': None}, used, sparse=True)
     used.add('head_dim')
     # The indexer's rotation is not a dial: GlmMoeDsaIndexer.forward always
     # interleaves, and a flag saying otherwise describes no model the
@@ -387,15 +373,38 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
                                                          'index_rope_interleave': True}}
     if shared:
         config['kv_shared_layers'] = shared
-    config["num_nextn_predict_layers"] = _records.integer(
-        hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
-    )
     return config
+
+
+def _indexer_types(model: CausalTransformer) -> Mapping[str, object]:
+    """Each layer's indexer as a full one or one sharing the previous full layer's (its kv-shared layers)."""
+    shared = set(model.kv_shared_layers or ())
+    return {'indexer_types': ['shared' if index in shared else 'full' for index in range(model.num_layers)]}
+
+
+GLM_MOE_DSA_CONFIG = ConfigLayout(
+    # GlmMoeDsaConfig.__post_init__:152 points head_dim at the rope slice whatever the config says
+    # (GLM-5.2 ships 192 over a rope width of 64), so the field describes nothing the reference computes.
+    deepseek_layout_of(sparse=True, points_head_dim=False),
+    ConfigPart(_glm_moe_dsa_config, _indexer_types))
+"""GLM-5's to 5.3's MoE DSA config, both ways: DeepSeek V3.2's sparse MLA block under GLM's choices."""
+
+
+GLM5_NEXT_CONFIG = ConfigLayout(
+    ConfigPart(_glm5_pattern, lambda model: {}), single_depth('num_nextn_predict_layers'),
+    # Its heads are as wide as its NoPE latent's, and each attends its own key/value head; it rotates
+    # nothing (`_glm5_next_config` states the base the reference never turns).
+    decoder_layout(DecoderSpelling(reads=frozenset({'sliding_window', 'attention_bias'}),
+                                   keys={'head_dim': 'qk_nope_head_dim',
+                                         'num_key_value_heads': 'num_attention_heads'}),
+                   rope=ROPE_APART),
+    ConfigPart(_glm5_next_config, _glm5_next_export))
+"""GLM-5.3-Flash's text config, both ways."""
 
 
 GLM5_NEXT_TEXT = DecoderFamily(
     ('glm5_next_text',),
-    ConfigLayout(ConfigPart(reads(_glm5_next_config), _glm5_next_export)),
+    GLM5_NEXT_CONFIG,
     lambda fields: any(
         isinstance(mixer, (KimiDeltaAttentionMixer, KPoolSparseAttentionMixer))
         for mixer in kind_mixers(fields)
@@ -411,7 +420,7 @@ GLM5_NEXT_TEXT = DecoderFamily(
 
 GLM4_MOE = DecoderFamily(
     ('glm4_moe',),
-    ConfigLayout(ConfigPart(reads(_glm4_moe_config), _glm4_moe_export)),
+    GLM4_MOE_CONFIG,
     lambda fields: (
         fields.partial_rotary_type == 'default'
         and (mixture := fields.mixture) is not None
@@ -432,7 +441,7 @@ GLM4_MOE = DecoderFamily(
 # pairs, which no DeepSeek release does, so that field names the family.
 GLM_MOE_DSA = DecoderFamily(
     ('glm_moe_dsa',),
-    ConfigLayout(ConfigPart(reads(_glm_moe_dsa_config), _glm_moe_dsa_export)),
+    GLM_MOE_DSA_CONFIG,
     lambda fields: (
         isinstance(mixer := fields.mixer, MLAMixer)
         and mixer.index_topk is not None
