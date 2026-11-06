@@ -1,0 +1,9 @@
+{
+ "bytes": 1257944,
+ "license": "StyleGAN-T: NVIDIA's own terms; DiT: CC BY-NC 4.0; both fetched at record time, neither vendored",
+ "path": "recordings/6295ef494fd82d7f075a67ff72612973bbf31a7934999f181265a6418fc7e5e5.npz",
+ "reference": "autonomousvision/stylegan-t, facebookresearch/DiT",
+ "repo": "dewml/fixtures",
+ "revision": "1fa57fbc41beb7ce56f9c27f477ea44eaf86d5a7",
+ "sha256": "6295ef494fd82d7f075a67ff72612973bbf31a7934999f181265a6418fc7e5e5"
+}

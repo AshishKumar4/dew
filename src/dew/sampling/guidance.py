@@ -44,6 +44,7 @@ from flax import linen as nn, struct
 from dew.batch import Variables
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
+from dew.nn.derivatives import contracted
 from dew.nn.precision import at_least_fp32, compensated_add, two_product
 from dew.sampling.solvers.common import given
 
@@ -172,6 +173,7 @@ def _spread(conditional: jax.Array, unconditional: jax.Array) -> tuple[jax.Array
     return held, unheld, jnp.where(large, 0.5, 1.0).astype(wide)
 
 
+@contracted("test_a_guided_prediction_holds_every_order")
 @jax.custom_jvp
 def _guided(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
     """`guide`'s value: the conditional prediction exactly at a unit scale and the unconditional at a zero

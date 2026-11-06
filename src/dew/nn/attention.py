@@ -20,6 +20,8 @@ import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.nn.derivatives import contracted
+
 from .attention_kernels import ATTENTION, DECODE, TPU_BACKEND, AttentionCase, decodes
 from .attention_masks import (
     combined_attention_mask,
@@ -754,6 +756,7 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
     CPU) takes its moving operands alone."""
     from jax.custom_derivatives import SymbolicZero
 
+    @contracted("test_a_fused_attention_call_in_forward_mode_holds_every_order")
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)

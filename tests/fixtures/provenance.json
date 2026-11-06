@@ -643,17 +643,6 @@
    ],
    "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors) over the float32 grid (its steps_override): the closing clean prediction, unclipped and through clip_images. Recorded over the seeds check 1 draws (record_case, summarized), x_T and the cotangent a seeded NumPy draw the test makes again; the float64 twin widens every explicit jnp.float32 of the schedule and the sampler's common steps, so sigma arithmetic runs in float64 on the float32 grid's times."
   },
-  "flow/densities.npz": {
-   "tool": "tools/flow_density_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "0.34.0",
-     "runs": "diffusers"
-    }
-   ],
-   "note": "compute_density_for_timestep_sampling on the draws FlowMatchingScheduler.sample_t makes from jax.random.key(0)."
-  },
   "flow/draws.npz": {
    "tool": "tools/flow_draw_reference.py",
    "sources": [
@@ -689,7 +678,7 @@
      "runs": "torch"
     }
    ],
-   "note": "Executes the Flux DreamBooth script's noising and loss statements (v0.34.0) with compute_loss_weighting_for_sd3, around a stand-in velocity network, on Dew's draws; FlowMatchEulerDiscreteScheduler(shift=3)'s sigma grid."
+   "note": "The Flux DreamBooth script's noising and loss statements (v0.34.0), which the test executes with compute_loss_weighting_for_sd3 around a stand-in velocity network on Dew's draws, with that network's pixels and weights; FlowMatchEulerDiscreteScheduler(shift=3)'s sigma grid."
   },
   "flow/resolution_shift.npz": {
    "tool": "tools/flux_shift_reference.py",
@@ -2772,7 +2761,7 @@
      "runs": "torch"
     }
    ],
-   "note": "An oracle of one LADD step from the papers' equations (no official training code), around StyleGAN-T's DiscHead and DiT's timestep_embedding executed as published; the draws are Dew's from jax.random.key(5)."
+   "note": "An oracle of one LADD step from the papers' equations (no official training code), around StyleGAN-T's DiscHead and DiT's timestep_embedding executed as published, recorded over seeded draws of its inputs, weights and step draws (seeds.npz, `draw`)."
   },
   "linear_attention": {
    "tool": "tools/qwen_linear_reference.py",
@@ -3633,7 +3622,7 @@
      "runs": "torch"
     }
    ],
-   "note": "AutoencoderKL(...).encoder at tests/test_models.py's encoder geometry, parameters moved off init; moments and image/parameter VJPs at batch 1 and 4, float32 and float64 (widened)."
+   "note": "AutoencoderKL(...).encoder at tests/test_models.py's encoder geometry, parameters moved off init and rounded to bfloat16-representable values; the weights alone, which the test runs Diffusers' encoder on."
   },
   "vae/sd3-tiny": {
    "tool": "tools/vae_reference.py",

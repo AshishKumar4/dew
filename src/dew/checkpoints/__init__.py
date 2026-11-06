@@ -12,7 +12,8 @@ run's, such as a simulation's, is saved as a mapping of arrays and restored
 through a mapping template, with the same asynchronous writes, retention and
 step index.
 
-The EMA copy is stored as its difference from the weights. Each EMA leaf with
+The EMA copy is stored as its difference from the weights, the run's and each
+DiLoCo group's (`_averages_held`). Each EMA leaf with
 its weight's floating dtype and shape is stored as the XOR of the two, split
 into byte planes (a leading uint8 axis, least significant byte first). An
 average agrees with the weights it follows in its leading bits, and the zstd
@@ -68,9 +69,10 @@ import hashlib
 import json
 import math
 import os
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, overload, runtime_checkable
+from typing import TYPE_CHECKING, Literal, TypedDict, overload
 
 import jax
 import jax.numpy as jnp
@@ -87,11 +89,53 @@ from dew._files import write_atomically
 from dew._hashing import fmix32
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables
+from dew.checkpoints._payloads import (
+    _NEEDS,
+    MODEL,
+    ONE_ITEM,
+    PROFILES,
+    PROJECTED,
+    RESUME,
+    ROLES,
+    _facts,
+    _from_payloads,
+    _frozen_held,
+    _held_payloads,
+    _in_payloads,
+    _payload,
+    _profile_path,
+    _refuse_cut_resume,
+    _refuse_profiles_alone,
+    _StepFacts,
+)
+from dew.checkpoints._replicas import _covered, _from_replicas, _grid, _zeros
+from dew.checkpoints._state_trees import (
+    TreePath,
+    _at,
+    _averaged,
+    _averages_of,
+    _by_path,
+    _decode_delta,
+    _ema_deltas,
+    _from_delta_planes,
+    _held_apart,
+    _item_metadata,
+    _named,
+    _plane_template,
+    _power_profiles,
+    _profile_record,
+    _profiles_at,
+    _snapshot_weights,
+    _variable_trees,
+    _with,
+    _with_averages,
+    _with_ema_deltas,
+)
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
 from dew.checkpoints.served import unpacked
-from dew.mesh import LogicalAxes, mesh_axes
+from dew.mesh import LogicalAxes
 from dew.nn import sharding
-from dew.nn.kernels.options import owned_program, program
+from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
 from dew.telemetry.profile import region
 
@@ -116,7 +160,8 @@ Resume = Literal["auto", "require", "never"]
 
 FROZEN_STORE = "frozen"
 """The directory beside the steps that holds every variables collection but
-`params` once, under the digest of its content (`_digest`). A step records
+`params` once, the run's and each DiLoCo group's (`_variable_trees`), under the
+digest of its content (`_digest`). A step records
 each collection's digest and holds `params` and the optimizer state itself,
 so weights no step moves (a LoRA run's frozen base, a pipeline's towers) are
 written once a run, and a collection a step does move (batch statistics) is
@@ -143,40 +188,6 @@ PYTHON_RUN: dict[str, JSON] = {
 }
 """The root record of a run defined in Python (`RUN_FILE`), beside which the trainer's checkpoints say
 why its record cannot rebuild it (`Checkpoints.python_run`)."""
-
-
-def _is_profiles(node) -> bool:
-    """Whether `node` is a `PowerProfilesState`, or the mapping of its fields
-    a restore without a template reads it as."""
-    from dew.optim import PowerProfilesState
-    return isinstance(node, PowerProfilesState) or (
-        isinstance(node, Mapping) and set(node) == set(PowerProfilesState._fields))
-
-
-def _power_profiles(opt_state):
-    """The `PowerProfilesState` inside `opt_state`, or its mapping, or None
-    where the solver keeps none."""
-    held = [node for node in jax.tree.leaves(opt_state, is_leaf=_is_profiles) if _is_profiles(node)]
-    if len(held) > 1:
-        raise ValueError(f"the optimizer state holds {len(held)} power_profiles; wrap the solver once")
-    return held[0] if held else None
-
-
-def _averages_of(profiles):
-    """The averages a `PowerProfilesState`, or its mapping, holds."""
-    return profiles['averages'] if isinstance(profiles, Mapping) else profiles.averages
-
-
-def _with_averages(opt_state, averages):
-    """`opt_state` with the averages of its power profiles replaced by `averages`."""
-    def put(node):
-        if not _is_profiles(node):
-            return node
-        return (
-            {**node, "averages": averages} if isinstance(node, Mapping) else node._replace(averages=averages)
-        )
-
-    return jax.tree.map(put, opt_state, is_leaf=_is_profiles)
 
 
 def is_uri(path: str) -> bool:
@@ -245,12 +256,16 @@ class Keep:
 
     `interval` keeps checkpoints at least this much wall time apart; it does
     not keep every old checkpoint. `where` receives a retained-step record
-    with its metrics.
+    with its metrics. `weights_only` keeps the steps `every`, `interval` and
+    `where` keep, beyond the latest, as their model alone (`ROLES`): the newest
+    steps stay whole for a resume, and an archive of a long run holds no
+    optimizer state it never resumes.
     """
     latest: int = 2
     every: int | None = None
     interval: datetime.timedelta | str | None = None
     where: Callable[[Kept], bool] | None = dataclasses.field(default=None, metadata={'record': False})
+    weights_only: bool = False
 
     def __post_init__(self):
         if self.latest < 0 or (self.every is not None and self.every < 1):
@@ -308,19 +323,22 @@ class Kept:
     ranked_by: str | None
     mode: str | None
     kind: str = 'state'
-    """'state' for a train state, 'weights' for a weights-only snapshot, 'tree'
-    for a mapping saved in place of a train state."""
+    """'state' for a train state, 'weights' for a step that holds its model
+    alone (a weights-only snapshot, or a step kept for its model past the
+    latest), 'profiles' for a step kept for its post-hoc EMA profiles alone,
+    'tree' for a mapping saved in place of a train state."""
     rankings: Mapping[str, dict] = dataclasses.field(default_factory=dict)
 
 
-def _kept(step: int, metrics: Mapping[str, float], custom: Mapping) -> Kept:
-    """The record of the step saved with `metrics` and `custom` metadata."""
+def _kept(step: int, metrics: Mapping[str, float], custom: Mapping, payloads: Sequence[str]) -> Kept:
+    """The record of the step saved with `metrics` and `custom` metadata, which holds `items`."""
     rules = custom.get('rankings') or {}
+    kind = ('tree' if custom.get('tree') else
+            'weights' if custom.get('weights_only') or (MODEL in payloads and RESUME not in payloads) else
+            'profiles' if tuple(payloads) == (PROFILES,) else 'state')
     return Kept(step=step, metrics=Metrics(metrics),
                 ranked_by=custom.get('primary') or next(iter(rules), None),
-                mode=next(iter(rules.values()), {}).get('mode'),
-                kind='weights' if custom.get('weights_only') else 'tree' if custom.get('tree') else 'state',
-                rankings=copy.deepcopy(rules))
+                mode=next(iter(rules.values()), {}).get('mode'), kind=kind, rankings=copy.deepcopy(rules))
 
 
 def _step_custom(step_directory: str) -> Mapping[str, object] | None:
@@ -337,17 +355,21 @@ def _step_custom(step_directory: str) -> Mapping[str, object] | None:
 
 def step_artifact(step_directory: str) -> JSON:
     """The inference declaration the step at `step_directory` records (`Checkpoints.artifact`,
-    `_step_custom`); None where it records none or is no Orbax step."""
+    `_step_custom`); None where it records none, holds no model (kept for its profiles alone) or is no
+    Orbax step."""
     custom = _step_custom(step_directory)
-    return None if custom is None else json_value(custom.get("artifact"), "artifact")
+    if custom is None or not {MODEL, ONE_ITEM} & set(_held_payloads(step_directory)):
+        return None
+    return json_value(custom.get("artifact"), "artifact")
 
 
 def frozen_entries(step_directory: str) -> list[str]:
-    """The `FROZEN_STORE` entries the step at `step_directory` records (`_step_custom`), relative to its
-    run directory, which `dew.io.publish` carries beside it; none for a directory that is no Orbax
-    step."""
+    """The `FROZEN_STORE` entries the step at `step_directory` records (`_step_custom`) of the items it holds
+    (`_frozen_held`), relative to its run directory, which `dew.io.publish` carries beside it; none for a
+    directory that is no Orbax step."""
     custom = _step_custom(step_directory)
-    frozen = {} if custom is None else record(custom.get("frozen") or {}, "frozen")
+    frozen = {} if custom is None else _frozen_held(record(custom.get("frozen") or {}, "frozen"),
+                                                    _held_payloads(step_directory))
     digests = {text(digest, "frozen digest") for names in frozen.values()
                for digest in record(names, "frozen").values()}
     return [f"{FROZEN_STORE}/{digest}" for digest in sorted(digests)]
@@ -498,140 +520,6 @@ def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
             if isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)) and leaf.sharding is not None}
 
 
-# The EMA copy is stored as byte planes of its difference from the weights.
-_UNSIGNED = {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}
-
-
-def _delta_planes(average: jax.Array, live: jax.Array) -> jax.Array:
-    """Return `average` XOR `live` split into byte planes, least significant first.
-
-    An average agrees with the weights it follows in its sign, exponent and
-    leading mantissa bits, so their XOR is zero there, and a plane of each
-    byte position hands zstd those zeros as long runs. Shifts, not a bitcast
-    to bytes, fix the plane order whatever the platform's byte order.
-    """
-    width = average.dtype.itemsize
-    delta = average.view(_UNSIGNED[width]) ^ live.view(_UNSIGNED[width])
-    return jnp.stack([(delta >> (8 * plane)).astype(jnp.uint8) for plane in range(width)])
-
-
-def _from_delta_planes(planes, live):
-    """Invert `_delta_planes`: the average whose difference from `live` is
-    `planes`. Works on numpy arrays and on jax arrays alike."""
-    kind = _UNSIGNED[live.dtype.itemsize]
-    delta = planes[0].astype(kind)
-    for plane in range(1, len(planes)):
-        delta = delta | (planes[plane].astype(kind) << (8 * plane))
-    return (delta ^ live.view(kind)).view(live.dtype)
-
-
-@functools.partial(program, static_argnums=2)
-def _decode_delta(planes: jax.Array, live: jax.Array, dtype) -> jax.Array:
-    """`_from_delta_planes` as one program per leaf signature: a model's
-    repeated blocks share a handful, where one program over every leaf
-    would compile anew for every model."""
-    return _from_delta_planes(planes, live).astype(dtype)
-
-
-def _planes_sharding(sharding):
-    """Where a leaf's byte planes go: the leaf's placement, with the plane axis
-    whole on every device, in device memory."""
-    if isinstance(sharding, jax.sharding.NamedSharding):
-        return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(None, *sharding.spec),
-                                          memory_kind="device")
-    return sharding if sharding is None else sharding.with_memory_kind("device")
-
-
-def _stored_as_delta(average, live) -> bool:
-    """Whether the EMA leaf `average` is written as its difference from `live`.
-
-    Both have to be device arrays of one floating dtype and shape, placed
-    by a sharding the planes' can be derived from. An average in pinned
-    host memory is written as itself: orbax writes it from its own buffer
-    (`_written_in_place`), and differencing it would hold a second copy of
-    it in the memory it was put there to spare.
-    """
-    return (isinstance(average, jax.Array) and isinstance(live, jax.Array)
-            and average.dtype == live.dtype and average.shape == live.shape
-            and jnp.issubdtype(average.dtype, jnp.floating)
-            and isinstance(average.sharding, (jax.sharding.NamedSharding,
-                                              jax.sharding.SingleDeviceSharding))
-            and "pinned_host" not in (average.sharding.memory_kind, live.sharding.memory_kind))
-
-
-def _by_path(tree):
-    """`tree`'s leaves by their key paths: an EMA leaf's path in the EMA
-    tree is its weight's in the params tree, whatever containers hold them."""
-    return dict(jax.tree_util.tree_flatten_with_path(tree)[0])
-
-
-def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateLeaf], list[str]]:
-    """Return `state_tree` with its EMA leaves, where `_stored_as_delta` allows,
-    as byte planes of their difference from the weights, and the paths of
-    those leaves in the EMA tree, which the checkpoint's metadata records.
-
-    The planes are computed on the devices the EMA sits on, sharded as it
-    is, so a save holds one more EMA-sized buffer there until orbax has
-    copied it to the host. A save runs between steps, when the buffers a
-    step holds beside the state, among them a gradient as large as the
-    weights, are free.
-    """
-    ema = state_tree['ema']
-    if ema is None:
-        return state_tree, []
-    paths_leaves, structure = jax.tree_util.tree_flatten_with_path(ema)
-    leaves = [leaf for _, leaf in paths_leaves]
-    held = _by_path(state_tree['variables'])
-    lives = [held[path] for path, _ in paths_leaves]
-    chosen = [index for index, (average, live) in enumerate(zip(leaves, lives, strict=True))
-              if _stored_as_delta(average, live)]
-    if not chosen:
-        return state_tree, []
-    for index in chosen:
-        encode = program(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
-        leaves[index] = encode(leaves[index], lives[index])
-    return ({**state_tree, 'ema': jax.tree.unflatten(structure, leaves)},
-            [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen])
-
-
-def _ema_deltas(metadata: _StepFacts) -> dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]:
-    """The EMA leaves the checkpoint at `step` stores as byte planes, by path,
-    each with the shape and dtype of the weight it is the difference from,
-    which are its own. The step's custom metadata records those paths; a
-    checkpoint written before the EMA was stored so records none."""
-    stored = dict(_item_metadata(metadata))
-    if stored.get('ema') is None:
-        return {}
-    custom = metadata.custom_metadata or {}
-    recorded = set(custom.get('ema_deltas', ()))
-    if not recorded:
-        return {}
-    deltas, lives = {}, _by_path(stored['variables'])
-    for path, _ in jax.tree_util.tree_flatten_with_path(dict(stored['ema']))[0]:
-        if jax.tree_util.keystr(path) in recorded:
-            live = lives[path]
-            deltas[path] = jax.ShapeDtypeStruct(tuple(live.shape), live.dtype)
-    return deltas
-
-
-@runtime_checkable
-class _MetadataTree(Protocol):
-    """The state tree exposed by Orbax's PyTree metadata wrapper."""
-
-    @property
-    def tree(self) -> Variables: ...
-
-
-def _item_metadata(metadata: _StepFacts) -> Variables:
-    """The named state tree, a dict or Orbax's newer metadata wrapper's `tree`."""
-    tree = metadata.item_metadata
-    if isinstance(tree, _MetadataTree):
-        tree = tree.tree
-    if not isinstance(tree, Mapping) or any(not isinstance(key, str) for key in tree):
-        raise ValueError("the checkpoint holds no named state metadata")
-    return dict(tree)
-
-
 def _read(want, dtype) -> ocp.ArrayRestoreArgs:
     """How a stored leaf is read for its template leaf `want` (None where
     there is none): in `dtype`, which Orbax casts it to on the host, where
@@ -691,20 +579,6 @@ def _refuse_lacking(lacking: set[str], where: str) -> None:
             f"written with.")
 
 
-def _plane_template(ema, deltas):
-    """Return the EMA template with each leaf `deltas` names as the plane stack
-    the checkpoint holds, and those leaves as the template had them, by path."""
-    targets = {}
-
-    def planes(path, leaf):
-        if path not in deltas:
-            return leaf
-        targets[path] = leaf
-        return jax.ShapeDtypeStruct((np.dtype(deltas[path].dtype).itemsize, *leaf.shape), np.uint8,
-                                    sharding=_planes_sharding(getattr(leaf, "sharding", None)))
-    return jax.tree_util.tree_map_with_path(planes, ema), targets
-
-
 RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
 """The hyperparameters Dew's optimizer injected before it held a schedule's own rate fields
 (`dew.optim.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
@@ -758,24 +632,6 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
         raise ValueError("checkpoint EMA configuration differs from this run")
 
 
-def _held_apart(state_tree: dict, frozen: Mapping[str, Mapping[str, str]]) -> dict[str, dict]:
-    """Take the collections a step holds in the store (`frozen`, by tree) out
-    of the restore template `state_tree`, in place, and return them by tree:
-    the restore reads them from the store onto these templates."""
-    held = {}
-    for tree, names in frozen.items():
-        collections = state_tree.get(tree)
-        if isinstance(collections, Mapping):
-            collections = dict(collections)
-            held[tree] = {name: collections.pop(name) for name in names if name in collections}
-            # A template asking for stored collections alone leaves no tree for the step to read.
-            if collections:
-                state_tree[tree] = collections
-            else:
-                del state_tree[tree]
-    return held
-
-
 def _host_read(*, from_local: bool) -> ocp.ArrayRestoreArgs:
     """How a leaf that no template places is read. It is typed as a host
     array, so Orbax reads no sharding file and warns about none. A local
@@ -822,133 +678,9 @@ def _filled(template, restored: dict, step: int):
                             **{name: None for name in OPTIONAL if name not in restored})
 
 
-def _split_axes(spec: jax.sharding.PartitionSpec) -> list[str]:
-    """The mesh axes `spec` splits an array over, sorted."""
-    return sorted(axis for entry in spec for axis in mesh_axes(entry))
-
-
-def _grid(tree: Mapping[str, StateLeaf]) -> JSON:
-    """What a local save records of where `tree`'s arrays lie, for a process that lost its copy to
-    find each shard it held on a replica (`_covered`): the mesh's axes and its devices' ids in grid
-    order, and, by path, the axes each array splits over. None where an array lies elsewhere than on
-    one mesh by name (a host-owned state's), which no replica recovers."""
-    meshes, split = set(), {}
-    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
-        if not isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)):
-            continue
-        if not isinstance(leaf.sharding, jax.sharding.NamedSharding):
-            return None
-        mesh = leaf.sharding.mesh
-        if not isinstance(mesh, jax.sharding.Mesh):
-            return None
-        grid = mesh.devices
-        meshes.add((tuple(mesh.axis_names), tuple(device.id for device in grid.flat), grid.shape))
-        split[jax.tree_util.keystr(path)] = _split_axes(leaf.sharding.spec)
-    if len(meshes) != 1:
-        return None
-    ((axes, devices, shape),) = meshes
-    return {"axes": list(axes), "shape": list(shape), "devices": list(devices), "split": split}
-
-
-def _sources(grid: Mapping[str, object], split: Sequence[str], holders: frozenset[int],
-             process: Mapping[int, int] | None = None) -> np.ndarray | None:
-    """Which device, in `grid`'s order, gives its shard of an array split over the axes `split` to the
-    devices that share it (the same coordinates on those axes): the first, by grid order, on a process
-    of `holders`, each device's process by its id (`process`, the pool's own by default). None where
-    some shard has no copy on any holder."""
-    shape = tuple(_records.integers(grid["shape"], "grid shape"))
-    axes = _records.strings(grid["axes"], "grid axes")
-    if process is None:
-        process = {device.id: device.process_index for device in jax.devices()}
-    devices = _records.integers(grid["devices"], "grid devices")
-    held = np.asarray([process[device] in holders for device in devices], bool).reshape(shape)
-    # The axes a shard's copies differ along come first, then each group's devices along the rest.
-    shared = [axis for axis, name in enumerate(axes) if name not in split]
-    order = [*[axis for axis in range(len(axes)) if axis not in shared], *shared]
-    groups = np.transpose(held, order).reshape(-1, math.prod(shape[axis] for axis in shared) if shared else 1)
-    if not groups.any(axis=1).all():
-        return None
-    first = np.zeros_like(groups)
-    first[np.arange(len(groups)), groups.argmax(axis=1)] = True
-    return np.transpose(first.reshape([shape[axis] for axis in order]), np.argsort(order))
-
-
-def _covered(grid: Mapping[str, object] | None, holders: frozenset[int],
-             process: Mapping[int, int] | None = None) -> bool:
-    """Whether the processes of `holders` hold a copy of every shard of every array a local save
-    placed over `grid` (`_grid`), so a process that lost its copy recovers it from them; each
-    device's process by its id (`process`, the pool's own by default)."""
-    if grid is None:
-        return False
-    split = record(grid["split"], "grid split")
-    return all(_sources(grid, _records.strings(axes, "split axes"), holders, process) is not None
-               for axes in {tuple(_records.strings(axes, "split axes")) for axes in split.values()})
-
-
-def _from_replicas(tree, grid: Mapping[str, object], holders: frozenset[int]):
-    """`tree`'s arrays, each shard on every device that holds it the bytes its first copy on a
-    process of `holders` holds (`_sources`): a process that lost its local copy holds zeros there,
-    and receives each shard as the sum, over the axes its copies lie along, of the source's bits and
-    the others' zeros, which is the source's bits exactly. Every process calls it alike."""
-    masks: dict[tuple[str, ...], jax.Array] = {}
-
-    def recovered(leaf):
-        if not isinstance(leaf, jax.Array):
-            return leaf
-        placed = leaf.sharding
-        assert isinstance(placed, jax.sharding.NamedSharding), "a covered save places by name (`_grid`)"
-        mesh, split = placed.mesh, tuple(_split_axes(placed.spec))
-        # Every axis the copies lie along, those of one device too, so the sum is replicated as its
-        # placement says.
-        along = tuple(name for name in mesh.axis_names if name not in split)
-        if all(mesh.shape[name] == 1 for name in along):
-            return leaf
-        if split not in masks:
-            sources = _sources(grid, split, holders)
-            assert sources is not None, "a recovered step's shards are covered (`_covered`)"
-            every = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*mesh.axis_names))
-            masks[split] = jax.make_array_from_callback(sources.shape, every, lambda index: sources[index])
-        typed = jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
-        values = jax.random.key_data(leaf) if typed else leaf
-        held = values.sharding
-        assert isinstance(held, jax.sharding.NamedSharding), "a key's data lies where its key does"
-        words = _UNSIGNED[max(values.dtype.itemsize, 1)]
-
-        def sum_of_sources(value, source):
-            bits = (value.astype(np.uint8) if value.dtype == np.bool_
-                    else jax.lax.bitcast_convert_type(value, words))
-            return jax.lax.psum(jnp.where(source.reshape(()), bits, jnp.zeros_like(bits)), along)
-
-        summing = jax.shard_map(sum_of_sources, mesh=mesh, out_specs=held.spec,
-                                in_specs=(held.spec, jax.sharding.PartitionSpec(*mesh.axis_names)))
-        summed = owned_program(summing)(jax.device_put(values, held.with_memory_kind("device")), masks[split])
-        value = (summed != 0 if values.dtype == np.bool_
-                 else jax.lax.bitcast_convert_type(summed, values.dtype))
-        value = jax.device_put(value, held)
-        return jax.random.wrap_key_data(value, impl=jax.random.key_impl(leaf)) if typed else value
-
-    return jax.tree.map(recovered, tree)
-
-
-def _zeros(leaf):
-    """Zeros where a placed template leaf lies, each process's shards its own: the shards a process
-    that lost its local copy holds until its replicas give it theirs (`_from_replicas`). A key is
-    read as its key data, as a restore reads it (`_placed`); a leaf nothing places is kept."""
-    sharding = getattr(leaf, "sharding", None)
-    if not isinstance(sharding, jax.sharding.NamedSharding):
-        return leaf
-    shape, dtype = tuple(leaf.shape), leaf.dtype
-    if jnp.issubdtype(dtype, jax.dtypes.prng_key):
-        key_words = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
-        shape, dtype = (*shape, *key_words.shape), key_words.dtype
-    # Every shard of a placement by name is one shape.
-    shard = sharding.shard_shape(shape)
-    return jax.make_array_from_callback(shape, sharding, lambda _: np.zeros(shard, dtype))
-
-
 def _tree_record(tree) -> JSON:
     """A step's item metadata as JSON: its nesting, and each array's shape and dtype, which a process
-    that lost its local copy reads its restore's checks from (`_RecoveredStep`)."""
+    that lost its local copy reads its restore's checks from (`_StepFacts`)."""
     if isinstance(tree, Mapping):
         return {"tree": {str(key): _tree_record(value) for key, value in tree.items()}}
     if isinstance(tree, (list, tuple)):
@@ -977,19 +709,6 @@ def _from_tree_record(recorded: JSON):
                                 jax.random.key(0).dtype if dtype == "key" else np.dtype(dtype))
 
 
-@dataclasses.dataclass(frozen=True)
-class _RecoveredStep:
-    """The metadata of a local step this process lost, as a process that holds it read it: what
-    `_step_metadata` gives in Orbax's `StepMetadata`'s place."""
-
-    custom_metadata: dict
-    item_metadata: Mapping[str, object]
-
-
-type _StepFacts = ocp.metadata.StepMetadata | _RecoveredStep
-"""A step's metadata as a restore reads it: Orbax's own, or a lost step's (`_RecoveredStep`)."""
-
-
 def _table_record(table: Mapping[str, np.ndarray]) -> JSON:
     return {name: {"dtype": str(np.asarray(value).dtype), "shape": list(np.shape(value)),
                    "hex": np.ascontiguousarray(value).tobytes().hex()} for name, value in table.items()}
@@ -1006,62 +725,97 @@ def _from_table_record(recorded: JSON) -> dict[str, np.ndarray]:
 
 
 class _RankedSteps(preservation.PreservationPolicy):
+    """Orbax's retention of a run's steps: each step its rules give a reason to keep, the readers of its
+    items (`roles`), which `Checkpoints._project` cuts it to once the save that changed them has landed."""
+
     def __init__(self, checkpoints):
         self.checkpoints = checkpoints
 
     def should_preserve(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo], *,
                         context: preservation.PreservationContext) -> Sequence[bool]:
-        keep = self.checkpoints.keep
+        held = self.roles(checkpoints, context)
+        deleting = self.checkpoints._deleting
+        # Orbax deletes a step no reader keeps once this save lands (its `_finalize`): one the last cut's
+        # deletion is still in waits for it to end first, any other leaves it running. Orbax asks after
+        # it dispatches the save's write, so what the deletion failed on waits for the run's next join.
+        if deleting is not None and any(not held[checkpoint.step] and checkpoint.step in deleting[2]
+                                        for checkpoint in checkpoints):
+            deleting[0].join()
+        newest = max((checkpoint.step for checkpoint in checkpoints), default=None)
+        self.checkpoints._plan = None if newest is None else (newest, held)
+        return [bool(held[checkpoint.step]) for checkpoint in checkpoints]
+
+    def roles(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo],
+              context: preservation.PreservationContext) -> dict[int, frozenset[str]]:
+        """The readers each step is kept for (`ROLES`), as the union of the run's rules: the latest steps a
+        resume reads, whole, and the latest a model's reader reads, their models; every `every`-th,
+        wall-time-spaced and predicate step, whole or, under
+        `Keep.weights_only`, its model; each ranking's best, whole or, ranked `weights_only`, its model;
+        and each post-hoc EMA snapshot, its profiles (row 4311)."""
+        owner, keep = self.checkpoints, self.checkpoints.keep
         ordered = sorted(checkpoints, key=lambda checkpoint: checkpoint.step)
-        # Orbax's selectors over the steps in order: the latest among those a
-        # resume reads (no weights-only step) and every `every`-th step.
-        full = [checkpoint for checkpoint in ordered
-                if not (checkpoint.metrics or {}).get("checkpoint/weights_only", 0)]
-        held = {checkpoint.step for checkpoint, kept in zip(
-            full, preservation.LatestN(n=keep.latest).should_preserve(full, context=context), strict=True)
-            if kept and keep.latest}
+        roles: dict[int, set[str]] = {checkpoint.step: set() for checkpoint in ordered}
+
+        def chosen(steps, policy, role):
+            for checkpoint, kept in zip(steps, policy.should_preserve(steps, context=context), strict=True):
+                if kept:
+                    roles[checkpoint.step].add(role)
+
+        kept_whole = MODEL if keep.weights_only else RESUME
+        # Orbax's selectors over the steps in order: the latest among those a resume reads, and among those
+        # a model's reader reads, a weights-only snapshot's or average's (`Decide.save`), their models;
+        # and every `every`-th step.
+        for role in (RESUME, MODEL):
+            held_by = [checkpoint for checkpoint in ordered if role in owner._roles_held(checkpoint.step)]
+            if keep.latest:
+                chosen(held_by, preservation.LatestN(n=keep.latest), role)
         if keep.every:
-            held.update(checkpoint.step for checkpoint, kept in zip(
-                ordered, preservation.EveryNSteps(interval_steps=keep.every).should_preserve(
-                    ordered, context=context), strict=True) if kept)
-        limits = self.checkpoints._rank_limits
+            chosen(ordered, preservation.EveryNSteps(interval_steps=keep.every), kept_whole)
         ranks = {key for checkpoint in checkpoints for key in checkpoint.metrics or {}
                  if key.startswith('checkpoint/rank/')}
         for rank in ranks:
+            name = rank.removeprefix('checkpoint/rank/')
             # Orbax's BestN over the steps a ranking scored, its scores lower-is-better (`reverse`) and the
             # newest first, so that of two tied steps its stable sort keeps the older.
             scored = sorted((checkpoint for checkpoint in checkpoints if rank in (checkpoint.metrics or {})),
                             key=lambda checkpoint: -checkpoint.step)
             best = preservation.BestN(get_metric_fn=lambda metrics, rank=rank: metrics[rank], reverse=True,
-                                      n=limits.get(rank.removeprefix('checkpoint/rank/'), 1))
-            held.update(checkpoint.step for checkpoint, kept in zip(
-                scored, best.should_preserve(scored, context=context), strict=True) if kept)
+                                      n=owner._rank_limits.get(name, 1))
+            for checkpoint, kept in zip(scored, best.should_preserve(scored, context=context), strict=True):
+                if kept:
+                    rule = (owner._custom(checkpoint.step).get('rankings') or {}).get(name) or {}
+                    roles[checkpoint.step].add(MODEL if rule.get('weights_only') else RESUME)
         previous = None
         interval = duration(keep.interval) if isinstance(keep.interval, str) else keep.interval
         # Orbax's EveryNSeconds takes whole seconds; Keep.interval is a timedelta, kept exact here.
         for checkpoint in ordered:
             if interval and (previous is None or checkpoint.time - previous >= interval):
-                held.add(checkpoint.step)
+                roles[checkpoint.step].add(kept_whole)
                 previous = checkpoint.time
             if keep.where:
                 try:
                     selected = keep.where(_kept(checkpoint.step, checkpoint.metrics or {},
-                                                self.checkpoints._custom(checkpoint.step)))
+                                                owner._custom(checkpoint.step),
+                                                owner._payloads(checkpoint.step)))
                 except KeyError:
                     selected = False
                 if selected:
-                    held.add(checkpoint.step)
-        return [checkpoint.step in held for checkpoint in checkpoints]
+                    roles[checkpoint.step].add(kept_whole)
+            if checkpoint.step in owner._profile_snapshots:
+                roles[checkpoint.step].add(PROFILES)
+        return {step: frozenset().union(*(_NEEDS[role] for role in held)) & owner._roles_held(step)
+                for step, held in roles.items()}
 
 
-class _ProfileSteps(preservation.PreservationPolicy):
-    """Keep ordinary checkpoints that also serve as post-hoc EMA snapshots."""
-    def __init__(self, steps: set[int]):
-        self.steps = steps
-
-    def should_preserve(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo], *,
-                        context: preservation.PreservationContext) -> Sequence[bool]:
-        return [checkpoint.step in self.steps for checkpoint in checkpoints]
+def _rmtrees(paths: Sequence[epath.Path], failures: list[OSError]) -> None:
+    """Delete each of `paths`, keeping what fails in `failures` (`Checkpoints._deleted`)."""
+    for path in paths:
+        try:
+            path.rmtree()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            failures.append(error)
 
 
 class Checkpoints:
@@ -1102,8 +856,15 @@ class Checkpoints:
         self._pending: tuple[int, dict[str, float]] | None = None
         # Each committed step's record, read once: its metrics and custom metadata, which `Kept`
         # views are derived from. A save in flight stages its metadata apart, until it commits.
-        self._committed: dict[int, tuple[Mapping[str, float], dict]] = {}
-        self._staged: dict[int, dict] = {}
+        self._committed: dict[int, tuple[Mapping[str, float], dict, tuple[str, ...]]] = {}
+        self._staged: dict[int, tuple[dict, tuple[str, ...]]] = {}
+        # The readers each step was kept for at the last retention, and the newest step then, applied once
+        # that step's save has landed (`_project`).
+        self._plan: tuple[int, dict[int, frozenset[str]]] | None = None
+        self._swept = False
+        # Process 0's deletion of the items the last projection cut, run behind the pool (`_project`), and
+        # what it failed on.
+        self._deleting: tuple[threading.Thread, list[OSError], frozenset[int]] | None = None
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
         # Why the run these checkpoints keep has no record that rebuilds it (`python_run`).
@@ -1149,7 +910,8 @@ class Checkpoints:
         (`ocp.metadata.get_step_metadata`), as `_custom` reads it, not the manager's metadata, which opens
         every array's TensorStore besides (row 3763)."""
         custom = ocp.metadata.get_step_metadata(self.path(step)).custom_metadata
-        self._committed[step] = (dict(store.metrics(step) or {}), copy.deepcopy(custom or {}))
+        self._committed[step] = (dict(store.metrics(step) or {}), copy.deepcopy(custom or {}),
+                                 _held_payloads(self.path(step)))
         self._staged.pop(step, None)
 
     def _custom(self, step: int) -> dict:
@@ -1157,10 +919,31 @@ class Checkpoints:
         as this process read it, or else from its committed metadata, which Orbax reads opening no
         manager."""
         if step in self._staged:
-            return self._staged[step]
+            return self._staged[step][0]
         if step in self._committed:
             return self._committed[step][1]
         return ocp.metadata.get_step_metadata(self.path(step)).custom_metadata or {}
+
+    def _payloads(self, step: int) -> tuple[str, ...]:
+        """The items `step` holds (`_held_payloads`): a save in flight's as it writes them, a committed step's
+        as this process read them."""
+        if step in self._staged:
+            return self._staged[step][1]
+        if step in self._committed:
+            return self._committed[step][2]
+        return _held_payloads(self.path(step))
+
+    def _roles_held(self, step: int) -> frozenset[str]:
+        """The readers `step`'s items serve (`ROLES`): its items, or for a step of one item (`ONE_ITEM`),
+        every reader of its whole state but where it was saved as its model alone, and its profiles where
+        it records them; a step another writer is saving, whose items Dew has not read, as a whole one."""
+        payloads = self._payloads(step)
+        if payloads and ONE_ITEM not in payloads:
+            return frozenset(payloads)
+        custom = self._custom(step) if payloads else {}
+        if custom.get('weights_only'):
+            return frozenset({MODEL})
+        return frozenset({MODEL, RESUME, *((PROFILES,) if custom.get('profiles') is not None else ())})
 
     def committed(self) -> list[int]:
         """The steps whose checkpoints have committed, oldest first, read from the store at each call
@@ -1260,17 +1043,28 @@ class Checkpoints:
         return min(candidates)[1] if candidates else None
 
     def pinned(self, step: int | str | None = None) -> int:
-        """The exact step `step` selects: itself, the best by a ranking, or, for
-        None or `latest`, the latest committed now, which a later save does not move."""
-        step = self.resolve(step)
-        step = self.latest if step is None else step
+        """The exact step `step` selects: itself, the best by a ranking, or, for None or `latest`, the
+        newest committed now that holds a model (a step kept for its model alone among them). A later save
+        does not move it."""
+        return self._pinned(step, MODEL)
+
+    def _pinned(self, step: int | str | None, reads: str) -> int:
+        """`pinned`, None and `latest` selecting the newest step that holds what a reader of `reads` reads
+        (`ROLES`): a resume's the latest (`latest`)."""
+        step = self._resolved(step, reads)
         if step is None:
             raise FileNotFoundError(f"{self.directory} holds no checkpoint")
         return step
 
     def resolve(self, step: int | str | None) -> int | None:
-        if not isinstance(step, str) or step == 'latest':
-            return self.latest if step == 'latest' else step
+        """The step `step` selects (`pinned`), None where it is None and no step holds a model."""
+        return self._resolved(step, MODEL)
+
+    def _resolved(self, step: int | str | None, reads: str) -> int | None:
+        if step is None or step == 'latest':
+            return self._newest(reads)
+        if not isinstance(step, str):
+            return step
         if step != 'best' and not step.startswith('best:'):
             raise ValueError(f"unknown checkpoint selector {step!r}")
         best = self._best_step(None if step == 'best' else step.removeprefix('best:'))
@@ -1282,15 +1076,12 @@ class Checkpoints:
         if self._manager is None:
             _check_shared(self.directory)
             options = ocp.CheckpointManagerOptions(
-                preservation_policy=preservation.AnyPreservationPolicy([
-                    _ProfileSteps(self._profile_snapshots),
-                    _RankedSteps(self),
-                ]),
-                best_fn=_recorded_rank, best_mode='min',
+                preservation_policy=_RankedSteps(self), best_fn=_recorded_rank, best_mode='min',
                 create=True, enable_async_checkpointing=True)
+            # A step's items (`ROLES`), or the one item of a step an earlier Dew wrote or a mapping's.
             self._manager = ocp.CheckpointManager(
                 self.directory, options=options,
-                item_handlers=_handler())
+                item_handlers={name: _handler() for name in (*ROLES, ONE_ITEM)})
             for step in self._manager.all_steps():
                 if not self._complete(step):
                     continue
@@ -1311,7 +1102,7 @@ class Checkpoints:
         all those arrays. A save invalidates it so a later inspection observes
         the newly committed step. Only one step's metadata is retained. A
         local step this process lost is read as the first process holding it
-        read it (`_RecoveredStep`), which every process hands on alike.
+        read it, which every process hands on alike.
         """
         held = self._metadata
         if held is not None and held[:2] == (local, step):
@@ -1320,16 +1111,18 @@ class Checkpoints:
         recovery = self._recovery
         if local and recovery is not None and recovery[0] == step:
             def read() -> JSON:
-                own = self._open_local().metadata(step)
-                return {"custom": own.custom_metadata or {}, "tree": _tree_record(_item_metadata(own))}
+                own = _facts(self._open_local().metadata(step))
+                return {"custom": own.custom_metadata, "tree": _tree_record(_item_metadata(own))}
 
             recorded = record(self._from_holder(recovery[1], read), "recovered step")
-            metadata = (_RecoveredStep(dict(record(recorded["custom"], "custom metadata")),
-                                       record(_from_tree_record(json_value(recorded["tree"], "tree")),
-                                              "item metadata"))
-                        if self._lost(step) else self._open_local().metadata(step))
+            metadata = (_StepFacts(dict(record(recorded["custom"], "custom metadata")),
+                                   record(_from_tree_record(json_value(recorded["tree"], "tree")),
+                                          "item metadata"))
+                        if self._lost(step) else _facts(self._open_local().metadata(step)))
+        elif local:
+            metadata = _facts(self._open_local().metadata(step))
         else:
-            metadata = (self._open_local() if local else self._open()).metadata(step)
+            metadata = _facts(self._open().metadata(step), self._payloads(step))
         self._metadata = local, step, metadata
         return metadata
 
@@ -1423,16 +1216,21 @@ class Checkpoints:
 
     @property
     def latest(self) -> int | None:
-        """Return the newest committed step a resume can read, local or persistent.
+        """Return the newest committed step a resume can read, local or persistent (`_newest`)."""
+        return self._newest(RESUME)
+
+    def _newest(self, reads: str) -> int | None:
+        """The newest committed step that holds what a reader of `reads` reads (`ROLES`), local or
+        persistent: a local step holds a whole state.
 
         Asking opens and writes nothing: until this process writes, Orbax's
         step format lists the committed steps read-only, and once it has, its
         manager's view, which holds this process's own saves, does."""
         steps = (self._manager.all_steps() if self._manager is not None
                  else [found.step for found in ocp.step.standard_name_format().find_all(self.directory)])
-        resumable = (step for step in sorted(steps, reverse=True)
-                     if self._complete(step) and not self._custom(step).get("weights_only", False))
-        persistent = next(resumable, None)
+        found = (step for step in sorted(steps, reverse=True)
+                 if self._complete(step) and reads in self._roles_held(step))
+        persistent = next(found, None)
         local = self._local_latest()
         if persistent is None or local is None:
             return local if persistent is None else persistent
@@ -1525,6 +1323,7 @@ class Checkpoints:
         hosts that keep the state there because device memory is short.
         """
         persistent = self._open()
+        self._project()
         mapping = isinstance(state, Mapping)
         if not mapping:
             self._identify_run()
@@ -1534,18 +1333,21 @@ class Checkpoints:
                 raise ValueError("a mapping is saved as it is: it takes no data position, share, "
                                  "weights-only split, rung, artifact or rollout, which a train state's save "
                                  "records")
-            profiles, state_tree, frozen, deltas = None, dict(state), {}, []
+            profiles, state_tree, frozen, deltas = None, dict(state), {}, {}
+            payloads = {ONE_ITEM: state_tree}
         else:
-            profiles = None if weights_only else _power_profiles(state.opt_state)
             if weights_only and rollout is not None:
                 raise ValueError("a weights-only snapshot resumes nothing, so it holds no rollout's state")
-            state_tree, frozen = self._frozen(self._item(state, saved, share, rollout))
-            state_tree, deltas = _with_ema_deltas(state_tree)
+            state_tree = self._item(state, saved, share, rollout)
             if weights_only:
                 from dew.state import MODEL_STATE
                 state_tree = {name: state_tree[name] for name in MODEL_STATE}
-        profile_metadata = None if profiles is None else {
-            'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
+            profiles = None if weights_only else _profiles_at(state_tree)
+            state_tree, frozen = self._frozen(state_tree)
+            state_tree, deltas = _with_ema_deltas(state_tree)
+            payloads = _in_payloads(state_tree, None if profiles is None else profiles[0])
+        profile_metadata = None if profiles is None else {**_profile_record(profiles[1]),
+                                                          'at': _named(profiles[0])}
         self._metadata = None
         if profiles is not None:
             self._profile_snapshots.add(step)
@@ -1553,16 +1355,7 @@ class Checkpoints:
         if weights_only:
             scores['checkpoint/weights_only'] = 1.0
         rankings = () if ranking is None else (ranking,) if isinstance(ranking, Ranking) else ranking
-        rules = {}
-        for rank in rankings:
-            previous = self._rank_modes.get(rank.metric)
-            if previous is not None and previous != rank.mode:
-                raise ValueError(f"ranking direction for {rank.metric!r} differs from this run's checkpoints")
-            self._rank_modes[rank.metric] = rank.mode
-            self._rank_limits[rank.metric] = rank.top
-            if rank.score is not None:
-                scores[f'checkpoint/rank/{rank.metric}'] = rank.score
-                rules[rank.metric] = dataclasses.asdict(rank)
+        rules = self._ranked(rankings, scores)
         custom = {
             **step_record(deltas, control, rung, artifact, boxed),
             "profiles": profile_metadata,
@@ -1574,11 +1367,13 @@ class Checkpoints:
         }
         # The retention policy reads this step's record without waiting for its metadata to commit;
         # a save Orbax refuses leaves the step's committed record as it was, and one it takes replaces it.
-        self._staged[step] = copy.deepcopy(custom)
+        self._staged[step] = (copy.deepcopy(custom),
+                              tuple(name for name in (*ROLES, ONE_ITEM) if name in payloads))
         try:
             with region("checkpoint.submit"):
-                persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=scores, force=True,
-                                custom_metadata=custom)
+                persistent.save(step, args=ocp.args.Composite(**{
+                    name: ocp.args.PyTreeSave(tree) for name, tree in payloads.items()}),
+                                metrics=scores, force=True, custom_metadata=custom)
         except BaseException:
             self._staged.pop(step)
             raise
@@ -1590,11 +1385,96 @@ class Checkpoints:
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
 
+    def _ranked(self, rankings: Sequence[Ranking], scores: dict[str, float]) -> dict[str, dict]:
+        """Each of a save's `rankings` that scored it, as its step records it, its score added to the
+        step's `scores`; every ranking's direction and limit held for the run's retention, a direction
+        another of the run's steps ranked otherwise refused."""
+        rules = {}
+        for rank in rankings:
+            previous = self._rank_modes.get(rank.metric)
+            if previous is not None and previous != rank.mode:
+                raise ValueError(f"ranking direction for {rank.metric!r} differs from this run's checkpoints")
+            self._rank_modes[rank.metric] = rank.mode
+            self._rank_limits[rank.metric] = rank.top
+            if rank.score is not None:
+                scores[f'checkpoint/rank/{rank.metric}'] = rank.score
+                rules[rank.metric] = dataclasses.asdict(rank)
+        return rules
+
+    def _project(self) -> None:
+        """Cut each committed step to the items its readers read, as the retention that ran with the newest
+        save decided (`_RankedSteps.roles`, row 4311), once that save has landed: as Orbax deletes a step
+        no reader keeps only once the save that dropped it commits (its `_finalize`), so a save that fails
+        leaves every step as it was. Process 0 records a step's kept items beside them (`PROJECTED`),
+        then deletes the rest, and hands every process the steps it cut; a step whose deletion was cut
+        short reads as cut, and its leftovers go at the first projection of a later process. It runs where
+        every process of the pool does, in `save`, `wait` and `close`, before the store's collection
+        reads the steps' references (`_frozen`). Process 0 deletes behind the pool, which waits on it for
+        the cut alone: the next projection and `close` join it, raising what it failed on (`_deleted`),
+        and a save whose retention drops a step the deletion is still in waits for it to end there
+        (`_RankedSteps.should_preserve`)."""
+        persistent = self._manager
+        if persistent is None:
+            self._plan = None
+            return
+        if self._plan is None:
+            return
+        # One deletion at a time: a new cut waits for the last, whose failure is raised before this plan
+        # is taken, so the run's next wait or close still cuts to it.
+        self._deleted()
+        plan, self._plan = self._plan, None
+        persistent.wait_until_finished()
+        newest, roles = plan
+        cuts: dict[str, list[str]] = {}
+        doomed: list[epath.Path] = []
+        if jax.process_index() == 0 and self._complete(newest):
+            steps = set(persistent.all_steps())
+            for step, needed in roles.items():
+                payloads = self._payloads(step)
+                if not needed or step not in steps or ONE_ITEM in payloads or not self._complete(step):
+                    continue
+                root = epath.Path(self.path(step))
+                kept = [name for name in ROLES if name in needed and name in payloads]
+                leftover = not self._swept and any((root / name).exists() for name in ROLES
+                                                   if name not in kept)
+                if len(kept) == len(payloads) and not leftover:
+                    continue
+                write_atomically(root / PROJECTED, json.dumps(kept))
+                doomed += [root / name for name in ROLES if name not in kept and (root / name).exists()]
+                cuts[str(step)] = kept
+        cuts = broadcast_from_process_zero(cuts)
+        if doomed:
+            failures: list[OSError] = []
+            deleting = threading.Thread(target=_rmtrees, args=(doomed, failures),
+                                        name="checkpoint projection")
+            deleting.start()
+            self._deleting = deleting, failures, frozenset(int(step) for step in cuts)
+        self._swept = True
+        for step, kept in cuts.items():
+            if int(step) in self._committed:
+                metrics, custom, _ = self._committed[int(step)]
+                self._committed[int(step)] = metrics, custom, tuple(kept)
+            if int(step) in self._staged:
+                self._staged[int(step)] = self._staged[int(step)][0], tuple(kept)
+        if cuts:
+            self._metadata = None
+
+    def _deleted(self) -> None:
+        """Join the last projection's deletion (`_project`), raising what it failed on: a step whose
+        deletion failed reads as cut, and its leftovers go at a later process's first projection."""
+        deleting, self._deleting = self._deleting, None
+        if deleting is None:
+            return
+        thread, failures, _ = deleting
+        thread.join()
+        if failures:
+            raise failures[0]
+
     def _frozen(self, state_tree: dict[str, StateLeaf]
-                ) -> tuple[dict[str, StateLeaf], dict[str, dict[str, str]]]:
-        """Return `state_tree` with its variables' and its EMA's collections
-        but `params` held in the store (`FROZEN_STORE`), and each one's digest
-        under its tree, which the step records.
+                ) -> tuple[Mapping[str, object], dict[str, dict[str, str]]]:
+        """Return `state_tree` with the collections but `params` of each of its variables trees
+        (`_variable_trees`: the variables and the EMA, the run's and each DiLoCo group's, stacked) held
+        in the store (`FROZEN_STORE`), and each one's digest under its tree's name, which the step records.
 
         An EMA collection no average moves has its weights' content, so it is
         the same entry. A collection the store lacks is written now, before
@@ -1602,12 +1482,10 @@ class Checkpoints:
         collection that no kept step, this step nor the one still in flight
         records is deleted first, by process 0.
         """
-        held: dict[str, dict[str, object]] = {}
-        for tree in ('variables', 'ema'):
-            collections = state_tree.get(tree)
-            if isinstance(collections, Mapping):
-                held[tree] = {str(name): value for name, value in collections.items()
-                              if name != 'params' and jax.tree.leaves(value)}
+        trees = _variable_trees(state_tree)
+        held = {_named(path): {str(name): value for name, value in collections.items()
+                               if name != 'params' and jax.tree.leaves(value)}
+                for path, collections in trees.items()}
         digests = {tree: {name: _digest(value) for name, value in values.items()}
                    for tree, values in held.items()}
         root = epath.Path(self.directory) / FROZEN_STORE
@@ -1615,7 +1493,8 @@ class Checkpoints:
         if jax.process_index() == 0 and root.exists():
             referenced = {*recorded, *self._frozen_pending}
             for kept in self.kept():
-                for values in (self._custom(kept.step).get('frozen') or {}).values():
+                frozen = _frozen_held(self._custom(kept.step).get('frozen') or {}, self._payloads(kept.step))
+                for values in frozen.values():
                     referenced.update(values.values())
             for path in root.iterdir():
                 if path.name not in referenced and ocp.utils.is_checkpoint_finalized(path):
@@ -1630,11 +1509,11 @@ class Checkpoints:
                     with region("checkpoint.frozen"), ocp.Checkpointer(_handler()) as checkpointer:
                         checkpointer.save(root / digest, args=ocp.args.PyTreeSave(value))
                     written.add(digest)
-        kept_tree = dict(state_tree)
-        for tree, values in held.items():
-            collections = state_tree[tree]
-            assert isinstance(collections, Mapping)
-            kept_tree[tree] = {name: value for name, value in collections.items() if name not in values}
+        kept_tree: Mapping[str, object] = state_tree
+        for path, collections in trees.items():
+            values = held[_named(path)]
+            kept_tree = _with(kept_tree, path, {name: value for name, value in collections.items()
+                                                if name not in values})
         return kept_tree, digests
 
     def _with_frozen(self, restored: dict, frozen: Mapping[str, Mapping[str, str]],
@@ -1643,11 +1522,14 @@ class Checkpoints:
         back into its tree, onto `held`'s templates (`_held_apart`) or, with
         none, as host arrays."""
         for tree, names in frozen.items():
+            path = tuple(tree.split('/'))
             templates = None if held is None else held.get(tree, {})
-            collections = restored.get(tree, {} if templates else None)
+            collections = _at(restored, path)
+            if collections is None and templates:
+                collections = {}
             if isinstance(collections, Mapping):
                 wanted = names if templates is None else {name: names[name] for name in templates}
-                restored[tree] = {**collections, **self._frozen_values(wanted, templates)}
+                restored = _with(restored, path, {**collections, **self._frozen_values(wanted, templates)})
         return restored
 
     def _frozen_values(self, digests: Mapping[str, str], templates: Mapping | None) -> dict[str, Variables]:
@@ -1696,30 +1578,47 @@ class Checkpoints:
         persistent = self._open()
         return sorted(step for step in self._profile_snapshots if step in persistent.all_steps()
                       and epath.Path(self.path(step)).exists()
-                      and ocp.utils.is_checkpoint_finalized(self.path(step)))
+                      and ocp.utils.is_checkpoint_finalized(self.path(step))
+                      and PROFILES in self._roles_held(step))
 
     def profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]:
-        """Return a snapshot's recorded updates and relative standard deviations, without its averages."""
+        """Return a snapshot's recorded updates and relative standard deviations, without its averages: the
+        run's updates, under DiLoCo the first group's, whose clocks are the run's (`_profile_updates`)."""
+        return self._profile_updates(step)[0][0], self._profile_updates(step)[1]
+
+    def _profile_updates(self, step: int) -> tuple[tuple[int, ...], tuple[float, ...], bool]:
+        """A snapshot's recorded updates of each holder of its profiles, one, or under DiLoCo each group's
+        (`_profile_record`), their stds, and whether they are the groups', stacked over them."""
         self.kept()
-        custom = self._custom(step)
-        profiles = custom.get('profiles')
+        profiles = self._custom(step).get('profiles')
         if profiles is None:
             raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA snapshot")
-        return int(profiles['updates']), tuple(profiles['stds'])
+        updates = profiles['updates']
+        grouped = isinstance(updates, list)
+        return (tuple(int(count) for count in updates) if grouped else (int(updates),),
+                tuple(profiles['stds']), grouped)
 
     def restore_profiles(self, step: int) -> tuple[Variables, ...]:
-        """Read only a snapshot's averages, as host arrays, from its retained checkpoint."""
-        persistent = self._open()
+        """Read only a snapshot's averages, as host arrays, from its retained checkpoint: under DiLoCo each
+        group's, stacked over the groups on a first axis (`_profiles_at`)."""
         self.profile_metadata(step)
-        opt_state = dict(persistent.item_metadata(step))['opt_state']
-        profiles = _power_profiles(opt_state)
-        averages = tuple(_averages_of(profiles))
-        wanted = _with_averages(jax.tree.map(lambda _: ocp.PLACEHOLDER, opt_state), averages)
-        wanted = {'opt_state': wanted}
+        facts = self._step_metadata(step)
         host = _host_read(from_local=False)
-        restored = persistent.restore(step, args=ocp.args.PyTreeRestore(
-            item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: host, wanted)))
-        return tuple(_averages_of(_power_profiles(restored['opt_state'])))
+        if PROFILES in facts.trees:
+            held = facts.trees[PROFILES]
+            restored = self._restored(step, None, {PROFILES: jax.tree.map(lambda _: host, held)}, local=False,
+                                      partial=False, by_payload=True)
+            return tuple(restored[PROFILES]['averages'])
+        # A step of one item, as an earlier Dew wrote it: its averages where its optimizer state keeps them.
+        metadata = _item_metadata(facts)
+        found = _profiles_at(metadata)
+        if found is None:
+            raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA profiles")
+        path, profiles = found
+        wanted = _with({}, path, _with_averages(jax.tree.map(lambda _: ocp.PLACEHOLDER, _at(metadata, path)),
+                                                tuple(_averages_of(profiles))))
+        restored = self._restored(step, wanted, jax.tree.map(lambda _: host, wanted), local=False)
+        return tuple(_averages_of(_power_profiles(_at(restored, path))))
 
     def posthoc_ema(self, std: float, step: int | None = None) -> Variables:
         """Return the post-hoc EMA with relative standard deviation `std` at checkpoint `step`.
@@ -1730,9 +1629,15 @@ class Checkpoints:
         reading one snapshot at a time and accumulating in fp32 or wider. Use
         the result where the run's params go:
         `merge(variables, {"params": checkpoints.posthoc_ema(...)})`.
-        """
-        from dew.averaging import coefficients
 
+        Under DiLoCo the profiles are each group's, of the parameters its inner
+        solver makes (`DiLoCo.started` moves the configured optimizer into the
+        groups), and a group's rejected updates are its own, so each group's
+        weights are solved from its own update counts: the result is the groups'
+        mean of their own reconstructions, as the groups' EMAs average each its
+        own group's parameters, not an average of the outer model's trajectory,
+        which no profile follows.
+        """
         steps = self.profile_steps()
         if not steps:
             raise FileNotFoundError(f"{self.directory} holds no EMA profile snapshots; train with "
@@ -1740,32 +1645,29 @@ class Checkpoints:
         step = steps[-1] if step is None else step
         if step not in steps:
             raise ValueError(f"{self.directory} holds EMA profile snapshots at steps {steps}, not {step}")
-        held = [(each, *self.profile_metadata(each)) for each in steps if each <= step]
-        # A snapshot before the first update holds the initial weights, with no
-        # profile to fit.
-        held = [(each, updates, stds) for each, updates, stds in held if updates > 0]
-        # A step that made no update (accumulating a window, or rejected by a loss scaler) holds the
-        # averages of the step before it, whose identical rows would leave the solve singular: one
-        # snapshot an update count, the latest.
-        held = list({updates: (each, updates, stds) for each, updates, stds in held}.values())
-        if not held or held[-1][0] != step:
-            raise ValueError(f"the snapshot at step {step} was taken before the first update")
-        weights = iter(coefficients([(updates, deviation) for _, updates, stds in held for deviation in stds],
-                                    held[-1][1], std))
+        held = [(each, *self._profile_updates(each)) for each in steps if each <= step]
+        grouped = held[-1][3]
+        weights = [_snapshot_weights([(each, updates[group], stds) for each, updates, stds, _ in held],
+                                     step, std) for group in range(len(held[-1][1]))]
         total, dtypes = None, None
-        for each, _, _ in held:
-            for average in self.restore_profiles(each):
-                weight = next(weights)
+        for each, *_ in held:
+            if not any((each, 0) in solved for solved in weights):
+                continue
+            for index, average in enumerate(self.restore_profiles(each)):
+                factors = [solved.get((each, index), 0.0) for solved in weights]
+
+                def weighted(leaf, factors=factors):
+                    # Each group's weight on its own row of the stacked average.
+                    return (np.reshape(np.asarray(factors), (-1,) + (1,) * (leaf.ndim - 1)) if grouped
+                            else factors[0])
                 if total is None:
                     dtypes = jax.tree.map(lambda leaf: leaf.dtype, average)
-                    total = jax.tree.map(
-                        lambda leaf, weight=weight: weight
-                        * leaf.astype(at_least_fp32(leaf.dtype)),
-                        average,
-                    )
+                    total = jax.tree.map(lambda leaf: weighted(leaf) * leaf.astype(at_least_fp32(leaf.dtype)),
+                                         average)
                 else:
-                    total = jax.tree.map(lambda sum_, leaf, weight=weight: sum_ + weight * leaf,
-                                         total, average)
+                    total = jax.tree.map(lambda sum_, leaf: sum_ + weighted(leaf) * leaf, total, average)
+        if grouped:
+            total = jax.tree.map(lambda leaf: np.mean(leaf, axis=0), total)
         return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)
 
     def save_local(
@@ -1793,7 +1695,8 @@ class Checkpoints:
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
         grid = _grid({name: leaf for name, leaf in state_tree.items() if name != 'position'})
-        state_tree, deltas = _with_ema_deltas(state_tree)
+        coded, deltas = _with_ema_deltas(state_tree)
+        state_tree = dict(coded)
         if saved is not None:
             state_tree['position'] = jax.tree.map(
                 lambda leaf: jax.device_put(leaf, state.step.sharding), state_tree['position'])
@@ -1818,7 +1721,8 @@ class Checkpoints:
     @staticmethod
     def _item(state: TrainState, saved: bytes | None, share: DataPartition | None,
               rollout: Mapping[str, object] | None = None) -> dict[str, StateLeaf]:
-        from dew.state import CHECKPOINTED
+        from dew.state import CHECKPOINTED, without_empty_window
+        state = without_empty_window(state)
         state_tree = {name: getattr(state, name) for name in CHECKPOINTED}
         if rollout is not None:
             state_tree['rollout'] = dict(rollout)
@@ -1879,6 +1783,9 @@ class Checkpoints:
         from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
 
         step = self.pinned(step)
+        if MODEL not in self._roles_held(step):
+            raise ValueError(f"step {step} of {self.directory} holds {_payload(self._payloads(step))} alone, "
+                             "which its retention keeps it for, and no model; read a step that holds one")
         stored = self.stored(step)
         template = {"variables": without(stored["variables"], unread)}
         if ema and stored.get("ema") is None:
@@ -1936,27 +1843,31 @@ class Checkpoints:
         """Return what the checkpoint at `step` holds, without reading its values.
 
         `step` defaults to the latest. Each state field comes back as a
-        shape/dtype tree, and an unset field as None.
+        shape/dtype tree, and an unset field as None. A step its retention
+        keeps for its model holds the model's fields (its post-hoc EMA
+        profiles, where it keeps them too, are `restore_profiles`'s); one kept
+        for its profiles alone is refused.
         """
         step = self.pinned(step)
         snapshot = self._step_metadata(step, local=step == self._local_latest())
+        _refuse_profiles_alone(step, snapshot)
         metadata = _item_metadata(snapshot)
         stored = {name: None if value is None else
                   jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
                   for name, value in dict(metadata).items()}
-        deltas = _ema_deltas(snapshot)
-        if deltas:
-            stored['ema'] = jax.tree_util.tree_map_with_path(
-                lambda path, leaf: deltas.get(path, leaf), stored['ema'])
+        for path, deltas in _ema_deltas(snapshot).items():
+            stored = _with(stored, path, jax.tree_util.tree_map_with_path(
+                lambda keys, leaf, deltas=deltas: deltas.get(keys, leaf), _at(stored, path)))
         frozen = epath.Path(self.directory) / FROZEN_STORE
         with ocp.PyTreeCheckpointer() as checkpointer:
             for tree, names in ((snapshot.custom_metadata or {}).get('frozen') or {}).items():
-                collections = stored.get(tree)
+                path = tuple(tree.split('/'))
+                collections = _at(stored, path)
                 if isinstance(collections, Mapping):
-                    stored[tree] = {**collections, **{
+                    stored = _with(stored, path, {**collections, **{
                         name: jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(
                             _item_metadata(checkpointer.metadata(frozen / digest))))
-                        for name, digest in names.items()}}
+                        for name, digest in names.items()}})
         return stored
 
     def accumulation_template(self, step: int):
@@ -1980,14 +1891,13 @@ class Checkpoints:
         while its state is still unplaced (`Trainer.fit`). None where the step saved no position."""
         from_local = step == self._local_latest()
         snapshot = self._step_metadata(step, local=from_local)
+        _refuse_cut_resume(step, snapshot, 'data position')
         metadata = _item_metadata(snapshot)
         if 'position' not in metadata or (snapshot.custom_metadata or {}).get('tree'):
             return None
         def read() -> dict[str, np.ndarray]:
-            checkpointer = self._open_local() if from_local else self._open()
             wanted, reads = _position_reads(metadata, from_local=from_local)
-            restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
-                item={'position': wanted}, partial_restore=True, restore_args={'position': reads}))
+            restored = self._restored(step, {'position': wanted}, {'position': reads}, local=from_local)
             return jax.tree.map(np.asarray, dict(restored['position']))
 
         recovery = self._recovery
@@ -2000,17 +1910,17 @@ class Checkpoints:
         """The rollout's tree the step at `step` holds (`save`'s `rollout`), read alone and placed as
         `template`'s leaves (`jax.ShapeDtypeStruct`s) are; None for a step saved without one."""
         from_local = step == self._local_latest()
-        metadata = _item_metadata(self._step_metadata(step, local=from_local))
+        snapshot = self._step_metadata(step, local=from_local)
+        _refuse_cut_resume(step, snapshot, "rollout's state")
+        metadata = _item_metadata(snapshot)
         if 'rollout' not in metadata:
             return None
         # A step saved before the rollout held a key holds the rest, which the rollout reads without it.
         held = metadata['rollout']
         wanted = {'rollout': {key: value for key, value in template.items() if key in held}}
         _refuse_reshaped(wanted, metadata, self.source(step))
-        checkpointer = self._open_local() if from_local else self._open()
-        restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
-            item=wanted, partial_restore=True,
-            restore_args=jax.tree.map(lambda want: _read(want, want.dtype), wanted)))
+        restored = self._restored(step, wanted, jax.tree.map(lambda want: _read(want, want.dtype), wanted),
+                                  local=from_local)
         return _placed(dict(restored['rollout']), wanted['rollout'])
 
     @overload
@@ -2047,9 +1957,9 @@ class Checkpoints:
         its members (`dew.checkpoints.served.unpacked`). Carried to 1.0, when it is deleted (ledger
         1552).
         """
-        step = self.pinned(step)
+        resumes = template is not None and not isinstance(template, Mapping)
+        step = self._pinned(step, RESUME if resumes else MODEL)
         from_local = step == self._local_latest()
-        checkpointer = self._open_local() if from_local else self._open()
         where = self.source(step) if from_local else self.path(step)
         if from_local and template is None and jax.process_count() > 1:
             raise ValueError(
@@ -2059,9 +1969,11 @@ class Checkpoints:
                 f"persistent checkpoint at {self.path(step)}")
         snapshot = self._step_metadata(step, local=from_local)
         mapping = bool((snapshot.custom_metadata or {}).get('tree'))
-        if template is not None and not isinstance(template, Mapping) and (
-                snapshot.custom_metadata or {}).get('weights_only', False):
-            raise ValueError("inference-only weights snapshot; resume a full checkpoint")
+        if resumes and not from_local and RESUME not in self._roles_held(step):
+            raise ValueError(f"step {step} of {self.directory} holds {_payload(self._payloads(step))} alone: "
+                             "a weights-only snapshot, or a step kept for its weights or profiles, resumes "
+                             "nothing; resume a whole checkpoint")
+        _refuse_profiles_alone(step, snapshot)
         metadata = _item_metadata(snapshot)
         stored = metadata.keys()
         _check_template(template, metadata, stored, mapping=mapping)
@@ -2069,17 +1981,16 @@ class Checkpoints:
         held: dict[str, dict] | None = None
         if template is None:
             untyped = _host_read(from_local=from_local)
-            restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
-                restore_args=jax.tree.map(lambda _: untyped, dict(metadata))))
+            restored = self._restored(step, None, jax.tree.map(lambda _: untyped, dict(metadata)),
+                                      local=from_local, partial=False)
             if from_local:
                 restored = jax.tree.map(np.asarray, restored)
-            deltas = _ema_deltas(snapshot)
-            if deltas:
-                restored = dict(restored)
-                weights = _by_path(restored['variables'])
-                restored['ema'] = jax.tree_util.tree_map_with_path(
-                    lambda path, leaf: _from_delta_planes(leaf, weights[path])
-                    if path in deltas else leaf, restored['ema'])
+            restored = dict(restored)
+            for path, deltas in _ema_deltas(snapshot).items():
+                weights = _by_path(_at(restored, _averaged(path)))
+                restored = _with(restored, path, jax.tree_util.tree_map_with_path(
+                    lambda keys, leaf, deltas=deltas, weights=weights: _from_delta_planes(leaf, weights[keys])
+                    if keys in deltas else leaf, _at(restored, path)))
         elif from_local and self._lost(step):
             restored, held = self._lost_shards(step, template, frozen, snapshot, metadata, where)
         else:
@@ -2090,10 +2001,11 @@ class Checkpoints:
             held = _held_apart(state_tree, frozen)
             if from_local:
                 self._check_placement(step, state_tree)
-            targets, deltas = {}, {}
-            if state_tree.get('ema') is not None:
-                deltas = _ema_deltas(snapshot)
-                state_tree['ema'], targets = _plane_template(state_tree['ema'], deltas)
+            targets, deltas = {}, _ema_deltas(snapshot)
+            for path, planes in deltas.items():
+                if _at(state_tree, path) is not None:
+                    templated, targets[path] = _plane_template(_at(state_tree, path), planes)
+                    state_tree = _with(state_tree, path, templated)
             _refuse_reshaped(state_tree, metadata, where)
             restore_args = jax.tree.map(lambda want: _read(want, want.dtype), state_tree)
             if 'position' in stored and not mapping and share is not None:
@@ -2103,8 +2015,8 @@ class Checkpoints:
                 # partial_restore: a key the checkpoint holds and the template
                 # does not is skipped instead of refused. A template asking for
                 # stored collections alone asks the step for nothing.
-                restored = {} if not state_tree else checkpointer.restore(step, args=ocp.args.PyTreeRestore(
-                    item=state_tree, restore_args=restore_args, partial_restore=True))
+                restored = {} if not state_tree else self._restored(step, state_tree, restore_args,
+                                                                     local=from_local)
             except (TypeError, ValueError) as mismatch:
                 if mapping:
                     raise ValueError(
@@ -2119,15 +2031,16 @@ class Checkpoints:
                     f"and the gradient accumulation it was written with. Resume it "
                     f"with those, or start a fresh run in a directory of its own."
                 ) from mismatch
-            restored = unpacked(checkpointer, step, metadata, dict(restored), served)
+            restored = unpacked(functools.partial(self._restored, step, local=from_local), metadata,
+                                dict(restored), served)
             _refuse_lacking({jax.tree_util.keystr(path) for path, leaf
                              in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
                              if isinstance(leaf, jax.ShapeDtypeStruct)}, where)
             restored = {name: value if name == 'position' else _placed(value, state_tree[name])
                         for name, value in restored.items()}
-            if targets:
-                restored = {**restored, 'ema': self._averages(checkpointer, step, metadata, restored,
-                                                              targets, deltas)}
+            for path, wanted in targets.items():
+                restored = _with(restored, path, self._averages(step, metadata, restored, path, wanted,
+                                                                deltas[path], local=from_local))
         if from_local and template is not None:
             restored = self._recovered(step, dict(restored),
                                        positioned='position' in stored and not mapping and share is not None)
@@ -2137,10 +2050,9 @@ class Checkpoints:
         restored = _filled(template, restored, step)
         return restored, saved
 
-    @staticmethod
-    def _averages(checkpointer: ocp.CheckpointManager, step: int, metadata, restored,
-                  targets: dict, deltas: dict) -> Variables:
-        """Return the restored EMA tree with each plane stack of `targets` turned
+    def _averages(self, step: int, metadata, restored, path: TreePath, targets: dict, deltas: dict, *,
+                  local: bool) -> Variables:
+        """Return the restored average at `path` with each plane stack of `targets` turned
         back into the leaf it holds, typed and placed as the template has it.
 
         Undoing a difference takes the weight it was taken from, in its
@@ -2149,36 +2061,70 @@ class Checkpoints:
         rest are read here, placed as the leaves they undo.
         """
         lives, unread = {}, {}
-        held = _by_path(restored.get('variables'))
-        for path, target in targets.items():
-            weight = held.get(path)
-            if (isinstance(weight, jax.Array) and weight.dtype == deltas[path].dtype
+        weights_path = _averaged(path)
+        held = _by_path(_at(restored, weights_path))
+        for keys, target in targets.items():
+            weight = held.get(keys)
+            if (isinstance(weight, jax.Array) and weight.dtype == deltas[keys].dtype
                     and weight.sharding.memory_kind != "pinned_host"):
-                lives[path] = weight
+                lives[keys] = weight
             else:
                 sharding = getattr(target, "sharding", None)
-                unread[path] = jax.ShapeDtypeStruct(
-                    deltas[path].shape, deltas[path].dtype,
+                unread[keys] = jax.ShapeDtypeStruct(
+                    deltas[keys].shape, deltas[keys].dtype,
                     sharding=None if sharding is None else sharding.with_memory_kind("device"))
         if unread:
             # The stored params tree, its containers kept, with every leaf
             # but the ones to read held back by orbax's placeholder.
-            weights = {'variables': jax.tree_util.tree_map_with_path(
-                lambda path, _: unread.get(path, ocp.PLACEHOLDER), dict(metadata)['variables'])}
-            read = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
-                item=weights, partial_restore=True, restore_args=jax.tree.map(
-                    lambda leaf: ocp.ArrayRestoreArgs(sharding=getattr(leaf, "sharding", None)),
-                    weights)))
-            lives.update({path: leaf for path, leaf in _by_path(read['variables']).items() if path in unread})
+            weights = _with({}, weights_path, jax.tree_util.tree_map_with_path(
+                lambda keys, _: unread.get(keys, ocp.PLACEHOLDER), _at(dict(metadata), weights_path)))
+            read = self._restored(step, weights, jax.tree.map(
+                lambda leaf: ocp.ArrayRestoreArgs(sharding=getattr(leaf, "sharding", None)), weights),
+                local=local)
+            lives.update({keys: leaf for keys, leaf in _by_path(_at(read, weights_path)).items()
+                          if keys in unread})
 
-        def average(path, planes):
-            if path not in targets:
+        def average(keys, planes):
+            if keys not in targets:
                 return planes
-            target = targets[path]
-            value = _decode_delta(planes, lives[path], np.dtype(target.dtype))
+            target = targets[keys]
+            value = _decode_delta(planes, lives[keys], np.dtype(target.dtype))
             sharding = getattr(target, "sharding", None)
             return value if sharding is None else jax.device_put(value, sharding)
-        return jax.tree_util.tree_map_with_path(average, restored['ema'])
+        return jax.tree_util.tree_map_with_path(average, _at(restored, path))
+
+    def _restored(self, step: int, asked, restore_args, *, local: bool, partial: bool = True,
+                  by_payload: bool = False) -> dict:
+        """What `step` holds of its named state as `asked` asks (a template of it; None for every leaf
+        `restore_args` names), read as `restore_args` say: a local step's one item, or from the persistent
+        step's items that hold those leaves (`_in_payloads`), one of a step an earlier Dew wrote among them
+        (`ONE_ITEM`). Every read of a step's arrays goes through it. `by_payload` reads `restore_args`'s own
+        payloads, by name, as they are. A read that needs an item the step does not hold, which its
+        retention cut (`_project`), is refused naming what the step holds."""
+        if local:
+            return dict(self._open_local().restore(step, args=ocp.args.PyTreeRestore(
+                item=asked, restore_args=restore_args, partial_restore=partial)))
+        facts = self._step_metadata(step)
+        if ONE_ITEM in facts.payloads:
+            one = ocp.args.PyTreeRestore(item=asked, restore_args=restore_args, partial_restore=partial)
+            return dict(self._open().restore(step, args=ocp.args.Composite(**{ONE_ITEM: one}))[ONE_ITEM])
+        at = _profile_path(facts.custom_metadata)
+        args = restore_args if by_payload else _in_payloads(restore_args, at)
+        trees = {} if asked is None else _in_payloads(asked, at)
+        # An item whose leaves the read holds back (`ocp.PLACEHOLDER`) is not read.
+        wanted = [name for name, tree in args.items()
+                  if any(leaf is not ocp.PLACEHOLDER for leaf in jax.tree.leaves(trees.get(name, tree)))]
+        missing = set(wanted) - set(facts.payloads)
+        if missing:
+            raise ValueError(f"step {step} of {self.directory} holds {_payload(facts.payloads)} alone, which "
+                             "its retention keeps it for (Keep, a weights-only ranking, a post-hoc EMA "
+                             f"snapshot); it holds no {_payload(missing)}: read a step that holds them")
+        if not wanted:
+            return {}
+        restored = self._open().restore(step, args=ocp.args.Composite(**{name: ocp.args.PyTreeRestore(
+            item=trees.get(name), restore_args=args[name], partial_restore=partial) for name in wanted}))
+        read = {name: dict(restored[name]) for name in wanted}
+        return read if by_payload else _from_payloads(read, at)
 
     def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
         """Refuse a local step written for another placement of the state."""
@@ -2214,10 +2160,11 @@ class Checkpoints:
             if not isinstance(template, Mapping) else dict(template)
         held = _held_apart(state_tree, frozen)
         self._check_recovered(step, state_tree)
-        # The EMA is stored as byte planes of its difference from the weights, checked as such.
+        # Each average is stored as byte planes of its difference from its weights, checked as such.
         checked = dict(state_tree)
-        if checked.get('ema') is not None:
-            checked['ema'], _ = _plane_template(checked['ema'], _ema_deltas(snapshot))
+        for path, planes in _ema_deltas(snapshot).items():
+            if _at(checked, path) is not None:
+                checked = _with(checked, path, _plane_template(_at(checked, path), planes)[0])
         _refuse_reshaped(checked, metadata, where)
         return jax.tree.map(_zeros, state_tree), held
 
@@ -2270,9 +2217,14 @@ class Checkpoints:
         """The steps that close the open managers, which this forgets: each one's wait, then each
         one's close."""
         opened = [writer for writer in (self._manager, self._local_manager) if writer is not None]
-        self._manager, self._local_manager, self._pending = None, None, None
-        return [*(("Checkpoint wait", writer.wait_until_finished) for writer in opened),
-                *(("Checkpoint close", writer.close) for writer in opened)]
+
+        def detached():
+            self._manager, self._local_manager, self._pending = None, None, None
+        # The projection reads the run's steps through its own manager (`_complete`), so it runs attached.
+        cut = ([] if self._manager is None else [("Checkpoint projection", self._project)])
+        cut.append(("Checkpoint deletion", self._deleted))
+        return [*(("Checkpoint wait", writer.wait_until_finished) for writer in opened), *cut,
+                ("Checkpoint detach", detached), *(("Checkpoint close", writer.close) for writer in opened)]
 
     def wait(self) -> None:
         """Block until pending async writes have landed on disk.
@@ -2284,6 +2236,7 @@ class Checkpoints:
             attempted([("Checkpoint wait", writer.wait_until_finished)
                         for writer in (self._manager, self._local_manager) if writer is not None])
             self._pending = None
+            self._project()
 
 
 @dataclasses.dataclass(frozen=True)
