@@ -150,36 +150,60 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     The start runs on a thread of its own (`_Starting`), which no Python signal handler runs on: one that
     raises (a Ctrl-C, a deadline's alarm) runs on the main thread, whichever thread the signal reached,
     and landing between a descriptor's creation and its holder's holding it, there or inside Popen's
-    own, would leak it. An interruption reaches the caller wherever it is, as it waits or as it returns,
-    and the start is then undone on a thread of its own, which the caller waits for before it raises; a
-    second interruption while it waits leaves the undoing to finish on its own."""
+    own, would leak it. An interruption reaches the caller wherever it is (launching the thread, waiting
+    for it, returning), which then abandons the start (`_Starting.abandon`): a group the start has handed
+    over is undone on a thread of its own, one it has yet to hand over is undone by the start itself,
+    and the caller waits for either before it raises; a second interruption while it waits leaves the
+    undoing to finish on its own. A start abandoned before it began starts nothing."""
     starting = _Starting(command, options)
     worker = threading.Thread(target=starting.run, name="dew-group-start", daemon=True)
     try:
         worker.start()
-        worker.join()
+        starting.done.wait()
         return starting.result()
     except BaseException:
-        undoing = threading.Thread(target=starting.undo, args=(worker,), name="dew-group-undo", daemon=True)
-        undoing.start()
-        undoing.join()
+        process, begun = starting.abandon()
+        if process is not None:
+            undoing = threading.Thread(target=_undone, args=(process,), name="dew-group-undo", daemon=True)
+            undoing.start()
+            undoing.join()
+        elif begun:
+            starting.done.wait()
         raise
 
 
 class _Starting:
-    """One `start` on a thread of its own (`run`): its group, or the error that ended it, which its
-    caller raises (`result`), and its undoing where its caller was interrupted (`undo`)."""
+    """One `start` on a thread of its own (`run`): its group, handed to its caller (`result`), or the error
+    that ended it, raised on the caller's thread, and, where its caller abandoned it (`abandon`), its
+    undoing, by whichever of the two holds the group then: the hand-over is one step under `lock`. `done`
+    is set once the start has handed its group over, raised, or undone what it started."""
 
     def __init__(self, command: Sequence[str], options: dict[str, object]) -> None:
         self.command, self.options = command, options
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.begun = self.abandoned = False
         self.process: subprocess.Popen | None = None
         self.error: BaseException | None = None
 
     def run(self) -> None:
+        with self.lock:
+            if self.abandoned:
+                return
+            self.begun = True
         try:
-            self.process = _started(self.command, **self.options)
+            process = _started(self.command, **self.options)
         except BaseException as error:  # the start's own error, raised on its caller's thread (`result`)
             self.error = error
+            self.done.set()
+            return
+        with self.lock:
+            abandoned = self.abandoned
+            if not abandoned:
+                self.process = process
+        if abandoned:
+            _undone(process)
+        self.done.set()
 
     def result(self) -> subprocess.Popen:
         if self.error is not None:
@@ -187,14 +211,13 @@ class _Starting:
         assert self.process is not None
         return self.process
 
-    def undo(self, worker: threading.Thread) -> None:
-        """The group this start started, once it has, undone (`_undone`): none where its thread never
-        started, or its start raised, having undone itself."""
-        if worker.ident is None:
-            return
-        worker.join()
-        if self.process is not None:
-            _undone(self.process)
+    def abandon(self) -> tuple[subprocess.Popen | None, bool]:
+        """Its caller's no more: the group it has handed over, for its caller to undo, and whether it has
+        begun, so that its caller waits for it to undo what it starts."""
+        with self.lock:
+            self.abandoned = True
+            process, self.process = self.process, None
+            return process, self.begun
 
 
 def _undone(process: subprocess.Popen) -> None:
