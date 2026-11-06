@@ -18,7 +18,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from kimi_support import RECORDING, assert_greedy_as_exact, drawn_batch, exported, kimi_source, recorded_dew
+from kimi_support import (
+    RECORDING,
+    assert_greedy_as_exact,
+    assert_update_as_exact,
+    drawn_batch,
+    exported,
+    kimi_source,
+    recorded_dew,
+)
 from reference_error import ieee_fixture
 from reference_runs import assert_as_exact_as_recorded
 
@@ -63,7 +71,7 @@ def test_forward_and_cached_decode_match_the_reference_over_left_padding():
                                 "Kimi K3's logits and cached decode")
 
 
-def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
+def test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference(source):
     """One all-parameter SGD step at the reference's learning rate (1e-2,
     which moves the logits by up to 4.2). The loss is within 1e-5 of the
     reference's (9.5e-7 apart). One run's distance of the updated logits
@@ -73,11 +81,16 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     of 32 whole (orders.npz, tests/residual_orders.py), by
     `assert_as_exact_over_orders`. Dew's RMS over them is 0.75 of the
     reference's on CPU, 0.71 on an AVX-512 CPU (Intel SDE's Ice Lake server)
-    and 0.69 on an RTX 4080.
+    and 0.69 on an RTX 4080."""
+    assert_update_as_exact(source, TINY)
 
-    The export writes every source name back: towers byte-exact, A_log
-    zero-padded to its stored length, trained experts as MXFP4 pairs,
-    everything else as trained; reloading reproduces that."""
+
+def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
+    """The model stepped once (`sgd_step`, whose numerics the test above holds,
+    apart so each fits its group, ledger 4330) and exported: the export writes
+    every source name back: towers byte-exact, A_log zero-padded to its stored
+    length, trained experts as MXFP4 pairs, everything else as trained;
+    reloading reproduces that."""
     trained, restored, written, shipped = exported(source, TINY, tmp_path)
     assert set(written) == set(shipped)
     for name in shipped:
@@ -109,13 +122,13 @@ def test_greedy_generation_and_decode_steps_match_the_reference(source):
 
 @pytest.mark.parametrize("param_dtype", ["bfloat16", "auto"])
 def test_a_narrow_storage_load_holds_the_float32_loads_weights_rounded_once(source, param_dtype):
-    """K3 nests its decoder under text_config and reads it whole, as a
-    registered family rather than a media wrapper, so its narrow load's
-    alias check reads it the same way: the MXFP4 experts decode in float32
-    and every leaf is the float32 load's, rounded once to the storage dtype
+    """K3 nests its decoder under text_config, which its language model alone reads whole as its
+    registered family (`text_only`), so its narrow load's alias check reads it the same way: the MXFP4
+    experts decode in float32 and every leaf is the float32 load's, rounded once to the storage dtype
     (bfloat16, the config's own for 'auto')."""
     loaded, _, _ = source
-    narrow = Pretrained.load(TINY, dtype="float32", param_dtype=param_dtype, attention_impl="reference")
+    narrow = Pretrained.load(TINY, dtype="float32", param_dtype=param_dtype, attention_impl="reference",
+                             text_only=True)
     assert jax.tree.structure(narrow.variables) == jax.tree.structure(loaded.variables)
     stored = set()
     for (path, ours), wide in zip(jax.tree_util.tree_leaves_with_path(narrow.variables),

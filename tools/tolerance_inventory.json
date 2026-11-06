@@ -30,7 +30,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_adversarial.py": {
-   "comparisons": 6,
+   "comparisons": 4,
    "lane": "Training"
   },
   "tests/test_agentic_losses.py": {
@@ -54,7 +54,7 @@
    "lane": "Kernels"
   },
   "tests/test_audio.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
   "tests/test_audio_condition.py": {
@@ -126,7 +126,7 @@
    "lane": "Training"
   },
   "tests/test_decision_laya.py": {
-   "comparisons": 4,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_decision_objective.py": {
@@ -146,7 +146,7 @@
    "lane": "Training"
   },
   "tests/test_decision_task.py": {
-   "comparisons": 7,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decode_attention.py": {
@@ -158,7 +158,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoder_export.py": {
-   "comparisons": 18,
+   "comparisons": 17,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoding_components.py": {
@@ -198,7 +198,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_distillation.py": {
-   "comparisons": 5,
+   "comparisons": 4,
    "lane": "Training"
   },
   "tests/test_distribution.py": {
@@ -230,7 +230,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_fid.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Training"
   },
   "tests/test_fla_gdn.py": {
@@ -250,7 +250,7 @@
    "lane": "Training"
   },
   "tests/test_flow_matching.py": {
-   "comparisons": 4,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_flux2_source.py": {
@@ -354,7 +354,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_jit.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_k2_horizon.py": {
@@ -398,11 +398,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_lora.py": {
-   "comparisons": 28,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_lora_peft.py": {
-   "comparisons": 4,
+   "comparisons": 25,
    "lane": "Models, Serving & RL"
   },
   "tests/test_lpips.py": {
@@ -414,7 +410,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_masked_diffusion.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_masked_diffusion_export.py": {
@@ -434,7 +430,7 @@
    "lane": "Training"
   },
   "tests/test_mimo_audio.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_mimo_v2.py": {
@@ -450,7 +446,7 @@
    "lane": "Kernels"
   },
   "tests/test_models.py": {
-   "comparisons": 12,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe.py": {
@@ -466,7 +462,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe_exchange.py": {
-   "comparisons": 7,
+   "comparisons": 6,
    "lane": "Training"
   },
   "tests/test_moe_precision.py": {
@@ -662,7 +658,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_tools.py": {
-   "comparisons": 25,
+   "comparisons": 24,
    "lane": "Models, Serving & RL"
   },
   "tests/test_torchax_fallback.py": {
@@ -706,7 +702,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_vision.py": {
-   "comparisons": 21,
+   "comparisons": 15,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_source.py": {

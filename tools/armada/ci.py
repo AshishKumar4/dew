@@ -319,8 +319,14 @@ FETCHED = ".fetched.json"
 def built(path: Path) -> bool:
     """Whether `path` is a build's output, never an input: compiled bytecode, or an editable install's
     metadata (setuptools' <name>.egg-info), which a task's environment writes into its checkout and a
-    planner's lacks."""
-    return "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts)
+    planner's lacks; or a directory holding nothing else, as a package a commit deleted leaves its bytecode
+    in a checkout the environment's snapshot carries across commits, which a planner's clean tree lacks (train
+    636: src/dew/cli/, its __pycache__ alone, listed in src/dew's entries, keyed every task's rows apart from
+    their plan's, and two tasks ran 120 kept rows each past their deadline)."""
+    if "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts):
+        return True
+    return path.is_dir() and not path.is_symlink() and all(
+        entry.name.startswith(".") or built(entry) for entry in path.iterdir())
 
 
 def contents(name: str) -> bytes:

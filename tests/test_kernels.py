@@ -36,7 +36,6 @@ from dew.nn.attention_blocks import NormalAttention
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template
 from dew.nn.precision import FP32_SUMS, WIDE_CPU_ARITHMETIC, at_least_fp32
-from dew.nn.visibility import window_sides
 
 pytestmark = pytest.mark.kernel
 
@@ -107,10 +106,8 @@ def flash_through_dews_attention_refuses_rows_it_would_misread(without_determini
                            normal(1, keys, 2, 64))
         assert not isinstance(refused.value, KernelRefused)
 
-    def draw(seed):
-        streams = np.random.default_rng([31, seed])
-        return tuple(jnp.asarray(streams.normal(size=shape), jnp.bfloat16)
-                     for shape in ((2, 32, 4, 64), (2, 32, 2, 64), (2, 32, 2, 64), (2, 32, 4, 64)))
+    draw = normal_drawn(31, (2, 32, 4, 64), (2, 32, 2, 64), (2, 32, 2, 64), (2, 32, 4, 64),
+                        dtype=jnp.bfloat16)
 
     for packed in ({}, own):
         attention_on_par(attend('flash', **packed), attend('xla', **packed), draw,
@@ -373,11 +370,9 @@ def queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents(
     pairs = list(zip(itertools.pairwise(starts.tolist()), itertools.pairwise(key_starts.tolist()),
                      strict=True))
 
-    def draw(seed):
-        streams = np.random.default_rng([0xC055, seed])
-        rows = (int(starts[-1]), int(key_starts[-1]), int(key_starts[-1]), int(starts[-1]))
-        return tuple(jnp.asarray(streams.normal(size=(count, heads, head_dim)), jnp.bfloat16)
-                     for count, heads in zip(rows, (8, 2, 2, 8), strict=True))
+    draw = normal_drawn(0xC055, *((count, heads, head_dim) for count, heads in zip(
+        (int(starts[-1]), int(key_starts[-1]), int(key_starts[-1]), int(starts[-1])), (8, 2, 2, 8),
+        strict=True)), dtype=jnp.bfloat16)
 
     def packed(q, k, v):
         return flash.flash_mha_varlen(q, k, v, starts, max(queries), key_cu_seqlens=key_starts,
@@ -448,10 +443,7 @@ def fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, he
     elif head_dim > cudnn_max_head_dim():
         pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
 
-    def draw(seed):
-        streams = np.random.default_rng([0xF05, seed])
-        return tuple(jnp.asarray(streams.normal(size=(1, 1024, heads, head_dim)), jnp.bfloat16)
-                     for heads in (8, 2, 2, 8))
+    draw = normal_drawn(0xF05, *((1, 1024, heads, head_dim) for heads in (8, 2, 2, 8)), dtype=jnp.bfloat16)
 
     def kernel(implementation):
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
@@ -495,9 +487,7 @@ def flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
             jax.jit(kernel('flash'))(q, k, v, s)
     attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
                      f"flash at width {width}, window {window}, sinks {sinks}",
-                     keep=kept(1024, 1024, causal=causal,
-                               window=None if window is None else window_sides(causal=causal,
-                                                                               sliding_window=window)))
+                     keep=kept(1024, 1024, causal=causal, sliding_window=window))
 
 
 MAPPED_FLASH_SEEDS = 32
@@ -591,10 +581,7 @@ def a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without
     while it takes the same window square."""
     flash_here()
 
-    def draw(seed):
-        streams = np.random.default_rng([61, seed])
-        return tuple(jnp.asarray(streams.normal(size=(1, length, 8, 64)), jnp.bfloat16)
-                     for length in (256, 512, 512, 256))
+    draw = normal_drawn(61, *((1, length, 8, 64) for length in (256, 512, 512, 256)), dtype=jnp.bfloat16)
 
     def kernel(implementation):
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
@@ -606,13 +593,6 @@ def a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without
     with pytest.raises(ValueError):
         jax.jit(kernel('flash'))(query, key, value)
     kernel('flash')(query, key[:, :256], value[:, :256]).block_until_ready()
-
-
-def read_by_documents(queries, keys) -> np.ndarray:
-    """The keys each query keeps, `[B, 1, q, k]`, where queries packed by their documents' ids
-    (`segment_ids`) read keys packed by theirs (`key_segment_ids`): its own document's, none for padding."""
-    queries, keys = np.asarray(queries), np.asarray(keys)
-    return ((queries[:, :, None] == keys[:, None, :]) & (queries[:, :, None] != 0))[:, None]
 
 
 def documents(lengths) -> np.ndarray:
@@ -656,9 +636,7 @@ def packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, 
             jax.jit(kernel('flash'))(q, k, v, s)
     attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
                      f"packed rows on flash, window {window}, sinks {sinks}",
-                     keep=kept(1024, 1024, causal=True, segment_ids=segments,
-                               window=None if window is None else window_sides(causal=True,
-                                                                               sliding_window=window)))
+                     keep=kept(1024, 1024, causal=True, sliding_window=window, segment_ids=segments))
 
 
 def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_document_mask(
@@ -687,7 +665,7 @@ def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_doc
             key_segment_ids=jnp.asarray(keys), max_segments=3)
 
     attention_on_par(kernel('flash'), kernel('xla'), draw, "queries reading another sequence's documents",
-                     keep=read_by_documents(queries, keys))
+                     keep=kept(96, 1024, segment_ids=queries, key_segment_ids=keys))
     query, key, value, _ = draw(0)
     found = np.asarray(jax.jit(kernel('flash'))(query, key, value))
     np.testing.assert_array_equal(found[~np.asarray(real[..., 0, 0])], 0)
@@ -760,7 +738,7 @@ def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_e
         return run
 
     attention_on_par(attend("tpu"), attend("xla"), draw, "the tpu kernels over another sequence's documents",
-                     keep=read_by_documents(queries, keys), seeds=TPU_DOCUMENT_SEEDS)
+                     keep=kept(128, 128, segment_ids=queries, key_segment_ids=keys), seeds=TPU_DOCUMENT_SEEDS)
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):

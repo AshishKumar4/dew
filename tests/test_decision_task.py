@@ -7,11 +7,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+import test_decision_laya as laya
 from decision_support import decision_rows
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact, dew_programs
+from reference_error import as_given, assert_as_exact, dew_programs, indexed_recording, recording
 from steady_state import steady_state
 
 from dew.artifacts import Decisions
@@ -169,22 +170,29 @@ def test_strict_answers_drop_the_extensions_and_hold_jevs_fields(decide):
 
 
 def test_a_small_budget_splits_passes_without_moving_a_logit(decide):
-    """Every question of every case at a budget of two rows a pass, held to
-    Laya's one-row logits under the float64 rule."""
+    """Every question of every case at a budget of two rows a pass, scored by the task's server over drawn
+    weights, as exact as Laya's float32 one-row run against its float64 run (check 1,
+    tests/test_decision_laya.py's recording)."""
     small = replace(decide, budget=Budget(tokens=256, rows=2))
-    rows, keys = [], []
-    for case, request in CASES.items():
-        laid = small._encoded(request["state"], {name: Question.from_wire(wire)
-                                                 for name, wire in request["questions"].items()})
-        rows.extend(laid)
-        keys.extend(f"sequential/{case}/{encoded.questions[0].name}" for encoded in laid)
-    found = [logits[0, :len(encoded.questions[0].options)]
-             for encoded, logits in zip(rows, small.logits(rows), strict=True)]
-    with np.load(TINY / "logits.npz") as reference:
-        assert_as_exact_as_the_reference(np.concatenate(found),
-                                         np.concatenate([reference[key] for key in keys]),
-                                         np.concatenate([reference[f"{key}/f64"] for key in keys]),
-                                         "budgeted logits")
+    laid = sorted(((f"sequential/{case}/{encoded.questions[0].name}", encoded)
+                   for case, request in CASES.items()
+                   for encoded in small._encoded(request["state"], {
+                       name: Question.from_wire(wire) for name, wire in request["questions"].items()})),
+                  key=lambda row: row[0])
+    rows = [encoded for _, encoded in laid]
+
+    def budgeted(index, inputs):
+        served = replace(small, variables=laya.variables_of(jnp.float32, inputs))
+        scored = zip(rows, served.logits(rows), strict=True)
+        return {"sequential": np.concatenate([logits[0, :len(encoded.questions[0].options)]
+                                              for encoded, logits in scored])}
+
+    def truth(inputs):
+        return {"sequential": laya.dew(jnp.float64, inputs)["sequential"]}
+    drawn, reference, truth = indexed_recording(recording(laya.FIXTURE), "laya", laya.LAYA_SEEDS,
+                                                inputs_of=laya.draw, leaves=("sequential",), truth_fn=truth)
+    assert_as_exact(as_given(budgeted), reference, drawn, "budgeted logits", seeds=laya.LAYA_SEEDS,
+                    truth_fn=truth)
 
 
 def drawn_about(variables):

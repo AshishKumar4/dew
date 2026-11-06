@@ -38,7 +38,6 @@ from dew.nn.memory import Gate, InContextMemory, MLPMemory
 from dew.nn.mixer_base import MLP_RESIDUALS, MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
-from dew.nn.mixers.parallel import ParallelMixer
 from dew.registry import mixers, models
 
 VOCAB = 37
@@ -465,36 +464,54 @@ ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "lightning_
 """The registry's kinds that mix tokens without attention, whose layers' attention policies are not theirs."""
 
 
-@pytest.mark.parametrize("kind", sorted(mixers.paths))
+POLICY_DTYPES = {"force_fp32_for_softmax": jnp.bfloat16, "wide_logits": jnp.bfloat16}
+"""The policies whose arithmetic shows in narrow inputs alone: a softmax, or logits, formed in bfloat16."""
+
+
+@pytest.mark.parametrize("kind", sorted(set(mixers.paths) - ATTENDS_NOTHING))
 @pytest.mark.parametrize("policy", sorted(POLICY_VALUES))
-def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kind, policy):
-    """A layer asking an attention policy builds a mixer that takes it, as an argument or in the
-    context it holds (`CausalSelfAttention.ctx`), or refuses it by name; no attention-family kind
-    builds without it. A parallel layer's every branch that attends takes it."""
-    if kind in ATTENDS_NOTHING:
-        pytest.skip(f"{kind} attends nothing")
-    context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=64, max_seq_len=32,
-                           **KIND_CONTEXT.get(kind, {}))
+def test_every_attention_mixer_computes_or_refuses_each_policy_it_is_asked(kind, policy):
+    """A layer asking an attention policy builds a mixer that computes it, or refuses it by name
+    (`MixerRefused`); no attention-family kind computes without it (row 4425). A block of the mixer asked
+    gives another output than the block not asked over the same weights where both hold them, a bias or a
+    sink the policy adds set off zero, trained where the policy reads training (attention dropout) and in
+    bfloat16 where it changes a narrow input's arithmetic (`POLICY_DTYPES`), and its gradient is finite,
+    reaching every weight the policy adds. A parallel layer computes it in its branch that attends."""
+    dtype = POLICY_DTYPES.get(policy, jnp.float32)
+    # The test decoder's geometry (`TINY`), which each kind's fields are sized for (`KIND_FIELDS`).
+    context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32,
+                           dtype=dtype, **KIND_CONTEXT.get(kind, {}))
     asked = dataclasses.replace(context, **{policy: POLICY_VALUES[policy]})
     assert asked.policies()[policy] and not context.policies()[policy]
     value = mixers.build(kind, **KIND_FIELDS.get(kind, ({}, {}))[0])
-    value.build(context)
+    plain = value.build(context)
     try:
-        factory = value.build(asked)
-    except ValueError as refused:
-        assert policy in str(refused)
+        taken = value.build(asked)
+    except MixerRefused as refused:
+        assert policy in refused.names
         return
-    attending = (factory,)
-    if isinstance(value, ParallelMixer):
-        nothing = tuple(mixers[name] for name in ATTENDS_NOTHING)
-        branches = zip(value.branches, factory.keywords["branches"], strict=True)
-        attending = tuple(built for branch, (_, built, *_) in branches
-                          if not isinstance(branch.mixer, nothing))
-    assert attending
-    for built in attending:
-        held = built.keywords.get("ctx")
-        taken = built.keywords.get(policy) if held is None else getattr(held, policy)
-        assert taken == POLICY_VALUES[policy]
+    plain_block, asked_block = (DecoderBlock(mixer=factory, feedforward=None, emb_features=32,
+                                             wiring=BlockWiring(), dtype=dtype) for factory in (plain, taken))
+    x = jax.random.normal(jax.random.key(1), (2, 8, 32), dtype)
+    weights = plain_block.init(jax.random.key(0), x)
+    drawn = asked_block.init(jax.random.key(0), x)
+    shared = dict(jax.tree_util.tree_leaves_with_path(weights))
+    added = [path for path, _ in jax.tree_util.tree_leaves_with_path(drawn) if path not in shared]
+    variables = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: shared[path] if path in shared else leaf + jnp.asarray(0.5, leaf.dtype), drawn)
+    train = policy == "attention_dropout_rate"
+    rngs = {"dropout": jax.random.key(2)}
+
+    def output(block, variables):
+        return block.apply(variables, x, train=train, rngs=rngs)
+
+    assert not np.array_equal(np.asarray(output(asked_block, variables), np.float32),
+                              np.asarray(output(plain_block, weights), np.float32))
+    gradient = jax.grad(lambda held: jnp.sum(jnp.square(output(asked_block, held).astype(jnp.float32))))(
+        variables)
+    leaves = dict(jax.tree_util.tree_leaves_with_path(gradient))
+    assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in leaves.values())
+    assert all(np.any(np.asarray(leaves[path], np.float32)) for path in added)
 
 
 def test_wide_logits_reach_the_reference_attention_and_are_refused_elsewhere():
@@ -521,7 +538,8 @@ def test_wide_logits_reach_the_reference_attention_and_are_refused_elsewhere():
         through(wide=True), np.asarray(reference_attention(q, k, v, precision=precision, wide_logits=True)))
     assert not np.array_equal(through(wide=True), through(wide=False))
     for named in ("auto", "xla"):
-        assert resolve_implementation(named, q, k, wide_logits=True).ran == "reference"
+        np.testing.assert_array_equal(np.asarray(scaled_dot_product_attention(
+            q, k, v, implementation=named, wide_logits=True)), through(wide=True), err_msg=named)
     with pytest.raises(KernelRefused) as refused:
         resolve_implementation("cudnn", q, k, wide_logits=True)
     assert "arithmetic" in {refusal.code for refusal in refused.value.refusals}

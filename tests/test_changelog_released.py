@@ -1,37 +1,63 @@
-"""A released version's notes are the ones it shipped: once `## X.Y.Z` is cut, its section's text is frozen,
-its sha256 recorded by the release in tools/changelog_releases.json. The changelog's merge joins both sides'
-new lines (.gitattributes, tools/changelog_merge.py), and the land queue merges each head onto main as the
-first parent, so a head queued before a release that adds its entry at the head of `## Unreleased` lands
-below the new version's header instead (row 3050: two entries filed under 0.2.0 at train 397); it fails
-here, and belongs under `## Unreleased`."""
+"""tools/changelog_released.py, the release tooling's check that a released version keeps the notes it
+shipped and `## Unreleased` comes first, on fixture changelogs."""
 
-import hashlib
 import json
-from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+from tool_support import load
+
+released = load("changelog_released")
+
+CHANGELOG = """# Changelog
+
+## Unreleased
+
+- a new entry
+
+## 0.2.0
+
+- shipped in 0.2.0
+
+## 0.1.0
+
+- shipped in 0.1.0
+"""
 
 
-def sections(text: str) -> dict[str, str]:
-    """Each `## <name>` section of a changelog's `text`, by name: its lines between its header and the
-    next."""
-    found: dict[str, list[str]] = {}
-    name = None
-    for line in text.splitlines():
-        if line.startswith("## "):
-            name = line[3:].strip()
-            found[name] = []
-        elif name is not None:
-            found[name].append(line)
-    return {name: "\n".join(lines).strip("\n") for name, lines in found.items()}
+def releases(text: str) -> dict[str, str]:
+    """Every version of `text` recorded as `text` holds its notes."""
+    recorded: dict[str, str] = {}
+    for version in released.sections(text):
+        if version != "Unreleased":
+            recorded = released.recorded(text, recorded, version)
+    return recorded
 
 
-def test_each_released_version_keeps_the_notes_it_shipped_and_unreleased_comes_first():
-    written = sections((REPO / "CHANGELOG.md").read_text())
-    released = json.loads((REPO / "tools/changelog_releases.json").read_text())
-    assert next(iter(written)) == "Unreleased"
-    assert {version for version in written if version != "Unreleased"} == set(released)
-    changed = [version for version, digest in released.items()
-               if hashlib.sha256(written[version].encode()).hexdigest() != digest]
-    assert not changed, (f"released notes changed under {', '.join(changed)}: "
-                         "move a new entry under ## Unreleased")
+def test_a_changelog_whose_released_notes_are_as_shipped_holds():
+    assert released.findings(CHANGELOG, releases(CHANGELOG)) == []
+
+
+def test_an_entry_merged_under_a_released_header_changes_its_notes():
+    """Row 3050: a head queued before a release lands its entry under the new version's header."""
+    merged = CHANGELOG.replace("- shipped in 0.2.0", "- a late entry\n- shipped in 0.2.0")
+    assert released.findings(merged, releases(CHANGELOG)) == [
+        released.Finding(released.Fault.CHANGED, "0.2.0")]
+
+
+def test_unreleased_comes_first_and_every_section_is_recorded_both_ways():
+    reordered = CHANGELOG.replace("## Unreleased\n\n- a new entry\n\n", "") + "\n## Unreleased\n\n- late\n"
+    assert released.Finding(released.Fault.UNRELEASED_NOT_FIRST, "0.2.0") in released.findings(
+        reordered, releases(CHANGELOG))
+    unrecorded = {version: notes for version, notes in releases(CHANGELOG).items() if version != "0.1.0"}
+    assert released.findings(CHANGELOG, unrecorded) == [released.Finding(released.Fault.UNRECORDED, "0.1.0")]
+    ghost = {**releases(CHANGELOG), "0.0.9": "0" * 64}
+    assert released.findings(CHANGELOG, ghost) == [released.Finding(released.Fault.MISSING, "0.0.9")]
+
+
+def test_a_release_records_its_notes_and_the_gate_reads_the_checkout(tmp_path):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "CHANGELOG.md").write_text(CHANGELOG)
+    (tmp_path / "tools" / "changelog_releases.json").write_text(json.dumps(
+        {"0.1.0": releases(CHANGELOG)["0.1.0"]}))
+    assert released.main(["check"], tmp_path) == 1
+    assert released.main(["record", "0.2.0"], tmp_path) == 0
+    assert released.main(["check"], tmp_path) == 0
