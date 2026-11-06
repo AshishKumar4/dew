@@ -25,8 +25,11 @@ SIZES = (0, 70, 1, 129, 100, 0)
 ROWS, DEPTH, WIDTH = 307, 128, 256
 SEEDS = 8
 """Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
-TILES = (mosaic_blackwell.Tiles(128, 128, 64, 2, 1), mosaic_blackwell.Tiles(128, 256, 64, 4, 2))
-"""A tile of each accumulator width, its two accumulators within the 512 columns of tensor memory."""
+TILES = (mosaic_blackwell.Tiles(128, 128, 64, 2, 1), mosaic_blackwell.Tiles(128, 256, 64, 3, 2))
+"""A tile of each accumulator width, its two accumulators within the 512 columns of tensor memory, its ring
+within a B200's shared memory beside two outputs' staging (four stages asked 245,900 of its 232,448 bytes,
+gate-2738-gemm-b200, row 4449). This kernel has no resource model of its own: the shared mainloop's
+derivation sizes tcgen05's tiles when it replaces it (the fold, piece 7)."""
 PAIRED = mosaic_blackwell.Tiles(128, 128, 64, 4, 1, cluster=2)
 """A pair of CTAs' tile (256 x 256, each CTA's accumulators 256 columns). Mosaic GPU's interpreter models no
 collective tcgen05 product (its TcGen05Mma takes no collective axis), so it is compiled here and run on a
