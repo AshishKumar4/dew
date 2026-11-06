@@ -33,6 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 
+from tools import flax_precision
 from tools.diffusers_reference_helpers import restore_transformers_names
 from tools.torch_precision import float64
 
@@ -140,7 +141,8 @@ def precision(wide: bool):
 def unet_predictor(export: Path, *, wide: bool = False):
     """The declared UNet (Flax or PyTorch), loaded once, as a function of a channels-last `sample` (noise
     and any inpaint channels), the timestep, the prompt states and, for SDXL, the pooled embedding and
-    the time ids, in float32 or (`wide`) float64, its prediction channels last."""
+    the time ids, in float32 or (`wide`) float64, its prediction channels last: a Flax UNet's float64 run
+    reads the float32 its modules name as float64 (`flax_precision.float64`)."""
     dtype = np.float64 if wide else np.float32
     if flax_declared(export, "unet"):
         with jax.enable_x64(new_val=wide):
@@ -156,7 +158,7 @@ def unet_predictor(export: Path, *, wide: bool = False):
                                              "time_ids": np.asarray(time_ids, dtype)}
         times = np.full((len(sample),), timestep, dtype)
         if flax_declared(export, "unet"):
-            with jax.enable_x64(new_val=wide):
+            with jax.enable_x64(new_val=wide), flax_precision.float64() if wide else contextlib.nullcontext():
                 output = model.apply({"params": params}, jnp.asarray(sample), jnp.asarray(times),
                                      jnp.asarray(context), added_cond_kwargs=added).sample
                 return np.moveaxis(np.asarray(output), 1, -1)

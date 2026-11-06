@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from interop_support import PROMPT_WORDS
+from interop_support import drawn_prompts
 from model_support import streamed_export
 from reference_error import as_given, assert_as_exact
 
@@ -79,17 +79,6 @@ ENCODED = {"z_image": "HiddenStatesConditioner", "wan": "WanConditioner"}
 PROMPTS = ["a red bird", "two cats on a mat"]
 CONDITIONER_SEEDS = 8
 """The conditioner-alone site's declared seeds, sized by `seeds_for` paired (armada, 11-06)."""
-
-
-def drawn_words(salt: int, seed, count: int) -> np.ndarray:
-    """`count` prompts of one to eight `PROMPT_WORDS` drawn from `seed` under `salt`, as each word's index,
-    -1 past a prompt's end: a draw the gate widens is arrays."""
-    rng = np.random.default_rng([salt, int(seed)])
-    indices = np.full((count, 8), -1, np.int32)
-    for row in indices:
-        row[:rng.integers(1, 9)] = -2
-        row[row == -2] = rng.integers(0, len(PROMPT_WORDS), (row == -2).sum())
-    return indices
 
 
 def encoded(directory: Path, conditioner: str, rows: list, placement: dict, *, widened: bool = False) -> dict:
@@ -210,14 +199,12 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
     masks = zip(alone(PROMPTS, "masks").values(), task_own(PROMPTS, "masks").values(), strict=True)
     for got, want in masks:
         np.testing.assert_array_equal(got, want)
-    def worded(indices):
-        """The prompts a draw's word indices spell (`drawn_words`)."""
-        return [" ".join(PROMPT_WORDS[index] for index in row if index >= 0) for row in np.asarray(indices)]
+    def drawn(seed):
+        return list(drawn_prompts(2190, seed, rows))
 
-    assert_as_exact(as_given(lambda indices: alone(worded(indices))),
-                    as_given(lambda indices: task_own(worded(indices))),
-                    lambda seed: (drawn_words(2190, seed, rows),), f"{family} conditioner alone",
-                    seeds=CONDITIONER_SEEDS, truth_fn=as_given(lambda indices: truth(worded(indices))))
+    assert_as_exact(as_given(lambda seed: alone(drawn(seed))), as_given(lambda seed: task_own(drawn(seed))),
+                    lambda seed: (np.int32(seed),), f"{family} conditioner alone",
+                    seeds=CONDITIONER_SEEDS, truth_fn=as_given(lambda seed: truth(drawn(seed))))
 
 
 WIDER_FLUX = """

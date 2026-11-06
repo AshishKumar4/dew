@@ -72,7 +72,7 @@ from dew.batch import (
 )
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
-from dew.nn.backbones.layer_names import group_layers, stored_layers
+from dew.nn.backbones.layer_names import Deferred, deferred, group_layers, stored_layers
 from dew.nn.dense import _contractions, _linear_site, _plain_dense
 from dew.nn.dropout import Dropout
 from dew.nn.flops import (
@@ -529,7 +529,7 @@ class Adapter:
         merged: dict = {}
         for path, target in self.targets.items():
             node = _node(variables, path)
-            kernel = _updated(node["kernel"], node["lora_A"], node["lora_B"], self.scale(target))
+            kernel = _merged(node["kernel"], node["lora_A"], node["lora_B"], self.scale(target))
             _insert(merged, (*path, "kernel"), kernel)
         dropped = {(*path, factor) for path in self.targets for factor in FACTORS}
         return select(overlay(variables, merged), lambda path: path not in dropped)
@@ -713,6 +713,19 @@ def _refuse_unadaptable(model: nn.Module) -> None:
 
 def _scale(target: Target, rslora: bool) -> float:
     return target.alpha / (math.sqrt(target.rank) if rslora else target.rank)
+
+
+def _merged(kernel, a, b, scale: float) -> jax.Array | Deferred:
+    """`_updated`, or over leaves an export reads as it writes them (a bank's rows, `stored_layers`) the
+    merge it builds as it writes it (`Deferred`)."""
+    if not any(deferred(leaf) for leaf in (kernel, a, b)):
+        return _updated(kernel, a, b, scale)
+
+    def built() -> jax.Array:
+        read = [jnp.asarray(np.asarray(leaf)) for leaf in (kernel, a, b)]
+        return _updated(read[0], read[1], read[2], scale)
+
+    return Deferred(kernel.shape, kernel.dtype, built)
 
 
 def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax.Array:
