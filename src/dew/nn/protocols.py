@@ -37,7 +37,7 @@ callers add flags and absent values.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, Self, runtime_checkable
 
 import jax
@@ -118,6 +118,7 @@ __all__ = [
     "Recomputing",
     "RematChoosing",
     "RequiresText",
+    "Routed",
     "Selective",
     "Serving",
     "StagedStacks",
@@ -570,6 +571,16 @@ class HiddenStates(Protocol):
 
     def hidden_states(self, tokens: jax.Array, *, train: bool = False,
                       **fields: ModelKwarg) -> jax.Array: ...
+
+
+@runtime_checkable
+class Routed(Protocol):
+    """A model that may route tokens to experts: the routers among its own whose expert weights are fixed
+    whatever they score (`dew.nn.backbones.decoder_block.Mixture.fixed_weights`), each by name and whether
+    a parameter, by its path in the model's own tree, is its, which no term of a plain loss reaches
+    (`dew.objectives.routing.refuse_fixed_router`)."""
+
+    def fixed_routers(self) -> Mapping[str, Callable[[tuple[str, ...]], bool]]: ...
 
 
 @runtime_checkable
