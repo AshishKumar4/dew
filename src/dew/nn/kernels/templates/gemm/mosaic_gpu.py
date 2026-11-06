@@ -581,8 +581,9 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     tail = None
     if (dense and paired is None and tiles.cluster == 1 and family_of(tiles, lhs.dtype).fixes_up
             and not exact_sums):
-        tail = tail_of.balanced(-(-m // tiles.block_m) * (n // block_n), k // block_k, multiprocessors,
-                                handoff_steps=handoff_steps(tiles, generation.gpu_target()))
+        tail = balanced_tail(tiles, (-(-m // tiles.block_m), n // block_n), k // block_k,
+                             (lhs.dtype.itemsize, rhs.dtype.itemsize), generation.gpu_target(),
+                             multiprocessors)
     walked = (-(-m // row_tile) + (0 if dense else g)) * (n // block_n) * tiles.cluster * tiles.splits
     programs = launched(family_of(tiles, lhs.dtype), multiprocessors, walked, tail)
     outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
@@ -1262,8 +1263,9 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     tail = None
     # An exact sum's order is its contract, which a tile summed across programs reassociates.
     if dense and family_of(tiles, lhs.dtype).fixes_up and not exact_sums:
-        tail = tail_of.balanced(m // block_m * (n // block_n), -(-k // block_k), multiprocessors,
-                                handoff_steps=handoff_steps(tiles, generation.gpu_target()))
+        tail = balanced_tail(tiles, (m // block_m, n // block_n), -(-k // block_k),
+                             (lhs.dtype.itemsize, rhs.dtype.itemsize), generation.gpu_target(),
+                             multiprocessors)
     walked = g * (m // block_m) * (n // block_n)
     programs = launched(family_of(tiles, lhs.dtype), multiprocessors, walked, tail)
     return _tgmm_streamed(
@@ -1552,6 +1554,23 @@ def step_seconds(tiles: Tiles, target) -> float | None:
     (`handoff_steps`) price their walks in; None where the target states no rate."""
     rate = unit_cost.rates(target, device=False)[0]
     return None if rate is None else 2 * tiles.block_m * tiles.block_n * tiles.block_k / rate
+
+
+def balanced_tail(tiles: Tiles, grid: tuple[int, int], steps: int, itemsizes: tuple[int, int], target,
+                  programs: int) -> tail_of.Tail | None:
+    """A dense product's last wave balanced over `programs` (`tail.balanced`) at `tiles` over its output
+    tiles' `grid` and `steps` a tile, priced from the target's facts: its MMA step (`step_seconds`), its
+    memory's rate and L2 (`GpuTarget.memory_rate`, `l2_bytes`), its operands' blocks a step (`itemsizes`,
+    the left's and the right's) and its hand-off (`handoff_steps`); walked where the target states no
+    rate."""
+    step, rate = step_seconds(tiles, target), target.memory_rate
+    if step is None or rate is None:
+        return None
+    left, right = itemsizes
+    traffic = tail_of.Traffic(grid, tiles.grid_block_n, tiles.block_m * tiles.block_k * left,
+                              tiles.block_n * tiles.block_k * right, step, rate, target.l2_bytes)
+    return tail_of.balanced(grid[0] * grid[1], steps, programs, traffic,
+                            handoff_steps=handoff_steps(tiles, target))
 
 
 def handoff_steps(tiles: Tiles, target) -> float:
