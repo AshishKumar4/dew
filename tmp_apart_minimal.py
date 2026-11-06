@@ -1,4 +1,4 @@
-import sys, os, tempfile, contextlib
+import sys, os, tempfile, contextlib, traceback
 sys.path[:0] = ["src", "tests", "."]
 os.environ["DEW_RUNG_RECORDS"] = tempfile.mkdtemp()
 import lane_environment
@@ -20,9 +20,12 @@ for label, scope in [("bare", contextlib.nullcontext), ("summed", summed_as_run)
             print("K footprint", label, copies, rows, "used", free - p["headroom"],
                   "temp", p["temp"], "argument", p["argument"], flush=True)
 for label, scope in [("original", contextlib.nullcontext), ("same-arithmetic-calibration", summed_as_run)]:
+    os.environ["DEW_RUNG_RECORDS"] = tempfile.mkdtemp()
     try:
         with pytest.MonkeyPatch.context() as patch, scope():
             t.test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(patch)
         print("K TEST PASS", label, flush=True)
     except Exception as error:
         print("K TEST FAIL", label, type(error).__name__, str(error), flush=True)
+        for line in traceback.format_exc().splitlines():
+            print("K TRACE", line, flush=True)
