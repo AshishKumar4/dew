@@ -712,6 +712,32 @@ def test_each_dense_launch_lowers_once_however_many_layers_call_it():
     assert one > 0 and kernels(2) == one
 
 
+def test_a_dense_projections_launch_is_decided_once_and_reported_at_every_call():
+    """`gemm.dot_general`'s question, whether a launch takes a dense projection's products (`gemm._launched`),
+    is decided once a key and answered from it after (row 3213): two traces of one projection report the
+    same routes, the second without selecting (no launch bound); a block naming a kernel is its own key."""
+    from dew.nn.kernels import grouped_matmul
+
+    rows, matrix = jnp.zeros((640, 384), jnp.bfloat16), jnp.zeros((384, 640), jnp.bfloat16)
+    bound = []
+    case = grouped_matmul.grouped_case
+
+    def counted(*args, **kwargs):
+        bound.append(args)
+        return case(*args, **kwargs)
+
+    with generation.assumed("sm90"):
+        reported = []
+        for _ in range(2):
+            with generation.routes() as found, pytest.MonkeyPatch.context() as patch:
+                patch.setattr(grouped_matmul, "grouped_case", counted)
+                gemm._launched(rows, matrix, jnp.bfloat16, None)
+            reported.append([(route.choice, route.kernel, route.refusal) for route in found])
+        assert reported[0] == reported[1] and len(bound) == 3, (reported, len(bound))
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            assert gemm._launched(rows, matrix, jnp.bfloat16, None)
+
+
 def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
     """A GEMM at 4089 rows and one at 4096, which its Mosaic mainloop pads alike, lowered for an H100 in one
     program: each launch's kernel carries its own launch's digest (`report.named`), as a spill refuses the
