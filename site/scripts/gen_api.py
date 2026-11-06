@@ -715,6 +715,27 @@ class Problem(NamedTuple):
         return self.why.value.format(symbol=self.symbol, owner=self.owner, member=self.member)
 
 
+def imported_problem(package: griffe.Module, pages: dict[str, Page], home: dict[str, str], module_path: str,
+                     name: str) -> Problem | None:
+    """Why `from module_path import name`, as a file shows it, leaves the API `package` documents in
+    `pages` and `home`: the module has no such member, or it does not resolve; a module imported has no
+    page, or a name imported none that documents it."""
+    statement = f"from {module_path} import {name}"
+    try:
+        module = module_of(package, module_path) if module_path == P.package else module_at(package, module_path)
+        member = module.members.get(name)
+        if member is None:
+            return Problem(Why.NO_MEMBER, statement, module_path, name)
+        target = resolve(member)
+    except (KeyError, Unresolved) as error:
+        return Problem(Why.UNREADABLE, statement, str(error))
+    if target.is_module:
+        if (name in target.members and f"{target.path}.{name}" in home) or target.path in pages:
+            return None
+        return Problem(Why.PAGELESS_MODULE, f"{module_path}.{name}", target.path)
+    return None if target.path in home else Problem(Why.NOT_DOCUMENTED, f"{module_path}.{name}", target.path)
+
+
 def called_attribute(cls: griffe.Object, path: list[str]) -> Problem | None:
     """Why calling `path`, an instance's member, leaves the documented API:
     the member is a value an instance holds, not a method, which is what a
@@ -914,27 +935,9 @@ def main() -> None:
         except Unresolved as error:
             problems.append(f"{file}: {error}")
     for file, module_path, name in usage_imports():
-        if file not in shown:
-            continue
-        shown_package, shown_pages, shown_home = shown[file]
-        try:
-            module = (module_of(shown_package, module_path) if module_path == P.package
-                      else module_at(shown_package, module_path))
-            member = module.members.get(name)
-            if member is None:
-                problems.append(f"{file}: `from {module_path} import {name}`: {module_path} has no {name}")
-                continue
-            target = resolve(member)
-        except (KeyError, Unresolved) as error:
-            problems.append(f"{file}: `from {module_path} import {name}`: {error}")
-            continue
-        if target.is_module:
-            if name in target.members and target.path + "." + name in shown_home:
-                continue
-            if target.path not in shown_pages:
-                problems.append(f"{file}: imports the module {target.path}, which has no API page")
-        elif target.path not in shown_home:
-            problems.append(f"{file}: imports {module_path}.{name} ({target.path}), which no API page documents")
+        problem = None if file not in shown else imported_problem(*shown[file], module_path, name)
+        if problem is not None:
+            problems.append(f"{file}: {problem}")
     for file, path in usage_files():
         if file in shown:
             problems.extend(f"{file}: {problem}" for problem in unresolved_in(file, path, *shown[file]))

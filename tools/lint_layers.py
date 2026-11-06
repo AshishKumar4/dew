@@ -14,6 +14,9 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lint_scopes as scopes
+
 FEATURES = ("dew.nn", "dew.data", "dew.inputs", "dew.objectives", "dew.training", "dew.inference",
             "dew.interop", "dew.rl", "dew.decision", "dew._cli", "dew.config", "dew.checkpoints",
             "dew.diffusion", "dew.sampling", "dew.eval", "dew.lora", "dew.quantization", "dew.telemetry",
@@ -69,37 +72,19 @@ def _within(name: str, prefix: str) -> bool:
     return name == prefix or name.startswith(prefix + ".")
 
 
-def imported(module: str, source: str) -> set[str]:
-    """The modules and names the source of `module` imports, absolute and relative: an import's module and
-    each name it takes from one, a relative import resolved from the module's package (an __init__'s
-    module ends in __init__)."""
-    parts = module.split(".")[:-1]
-    names = set()
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            base = node.module or ""
-            if node.level:
-                base = ".".join([*parts[: len(parts) - node.level + 1], *([base] if base else [])])
-            names.add(base)
-            names.update(f"{base}.{alias.name}" for alias in node.names)
-    return names
-
-
 def crossings(root: Path, layers: Mapping[str, Contract] | None = None) -> Iterator[Crossing]:
     """Every crossing of `layers` (`LAYERS`) in the `dew` package under `root`, by contract, module and
     package."""
     layers = LAYERS if layers is None else layers
     for path in sorted((root / "dew").rglob("*.py")):
-        named = ".".join(path.relative_to(root).with_suffix("").parts)
-        module = named.removesuffix(".__init__")
+        module = ".".join(path.relative_to(root).with_suffix("").parts).removesuffix(".__init__")
         held = [(name, contract) for name, contract in layers.items()
                 if any(_within(module, prefix) for prefix in contract.modules)
                 and not any(_within(module, left) for left in contract.excepted)]
         if not held:
             continue
-        names = imported(named, path.read_text())
+        names = scopes.modules_imported(ast.parse(path.read_text()),
+                                        scopes.package_of(module, path.name == "__init__.py"))
         for name, contract in held:
             for package in sorted({package for package in contract.forbidden
                                    if any(_within(found, package) for found in names)}):

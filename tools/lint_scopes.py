@@ -41,14 +41,27 @@ def annotations(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[tu
         yield "return", function.returns
 
 
+def package_of(module: str, initializer: bool) -> list[str]:
+    """The package a module's relative imports start from, as its parts: the dotted `module` itself where
+    it is a package's `__init__` (`initializer`), named without it, else the package holding it."""
+    parts = module.split(".")
+    return parts if initializer else parts[:-1]
+
+
+def imported_from(node: ast.ImportFrom, parent: Sequence[str]) -> str:
+    """The module a `from` import reads, as a dotted path, a relative one resolved from `parent`, the
+    package its relative imports start from (`package_of`)."""
+    if not node.level:
+        return node.module or ""
+    return ".".join([*parent[:len(parent) - node.level + 1], *([node.module] if node.module else [])])
+
+
 def bound_by(node: ast.Import | ast.ImportFrom, parent: Sequence[str]) -> dict[str, str]:
     """What each name one import statement binds stands for, as a dotted path."""
     if isinstance(node, ast.Import):
         heads = {alias: alias.name.split(".")[0] for alias in node.names}
         return {alias.asname or head: alias.name if alias.asname else head for alias, head in heads.items()}
-    base = node.module or ""
-    if node.level:
-        base = ".".join([*parent[:len(parent) - node.level + 1], *([base] if base else [])])
+    base = imported_from(node, parent)
     return {alias.asname or alias.name: f"{base}.{alias.name}" for alias in node.names if alias.name != "*"}
 
 
@@ -86,12 +99,27 @@ def binders(nodes: Sequence[ast.AST], parameters: Sequence[ast.arg] = ()) -> dic
 def imports(tree: ast.Module, parent: Sequence[str]) -> dict[str, str]:
     """What each name a module imports stands for, as a dotted path: every
     import in it, those inside functions and type-checking blocks included.
-    `parent` is the package its relative imports start from (`_parent`)."""
+    `parent` is the package its relative imports start from (`package_of`)."""
     bound: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import | ast.ImportFrom):
             bound |= bound_by(node, parent)
     return bound
+
+
+def modules_imported(tree: ast.Module, parent: Sequence[str]) -> set[str]:
+    """The modules and names a module imports, as dotted paths: each import's module, and each module a
+    `from` import reads (`imported_from`) with every name it takes from it; every import in it, those
+    inside functions and type-checking blocks included."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = imported_from(node, parent)
+            names.add(base)
+            names.update(f"{base}.{alias.name}" for alias in node.names if alias.name != "*")
+    return names
 
 
 def outside(scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef) -> list[ast.AST]:

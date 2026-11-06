@@ -793,9 +793,8 @@ def _module_name(module: Module) -> str:
 
 
 def _parent(module: Module) -> list[str]:
-    """The package a module's relative imports start from, as its parts."""
-    name = _module_name(module)
-    return name.split(".") if module.path.name == "__init__.py" else name.split(".")[:-1]
+    """The package a module's relative imports start from, as its parts (`scopes.package_of`)."""
+    return scopes.package_of(_module_name(module), module.path.name == "__init__.py")
 
 
 def _aliased(node: ast.stmt) -> tuple[str, ast.expr] | None:
