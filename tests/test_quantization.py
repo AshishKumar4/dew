@@ -1249,6 +1249,31 @@ def test_stochastic_rounding_draws_from_its_own_stream():
                                         jax.tree.leaves(other), strict=True)) > 0.0
 
 
+def test_a_convolutions_quantized_gradients_run_on_every_backend():
+    """A convolution trained under quantized gradients (`bwd_qtype`) runs Qwix's own quantized backward
+    on every backend, a GPU's among them, whose integer convolutions Qwix runs exactly in float32 chunks
+    (0.1.8.post4; row 783): Dew refused it on a GPU before. Its gradients are finite and move with the
+    input."""
+    pytest.importorskip("qwix")
+    from dew.nn.conv import Conv
+
+    conv = Conv(features=8, kernel_size=(3, 3), padding="SAME", use_bias=False)
+    x = jax.random.normal(jax.random.key(4), (2, 12, 12, 4))
+    variables = nn.unbox(conv.init(jax.random.key(5), x))
+    quantized = Quantization(bwd_qtype="int8").apply(conv)
+
+    @jax.jit
+    def gradients(params, x):
+        return jax.grad(lambda params, x: jnp.sum(quantized.apply({"params": params}, x) ** 2),
+                        argnums=(0, 1))(params, x)
+
+    kernel, inputs = gradients(variables["params"], x)
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves((kernel, inputs)))
+    moved, _ = gradients(variables["params"], 2.0 * x)
+    assert not all(np.array_equal(first, second) for first, second in zip(
+        jax.tree.leaves(kernel), jax.tree.leaves(moved), strict=True))
+
+
 def test_an_objective_rounds_its_gradients_from_the_step_key():
     """An LM objective's training loss under int8 gradients with stochastic
     rounding: the step's key alone feeds Qwix's rounding stream, which the
