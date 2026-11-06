@@ -121,7 +121,7 @@ def drops() -> bool:
     return not _on_gpu()
 
 
-@contracted("test_a_fused_attention_kernel_holds_its_reverse_orders", "kernel")
+@contracted("test_a_fused_attention_kernel_holds_its_reverse_orders")
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
 def _attend(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             hooks: Hooks) -> jax.Array:

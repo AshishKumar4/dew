@@ -135,7 +135,7 @@ def _custom(eqn, *operands, **params):
         raise Untransposable(f"a {eqn.primitive.name} whose program or derivative reads an axis or a "
                              "constant tile")
 
-    @contracted("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order", "kernel")
+    @contracted("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order")
     @jax.custom_vjp
     def held(*values):
         return _run(primal.jaxpr, primal.consts, values)
@@ -169,7 +169,7 @@ def _held_jvp(primal, call, traced: list, floating: list[int]) -> Callable:
                                   for program in (primal, tangents)):
         raise Untransposable("a custom_jvp_call whose program or derivative reads an axis or a constant tile")
 
-    @contracted("test_a_transposed_hooks_custom_derivative_holds_every_order", "kernel")
+    @contracted("test_a_transposed_hooks_custom_derivative_holds_every_order")
     @jax.custom_jvp
     def held(*values):
         return _run(primal.jaxpr, primal.consts, values)

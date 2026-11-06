@@ -140,7 +140,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                   *gradients[1:]]
         return tuple(leaves[index] for index in live)
 
-    differentiable = contracted("test_a_grouped_gemm_holds_every_order", "kernel")(
+    differentiable = contracted("test_a_grouped_gemm_holds_every_order")(
         generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
                                    live_cotangents=True))
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired)
@@ -434,7 +434,7 @@ def _prologued(prologue, prologue_jvp):
 
     # The fused kernel's derivative glue (`derivatives.KernelGlue`): the producer's own derivative, true and
     # rewritten as any other math, written once for the prologue the kernel applies to its tiles.
-    prologued = contracted("test_a_gemm_prologue_holds_every_order", "kernel")(
+    prologued = contracted("test_a_gemm_prologue_holds_every_order")(
         declared_tangent(KernelGlue(), lambda lhs, *sides: prologue(lhs, *sides), tangent))
     return prologued
 

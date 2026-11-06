@@ -551,6 +551,6 @@ def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float
         return xla_conv1d(x, taps, activation, bias, valid=valid, segments=documents, parts=parts,
                           dtype=dtype)
 
-    return contracted("test_the_short_conv_holds_every_order", "kernel")(
+    return contracted("test_the_short_conv_holds_every_order")(
         generation.linear_tangent(forward, backward, portable))(x, taps, bias, valid, documents)
 

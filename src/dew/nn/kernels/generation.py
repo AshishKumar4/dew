@@ -967,7 +967,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     from dew.nn.derivatives import contracted
 
-    @contracted("test_an_embedding_lookup_holds_every_order", "kernel")
+    @contracted("test_an_embedding_lookup_holds_every_order")
     @jax.custom_jvp
     def produced(*operands):
         return forward(*operands)
@@ -978,7 +978,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
         return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
 
-    @contracted("test_an_embedding_lookup_holds_every_order", "kernel")
+    @contracted("test_an_embedding_lookup_holds_every_order")
     @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
     def pulled(saved, operands, cotangent, live):
         arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
@@ -996,7 +996,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
 
-    @contracted("test_an_embedding_lookup_holds_every_order", "kernel")
+    @contracted("test_an_embedding_lookup_holds_every_order")
     @jax.custom_jvp
     def bounded(*operands):
         return forward(*operands)[0] if primal is None else primal(*operands)

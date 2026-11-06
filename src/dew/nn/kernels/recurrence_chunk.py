@@ -459,7 +459,7 @@ def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype)
     def portable(query, key, value, g, beta, state, starts):
         return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
 
-    return contracted("test_the_chunked_delta_rule_holds_every_order", "numerics")(
+    return contracted("test_the_chunked_delta_rule_holds_every_order")(
         generation.linear_tangent(forward, backward, portable))
 
 
@@ -905,7 +905,7 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
         del operands
         return pullback(cotangent)
 
-    return contracted("test_the_chunked_op_holds_every_order", "kernel")(
+    return contracted("test_the_chunked_op_holds_every_order")(
         generation.linear_tangent(functools.partial(jax.vjp, training), pulled, portable, primal=primal,
                                   nested=False))(*operands)
 

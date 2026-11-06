@@ -59,7 +59,7 @@ def _rows(dtype: jnp.dtype) -> Callable:
     def forward(table, ids):
         return _table_rows(table, ids, dtype), (table, ids)
 
-    return contracted("test_an_embedding_lookup_holds_every_order", "numerics")(
+    return contracted("test_an_embedding_lookup_holds_every_order")(
         linear_tangent(forward, _table_rows_backward, lambda table, ids: _table_rows(table, ids, dtype)))
 
 

@@ -848,7 +848,7 @@ def gpu_paged(softcap: float | None):
     turn down included, and forward mode takes the forward-mode path's tangent (`_gathered_tangent`),
     with no context of the caller's. An inactive row reads one slot, so its unused output stays
     finite."""
-    return contracted("test_the_paged_decode_kernel_holds_every_order", "kernel")(
+    return contracted("test_the_paged_decode_kernel_holds_every_order")(
         generation.linear_tangent(functools.partial(_paged_forward, softcap=softcap),
                                   functools.partial(_paged_backward, softcap=softcap),
                                   functools.partial(_gathered_tangent, softcap=softcap)))
@@ -877,7 +877,7 @@ def template_paged(softcap: float | None):
     """The attention template's decode over the pages (`_template_forward`) under the layer's `softcap`,
     over `(query, key, value, table, lengths, starts, sinks)` as `gpu_paged` takes them, its derivatives at
     every order the gathered attention's (`generation.linear_tangent`), as `gpu_paged`'s."""
-    return contracted("test_the_paged_decode_kernel_holds_every_order", "kernel")(
+    return contracted("test_the_paged_decode_kernel_holds_every_order")(
         generation.linear_tangent(functools.partial(_template_forward, softcap=softcap),
                                   functools.partial(_paged_backward, softcap=softcap),
                                   functools.partial(_gathered_tangent, softcap=softcap)))

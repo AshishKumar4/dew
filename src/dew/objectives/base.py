@@ -688,7 +688,7 @@ def _ruled_tangent(primals, tangents, _value) -> jax.Array:
                              zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 
-_ruled = contracted("test_a_ruled_loss_holds_every_order", "surrogate")(
+_ruled = contracted("test_a_ruled_loss_holds_every_order")(
     surrogate(lambda value, rule, params: value, _ruled_tangent))
 """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`): a surrogate
 (`dew.nn.derivatives.surrogate`), the loss's own derivative replaced by a learning rule's."""

@@ -177,7 +177,7 @@ def _exact_gelu_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]
     return output, jax.lax.optimization_barrier(tangent.astype(x.dtype))
 
 
-exact_gelu = contracted("test_an_exact_gelu_holds_every_order", "numerics")(
+exact_gelu = contracted("test_an_exact_gelu_holds_every_order")(
     declared_tangent(Protected(), _exact_gelu, _exact_gelu_jvp))
 
 

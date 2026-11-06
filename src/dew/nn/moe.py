@@ -807,7 +807,7 @@ def _stored_primal_jvp(run, primals, tangents):
                    tuple(directions[index] for index in live))
 
 
-_stored_primal = contracted("test_a_stored_expert_primal_holds_every_order", "numerics")(
+_stored_primal = contracted("test_a_stored_expert_primal_holds_every_order")(
     declared_tangent(KernelGlue(), _stored, _stored_primal_jvp, nondiff_argnums=(0,),
                      symbolic_zeros=True))
 

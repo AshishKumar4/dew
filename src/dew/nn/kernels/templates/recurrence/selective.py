@@ -479,7 +479,7 @@ def _scan_backward(scan: Scan, residuals, grads):
             None)
 
 
-_scan = derivatives.contracted("test_the_selective_scan_holds_its_orders", "kernel")(
+_scan = derivatives.contracted("test_the_selective_scan_holds_its_orders")(
     derivatives.declared_derivative(derivatives.KernelGlue(), _scan_primal, _scan_forward, _scan_backward,
                                     nondiff_argnums=(8,)))
 

@@ -212,7 +212,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
             return moved, zero_from_primal(aux)
 
         # The loss, differentiated as the node-perturbation estimate: a surrogate, no derivative of the loss.
-        estimated = contracted("test_a_node_perturbation_estimate_holds_every_order", "surrogate")(
+        estimated = contracted("test_a_node_perturbation_estimate_holds_every_order")(
             surrogate(value, estimate))
         return estimated(variables["params"], (held, batch, step))
 

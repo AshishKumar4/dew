@@ -74,12 +74,11 @@ Scope is per rule, because the rules are not all about the same thing:
   operands an automatic mesh axis splits (rows 1897, 1923, 4077).
 - SLOP028 is about `src/<package>`: every custom derivative (`DERIVATIVE_MAKERS`:
   JAX's custom_jvp and custom_vjp, Dew's declaring functions and linear_tangent)
-  declares at its seam the contract that holds it, `contracted(test, kind)` of
-  `dew.nn.derivatives`, decorating it or wrapping its making call: `test` a test
-  function of tests/test_contracts_*.py (`assert_contract`: every order finite
-  against its float64 truth and an independent plain formula), and `kind`
-  "surrogate" exactly where a surrogate is declared, "kernel" or "numerics"
-  elsewhere (row 4411).
+  declares at its seam the contract that holds it, `contracted(test)` of
+  `dew.nn.derivatives`, decorating it or wrapping its making call: `test` the
+  name of exactly one test function of tests/test_contracts_*.py
+  (`assert_contract`: every order finite against its float64 truth and an
+  independent plain formula) (row 4411).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -112,6 +111,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import collections
 import functools
 import hashlib
 import io
@@ -2295,13 +2295,6 @@ DERIVATIVE_MAKERS = frozenset({"custom_jvp", "custom_vjp", "surrogate", "declare
 kind its first argument; `generation.linear_tangent`, whose call makes one), as a decorator, a call, or
 within functools.partial."""
 
-DERIVATIVE_KINDS = frozenset({"kernel", "numerics", "surrogate"})
-"""A contracted seam's kinds (`dew.nn.derivatives.contracted`)."""
-
-SURROGATE_RULE = "src/dew/nn/derivatives.py::surrogate.rule"
-"""The surrogate declaration's own custom rule: a surrogate's seam though JAX's custom_jvp makes it."""
-
-
 def _maker_of(node: ast.expr, given: tuple = ()) -> str | None:
     """The custom derivative `node`, a decorator or a call, makes (`DERIVATIVE_MAKERS`), or None: a
     declaring builder's with the kind its first argument constructs (`declared_derivative:Surrogate`), as
@@ -2368,34 +2361,29 @@ def derivative_seams(relative: str, tree: ast.Module) -> Iterator[tuple[str, str
 
 
 @functools.cache
-def contract_tests(checkout: Path) -> frozenset[str]:
-    """The test functions of `checkout`'s tests/test_contracts_*.py, each the holder of a contract."""
-    return frozenset(node.name for path in (checkout / "tests").glob("test_contracts_*.py")
-                     for node in ast.parse(path.read_text()).body
-                     if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"))
+def contract_tests(checkout: Path) -> collections.Counter[str]:
+    """The test functions of `checkout`'s tests/test_contracts_*.py, each the holder of a contract, with
+    how many files define each name (a seam's contract names one alone)."""
+    return collections.Counter(node.name for path in (checkout / "tests").glob("test_contracts_*.py")
+                               for node in ast.parse(path.read_text()).body
+                               if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"))
 
 
 def derivative_contracts(module: Module) -> Iterator[Finding]:
-    """SLOP028: every custom derivative of `module` declares the contract that holds it, a test of its own
-    checkout's."""
+    """SLOP028: every custom derivative of `module` declares the contract that holds it, one test function
+    of its own checkout's tests/test_contracts_*.py."""
     checkout = module.path.parents[len(Path(module.relative).parts) - 1]
     for seam, maker, node, contract in derivative_seams(module.relative, module.tree):
         where = (module.relative, node.lineno, node.col_offset + 1, "SLOP028")
+        name = seam.split("::")[1]
         if contract is None:
-            yield Finding(*where, f"{seam.split('::')[1]} ({maker}) makes a custom derivative with no "
-                                  "contract: declare `contracted(test, kind)` of dew.nn.derivatives at it")
+            yield Finding(*where, f"{name} ({maker}) makes a custom derivative with no contract: declare "
+                                  "`contracted(test)` of dew.nn.derivatives at it")
             continue
-        arguments = [argument.value if isinstance(argument, ast.Constant) else None
-                     for argument in contract.args]
-        test, kind = [*arguments, None, None][:2]
-        surrogate = maker == "surrogate" or maker.endswith(":Surrogate") or seam == SURROGATE_RULE
-        if len(arguments) != 2 or test not in contract_tests(checkout):
-            yield Finding(*where, f"{seam.split('::')[1]}'s contract names {test!r}, no test function of "
+        named = [argument.value for argument in contract.args if isinstance(argument, ast.Constant)]
+        if len(named) != 1 or len(contract.args) != 1 or contract_tests(checkout)[named[0]] != 1:
+            yield Finding(*where, f"{name}'s contract names {named}, not one test function of "
                                   "tests/test_contracts_*.py")
-        elif kind not in DERIVATIVE_KINDS or (kind == "surrogate") != surrogate:
-            yield Finding(*where, f"{seam.split('::')[1]}'s contract kind {kind!r} is not its declaration's: "
-                                  f"\"surrogate\" exactly where a surrogate is declared, else \"kernel\" or "
-                                  "\"numerics\"")
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,

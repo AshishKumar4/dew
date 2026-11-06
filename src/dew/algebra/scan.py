@@ -570,7 +570,7 @@ def _lowered_rule() -> Callable:
         back = _applied(lower.T, d_lower)
         return (_below(-_applied(lower, back.T).T),)
 
-    return contracted("test_the_derived_delta_rule_chunks_hold_their_orders", "numerics")(
+    return contracted("test_the_derived_delta_rule_chunks_hold_their_orders")(
         generation.linear_tangent(forward, backward, _doubled))
 
 
@@ -675,7 +675,7 @@ def _decays_rule(base2: bool) -> Callable:
         del operands
         return _decays_backward(base2, decays, cotangents)
 
-    return contracted("test_the_derived_delta_rule_chunks_hold_their_orders", "numerics")(
+    return contracted("test_the_derived_delta_rule_chunks_hold_their_orders")(
         generation.linear_tangent(forward, backward, functools.partial(_decays_value, base2=base2)))
 
 

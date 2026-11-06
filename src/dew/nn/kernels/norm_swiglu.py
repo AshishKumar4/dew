@@ -828,7 +828,7 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
         # The sum's two addends share its cotangent: one buffer, read by both.
         return dstream, dstream, dscale
 
-    local = contracted("test_the_fused_norms_and_products_hold_every_order", "kernel")(
+    local = contracted("test_the_fused_norms_and_products_hold_every_order")(
         generation.linear_tangent(forward, backward, _stored(portable, norm, 2)))
     return _per_shard(local, axes, (x, branch, _widened(scale)), (False, False, True))
 
@@ -849,7 +849,7 @@ def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, po
         dx, _, dscale = _rms_backward_call(x, scale, None, mean_square, dy, None, norm)
         return dx, dscale
 
-    local = contracted("test_the_fused_norms_and_products_hold_every_order", "kernel")(
+    local = contracted("test_the_fused_norms_and_products_hold_every_order")(
         generation.linear_tangent(forward, backward, _stored(portable, norm, 1)))
     return _per_shard(local, axes, (x, _widened(scale)), (False, True))
 
@@ -869,7 +869,7 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, porta
         x, gate, scale = operands
         return _rms_backward_call(x, scale, gate, mean_square, dy, None, norm)
 
-    local = contracted("test_the_fused_norms_and_products_hold_every_order", "kernel")(
+    local = contracted("test_the_fused_norms_and_products_hold_every_order")(
         generation.linear_tangent(forward, backward, _stored(portable, norm, 2)))
     return _per_shard(local, axes, (x, gate, _widened(scale)), (False, False, True))
 
@@ -1047,7 +1047,7 @@ def swiglu(gate, up, portable, *, axes=None):
     """The fused SiLU product, `portable(gate, up)` its arithmetic in XLA, interpreted or lowered,
     placed on a mesh and differentiated as `stream_rms_norm` is."""
     interpret = not generation.triton_runs()
-    local = contracted("test_the_fused_norms_and_products_hold_every_order", "kernel")(
+    local = contracted("test_the_fused_norms_and_products_hold_every_order")(
         generation.linear_tangent(lambda gate, up: (_swiglu(gate, up, interpret), ()),
                                   lambda saved, operands, dy: _swiglu_bwd(interpret, operands, dy),
                                   portable))
@@ -1060,7 +1060,7 @@ def packed_swiglu(gate_up, portable, *, axes=None):
     the pair axis is never split; `portable(gate_up)` is its arithmetic in XLA, which differentiates it
     as `stream_rms_norm`'s does."""
     interpret = not generation.triton_runs()
-    local = contracted("test_the_fused_norms_and_products_hold_every_order", "kernel")(
+    local = contracted("test_the_fused_norms_and_products_hold_every_order")(
         generation.linear_tangent(lambda gate_up: (_packed(gate_up, interpret), ()),
                                   lambda saved, operands, dy: _packed_bwd(interpret, operands[0], dy),
                                   portable))

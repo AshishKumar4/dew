@@ -231,7 +231,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         return (*grads, None if state is None else dh0, None, None,
                 None if dskip is None else dskip.astype(skip.dtype))
 
-    rule = derivatives.contracted("test_the_template_rule_holds_its_orders", "kernel")(
+    rule = derivatives.contracted("test_the_template_rule_holds_its_orders")(
         derivatives.declared_derivative(derivatives.KernelGlue(), primal, forward, backward))
     return rule(query, key, value, g, beta, state, starts, firsts, skip)
 

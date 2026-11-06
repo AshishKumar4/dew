@@ -1101,7 +1101,7 @@ def _dkv(
 _NONDIFF = ("blocks", "call")
 
 
-@contracted("test_a_fused_attention_kernel_holds_its_reverse_orders", "kernel")
+@contracted("test_a_fused_attention_kernel_holds_its_reverse_orders")
 @functools.partial(jax.custom_vjp, nondiff_argnames=_NONDIFF)
 def _attention(
     fwd_mask_info: mask_info_lib.MaskInfo,

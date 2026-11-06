@@ -1984,23 +1984,24 @@ def test_each_form_of_a_custom_derivative_is_a_seam():
 
 
 def test_a_custom_derivative_without_its_contract_is_reported(tmp_path):
-    """SLOP028: in `src/<package>`, a custom derivative with no `contracted(test, kind)` at its seam, one
-    naming no test function of tests/test_contracts_*.py, or one whose kind is not its declaration's (a
-    surrogate's "surrogate", every other "kernel" or "numerics") is reported; each form declared with a
-    contract its checkout holds is not, nor a seam in the tests or the tools."""
-    contracts = "def test_a_seam_holds(): pass\ndef test_a_surrogate_holds(): pass\n"
+    """SLOP028: in `src/<package>`, a custom derivative with no `contracted(test)` at its seam, or one
+    naming no test function of tests/test_contracts_*.py or one two of those files define, is reported;
+    each form declared with a contract its checkout holds once is not, nor a seam in the tests or the
+    tools."""
+    contracts = "def test_a_seam_holds(): pass\ndef test_twice(): pass\n"
     seams = ("import functools\nimport jax\n"
              "from sparx.nn.derivatives import contracted, linear_tangent, surrogate\n"
              "@jax.custom_jvp\ndef bare(x): return x\n"
-             "@contracted('test_a_missing_one', 'numerics')\n@jax.custom_jvp\ndef unknown(x): return x\n"
-             "@contracted('test_a_seam_holds', 'surrogate')\n@jax.custom_jvp\ndef unkind(x): return x\n"
-             "@contracted('test_a_seam_holds', 'kernel')\n@jax.custom_vjp\ndef held(x): return x\n"
-             "wrapped = contracted('test_a_surrogate_holds', 'surrogate')(surrogate(f, g))\n"
+             "@contracted('test_a_missing_one')\n@jax.custom_jvp\ndef unknown(x): return x\n"
+             "@contracted('test_twice')\n@jax.custom_jvp\ndef shared(x): return x\n"
+             "@contracted('test_a_seam_holds')\n@jax.custom_vjp\ndef held(x): return x\n"
+             "wrapped = contracted('test_a_seam_holds')(surrogate(f, g))\n"
              "plain = surrogate(f, g)\n"
              "def step(x):\n"
-             "    return contracted('test_a_seam_holds', 'numerics')(linear_tangent(f, g, h))(x)\n"
+             "    return contracted('test_a_seam_holds')(linear_tangent(f, g, h))(x)\n"
              "def loose(x):\n    return linear_tangent(f, g, h)(x)\n")
-    files = {"tests/test_contracts_seams.py": contracts, "src/sparx/nn/seams.py": seams}
+    files = {"tests/test_contracts_seams.py": contracts, "src/sparx/nn/seams.py": seams,
+             "tests/test_contracts_more.py": "def test_twice(): pass\n"}
     assert [found for found in _linted(tmp_path / "source", files) if found[2] == "SLOP028"] == [
         ("src/sparx/nn/seams.py", line, "SLOP028") for line in (5, 8, 11, 16, 20)]
     suite = {"tests/test_contracts_seams.py": contracts, "tests/test_seams.py": seams,

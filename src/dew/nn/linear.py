@@ -449,7 +449,7 @@ def _shard_bias_backward(_, cotangent):
     return (jnp.where(jax.lax.axis_index(SEQUENCE_AXIS) == 0, total, jnp.zeros_like(total)),)
 
 
-_shards_summed = contracted("test_a_split_convs_bias_holds_its_orders", "numerics")(
+_shards_summed = contracted("test_a_split_convs_bias_holds_its_orders")(
     declared_derivative(Protected(), _shard_bias, _shard_bias_forward, _shard_bias_backward))
 
 

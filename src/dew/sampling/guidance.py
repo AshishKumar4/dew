@@ -173,7 +173,7 @@ def _spread(conditional: jax.Array, unconditional: jax.Array) -> tuple[jax.Array
     return held, unheld, jnp.where(large, 0.5, 1.0).astype(wide)
 
 
-@contracted("test_a_guided_prediction_holds_every_order", "numerics")
+@contracted("test_a_guided_prediction_holds_every_order")
 @jax.custom_jvp
 def _guided(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
     """`guide`'s value: the conditional prediction exactly at a unit scale and the unconditional at a zero

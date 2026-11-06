@@ -988,7 +988,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
     return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), dg, db.astype(beta.dtype), dh0, None)
 
 
-chunk_kda = derivatives.contracted("test_the_delta_rule_ports_hold_their_orders", "kernel")(
+chunk_kda = derivatives.contracted("test_the_delta_rule_ports_hold_their_orders")(
     derivatives.declared_derivative(derivatives.KernelGlue(), _rule, _rule_fwd, _rule_bwd,
                                     nondiff_argnums=(7, 8, 9, 10, 11)))
 """fla's chunked Kimi delta attention on the ported kernels: `(o, final)` for `q`, `k` `[B, T, H, K]`

@@ -618,7 +618,7 @@ def _frozen_fp8_tangent(primals, tangents, value):
     return linear_map(tangent, transposed, residuals, tangents[0])
 
 
-frozen_fp8_product = contracted("test_a_frozen_fp8_product_holds_every_order", "surrogate")(
+frozen_fp8_product = contracted("test_a_frozen_fp8_product_holds_every_order")(
     surrogate(_frozen_fp8_value, _frozen_fp8_tangent))
 """`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as `frozen_fp8_leaves`: FP8 products
 forward and for `x`'s gradient, and no gradient for the kernel, which is frozen. A surrogate
@@ -1295,7 +1295,7 @@ def _grouped_convolution_gradient() -> type:
     # The integer convolution, differentiated as the float one at its dequantized operands: a surrogate,
     # whose value carries the quantized operands so the forward quantizes once (a static-scale
     # activation's running statistics update once a step).
-    quantized_training = contracted("test_a_quantized_convolution_holds_every_order_it_takes", "surrogate")(
+    quantized_training = contracted("test_a_quantized_convolution_holds_every_order_it_takes")(
         surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11))))
 
     class GroupedConvolutionGradient(qwix.QtProvider):

@@ -187,7 +187,7 @@ def _tapped_backward(histogram, saved, cotangent):
     return cotangent, terms, zero_from_primal(where), zero_from_primal(scale)
 
 
-tapped = contracted("test_a_probes_tap_holds_its_orders", "surrogate")(
+tapped = contracted("test_a_probes_tap_holds_its_orders")(
     declared_derivative(Surrogate(), _passed, _tapped_forward, _tapped_backward, nondiff_argnums=(4,)))
 
 

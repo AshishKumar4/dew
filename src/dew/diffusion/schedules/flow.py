@@ -31,7 +31,7 @@ def static_shift(shift, t):
     return shift * t / (1 + (shift - 1) * t)
 
 
-@contracted("test_a_time_shift_holds_every_order", "numerics")
+@contracted("test_a_time_shift_holds_every_order")
 @partial(jax.custom_jvp, nondiff_argnums=(0,))
 def time_shift(shift: float, t: jax.Array) -> jax.Array:
     """shift / (shift + 1 / t - 1), Diffusers' `FlowMatchEulerDiscreteScheduler.time_shift` operation for

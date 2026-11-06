@@ -1795,7 +1795,7 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     return output, tangent
 
 
-portable_projection = contracted("test_a_portable_grouped_projection_holds_every_order", "numerics")(
+portable_projection = contracted("test_a_portable_grouped_projection_holds_every_order")(
     declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
                      nondiff_argnums=(3, 4, 5), symbolic_zeros=True))
 

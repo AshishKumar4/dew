@@ -71,7 +71,7 @@ def _probabilities_tangent(primals, tangents):
     return probability, jnp.where(top, -rest, tangent)
 
 
-_probabilities = contracted("test_the_categorical_losses_hold_every_order", "numerics")(
+_probabilities = contracted("test_the_categorical_losses_hold_every_order")(
     declared_tangent(Protected(), _softmax, _probabilities_tangent))
 
 
@@ -141,7 +141,7 @@ def _label_terms_tangent(primals, tangents):
                                      jnp.sum(probability * tangents[0], axis=-1))
 
 
-label_terms = contracted("test_the_label_terms_hold_every_order", "numerics")(
+label_terms = contracted("test_the_label_terms_hold_every_order")(
     declared_tangent(Protected(), _label_terms, _label_terms_tangent))
 
 
@@ -210,7 +210,7 @@ def _soft_loss_tangent(primals, tangents):
     return value, tangent + jnp.sum(derivative * d_logits, axis=-1)
 
 
-_soft_loss = contracted("test_the_categorical_losses_hold_every_order", "numerics")(
+_soft_loss = contracted("test_the_categorical_losses_hold_every_order")(
     declared_tangent(Protected(), _soft_value, _soft_loss_tangent, symbolic_zeros=True))
 
 
@@ -252,7 +252,7 @@ def _divergence_tangent(primals, tangents):
     return value, tangent + jnp.sum(_divergence_derivative(logits, reference) * d_logits, axis=-1)
 
 
-_divergence = contracted("test_the_categorical_losses_hold_every_order", "numerics")(
+_divergence = contracted("test_the_categorical_losses_hold_every_order")(
     declared_tangent(Protected(), _divergence_value, _divergence_tangent, symbolic_zeros=True))
 
 

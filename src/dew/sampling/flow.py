@@ -230,7 +230,7 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
     return _scaled(quotient, power)
 
 
-@contracted("test_a_transitions_quadratic_term_holds_every_order", "numerics")
+@contracted("test_a_transitions_quadratic_term_holds_every_order")
 @jax.custom_jvp
 def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
     """`|value - mean|**2 / (2 variance)` per row, the density's quadratic term, as the KL forms it
@@ -272,7 +272,7 @@ def _half(power: jax.Array) -> jax.Array:
     return (power.astype(jnp.float32) * 0.5).astype(jnp.int32)
 
 
-@contracted("test_a_transitions_kl_holds_every_order", "numerics")
+@contracted("test_a_transitions_kl_holds_every_order")
 @jax.custom_jvp
 def _gaussian_kl(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
     """`_divergence`, the KL of two transitions of one variance, differentiated as one linear map: its

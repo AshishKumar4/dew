@@ -344,6 +344,6 @@ def _ssd_bwd(chunk_size: int, platform: str, residual, cotangent):
     return _backward(x, b, c, a, entered, dy, dfinal, chunk_size, platform)
 
 
-ssd_chunk_scan = derivatives.contracted("test_the_tpu_ssd_scan_holds_its_orders", "kernel")(
+ssd_chunk_scan = derivatives.contracted("test_the_tpu_ssd_scan_holds_its_orders")(
     derivatives.declared_derivative(derivatives.KernelGlue(), _ssd_scan, _ssd_fwd, _ssd_bwd,
                                     nondiff_argnums=(5, 6)))
