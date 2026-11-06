@@ -211,9 +211,11 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
 
     blocks = [block for block in key_extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
     queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0]
+    # Its key blocks copied by its consumers together where its family's copies split them
+    # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts).
     candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)
                   for rows in queries for consumers in range(tiles.consumers, 0, -1) for block in blocks
-                  for narrow in stagings(family))
+                  if family.shares_rows(block, consumers) for narrow in stagings(family))
     ranked = list(candidates)
     return next((candidate for candidate in ranked if held(candidate)), None if held_only else ranked[-1])
 
