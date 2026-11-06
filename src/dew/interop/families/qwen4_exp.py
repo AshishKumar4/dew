@@ -35,7 +35,13 @@ from dew.interop.decoder_parts import (
     renamed_name,
     renamed_path,
 )
-from dew.interop.families.qwen import _QWEN_MOE_LEAVES, FUSED_EXPERTS, _qwen_hybrid_config, _qwen_moe_mixture
+from dew.interop.families.qwen import (
+    _QWEN_MOE_LEAVES,
+    FUSED_EXPERTS,
+    _qwen_hybrid_config,
+    _qwen_moe_mixture,
+    qwen_hybrid_export,
+)
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.unread import Stored, equal
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -63,11 +69,6 @@ _LEAVES = {
     **{f'ple.{norm}.weight': ('engram', norm, 'scale') for norm in ('norm_key', 'norm_query', 'norm_conv')},
     'ple.conv1d.weight': ('engram', 'conv1d', 'weight'),
     **_QWEN_MOE_LEAVES,
-    # The delta net's, by Qwen3.5's names (`dew_path`), which a write names back.
-    **{f'linear_attn.{name}.weight': ('self_attn', name, 'kernel')
-       for name in ('in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'out_proj')},
-    **{f'linear_attn.{name}': ('self_attn', *name.split('.'))
-       for name in ('conv1d.weight', 'norm.weight', 'A_log', 'dt_bias')},
 }
 """Each layer's own tensors below `model.layers.N.`, at their place in its block."""
 
@@ -217,6 +218,8 @@ def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
     qsa = [mixer for mixer in mixers.values() if isinstance(mixer, QSAAttentionMixer)]
     delta = [mixer for mixer in mixers.values() if isinstance(mixer, GatedDeltaNetMixer)]
     mixture = model.mixture
+    # The hybrid block's own fields (`qwen_hybrid_export`), its delta net's and its rotary's fraction.
+    hybrid = qwen_hybrid_export(model)
     if len(qsa) + len(delta) != len(mixers) or len(qsa) > 1 or len(delta) > 1 or mixture is None:
         raise ValueError("a qwen4_exp_text config states one QSA attention, one gated delta net and routed "
                          f"experts in every layer; this model's layers are {list(mixers.values())}")
@@ -226,14 +229,14 @@ def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
         'hc_count': streams.hc_mult, 'hc_lowrank': streams.hc_lowrank,
         **({name: getattr(qsa[0], name) for name in _QSA_FIELDS} if qsa else {}), 'indexer_kv_heads': 1,
         **({'output_gate_type': delta[0].output_gate_type,
-            **{name: getattr(delta[0], name) for name in LINEAR_FIELDS}} if delta else {}),
+            **{name: hybrid[name] for name in LINEAR_FIELDS}} if delta else {}),
         'num_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
         'moe_intermediate_size': mixture.expert_features,
         'shared_expert_intermediate_size': mixture.shared_features, 'norm_topk_prob': mixture.norm_topk_prob,
         'mtp_num_hidden_layers': 0, 'ple_layer_ids': [],
         # The class reads its rotary's width from its rope record (`_qwen35_rope`).
         'rope_parameters': {'rope_type': 'default', 'rope_theta': model.rope_theta,
-                            'partial_rotary_factor': model.partial_rotary_factor or 1.0}}
+                            'partial_rotary_factor': hybrid['partial_rotary_factor']}}
     engram = model.engram
     if engram is not None:
         fields.update(
