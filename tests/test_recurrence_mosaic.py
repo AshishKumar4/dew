@@ -1031,6 +1031,18 @@ def _skipped(name: str, dtype) -> dict:
     return {'skip': jax.ShapeDtypeStruct((RESOURCE_SHAPES[name][1],), jnp.float32)}
 
 
+def _two_roles(name: str, bound, derived, family, facts, *, packed: bool) -> list:
+    """The walks at two consumer roles a program (`Tiles.walkers`) as a gate case's tiles, which the
+    derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do: a role's
+    registers are its share of the program's; none where the family's walks take one role
+    (`template.walk_roles`), packed documents' or a value width of an odd number of blocks."""
+    value_width = RESOURCE_SHAPES[name][3]
+    if template.walk_roles(family) < 2 or packed or value_width // derived.block_v % 2:
+        return []
+    return [(template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
+                                     wide=derived.block_o or derived.block_v), 'two roles ')]
+
+
 def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: tuple | None = None) -> list:
     """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
     1971): each `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed
@@ -1089,15 +1101,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                              kind='refused ')]
         assert tiled[0] == derived, f"{name} on {target}: variants {tiled} lead with no {derived}"
         derived_tiles = [(derived, '')]
-        # The walks at two consumer roles a program (`Tiles.walkers`), which the derivation gives a call
-        # whose walks fill more than a wave and these shapes never do: a role's registers are its share
-        # of the program's.
-        value_width = RESOURCE_SHAPES[name][3]
-        two = (template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
-                                       wide=derived.block_o or derived.block_v)
-               if template.walk_roles(family) >= 2 and not packed and value_width // derived.block_v % 2 == 0
-               else None)
-        walked = [] if two is None else [(two, 'two roles ')]
+        walked = _two_roles(name, bound, derived, family, facts, packed=packed)
         if variant == TWO_ROLES:
             return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
                     for tiles, kind in walked]
