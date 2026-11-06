@@ -575,7 +575,7 @@ def test_each_launch_lowers_once_however_many_layers_call_it():
     lowered program, which both layers call (`mainloop.lowered_once`), as many as one layer's. Each call
     site traced, lowered and serialized its own kernel: a Qwen3.5-4B step's first update waited 30 minutes
     on its layers' identical kernels (row 2102)."""
-    import re
+    from dew.nn.kernels import lowered
 
     rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 128
     operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
@@ -600,10 +600,10 @@ def test_each_launch_lowers_once_however_many_layers_call_it():
     lowered_for = generation.device_generation() if mainloop.family_of() is not None else "sm90"
 
     def kernels(count: int) -> int:
+        # The program's Mosaic GPU calls, each lowered function's once (`lowered.custom_calls`).
         with generation.assumed(lowered_for):
-            text = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(
-                dialect="hlo")
-        return len([line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)])
+            program = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",))
+        return sum(call.target.startswith("mosaic_gpu") for call in lowered.custom_calls(program))
 
     one = kernels(1)
     assert one > 0 and kernels(2) == one
