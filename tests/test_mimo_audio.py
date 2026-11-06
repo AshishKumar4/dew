@@ -136,10 +136,11 @@ def test_the_tokenizer_s_features_and_codes_are_the_reference_s(prefix, bound):
     wide_held, wide_encoder = float64_of(held), encoder.clone(dtype=jnp.float64)
 
     def wide(inputs):
+        # The segments and each batch's longest, integers the float32 run reads, cut before widening.
+        mels, spans = segmented(config, mels_of(inputs), lengths)
+        longest = batch_longest(spans, config)
         with jax.enable_x64(new_val=True):
-            mels, spans = segmented(config, mels_of(inputs), lengths)
-            features, _ = wide_encoder.apply(wide_held, jnp.asarray(mels, jnp.float64), spans,
-                                             batch_longest(spans, config))
+            features, _ = wide_encoder.apply(wide_held, jnp.asarray(mels, jnp.float64), spans, longest)
             return {"features": entries(features)}
 
     site = f"{'bounded ' if prefix else ''}tokenizer features"
