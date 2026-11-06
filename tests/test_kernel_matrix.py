@@ -37,13 +37,15 @@ def test_a_familys_cells_cover_every_pair_of_axis_values_its_route_serves_and_no
                          f"kernel_matrix.covering({family!r})")
 
 
-def test_every_matrix_flow_is_a_test_the_gpu_tier_selects():
-    """Each of `FLOWS`, the tier's node ids, is a test pytest collects under the GPU tier's selection (`-m
-    gpu`), so the tier runs what the matrix declares (review: a helper's name, or an unmarked test, would run
-    nothing)."""
-    command = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "-m", "gpu"]
-    collected = subprocess.run([*command, *kernel_matrix.FLOWS], cwd=TESTS.parent, capture_output=True,
-                               text=True, check=False)
+@pytest.mark.parametrize(("flows", "tier"), [(kernel_matrix.FLOWS, "gpu"), (kernel_matrix.TPU_FLOWS, "tpu")],
+                         ids=["gpu", "tpu"])
+def test_every_matrix_flow_is_a_test_its_tier_selects(flows, tier):
+    """Each of a tier's flows (`FLOWS`, `TPU_FLOWS`: node ids) is a test pytest collects under the tier's
+    selection (`-m gpu`, `-m tpu`), so the tier runs what the matrix declares (review: a helper's name, or an
+    unmarked test, would run nothing)."""
+    command = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "-m", tier]
+    collected = subprocess.run([*command, *flows], cwd=TESTS.parent, capture_output=True, text=True,
+                               check=False)
     found = {line.strip() for line in collected.stdout.splitlines()}
-    missing = sorted(set(kernel_matrix.FLOWS) - found)
+    missing = sorted(set(flows) - found)
     assert not missing, (missing, collected.stdout[-2000:], collected.stderr[-2000:])
