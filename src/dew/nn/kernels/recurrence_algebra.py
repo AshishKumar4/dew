@@ -34,7 +34,7 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 
 import functools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
@@ -939,12 +939,15 @@ def _laid_references(reference: Callable[[int, int], tuple], c, index: jax.Array
     return jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
 
 
-def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, at: Callable[[int], tuple],
-                    summed: Callable[..., jax.Array], staged: Callable[[jax.Array], Staged], *, chunk: int,
-                    diagonal: bool, sub: int = SUB) -> list[jax.Array]:
-    """A chunk's pairs' products under a decay a key dimension, one key block's for each of `rows` (the
-    queries, the write-gated keys; fp32) against the same `keys` (fp32), its prefix halves `prefix`,
-    unmasked `[C, C]` fp32 each, their factors formed once for all of them: `sum_k r_ik k_jk exp2(g_ik -
+def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, prefix: tuple,
+                    at: Callable[[int], tuple], summed: Callable[..., jax.Array],
+                    staged: Callable[[jax.Array], Staged], *, chunk: int, diagonal: bool,
+                    sub: int = SUB) -> Iterator[jax.Array]:
+    """A chunk's pairs' products under a decay a key dimension, one key block's for each of `rows` (each
+    forming its row when called: the queries, the write-gated keys; fp32) against the same `keys` (fp32),
+    its prefix halves `prefix`, unmasked `[C, C]` fp32 each, formed as they are taken, one output's row and
+    products at a time (a mainloop adds each to its sum before the next is formed), their factors formed
+    once for all of them: `sum_k r_ik k_jk exp2(g_ik -
     g_jk)` for row `i` in sub-chunk `s` and key `j` in sub-chunk `t <= s` (`t < s` without the
     `diagonal`), zero for `t > s`. The pair's decay splits at `s`'s first token `G_s` and `t`'s last
     `E_t`, `exp2(g_i - G_s) exp2(G_s - E_t) exp2(E_t - g_j)`: the rows gated down to their own sub-chunk's
@@ -975,7 +978,6 @@ def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, a
     starts = [separated(*at(s * sub)) for s in range(blocks)]
     ends = [separated(*at(s * sub + sub - 1)) for s in range(blocks)]
     down = between(whole, laid(starts.__getitem__))
-    gated = [row * down for row in rows]
     up = staged(keys * between(laid(ends.__getitem__), whole))
 
     def middle(t: int) -> jax.Array:
@@ -991,7 +993,9 @@ def key_block_pairs(rows: Sequence[jax.Array], keys: jax.Array, prefix: tuple, a
         # The left operand formed as its product stages it (`summed` calls it), so one is live at a time.
         return summed([("pairs", lambda: row * middle(t), up.rows(t * sub, sub).T)], shape=(chunk, sub))
 
-    return [jnp.concatenate([columns(row, t) for t in range(blocks)], axis=1) for row in gated]
+    for row in rows:
+        gated = row() * down
+        yield jnp.concatenate([columns(gated, t) for t in range(blocks)], axis=1)
 
 
 Shifted = Callable[[int], Callable[[jax.Array], tuple]]

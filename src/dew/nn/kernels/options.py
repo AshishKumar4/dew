@@ -163,6 +163,9 @@ class JitArguments(TypedDict, total=False):
 _PROGRAMS: weakref.WeakSet[OuterProgram] = weakref.WeakSet()
 """Every program alive (`OuterProgram`), whose executables `release` drops."""
 
+_PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_passing", default=False)
+"""Whether an `OuterProgram`'s trace, which the algebra pass reads whole, encloses the current call."""
+
 
 def release() -> None:
     """Drop every live program's compiled executables (`OuterProgram.released`), as `jax.clear_caches`
@@ -223,38 +226,59 @@ class OuterProgram:
         lowering, its trace, its executable and every relowering read one program (docs/design/algebra.md
         §6.7): the pass reads the trace jit made, which lowers as it is where no rule changes it; a program
         a rule changes is traced afresh from its rewritten program (`program.replaying`). Its switch is in
-        JAX's trace context, so a held program traces afresh as it changes."""
-        traced = jitted.trace(*args, **kwargs)
-        rewritten = algebra.rewritten_program(traced.jaxpr)
-        if rewritten is traced.jaxpr:
-            return traced
-        replay = algebra.program.replaying(rewritten, jax.tree.structure(traced.out_info), self.numbers,
-                                           self.names)
-        return jax.jit(functools.wraps(self.function)(replay), **self.arguments).trace(*args, **kwargs)
+        JAX's trace context, so a held program traces afresh as it changes. A program called within the
+        trace is part of this one, which the pass reads whole (`_nested`)."""
+        token = _PASSING.set(True)
+        try:
+            traced = jitted.trace(*args, **kwargs)
+            rewritten = algebra.rewritten_program(traced.jaxpr)
+            if rewritten is traced.jaxpr:
+                return traced
+            replay = algebra.program.replaying(rewritten, jax.tree.structure(traced.out_info), self.numbers,
+                                               self.names)
+            return jax.jit(functools.wraps(self.function)(replay), **self.arguments).trace(*args, **kwargs)
+        finally:
+            _PASSING.reset(token)
 
     @functools.cached_property
-    def _eager(self) -> jax.stages.Wrapped:
-        """Its jit called under an eager transformation, which traces it where no trace of it can be read
-        first: the function rewritten as it traces (`algebra.rewritten`), one program as its compiles'."""
+    def _rewriting(self) -> Callable:
+        """The function rewritten as it traces (`algebra.rewritten`): where no trace of it is read first, the
+        pass reads the program it makes there."""
         @functools.wraps(self.function)
         def traced(*args, **kwargs):
             return algebra.rewritten(self.function, static_argnums=self.numbers,
                                      static_argnames=tuple(self.names))(*args, **kwargs)
-        return jax.jit(traced, **self.arguments)
+        return traced
+
+    @functools.cached_property
+    def _eager(self) -> jax.stages.Wrapped:
+        """Its jit called under an eager transformation, which traces it where no trace of it can be read
+        first: the function rewritten as it traces (`_rewriting`), one program as its compiles'."""
+        return jax.jit(self._rewriting, **self.arguments)
 
     @functools.cached_property
     def _nested(self) -> jax.stages.Wrapped:
-        """Its jit within another trace: the enclosing program's own options are the ones it compiles under,
-        as JAX takes compiler options on the outermost jit alone."""
+        """Its jit within another trace, the enclosing program's own options the ones it compiles under, as
+        JAX takes compiler options on the outermost jit alone: as written where the enclosing program is
+        one of these, whose pass reads it whole (`_traced`); rewritten as it traces under any other, so a
+        transformation outside it (`jax.grad` of it within a plain `jax.jit`) reads the pass's program, the
+        templates' derivatives among it (row 3450)."""
+        arguments = {name: value for name, value in self.arguments.items() if name != "compiler_options"}
+        return jax.jit(self._rewriting, **arguments)
+
+    @functools.cached_property
+    def _within(self) -> jax.stages.Wrapped:
+        """Its jit within a program the pass reads whole (`_nested`'s first case)."""
         arguments = {name: value for name, value in self.arguments.items() if name != "compiler_options"}
         return jax.jit(self.function, **arguments)
 
     def __call__(self, *args, **kwargs):
         # Within a staging trace the enclosing program compiles this one as part of its own, under its
-        # own options (`_nested`); under an eager transformation alone, or `jax.disable_jit`, its jit
-        # compiles itself with its options, or runs the function as Python.
+        # own options (`_nested`, or `_within` where its pass reads this one whole); under an eager
+        # transformation alone, or `jax.disable_jit`, its jit compiles itself with its options, or runs the
+        # function as Python.
         if staged():
-            return self._nested(*args, **kwargs)
+            return (self._within if _PASSING.get() else self._nested)(*args, **kwargs)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self._eager(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
@@ -381,6 +405,15 @@ def owned_program[**P, R](function: Callable[P, R], *models: Held,
     would keep it and the run it closes over (a trainer, its objective and their arrays) for good."""
     return OuterProgram(function, compiler_options={**compiler_options(*models), **(step or {})},
                         **arguments)
+
+
+def jit[**P, R](function: Callable[P, R], **arguments: Unpack[JitArguments]) -> OuterProgram:
+    """`function` compiled through Dew's compile point, as `jax.jit` compiles it (its static arguments, the
+    arguments it donates, its placements): a plain JAX or Flax program's products, alone or with their
+    elementwise consumers, run the kernel templates where their selectors give them (`dew.algebra.fusion`;
+    `dew.kernels.use` names a choice), under the algebra pass, its gradients' too, whichever order
+    `jax.grad` and it take. Its caller holds the program (`owned_program`)."""
+    return owned_program(function, **arguments)
 
 
 class Fetched:

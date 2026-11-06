@@ -752,6 +752,90 @@ def test_the_tpu_persistent_walk_lowers_for_a_v5e():
             lowering_platforms=("tpu",))
 
 
+def _read_through(x, rows, index, *, interpret):
+    """`x * index[0] + rows[:, None]` on a TPU core, each operand left in HBM and read through its family
+    (`tile_of`, `scalar_of`, `rows_of`), the result stored by a copy out of VMEM."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+
+    def body(x_hbm, rows_hbm, index_hbm, out_hbm):
+        value = (family.tile_of(x_hbm) * family.scalar_of(index_hbm).astype(jnp.float32)
+                 + family.rows_of(rows_hbm)[:, None])
+
+        def write(held):
+            held[...] = value
+            pltpu.sync_copy(held, out_hbm)
+
+        pl.run_scoped(write, pltpu.VMEM(x.shape, jnp.float32))
+
+    launch = family.kernel(body, out_type=jax.ShapeDtypeStruct(x.shape, jnp.float32), grid=(1,),
+                           grid_names=("programs",), consumers=1, interpret=interpret, name="reads")
+    return launch(x, rows, index)
+
+
+def test_a_tpu_core_reads_its_hbm_operands_through_its_family():
+    """A TPU core's tile, row vector and scalar read from operands left in HBM (`VmemRings.tile_of`,
+    `rows_of`, `scalar_of`, each through a copy): interpreted on any host, exactly `x * index[0] + rows`;
+    lowered for a TPU v5e."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    x = jnp.arange(8 * 128, dtype=jnp.float32).reshape(8, 128)
+    rows = jnp.arange(8, dtype=jnp.float32) * 1000
+    index = jnp.asarray([3], jnp.int32)
+    got = _read_through(x, rows, index, interpret=True)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(x) * 3 + np.asarray(rows)[:, None])
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    shapes = [jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (x, rows, index)]
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(functools.partial(_read_through, interpret=False)).trace(*shapes).lower(
+            lowering_platforms=("tpu",))
+
+
+def _added_in_place(x, *, interpret):
+    """Three programs of a TPU core each adding `x * (its index + 1)` into one in-place ref's rows
+    (`VmemRings.added`, the ref a `jax.new_ref` the launch takes as an operand), beside an output each
+    program writes its index into: the ref after the launch, and the output."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+    summed = jax.new_ref(jnp.zeros(x.shape, jnp.float32))
+
+    def body(x_hbm, summed_hbm, out_hbm):
+        index = family.program_index("programs")
+        family.added(family.tile_of(x_hbm) * (index + 1).astype(jnp.float32), summed_hbm, interpret,
+                     smem=None)
+
+        def write(held):
+            held[...] = jnp.full(held.shape, index, jnp.int32)
+            pltpu.sync_copy(held, out_hbm.at[pl.ds(index, 1)])
+
+        pl.run_scoped(write, pltpu.VMEM((1, 128), jnp.int32))
+
+    launch = family.kernel(body, out_type=jax.ShapeDtypeStruct((3, 128), jnp.int32), grid=(3,),
+                           grid_names=("programs",), consumers=1, interpret=interpret, name="added")
+    out = launch(x, summed)
+    return summed[...], out
+
+
+def test_a_tpu_cores_programs_add_into_an_in_place_ref_in_turn():
+    """Three programs of a TPU core adding into one ref the launch takes in place (a launch's dQ, its grouped
+    dK and dV), each read-modify-write through VMEM in turn: interpreted on any host, the ref holds the three
+    adds' sum exactly, and the launch's own output each program's row; lowered for a TPU v5e."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    x = jnp.arange(8 * 128, dtype=jnp.float32).reshape(8, 128)
+    summed, out = jax.jit(functools.partial(_added_in_place, interpret=True))(x)
+    np.testing.assert_array_equal(np.asarray(summed), np.asarray(x) * 6)
+    np.testing.assert_array_equal(np.asarray(out), np.repeat(np.arange(3, dtype=np.int32)[:, None], 128, 1))
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(functools.partial(_added_in_place, interpret=False)).trace(
+            jax.ShapeDtypeStruct(x.shape, x.dtype)).lower(lowering_platforms=("tpu",))
+
+
 def _gemm_on_a_tpu_core():
     """The GEMM template's kernel bodies on a TPU core's bundle (`mosaic_tpu.MXU`), each `(call, operands,
     expected)` at small integers, so each product is exact in fp32: a dense forward with a bias epilogue,
@@ -785,6 +869,34 @@ def _gemm_on_a_tpu_core():
                             np.stack([xf[:100].T @ dyf[:100], np.zeros((depth, width), np.float32),
                                       xf[100:350].T @ dyf[100:350]])),
     }
+
+
+def test_a_tpu_launch_plans_one_program_within_its_cores_scoped_vmem():
+    """`resources.plan` on a TPU v5e for a launch on its core's bundle (`mosaic_tpu.MXU`, which budgets no
+    registers): one program at a ring its scoped VMEM holds, its DMA semaphores and its turns' schedule
+    (`schedule`, a role's) no VMEM byte of it (a scope holding them plans as one without them); one whose
+    floor of two stages the scoped VMEM does not hold plans nothing."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu, resources
+
+    family = mosaic_tpu.MXU
+
+    def launch(stage_bytes: int, *, signalled: bool) -> resources.Launch:
+        def scope(stages: int) -> resources.Scope:
+            semaphores = (pltpu.SemaphoreType.DMA((stages,)), family.schedule(1)) if signalled else ()
+            return resources.Scope(program=(pltpu.VMEM((stages * stage_bytes,), jnp.uint8), *semaphores))
+
+        return resources.Launch(scope, consumers=1, registers=0)
+
+    with generation.assumed("v5e"):
+        target = generation.gpu_target()
+        plain, signalled = (resources.plan([launch(2 ** 20, signalled=held)], family, target)
+                            for held in (False, True))
+        assert plain is not None and plain == signalled
+        (found,) = plain
+        assert found.programs == 1 and found.stages >= 2 and found.shared <= target.scoped_vmem
+        assert resources.plan([launch(target.scoped_vmem, signalled=True)], family, target) is None
 
 
 @pytest.mark.parametrize("case", ["dense bias", "grouped", "grouped transposed", "kernel gradient"])
