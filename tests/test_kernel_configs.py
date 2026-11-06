@@ -1092,3 +1092,38 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     handed = subprocess.run([sys.executable, "-c", handoff], check=True, env=environment,
                             input=exported, capture_output=True, text=True)
     assert json.loads(handed.stdout) == json.loads(exported)
+
+
+def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
+    """Programs compiled at once (`report.compiled_at_once`) keep, in turn, the executables compiling them
+    one after another keeps, in the order given, each making its first compile in a thread of its own
+    (`report.attempts`): those lowered in distinct MLIR contexts (here, each on a thread of its own, as JAX
+    lowers a thread's programs in one) and those sharing one alike, whose compiles JAX's cache key reads
+    without writing their context from 0.12.0.1.post54."""
+    import threading
+
+    from dew.nn.kernels.templates import report
+    from dew.telemetry.compiles import Compiles
+
+    square = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    functions = (lambda x, y: x @ y, lambda x, y: jnp.tanh(x) + y, lambda x, y: jnp.sum(x * y, axis=0))
+    apart: list = [None] * len(functions)
+
+    def lowered(index: int) -> None:
+        apart[index] = jax.jit(functions[index]).lower(square, square)
+    threads = [threading.Thread(target=lowered, args=(index,)) for index in range(len(functions))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    shared = [jax.jit(function).lower(square, square) for function in functions]
+    for lowerings in (apart, shared):
+        with Compiles(None) as compiles:
+            together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
+                                                for lowered in lowerings])
+        threads = [program.thread for program in compiles.programs if program.kind == "compiled"]
+        assert len(threads) == 3, threads
+        assert all(thread.startswith("dew-compile") for thread in threads), threads
+        alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
+        assert [executable.as_text() for executable in together] == [
+            executable.as_text() for executable in alone]
