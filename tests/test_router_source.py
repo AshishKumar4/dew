@@ -38,7 +38,8 @@ CASES = {
 """Kimi Linear's published router (256 experts, 8 chosen, sigmoid, renormalized, scaled by 2.446, one group,
 a bias that changes choices), then the other paths: 64 experts in 8 groups, 3 groups per token by their two
 best biased scores; softmax, not renormalized, with a bias; softmax over 4 groups, 2 per token by their best
-score, no bias. Each is drawn to its worker as `grouped_topk`'s arguments."""
+score, no bias. Each is drawn to its worker as `grouped_topk`'s arguments, its scoring function as
+whether it is the sigmoid."""
 ROUTER_SEEDS = {"kimi": 8, "grouped": 8, "softmax": 8, "unbiased": 8}
 """Each router's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
 OUTPUTS = ("weights",)
@@ -74,7 +75,7 @@ def drawing(case: str):
     """`draw(seed)` of `case`: a bias of the experts' scale (zero for an unbiased router) and TOKENS rows of
     gate logits, each drawn until its choices clear MARGIN (`margins`)."""
     config = CASES[case]
-    experts = config["experts"]
+    experts, sigmoid = config["experts"], config["scoring_func"] == "sigmoid"
 
     def draw(seed: int) -> dict[str, np.ndarray]:
         rng = np.random.default_rng([56, seed])
@@ -85,8 +86,9 @@ def drawing(case: str):
             row = (rng.standard_normal((1, experts)) * 2).astype(np.float32)
             if margins(row, bias, config)[0] >= MARGIN:
                 rows.append(row[0])
-        return {"logits": np.stack(rows), "bias": bias,
-                **{f"config.{key}": np.asarray(value) for key, value in config.items() if key != "experts"}}
+        numbers = {key: value for key, value in config.items() if key not in ("experts", "scoring_func")}
+        return {"logits": np.stack(rows), "bias": bias, "config.sigmoid": np.asarray(sigmoid),
+                **{f"config.{key}": np.asarray(value) for key, value in numbers.items()}}
     return draw
 
 

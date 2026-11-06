@@ -67,6 +67,11 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                "reference": "vllm-project/vllm ced6857afa0ea7b2e3f0846a62e1394e90f15607",
                                "license": "Apache-2.0"}
             for case in ("kimi", "grouped", "softmax", "unbiased")},
+         "repa-preprocessing": {"test": "test_alignment", "worker": "repa_worker.py",
+                                "reference": "sihyun-yu/REPA 67f714503e3892f993844aab088ffc5791c92613 with "
+                                             "End2End-Diffusion/iREPA "
+                                             "99ad4ac234efe8de52ce157120f72856e836d09f",
+                                "license": "MIT"},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",

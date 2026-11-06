@@ -12,8 +12,9 @@ from the pinned file with its `torch.compile` decorator dropped: vLLM's fused CU
 
     python tools/vllm_router_worker.py router-CASE    `IN OUT` lines on stdin, each `done`
 
-IN holds each draw's router, `<draw>.config.<argument>` each a 0-d array of `grouped_topk`'s arguments
-and `bias` whether it takes the balancing bias, its `logits` `[tokens, experts]` and its `bias`
+IN holds each draw's router, `<draw>.config.<argument>` each a 0-d array of `grouped_topk`'s numeric
+arguments, `sigmoid` whether it scores by the sigmoid (else the softmax) and `bias` whether it takes the
+balancing bias, its `logits` `[tokens, experts]` and its `bias`
 `[experts]`. OUT gets `<draw>.reference.weights` and `<draw>.truth.weights` in float32 and float64 (the
 float64 run under `torch_precision.widened`, which widens the function's float32 return cast): each token's
 weight of every expert, its chosen experts' weights scattered by their ids, zero elsewhere.
@@ -56,7 +57,8 @@ def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         config = {key.removeprefix("config."): value.item() for key, value in inputs.items()
                   if key.startswith("config.")}
         arguments = {key: config[key] for key in ("topk", "renormalize", "num_expert_group", "topk_group",
-                                                  "scoring_func", "routed_scaling_factor")}
+                                                  "routed_scaling_factor")}
+        arguments["scoring_func"] = "sigmoid" if config["sigmoid"] else "softmax"
         for kind, dtype in (("reference", torch.float32), ("truth", torch.float64)):
             gate = torch.from_numpy(inputs["logits"]).to(dtype)
             correction = torch.from_numpy(inputs["bias"]).to(dtype) if config["bias"] else None
