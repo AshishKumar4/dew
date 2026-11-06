@@ -1295,12 +1295,14 @@ def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks
 
 
 @INTERPRETS
-def test_a_softcapped_backward_in_one_launch_holds_check_1_interpreted(without_deterministic_ops):
-    """The fast form's one launch queries first under a softcap, a score hook of no parameters: its score
+@pytest.mark.parametrize("form", ["fused", "fused-shared-keys"])
+def test_a_softcapped_backward_in_one_launch_holds_check_1_interpreted(form, without_deterministic_ops):
+    """The fast form's one launch queries first under a softcap, a score hook of no parameters, each
+    consumer its own keys or its share of a shared key block (`attention_mosaic_coop`): its score
     cotangents taken back through the cap's slope (`gradient.pulled`) before dQ's and dK's products, every
     gradient the reference's (check 1) over causal packed documents under a window, under the
     interpreter."""
-    _check_hooked_backward("softcap", form="fused", interpret=True)
+    _check_hooked_backward("softcap", form=form, interpret=True)
 
 
 @INTERPRETS
@@ -1705,9 +1707,10 @@ BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name 
                  for width in (64, 128, 256) for accurate in (False, True)]
 BACKWARD_GATE += [(generation_name, width, False, hooks) for generation_name in GATED for width in (64, 128)
                   for hooks in BACKWARD_HOOKS if hooks != "none"]
+BACKWARD_GATE += [(generation_name, 256, False, "softcap") for generation_name in GATED]
 """The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
-call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
-whole (row 2281: its live set beside the step's)."""
+call's head widths, each form, hookless; each score hook at the widths a hooked call's derivation takes
+whole (row 2281: its live set beside the step's); and Gemma 2's softcap at width 256."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):
