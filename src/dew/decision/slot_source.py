@@ -145,15 +145,17 @@ class SlotSource(SourceKind):
         layout = bundle.layout
         if not isinstance(layout, QuestionLayout) or layout.labels is None:
             raise ValueError("the slot format needs its whole-question layout")
-        labels = layout.labels
-        prompt = SlotSource.layout(max_len=layout.max_len, labels=labels, blocks=layout.blocks)
         ids = _records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
                              what="a list of label ids")
-        canonical, picked = _labels(bundle.decision_tokenizer, len(ids))
+        # The prompt an external release derives (its canonical bare labels), which the release states the
+        # layout over where its labels are others; the readout reads the layout's own.
+        canonical, _ = _labels(bundle.decision_tokenizer, len(ids))
+        prompt = SlotSource.layout(max_len=layout.max_len, labels=canonical, blocks=layout.blocks)
+        picked = layout.labels.ids(bundle.decision_tokenizer, len(ids))
         actual = (tuple(_records.integers(group, "label_ids") for group in ids) if mode == "slot_lm"
                   else tuple((_records.integer(value, "label_ids"),) for value in ids))
-        if labels != canonical or actual != picked:
-            raise ValueError("the slot format records its canonical bare labels in tokenizer order")
+        if actual != (picked if mode == "slot_lm" else tuple(row[:1] for row in picked)):
+            raise ValueError("the slot readout reads the labels its layout writes, in the layout's order")
         root = Path(directory)
         bundle.backbone().save(root, max_shard_size=max_shard_size)
         readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
@@ -265,17 +267,18 @@ class SlotSource(SourceKind):
         # the backbone the native loader builds under them reads blocks, of whatever kind.
         blocks = reads_blocks(config, overrides)
         tokenizer = HFTokenizer(str(directory), local_files_only=True)
-        labels, ids = _labels(tokenizer, count)
+        labels, _ = _labels(tokenizer, count)
+        # The release's window, else an external release's default, over its prompt; and the layout and
+        # calibration it states whole over that, whose labels the readout reads.
+        layout, calibration = released_decision(
+            directory, SlotSource.layout(max_len=released_length(directory, SLOT_WINDOW), labels=labels,
+                                         blocks=blocks), Calibration(), kind=QuestionLayout)
+        ids = (layout.labels or labels).ids(tokenizer, count)
         head = (SlotHeadSource({"class": import_path(LabelReadout), "fields": {
                     "label_ids": [list(row) for row in ids]}}, _path)
                 if mode == "slot_lm" else SlotHeadSource({"class": import_path(SlotReadout), "fields": {
                     "label_ids": [row[0] for row in ids], "head_dim": dimension, "slot_rows": count}},
                     _path, weight_file="readout_head.pt", initialize=_initialize))
-        # The release's window, else an external release's default, over its prompt; and the layout and
-        # calibration it states whole over that.
-        layout, calibration = released_decision(
-            directory, SlotSource.layout(max_len=released_length(directory, SLOT_WINDOW), labels=labels,
-                                         blocks=blocks), Calibration(), kind=QuestionLayout)
         return CompositeSource(NativeComponent(config), head, PretrainedDecision.from_components, "",
                                {"layout": layout, "calibration": calibration, "strict_specials": False,
                                 "writer": SlotSource.save, "exporter": SlotSource.export})
