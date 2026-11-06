@@ -296,11 +296,10 @@ class Decoder(nn.Module):
 
 
 @INTERPRETS
-def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_interpreted():
-    """A bf16 pool split between two groups of rows (`KVCache.groups`), which the GPU's Pallas paged kernel
-    turns down, decoded on an H100 by the attention template's decode over the pages (`PAGED`'s template
-    kernel), each row through its own group's part of the pool (`KVStore._absolute`): on par with the
-    reference path over the rows written dense (check 1)."""
+def _grouped_pool_decode():
+    """A bf16 pool split between two groups of rows (`KVCache.groups`), decoded on an H100 by the attention
+    template's decode over the pages: the decode, the reference path over the rows written dense, and a
+    draw of their keys, values and queries by seed."""
     from dew.nn.kernels import generation
     from dew.nn.kernels.templates import attention as template
 
@@ -325,7 +324,29 @@ def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_in
                       for stream in streams[:2])
         return key, value, jax.random.normal(streams[2], (rows, 2 * kv_heads, width), jnp.bfloat16)
 
+    return ours, reference, draw
+
+
+def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_interpreted():
+    """The grouped pool's decode (`_grouped_pool_decode`), which the GPU's Pallas paged kernel turns down,
+    by the attention template's decode over the pages (`PAGED`'s template kernel), each row through its own
+    group's part of the pool (`KVStore._absolute`): on par with the reference path over the rows written
+    dense (check 1)."""
+    ours, reference, draw = _grouped_pool_decode()
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "grouped pool's template decode", seeds=8)
+
+
+def test_a_grouped_pools_decode_maps_over_a_leading_axis_interpreted():
+    """The grouped pool's template decode mapped over two calls (`jax.vmap`): its guards' rewalk into the
+    plain launch's outputs discharged as it is traced (`algebra.walked_launches`' in-place refs), so the map
+    batches its launches, each call on par with the reference path's (check 1)."""
+    ours, reference, draw = _grouped_pool_decode()
+
+    def drawn(seed: int):
+        return jax.tree.map(lambda *calls: jnp.stack(calls), draw(2 * seed), draw(2 * seed + 1))
+
+    assert_as_exact(jax.jit(jax.vmap(ours)), jax.jit(jax.vmap(reference)), drawn,
+                    "grouped pool's template decode mapped", seeds=8)
 
 
 @pytest.mark.parametrize("mixed", [False, True], ids=["rectangular", "mixed"])
