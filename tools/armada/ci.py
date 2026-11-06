@@ -1555,6 +1555,46 @@ def dumped(done: subprocess.Popen, stacks: Path) -> str:
     return stacks.read_text(errors="replace")
 
 
+def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: float, grace: float,
+               stacks: Path) -> tuple[int, str, bool, str, set[str] | None]:
+    """A task's pytest `command` run under `environment` to its `deadline`: its exit code, its output,
+    whether it passed the deadline, every thread's stack then (`dumped`), and the data files its processes
+    opened (`watched`), none where one of its group outlived the kill and may open more. pytest leads a
+    process group of its own, so what its tests start ends with it. Its output is streamed as it comes by a
+    reader of its own, which nothing waits on past pytest's end: a test's child holding the pipe open (a
+    pool worker, a server) cannot keep the verdict from being written."""
+    lines: list[str] = []
+    # Every data file the task's processes open, held from before pytest starts until its group stopped
+    # (`watched`): each is the input of every file the task runs.
+    opens = watched.Opens(os.getcwd())
+    done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              env=dict(environment))
+
+    def read() -> None:
+        for line in done.stdout or ():
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            lines.append(line)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    expired, dump = False, ""
+    try:
+        done.wait(deadline)
+    except subprocess.TimeoutExpired:
+        # Every thread's stack as pytest stands at its deadline, before the interrupt below.
+        expired, dump = True, dumped(done, stacks)
+    # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
+    # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
+    if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
+                                 settle=SETTLE):
+        print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
+    # A process of the group still running may yet open a file: no record of this task keeps a key.
+    closed = opens.closed()
+    reader.join(10)
+    return done.returncode, "".join(lines), expired, dump, None if left else closed
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
@@ -1583,45 +1623,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     done_before = {} if site is not None or release or coverage is not None else resumed(tests)
     command = [*pytest_command(run, tests, split, release), "-p", "progress",
                *(word for node in done_before for word in ("--deselect", node))]
-    # pytest leads a process group of its own, so what its tests start ends with it. Its output is
-    # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
-    # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
-    lines: list[str] = []
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
                                               "DEW_UNRECORDED": str(unrecorded), "DEW_STACKS": str(stacks)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    # Every data file the task's processes open, held from before pytest starts until its group stopped
-    # (`watched`): each is the input of every file the task runs.
-    opens = watched.Opens(os.getcwd())
-    done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              env=environment)
-
-    def read() -> None:
-        for line in done.stdout or ():
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            lines.append(line)
-
-    reader = threading.Thread(target=read, daemon=True)
-    reader.start()
-    expired, dump = False, ""
-    try:
-        done.wait(deadline)
-    except subprocess.TimeoutExpired:
-        # Every thread's stack as pytest stands at its deadline, before the interrupt below.
-        expired, dump = True, dumped(done, stacks)
-    # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
-    # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
-    if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
-                                 settle=SETTLE):
-        print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
-    # A process of the group still running may yet open a file: no record of this task keeps a key.
-    closed = opens.closed()
-    opened = None if left else closed
-    reader.join(10)
-    output = "".join(lines)
+    returncode, output, expired, dump, opened = ran_pytest(command, environment, deadline, grace, stacks)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
@@ -1641,7 +1648,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                    if "could not import" in f"{node.get('message')} {node.text}"]
         counted = counts.get(name, {})
         deselected = bool(counted) and counted["collected"] == counted["deselected"]
-        exited = exit_red(done.returncode, cases, own, deselected, name)
+        exited = exit_red(returncode, cases, own, deselected, name)
         unaccounted = ([] if exited or (report.is_file() and (own or deselected))
                        else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
                                                             else "pytest reported none of its tests, and its "
