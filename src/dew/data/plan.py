@@ -936,8 +936,8 @@ saved under an earlier version reads by it (carried to 1.0, ledger 1552)."""
 
 
 def read_by(version: int) -> int:
-    """`version`, refused where this Dew reads by none of it (`PLAN_VERSIONS`): what every read builds by
-    (`dew.data.compile._build`) and every cache key keys its fill by (`dew.data.analysis._cache_key`), where
+    """`version`, refused where this Dew reads by none of it (`PLAN_VERSIONS`): what every read
+    (`dew.data.compile`'s `compile`, `iterate` and `publish`) asks before it prepares anything, where
     another would read as the version it falls among (11 as 10, 5 as 8)."""
     if version not in PLAN_VERSIONS:
         raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "

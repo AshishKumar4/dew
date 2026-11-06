@@ -990,7 +990,8 @@ def test_options_knocked_out_with_no_probability_share_the_residual_evenly():
 def test_a_batch_of_requests_takes_no_one_requests_request_images_or_context(decide):
     """A batch of requests, each its own whole request, refuses a `request` of its parts (train 658's
     review, row 4605), and the images and context of one request, which it would read for none of them;
-    each request's context goes in `contexts` (train 660's review, row 4622)."""
+    each request's context goes in `contexts`, which one request refuses (train 660's review, row 4622;
+    train 666's, row 4658)."""
     from PIL import Image
 
     request = CASES["many_options"]
@@ -999,3 +1000,6 @@ def test_a_batch_of_requests_takes_no_one_requests_request_images_or_context(dec
     for given in ({"request": asked}, {"images": [Image.new("RGB", (8, 8))]}, {"context": "a context"}):
         with pytest.raises(ValueError):
             decide(batch, **given)
+    # One request's context goes in `context`; a batch's `contexts` it would read none of (row 4658).
+    with pytest.raises(ValueError):
+        decide(request["state"], asked, contexts=["a context"])
