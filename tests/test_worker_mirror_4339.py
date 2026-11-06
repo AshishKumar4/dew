@@ -99,7 +99,9 @@ def test_workers_mirror_counters_reach_run(tmp_path, monkeypatch, read, workers,
            format="array_record", rows_per_shard=2)
     observed = tmp_path / "observed"
     observed.mkdir()
-    options = {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 2**20}}
+    # ArrayRecord's physical minimum shard size exceeds its tiny logical records.
+    # Keep enough room for every reader pin; cache exhaustion is a different contract.
+    options = {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 64 * 2**20}}
     source = Files(f"dewcache::file://{root}", storage_options=options)
     chain = Pipeline(source).map(ObserveMirror(observed)).repeat(1).batch(1)
     loader = compile(chain, read=read,
