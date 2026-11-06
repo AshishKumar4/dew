@@ -1777,6 +1777,10 @@ def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
     has no form of (Mosaic GPU's: "Scalars must be represented by non-vector types", ET-FP16-h100)."""
     top = jnp.max(jnp.abs(x), axis=-1) if rows else jnp.max(jnp.abs(x))
     exponent = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
+    # A GPU's approximate log2 flushes a subnormal largest to zero, its exponent -inf: scaled by 2^381
+    # (`power2`'s reach) the part passed fp32's largest and its remainder was inf - inf, NaN (row 4464, an
+    # fp16 row whose keys weigh subnormal beside a state near fp32's largest). Such a part takes no scale.
+    exponent = jnp.where(finite(exponent), exponent, 0.0)
     return power2(x, expand(14.0 - exponent, x) if rows else 14.0 - exponent), exponent - 14.0
 
 
