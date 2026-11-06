@@ -236,18 +236,25 @@ def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
     assert exits == [0] * WORLD, f"rank exits {exits}\n{ran.stdout[-6000:]}\n{ran.stderr[-6000:]}"
     return ran.stdout
 
+LAYOUT_SEEDS = 32
+"""The draws check 1 holds each model's layouts over across hosts: `seeds_for` paired sized the dense
+decoder's and the mixture's data4 and fsdp4 layouts at 32 on four devices of one host (armada, 11-06); a
+replica layout sums its rows as data does, across granules."""
+
+
 @pytest.mark.distributed
 @pytest.mark.parametrize("model", MODELS)
 def test_layouts_across_hosts_split_only_data_and_fsdp_and_match_one_device(model):
     """The parity tool's dense decoder or mixture of experts over one device on each of four hosts:
-    the data, fsdp and replica layouts, whose sums cross the relay between containers, match one
-    device, and an axis inside a model replica (tensor, stage) is refused across hosts, since each
-    container is its own slice and only fsdp may cross slices. One model a test, so CI's gangs run
-    them side by side."""
+    the data, fsdp and replica layouts, whose sums cross the relay between containers, are on par with
+    one device over LAYOUT_SEEDS draws (check 1), and an axis inside a model replica (tensor, stage) is
+    refused across hosts, since each container is its own slice and only fsdp may cross slices. One
+    model a test, so CI's gangs run them side by side."""
     if WORLD != 4:
         pytest.skip("one device on each of four hosts")
-    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", model, "--layouts",
-                       "data4", "fsdp4", "replicas4", "replicas2_fsdp2", "tensor4", "stage4"], devices=1)
+    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", model,
+                       "--seeds", str(LAYOUT_SEEDS), "--layouts", "data4", "fsdp4", "replicas4",
+                       "replicas2_fsdp2", "tensor4", "stage4"], devices=1)
     if RANK == 0:
         summary = next(line for line in output.splitlines() if re.fullmatch(r"\w+ \d+(, \w+ \d+)*", line))
         counts = {status: int(count) for status, count in re.findall(r"(\w+) (\d+)", summary)}
