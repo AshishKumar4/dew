@@ -154,14 +154,16 @@ def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_g
     assert not failures(found), "\n".join(failures(found))
 
 
-@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
-    """Each of the short conv's training cases lowered as on the GPU and compiled by XLA's CUDA backend for a
-    compile-only device on this CPU (tests/kernel_compile.py), within the compile bound and the block's
-    shared memory."""
-    found = compile_kernels(conv_training_cases(), target)
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
+    """Each of the short conv's training cases (the recurrence template's conv, `templates.recurrence.conv`)
+    lowered as on the GPU and compiled by Mosaic for a compile-only device on this CPU through ptxas
+    (tests/kernel_compile.py): within the block's shared memory, no register spilled."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    found = compile_mosaic_kernels(list(conv_training_cases()), target)
     assert len(found) == 2 * len(CONV_SHAPES) + 2
-    assert not failures(found), "\n".join(failures(found))
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
 

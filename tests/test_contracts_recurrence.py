@@ -356,9 +356,10 @@ def test_the_decode_step_holds_every_order(edge):
     `generation.linear_tangent`; interpreted off a GPU), the gated delta rule with a decay a head and the
     skip: every order of its output and updated memory finite wherever float64 is a normal float32 and the
     token's update as the rule states it is (`plain_delta_rule` over one token), at queries, keys, values
-    and memory whose products near float32's ends."""
+    and memory whose products near float32's ends, at a model's 128 keys and values a head (the launch's
+    warpgroup takes a value column a thread)."""
     (query, key, value, g, beta, state), direction, cotangent = delta_rule_draw(
-        2669, EDGES[edge], key_heads=1, value_heads=2, width=8, length=1, per_key=False)
+        2669, EDGES[edge], key_heads=1, value_heads=2, width=128, length=1, per_key=False)
     (skip,) = normal_draw(2672, (2,))
     (skip_direction,) = normal_draw(2673, (2,))
     hooks = recurrence.Hooks(decay="scalar", skip=True)
@@ -376,7 +377,7 @@ def test_the_decode_step_holds_every_order(edge):
     flat_cotangent = jnp.concatenate([cotangent[0][:, 0].ravel(), cotangent[1].ravel()])
     assert_contract(flattened(stepped), (query, key, value, g, beta, state, skip),
                     (*direction, skip_direction), flat_cotangent, f"the decode step {edge}",
-                    truth_fn=flattened(plain), plain_fn=flattened(plain))
+                    truth_fn=flattened(plain), plain_fn=flattened(plain), without=INTERPRETED_REMAT)
 
 
 def ssd_draw(seed: int, scale: float):
@@ -442,14 +443,15 @@ def test_the_short_conv_holds_every_order(edge):
     float64 is a normal float32 and the causal depthwise conv as its definition sums it is, at inputs and
     taps whose products near float32's ends."""
     scale = EDGES[edge]
-    x, taps, bias = normal_draw(2677, (1, 12, 16), (16, 4), (16,))
+    # A warpgroup's channels, the kernels' block (`templates.recurrence.conv.fits`).
+    x, taps, bias = normal_draw(2677, (1, 12, 128), (128, 4), (128,))
     primals = (x * scale, taps, bias * scale)
     direction = tuple(along * (scale if at != 1 else 1.0)
                       for at, along in enumerate(normal_draw(2678, x.shape, taps.shape, bias.shape)))
     (cotangent,) = normal_draw(2679, x.shape)
 
     def kernel(x, taps, bias):
-        return short_conv.conv(x, taps, bias, None, None, ((16, None),), activation=True, eps=1e-6,
+        return short_conv.conv(x, taps, bias, None, None, ((128, None),), activation=True, eps=1e-6,
                                dtype=x.dtype, interpret=INTERPRETED)[0]
 
     def plain(x, taps, bias):
@@ -459,7 +461,7 @@ def test_the_short_conv_holds_every_order(edge):
         return jax.nn.silu(summed)
 
     assert_contract(kernel, primals, direction, cotangent, f"the short conv {edge}", truth_fn=plain,
-                    plain_fn=plain)
+                    plain_fn=plain, without=INTERPRETED_REMAT)
 
 
 def _gated(h, q, k, v, g, beta):

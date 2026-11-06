@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Hashable, Mapping
-from typing import TypedDict, cast
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +32,6 @@ from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import Option, OuterProgram, compiler_options, program as outer_program
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import (
-    GROUPS,
     POOLED,
     ROW_CURSORS,
     SCALES,
@@ -131,14 +129,6 @@ class Draws:
     ended: jax.Array
     behavior: jax.Array
     raw: jax.Array
-
-
-class GroupKeywords(TypedDict, total=False):
-    """A prefill's group keywords of the model's own call (`kv_cache.GROUPS`' names), each where its pieces
-    carry it: the tokens' image and block groups."""
-
-    image_groups: jax.Array
-    block_groups: jax.Array
 
 
 def _base_rows(model: nn.Module, rows: int) -> jax.Array | None:
@@ -492,16 +482,20 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     flat = jnp.concatenate([jnp.where(fed, last, pad_id), jnp.where(valid, tokens, pad_id).reshape(-1)])
     real = jnp.concatenate([fed, valid.reshape(-1)])
     scored = jnp.concatenate([jnp.arange(rows), rows + jnp.arange(pieces) * width + width - 1])
-    # The pieces' tokens' image and block groups where they carry them (`GROUPS`), -1 at the fed rows' tokens
-    # and at padding, as a prefill of their own reads them.
     fields = admission.prompts.token_fields
-    groups = cast(GroupKeywords, {
-        name: jnp.concatenate([jnp.full((rows,), -1, jnp.int32),
-                               jnp.where(valid, jnp.asarray(fields[name], jnp.int32), -1).reshape(-1)])[None]
-        for name in GROUPS if name in fields})
+
+    def grouped(name: str) -> jax.Array | None:
+        """The pieces' tokens' `name` groups (`kv_cache.GROUPS`, image or block) where they carry them, -1 at
+        the fed rows' tokens and at padding, as a prefill of their own reads them; None where they carry
+        none, the model's own default."""
+        if name not in fields:
+            return None
+        return jnp.concatenate([jnp.full((rows,), -1, jnp.int32),
+                                jnp.where(valid, jnp.asarray(fields[name], jnp.int32), -1).reshape(-1)])[None]
     (_, logits), updated = model.apply(
         {**params, "cache": decoder.cache}, flat[None], scored[None], decode=True,
-        coordinates=coordinates(flat[None].shape, valid=real[None]), **groups,
+        coordinates=coordinates(flat[None].shape, valid=real[None]),
+        image_groups=grouped("image_groups"), block_groups=grouped("block_groups"),
         admitted=Admitted(slots=admission.slots, cursors=admission.cursors,
                           tables=admission.tables if isinstance(placement, Paged) else None,
                           continuing=placement.continuing),
