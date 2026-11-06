@@ -285,7 +285,7 @@ def test_a_published_parquet_stream_names_its_rows_by_its_files_counts():
     assert rows == [(row, row * 10) for row in range(FILES * GROUPS * ROWS)]
 
 
-def test_dew_data_publish_publishes_a_parquet_stream_at_the_plan_version_it_names():
+def test_dew_data_publish_publishes_a_parquet_stream_at_the_plan_version_it_names(tmp_path):
     """`dew data publish --plan-version` fills a Parquet stream's publication as a run reading by that plan
     version does, shards of its row groups at 9 and of its files at 10: each the publication `publish` makes
     at that version, two publications of one store (train 649's review)."""
@@ -296,10 +296,13 @@ def test_dew_data_publish_publishes_a_parquet_stream_at_the_plan_version_it_name
     from dew.data.compile import publish
 
     url = written(f"cli-{uuid4().hex}")
+    chain = tmp_path / "chain.py"
+    chain.write_text("from dew.data.pipeline import Pipeline\nfrom dew.data.sources import Files\n"
+                     f"data = Pipeline(Files({url!r}, format='parquet'))\n")
     made = {}
     for version in (9, 10):
         cache = f"memory://parquet-files-cli-cache-{uuid4().hex}"
-        assert main(["data", "publish", url, cache, "--plan-version", str(version)]) == 0
+        assert main(["data", "publish", str(chain), cache, "--plan-version", str(version)]) == 0
         made[version] = [path.name for path in Store(cache).iterdir()]
         again = publish(Pipeline(Files(url, format="parquet")), Cache(f"memory://parquet-files-api-{uuid4().hex}"),
                         read="streamed", plan_version=version)
