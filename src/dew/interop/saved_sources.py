@@ -91,7 +91,8 @@ def source_publishes(run: SavedRun) -> bool:
     (`dew.inference.models.write_run_release`)."""
     from dew.inference.tasks import saved_model
     from dew.interop import diffusion_gemma
-    from dew.interop.pretrained import source_states, wrapper_writes
+    from dew.interop.pretrained import source_states
+    from dew.interop.wrappers import wrapper_writes
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.nn.multimodal import MultimodalTransformer

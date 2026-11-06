@@ -185,7 +185,7 @@ def test_a_qwen35_wrapper_holding_cross_attention_is_written_as_no_release():
     run's export is the run's native release (`source_publishes`), as a decoder's with them is; the wrapper
     without them is its release's."""
     from dew.interop import Pretrained
-    from dew.interop.pretrained import wrapper_writes
+    from dew.interop.wrappers import wrapper_writes
     from dew.nn.cross_attention import CrossAttention
 
     loaded = Pretrained.load(FIXTURES / "qwen38-dense-tiny", dtype="float32", attention_impl="reference")

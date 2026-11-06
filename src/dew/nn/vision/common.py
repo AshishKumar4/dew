@@ -227,7 +227,8 @@ def projector_native_layouts(kind: str, params: Variables) -> tuple[WeightLayout
     each under its name past the layout's prefix (`ProjectorLayout.tensors`), rooted at `params`."""
     layout = projector_layout(kind)
     names = {("params", *path): name for name, path in layout.tensors.items()}
-    return native_layouts({"params": params}, names.__getitem__, lambda name: ("params", *layout.path(name)))
+    return native_layouts({"params": params}, lambda path: names[path],
+                          lambda name: ("params", *layout.path(name)))
 
 
 def _held[Layout](layout: Layout | None, what: str, kind: str) -> Layout:
