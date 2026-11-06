@@ -156,14 +156,17 @@ def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew
     """`dew.jit` over a plain JAX loss on an H100 whose template a call names: its gradient's products run
     the template whether `jax.grad` is taken of the compiled program (inside a plain jit, the pass reads the
     program as it traces) or the program compiles the gradient (the pass reads the joint program), each
-    the gradient as written, bitwise."""
+    the gradient as written, bitwise. The loss contracts its projection whole with a fixed cotangent, so
+    the projection is a product alone: a fused epilogue's derivative recomputes its sums in IEEE fp32,
+    which the template does not take, and a call naming it refuses."""
     import dew
 
     operands = draw()
     cotangent = jax.random.randint(jax.random.key(11), (256, 256), -2, 3).astype(jnp.bfloat16)
 
     def loss(x, w, bias, other):
-        return jnp.sum((biased(x, w, bias, other) * cotangent).astype(jnp.float32))
+        del bias, other
+        return jnp.tensordot(x @ w, cotangent, axes=2).astype(jnp.float32)
 
     plain = jax.grad(loss, argnums=(0, 1))
     outside = jax.jit(jax.grad(dew.jit(loss), argnums=(0, 1)))
