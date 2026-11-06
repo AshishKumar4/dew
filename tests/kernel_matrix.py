@@ -14,6 +14,7 @@ import importlib
 import itertools
 
 import gpu_flow
+import jax.numpy as jnp
 
 AXES: dict[str, dict[str, tuple[str, ...]]] = {
     "attention": {
@@ -214,6 +215,13 @@ TPU_FLOWS: tuple[str, ...] = (
     "tests/test_attention_splash.py::test_the_decode_matrix_holds_on_this_tpu",
 )
 """The flows that run the matrices' TPU cells on the TPU tier (`-m tpu`), by pytest node id."""
+
+
+def head_shapes(case: dict[str, str], heads: dict[str, tuple[int, int]]) -> tuple:
+    """An attention family's case's query heads and key heads (by its `heads` axis, `heads`' table), head
+    width and dtype, as its cells draw them."""
+    query_heads, kv_heads = heads[case["heads"]]
+    return query_heads, kv_heads, int(case["width"]), jnp.dtype(case["dtype"])
 
 
 def check(family: str):

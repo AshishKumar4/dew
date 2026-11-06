@@ -22,7 +22,7 @@ import pytest
 from attention_matrix import DOCUMENTS, HEADS, LENGTH, SEEDS, _masked, operands, terms_of
 from gpu_flow import cell
 from jax.sharding import Mesh
-from kernel_matrix import AXES
+from kernel_matrix import AXES, head_shapes
 from reference_error import assert_as_exact
 
 from dew.nn import attention, attention_kernels
@@ -58,15 +58,9 @@ def _step(case: dict[str, str], kernel: str):
     return step
 
 
-def _shapes(case: dict[str, str]) -> tuple[int, int, int, jnp.dtype]:
-    """`case`'s query heads, key heads, head width and dtype."""
-    heads, kv_heads = HEADS[case["heads"]]
-    return heads, kv_heads, int(case["width"]), jnp.dtype(case["dtype"])
-
-
 def _spec(case: dict[str, str]) -> tuple:
     """`case`'s step's operands as shapes and dtypes: the query, key, value and output cotangent."""
-    heads, kv_heads, width, dtype = _shapes(case)
+    heads, kv_heads, width, dtype = head_shapes(case, HEADS)
     query = jax.ShapeDtypeStruct((1, LENGTH, heads, width), dtype)
     key = jax.ShapeDtypeStruct((1, LENGTH, kv_heads, width), dtype)
     return query, key, key, query
@@ -135,7 +129,7 @@ def a_kernels_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The op's training step of `case` on its kernel, on its device, on par with the reference path's (check
     1), from the float64 terms. Its routes take the kernel named and the reference path alone."""
     named = dict(zip(AXES["attention_kernels"], case, strict=True))
-    heads, kv_heads, width, dtype = _shapes(named)
+    heads, kv_heads, width, dtype = head_shapes(named, HEADS)
     _, keep = _masked(named["mask"])
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_step(named, named["kernel"])), jax.jit(_step(named, REFERENCE)),
