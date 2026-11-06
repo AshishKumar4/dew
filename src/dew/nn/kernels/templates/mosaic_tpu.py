@@ -114,14 +114,21 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         # No lane decides a column: the index is its own offset.
         return jnp.zeros((), jnp.int32), self.iota(shape, 1)
 
+    # A launch's operands stay in HBM (`VmemRings.kernel`), which a core reads only through a copy: each read
+    # copies its ref into a scoped buffer first (a VMEM ref's own copy is VMEM to VMEM).
     def rows_of(self, ref) -> jax.Array:
-        return ref[...]
+        return _read(ref)
 
     def columns_of(self, ref) -> jax.Array:
-        return ref[...]
+        return _read(ref)
 
     def tile_of(self, ref) -> jax.Array:
-        return ref[...]
+        return _read(ref)
+
+    def scalar_of(self, ref) -> jax.Array:
+        # A scalar a core's scalar unit reads: its first entry copied into SMEM.
+        return pl.run_scoped(lambda held: (pltpu.sync_copy(ref.at[pl.ds(0, 1)], held), held[0])[1],
+                             pltpu.SMEM((1,), ref.dtype))
 
     def key_magnitudes(self, tile) -> jax.Array:
         return jnp.max(jnp.abs(tile[...]), axis=1).astype(jnp.float32)
@@ -407,6 +414,12 @@ class Mxu(MxuIssuer, VmemRings):
 
 MXU = Mxu()
 """The TPU bundle (`bundles.of` on a TPU)."""
+
+
+def _read(ref) -> jax.Array:
+    """`ref`'s whole value through a scoped VMEM buffer of its shape (`pltpu.sync_copy`)."""
+    return pl.run_scoped(lambda held: (pltpu.sync_copy(ref, held), held[...])[1],
+                         pltpu.VMEM(ref.shape, ref.dtype))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:
