@@ -31,6 +31,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict
+from interop_support import clearing_selections, token_draw, transformers_arms
+from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
@@ -133,9 +135,6 @@ def test_the_trunk_is_transformers():
     float64 twin's (check 1, row 354), as released: no tie order forced on its selections; the rows drawn
     clear its indexer's and routers' choices with no tie at a budget (`clearing_selections`,
     `stable=False`, torch's `topk` stating no tie order)."""
-    from interop_support import clearing_selections, token_draw, transformers_arms
-    from reference_error import assert_as_exact
-
     from tools.decoder_export_reference import Case, reference_model
 
     source = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
