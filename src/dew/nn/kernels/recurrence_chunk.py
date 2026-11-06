@@ -598,7 +598,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
                                      max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
                                      floor=hooks.floor, bound=hooks.inverse_bound,
-                                     rounded=chunk_rounding(hooks.delta))
+                                     rounded=chunk_rounding(hooks.delta, jnp.result_type(query, key, value)))
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
@@ -959,7 +959,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor, bound=bound,
-                     rounded=chunk_rounding(delta),
+                     rounded=chunk_rounding(delta, jnp.result_type(query, key, value)),
                      recomputed=recomputed_memory())
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
@@ -1444,8 +1444,8 @@ def fast_rounding() -> bool:
     return generation.numerics().forms == 'fast'
 
 
-def chunk_rounding(delta: bool) -> bool:
-    """Whether a call on the delta rule's route (`chunk`, `port_kernel`) takes the run's fast
+def chunk_rounding(delta: bool, dtype) -> bool:
+    """Whether a call of `dtype` on the delta rule's route (`chunk`, `port_kernel`) takes the run's fast
     forms' numbers (`fast_rounding`): the delta rule's alone, whose bar is fla's (TF32 products in an fp32
     call). A form without the delta rule has no port, its bar the portable math at full fp32: an fp32 call's
     two bf16 parts put its training step 30 to 69 times the portable math's distance from float64 on every
@@ -1454,6 +1454,7 @@ def chunk_rounding(delta: bool) -> bool:
     (`_rated_scan`). Rounded there, a write gate without the delta rule passed its values between launches
     in bf16, its final memory 2.1e4 times the portable math's distance from float64 under aligned keys
     (interpreted at 2b595ff93, 9593 to 46978 times on an H100, gpuflow-a-abfff38d9)."""
+    del dtype  # The run's declaration rounds a call by its dtype (`fast_rounding`, row 4673).
     return fast_rounding() and delta
 
 

@@ -195,7 +195,8 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
                                 floor=hooks.floor, bound=hooks.inverse_bound,
-                                rounded=fast_rounding() if hooks.rated else chunk_rounding(hooks.delta))
+                                rounded=fast_rounding() if hooks.rated else chunk_rounding(
+                                    hooks.delta, jnp.result_type(query, key, given.value)))
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
