@@ -992,7 +992,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     initial state (`Initial`, or None) and a training forward's residuals (`forward`'s). Returns its
     gradients (`Gradients`). Its config comes from the family's facts and the call's extents (`derived`: one
     launch for a fast-form call whose score hook takes no parameters, deterministic mode's a full or causal
-    one's, two for the accurate form and a call whose hook does),
+    one's, two for the accurate form and a call whose hook does or that drops),
     legal within the device's block and a consumer's registers (`legal`)."""
 
     HOOKS = ("score_mod",)
@@ -1032,15 +1032,17 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
         # The one launch adds each tile's dQ under the first pass's D: the fast form's, an undropped call's
-        # of equal head widths with no initial state, its dK/dV program queries first on the dQ launch's
-        # layout or keys first on one whose consumers share a key block (`split_queries`), each consumer's
-        # share of a slot's queries a warpgroup MMA's rows (dQ's product's M), or keys first each consumer
-        # its own keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`). A score hook's
-        # only queries first, and one of no parameters, whose gradients no launch writes (Gemma 2's softcap,
-        # FlashAttention 3's; at width 256 its consumers sharing a key block, `attention_mosaic_coop`).
-        hooked = (bool(self.score_kinds) or ba.arguments["initial"] is not None
-                  or ba.arguments["drop"] is not None)
-        if config.fused and self.score_mod is not None and not config.queries_first:
+        # of equal head widths, its dK/dV program queries first on the dQ launch's layout or keys first on
+        # one whose consumers share a key block (`split_queries`), each consumer's share of a slot's queries
+        # a warpgroup MMA's rows (dQ's product's M), or keys first each consumer its own keys over the whole
+        # slot where they share dQ (`BackwardTiles.shared_dq`). A score hook's and an initial state's only
+        # queries first (at width 256 its consumers sharing a key block, `attention_mosaic_coop`), and a
+        # hook of no parameters, whose gradients no launch writes (Gemma 2's softcap, FlashAttention 3's);
+        # the state's (gpt-oss's sinks) the first pass's D and the keys' share of the weights give
+        # (`gradient.split_mass`), its weights' denominator the forward's.
+        hooked = bool(self.score_kinds) or ba.arguments["drop"] is not None
+        if (config.fused and (self.score_mod is not None or ba.arguments["initial"] is not None)
+                and not config.queries_first):
             return False
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         dkv_family = found.get(config.dkv.family)
@@ -1098,10 +1100,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         launches walk the largest their registers and the block hold, two stages, one consumer, whose step
         issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
         at 64 x 64 with two consumers and one). The fast form of a hookless call (or one whose hook takes no
-        parameters: a softcap) takes one launch where one holds the whole width, its dK/dV program queries
-        first adding each tile's dQ atomically (FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and
-        128 over 1k to 8k tokens; ET-A05AB3-h100: 5.20 against 6.19 ms the two keys-first launches at
-        Qwen3-8B causal, 1.19 against 1.53 at width 64;
+        parameters, a softcap, or under an initial state, sinks) takes one launch where one holds the whole
+        width, its dK/dV program queries first adding each tile's dQ atomically (FUSEDFORM-h100: 1.05 to 1.4
+        times as fast at widths 64 and 128 over 1k to 8k tokens; ET-A05AB3-h100: 5.20 against 6.19 ms the two
+        keys-first launches at Qwen3-8B causal, 1.19 against 1.53 at width 64;
         check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
         temporaries against 258 at llama-d128 2 x 4096, its dQ fp32), a call over key spans, windows,
         documents or runs as a plain one (ET-CROSS-h100 and ET-SPAN4-h100, the attention launches a training
