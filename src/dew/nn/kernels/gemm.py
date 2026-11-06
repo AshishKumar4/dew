@@ -453,6 +453,71 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     return summed.astype(out_dtype)
 
 
+def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_blocks: jax.Array,
+                                  row_scales: jax.Array, column_scales: jax.Array, *, out_dtype,
+                                  interpret_on_cpu: bool = False) -> jax.Array:
+    """Each group's rows of `lhs_t` (FP8 codes, `[depth, rows]`, the rows contiguous) times its rows of
+    `rhs_t` (FP8 codes, `[width, rows]`), contracted over the rows: `[groups, depth, width]` in `out_dtype`,
+    each 128-row block's partial, summed exactly in fp32, times its depth rows' scales (`row_scales`,
+    `[rows / 128, depth]`) and its columns' (`column_scales`, `[rows / 128, width]`) before it is added to
+    its group's sum: a blockwise FP8 recipe's kernel gradient (DeepSeek-V3's, row 4518). Group `g` holds
+    `group_blocks[g]` whole 128-row blocks, in order (a recipe pads each group's rows to them, DeepGEMM's
+    contiguous layout), so no block straddles groups. Its selector (`BLOCKWISE_FP8`) runs the template's
+    rows-contiguous kernel gradient where named (`mosaic_gpu.tgmm`'s `k_major`), else XLA's."""
+    sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
+    tile = _gradient_tile(lhs_t, rhs_t, sizes, interpret_on_cpu)
+    if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic_gpu':
+        assert tile is not None, "the selector names the template where it plans a tile"
+        launched = grouped_matmul.MosaicTgmm()._launched(tile, interpret_on_cpu)
+        summed = mosaic_gpu.tgmm(lhs_t, rhs_t, sizes, tiles=tile, out_dtype=jnp.float32,
+                                 multiprocessors=launched,
+                                 interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
+                                 exact_sums=True, k_major=True, step_scales=(row_scales, column_scales))
+    else:
+        summed = _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales)
+    return summed.astype(out_dtype)
+
+
+def _gradient_tile(lhs_t, rhs_t, sizes, interpret: bool) -> mosaic_gpu.Tiles | None:
+    """The template's tile for a blockwise kernel gradient (`blockwise_fp8_kernel_gradient`): the exactly
+    summed kernel gradient's derived tile for 16-bit operands of its shapes, at a 128-row step, where the
+    16-bit tile is legal at a 64-row one (an FP8 128-row step's bytes, the shared memory and registers it
+    holds: the launch takes no FP8 kernel gradient to plan, and a 16-bit step is at most a swizzled row's 64
+    elements); None where it plans none."""
+    launch = grouped_matmul.MosaicTgmm()
+    rows = lhs_t.shape[1]
+    bound = launch.bind(jax.ShapeDtypeStruct((rows, lhs_t.shape[0]), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((rows, rhs_t.shape[0]), jnp.bfloat16),
+                        jax.ShapeDtypeStruct(sizes.shape, jnp.int32), out_dtype='float32',
+                        interpret=interpret, exact_sums=True)
+    target = generation.gpu_target()
+    if not launch.eligible(bound, target) or (tile := launch.derived(bound, target)) is None:
+        return None
+    if not launch.legal(bound, dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH // 2), target):
+        return None
+    return dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH)
+
+
+def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax.Array:
+    """`blockwise_fp8_kernel_gradient`'s portable arm: each 128-row block's product in fp32 (FP8 values exact
+    in bfloat16, their products in fp32), times its scales, added in order into its group's fp32 sum."""
+    depth, width, blocks = lhs_t.shape[0], rhs_t.shape[0], row_scales.shape[0]
+    groups = group_blocks.shape[0]
+    owner = jnp.repeat(jnp.arange(groups), group_blocks, total_repeat_length=blocks)
+
+    def block(index, total):
+        rows = jax.lax.dynamic_slice_in_dim(lhs_t, index * grouped_matmul.SCALE_DEPTH,
+                                            grouped_matmul.SCALE_DEPTH, axis=1)
+        columns = jax.lax.dynamic_slice_in_dim(rhs_t, index * grouped_matmul.SCALE_DEPTH,
+                                               grouped_matmul.SCALE_DEPTH, axis=1)
+        partial = jax.lax.dot_general(rows.astype(jnp.bfloat16), columns.astype(jnp.bfloat16),
+                                      (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+        scaled = partial * row_scales[index][:, None] * column_scales[index][None, :]
+        return total.at[owner[index]].add(scaled)
+
+    return jax.lax.fori_loop(0, blocks, block, jnp.zeros((groups, depth, width), jnp.float32))
+
+
 def _step_scaled_tile(launch, bound, target, width: int, scaled: int) -> mosaic_gpu.Tiles | None:
     """The tile the template's launch plans for a blockwise-scaled product (`blockwise_fp8_product`): its
     derived FP8 tile at a 128-deep step, its columns the derived tile's, else the columns one column scale
