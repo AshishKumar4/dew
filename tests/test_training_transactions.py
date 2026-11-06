@@ -241,7 +241,7 @@ def _maxima(tree):
             if any(getattr(entry, "key", None) == "max_logits" for entry in path)]
 
 
-QK_CLIP_SEEDS = 4
+QK_CLIP_SEEDS = 8
 """Check 1's declared seeds for the step's QK-Clip against the clip's own update."""
 
 

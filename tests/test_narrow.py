@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from layout_parity import layouts_agree
+from placement_parity import layouts_agree, x64
 
 from dew.checkpoints import _filled
 from dew.nn.kernels.generation import chosen
@@ -159,14 +159,15 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     the trainer, its plan the last shape's."""
     from dew.batch import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
-    wide = jax.config.read("jax_enable_x64")
+    wide = x64()
     objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows, dex=dex, seed=seed,
                                 dtype=jnp.float64 if wide else jnp.bfloat16)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
                                              jnp.int32)}
     with chosen(narrow_copies='on' if copies else 'off'):
         trainer = Trainer(objective, optimizer, key=jax.random.key(seed), mesh=mesh or MeshSpec(),
-                          layout=Layout(min_shard=1, tolerance=1.0), accumulation=accumulation, split=split)
+                          layout=Layout(min_shard=1, tolerance=1.0), accumulation=accumulation, split=split,
+                          param_dtype="float64" if wide else None)
         state = trainer.initial_state()
         steps_by = {False: (trainer.compile(state, batch), None)}
         if long:
@@ -463,7 +464,7 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     def run(copies, seed):
         nonlocal budget
         # The float64 truth's wider arrays are planned in the whole memory, where the arms' plans are not.
-        budget = 2 ** 39 if jax.config.read("jax_enable_x64") else free
+        budget = 2 ** 39 if x64() else free
         state, losses, _ = _trained(optax.sgd(0.5), copies=copies, seed=int(seed), steps=3, accumulation=2,
                                     split=1, remat="full", rows=8, longer=64)
         return {"state": state.variables, "losses": losses}
