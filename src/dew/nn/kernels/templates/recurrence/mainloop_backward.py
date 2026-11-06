@@ -6,6 +6,7 @@ template's (`template.planned`, `template.backward_holds`)."""
 import dataclasses
 import functools
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -70,11 +71,55 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
 
 
-def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, firsts=None,
-              max_segments: int | None = None, scale: float | None = None,
-              family: mosaic.Family | None = None, interpret: bool = False,
-              inverse=None, kept=None, delta: bool = True, floor: float | None = None, rounded: bool = False,
-              ranged: bool = False, skip=None):
+class Kept(NamedTuple):
+    """Each launch of the fast backward's outputs as it stores them (`kept_backward`), nothing computed again
+    for them: what check 2's witness holds each launch to (tests/recurrence_witness.py). Without the delta
+    rule the system's, values' and keys' launches take none (their fields None)."""
+
+    run: object
+    """The prepared call (`mainloop.prepared`): its laid operands, decay halves, inverse, corrected values
+    and stored memories, which the launches read."""
+    local: jax.Array
+    """`_local_back`'s corrected values' gradient from each chunk's own output."""
+    dh: jax.Array
+    """`_reverse`'s gradient of the memory each chunk leaves."""
+    dv: jax.Array
+    """`_reverse`'s corrected values' gradient."""
+    dh0: jax.Array
+    """`_reverse`'s gradient of the initial memory."""
+    ds: jax.Array
+    """`_scores_back`'s scores' gradient."""
+    decay_pairs: jax.Array
+    """`_scores_back`'s decay pair terms."""
+    dq: jax.Array
+    dk: jax.Array
+    dw: jax.Array | None
+    after: jax.Array
+    leaving: jax.Array
+    memory: jax.Array
+    """`_query_key`'s queries', keys' and weights' gradients and its decay terms."""
+    d_l: jax.Array | None
+    """`_system_back`'s system's gradient."""
+    values: jax.Array | None
+    values_beta: jax.Array | None
+    """`_values_back`'s values' gradient and beta's through `u`."""
+    keys: jax.Array | None
+    keys_beta: jax.Array | None
+    keys_after: jax.Array | None
+    keys_decay: jax.Array | None
+    """`_keys_back`'s keys' gradient and its beta, range and pair terms, a key block's each, unsummed."""
+
+
+def gradients(q, k, v, g, beta, h0, do, dfinal, **options):
+    """The fast backward's gradients (`kept_backward`'s first)."""
+    return kept_backward(q, k, v, g, beta, h0, do, dfinal, **options)[0]
+
+
+def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, firsts=None,
+                  max_segments: int | None = None, scale: float | None = None,
+                  family: mosaic.Family | None = None, interpret: bool = False,
+                  inverse=None, kept=None, delta: bool = True, floor: float | None = None,
+                  rounded: bool = False, ranged: bool = False, skip=None) -> tuple[tuple, "Kept | None"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
     call, or of a `rounded` call without it (the SSD's under the run's fast forms, `fast_backward_form`):
     `(dq, dk, dv, dg, dbeta, dh0, dskip)` for the output's and final memory's gradients `do`, `dfinal`, fla's
@@ -87,7 +132,9 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     math's token adjoint. Without the delta rule there is no system: the corrected values are the values
     gated, `u = v beta`, whose gradient `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v
     du)`, and the memory walks back with no `w^T dv`; a `skip` `[HV]` (Mamba2's `D`, `mainloop.forward`'s)
-    adds `D do` to `dv`, its own gradient `sum(v do)` (`dskip`, None without a skip)."""
+    adds `D do` to `dv`, its own gradient `sum(v do)` (`dskip`, None without a skip). Returns them with each
+    launch's outputs as stored (`Kept`), the forward's `kept_forward` beside it; a decay a key dimension's
+    (`key_backward`) keeps none yet."""
     if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
                                   "under the run's fast forms, an fp32 call's under them alone")
@@ -101,7 +148,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     if call.per_key:
         dq, dk, dv, dg, dbeta, dh0 = key_backward.gradients(run, laid_do, dht, tiles)
         dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
-        return (*_unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts), None)
+        return (*_unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts), None), None
     local = _local_back(run.q, run.k, laid_do, run.hi, run.lo, run.taken, call, scale=run.scale)
     # Without the delta rule the walk gates the values where their columns are the call's own. Padded, it
     # read a padded copy of them (0.061 ms of Nemotron-H 4B's SSD training on an H100) and its gate took
@@ -117,6 +164,8 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     dq, dk, dw, after, leaving, memory = _query_key(run.q, run.k, run.corrected, laid_do, dv2, run.h, dh, ds,
                                                     run.hi, run.lo, run.taken, run.beta, call,
                                                     scale=run.scale)
+    kept_ = Kept(run, local, dh, dv2, dh0, ds, decay_pairs, dq, dk, dw, after, leaving, memory,
+                 *[None] * 7)
     chunks = call.chunks
     dskip = None
     if delta:
@@ -124,6 +173,8 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
         dv, dbeta_u = _values_back(run.a, run.v, dv2, run.beta, run.taken, call)
         dk_w, dbeta_k, after_w, decay_w = _keys_back(run.a, run.k, dw, d_l, run.hi, run.lo, run.beta,
                                                      run.taken, call)
+        kept_ = kept_._replace(d_l=d_l, values=dv, values_beta=dbeta_u, keys=dk_w, keys_beta=dbeta_k,
+                               keys_after=after_w, keys_decay=decay_w)
         # The keys launch's terms a key block's, summed (each linear in them).
         dbeta_k, after_w, decay_w = (x.sum(0) for x in (dbeta_k, after_w, decay_w))
         dbeta = dbeta_u + dbeta_k
@@ -155,7 +206,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     extra = 0.0 if dk_w is None else keyed(headed(dk_w, width))
     grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, run.unlaid(dg), run.unlaid(dbeta), dh0, starts,
                     extra_dk=extra)
-    return (*grads, dskip)
+    return (*grads, dskip), kept_
 
 
 def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_dk=0.0) -> tuple:
