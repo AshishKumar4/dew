@@ -63,7 +63,7 @@ def run(kernel):
             return jax.jit(lambda x: jax.vjp(f, x)[0])(x)[1]
     return jax.jit(lambda x: jax.vjp(f, x)[0])(x)[1]
 
-with jax.experimental.enable_x64():
+with jax.enable_x64():
     truth = T.token_by_token(hooks, jax.tree.map(
         lambda y: y.astype(jnp.float64) if hasattr(y, 'dtype') and jnp.issubdtype(y.dtype, jnp.inexact) else y,
         x))[1]
