@@ -184,8 +184,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # and the fused one, each consumer its own keys over the stream they walk whole. The forward on it
         # has no use the producer's layout does not serve, and deadlocked (row 2599): it is no config.
         walks_whole = not isinstance(config, Tiles) and config.queries_first
-        # A decode step's 16-row tile on mma.sync's fed layout (an H100's, `few_rows`): one consumer feeding its
-        # own rings, no turns between consumers, whose dropped turns hung the two-consumer fed forward.
+        # A decode step's 16-row tile on mma.sync's fed layout (an H100's, `few_rows`): one consumer feeding
+        # its own rings, no turns between consumers, whose dropped turns hung the two-consumer fed forward.
         alone = (family is not None and isinstance(config, Tiles) and config.consumers == 1
                  and config.block_q < family.role_rows)
         return (family is not None and (walks_whole or alone or not split_queries(family))
