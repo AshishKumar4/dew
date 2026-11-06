@@ -36,12 +36,16 @@ from .layout import (
     Text,
 )
 from .model import DecisionModel
+from .release import released_decision, released_length, stated_release
 from .sources import PretrainedDecision
 
 SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the listed options. Respond with only "
                "its uppercase letter, with no explanation or reasoning.")
 _NOT_ONE_TOKEN = frozenset(["BQ", "BZ", "CJ", "CQ", "CZ", "DQ", "DZ", "EJ", "EY", "FJ", "FQ", "FV", "FZ",
                             "GJ", "GK", "GQ", "GZ", "HJ", "IY", "JF", "JG", "JH", "JL", "JN", "JQ"])
+SLOT_WINDOW = 32768
+"""The window a slot release's prompt takes where its release states none (`SlotSource.layout`): an external
+release that never declared one."""
 SLOT_LABELS = tuple(name for name in LABEL_NAMES if name not in _NOT_ONE_TOKEN)[:256]
 """OneJev qev/prompt.py's 256 labels at 81ce62f1597c91e46767d4d02d6ac2e18534fe94."""
 _PATHS = {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)}
@@ -142,9 +146,7 @@ class SlotSource(SourceKind):
         if not isinstance(layout, QuestionLayout) or layout.labels is None:
             raise ValueError("the slot format needs its whole-question layout")
         labels = layout.labels
-        expected = SlotSource.layout(max_len=layout.max_len, labels=labels, blocks=layout.blocks)
-        if layout != expected or bundle.calibration != Calibration():
-            raise ValueError("the slot format holds its release prompt and uncalibrated logits")
+        prompt = SlotSource.layout(max_len=layout.max_len, labels=labels, blocks=layout.blocks)
         ids = _records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
                              what="a list of label ids")
         canonical, picked = _labels(bundle.decision_tokenizer, len(ids))
@@ -171,6 +173,11 @@ class SlotSource(SourceKind):
             if writes_weights():
                 torch.save(tensors, root / "readout_head.pt")
         (root / "readout.json").write_text(json.dumps(readout, indent=2) + "\n")
+        # The release's window, which the readout's prompt takes (`describe`), and the layout whole where
+        # it is another than that prompt, and the calibration where the task has one.
+        stated_release(root, None if layout == prompt else layout,
+                       bundle.calibration if bundle.calibration != Calibration() else None,
+                       max_length=layout.max_len)
 
     @staticmethod
     def readout(bundle: PretrainedDecision) -> Mapping[str, np.ndarray]:
@@ -198,7 +205,7 @@ class SlotSource(SourceKind):
                               "the backbone's shards and readout_head.pt")
 
     @staticmethod
-    def layout(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all",
+    def layout(*, max_len: int = SLOT_WINDOW, keep: Literal["start", "end", "all"] = "all",
                labels: Labels = _LABELS,
                blocks: bool = False) -> QuestionLayout:
         """The release's whole-prompt encoding with thinking disabled and its question last."""
@@ -264,7 +271,11 @@ class SlotSource(SourceKind):
                 if mode == "slot_lm" else SlotHeadSource({"class": import_path(SlotReadout), "fields": {
                     "label_ids": [row[0] for row in ids], "head_dim": dimension, "slot_rows": count}},
                     _path, weight_file="readout_head.pt", initialize=_initialize))
-        layout = SlotSource.layout(labels=labels, blocks=blocks)
+        # The release's window, else an external release's default, over its prompt; and the layout and
+        # calibration it states whole over that.
+        layout, calibration = released_decision(
+            directory, SlotSource.layout(max_len=released_length(directory, SLOT_WINDOW), labels=labels,
+                                         blocks=blocks), Calibration(), kind=QuestionLayout)
         return CompositeSource(NativeComponent(config), head, PretrainedDecision.from_components, "",
-                               {"layout": layout, "calibration": Calibration(), "strict_specials": False,
+                               {"layout": layout, "calibration": calibration, "strict_specials": False,
                                 "writer": SlotSource.save, "exporter": SlotSource.export})

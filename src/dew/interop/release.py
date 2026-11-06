@@ -1,14 +1,12 @@
-"""A run's release metadata beside an export's config (`RELEASE_FILE`): the run's own task declaration, the
-numerics its tasks trace under and the dtype its model computes in, which `Pretrained.save` writes and
-`Pretrained.load` reads back in place of a family's defaults (ledger 4314). Its record is the release
-contract's task (`dew.config.Release`); generation_config.json, which every other reader reads, is derived
-from the same declaration.
+"""The release metadata of an export of a causal decoder's run (`dew.config.Release`'s task): the run's own
+task declaration, the numerics its tasks trace under and the dtype its model computes in, which
+`Pretrained.save` writes and `Pretrained.load` reads back in place of a family's defaults (ledger 4314).
+generation_config.json, which every other reader reads, is derived from the same declaration. The record, its
+file and its other fields (a decision release's layout) are the release contract's, `dew.config.release`.
 """
 
 from __future__ import annotations
 
-import json
-from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
@@ -25,38 +23,38 @@ from dew.nn.protocols import ComputesIn
 from dew.registry import DtypeName, dtype_name, from_record, to_record
 
 if TYPE_CHECKING:
+    from dew.config.release import Release
     from dew.inference.tasks import TaskSettings
-
-RELEASE_FILE = "dew_release.json"
-"""The file an export of a run writes its release metadata in, beside its config."""
 
 
 def release_record(settings: TaskSettings, numerics: Numerics | None, model: nn.Module,
-                   variables: Variables) -> Mapping[str, object]:
-    """The release metadata of a run's export: its task settings' record, its numerics and the dtype its
+                   variables: Variables) -> Release:
+    """The release of a run's export: its task settings' record, its numerics and the dtype its
     model computes in, the one it states (`ComputesIn`), else its parameters' (`variables`), which a
     module stating none computes in; the parameters' own dtypes are the export's."""
+    from dew.config.release import Release
     from dew.inference.tasks import TaskSettings
 
     stated = model.dtype if isinstance(model, ComputesIn) else None
     held = jnp.result_type(*(leaf.dtype for leaf in jax.tree.leaves(unboxed(variables))
                              if jnp.issubdtype(leaf.dtype, jnp.floating)))
     compute = held if stated is None else stated
-    return {"task": {"settings": to_record(settings, TaskSettings),
-                     "numerics": None if numerics is None else to_record(numerics, Numerics),
-                     "dtypes": {"compute": dtype_name(compute)}}}
+    return Release(task={"settings": to_record(settings, TaskSettings),
+                         "numerics": None if numerics is None else to_record(numerics, Numerics),
+                         "dtypes": {"compute": dtype_name(compute)}})
 
 
 def released(directory: Path) -> tuple[TaskSettings | None, Numerics | None, DtypeName | None]:
     """The run's own task settings, numerics and compute dtype an export of it wrote (`release_record`),
     or None for each where the directory holds none: a source with no run behind it builds its tasks from
     its own files, in the load's dtypes."""
+    from dew.config.release import Release
     from dew.inference.tasks import TaskSettings
 
-    path = directory / RELEASE_FILE
-    if not path.is_file():
+    release = Release.load(directory)
+    if release is None or release.task is None:
         return None, None, None
-    task = _records.record(_records.record(json.loads(path.read_text()), RELEASE_FILE)["task"], "task")
+    task = release.task
     numerics, dtypes = task.get("numerics"), _records.record(task["dtypes"], "dtypes")
     return (from_record(TaskSettings, _records.record(task["settings"], "settings"), dtypes=False),
             None if numerics is None else from_record(Numerics, _records.record(numerics, "numerics"),

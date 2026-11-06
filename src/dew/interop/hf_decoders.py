@@ -33,7 +33,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
@@ -64,7 +64,6 @@ from dew.interop.decoder_parts import (
     refuse_drafter,
     translated,
 )
-from dew.interop.release import RELEASE_FILE
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
 from dew.interop.unread import Stored, equal, held
 from dew.interop.weights import checkpoint_dtype, insert, nested
@@ -84,6 +83,9 @@ from dew.nn.vision.muse_glimmer import (
 from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
 from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.registry import from_record, towers
+
+if TYPE_CHECKING:
+    from dew.config.release import Release
 
 GENERATION_CONFIG_FILE = "generation_config.json"
 
@@ -1230,10 +1232,10 @@ def save_export_assets(
     tokenizer: str | ExportTokenizer | None = None,
     generation_config: Mapping[str, object] | None = None,
     named: bool = True,
-    release: Mapping[str, object] | None = None,
+    release: "Release | None" = None,
 ) -> None:
     """Write the tokenizer files and generation_config.json beside exported weights, and the run's
-    release metadata where the export has one (`release`, `dew.interop.release.RELEASE_FILE`).
+    release where the export has one (`release`, `dew.config.release.RELEASE_FILE`).
 
     Readers of the HF layout (transformers, llama.cpp and the runtimes on it) locate the
     vocabulary through tokenizer_config.json, so the tokenizer writes its own files here
@@ -1275,11 +1277,10 @@ def save_export_assets(
     if byte:
         values['tokenizer_name'] = "byte"
     write_atomically(os.path.join(directory, GENERATION_CONFIG_FILE), json.dumps(values, indent=2))
-    if release is not None:
-        write_atomically(os.path.join(directory, RELEASE_FILE), json.dumps(dict(release), indent=2))
-    else:
-        # An export without a run's declaration replaces one an earlier export of the directory wrote.
-        Path(directory, RELEASE_FILE).unlink(missing_ok=True)
+    # An export without a run's declaration replaces one an earlier export of the directory wrote.
+    from dew.config.release import Release
+
+    (Release() if release is None else release).write(directory)
 
 
 def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
