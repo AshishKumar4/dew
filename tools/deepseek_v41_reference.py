@@ -979,10 +979,10 @@ def write_padding() -> None:
                    json.loads((FIXTURE / "config.json").read_text()), FIXTURE)
 
 
-def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
+def clearing_rows(net, vocabulary: int, seed: int, clears=lambda ids: True) -> np.ndarray:
     """The `seed`-th drawn rows `[2, LENGTH]` (from the seed's stream, redrawn until it does) whose every
-    top-k of the release's plain forward clears the gate's `MARGIN` (tests/selection_margins.py): rows a
-    float32 port selects over as the release does."""
+    top-k of the release's plain forward clears the gate's `MARGIN` (tests/selection_margins.py), and
+    which `clears` besides: rows a float32 port selects over as the release does."""
     from selection_margins import MARGIN
 
     generator = torch.Generator().manual_seed(0x4241 + seed)
@@ -995,7 +995,7 @@ def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
             forward(net, ids.to(next(net.parameters()).device))
         RECORDS.clear()
         margins = [call["margin"] for call in recorded.calls.get("selection", [])]
-        if all(bool((margin > MARGIN).all()) for margin in margins):
+        if all(bool((margin > MARGIN).all()) for margin in margins) and clears(ids.numpy()):
             return ids.numpy().astype(np.int32)
 
 
@@ -1139,6 +1139,34 @@ def release_vision(net, inputs: dict[str, np.ndarray]) -> np.ndarray:
     return torch.stack(found, 1).double().cpu().numpy()
 
 
+def dew_clears(ids: np.ndarray) -> bool:
+    """Whether Dew's float64 forward of the fixture as the release runs it (bf16's model, its quantizers on)
+    selects over `ids` clear of the gate's MARGIN by the gate's own reading of every selection
+    (`selection_margins.margin`: an indexer's top-k and its ties at zero agreement, its pooled blocks, a
+    router's groups and experts), which the release's top-k margins alone leave out; Dew's float64 run is
+    the release's to float64's rounding (tests/test_deepseek_v41.py holds its sketch to the recording's)."""
+    import jax
+    import jax.numpy as jnp
+    import selection_margins
+    from model_support import float64_twin
+
+    loaded = _dew_release()
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf,
+                            loaded.variables)
+        _, captured = selection_margins.capturing(float64_twin(loaded.model), wide, jnp.asarray(ids))
+    return selection_margins.margin(loaded.model_config, captured, "release rows") > selection_margins.MARGIN
+
+
+@functools.cache
+def _dew_release():
+    """The fixture loaded by Dew as the release runs it (`dew_clears`)."""
+    from dew.interop import Pretrained
+
+    return Pretrained.load(FIXTURE, dtype="bfloat16", attention_impl="reference")
+
+
 def write_release_recording():
     """release.npz beside the fixture, on a CUDA GPU: the release's logits at every position (`release_rows`)
     as released, bf16 over its own tilelang kernels and its activation quantizers, and their float64 truth
@@ -1172,7 +1200,7 @@ def write_release_recording():
     def draw(index: int) -> dict[str, np.ndarray]:
         if index not in rows:
             with widened(twin_module):
-                rows[index] = clearing_rows(twin, TINY["vocab_size"], index)
+                rows[index] = clearing_rows(twin, TINY["vocab_size"], index, dew_clears)
         return {"input_ids": rows[index]}
 
     @functools.cache

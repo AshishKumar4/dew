@@ -415,12 +415,16 @@ def test_an_image_prompt_computes_the_releases_logits(tmp_path):
     loaded = Pretrained.load(vision_bundle(tmp_path), dtype="bfloat16", attention_impl="reference")
     model, variables = loaded.model, loaded.variables
 
+    with np.load(TINY / "release_rows.npz") as stored:
+        prompts = {name: stored[f"vision_{name}"] for name in ("pixels", "input_ids", "token_types")}
+    # Every prompt's image span the same, GRID's at IMAGE_START_AT: the logits from the token after it.
+    prompt = int(np.flatnonzero(prompts["token_types"][0, 0] >= 0)[-1]) + 2
+
     def logits(model, variables, inputs):
-        ids = jnp.asarray(inputs["input_ids"])
-        media = inputs["token_types"] >= 0
-        prompt = int(np.flatnonzero(media[0])[-1]) + 2
+        media = jnp.asarray(inputs["token_types"]) >= 0
         return {"logits": model.apply(
-            variables, ids, image_indices=jnp.asarray(np.where(media, np.cumsum(media, -1) - 1, -1)),
+            variables, jnp.asarray(inputs["input_ids"]),
+            image_indices=jnp.where(media, jnp.cumsum(media, -1) - 1, -1),
             conditioning={"pixel_values": jnp.asarray(inputs["pixels"])[None, None]})[:, prompt - 1:]}
 
     wide = float64_twin(model)
@@ -431,8 +435,6 @@ def test_an_image_prompt_computes_the_releases_logits(tmp_path):
                                 if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
             return logits(wide, held, inputs)
 
-    with np.load(TINY / "release_rows.npz") as stored:
-        prompts = {name: stored[f"vision_{name}"] for name in ("pixels", "input_ids", "token_types")}
     site = "deepseek v41 release vision"
     seeds = declared_seeds(RELEASE)[site]
     draw, reference, truth = indexed_recording(
