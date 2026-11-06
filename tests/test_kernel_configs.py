@@ -770,8 +770,10 @@ def test_each_triton_call_needs_a_launch_of_its_own():
         lines = "\n".join(thunks).splitlines()
         dropped = next(index for index, line in enumerate(lines) if missing in line)
         without = ["\n".join(lines[:dropped] + lines[dropped + 1:])]
-        assert triton_evidence(calls, without) == {
-            "error": f"no launch of its own states the shared bytes of {said}"}
+        evidence = triton_evidence(calls, without)
+        # Refused, naming the call whose launch is gone, and no other.
+        assert "shared" not in evidence and said in evidence["error"].split()
+        assert ({"probe", "probe_headroom"} - {said}).isdisjoint(evidence["error"].split())
 
 
 def test_records_a_failed_process_of_their_own_wrote_are_refused():
