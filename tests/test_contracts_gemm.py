@@ -168,6 +168,29 @@ def test_a_once_rounded_biased_layer_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_an_mxfp8_projection_holds_every_reverse_order(edge):
+    """`gemm.mxfp8_projection` (the MXFP8 recipe, its custom VJP the recipe's own MX products, declared as a
+    surrogate): every reverse order, under a nested jit and a scan, in the rows and the matrices, finite
+    wherever float64 is a normal float32 and wherever the recipe's own fp32 sums are (tests/mx_matrix.py's
+    `recipe_truth`, its float64 run the truth: a value quantized can round up past float32's largest where
+    the unquantized one does not), at values whose products near float32's ends (row 2513). It takes no
+    forward order: a custom VJP has none."""
+    import mx_matrix
+
+    group_blocks = jnp.asarray([1, 0, 1], jnp.int32)
+    primals = normal_draw(2519, (256, 128), (3, 128, 128), scale=EDGES[edge])
+    direction = normal_draw(2520, (256, 128), (3, 128, 128), scale=EDGES[edge])
+    (cotangent,) = normal_draw(2521, (256, 128))
+
+    def recipe(rows, matrices):
+        return gemm.mxfp8_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
+
+    assert_contract(recipe, primals, direction, cotangent, f"an mxfp8 projection {edge}",
+                    truth_fn=mx_matrix.recipe_truth(group_blocks),
+                    plain_fn=mx_matrix.recipe_truth(group_blocks, jnp.float32), without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_a_blockwise_fp8_projection_holds_every_reverse_order(edge):
     """`gemm.blockwise_fp8_projection` (DeepSeek-V3's blockwise FP8 recipe, its custom VJP the recipe's own
     FP8 products, declared through `derivatives.declared_derivative` as a surrogate): every reverse order,

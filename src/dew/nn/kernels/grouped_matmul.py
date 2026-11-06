@@ -950,6 +950,8 @@ class MosaicGmm(_Mosaic):
     FP8: ClassVar[bool] = True
     STEP_SCALED: ClassVar[bool] = False
     """Whether its kernel streams a step's rows' scales beside its ring (`MosaicStepScaledGmm`)."""
+    BLOCK_SCALED: ClassVar[bool] = False
+    """Whether its kernel streams an MX product's block scales beside its rings (`MosaicMxGmm`)."""
 
     def output_sides(self, ba) -> tuple[int, int]:
         return _product_sides(ba)
@@ -963,7 +965,8 @@ class MosaicGmm(_Mosaic):
             epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
             dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
-            paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED)
+            paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED,
+            block_scaled=self.BLOCK_SCALED)
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A group's rows on average over the call's groups, which a stack read from its `first` matrix
@@ -1294,6 +1297,31 @@ class MosaicStepScaledGmm(MosaicGmm):
         # Beside the exact product's live set, a step's column scales in its accumulator's column layout.
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         return super().registers(ba, config) + family.column_registers(config.block_n, jnp.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class MosaicMxGmm(MosaicGmm):
+    """`MosaicGmm` of an MX product (`gemm.mxfp8_product`, row 4519), planned on the call it is: FP8 rows
+    times a K-major FP8 matrix, each 32 depths of each scaled by its E8M0 scale in the products
+    (`mosaic_gpu.gmm`'s `mx_scales`, `mosaic.Issuer.scaled_products`), its block scales streamed beside its
+    rings (`gmm_allocations`' `block_scaled`) on a family whose products take them (tcgen05's), its tiles
+    whole 128s of rows, columns and depth, and no split, swap, hook or exact sums."""
+
+    BLOCK_SCALED: ClassVar[bool] = True
+
+    def _fp8(self, ba, dtype, family: mosaic.Family | None) -> bool:
+        # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted.
+        return (jnp.dtype(dtype) in EIGHT and family is not None and family.takes_block_scales
+                and ba.arguments['trans_rhs'] and ba.arguments['hooks'] == NO_HOOKS
+                and ba.arguments.get('paired') is None and not ba.arguments.get('exact_sums'))
+
+    def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        whole = all(extent % 128 == 0 for extent in (config.block_m, config.block_n, config.block_k))
+        return config.splits == 1 and not config.swapped and whole and super().candidate(ba, config, target)
+
+    def _swapped(self, ba, target):
+        # Its scales are its rows' and columns': no swapped orientation reads them.
+        del ba, target
 
 
 @dataclasses.dataclass(frozen=True)
