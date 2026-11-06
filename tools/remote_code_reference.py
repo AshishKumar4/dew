@@ -114,8 +114,15 @@ RELEASES = {
                                                "processing_lfm3_vl.py", "image_processing_lfm3_vl.py",
                                                "video_processing_lfm3_vl.py"),
                      "AutoModelForImageTextToText"),
+    # Kimi K2.5's processor (KimiK25Processor and its vision processor), its release's own code, whose
+    # public call takes `medias` and returns `grid_thws` (`dew.interop.processors.Processor.media`), and
+    # the chat template that writes an image part's placeholder.
+    "kimi-k25-tiny": ("moonshotai/Kimi-K2.5", "4d01dfe0332d63057c186e0b262165819efb6611",
+                      ("kimi_k25_processor.py", "kimi_k25_vision_processing.py", "media_utils.py",
+                       "preprocessor_config.json", "chat_template.jinja"), "AutoModelForCausalLM"),
 }
 LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "lfm3-vl-tiny": "lfm1.0",
+            "kimi-k25-tiny": "modified-mit",
             "mimo-v2-tiny": "mit", "mimo-v2-vl-tiny": "mit",
             "dream-tiny": "apache-2.0", "llada-tiny": "mit"}
 """The license of each release a recording (`--record`) runs, as its Hub card states it."""
