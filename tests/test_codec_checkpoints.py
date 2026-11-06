@@ -17,15 +17,11 @@ import numpy as np
 import pytest
 from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors
 from reference_error import assert_as_exact, indexed_recording, recording
-from tool_support import run_from
 
 from dew.interop import Pretrained
 from dew.interop.safetensors_io import read_weights
 
 CODECS = Path(__file__).parent / "fixtures" / "codecs"
-GENERATORS = {"modelopt": "modelopt_nvfp4_reference", "nvfp4_qdq": "nvfp4_qdq_reference",
-              "storage": "nvfp4_storage_reference"}
-"""Each checkpoint kind's generator, whose `draw` the recording's ids are drawn by."""
 CHECKPOINTS = ("modelopt/tiny", "modelopt/mixed", *(f"nvfp4_qdq/{kind}" for kind in NVFP4_QDQ_CASES),
                "storage/fp8", "storage/nvfp4")
 
@@ -44,10 +40,10 @@ def test_a_quantized_checkpoint_computes_its_reference_and_saves_its_own_bytes(n
     directory = CODECS / name
     recorded = recording(directory / "reference.npz")
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    with run_from(GENERATORS[name.split("/")[0]], "tools") as generator:
-        redraw = generator.draw
     seeds = int(recorded["logits.seeds"])
-    draw, reference, truth = indexed_recording(recorded, "logits", seeds, inputs_of=redraw)
+    # The recording keeps its ids, a few bytes a draw: the format author's environment (ModelOpt's on CUDA)
+    # is the generator's, not the test's.
+    draw, reference, truth = indexed_recording(recorded, "logits", seeds)
     assert_as_exact(lambda index, inputs: {"logits": loaded.model.apply(loaded.variables, inputs["ids"])},
                     reference, draw, f"{name} logits", seeds=seeds, truth_fn=truth)
     index, inputs = draw(0)

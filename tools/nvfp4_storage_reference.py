@@ -141,7 +141,7 @@ def checkpoint(kind: str) -> None:
 
     from recorded_references import record_case
 
-    recorded = record_case("logits", draw, evaluate, store_inputs=False)
+    recorded = record_case("logits", draw, evaluate)
     np.savez(directory / "reference.npz", published_ids=ids.numpy(), published_logits=published, **decoded,
              **recorded)
     print(kind, "recorded the reference's logits over", int(recorded["logits.seeds"]), "seeds")

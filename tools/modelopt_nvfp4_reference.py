@@ -152,7 +152,7 @@ def recorded_logits(reference, wide) -> dict[str, np.ndarray]:
         with float64(), torch.no_grad():
             return {"logits": narrow}, {"logits": wide(drawn, use_cache=False).logits.cpu().numpy()}
 
-    return record_case("logits", draw, evaluate, store_inputs=False)
+    return record_case("logits", draw, evaluate)
 
 
 def tiny(*, mixed: bool = False) -> None:

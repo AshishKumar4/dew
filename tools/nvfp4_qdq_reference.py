@@ -76,7 +76,7 @@ def recorded_logits(model, exact, directory: Path) -> dict[str, np.ndarray]:
                 "compressed_tensors.quantization.lifecycle.forward.forward_quantize", quantize_wide):
             return {"logits": narrow}, {"logits": exact(ids, use_cache=False).logits.numpy()}
 
-    return record_case("logits", draw, evaluate, store_inputs=False,
+    return record_case("logits", draw, evaluate,
                        dew=lambda inputs: {"logits": np.asarray(forward(loaded.variables, inputs["ids"]))})
 
 
