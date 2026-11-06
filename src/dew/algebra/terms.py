@@ -46,12 +46,14 @@ BINARY = frozenset({"add", "sub", "mul", "div", "max", "min", "pow", "atan2", "r
                     "or", "xor"})
 UNARY = frozenset({"neg", "exp", "exp2", "log", "log2", "log1p", "expm1", "sqrt", "rsqrt", "abs", "sign",
                    "tanh", "logistic", "integer_pow", "square", "sin", "cos", "erf", "erf_inv", "floor",
-                   "ceil", "round", "is_finite", "not"})
+                   "ceil", "round", "is_finite", "not", "optimization_barrier"})
 COMPARISONS = frozenset({"lt", "le", "eq", "ne", "ge", "gt"})
 REDUCTIONS = {"reduce_sum": "sum", "reduce_max": "max", "reduce_min": "min"}
 SHAPES = frozenset({"broadcast_in_dim", "reshape", "transpose", "squeeze", "expand_dims"})
 """The primitives of the language (§1): elementwise arithmetic and comparisons, casts, the layout changes, the
-reductions a rule reads, and products (`dot_general`). Every other equation is a leaf of the region."""
+reductions a rule reads, and products (`dot_general`); an optimization barrier among the unaries, whose value
+is its operand's, which no rule rewrites through (a value rounded once before its readers, as a declaration's
+dropped products are). Every other equation is a leaf of the region."""
 RESCALE = "rescale"
 """A binary no program holds: a derived walk's rescale of a carried state from its first operand's anchor to
 its second's where the declaration states its own (`derive.Reduction.rescale`), evaluated by that function
@@ -841,7 +843,9 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
     for constructor in (Term.unary, Term.convert, Term.shaped, Term.reduce):
         if (args := get_callable_args(term, constructor)) is not None:
             primitive, given = region_.params[integer(args[-1])]
-            return primitive.bind(value(args[0]), **given)
+            made = primitive.bind(value(args[0]), **given)
+            # A barrier of one value binds as a primitive of many results, its one result its value.
+            return made[0] if primitive.multiple_results else made
     raise ValueError(f"a term of no known constructor: {term}")
 
 
