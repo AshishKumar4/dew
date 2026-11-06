@@ -283,6 +283,21 @@ def raw(q, k, v, rows, keys):
 SCALE = WIDTH ** -0.5
 
 
+def test_a_maximum_read_only_floored_is_carried_from_its_floor():
+    """A walked maximum the declaration reads only floored at the least finite value (`held_floored`'s,
+    attention's `max(m, least)`) starts its walk at that floor, as the hand walk carries it, not at -inf,
+    and the walk is on par with the declared function against the float64 truth (check 1), the query that
+    sees no key among its rows."""
+    forms = derive.derive(declared(held_floored), accurate=False, saturation=SATURATION)
+    q, k, v = draw(0)
+    shapes = shaped(tile_of(operands(q, k, v), 0))
+    roles = [role for role, _ in forms.slots(shapes)]
+    peak = forms.init(shapes)[roles.index("max")]
+    np.testing.assert_array_equal(np.asarray(peak), np.full(peak.shape, np.finfo(peak.dtype).min))
+    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(held_floored)), draw, "floored walk",
+                    seeds=16)
+
+
 def natural_exp(x, scale=1.0):
     """An exponential of the declaration's own, of `x` times `scale`: `exp` by way of `exp2` (a launch's
     lowering of it)."""
