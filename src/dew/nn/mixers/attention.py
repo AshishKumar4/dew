@@ -164,7 +164,7 @@ class CallVisibility(NamedTuple):
     """A call's own visibility over its keys (`call_visibility`), which replaces a layer's causality,
     documents, groups and validity: its mask `[B, 1, queries, keys]`, its key runs `[B, queries, R, 2]`
     (the template's spans), the window the runs are read under, the places its keys are read at, a cached
-    call's queries' places the window counts from (None: the call's own tokens, read at `key_places`),
+    call's queries' places (None: the call's own tokens, read at `key_places`),
     and its keys' validity `[B, keys]` (`AttentionMetadata.key_valid`)."""
 
     mask: jax.Array | None
@@ -222,8 +222,8 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
         raise ValueError("attention_key_runs must be [B, queries, R, 2]")
     window = None if key_positions is None else sliding_window
     key_places = key_places if key_positions is None else key_positions
-    # A cached call's queries are not its keys: the window counts from their rotary positions.
-    query_places = (None if window is None or keys == queries
+    # A cached call's queries are not its keys: they are read at their rotary positions.
+    query_places = (None if keys == queries
                     else jnp.broadcast_to(jnp.asarray(rotary_positions), (batch, queries)))
     return CallVisibility(None, runs, window, key_places, query_places, valid)
 
