@@ -27,6 +27,7 @@ from dew.interop.decoder_parts import (
     PREDICTION_STEP_END,
     DecoderFamily,
     Packed,
+    prediction_name,
     prediction_path,
     record_bool,
     record_int,
@@ -278,30 +279,35 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
 
 def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
     """Invert the checkpoint's tensor names for source-layout exports."""
-    parts = dew_name.split(".")
-    if parts[0].startswith("mtp_"):
-        return _prediction_name(parts, config)
+    if dew_name.startswith("mtp_"):
+        return _prediction_name(dew_name, config)
     return mamba2.export_path(dew_name, config, layer_names=_LAYER_NAMES, family="Nemotron-H")
 
 
-def _prediction_name(parts: list[str], config: Mapping[str, object]) -> str:
-    """`_prediction_path` backwards: the `mtp.layers.{i}.*` name of a step's leaf."""
+def _prediction_name(dew_name: str, config: Mapping[str, object]) -> str:
+    """`_prediction_path` backwards (`prediction_name`): the `mtp.layers.{i}.*` name of a step's leaf, its
+    own leaves at their block of the step (its first's input maps, its last's final norm), its blocks'
+    pre-norms and mixers as the trunk's layer 0's."""
     blocks = _step_blocks(config)
-    first = int(parts[0].removeprefix("mtp_")) * blocks
-    own = tuple(parts[1:])
-    for position, leaves in ((0, _STEP_START), (blocks - 1, PREDICTION_STEP_END)):
-        named = {path: name for name, path in leaves.items()}
-        if own in named:
-            return f"mtp.layers.{first + position}.{named[own]}"
-    for position, (norm, slot) in enumerate(_STEP_SLOTS[:blocks]):
-        if own == ("block", norm, "scale"):
-            return f"mtp.layers.{first + position}.norm.weight"
-        if own[:2] == ("block", slot):
-            trunk = mamba2.export_path(".".join(("layers_0", "self_attn", *own[2:])), config,
-                                       layer_names=_LAYER_NAMES, family="Nemotron-H")
-            assert trunk is not None
-            return f"mtp.layers.{first + position}." + trunk.removeprefix("backbone.layers.0.")
-    raise ValueError(f"{'.'.join(parts)!r} is not a Nemotron-H CausalTransformer parameter")
+    # Each own leaf, and each block's leaf, named past its step's first block, its block's place first.
+    leaves = {**{f"0.{name}": path for name, path in _STEP_START.items()},
+              **{f"{blocks - 1}.{name}": path for name, path in PREDICTION_STEP_END.items()}}
+
+    def block(path: tuple[str, ...]) -> str:
+        for position, (norm, slot) in enumerate(_STEP_SLOTS[:blocks]):
+            if path == (norm, "scale"):
+                return f"{position}.norm.weight"
+            if path[:1] == (slot,):
+                trunk = mamba2.export_path(".".join(("layers_0", "self_attn", *path[1:])), config,
+                                           layer_names=_LAYER_NAMES, family="Nemotron-H")
+                assert trunk is not None
+                return f"{position}." + trunk.removeprefix("backbone.layers.0.")
+        raise ValueError(f"{dew_name!r} is not a Nemotron-H CausalTransformer parameter")
+
+    depth, tail = prediction_name(dew_name, "mtp", leaves, block)
+    assert tail is not None
+    position, name = tail.split(".", 1)
+    return f"mtp.layers.{depth * blocks + int(position)}.{name}"
 
 
 NEMOTRON_H = DecoderFamily(

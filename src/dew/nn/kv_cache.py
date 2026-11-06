@@ -71,7 +71,9 @@ PLACES = "cached_places"
 GROUPS = {"image_groups": "cached_image_groups", "block_groups": "cached_block_groups"}
 """Each cached key's image or block group (`dew.nn.inputs.AttentionMetadata`), kept beside the key where a
 layer reads it (`Append.groups`), by the field's name."""
-POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale", PLACES, *GROUPS.values()})
+SCALES = frozenset({"key_scale", "value_scale"})
+"""A quantized pool's scale leaves (`scale_shape`)."""
+POOLED = frozenset({"cached_key", "cached_value", *SCALES, PLACES, *GROUPS.values()})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
 ROUNDING_KEYS = "rounding_keys"
 """A per-row cache leaf, each row's key data of its stochastic-rounding stream `[rows, words]`, which a
@@ -222,6 +224,16 @@ def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
     product = float32_einsum("...d,de->...e", values.astype(jnp.float32), rotation,
                              precision=jax.lax.Precision.HIGHEST)
     return product.astype(values.dtype)
+
+
+def scale_shape(shape: tuple[int, ...], layout: KVCache) -> tuple[int, ...]:
+    """A quantized pool's scales' shape for codes of `shape` (`KVStore.open`): a scale a token and head, each
+    head's tokens contiguous, `[heads, pages, page_size]` for a paged pool's `[heads, pages, page_size, D]`,
+    `[rows, heads, capacity]` for a dense cache's `[rows, capacity, heads, D]`."""
+    if layout.page_size is not None:
+        return shape[:-1]
+    rows, capacity, heads, _ = shape
+    return rows, heads, capacity
 
 
 def write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array,
@@ -443,10 +455,12 @@ class KVStore:
             shape = (kv_heads, pages, layout.page_size, head_dim)
             module.variable("cache", TABLE, default_page_table, rows, per_row, pages, layout.groups)
         values = (*shape[:-1], head_dim if value_dim is None else value_dim)
+        # A quantized pool's scales head-major, as a paged pool keeps its codes: each key head's run of a
+        # row's slots contiguous, which a kernel reads as a stream beside the codes (`scale_shape`).
         for (name, scale), stored in zip(store.payloads, (shape, values), strict=False):
             module.variable("cache", name, jnp.zeros, stored, storage)
             if layout.quantized is not None:
-                module.variable("cache", scale, jnp.ones, shape[:-1], jnp.float32)
+                module.variable("cache", scale, jnp.ones, scale_shape(shape, layout), jnp.float32)
         # A scale's storage with one head: every key head of a token sits at its place and in its group.
         held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
         if places:
@@ -495,7 +509,23 @@ class KVStore:
                 stored, scale = quantize(incoming, self.layout.quantized)
             self._write(name, functools.partial(self._written, values=stored, positions=positions))
             if scale is not None:
-                self._write(scale_name, functools.partial(self._written, values=scale, positions=positions))
+                self._write(scale_name, functools.partial(self._scales_written, values=scale,
+                                                          positions=positions))
+
+    def _scales_written(self, buffer: jax.Array, layer: jax.Array | int | None, *, values: jax.Array,
+                        positions: jax.Array) -> jax.Array:
+        """Scales `values` `[rows, tokens, heads]` stored at `positions` in their leaf's layout
+        (`scale_shape`); -1 drops: a dense cache's `[rows, heads, capacity]` takes each row's tokens at
+        their slots along its last axis, at `layer` of a run's bank (`_written`)."""
+        if self.layout.page_size is not None:
+            return self._written(buffer, layer, values=values, positions=positions)
+        slots = jnp.where(positions >= 0, positions, DROPPED)
+
+        def put(held):
+            return jax.vmap(lambda row, incoming, at: row.at[:, at].set(incoming.T, mode="drop"))(
+                held, values.astype(held.dtype), slots)
+
+        return put(buffer) if layer is None else buffer.at[layer].set(put(buffer[layer]))
 
     def _written(self, buffer: jax.Array, layer: jax.Array | int | None, *, values: jax.Array,
                  positions: jax.Array) -> jax.Array:
@@ -613,6 +643,9 @@ class KVStore:
         if self.layout.page_size is not None:
             stored = self._gathered(stored)
             scale = None if scale is None else self._gathered(scale)
+        elif scale is not None:
+            # Head-major, `[rows, heads, capacity]` (`scale_shape`): the codes' `[rows, capacity, heads]`.
+            scale = jnp.swapaxes(scale, 1, 2)
         return stored.astype(self.dtype) if scale is None else dequantize(stored, scale, self.dtype)
 
     def attends_rows(self, query: jax.Array, softcap: float | None) -> bool:
@@ -633,7 +666,7 @@ class KVStore:
             return family is not None
         case = PagedCase(heads=query.shape[2], kv_heads=pool.shape[0], head_dim=query.shape[3],
                          value_dim=self._get(self.payloads[-1][0]).shape[-1], dtype=query.dtype,
-                         pool=pool.dtype, page_size=self.layout.page_size, quantized=False,
+                         pool=pool.dtype, page_size=self.layout.page_size, quantized=None,
                          groups=self.layout.groups, head_shards=1, softcap=softcap, arithmetic=False,
                          named='auto')
         return not next(kernel for kernel in PAGED.kernels if kernel.name == 'template').failed(case)
@@ -680,7 +713,7 @@ class KVStore:
         each row from its window's first key; a layer with `sinks` has attention sinks."""
         return PagedCase(heads=query.shape[-2], kv_heads=self.kv_heads, head_dim=self.head_dim,
                          value_dim=value_dim, dtype=jnp.dtype(query.dtype), pool=jnp.dtype(self.dtype),
-                         page_size=self.layout.page_size, quantized=self.layout.quantized is not None,
+                         page_size=self.layout.page_size, quantized=self.layout.quantized,
                          groups=self.layout.groups, head_shards=_head_shards(query), softcap=softcap,
                          arithmetic=arithmetic, named=named, windowed=windowed, sinks=sinks)
 
@@ -711,8 +744,13 @@ class KVStore:
             selected(PAGED, case, 'triton' if backend() == "gpu" else 'tpu')
 
         def local(query, key, value, lengths, table, *extras):
-            # The optional operands as `decode` gave them: the window's starts, then the sinks.
-            starts, sinks = (extras[0] if given else None), (extras[-1] if sunk else None)
+            # The optional operands as `decode` gave them: the window's starts, the sinks, then a quantized
+            # pool's scales.
+            starts = extras[0] if given else None
+            sinks = extras[len(given)] if sunk else None
+            if kernel == 'template' and dequantizes:
+                return template_quantized(query, key, value, table if paged else None, lengths, *extras[-2:],
+                                          starts, sinks if sunk else None, softcap=softcap)
             if kernel == 'template':
                 return template_paged(softcap)(query, key, value, table, lengths, starts, sinks)
             if kernel == 'triton':
@@ -726,13 +764,21 @@ class KVStore:
         given = () if starts is None else (starts,)
         sunk = () if sinks is None else (sinks,)
         pools = [self._get(name) for name, _ in self.payloads]
-        arrays = (query, pools[0], pools[-1], lengths, self._absolute(self._get(TABLE)),
-                  *given, *sunk)
+        # A quantized pool's codes and their scales (`scale_shape`), which the template reads as they are.
+        dequantizes = kernel == 'template' and self.layout.quantized is not None
+        scales = (tuple(self._get(scale) for _, scale in self.payloads) * 2)[:2] if dequantizes else ()
+        paged = self.layout.page_size is not None
+        # A dense cache's rows its own, no table: its row indices stand in for one (unread).
+        table = self._absolute(self._get(TABLE)) if paged else jnp.zeros((query.shape[0], 0), jnp.int32)
+        arrays = (query, pools[0], pools[-1], lengths, table, *given, *sunk, *scales)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
         rows, heads = (*queries, None, None)[:2]
-        specs = (queries, P(heads), P(heads), P(rows), P(rows), *(P(rows) for _ in given),
-                 *(P(heads) for _ in sunk))
+        # A pool's key heads lead, a dense cache's rows (`[rows, capacity, heads, D]`, scales `[rows, heads,
+        # capacity]`).
+        pooled, scaled = (P(heads), P(heads)) if paged else (P(rows, None, heads), P(rows, heads))
+        specs = (queries, pooled, pooled, P(rows), P(rows), *(P(rows) for _ in given),
+                 *(P(heads) for _ in sunk), *(scaled for _ in scales))
         return manual_map(local, specs, queries)(*arrays)
 
 
@@ -744,10 +790,10 @@ DECODE_QUERY = ("activation_batch", "activation_heads", None)
 class PagedCase:
     """A decode step over a paged pool as the paged selector reads it (`PAGED`, `KVStore.case`): the
     query's `heads` over the pool's `kv_heads`, `head_dim` wide with values `value_dim` wide; the
-    query's `dtype` and the `pool`'s; its `page_size` (None for a compact cache), whether it is
-    `quantized`, its `groups`; how many ways a mesh splits the query heads (`head_shards`); the layer's
-    `softcap`; whether its arithmetic is the reference path's alone (`arithmetic`); the
-    `AttentionImpl` it `named`; whether it reads each row from its window's first key
+    query's `dtype` and the `pool`'s; its `page_size` (None for a compact cache), the format it is
+    `quantized` in (None for none), its `groups`; how many ways a mesh splits the query heads
+    (`head_shards`); the layer's `softcap`; whether its arithmetic is the reference path's alone
+    (`arithmetic`); the `AttentionImpl` it `named`; whether it reads each row from its window's first key
     (`windowed`); and whether the layer has attention sinks (`sinks`)."""
 
     heads: int
@@ -757,7 +803,7 @@ class PagedCase:
     dtype: jnp.dtype
     pool: jnp.dtype
     page_size: int | None
-    quantized: bool
+    quantized: KVDtype | None
     groups: int
     head_shards: int
     softcap: float | None
@@ -812,26 +858,35 @@ def _template_tiles(case: PagedCase) -> bool:
     family's key extents, `attention_mosaic_program.extents`)."""
     from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program
 
-    if backend() != "gpu" or case.page_size is None:
+    if backend() != "gpu":
         return False
     # One query a row: a key head's query heads its packed rows (`attention_decode.packed`).
     family = attention_mosaic_program.bundle(generation.gpu_target().generation, case.dtype,
                                              case.heads // case.kv_heads)
-    if family is None:
-        return False
+    if family is None or case.page_size is None:
+        # A dense cache's codes read as its rows lie (`template_quantized`).
+        return family is not None
     # Every key tile the family's copies move (a page's keys whole in it), else one of the page's.
     tiles = attention_mosaic_program.extents(family, case.dtype, family.copy_extent or case.page_size)
     return any(attention_mosaic._pages_hold(case.page_size, tile, family) for tile in tiles)
 
 
+def _converts(stored: KVDtype) -> bool:
+    """Whether the current GPU's template converts a pool's codes `stored` in its walk (`mosaic.converts`:
+    int8 on any, an FP8 on sm_89 on)."""
+    from dew.nn.kernels.templates import mosaic
+
+    return mosaic.converts(jnp.dtype(stored))
+
+
 TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
-    Requirement('pages', lambda case: case.page_size is not None, "the cache keeps no pages", row=INHERENT),
-    Requirement('quantized', lambda case: not case.quantized,
-                "the template's decode reads 16-bit pages; a quantized pool is read through the gather",
-                row='ledger 3624'),
-    Requirement('dtype', lambda case: case.dtype == case.pool and case.pool in (jnp.bfloat16, jnp.float16),
-                lambda case: f"the template's decode reads a 16-bit query over pages of its dtype, not "
-                             f"{case.dtype} over {case.pool}", row='ledger 3624'),
+    Requirement('pages', lambda case: case.page_size is not None or case.quantized is not None,
+                "the cache keeps no pages and no codes: the layer's attention reads it", row=INHERENT),
+    Requirement('dtype', lambda case: case.dtype in (jnp.bfloat16, jnp.float16)
+                and (case.pool == case.dtype if case.quantized is None
+                     else _converts(case.quantized)),
+                lambda case: f"the template's decode reads a 16-bit query over pages of its dtype or of "
+                             f"codes it dequantizes, not {case.dtype} over {case.pool}", row='ledger 3624'),
     Requirement('tiles', _template_tiles,
                 lambda case: f"the attention template's decode reads no key tile of pages of "
                              f"{case.page_size} keys on this GPU", row='ledger 3648'),
@@ -845,7 +900,8 @@ TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
 """The attention template's decode over the pages (`attention_decode.attend`'s `table`): a GPU's paged
 step where Dew's Pallas kernel turns the pool down (its values narrower than its keys, a 16-bit query of
 fp16, a pool split into groups, read through its table's pages past each group's part's start,
-`KVStore._absolute`), its derivatives at every order the gathered attention's (`template_paged`)."""
+`KVStore._absolute`, a quantized pool's codes dequantized in its walk, `template_quantized`), its derivatives
+at every order the gathered attention's (`template_paged`)."""
 
 TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('capability', lambda case: generation.backend() == 'tpu',
@@ -957,22 +1013,43 @@ def _paged(forward: Callable, softcap: float | None) -> Callable:
                                   functools.partial(_gathered_tangent, softcap=softcap), kind=KernelGlue()))
 
 
-def _template_forward(query, key, value, table, lengths, starts=None, sinks=None, *, softcap=None):
+def _template_forward(query, key, value, table, lengths, starts=None, sinks=None, *, softcap=None,
+                      scales=None):
     """The attention template's decode over the pages (`attention_decode.attend`): one query a row over its
     keys from `starts` (a window's first, where given) to `lengths`, under the `softcap` and the `sinks`
     `[heads]` the layer has. An inactive row reads one slot."""
     from dew.nn.kernels.templates import attention as template, attention_decode
 
     rows = query.shape[0]
-    spans = template.spans(1, table.shape[1] * key.shape[2], rows, lengths=jnp.maximum(lengths, 1),
-                           starts=starts)
+    keys = key.shape[1] if table is None else table.shape[1] * key.shape[2]
+    spans = template.spans(1, keys, rows, lengths=jnp.maximum(lengths, 1), starts=starts)
     hooks = template.Hooks(None if softcap is None else template.Capped(softcap),
                            initial=None if sinks is None else template.sinks(sinks, rows, 1, value.shape[-1]))
     # Interpreted where the arrays lie off a GPU (Mosaic GPU compiles on one alone), whatever GPU the step
     # is chosen for (`generation.assumed`).
     out = attention_decode.attend(query[:, None], key, value, spans, hooks, table=table,
-                                  interpret=generation.placed_platform() != "gpu")
+                                  interpret=generation.placed_platform() != "gpu", scales=scales)
     return out[:, 0], ()
+
+
+def template_quantized(query, key, value, table, lengths, key_scale, value_scale, starts=None, sinks=None, *,
+                       softcap=None):
+    """The attention template's decode over a quantized pool (`_template_forward`'s): its codes `key` and
+    `value` read as they are and dequantized in the walk by their scales (`attention_decode.attend`'s
+    `scales`, ledger 3624): a paged pool's `[KV, P, page, D]` and `[KV, P, page]`, its scales put in each
+    row's key order by its `table`; a dense cache's `[rows, capacity, KV, D]` and head-major `[rows, KV,
+    capacity]`, as they lie (`table` None)."""
+    if table is None:
+        return _template_forward(query, key, value, None, lengths, starts, sinks, softcap=softcap,
+                                 scales=(key_scale, value_scale))[0]
+    rows, (kv_heads, _, page) = table.shape[0], key_scale.shape
+
+    def ordered(scale):
+        # `[KV, P, page]` at each row's pages: `[rows, KV, keys]`.
+        return jnp.moveaxis(scale[:, table], 1, 0).reshape(rows, kv_heads, table.shape[1] * page)
+
+    return _template_forward(query, key, value, table, lengths, starts, sinks, softcap=softcap,
+                             scales=(ordered(key_scale), ordered(value_scale)))[0]
 
 
 @functools.cache

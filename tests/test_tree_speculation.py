@@ -255,22 +255,14 @@ def test_a_trees_first_two_tokens_are_drawn_as_the_target_draws_them(drafter):
     it, over every pair of the vocabulary (the sampling gate). The picked drafter offers the target's
     second- and third-ranked tokens (one-hot `q`), the sampled one draws children from a sharpened
     distribution (its own `q`), both off the target's law."""
-    from reference_error import widened
     from sampling_gate import assert_draws_as_declared
-    from test_speculative import LAW_ROWS, LAW_SEEDS, LAW_TEMPERATURE
+    from test_speculative import LAW_ROWS, LAW_SEEDS, LAW_TEMPERATURE, pair_law
 
     from dew.sampling import Sampling
 
     model = _model("attention", 16)
-    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
-    params = jax.jit(model.init)(jax.random.key(0), prompt)
+    prompt, params, chances = pair_law(model)
     vocab = model.vocab_size
-    with jax.enable_x64(new_val=True):
-        wide, wide_params = model.clone(dtype=jnp.float64), widened(params)
-        first = jax.nn.softmax(wide.apply(wide_params, prompt)[0, -1] / LAW_TEMPERATURE)
-        pairs = jnp.concatenate([jnp.broadcast_to(prompt, (vocab, 3)), jnp.arange(vocab)[:, None]], axis=1)
-        second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1] / LAW_TEMPERATURE, axis=-1)
-        chances = np.asarray(first[:, None] * second).reshape(-1)
 
     shape = TreeShape.widths(2, 1)
     drafting = _ranked([(1, 2), (0,)]) if drafter == "picked" else _sampled(3.0)

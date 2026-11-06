@@ -455,7 +455,9 @@ def placed_host(objective, fresh: Callable[[], TrainState], state_mesh: Mesh, de
             # where each row was. An objective placed this way holds banks at its rows afterwards and
             # does not seed a second trainer.
             def stack(rows, path):
-                bank = place_leaf(jnp.stack(rows), at_path(shardings.variables, path))
+                target = at_path(shardings.variables, path)
+                assert isinstance(target, jax.sharding.Sharding), path
+                bank = place_leaf(jnp.stack(rows), target)
                 for row in rows:
                     evict(np.asarray(row))
                 return bank
