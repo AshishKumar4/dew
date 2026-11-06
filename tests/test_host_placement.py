@@ -38,6 +38,7 @@ from reference_error import assert_as_exact
 from dew.data.dataset import Loader
 from dew.inference.banks import CheckpointBanks, HeldBanks
 from dew.nn.backbones.decoder_stack import StackView
+from dew.nn.kv_cache import row_axis
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
@@ -216,9 +217,11 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     continuation as the resident banks, out of a cache the fetched run
     allocated and wrote itself.
 
-    The cache comes back out per layer with the batch on its first axis,
-    which is what a caller between two steps holds and what the banking must
-    not change.
+    The cache comes back out as the store holds the stack, each run's
+    layers one bank under the run's name and a run of one per layer, the
+    batch after a bank's layers and first elsewhere (`row_axis`): what a
+    caller between two steps holds, which the next step reads and writes
+    where it lies.
     """
     _, scanned, variables, tokens = pair(**SHAPES[shape])
     resident, on_host = stores(scanned, variables)
@@ -229,10 +232,9 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
         np.asarray(generate(scanned, resident, tokens, 4, key=0, sampling=greedy).tokens))
 
     cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
-    depth = SHAPES[shape]["num_layers"]
-    assert sorted(cache) == sorted(f"layers_{index}" for index in range(depth))
+    assert sorted(cache) == sorted(name for name in on_host["params"] if name.startswith("layers_"))
     assert memory_kinds(cache) == {"device"}
-    assert {leaf.shape[0] for leaf in jax.tree.leaves(cache)} == {2}
+    assert {leaf.shape[row_axis(path)] for path, leaf in jax.tree_util.tree_leaves_with_path(cache)} == {2}
 
 
 def test_a_layout_offloads_only_the_layers_it_names():
