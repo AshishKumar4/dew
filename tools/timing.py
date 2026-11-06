@@ -353,7 +353,8 @@ def summarized(manifest: dict, out: Path) -> None:
                 rounds = by_round(arm)
                 ratios = [value / base[round_] for round_, value in rounds.items()]
                 values = [row[measure] for row in mine if row["arm"] == arm and row[measure] is not None]
-                differs = bool(band and ratios and not arm.endswith("~aa")
+                # The reference and its A/A are the band's own ends, never judged against it.
+                differs = bool(band and ratios and arm not in (reference, f"{reference}~aa")
                                and (min(ratios) > band[1] or max(ratios) < band[0]))
                 same = next(row["digest"] for row in mine if row["arm"] == arm) == digest
                 arms.append({"arm": arm, "median": statistics.median(values) if values else None,
