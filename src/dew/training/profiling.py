@@ -36,12 +36,11 @@ class ProfileWindow:
 
     It traces `steps` steps into `directory` after `warmup` steps have run and the
     run's first step has compiled, so the trace shows the loop and not the compile, and it holds the
-    training steps alone: work between them (an evaluation, a checkpoint save, a cooldown branch) runs
-    outside its capture, which starts again at the next step's read, so a window
-    that spans such work writes a capture of each run of its steps
-    (`dew.training._fit.FitRun.outside_window`).
-    A fit under JAX's AutoPGLE, which profiles programs in sessions of its own,
-    refuses a window (`PGLE_CAPTURE`).
+    training steps and the loop's own cadenced reads of them (its log, an observer's call): the work between
+    them that is no step's (an evaluation, a checkpoint save, a cooldown branch) runs outside its capture,
+    which starts again at the next step's read, so a window that spans such work writes a capture of each
+    run of its steps (`dew.training._fit.FitRun.outside_window`). A fit under JAX's AutoPGLE, which
+    profiles programs in sessions of its own, refuses a window (`PGLE_CAPTURE`).
 
     The capture records what `capture` asks (`dew.telemetry.profile.CaptureOptions`): by default
     host events at level 2, no Python calls (the Python tracer slows Python-heavy host work several
