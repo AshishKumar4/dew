@@ -1956,6 +1956,9 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     calls = suite_step(tmp_path / "whole-deadlines", "main", "", "off", 2, whole=True)
     assert {word for call in calls for word in call if word.startswith(("--deadline", "--pool=48"))} == {
         "--deadline=6000", "--pool=48"}
+    # A base push, below lanes too and on the pool armada gives it, keeps the background deadline.
+    assert run_options(tmp_path, "base/kernels", "on", "--deadline") == ["--deadline=6000"]
+    assert run_options(tmp_path, "base/kernels", "on", "--pool") == []
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):

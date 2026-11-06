@@ -251,8 +251,9 @@ jobs:
         || 'armada' }}
       cancel-in-progress: false
       queue: max
-    # Main's daily whole run, below every lane's, waits for capacity within its 6000 s deadlines: 130 minutes.
-    timeout-minutes: ${{ ((github.event_name == 'schedule' || inputs.whole) && 130)
+    # Main's daily whole run, below every lane's, waits for capacity within its suite's and then its release
+    # checks' 6000 s deadlines, one after the other: 210 minutes.
+    timeout-minutes: ${{ ((github.event_name == 'schedule' || inputs.whole) && 210)
       || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels'
       || needs.scope.outputs.policy == 'off') && 110) || 60 }}
     steps:
@@ -310,10 +311,12 @@ jobs:
           *) priority= ;;
         esac
         if [ -n "$DEW_WHOLE_SUITE" ]; then priority=-15; fi
+        # A run below every lane's waits for capacity within its deadlines: background ones (train 665's review).
+        case "$priority" in -*) background=1 ;; *) background= ;; esac
         pool=$BACKGROUND_POOL
         case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) pool=${GITHUB_REF_NAME##*-p} ;; esac
         ARMADA=armada LABEL="$GITHUB_REF_NAME" PRIORITY="$priority" GANGLESS="$gangless" POOL="$pool" \
-          BACKGROUND="${BACKGROUND_POOL:+1}" OUT="$RUNNER_TEMP/ci" bash tools/ci/suite.sh ${{ github.sha }}
+          BACKGROUND="$background" OUT="$RUNNER_TEMP/ci" bash tools/ci/suite.sh ${{ github.sha }}
     - name: Cancel the armada jobs of a cancelled run
       # A client killed before it cancelled leaves its job running to its deadline, on the fleet the
       # next run needs: each job the clients named is cancelled (armada's POST /jobs/<id>/cancel, at
