@@ -171,16 +171,23 @@ def test_a_row_over_one_state_decides_each_question_as_its_own_row_does(siblings
 
 
 def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_one_row(tmp_path):
-    """A decision run of a letter readout over a causal source, its rows asking a request's questions over
-    one state (`shared_state`), trains a step; the task loaded from its run lays a request's three questions
-    in one row and answers each with one of its options."""
-    from run_kinds import lettered, trained
+    """A decision run of a letter readout over a causal source whose every layer reads key runs, its rows
+    asking a request's questions over one state (`shared_state`), trains a step; the task loaded from its run
+    lays a request's three questions in one row and answers each with one of its options. Over a source whose
+    recurrent layers read no key runs (Qwen3.5's gated delta net), the run is refused, as its rows' streams
+    would be read as one sequence (until a document enters from a given memory, row 1506)."""
+    from run_kinds import QWEN_TINY, lettered, trained
+    from test_decision_streams import LLAMA
 
     from dew.data import Memory
     from dew.decision import Decide, decisions
 
     rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
     run = dataclasses.replace(lettered(tmp_path, drawn=False), data=rows, validation=None, shared_state=3)
+    assert run.pretrained == str(QWEN_TINY)
+    with pytest.raises(ValueError):
+        trained(run, tmp_path, "hybrid")
+    run = dataclasses.replace(run, pretrained=str(LLAMA))
     trained(run, tmp_path, "shared")
     decide = Decide.from_run(str(tmp_path / "runs" / "shared"))
     assert decide.layout.shared_state == 3
