@@ -1,8 +1,45 @@
-"""tools/lint_assertions.py's rules, as tools/lint_slop.py reports them: bible §7's banned assertions in a
-test, each case reported and its neighbours spared."""
+"""tools/lint_slop.py's case tables: row 1878's lints and bible §7's banned assertions in a test
+(tools/lint_assertions.py), each case reported and its neighbours spared."""
 
 import pytest
 from tool_support import linted
+
+ROW_1878_LINTS = {
+    "SLOP008": ({
+        "src/sparx/store.py": "class Store:\n    def _open(self):\n        pass\ndef open(path):\n    pass\n",
+        "tests/test_store.py": (
+            "from sparx.store import Store\n"
+            "import sparx.store as store\n"
+            "def test_private(monkeypatch):\n"
+            "    monkeypatch.setattr(Store, '_open', lambda self: None)\n"
+            "def test_public(monkeypatch):\n"
+            "    monkeypatch.setattr(store, 'open', lambda path: None)\n"
+            "def test_a_seams_own_private(monkeypatch):\n"
+            "    monkeypatch.setattr('sparx.store.os._exit', lambda code: None)\n"
+            "def test_a_first_party_private_under_a_seam_word(monkeypatch):\n"
+            "    monkeypatch.setattr('sparx.sources.hub.Hub._selected', lambda self: None)\n"),
+    }, "tests/test_store.py", (4, 10)),
+    "SLOP011": ({
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": (
+            "def test_table(table):\n"
+            "    assert report.table().splitlines() == ['   a  b', 'x  1  2']\n"
+            "    assert table.plain == 'data 4,824 rows  ·  0 rejected'\n"
+            "    assert '4,824' in table.split()\n"
+            "    assert table.title == 'data rows'\n"
+            "    assert table.index('b') + 1 == len('   a  b')\n"
+            "    assert json.loads(payload) == ['a  b']\n"
+            "    assert parsed.name == 'two  spaces'\n"),
+    }, "tests/test_graph.py", (2, 3)),
+}
+"""Row 1878's two lint cases, by code: the files linted, the file the findings are in, their lines.
+SLOP008: a private attribute of a first-party object is the code under test, so replacing it is
+reported even where its name holds a seam's (`Checkpoints._open`); a public seam of the same name and a
+standard-library module's own private attribute are not. SLOP011: a rendering (its text read through
+`plain`, `table()`, captured output or `str`) compared whole with a string, or a list of strings, with a
+run of two or more spaces between words is a spacing snapshot; its words and numbers looked for, a
+one-space string, a column end measured and parsed data holding two spaces are not."""
+
 
 BANNED_ASSERTION_LINTS = {
     "SLOP008": ({
@@ -66,7 +103,11 @@ uncaught error's, among them); one that asserts the state the refusal reports as
 own, or that a process ran (exit 0, its own checks inside it), is not."""
 
 
-@pytest.mark.parametrize("code", sorted(BANNED_ASSERTION_LINTS))
-def test_the_banned_assertions_the_lint_reads_are_reported_and_the_rest_spared(code, tmp_path):
-    files, where, lines = BANNED_ASSERTION_LINTS[code]
+CASES = {**ROW_1878_LINTS, **BANNED_ASSERTION_LINTS}
+"""Every table's cases, by code: no code is in two."""
+
+
+@pytest.mark.parametrize("code", sorted(CASES))
+def test_each_lint_reports_its_cases_and_spares_the_rest(code, tmp_path):
+    files, where, lines = CASES[code]
     assert linted(tmp_path, files) == [(where, line, code) for line in lines]
