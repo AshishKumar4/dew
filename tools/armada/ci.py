@@ -1619,16 +1619,19 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
-    # The tests an attempt the fleet recalled passed (`resumed`): set aside by their exact ids (progress.py's
-    # `SET_ASIDE`), their seconds kept for the rows.
-    done_before = {} if site is not None or release or coverage is not None else resumed(tests)
+    # A task that resumes keeps its progress (progress.py) and, recalled before, sets aside by their exact ids
+    # the tests its attempt passed (`resumed`, progress.py's `SET_ASIDE`), their seconds kept for the rows. A
+    # check-1 site's map task, whose artifacts are its judge's draws alone, a release check and a traced run
+    # resume none, and keep none.
+    resumes = site is None and not release and coverage is None
+    done_before = resumed(tests) if resumes else {}
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
-    command = [*pytest_command(run, tests, split, release), "-p", "progress"]
+    command = [*pytest_command(run, tests, split, release), *(["-p", "progress"] if resumes else [])]
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
                                               "DEW_UNRECORDED": str(unrecorded), "DEW_STACKS": str(stacks),
-                                              progress.SET_ASIDE: str(aside)})
+                                              **({progress.SET_ASIDE: str(aside)} if resumes else {})})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     returncode, output, expired, dump, opened = ran_pytest(command, environment, deadline, grace, stacks)
