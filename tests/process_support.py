@@ -266,7 +266,8 @@ def raised(done: subprocess.CompletedProcess) -> dict[str, list[str]]:
     found: dict[str, list[str]] = {}
     for previous, line in itertools.pairwise(lines):
         named, _, message = line.partition(": ")
-        if previous.startswith("  ") and re.fullmatch(r"[\w.]+(Error|Exception|Failure|Exit)", named):
+        # An error's type, a class's name (`ValueError`, `dew.mesh.LayoutRefused`), at the line's start.
+        if previous.startswith("  ") and re.fullmatch(r"(\w+\.)*[A-Z][a-z]\w*", named):
             found.setdefault(named, []).append(message)
     return found
 
