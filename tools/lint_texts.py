@@ -28,10 +28,12 @@ TEXT_CALLS = {"re.search", "re.match", "re.fullmatch", "re.findall", "re.findite
 
 
 def _resolved(node: ast.expr, tables: Mapping[int, Mapping[str, str]]) -> str:
-    """`scopes.resolved` of a name or an attribute chain at `node`, through its scope's imports."""
+    """`scopes.resolved` of a name or an attribute chain at `node`, through its scope's imports; a name no
+    import binds, a builtin's, as it is spelled."""
     if not isinstance(node, ast.Name | ast.Attribute):
         return ""
-    return scopes.resolved(node, tables.get(id(node), {}))
+    table = tables.get(id(node), {})
+    return scopes.resolved(node, table) or (node.id if isinstance(node, ast.Name) else "")
 
 
 @dataclass
