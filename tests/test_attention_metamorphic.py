@@ -8,6 +8,7 @@ slice count its work list takes (every count a case, Hypothesis drawing the rows
 pages permuted with its table are `test_attention_decode_template`'s paged cells). The plain-JAX mainloop runs
 the dense properties on this CPU; the decode one runs the Mosaic mainloop interpreted, as an H100 runs it."""
 
+import functools
 
 import hypothesis
 import jax
@@ -150,6 +151,34 @@ def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted():
                     "a far short row's slices through its masked rewalk", seeds=SEEDS)
 
 
+@functools.partial(jax.jit, static_argnames="slices")
+def _sliced_step(query, key, value, lengths, *, slices: int):
+    """A decode step of rows `lengths` long, its keys cut into `slices` slices a row at the decode plan's
+    config and merged, as `attention_decode.attend` walks them (the fold's raw products, `subtracted`);
+    lengths an operand, so every drawn length compiles one program."""
+    spans = _decode_spans(lengths)
+    with generation.assumed("sm90"):
+        rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
+        config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
+                                       target=generation.gpu_target()).config
+        with tuning.pinned({attention_mosaic.MosaicForward: config}):
+            out, maximum, total = attention_mosaic.forward(
+                rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
+                residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=slices,
+                subtracted=True)[:3]
+        if slices == 1:
+            # One slice's launch gives its rows without a slices axis.
+            out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
+        spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
+        merged = attention_decode.merged(spec, out, maximum, total)
+        return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
+
+
+@jax.jit
+def _whole_step(query, key, value, lengths):
+    return template.reference(query, key, value, _decode_spans(lengths))
+
+
 @INTERPRETS
 @INTERPRETED
 @pytest.mark.parametrize("slices", [1, 2, 4, 8])
@@ -158,25 +187,8 @@ def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_int
     """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
     decode plan's config, a program a slice), the slices merged (`attention_decode.merged`), rows of their own
     lengths: on par with the step walked whole."""
-    spans = _decode_spans(lengths)
-
-    def sliced(query, key, value):
-        with generation.assumed("sm90"):
-            rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
-            config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
-                                           target=generation.gpu_target()).config
-            with tuning.pinned({attention_mosaic.MosaicForward: config}):
-                out, maximum, total = attention_mosaic.forward(
-                    rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
-                    residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True,
-                    splits=slices)[:3]
-            if slices == 1:
-                # One slice's launch gives its rows without a slices axis.
-                out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
-            spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
-            merged = attention_decode.merged(spec, out, maximum, total)
-            return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
-
-    assert_as_exact(jax.jit(sliced), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
-                    _decode_draw, f"decode step cut into {slices} slices", seeds=SEEDS)
+    lengths = jnp.asarray(lengths, jnp.int32)
+    assert_as_exact(lambda q, k, v: _sliced_step(q, k, v, lengths, slices=slices),
+                    lambda q, k, v: _whole_step(q, k, v, lengths), _decode_draw,
+                    f"decode step cut into {slices} slices", seeds=SEEDS)
 
