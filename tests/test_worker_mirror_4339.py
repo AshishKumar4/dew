@@ -60,3 +60,15 @@ def test_workers_mirror_counters_reach_run(tmp_path, read, workers):
     assert statistics["data/mirror/hits"] + statistics["data/mirror/misses"] >= (
         own["data/mirror/hits"] + own["data/mirror/misses"] + worker_reads
     )
+
+
+def test_uncommitted_urls_keep_mirror_in_planned_paths(tmp_path):
+    paths = []
+    for index in range(4):
+        path = tmp_path / f"{index}.jsonl"
+        path.write_text('{"id": 0}\n')
+        paths.append(f"dewcache::file://{path}")
+    files = Files(tuple(paths), format="jsonl",
+                  storage_options={"dewcache": {"cache_storage": str(tmp_path / "mirror")}})
+    print("PATHS4339", json.dumps({"written": paths, "planned": files.paths}), flush=True)
+    assert all(path.startswith("dewcache::") for path in files.paths)
