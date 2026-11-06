@@ -17,6 +17,10 @@ chunk and head (`chunk_step`):
 5. `o` from the queries, keys, `h` and `c`: `scale ((q h) exp2(g) + tril(q k^T exp2(g_s - g_t)) c)`
    (`algebra.chunk_scores`, `chunk_output`).
 
+Under a decay a key dimension (Kimi delta attention's, a declared floor's, `key_enclosures`) the pairs are the
+intra launch's, each pair's decay factored over sub-chunks (`key_pairs`), the weights gated by each key's
+own decay, the keys gated to the chunk's end, and each key row of the memory decayed by its own.
+
 Each enclosure is outward interval arithmetic in float64, each end snapped to its op's own grid: products of
 16-bit values (or of an fp32 operand's three bf16 parts, six of them a pair, `product.formed`) exact, summed
 as the native-dot contract holds a tensor core's sum (gamma_n at a truncating add's unit, of the terms that
@@ -888,3 +892,18 @@ def assert_step_faults_refused(lane: Lane, heads: int | None = None) -> None:
     assert_refusals(cumsum_refusals(draw(1, "decay", chunks=2, **sized), lane), CUMSUM_SHARES)
     assert_refusals(shifted_refusals(draw(1, "mild", chunks=2, **sized), lane), SHIFTED_SHARES)
 
+
+KEY_DECAY_SHARES = {"leaving": 0.5}
+"""The least share of each chunk's leaving fp32 memory at which a decay a key dimension read as its head's
+mean is refused."""
+
+
+def assert_key_decays_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness under a decay a key dimension (Kimi delta attention's, its floor's factored pairs): a
+    bf16 call of three chunks, every record inside its step's enclosure, and a kernel reading each token's
+    mean decay for all its keys refused (`shared_decay_refusals`, `KEY_DECAY_SHARES`)."""
+    operands = draw(0, "mild", heads=heads, per_key=True)
+    held = witness(recorded(*operands, floor=FLOOR), lane)
+    for name in RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
+    assert_refusals(shared_decay_refusals(operands, lane), KEY_DECAY_SHARES)
