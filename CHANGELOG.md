@@ -7,6 +7,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A decision tournament takes its round rule as a typed policy (`Decide.tournament(rounds=)`): `Knockout(group)`,
+  Laya's groups whose winners meet in a final, or `Finalists`, a released engine's one round of near-equal
+  groups whose best go to a final, the answer over every option with the knocked-out sharing a residual.
+  `tournament(group=n)` is now `tournament(rounds=Knockout(n))`.
+- A question row's segments write what released decision models write: a summary of the request in each
+  question's row (`RequestSummary`), the question again past a long state (`Again`), a conversation state turn
+  by turn (`State(turns=Turns(...))`), and value policies (`Values`: a long list indexed, an empty value
+  substituted, option names normalized). Training and serving summarize the whole request alike.
 - The `cuda12` and `cuda13` extras install `dew-cutlass` 0.1.0 (`dew-cutlass-cu12` or `dew-cutlass-cu13`, on
   Linux x86_64 and aarch64), Dew's build of CUTLASS's grouped GEMMs, whose kernels are Hopper's. On an sm90
   GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells
