@@ -10,7 +10,7 @@ from flax import linen as nn
 from dew import _records
 from dew.interop.weights import in_params
 from dew.nn.activations import HIDDEN_ACT
-from dew.registry import Record
+from dew.registry import Record, towers
 
 from .common import (
     ProjectorBase,
@@ -44,6 +44,7 @@ class Lfm3VlVision(TowerBase):
     keys before the rotary turns them by the patch grid, rows then columns (`full_attention`), or by a
     gated depthwise convolution over the frame's grid (`conv`, `GatedGridConv`); no norm after the
     blocks. Every RMS norm weighs its input after its cast back, as the release's `Lfm3VlRMSNorm` does.
+    `layer_types` None is the release's cadence over its depth (`default_layer_types`).
     """
 
     hidden_size: int = 1024
@@ -58,11 +59,19 @@ class Lfm3VlVision(TowerBase):
     conv_kernel_size: int = 3
     norm_eps: float = 1e-5
     rope_theta: float = 1_000_000.0
-    layer_types: tuple[str, ...] = default_layer_types(14)
+    layer_types: tuple[str, ...] | None = None
 
     def __post_init__(self):
-        if len(self.layer_types) != self.num_hidden_layers:
-            raise ValueError(f"layer_types names {len(self.layer_types)} layers of {self.num_hidden_layers}")
+        unknown = sorted(set(self.kinds) - {"conv", "full_attention"})
+        if unknown:
+            raise ValueError(f"layer_types {unknown} are neither conv nor full_attention")
+        if len(self.kinds) != self.num_hidden_layers:
+            raise ValueError(f"layer_types names {len(self.kinds)} layers of {self.num_hidden_layers}")
+
+    @property
+    def kinds(self) -> tuple[str, ...]:
+        """Each layer's kind: `layer_types`, or the release's cadence over the depth."""
+        return default_layer_types(self.num_hidden_layers) if self.layer_types is None else self.layer_types
 
     def layout(self) -> ViTLayout:
         depth = self.num_hidden_layers
@@ -74,7 +83,7 @@ class Lfm3VlVision(TowerBase):
             patch_size=self.patch_size, temporal_patch_size=self.temporal_patch_size,
             spatial_merge_size=self.spatial_merge_size, norm_type="rms", norm_eps=self.norm_eps,
             norm_bias=False, mlp_bias=False, packed=False, patch_bias=False,
-            attention=tuple("conv" if kind == "conv" else "full" for kind in self.layer_types),
+            attention=tuple("conv" if kind == "conv" else "full" for kind in self.kinds),
             order=("patches",) * depth, sinks=(False,) * depth, pre_norm="rms", outer_norm_eps=self.norm_eps,
             rope_theta=self.rope_theta, attention_bias=False, qk_norm=True, conv_kernel=self.conv_kernel_size,
             scale_after_cast=True)
@@ -124,35 +133,35 @@ def lfm3_vl_vision_path(hf_name: str) -> tuple[str, ...]:
     return path
 
 
+_INTEGERS = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
+             "num_key_value_heads", "patch_size", "temporal_patch_size", "in_channels", "spatial_merge_size",
+             "conv_kernel_size")
+"""The Lfm3VlVision fields an Lfm3VlVisionConfig states as integers under the same names."""
+
+
 def translate_lfm3_vl_vision_config(hf_config: Mapping[str, object]) -> Record:
-    """An Lfm3VlVisionConfig into an Lfm3VlVision value's fields; the rotary is the axial one over the
-    patch grid alone, as the release's Lfm3VlVisionRotaryEmbedding runs no other."""
+    """An Lfm3VlVisionConfig into an Lfm3VlVision value's fields: those it states, checked, the value's
+    own defaults for the rest (its cadence over the depth among them, `Lfm3VlVision.kinds`); the rotary
+    is the axial one over the patch grid alone, as the release's Lfm3VlVisionRotaryEmbedding runs no
+    other."""
     vision = _vision_section(hf_config)
     if vision.get("model_type", "lfm3_vl_vision") != "lfm3_vl_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not LFM3-VL's trunk")
-    layers = _records.integer(vision.get("num_hidden_layers", 14), "num_hidden_layers")
-    kinds = _records.strings(vision.get("layer_types") or default_layer_types(layers), "layer_types")
-    unknown = sorted(set(kinds) - {"conv", "full_attention"})
-    if unknown:
-        raise ValueError(f"layer_types {unknown} are neither conv nor full_attention")
     rope = _records.record(vision.get("rope_parameters") or {"rope_type": "axial"}, "rope_parameters")
     if rope.get("rope_type", "axial") != "axial":
         raise ValueError(f"LFM3-VL's trunk turns its axial rotary alone, not {rope.get('rope_type')!r}")
-    return {"class": "lfm3_vl", "fields": {
-        "hidden_size": _records.integer(vision.get("hidden_size", 1024), "hidden_size"),
-        "intermediate_size": _records.integer(vision.get("intermediate_size", 2560), "intermediate_size"),
-        "num_hidden_layers": layers,
-        "num_attention_heads": _records.integer(vision.get("num_attention_heads", 16), "num_attention_heads"),
-        "num_key_value_heads": _records.integer(vision.get("num_key_value_heads", 8), "num_key_value_heads"),
-        "patch_size": _records.integer(vision.get("patch_size", 16), "patch_size"),
-        "temporal_patch_size": _records.integer(vision.get("temporal_patch_size", 2), "temporal_patch_size"),
-        "in_channels": _records.integer(vision.get("in_channels", 3), "in_channels"),
-        "spatial_merge_size": _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "conv_kernel_size": _records.integer(vision.get("conv_kernel_size", 3), "conv_kernel_size"),
-        "norm_eps": _records.number(vision.get("norm_eps", 1e-5), "norm_eps"),
-        "rope_theta": rope_base({**vision, "rope_parameters": rope}, 1_000_000.0, axial=True),
-        "layer_types": kinds,
-    }}
+    fields: dict[str, object] = {name: _records.integer(vision[name], name) for name in _INTEGERS
+                                 if vision.get(name) is not None}
+    if vision.get("norm_eps") is not None:
+        fields["norm_eps"] = _records.number(vision["norm_eps"], "norm_eps")
+    if vision.get("layer_types"):
+        fields["layer_types"] = _records.strings(vision["layer_types"], "layer_types")
+    fields["rope_theta"] = rope_base({**vision, "rope_parameters": rope}, Lfm3VlVision.rope_theta, axial=True)
+    record: Record = {"class": "lfm3_vl", "fields": fields}
+    # Built here, so a config the value refuses (a cadence of another depth, an unknown kind) is refused
+    # as it is read.
+    towers.from_record(record)
+    return record
 
 
 def translate_lfm3_vl_projector_config(hf_config: Mapping[str, object], text_width: int) -> Record:

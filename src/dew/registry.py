@@ -1521,6 +1521,7 @@ towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "llama4": "dew.nn.vision.llama4:Llama4Vision",
     "mimo": "dew.nn.vision.mimo:MiMoVision",
     "mimo_audio": "dew.nn.mimo_audio:MiMoAudio",
+    "moonvit": "dew.nn.vision.moonvit:MoonViT",
     "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerVision",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Vision",
     "siglip": "dew.nn.vision.siglip:SiglipVision",
@@ -1533,6 +1534,8 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "lfm3_vl": "dew.nn.vision.lfm3:Lfm3VlProjector",
     "llama4": "dew.nn.vision.llama4:Llama4Projector",
     "mimo": "dew.nn.vision.mimo:MiMoProjector",
+    "moonvit": "dew.nn.vision.moonvit:MoonViTProjector",
+    "moonvit_v2": "dew.nn.vision.moonvit:MoonViTProjectorV2",
     "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerProjector",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
 }, base="dew.nn.vision.common:ProjectorBase")
