@@ -23,6 +23,7 @@ fold's reach, and its overflowed rows again shifting under headroom). Its legali
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -318,7 +319,15 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
         assert guarded is not None, at
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
-        walks = _walked_blocks(live, splits, guarded.block_q) if masked or into is not None else None
+        # A merging walk's guarded rewalk walks each of its rows' keys whole, one program a query block (its
+        # rows live in every slice where in any, `_whole_rows`), and merges nothing: its tiles and column
+        # blocks are not the plain launch's, whose grid its legality holds resident (`MosaicForward.legal`),
+        # and it runs where a row's sums overflowed alone.
+        rewalk_splits = 1 if merges else splits
+        if merges:
+            live = live.reshape(*live.shape[:2], splits, -1)[:, :, 0]
+            in_place = {"into": into, "keeping": live.astype(jnp.int32)} if into is not None else {}
+        walks = _walked_blocks(live, rewalk_splits, guarded.block_q) if masked or into is not None else None
         # A masked launch's rows its own whole, their finished maxima and denominators beside their output
         # (`kept`): a fold's natural rewalk's are its rows' own, in its units.
         finishes = rows and (masked or into is not None)
@@ -337,14 +346,14 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
             launched = _launch(
                 q, k, v, guarded_spans, held._replace(output=()), guard, spec=form, hooks=_unhooked(hooks),
                 tiles=guarded, family=family, training=False, interpret=interpret, columns=first,
-                splits=splits, table=paged, sources=sources,
+                splits=rewalk_splits, table=paged, sources=sources,
                 out_dtype=jnp.float32 if hooked_blocks else out_dtype,
                 finishes=finishes, column_width=columns.shape[-1] if first is not None else None,
-                walks=walks, column_blocks=len(column_blocks) if together else 1, merges=merges, **in_place)
+                walks=walks, column_blocks=len(column_blocks) if together else 1, **in_place)
             if into is not None:
                 # In place, its status alone: its rows are written into the refs.
                 continue
-            _, block, *block_rows = launched[:-2] if merges else launched
+            _, block, *block_rows = launched
             blocks.append(block)
             # Every block's rows alike: its logits are the row's whole.
             finished = finished or tuple(block_rows)
@@ -1086,8 +1095,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         out_params = tuple(_param(family, ref, param.kind, row, head, first, state.acc)
                            for ref, param in zip(hooked.output, hooks.output_params, strict=True))
 
-        def store(state: algebra.Partial, *, initial: bool) -> None:
-            output, maximum, denominator = algebra.finish(spec, state, initial=initial,
+        def store(state: algebra.Partial, form: algebra.Forward, *, initial: bool) -> None:
+            output, maximum, denominator = algebra.finish(form, state, initial=initial,
                                                           output_mod=hooks.output_mod,
                                                           output_params=out_params)
             family.stored((_kept_rows(family, keep, output, out_view),), (out_view,), smem=out_smem)
@@ -1099,21 +1108,23 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                               finished, smem=row_smem)
 
         if merge is None:
-            store(state, initial=hooked.initial is not None)
+            store(state, spec, initial=hooked.initial is not None)
             return
-        # A slice's state finished (a short row's slice may see no key) and folded (`algebra.slice_state`);
-        # each slot a slice from the last, which merges the others' in turn, then the initial state's, and
-        # finishes once: no row's output multiplied back by its denominator.
-        own = algebra.slice_state(spec, *algebra.finish(spec, state, initial=True))
+        # A slice's state finished (a short row's slice may see no key) and folded (`algebra.slice_state`),
+        # in the units its finished rows are in (`algebra.finished_form`: a fold's natural ones); each slot a
+        # slice from the last, which merges the others' in turn, then the initial state's, and finishes
+        # once: no row's output multiplied back by its denominator.
+        form = algebra.finished_form(spec)
+        own = algebra.slice_state(form, *algebra.finish(spec, state, initial=True))
         slot = merge.splits - 1 - merge.split
 
         def merged(running: algebra.Partial) -> None:
             if merge.initial is not None:
-                running = algebra.merge(spec, running, algebra.initial_state(spec, merge.initial()))
-            store(running, initial=True)
+                running = algebra.merge(form, running, algebra.initial_state(form, merge.initial()))
+            store(running, form, initial=True)
 
         family.fixed_up(own, merge.slots, merge.ready, slot, slot, merge.splits, merged,
-                        combine=functools.partial(algebra.merge, spec))
+                        combine=functools.partial(algebra.merge, form))
         return
     maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
     own, others_total, key = trained
@@ -1365,7 +1376,6 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
     and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
     `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it)."""
-    del target
     leaves, treedef = jax.tree.flatten(read)
     batch, queries, heads, width = query.shape
     # A block of the values' columns where it walks one in place (`_launch`'s `column_width`).
@@ -1466,9 +1476,12 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by)
     grid = (heads * column_blocks, queries // pair * splits, batch)
+    # A merging launch's every program resident at once (`MosaicForward.legal`), its registers capped so
+    # that many fit a multiprocessor's (`Family.kernel`'s `resident`).
+    resident = (-(-math.prod(grid) // target.multiprocessors) if merges and target.multiprocessors else 1)
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
-                         interpret=interpret,
+                         interpret=interpret, resident=resident,
                          approx_math=approx_math, name=name, cost=cost, model_flops=model,
                          reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod,
                                                       guarded=read.guard is not None)

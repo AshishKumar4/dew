@@ -248,8 +248,9 @@ class MosaicForward(_Mainloop[Tiles]):
     merges: bool = False
     """Whether a split launch merges its slices itself, the last slice's program each query block's, the
     initial state's among them (`attention_mosaic_forward._Merge`): its outputs the rows' whole, no merge in
-    XLA after it. Legal where every program of its grid is resident at once (`resident`), as its waits on
-    the other slices need."""
+    XLA after it. Legal on a family that waits across programs (`Family.fixes_up`) where every program of
+    its grid is resident at once (`resident`), as its waits on the other slices need."""
+
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
              drop=None, table=None, sources=None, *, residuals: Kept, interpret: bool, config: Tiles,
              return_residuals: bool = False):
@@ -300,18 +301,20 @@ class MosaicForward(_Mainloop[Tiles]):
         if not super().legal(ba, config, target):
             return False
         query, value = ba.arguments["query"], ba.arguments["value"]
+        family = bundle_of(config, query.dtype)
         if self.merges and self.splits > 1:
-            # Every program of the grid resident at once: the last slice's waits on the others' states.
+            # On a family that waits across programs (`Family.fixes_up`), every program of the grid resident
+            # at once: the last slice's waits on the others' states. Its kernel holds that residency
+            # (`_launched`'s `resident`); a guarded rewalk merges nothing (`_inference_walk`).
             programs = (query.shape[0] * query.shape[2] * self.splits
                         * -(-query.shape[1] // (config.consumers * config.block_q)))
-            if not target.multiprocessors or programs > target.multiprocessors * self.resident(ba, config,
-                                                                                                 target):
+            if (not family.fixes_up or not target.multiprocessors
+                    or programs > target.multiprocessors * self.resident(ba, config, target)):
                 return False
         # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
         # in them (`_pages_hold`).
         tiles = (config.block_k, config.relaunch_k or config.block_k)
         page = _page(ba)
-        family = bundle_of(config, query.dtype)
         if page is not None and not all(_pages_hold(page, tile, family) for tile in tiles):
             return False
         if ba.arguments["residuals"] is Kept.SPLIT or not algebra.headroom(value.dtype):
