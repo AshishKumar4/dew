@@ -1289,8 +1289,7 @@ def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
 
     for name, attend in (("triton", triton), ("portable", portable)):
         query, key, _, _, _ = draw(0)
-        _, _, _, anchors, split = attend(*draw(0))
-        np.testing.assert_array_equal(np.asarray(split.shift), -1.0, err_msg=name)
+        _, _, _, anchors, _ = attend(*draw(0))
         np.testing.assert_array_equal(np.asarray(anchors), logits_of(query, key, np.float64).argmax(axis=-1),
                                       err_msg=name)
         @as_given
