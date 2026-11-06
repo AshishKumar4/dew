@@ -440,6 +440,38 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
+def entered_scan(mixed, taps, bias, rule, coordinates: Coordinates, state_shape: tuple[int, ...], *,
+                 parts=None, dtype=None, state_dtype=None):
+    """The conv and scan of a recurrent mixer over packed documents of which some enter another
+    (`Coordinates.entered`), each token read once, in two calls: the documents that enter none, from a zero
+    memory and no history, each one's final memory and last `K - 1` tokens kept (`document_tails`); then the
+    documents that enter one, each from that one's memory and after its history (`entered_conv1d`). `rule(
+    convolved, *, valid, starts, state, entered)` runs a call's scan over the tokens `valid` marks, a
+    document's memory a slot of `state` `[B, D, *state_shape]` (`chunk_gated_delta_rule`'s `entered`),
+    returning `(output, finals)`. The gradient of a memory or history entered sums over the documents
+    entering it."""
+    entered = coordinates.entered
+    assert entered is not None
+    real = jnp.ones(entered.documents.shape, bool) if coordinates.valid is None else coordinates.valid
+    roots = entered.roots & real
+    branches = real & (entered.documents > 0) & ~roots
+    documents, count, width = entered.documents, entered.count, taps.shape[1] - 1
+    turned = documents[:, 1:] != documents[:, :-1]
+    begins = jnp.concatenate([jnp.ones_like(documents[:, :1], bool), turned], axis=1)
+    zero = jnp.zeros((documents.shape[0], count, *state_shape), state_dtype or mixed.dtype)
+    convolved = causal_conv1d(mixed, taps, bias=bias, valid=roots, segments=documents, parts=parts,
+                              dtype=dtype)
+    first, finals = rule(convolved, valid=roots, starts=begins & roots, state=zero,
+                         entered=jnp.zeros_like(entered.entered))
+    held = document_tails(mixed, roots, documents, width, count)
+    convolved = entered_conv1d(mixed, taps, branches, documents, held, entered.entered, bias=bias,
+                               parts=parts, dtype=dtype)
+    second, _ = rule(convolved, valid=branches, starts=begins & branches, state=finals,
+                     entered=entered.entered)
+    out = jnp.where(roots[:, :, *([None] * (first.ndim - 2))], first, second)
+    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+
+
 def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
     """`local(*tokens, *whole)` on shards (`on_shards`) that split the rows and the sequence of each of
     `tokens` (`[B, S, ...]` or None) as the rule table places a `[batch, length, ...]` activation, `whole`
@@ -792,9 +824,11 @@ class GatedDeltaNet(nn.Module):
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
-    of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"entered"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that enter another
+    (`dew.batch.Entered`), each read from the memory and the conv history the one it enters ends with
+    (`entered_scan`); no mask or bias, which a recurrence reading every earlier token of its document has
+    no way to narrow."""
 
     emb_features: int
     num_k_heads: int
@@ -1056,7 +1090,25 @@ class GatedDeltaNet(nn.Module):
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
-        if shards > 1:
+        if tokens.entered is not None:
+            if decode or shards > 1:
+                raise LayoutRefused("documents that enter another are read whole in their rows by a training "
+                                    "or scoring call; a decode step or a sequence axis splits them")
+
+            def entered_rule(convolved, *, valid, starts, state, entered):
+                query, key, value = (self._split_heads(part, width)
+                                     for part, width in zip(convolved, widths, strict=True))
+                # A call's other tokens keep its memory, as padding does (exp(0)=1, beta=0).
+                kept = valid[:, :, None]
+                return chunk_gated_delta_rule(query, key, value, jnp.where(kept, g, 0.0),
+                                              jnp.where(kept, beta, 0.0), state, self.chunk_size,
+                                              starts=starts, max_segments=tokens.max_segments,
+                                              write_bound=1.0, entered=entered)
+
+            out = entered_scan(mixed, self.conv1d()[0], None, entered_rule, tokens,
+                               (self.num_v_heads, self.head_k_dim, self.head_v_dim), parts=heads,
+                               dtype=operand if ported else wide, state_dtype=wide)
+        elif shards > 1:
             if decode:
                 raise LayoutRefused(f"a gated delta net under a sequence axis of {shards} runs whole "
                                     f"training sequences; a decode step holds one state per row. Decode on "

@@ -26,6 +26,7 @@ instead of `q^T S` in the recurrent form; the numbers are in the tests that
 catch them.
 """
 
+import dataclasses
 import functools
 import itertools
 import json
@@ -1130,3 +1131,57 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
     assert not failures(found), "\n".join(failures(found))
 
 
+
+
+ENTERED_SEEDS = 12
+"""Check 1's declared seeds for documents entering another's memory and history against each one's row."""
+
+
+def test_documents_that_enter_another_read_its_memory_and_history_as_their_own_rows_do(reference, geometry):
+    """A row of a shared part and the documents that enter it (`dew.batch.Entered`, the questions of a row
+    over one state) gives each document's tokens what its own row of the shared part and itself gives them,
+    over drawn inputs (check 1): the conv reads the shared part's last tokens and the recurrence starts
+    from its final memory (`entered_scan`), its own tokens read once; a second request in the row enters its
+    own shared part, and padding comes back zero (row 1506)."""
+    from dew.batch import Entered
+
+    module = layer(geometry)
+    variables = layer_params(reference)
+    width = geometry["hidden_size"]
+    # Two requests: a shared part of 5 with parts of 3 and 2, then one of 4 with a part of 3; 2 padded.
+    lengths = [5, 3, 2, 4, 3]
+    enters = [0, 1, 1, 0, 4]
+    documents = np.concatenate([*(np.full(length, number, np.int32)
+                                  for number, length in enumerate(lengths, 1)), np.zeros(2, np.int32)])
+    tokens = len(documents)
+    valid = documents > 0
+    entered = Entered(jnp.asarray(documents[None]), jnp.asarray([enters], jnp.int32))
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid[None]),
+                                                               segments=jnp.asarray(documents[None]))))
+    call = MixerCall(AttentionMetadata(coordinates=dataclasses.replace(call.metadata.coordinates,
+                                                                      entered=entered)))
+    begins = np.cumsum([0, *lengths])
+
+    def draw(seed):
+        return (jnp.asarray(np.random.default_rng(seed).normal(size=(1, tokens, width)), jnp.float32),)
+
+    @jax.jit
+    def entering(hidden):
+        return module.apply(variables, hidden, call)
+
+    @jax.jit
+    def apart(hidden):
+        out = jnp.zeros((1, tokens, width), hidden.dtype)
+        for number, (length, root) in enumerate(zip(lengths, enters, strict=True)):
+            own = hidden[:, begins[number]:begins[number] + length]
+            if root == 0:
+                out = out.at[:, begins[number]:begins[number] + length].set(module.apply(variables, own))
+                continue
+            shared = hidden[:, begins[root - 1]:begins[root - 1] + lengths[root - 1]]
+            row = module.apply(variables, jnp.concatenate([shared, own], axis=1))
+            out = out.at[:, begins[number]:begins[number] + length].set(row[:, shared.shape[1]:])
+        return out
+
+    assert_as_exact(entering, apart, draw, "documents entering another's memory and history",
+                    seeds=ENTERED_SEEDS)
+    assert not np.any(np.asarray(entering(*draw(0)))[:, ~valid])

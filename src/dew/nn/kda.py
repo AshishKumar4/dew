@@ -47,6 +47,7 @@ from .linear import (
     DepthwiseConv1d,
     RMSNormGated,
     decode_delta_rule,
+    entered_scan,
     held_scan,
     over_sequence,
     split_delta_rule,
@@ -88,9 +89,10 @@ class KimiDeltaAttention(nn.Module):
     `chunk_kda`, fla-core 0.5.2, fla/ops/kda/gate.py:57-70).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
-    of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"entered"})
+    """Of the call's `MIXING` fields, the documents that enter another, each read from the memory and the
+    conv history the one it enters ends with (`dew.nn.linear.entered_scan`); no mask or bias, which a
+    recurrence reading every earlier token of its document has no way to narrow."""
 
     emb_features: int
     num_heads: int
@@ -213,7 +215,24 @@ class KimiDeltaAttention(nn.Module):
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, floor=self.lower_bound, write_bound=1.0)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         shards = sequence_shards()
-        if shards > 1:
+        if tokens.entered is not None:
+            if decode or shards > 1:
+                raise LayoutRefused("documents that enter another are read whole in their rows by a training "
+                                    "or scoring call; a decode step or a sequence axis splits them")
+
+            def entered_rule(convolved, *, valid, starts, state, entered):
+                query, key, value = (split(part) for part in convolved)
+                # A call's other tokens keep its memory, as padding does (exp(0) = 1, beta = 0).
+                kept_g = jnp.where(valid[:, :, None, None], g, 0.0)
+                kept_beta = jnp.where(valid[:, :, None], beta, 0.0)
+                return chunk_gated_delta_rule(query, key, value, kept_g, kept_beta, state, self.chunk_size,
+                                              starts=starts, max_segments=tokens.max_segments,
+                                              floor=self.lower_bound, write_bound=1.0, entered=entered)
+
+            out = entered_scan(projected, taps, None, entered_rule, tokens,
+                               (self.num_heads, self.head_dim, self.head_dim), parts=heads,
+                               dtype=projected.dtype if ported else wide, state_dtype=wide)
+        elif shards > 1:
             if decode:
                 raise LayoutRefused(f"Kimi delta attention under a sequence axis of {shards} runs whole "
                                     f"training sequences; a decode step holds one state per row. Decode on a "
