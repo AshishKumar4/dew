@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import process_support
 import run_kinds
-from run_kinds import KINDS, decision, lm, read, requested
+from run_kinds import KINDS, decision, lm, masked, read, requested
 from test_lm_recipe import SEQ, write_token_files
 
 from dew.config import RunConfig, SourceOptions, TrainerConfig
@@ -157,8 +157,8 @@ def answered(task) -> None:
 
 SAVED_KINDS = {**KINDS, "multimodal": multimodal, "decision-segments": segmented,
                "decision-lettered": lettered, "decision-lettered-context": lettered_in_context,
-               "block-diffusion": blockwise, "lm-examples": clocked,
+               "block-diffusion": blockwise, "masked-diffusion": masked, "lm-examples": clocked,
                "lm-bf16": fresh, "lm-float16": scaled, "lm-scaled": chosen_scale, "lm-stored": stored}
 """Each kind the corpus saves a run of: every run kind (`run_kinds.KINDS`), an LM run whose decoder
-its source's model nests, and each serialized variant beside them, a lettered question read in context
-among them."""
+its source's model nests, a run of every task a registered objective saves its runs as, and each
+serialized variant beside them, a lettered question read in context among them."""
