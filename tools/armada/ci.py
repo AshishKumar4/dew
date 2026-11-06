@@ -301,15 +301,35 @@ def shared(python: str) -> str:
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
-        digest.update(name.encode() + contents(name))
+        digest.update(name.encode() + (code_of(name) if name.endswith(".py") else contents(name)))
     return digest.hexdigest()
+
+
+def code_of(name: str) -> bytes:
+    """The hash of Python file `name`'s code: its syntax tree, with no comment, no docstring and no line
+    number, so a change of what the harness says of itself re-keys no row (row 2730: a docstring edit to a
+    SHARED module ran the suite cold); its bytes' (`contents`) where it does not parse, or b"missing"."""
+    path = Path(name)
+    if not path.is_file():
+        return b"missing"
+    try:
+        tree = ast.parse(path.read_bytes(), name)
+    except SyntaxError:
+        return contents(name)
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if (isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and body
+                and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            node.body = body[1:] or [ast.Pass()]
+    return hashlib.sha256(ast.dump(tree).encode()).digest()
 
 
 def lane_inputs(python: str) -> str:
     """The hash of what a GPU lane's file shares (`gpu_lane`): what every test file's run shares (`shared`),
     and this file, which sets the environment, share and deadline each file runs under on a GPU, where a
     CPU task's are the session's."""
-    return hashlib.sha256((shared(python) + contents(__file__).hex()).encode()).hexdigest()
+    return hashlib.sha256((shared(python) + code_of(__file__).hex()).encode()).hexdigest()
 
 
 FIXTURES = Path("tests/fixtures")

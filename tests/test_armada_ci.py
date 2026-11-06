@@ -1188,6 +1188,21 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
             ci.plan(300.0, {})
 
 
+def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does(ci, tmp_path):
+    """Every row's shared key holds the SHARED harness modules by their code (`code_of`): an edit to what one
+    says of itself, a comment or a docstring, reuses every row, as it changes no run (row 2730: a docstring
+    edit to followed.py ran a train's suite cold); an edit to what it does re-keys them all."""
+    module = tmp_path / "tools/armada/followed.py"
+    module.parent.mkdir(parents=True)
+    module.write_text('"""Followed."""\n\n\ndef read(path):\n    """The file."""\n    return path\n')
+    before = ci.shared("3.12")
+    module.write_text('"""Followed, as each run reads."""\n\n\n# A comment.\ndef read(path):\n'
+                      '    """The file, whole."""\n    return path\n')
+    assert ci.shared("3.12") == before
+    module.write_text('"""Followed."""\n\n\ndef read(path):\n    """The file."""\n    return [path]\n')
+    assert ci.shared("3.12") != before
+
+
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
     """The durations record is no file's input but a split file's groups', which are cut from that file's
     own entries: a change to another file's entries reuses every row, and so does one to the split file's
