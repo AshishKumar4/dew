@@ -243,8 +243,8 @@ def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
                     logits.setdefault(key.decode(errors="replace"), held[window][asked][real])
         return dict(sorted(logits.items()))
 
-    def arm(objective, batches):
-        return as_given(lambda variables: scored(objective, batches, variables))
+    def arm(objective, name):
+        return as_given(lambda variables, windows: scored(objective, windows[name], variables))
 
     initialized = jax.jit(packed.init)
     wide = copy.copy(alone)
@@ -252,14 +252,18 @@ def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
                                alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
 
     @as_given
-    def truth(variables):
+    def truth(variables, windows):
         with jax.enable_x64(new_val=True):
             return scored(wide, windows["alone"], widened(variables))
 
     def draw(seed):
-        return (opened(initialized(jax.random.key(seed))),)
+        order = np.arange(len(rows)) if seed == 0 else np.random.default_rng(seed).permutation(len(rows))
+        ordered = [rows[index] for index in order]
+        windows = {name: windows_of(objective, ordered, count=12)
+                   for name, objective in (("packed", packed), ("alone", alone))}
+        return opened(initialized(jax.random.key(seed))), windows
 
-    return arm(packed, windows["packed"]), arm(alone, windows["alone"]), draw, truth
+    return arm(packed, "packed"), arm(alone, "alone"), draw, truth
 
 
 def assert_packed_as_alone(packed: DecisionObjective, alone: DecisionObjective, rows, what: str, seeds: int):
