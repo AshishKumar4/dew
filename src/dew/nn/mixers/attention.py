@@ -73,7 +73,7 @@ from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared
 from dew.nn.value_experts import RoutedValues
-from dew.nn.visibility import same_group, windowed
+from dew.nn.visibility import windowed
 
 
 def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
@@ -1373,8 +1373,8 @@ class CausalSelfAttention(nn.Module):
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
-        # A piece reading its groups whole sees a group's keys wherever they lie, past its own place too,
-        # which no span a query states covers (`same_group`): its keys by the mask below.
+        # A piece reading its groups whole sees its group's keys past its own slot (`visibility_mask`), which
+        # the work list's spans, each its query's slot, do not state: its keys by the mask below.
         if not groups and self._one_work_list(store, query):
             return self._worked(store, query, index.value, positions[:rows], prompt, admitted.slots)
         if self._pages(store, query[0, :rows], windowed=False):
@@ -1388,20 +1388,18 @@ class CausalSelfAttention(nn.Module):
             # A padding piece's row is past the cache's; it reads row 0 and is never drawn from.
             held = jnp.where(admitted.slots < rows, admitted.slots, 0)
             keys, values = store.read_rows(held)
-            real = filled_slots(index.value[held], self.ctx.max_seq_len)
-            keep = causal_attention_mask(prompt, self.ctx.max_seq_len, key_valid=real)
+            real, slots = filled_slots(index.value[held], self.ctx.max_seq_len), prompt
             key_groups = {name: store.read_groups(name)[held] for name in groups}
         else:
             # A piece that starts its row reads only its own keys, in its own order.
             keys, values = (x[0, rows:].reshape(pieces, width, *x.shape[2:]) for x in (key, value))
             real = prompt >= 0
-            keep = (prompt[:, None, :, None] >= prompt[:, None, None, :]) & real[:, None, None, :]
+            slots = jnp.where(real, jnp.arange(width, dtype=jnp.int32), -1)
             key_groups = {name: held[rows:].reshape(pieces, width) for name, held in groups.items()}
-        for name, held in groups.items():
-            # A query in a group also reads its group's real keys after it (`same_group`).
-            mine = held[rows:].reshape(pieces, width)
-            keep = keep | (same_group(mine[:, None, :, None], key_groups[name][:, None, None, :])
-                           & real[:, None, None, :])
+        # Each query's keys up to its own slot, widened by the groups it reads whole as a prefill's are
+        # (`visibility_mask`: a block or an image holding its key runs on to its end).
+        keep = visibility_mask(width, keys.shape[1], True, None, key_valid=real, query_slots=slots,
+                               **key_groups)
         # A padding query reads one key, so its (unused) output stays finite.
         keep = keep | ((prompt < 0)[:, None, :, None] & (jnp.arange(keep.shape[-1]) == 0))
         prefilled = scaled_dot_product_attention(
