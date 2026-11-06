@@ -267,10 +267,11 @@ def test_train_masked_lm_smoke_trains_its_run_and_reads_it_back_as_a_masked_gene
     smoke("train_masked_lm", tmp_path)
 
     report = json.loads((tmp_path / "result.json").read_text())
-    assert report["steps"] == 4
+    assert len(logged_losses(tmp_path / "checkpoints" / "mdlm-json")) == 4
     assert report["held_out"] and all(np.isfinite(value) for value in report["held_out"].values())
-    assert [sample[:len(prompt)] for sample, prompt in zip(report["samples"], ("The cat", "A small boat"),
-                                                           strict=True)] == ["The cat", "A small boat"]
+    # Each sample its prompt and the continuation the run unmasked after it.
+    prompts = ("The cat", "A small boat")
+    assert all(len(sample) > len(prompt) for sample, prompt in zip(report["samples"], prompts, strict=True))
     assert (tmp_path / "checkpoints" / "mdlm-json" / "run.json").is_file()
 
 

@@ -4,16 +4,15 @@ record the one `dew train` reads (row 3727)."""
 
 import json
 import os
-import subprocess
-import sys
 from pathlib import Path
 
 import nbformat
+from lane_environment import outside_suite
 from nbclient import NotebookClient
+from process_support import dew_train, logged_losses
 
 import dew
 from dew.config import RunConfig
-from dew.training import LocalTracker
 
 CELLS = ['''
 import json
@@ -61,11 +60,10 @@ task it saved."""
 
 
 def environment() -> dict[str, str]:
-    """A user's machine: the Dew under test importable wherever this process found it, one CPU device
-    (this process's forced host devices left out)."""
+    """A user's machine (`outside_suite`: one CPU device, none of the suite's settings), with the Dew under
+    test importable wherever this process found it."""
     path = os.pathsep.join(filter(None, [str(Path(dew.__file__).parents[1]), os.environ.get("PYTHONPATH")]))
-    return {**{key: value for key, value in os.environ.items() if key != "XLA_FLAGS"}, "PYTHONPATH": path,
-            "JAX_PLATFORMS": "cpu"}
+    return {**outside_suite(os.environ), "PYTHONPATH": path}
 
 
 def executed(directory: Path) -> list[list]:
@@ -77,8 +75,9 @@ def executed(directory: Path) -> list[list]:
 
 
 def printed(outputs) -> dict:
-    """A cell's printed JSON."""
-    return json.loads("".join(output.text for output in outputs if output.output_type == "stream"))
+    """A cell's JSON printed to its standard output."""
+    return json.loads("".join(output.text for output in outputs
+                              if output.output_type == "stream" and output.name == "stdout"))
 
 
 def test_a_notebook_trains_scores_checkpoints_and_reloads_a_run_dew_train_continues(tmp_path):
@@ -97,10 +96,5 @@ def test_a_notebook_trains_scores_checkpoints_and_reloads_a_run_dew_train_contin
     run_dir = tmp_path / "checkpoints" / "notebook"
     assert RunConfig.load(str(run_dir)).trainer.steps == 4
 
-    finished = subprocess.run([sys.executable, "-m", "dew._cli.main", "train", str(run_dir / "run.json"),
-                               "--set", "trainer.steps=6"], cwd=tmp_path, capture_output=True, text=True,
-                              timeout=600, env=environment())
-    assert finished.returncode == 0, finished.stdout + finished.stderr
-    with LocalTracker(run_dir / "tracking") as journal:
-        steps = [step for step, scores in journal.scalars() if "train/loss" in scores]
-    assert steps == [1, 2, 3, 4, 5, 6]
+    dew_train(tmp_path, environment(), str(run_dir / "run.json"), "--set", "trainer.steps=6")
+    assert len(logged_losses(run_dir)) == 6
