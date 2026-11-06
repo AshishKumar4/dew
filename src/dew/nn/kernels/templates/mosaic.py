@@ -1794,11 +1794,17 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def staging(self, name: str, shaped) -> dict:
         """The scoped allocations of each consumer's staging of each operand a tile reads whole (`shaped`:
-        its tile's shape and its operand), one for each of up to two consumers, and the completion of its
-        load (`loaded`'s barriers), as `{name}_smems` and `{name}_barriers`."""
+        its tile's shape and its operand), one for each of up to two consumers, in the memory a program
+        stages in (`staged_memory`), and the completion of its load (`loaded`'s barriers), as
+        `{name}_smems` and `{name}_barriers`."""
         shaped = list(shaped)
-        return {f'{name}_smems': [plgpu.SMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
+        return {f'{name}_smems': [self.staged_memory((2, *shape), gmem.dtype) for shape, gmem in shaped],
                 f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
+
+    def staged_memory(self, shape: tuple[int, ...], dtype):
+        """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory (a
+        TPU's VMEM)."""
+        return plgpu.SMEM(shape, dtype)
 
     def meeting(self, consumers: int):
         """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""
