@@ -1906,6 +1906,7 @@ def validation(
     stream. With no `read`, the sources choose it (`_preferred_read`); `widths` are the run's static
     widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched; it
     reads by data plan version `plan_version`, its run's (`compile`)."""
+    read_by(plan_version)
     read = read or _preferred_read((pipeline,), provision=provision)
 
     # One pass reads every record, in the chain's own batches or `batch`'s (`_held_batched`).

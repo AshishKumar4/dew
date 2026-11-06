@@ -160,18 +160,20 @@ class ShardManifest:
         shards = self.sized(reads).shards
         if any(shard.rows is None for shard in (*shards, *parts)):
             return {}
+        # A part of no rows holds no record any shard reads: the walk takes those that hold some.
+        holding = [part for part in parts if part.rows]
         held: dict[str, tuple[Shard, ...]] = {}
         at = 0
         for shard in shards:
             taken = 0
             first = at
-            while at < len(parts) and taken < (shard.rows or 0):
-                taken += parts[at].rows or 0
+            while at < len(holding) and taken < (shard.rows or 0):
+                taken += holding[at].rows or 0
                 at += 1
             if taken != shard.rows:
                 return {}
-            held[shard.id] = parts[first:at]
-        return held if at == len(parts) else {}
+            held[shard.id] = tuple(holding[first:at])
+        return held if at == len(holding) else {}
 
     def sized(self, reads: int) -> ShardManifest:
         """The manifest with each shard's rows its store counts (`counted`), `reads` at once (its reading's

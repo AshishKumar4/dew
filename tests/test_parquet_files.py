@@ -391,7 +391,7 @@ def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
     from uuid import uuid4
 
     from dew.data.cache import Cache
-    from dew.data.compile import iterate, publish
+    from dew.data.compile import iterate, publish, validation
 
     chain = Pipeline(Files(written(f"version-{version}"), format="parquet"))
     with pytest.raises(ValueError):
@@ -407,6 +407,9 @@ def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
     with pytest.raises(ValueError):
         compile(Pipeline(Memory([{"id": 0}, {"id": 1}])).map(Unread()).batch(2), read="memory",
                 plan_version=version)
+    with pytest.raises(ValueError):
+        validation(Pipeline(Memory([{"id": 0}, {"id": 1}])).map(Unread()), batch=2, read="memory",
+                   plan_version=version)
 
 
 @dataclasses.dataclass(frozen=True)
