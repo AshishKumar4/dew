@@ -161,7 +161,7 @@ def test_the_derived_chunk_stays_finite_and_exact_on_every_regime(name, regime):
     seeds = recurrence_suite.SEEDS[name, regime]
     with derived():
         recurrence_suite.assert_finite_and_on_par(
-            functools.partial(chunk_on, "xla", hooks, chunk_size=recurrence_suite.CHUNK),
+            functools.partial(chunk_on, "derived", hooks, chunk_size=recurrence_suite.CHUNK),
             functools.partial(token_by_token, hooks),
             functools.partial(recurrence_suite.stressed, hooks, regime),
             f"the derived chunk, {name} under {regime}", seeds=seeds, finite_seeds=seeds)
@@ -205,8 +205,8 @@ def test_the_derived_chunk_holds_every_order_at_the_decays_edges(edge, name):
     with jax.enable_x64(new_val=True):
         exact = orders(functools.partial(token_by_token, hooks), *widened((operands, target)))
     with derived():
-        mine = orders(functools.partial(chunk_on, "xla", hooks, chunk_size=recurrence_suite.CHUNK), operands,
-                      target)
+        mine = orders(functools.partial(chunk_on, "derived", hooks, chunk_size=recurrence_suite.CHUNK),
+                      operands, target)
     for leaf, ours, theirs in zip(("value", "gradient", "tangent"), mine, exact, strict=True):
         # Finite where float64's is within the call's float32: a value past its range overflows as it must.
         with np.errstate(over="ignore"):

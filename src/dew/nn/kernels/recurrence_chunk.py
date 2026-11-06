@@ -35,7 +35,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
-from dew.algebra.forms import derived_on
 from dew.algebra.scan import RESET_DECAY
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected
@@ -583,8 +582,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
                                 scale=scale, wide=epilogue, firsts=firsts)
-            if derived_on():
-                # Behind the switch, the portable math's forms derived from the token update.
+            if kernel == 'derived':
+                # The portable math's forms derived from the token update, where a call names them.
                 return derived_rule(query, key, value, g, beta, state, starts, scale=scale, delta=hooks.delta,
                                     chunk_size=chunk_size, dtype=work, bound=hooks.inverse_bound)
             group = value.shape[2] // key.shape[2]
@@ -755,13 +754,16 @@ MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
 GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
-                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
+                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True),
+                                Kernel('derived', (), generic=True)),
                                declared=PORT_CELLS)
 """The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
 recurrence template at its derived tiles, else the port on any GPU Dew's Triton kernels run on, else the
-portable math, whose forms are those derived from the token update behind the switch (`derived_rule`,
-`dew.algebra.forms.derived`)."""
+portable math (`chunk_delta_rule`). The portable math's forms derived from the token update
+(`derived_rule`) run where a call names them (`generation.chosen(gated_delta_rule='derived')`), until they
+match the hand forms in check 1 at the edges, in every derivative order and in time (the shared switch,
+`dew.algebra.forms.derived`, no longer reads here)."""
 
 
 RESET = "first"
@@ -893,8 +895,8 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     except KernelRefused as refusal:
         training = functools.partial(_refusing, refusal)
     else:
-        if forward == trained == 'xla':
-            return run('xla', *operands)
+        if forward == trained and forward in ('xla', 'derived'):
+            return run(forward, *operands)
         training = functools.partial(run, trained)
     primal = functools.partial(run, forward)
 
