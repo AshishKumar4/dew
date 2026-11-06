@@ -960,10 +960,11 @@ HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].dr
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",
                        "a small column beside an overflowing one",
                        "a cotangent on a small column beside an overflowing one",
-                       "a column near fp32's least normal beside an overflowing one")
+                       "a column near fp32's least normal beside an overflowing one",
+                       "a resumed state beside an overflowing column")
 """The families whose Pallas-Triton default-form check runs on a GPU alone, compiled as its route runs it
-(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (137 to 257
-s, rows 1849, 2193; `GPU_ONLY`)."""
+(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (123 to 257
+s, rows 1849, 2193, 4344; `GPU_ONLY`)."""
 
 
 @pytest.mark.parametrize("family", [
