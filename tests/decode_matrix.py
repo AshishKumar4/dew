@@ -35,10 +35,10 @@ CHOICES = frozenset({"decode", "paged_decode", "attention_mainloop"})
 """The kernel choices (`generation.CHOICES`) its cells run: a dense cache's step's selector and a paged
 pool's, and the template's mainloop where a cell names the template's decode."""
 KERNELS = {"decode": frozenset({"decode", "cudnn", "template"}),
-           "paged_decode": frozenset({"triton", "template"})}
+           "paged_decode": frozenset({"triton", "template", "tpu"})}
 """The kernels its cells run under test, each named by its choice (`generation.chosen`, the `kernel` axis):
 the decode selector's hand kernel, cuDNN's and the attention template's decode; the paged selector's Pallas
-kernel and the template's decode over the pages."""
+kernel and the template's decode over the pages on a GPU, jax's Pallas paged attention on a TPU."""
 
 
 def _choice(case: dict[str, str]) -> str:
@@ -185,11 +185,11 @@ CASES = (
 
 @cell("decode", covers=lambda case: dict(zip(AXES["decode"], case, strict=True)))
 @pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+    generation.device_generation() != case[0], reason=f"a {case[0]} cell runs on its own device alone"))
     for case in CASES], ids="-".join)
 def a_decode_step_is_on_par(case: tuple[str, ...]) -> None:
-    """A decode step of `case` on its GPU, through its choice's route at its kernel, on par with the reference
-    path's (check 1); its routes its layout's choice at that kernel (`KERNELS`)."""
+    """A decode step of `case` on its device, through its choice's route at its kernel, on par with the
+    reference path's (check 1); its routes its layout's choice at that kernel (`KERNELS`)."""
     named = dict(zip(AXES["decode"], case, strict=True))
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_step(named, reference=False)), jax.jit(_step(named, reference=True)),
