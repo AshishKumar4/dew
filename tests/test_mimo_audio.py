@@ -123,8 +123,9 @@ def test_the_tokenizer_s_features_and_codes_are_the_reference_s(prefix, bound):
     # The pooled entries each segment holds, which its span alone decides: read on the host once.
     _, spans = segmented(config, np.zeros((len(lengths), max(lengths), config.tokenizer.n_mels)), lengths)
     shape = (len(spans), config.audio_segment_size, config.tokenizer.n_mels)
-    kept = np.flatnonzero(np.asarray(encoder.apply(held, np.zeros(shape, np.float32), spans,
-                                                   batch_longest(spans, config))[1]).reshape(-1))
+    valid = encoder.apply(held, np.zeros(shape, np.float32), spans, batch_longest(spans, config))[1]
+    # int32 places, which index a float64 twin's entries as they index the float32 run's.
+    kept = np.flatnonzero(np.asarray(valid).reshape(-1)).astype(np.int32)
 
     def entries(features):
         return features.reshape(-1, features.shape[-1])[kept]
