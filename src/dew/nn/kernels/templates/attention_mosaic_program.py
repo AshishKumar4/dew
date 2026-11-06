@@ -833,6 +833,10 @@ def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: in
     (`algebra.seen`)."""
     if spec.form != "spans":
         return None
+    if call.per_span > 1:
+        # Each interval a position's packed rows (`KeySpans.per_span`): its programs read them by position
+        # and form their tiles' bounds themselves (`_Program.reach`, `_Program.bounds`), no block map in XLA.
+        return _Spans(call.start, call.end, None, None, None, None, None, None)
     blocks = block_map(KeySpans(call.start, call.end, call.query_ids, call.key_ids, call.key_rows),
                        block_q, block_k)
     start, end = (jnp.moveaxis(bound, 2, 1) if bound.ndim == 3 else bound for bound in (call.start, call.end))
@@ -856,6 +860,9 @@ class _Program[T: (Tiles, BackwardTiles)]:
     causal: bool
     queries: int | None = None
     splits: int = 1
+    per_span: int = 1
+    """The queries each of a spans call's intervals holds (`KeySpans.per_span`): more than one, its programs
+    read the intervals by position (`reach`, `bounds`)."""
 
     def split(self):
         """This program's slice of its query tile's keys (`splits`), 0 of one."""
@@ -908,6 +915,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
             # A block holding padding rows is whole nowhere: its padding sees no key (`algebra.seen`).
             count = jnp.where(self.padded(first), 0, self.whole(first, walked))
             return *self._sliced(jnp.int32(0), walked), lambda index: index < count
+        if spans.lo is None:
+            return self._positions_reach(first, spans, row)
         block = lax.div(first, self.tiles.block_q)
         full_lo, full_hi = spans.full_lo[row, block], spans.full_hi[row, block]
 
@@ -919,6 +928,57 @@ class _Program[T: (Tiles, BackwardTiles)]:
             return inside & (doc != 0) & (doc == spans.key_doc[row, index])
 
         return *self._sliced(spans.lo[row, block], spans.hi[row, block]), whole
+
+    def _positions(self, first, spans: _Spans, row) -> list[tuple[jax.Array, jax.Array, jax.Array]]:
+        """The positions a query block from `first` holds rows of, in a call whose intervals each hold
+        `per_span` queries (`KeySpans.per_span`): each one's index, its interval `[start, end)` (batch row
+        `row`'s, read once) and whether the block holds its rows; as many as the block can hold, statically."""
+        positions = spans.start.shape[1]
+        held = min(positions, self.tiles.block_q // self.per_span + 1)
+        at = lax.div(first, self.per_span)
+        found = []
+        for offset in range(held):
+            position = at + offset
+            # A position past the call's holds no row: read its last one's, unused.
+            index = jnp.minimum(position, positions - 1)
+            holds = (position < positions) & (position * self.per_span < first + self.tiles.block_q)
+            found.append((position, spans.start[row, index], spans.end[row, index], holds))
+        return found
+
+    def _positions_reach(self, first, spans: _Spans, row):
+        """`reach`'s for a call whose intervals each hold `per_span` queries: the key tiles from the first any
+        of its rows' intervals starts in to the last any ends in, none seen whole where the block holds a
+        padding row (a decode step's few rows of a tile), else those every one of its intervals covers."""
+        block_k, big = self.tiles.block_k, jnp.iinfo(jnp.int32).max
+        lo, hi, full_lo, full_hi = jnp.int32(big), jnp.int32(0), jnp.int32(0), jnp.int32(big)
+        for _, start, end, holds in self._positions(first, spans, row):
+            seen = holds & (end > start)
+            lo = jnp.where(seen, jnp.minimum(lo, lax.div(start, block_k)), lo)
+            hi = jnp.where(seen, jnp.maximum(hi, pl.cdiv(end, block_k)), hi)
+            full_lo = jnp.where(holds, jnp.maximum(full_lo, pl.cdiv(start, block_k)), full_lo)
+            full_hi = jnp.where(holds, jnp.minimum(full_hi, lax.div(end, block_k)), full_hi)
+        lo = jnp.minimum(lo, hi)
+        if self.padded(first) is not False:
+            full_hi = jnp.where(self.padded(first), full_lo, full_hi)
+
+        def whole(index):
+            return (index >= full_lo) & (index < full_hi)
+
+        return *self._sliced(lo, hi), whole
+
+    def bounds(self, first, spans: _Spans, row) -> tuple[tuple, jax.Array | None]:
+        """A query block's intervals and its ids as `_coords` reads them (`_query_bounds`), read once before
+        its walk; a call whose intervals each hold `per_span` queries its rows' from their positions', a
+        padding row's empty."""
+        family, count = self.family, self.tiles.block_q
+        if spans.lo is not None:
+            return _query_bounds(family, spans, row, first, count)
+        place = lax.div(first + family.iota((count,), 0), self.per_span)
+        start = end = place * 0
+        for position, low, high, holds in self._positions(first, spans, row):
+            mine = (place == position) & holds
+            start, end = jnp.where(mine, low, start), jnp.where(mine, high, end)
+        return ((family.as_row(start), family.as_row(end)),), None
 
     def _sliced(self, lo, hi) -> tuple[jax.Array, jax.Array]:
         """`[lo, hi)` key tiles, this program's slice of them (`split`): the `splits` contiguous slices of a
@@ -984,6 +1044,15 @@ class _Program[T: (Tiles, BackwardTiles)]:
         start = jnp.where(k_first + block_k > self.keys, q_steps, jnp.maximum(start, lo))
         end = jnp.int32(q_steps if self.queries is None else min(self.queries // block_q, q_steps))
         return start, jnp.maximum(end, start)
+
+
+def _per_span(spec: algebra.Forward, spans: _Spans | None) -> int:
+    """The queries each of a launch's spans' intervals holds (`KeySpans.per_span`): its queries over its
+    positions where its programs read them by position (`_spans_of`), else 1."""
+    if spans is None or spans.lo is not None:
+        return 1
+    assert spec.queries is not None  # a call read by position states its queries (`_prepared`)
+    return spec.queries // spans.start.shape[1]
 
 
 def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
