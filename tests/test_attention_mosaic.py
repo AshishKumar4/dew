@@ -471,6 +471,34 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
     _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True)
 
 
+TPU_PASSES = {"fold": {"natural": False}, "natural": {"natural": True},
+              "sinks": {"natural": False, "sinks": True},
+              "training": {"natural": False, "training": template.Kept.SPLIT}}
+"""The forward passes a TPU core's launches run (`mosaic_tpu.MXU`): the base-2 fold, the natural form, an
+initial state, and the training forward's output beside its residuals."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("forward", TPU_PASSES)
+@pytest.mark.parametrize("call", CALLS)
+def test_a_tpu_cores_forward_is_on_par_interpreted(call, forward):
+    """The forward on a v5e's MXU (`mosaic_tpu.MXU`), the one mainloop's launches through the family's
+    seams (its staging, reads, grid coordinates and turns), in each pass, under Pallas TPU's interpreter: on
+    par with the reference (check 1)."""
+    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], interpret=True,
+                   target=generation.gpu_target("v5e"), **TPU_PASSES[forward])
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", CALLS)
+def test_a_tpu_cores_backward_is_on_par_interpreted(call):
+    """The backward on a v5e's MXU, its fused launch's dQ adds each program's in turn on the core's one
+    TensorCore (`mosaic_tpu.VmemRings.added`), under Pallas TPU's interpreter: every gradient on par with
+    the reference (check 1)."""
+    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True,
+                    target=generation.gpu_target("v5e"))
+
+
 @INTERPRETS
 @pytest.mark.parametrize("call", CALLS)
 def test_a_dropping_backward_is_on_par_over_every_call_interpreted(call):
