@@ -1829,17 +1829,9 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     def body(*refs, streams):
         refs = layout.unpacked(*refs)
         read = refs.read
-        row, axis = family.program_index("batch"), family.program_index("heads")
-        # A launch of several column blocks a program a block along its heads' axis.
-        if column_blocks > 1:
-            head, column = lax.div(axis, column_blocks), lax.rem(axis, column_blocks)
-        else:
-            head, column = axis, None if read.block is None else family.scalar_of(read.block)
-        named = {"keys": refs.k} if peaks else {"keys": refs.k, "values": refs.v}
-        views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page,
-                           block_k=block_k, column_block=column)
-        if parts > 1:
-            views = _parted_views(views, named, row, lax.div(head, group), batch=batch, parts=parts)
+        row, axis, head, column, views = _program_views(family, refs, read, peaks=peaks, group=group,
+                                                        page=page, block_k=block_k,
+                                                        column_blocks=column_blocks, batch=batch, parts=parts)
         streams = family.opened(streams, views)
         pair_first = program.query_tile(queries // pair) * pair
         streamed = _streamed([program.reach(pair_first + index * block_q, read.spans, row)[:2]
@@ -1902,6 +1894,25 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                          reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod,
                                                       guarded=read.guard is not None or flags)
                          )(query, key, value, *leaves)
+
+
+def _program_views(family: mosaic.Family, refs, read: _Read, *, peaks: bool, group: int, page: int | None,
+                   block_k: int, column_blocks: int, batch: int, parts: int) -> tuple:
+    """A forward program's place and the key views it streams (`_launched`'s): its batch row, its grid axis
+    along the heads and the query head and column block of the values it walks (a launch of several column
+    blocks a program a block along that axis, else the block `read` names), and its key and value views
+    (`_key_views`; a peak walk's keys alone, an fp32 call's its parts', `_parted_views`)."""
+    row, axis = family.program_index("batch"), family.program_index("heads")
+    if column_blocks > 1:
+        head, column = lax.div(axis, column_blocks), lax.rem(axis, column_blocks)
+    else:
+        head, column = axis, None if read.block is None else family.scalar_of(read.block)
+    named = {"keys": refs.k} if peaks else {"keys": refs.k, "values": refs.v}
+    views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page, block_k=block_k,
+                       column_block=column)
+    if parts > 1:
+        views = _parted_views(views, named, row, lax.div(head, group), batch=batch, parts=parts)
+    return row, axis, head, column, views
 
 
 def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, value, keys_count: int,
