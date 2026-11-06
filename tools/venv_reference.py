@@ -72,6 +72,10 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                              "End2End-Diffusion/iREPA "
                                              "99ad4ac234efe8de52ce157120f72856e836d09f",
                                 "license": "MIT"},
+         **{"flaxdiff-" + case.replace("/", "-"): {
+             "test": "test_flaxdiff_family_source", "arms": case, "worker": "flaxdiff_family_worker.py",
+             "reference": "AshishKumar4/FlaxDiff 15c55b001304604147a2a8002a76cf5d4c32092f", "license": "MIT"}
+            for case in importlib.import_module("flaxdiff_family_cases").CASES},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",

@@ -561,15 +561,15 @@
    "note": "FlaxDiff 0.2.10, JAX 0.5.3 and Flax 0.10.6 documented at tool:29."
   },
   "flaxdiff_family": {
-   "tool": "tools/flaxdiff_family_reference.py",
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "AshishKumar4/FlaxDiff",
-     "version": "15c55b001304604147a2a8002a76cf5d4c32092f",
-     "runs": "fetched"
+     "revision": "15c55b001304604147a2a8002a76cf5d4c32092f",
+     "runs": "flaxdiff/models (simple_dit, simple_vit, simple_mmdit, simple_unet, video_dit, unet_3d and their imports)"
     }
    ],
-   "note": "flaxdiff/models (hilbert, s5, common, attention, vit_common, dit_common, simple_unet, simple_vit, simple_dit, simple_mmdit, video_dit, unet_3d) fetched at the commit, SHA-256 checked; reference attention without forced-fp32 softmax; float32 and float64 (every jnp.float32 read as jnp.float64, x64) forward and gradients, on one CPU thread without XNNPACK. JAX 0.11.2.post3. orders.npz holds 52 spatial channel permutations of unet/variant, with every float64 output and gradient checked against the identity and its fp32 identity reproduced bit for bit."
+   "note": "Each case of tools/flaxdiff_family_cases.py (FlaxDiff's SimpleDiT, SimpleUDiT, SimpleMMDiT, HierarchicalMMDiT, Unet, VideoDiT and UNet3D, published and variant), <model>-<config>.npz, run by tools/flaxdiff_family_worker.py flaxdiff-<model>-<config> on the CPU in Dew's own JAX (one thread, no XNNPACK) over each seed's drawn weights, images or clips, times, text states and cotangent: the output and the gradients of the image, the text and every parameter, in float32 and, a copy of the model files with every float32 read as float64 and the Fourier frequencies drawn in float32 and widened, in float64; kept as its evidence and its truth's sketch. layout.json: each case's parameters' shapes by path, from its model's own initialization (--layout)."
   },
   "flaxdiff_pipeline": {
    "tool": "tools/flaxdiff_pipeline_reference.py",

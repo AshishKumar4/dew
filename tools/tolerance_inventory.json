@@ -753,10 +753,6 @@
    "comparisons": 3,
    "lane": "Training"
   },
-  "tools/flaxdiff_family_reference.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tools/gated_product_reference.py": {
    "comparisons": 1,
    "lane": "Kernels"
