@@ -32,11 +32,12 @@ from dew.interop.decoder_parts import (
     layer_type,
     native_fields,
     read_rope,
+    reads,
     refuse,
     refuse_export,
     specified_layer_types,
 )
-from dew.interop.layouts import Config, Route, Table
+from dew.interop.layouts import Config, ConfigLayout, ConfigPart, Route, Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers.mlp import MLPMixer
@@ -230,7 +231,8 @@ def _dory_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 DORY = DecoderFamily(
-    ('dory',), _dory_config, lambda fields: fields.ngpt is not None, 'dory', 'DoryForCausalLM', _dory_export,
+    ('dory',), ConfigLayout(ConfigPart(reads(_dory_config), _dory_export)),
+    lambda fields: fields.ngpt is not None, 'dory', 'DoryForCausalLM',
     routes=_ROUTES,
     preserve_source_layout=True, defaults=_DEFAULTS,
     tied_head_names=('lm_head.weight', 'backbone.embeddings.weight'),

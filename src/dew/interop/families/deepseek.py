@@ -46,16 +46,31 @@ from dew.interop.decoder_parts import (
     prediction_routes,
     read_partial_rope,
     read_rope,
+    reads,
     record_float,
     record_int,
     refuse,
     refuse_encoder_fields,
+    refuse_export,
     spelled,
     translated,
     yarn_record,
 )
-from dew.interop.layouts import INDEX, Config, Prefixed, Route, Routes, Slot, Table, mapped, one_of
+from dew.interop.layouts import (
+    INDEX,
+    Config,
+    ConfigLayout,
+    ConfigPart,
+    Prefixed,
+    Route,
+    Routes,
+    Slot,
+    Table,
+    mapped,
+    one_of,
+)
 from dew.interop.unread import Stored, held, valued
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
@@ -380,6 +395,60 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
         mixture=mixture(hf_config, layers, used) if routed else None,
     )
     return config
+
+
+def deepseek_moe_export(model: CausalTransformer, *, scheduled: bool = True) -> Mapping[str, object]:
+    """`deepseek_layout` and `deepseek_mixture` backwards, V3's sigmoid router (`_deepseek_v2_mixture`'s
+    softmax one where the mixture scores so): the routed experts' count, top-k and width, the shared ones
+    as a count of that width, the routed weights' scale and groups and how they are picked, and, where
+    `scheduled` (DeepSeek's own config), the dense layers before the routed ones
+    (`first_k_dense_replace`, `deepseek_routed`), every layer where the model routes none."""
+    mixture = model.mixture
+    if mixture is None:
+        return {'first_k_dense_replace': model.num_layers} if scheduled else {}
+    width = mixture.expert_features or model.hidden_features
+    if mixture.shared_features % width:
+        refuse_export('mixture.shared_features', 'DeepSeek counts whole shared experts of the routed width')
+    softmax = mixture.score_function == 'softmax'
+    fields: dict[str, object] = {
+        'n_routed_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
+        'moe_intermediate_size': width, 'n_shared_experts': mixture.shared_features // width,
+        'routed_scaling_factor': mixture.scaling, 'n_group': mixture.groups,
+        'topk_group': mixture.groups_per_token, 'norm_topk_prob': mixture.norm_topk_prob,
+        'scoring_func': mixture.score_function,
+        'topk_method': (('greedy' if mixture.groups == 1 else 'group_limited_greedy') if softmax
+                        else 'noaux_tc')}
+    if scheduled:
+        routed = tuple(model.sparse_layers)
+        first = model.num_layers - len(routed)
+        if routed != tuple(range(first, model.num_layers)):
+            refuse_export('mixture.layers', 'DeepSeek routes every layer past its first dense ones')
+        fields['first_k_dense_replace'] = first
+    return fields
+
+
+def mla_export(model: CausalTransformer) -> Mapping[str, object]:
+    """`deepseek_config`'s MLA backwards: the latents' ranks, the query and key heads' rotated and unrotated
+    widths (`head_dim` the rotated slice, as DeepSeek points it), the values', and the lightning indexer's
+    geometry where the mixer selects keys (V3.2's)."""
+    mixer = model.mixer
+    if not isinstance(mixer, MLAMixer):
+        refuse_export('mixer', 'a DeepSeek layer attends by multi-head latent attention')
+    return {'q_lora_rank': mixer.q_lora_rank, 'kv_lora_rank': mixer.kv_lora_rank,
+            'qk_nope_head_dim': mixer.qk_nope_head_dim, 'qk_rope_head_dim': mixer.qk_rope_head_dim,
+            'qk_head_dim': mixer.qk_nope_head_dim + mixer.qk_rope_head_dim,
+            'head_dim': mixer.qk_rope_head_dim,
+            'v_head_dim': mixer.v_head_dim, 'rope_interleave': mixer.rope_interleave,
+            **({} if mixer.index_topk is None else {
+                'index_topk': mixer.index_topk, 'index_n_heads': mixer.index_n_heads,
+                'index_head_dim': mixer.index_head_dim})}
+
+
+def deepseek_export(model: CausalTransformer) -> Mapping[str, object]:
+    """`deepseek_config` backwards: the MLA block (`mla_export`), the routed experts (`deepseek_moe_export`)
+    and the prediction depths the release stores past the trunk."""
+    return {**mla_export(model), **deepseek_moe_export(model),
+            'num_nextn_predict_layers': model.num_nextn_predict_layers}
 
 
 # The text half of a Kimi K2.5 wrapper, by the model_type its text_config
@@ -1146,12 +1215,11 @@ def v4_prepare(routes: Routes) -> WeightPreparer:
 
 MINIMAX_M2 = DecoderFamily(
     ('minimax_m2',),
-    _minimax_m2_config,
+    ConfigLayout(ConfigPart(reads(_minimax_m2_config), lambda model: {})),
     lambda fields: bool(fields.qk_norm and fields.qk_norm_scope == 'projection'
                         and fields.pre_norms and fields.mixture is not None),
     'minimax_m2',
     'MiniMaxM2ForCausalLM',
-    lambda model: {},
     routes=spelled(_MINIMAX_M2_NAMES),
     preserve_source_layout=True,
     padding_idx=True,
@@ -1163,11 +1231,10 @@ MINIMAX_M2 = DecoderFamily(
 # window, its compressor and its grouped output projection at once.
 DEEPSEEK_V4 = DecoderFamily(
     ('deepseek_v4',),
-    _deepseek_v4_config,
+    ConfigLayout(ConfigPart(reads(_deepseek_v4_config), lambda model: {})),
     lambda fields: isinstance(fields.mixer, DeepseekV4Mixer),
     'deepseek_v4',
     'DeepseekV4ForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_V4_ROUTES, prediction_depth=v4_depth,
     prepare=v4_prepare(DEEPSEEK_V4_ROUTES), folded=('o_a_proj/kernel',),
     preserve_source_layout=True,
@@ -1178,11 +1245,10 @@ DEEPSEEK_V4 = DecoderFamily(
 
 DEEPSEEK_V32 = DecoderFamily(
     ('deepseek_v32',),
-    partial(deepseek_config, sparse=True),
+    ConfigLayout(ConfigPart(reads(partial(deepseek_config, sparse=True)), deepseek_export)),
     lambda fields: (isinstance(mixer := fields.mixer, MLAMixer) and mixer.index_topk is not None),
     'deepseek_v32',
     'DeepseekV32ForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     padding_idx=True,
@@ -1191,7 +1257,7 @@ DEEPSEEK_V32 = DecoderFamily(
 
 DEEPSEEK_V2 = DecoderFamily(
     ('deepseek_v2',),
-    partial(deepseek_config, mixture=_deepseek_v2_mixture),
+    ConfigLayout(ConfigPart(reads(partial(deepseek_config, mixture=_deepseek_v2_mixture)), deepseek_export)),
     lambda fields: (
         isinstance(fields.mixer, MLAMixer)
         and (mixture := fields.mixture) is not None
@@ -1199,7 +1265,6 @@ DEEPSEEK_V2 = DecoderFamily(
     ),
     'deepseek_v2',
     'DeepseekV2ForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     aliases={'num_experts': 'n_routed_experts'},
@@ -1217,11 +1282,10 @@ DEEPSEEK_V2 = DecoderFamily(
 # text_config (modeling_kimi_k25.py:586), and DeepSeek V3's reader reads it.
 KIMI_K25 = DecoderFamily(
     ('kimi_k25',),
-    _kimi_k25_config,
+    ConfigLayout(ConfigPart(reads(_kimi_k25_config), lambda model: {})),
     lambda fields: False,
     'kimi_k25',
     'Kimi_K25ForConditionalGeneration',
-    lambda model: {},
     routes=Table(Prefixed('language_model.', DECODER_ROUTES),
                  # The tower and the projector have no counterpart here: their tensors fill no leaf, and
                  # a save writes their source bytes back.
@@ -1236,11 +1300,10 @@ KIMI_K25 = DecoderFamily(
 # exports as DeepSeek V3, the name `export_model_type` gives either source.
 DEEPSEEK_V3 = DecoderFamily(
     ('deepseek_v3', 'kimi_k2'),
-    deepseek_config,
+    ConfigLayout(ConfigPart(reads(deepseek_config), deepseek_export)),
     lambda fields: isinstance(fields.mixer, MLAMixer),
     'deepseek_v3',
     'DeepseekV3ForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     aliases={'num_local_experts': 'n_routed_experts', 'num_mtp_layers': 'num_nextn_predict_layers'},

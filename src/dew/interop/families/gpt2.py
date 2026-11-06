@@ -18,11 +18,12 @@ from dew.interop.decoder_parts import (
     Renames,
     fixed_attention_buffer,
     hf_ungated,
+    reads,
     refuse,
     spelled,
     ungated_mlp,
 )
-from dew.interop.layouts import Route, Slot, Spelled, Table, one_of
+from dew.interop.layouts import ConfigLayout, ConfigPart, Route, Slot, Spelled, Table, one_of
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -264,18 +265,18 @@ def gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 GPT_NEO = DecoderFamily(
-    ('gpt_neo',), _gpt_neo_config,
+    ('gpt_neo',), ConfigLayout(ConfigPart(reads(_gpt_neo_config), _gpt_neo_export)),
     lambda fields: fields.position_embedding == 'learned' and fields.attention_scale == 1.0
                    and fields.attention_bias is False and fields.o_proj_bias is True,
-    'gpt_neo', 'GPTNeoForCausalLM', _gpt_neo_export,
+    'gpt_neo', 'GPTNeoForCausalLM',
     routes=spelled(_GPT_NEO_NAMES), preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )
 
 GPTJ = DecoderFamily(
-    ('gptj',), _gptj_config,
+    ('gptj',), ConfigLayout(ConfigPart(reads(_gptj_config), _gptj_export)),
     lambda fields: fields.shared_parallel_norm and fields.head_bias and not fields.attention_bias,
-    'gptj', 'GPTJForCausalLM', _gptj_export,
+    'gptj', 'GPTJForCausalLM',
     routes=_GPTJ_ROUTES, head_rows=_GPTJ_ROWS, prepare=_gptj_prepare, preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )
@@ -343,12 +344,11 @@ the fixed causal masks fill no leaf."""
 
 OPENAI_GPT = DecoderFamily(
     ('openai-gpt',),
-    _openai_gpt_config,
+    ConfigLayout(ConfigPart(reads(_openai_gpt_config), _openai_gpt_export)),
     lambda fields: (fields.position_embedding == 'learned' and fields.post_residual_norms
                     and not fields.final_norm and fields.position_embedding_offset == 0),
     'openai-gpt',
     'OpenAIGPTLMHeadModel',
-    _openai_gpt_export,
     routes=_OPENAI_GPT_ROUTES,
     prepare=_openai_gpt_prepare,
     spelling=_openai_nested,
@@ -359,11 +359,10 @@ OPENAI_GPT = DecoderFamily(
 
 GPT2 = DecoderFamily(
     ('gpt2',),
-    gpt2_config,
+    ConfigLayout(ConfigPart(reads(gpt2_config), gpt2_export)),
     lambda fields: fields.position_embedding == 'learned',
     'gpt2',
     'GPT2LMHeadModel',
-    gpt2_export,
     routes=_GPT2_ROUTES,
     prepare=_gpt2_prepare,
     spelling=_nested,

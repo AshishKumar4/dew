@@ -30,10 +30,11 @@ from dew.interop.decoder_parts import (
     Packed,
     declared_depths,
     in_trunk,
+    reads,
     record_bool,
     record_int,
 )
-from dew.interop.layouts import Condition, Route, Slot, Table, When, one_of
+from dew.interop.layouts import Condition, ConfigLayout, ConfigPart, Route, Slot, Table, When, one_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -196,6 +197,41 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     return config
 
 
+def export_fields(model: CausalTransformer) -> Mapping[str, object]:
+    """`config_from_hf` backwards: the blocks' kinds as the pattern spells them (`_PATTERN`), the SSD's,
+    the MLP's and the routed experts' geometry, the attention's heads, the norms' epsilon and the
+    prediction steps' kinds; the shared decoder's fields the config declares none of cleared."""
+    letters = {kind: letter for letter, kind in _PATTERN.items()}
+    step = tuple(kind for kind in (model.mtp_layer_type, model.mtp_feedforward_type) if kind is not None)
+    mixers = {kind: model.kind_of(kind).mixer for kind in (*model.per_layer_types, *step)}
+    fields: dict[str, object] = {
+        'hybrid_override_pattern': ''.join(letters[kind] for kind in model.per_layer_types),
+        'layer_norm_epsilon': model.norm_eps, 'num_nextn_predict_layers': model.num_nextn_predict_layers,
+        **({'mtp_layers_block_type': list(step)} if step else {}),
+        'mlp_hidden_act': 'relu2', 'mamba_hidden_act': 'silu',
+        'rms_norm_eps': None, 'hidden_act': None, 'rope_theta': None, 'attention_bias': None,
+        'intermediate_size': None}
+    mamba = mixers.get('linear_attention')
+    if isinstance(mamba, Mamba2Mixer):
+        fields.update(mamba_num_heads=mamba.num_heads, mamba_head_dim=mamba.head_dim,
+                      ssm_state_size=mamba.state_size, n_groups=mamba.n_groups, conv_kernel=mamba.conv_kernel,
+                      chunk_size=mamba.chunk_size, use_bias=mamba.use_bias, use_conv_bias=mamba.use_conv_bias,
+                      time_step_min=mamba.time_step_limit[0])
+    mlp = mixers.get('mlp')
+    if isinstance(mlp, MLPMixer):
+        fields.update(intermediate_size=mlp.intermediate_size, mlp_bias=mlp.use_bias)
+    moe = mixers.get('moe')
+    mixture = moe.mixture if isinstance(moe, MLPMixer) else None
+    if mixture is not None:
+        fields.update(n_routed_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
+                      norm_topk_prob=mixture.norm_topk_prob, routed_scaling_factor=mixture.scaling,
+                      n_group=mixture.groups, topk_group=mixture.groups_per_token,
+                      moe_intermediate_size=mixture.expert_features,
+                      moe_shared_expert_intermediate_size=mixture.shared_features,
+                      moe_latent_size=mixture.latent_features)
+    return fields
+
+
 def _prediction_step(hf_config: Mapping[str, object]) -> tuple[str, ...]:
     """The kinds of one prediction step's blocks: the one whose mixer the step
     builds, then the MLP kind feeding forward, as `MTPBlock` holds them.
@@ -293,11 +329,10 @@ SSD's, each expert one tensor, and the prediction steps' blocks (`_step_routes`)
 
 NEMOTRON_H = DecoderFamily(
     ("nemotron_h",),
-    config_from_hf,
+    ConfigLayout(ConfigPart(reads(config_from_hf), export_fields)),
     matches,
     "nemotron_h",
     "NemotronHForCausalLM",
-    lambda model: {},
     routes=ROUTES,
     prediction_depth=step_depth,
     packed=PACKED,

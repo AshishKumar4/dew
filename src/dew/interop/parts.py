@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import functools
 import inspect
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from functools import cache
 from types import FunctionType, MethodType
@@ -31,7 +31,7 @@ from dew.interop import decoder_parts, sources
 from dew.interop.code_identity import Renaming, matched_class, same_code
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import ACTIVATIONS, PLAIN_SPELLING, DecoderFields
-from dew.interop.layouts import Leaf, Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Table, Unwritten
 from dew.interop.unread import Stored, held
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, NormSpec
@@ -1592,24 +1592,6 @@ _DEPTH_COPIES = Table(*decoder_parts.prediction_copies('model.layers.{depth}.',
 """A release's prediction depths' copies of the trunk's table and head (`decoder_parts.prediction_copies`)."""
 
 
-@dataclass(frozen=True, eq=False)
-class _Assembled:
-    """The names of a type verified from parts (`family`), read through `path` alone: its export writes
-    each tensor back from the reading that placed it (`preserve_source_layout`), so no route writes one,
-    and no model is written as it (`matches` is False)."""
-
-    path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None]
-
-    def read(self, name: str, config: Mapping[str, object]) -> Leaf | None:
-        return Leaf(self.path(name, config))
-
-    def write(self, path: tuple[str, ...], config: Mapping[str, object]) -> str | None:
-        return None
-
-    def copies(self, config: Mapping[str, object]) -> Iterator[tuple[str, tuple[str, ...]]]:
-        return iter(())
-
-
 def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     """The decoder family a type verified from parts loads through (`dew.interop.verify`): `assembly`'s
     fields for its config, every field of which the source's own code read, and each stored tensor at
@@ -1667,6 +1649,8 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         return prepared
 
     return decoder_parts.DecoderFamily(
-        (model_type,), translated, lambda fields: False, model_type, 'ForCausalLM', lambda model: {},
-        preserve_source_layout=True, routes=_Assembled(weight_path), packed=assembly.packed,
+        (model_type,), ConfigLayout(ConfigPart(decoder_parts.reads(translated), lambda model: {})),
+        lambda fields: False, model_type, 'ForCausalLM',
+        preserve_source_layout=True, routes=Unwritten(weight_path),
+        packed=assembly.packed,
         tied_head_names=assembly.tied, prediction_depth=decoder_parts.layer_depth, prepare=prepare)

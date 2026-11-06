@@ -28,11 +28,12 @@ from dew.interop.decoder_parts import (
     kind_mixers,
     kinds_of,
     read_rope_theta,
+    reads,
     refuse,
     specified_layer_types,
     spelled,
 )
-from dew.interop.layouts import Table, When
+from dew.interop.layouts import ConfigLayout, ConfigPart, Table, When
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers.short_conv import ShortConvMixer
@@ -179,11 +180,10 @@ def _export(model: CausalTransformer) -> Mapping[str, object]:
 
 LFM3 = DecoderFamily(
     ('lfm3',),
-    lfm3_config,
+    ConfigLayout(ConfigPart(reads(lfm3_config), _export)),
     lambda fields: any(isinstance(mixer, ShortConvMixer) for mixer in kind_mixers(fields)),
     'lfm3',
     'Lfm3ForCausalLM',
-    _export,
     routes=LFM3_ROUTES,
     # The path map names every leaf of the convolution layers, so the shared writer writes it whole.
     preserve_source_layout=True,

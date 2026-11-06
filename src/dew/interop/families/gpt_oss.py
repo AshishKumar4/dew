@@ -17,10 +17,12 @@ from dew.interop.decoder_parts import (
     RopeSpelling,
     base_config,
     read_rope,
+    reads,
     refuse,
     refuse_export,
     spelled,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.rope import YarnScaling
@@ -74,11 +76,10 @@ def _gpt_oss_export(model: CausalTransformer) -> Mapping[str, object]:
 
 GPT_OSS = DecoderFamily(
     ('gpt_oss',),
-    _gpt_oss_config,
+    ConfigLayout(ConfigPart(reads(_gpt_oss_config), _gpt_oss_export)),
     lambda fields: fields.mlp == 'swigluoai',
     'gpt_oss',
     'GptOssForCausalLM',
-    _gpt_oss_export,
     routes=spelled((), layer_leaves=_GPT_OSS_LEAVES),
     preserve_source_layout=False,
     # GptOssConfig's defaults: biased attention, its own norm epsilon and expert geometry, a window,

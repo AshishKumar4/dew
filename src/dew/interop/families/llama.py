@@ -12,9 +12,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
+    LOCAL_EXPERTS,
     MOE_NAMES,
     PLAIN_SPELLING,
     DecoderFamily,
@@ -24,13 +24,12 @@ from dew.interop.decoder_parts import (
     base_config,
     every_layer_windowed,
     read_rope,
+    reads,
     refuse,
-    softmax_top_k,
     spelled,
 )
 from dew.interop.families.qwen import QWEN_MOE_ROUTES
-from dew.interop.layouts import Spelled
-from dew.nn.backbones.decoder_block import Mixture
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Spelled
 
 
 def llama_config(hf_config, used):
@@ -57,14 +56,11 @@ _MIXTRAL_SPELLING = RopeSpelling(theta=1000000.0)
 
 
 def _mixtral_config(hf_config, used):
-    config = _mistral_config(hf_config, used, _MIXTRAL_SPELLING)
-    used.update(('num_local_experts', 'router_jitter_noise'))
+    """Mixtral's decoder, Mistral's under its own rope base; its experts are `LOCAL_EXPERTS`."""
+    used.add('router_jitter_noise')
     if hf_config.get('router_jitter_noise', 0.0):
         refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
-    experts = _records.integer(hf_config['num_local_experts'], 'num_local_experts')
-    config['mixture'] = native_fields(Mixture)(
-        top_k=softmax_top_k(hf_config, used), experts=experts)
-    return config
+    return _mistral_config(hf_config, used, _MIXTRAL_SPELLING)
 
 
 def _mistral_config(hf_config, used, spelling: RopeSpelling = PLAIN_SPELLING):
@@ -79,26 +75,20 @@ def _mistral_config(hf_config, used, spelling: RopeSpelling = PLAIN_SPELLING):
 
 
 def _granitemoe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read Granite's embedding, attention, residual and head multipliers.
-
-    Every layer uses ordinary GQA and a normalized softmax MoE, without
-    shared experts or a balancing bias. The reference reads hidden_act, not
-    the released activation_function beside it, and applies no
-    router_jitter_noise, so both are read as the reference reads them: not at all.
-    """
+    """Read Granite's decoder: Llama's, ordinary GQA under a normalized softmax MoE on every layer
+    (`LOCAL_EXPERTS`), without shared experts or a balancing bias, and its multipliers
+    (`_GRANITE_MULTIPLIERS`). The reference reads hidden_act, not the released activation_function beside
+    it, and applies no router_jitter_noise, so both are read as the reference reads them: not at all."""
     used.update(('activation_function', 'router_jitter_noise'))
-    config = llama_config(hf_config, used)
+    return llama_config(hf_config, used)
+
+
+_GRANITE_MULTIPLIERS = tuple(
+    ConfigField(source, target, default=1.0, parse=_records.number)
     for source, target in (('embedding_multiplier', 'embedding_multiplier'),
                            ('residual_multiplier', 'residual_multiplier'),
-                           ('logits_scaling', 'logits_scaling'), ('attention_multiplier', 'attention_scale')):
-        used.add(source)
-        config[target] = _records.number(hf_config.get(source, 1.0), source)
-
-    config['mixture'] = native_fields(Mixture)(
-        experts=_records.integer(hf_config.get('num_local_experts', 8), 'num_local_experts'),
-        top_k=softmax_top_k(hf_config, used))
-    used.add('num_local_experts')
-    return config
+                           ('logits_scaling', 'logits_scaling'), ('attention_multiplier', 'attention_scale')))
+"""Granite's embedding, residual, head and attention multipliers, each one field both ways."""
 
 
 _GRANITEMOE_NAMES = (
@@ -116,27 +106,26 @@ _GRANITEMOE_PACKED = (
 
 GRANITEMOE = DecoderFamily(
     ('granitemoe',),
-    _granitemoe_config,
+    ConfigLayout(ConfigPart(reads(_granitemoe_config), lambda model: {}), *_GRANITE_MULTIPLIERS,
+                 LOCAL_EXPERTS),
     lambda fields: bool(fields.mixture is not None and not fields.qk_norm
                         and (fields.embedding_multiplier != 1.0 or fields.residual_multiplier != 1.0
                              or fields.logits_scaling != 1.0 or fields.attention_scale is not None)),
     'granitemoe',
     'GraniteMoeForCausalLM',
-    lambda model: {},
     routes=Spelled(_GRANITEMOE_NAMES, QWEN_MOE_ROUTES),
     packed=_GRANITEMOE_PACKED,
     preserve_source_layout=True,
     padding_idx=True,
-    defaults={'max_position_embeddings': 2048},
+    defaults={'max_position_embeddings': 2048, 'num_local_experts': 8},
 )
 
 MIXTRAL = DecoderFamily(
     ('mixtral',),
-    _mixtral_config,
+    ConfigLayout(ConfigPart(reads(_mixtral_config), lambda model: {'layer_types': None}), LOCAL_EXPERTS),
     lambda fields: fields.mixture is not None,
     'mixtral',
     'MixtralForCausalLM',
-    lambda model: {},
     routes=spelled(MOE_NAMES),
     preserve_source_layout=True,
     # MixtralConfig's defaults (its rope base is its spelling's).
@@ -149,11 +138,11 @@ MIXTRAL = DecoderFamily(
 # MistralConfig has no layer_types: its window is on every layer.
 MISTRAL = DecoderFamily(
     ('mistral',),
-    _mistral_config,
+    ConfigLayout(ConfigPart(reads(_mistral_config), lambda model: {
+        'layer_types': None, 'sliding_window': model.kind_of('sliding_attention').window})),
     every_layer_windowed,
     'mistral',
     'MistralForCausalLM',
-    lambda model: {'layer_types': None, 'sliding_window': model.kind_of('sliding_attention').window},
     preserve_source_layout=False,
     # MistralConfig's defaults: it attends a 4096-token window unless a config says otherwise, so
     # an export of a model without one says so with a null.
@@ -165,11 +154,10 @@ MISTRAL = DecoderFamily(
 
 MINISTRAL = DecoderFamily(
     ("ministral",),
-    ministral_config,
+    ConfigLayout(ConfigPart(reads(ministral_config), lambda model: {})),
     lambda fields: "sliding_attention" in (fields.layer_types or ()),
     "ministral",
     "MinistralForCausalLM",
-    lambda model: {},
     preserve_source_layout=False,
     # MinistralConfig's defaults for the fields its decoder reads.
     defaults={"sliding_window": 4096, "num_key_value_heads": 8, "max_position_embeddings": 131072},
@@ -178,12 +166,10 @@ MINISTRAL = DecoderFamily(
 
 LLAMA = DecoderFamily(
     ("llama",),
-    llama_config,
+    ConfigLayout(ConfigPart(reads(llama_config), lambda model: {"mlp_bias": True} if model.mlp_bias else {})),
     lambda fields: True,
     "llama",
     "LlamaForCausalLM",
-    # LlamaMLP's projections carry biases where mlp_bias says so.
-    lambda model: {"mlp_bias": True} if model.mlp_bias else {},
     preserve_source_layout=False,
     # LlamaConfig's context (configuration_llama.py:71), which a YaRN record's omitted lengths read.
     defaults={"max_position_embeddings": 2048},

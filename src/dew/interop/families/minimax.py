@@ -37,11 +37,13 @@ from dew.interop.decoder_parts import (
     kind_mixers,
     kinds_of,
     read_partial_rope,
+    reads,
     refuse,
     softmax_top_k,
     specified_layer_types,
     spelled,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -180,11 +182,10 @@ def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
 
 MINIMAX = DecoderFamily(
     ('minimax', *_OWN),
-    _minimax_config,
+    ConfigLayout(ConfigPart(reads(_minimax_config), _minimax_export)),
     lambda fields: bool(_lightning(fields) or fields.normed_residual or fields.stream_multiplier != 1.0),
     'minimax',
     'MiniMaxForCausalLM',
-    _minimax_export,
     routes=spelled(MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
     preserve_source_layout=False,
     padding_idx=True,

@@ -11,9 +11,11 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Renames,
     grouped_qkv,
+    reads,
     refuse,
     spelled,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -68,9 +70,9 @@ def _bloom_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 BLOOM = DecoderFamily(
-    ('bloom',), _bloom_config,
+    ('bloom',), ConfigLayout(ConfigPart(reads(_bloom_config), _bloom_export)),
     lambda fields: fields.position_embedding == 'alibi' and fields.embedding_norm,
-    'bloom', 'BloomForCausalLM', _bloom_export,
+    'bloom', 'BloomForCausalLM',
     routes=spelled(_BLOOM_NAMES),
     packed=grouped_qkv('.self_attention.query_key_value'),
     preserve_source_layout=False,

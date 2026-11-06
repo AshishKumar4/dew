@@ -56,13 +56,14 @@ from dew.interop.decoder_parts import (
     partial_rope_entry,
     plain_partial_rope,
     prediction_routes,
+    reads,
     record_int,
     refuse,
     spelled,
     translated,
 )
 from dew.interop.families.deepseek import deepseek_layout, deepseek_mixture
-from dew.interop.layouts import INDEX, Config, Route, Slot, Spelled, Table, When
+from dew.interop.layouts import INDEX, Config, ConfigLayout, ConfigPart, Route, Slot, Spelled, Table, When
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mimo_audio import AUDIO_TOKENIZER, translate_mimo_audio_config
@@ -265,8 +266,8 @@ def _flash_matches(fields: CausalTransformer) -> bool:
 
 
 MIMO_V2_FLASH = DecoderFamily(
-    ('mimo_v2_flash',), _mimo_v2_flash_config, _flash_matches, 'mimo_v2_flash', 'MiMoV2FlashForCausalLM',
-    _mimo_v2_flash_export, routes=_MIMO_V2_FLASH_ROUTES,
+    ('mimo_v2_flash',), ConfigLayout(ConfigPart(reads(_mimo_v2_flash_config), _mimo_v2_flash_export)),
+    _flash_matches, 'mimo_v2_flash', 'MiMoV2FlashForCausalLM', routes=_MIMO_V2_FLASH_ROUTES,
     # Its experts are stored one tensor each, so a save writes them back through the source's own names.
     preserve_source_layout=True,
     padding_idx=True,
@@ -555,8 +556,8 @@ def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 MIMO_V2 = DecoderFamily(
-    ('mimo_v2',), _mimo_v2_config, _matches, 'mimo_v2', 'MiMoV2ForCausalLM',
-    _mimo_v2_export, routes=_MIMO_V2_ROUTES,
+    ('mimo_v2',), ConfigLayout(ConfigPart(reads(_mimo_v2_config), _mimo_v2_export)), _matches, 'mimo_v2',
+    'MiMoV2ForCausalLM', routes=_MIMO_V2_ROUTES,
     prediction_depth=_prediction_depth,
     packed=_FUSED_QKV, packs=lambda config: config.get('attention_projection_layout') == 'fused_qkv',
     preserve_source_layout=True, release_code=SourceCode(*release_pins.MIMO_V2),

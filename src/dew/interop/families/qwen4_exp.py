@@ -31,6 +31,7 @@ from dew.interop.decoder_parts import (
     Renames,
     in_layer,
     kinds_of,
+    reads,
     refuse,
     spelled,
 )
@@ -41,7 +42,7 @@ from dew.interop.families.qwen import (
     _qwen_moe_mixture,
     qwen_hybrid_export,
 )
-from dew.interop.layouts import Route, Slot, Table, one_of
+from dew.interop.layouts import ConfigLayout, ConfigPart, Route, Slot, Table, one_of
 from dew.interop.unread import Stored, equal
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -251,11 +252,10 @@ def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
 
 QWEN4_EXP_TEXT = DecoderFamily(
     ('qwen4_exp_text',),
-    _qwen4_exp_config,
+    ConfigLayout(ConfigPart(reads(_qwen4_exp_config), _qwen4_exp_export)),
     lambda fields: bool(fields.hyper_connections is not None and fields.hyper_connections.gated),
     'qwen4_exp_text',
     'Qwen4ExpForCausalLM',
-    _qwen4_exp_export,
     routes=_ROUTES,
     prepare=_qwen4_exp_prepare,
     derived=_lookups,

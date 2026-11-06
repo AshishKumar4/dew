@@ -25,9 +25,11 @@ from dew.interop.decoder_parts import (
     RopeSpelling,
     base_config,
     read_rope,
+    reads,
     refuse,
     spelled,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -170,13 +172,12 @@ _LLAMA4_EXPERTS: Leaves = {f'mlp.experts.{projection}': ('mlp', 'experts', proje
 
 LLAMA4_TEXT = DecoderFamily(
     ('llama4_text',),
-    _llama4_config,
+    ConfigLayout(ConfigPart(reads(_llama4_config), _llama4_export)),
     # Llama 4 alone scales its routed experts' inputs by their routing weight, whatever its layers'
     # positions: a model of only NoPE layers is as much Llama 4 as one with rotated ones.
     lambda fields: bool(fields.mixture is not None and fields.mixture.scale_inputs),
     'llama4_text',
     'Llama4ForCausalLM',
-    _llama4_export,
     routes=spelled(_LLAMA4_NAMES, layer_leaves=_LLAMA4_EXPERTS),
     packed=_LLAMA4_PACKED,
     preserve_source_layout=True,

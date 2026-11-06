@@ -11,10 +11,12 @@ from dew.interop.decoder_parts import (
     base_config,
     grouped_qkv,
     hf_ungated,
+    reads,
     refuse,
     spelled,
     ungated_mlp,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -66,10 +68,10 @@ def _falcon_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 FALCON = DecoderFamily(
-    ('falcon',), _falcon_config,
+    ('falcon',), ConfigLayout(ConfigPart(reads(_falcon_config), _falcon_export)),
     lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact'
                    and fields.partial_rotary_factor is None,
-    'falcon', 'FalconForCausalLM', _falcon_export,
+    'falcon', 'FalconForCausalLM',
     routes=spelled(MEGATRON_NAMES),
     packed=grouped_qkv('.self_attention.query_key_value'),
     preserve_source_layout=False,

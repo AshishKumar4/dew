@@ -1348,23 +1348,6 @@ def export_config(model) -> Mapping[str, object]:
             overrides[name] = "block_bidirectional"
     if overrides:
         config["modeling_overrides"] = {"attention": overrides}
-    # A dial only some families' references read cannot ride in another
-    # family's config. Qwen2 splits the o_proj bias from the others, and
-    # Dream's reference is that block with the causal mask dropped
-    # (modeling_dream.py, DreamAttention builds o_proj bias-free over
-    # biased q/k/v); Gemma 2 alone applies the attention softcap (Gemma 3
-    # reads the field without passing it on). A checkpoint written under a
-    # family that would drop the dial is refused naming it.
-    if (model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias
-            and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo', 'llada2_moe')):
-        raise ExportRefused(
-                "o_proj_bias differs from attention_bias, which only the qwen2 "
-                "and dream references build, so the model cannot be written as "
-                f"{family.export_model_type}")
-    if model.attn_logit_softcap is not None and family.export_model_type != 'gemma2':
-        raise ExportRefused(
-            "attn_logit_softcap is applied by the gemma2 reference alone, so "
-            f"the model cannot be written as {family.export_model_type}")
     types = model.per_layer_types
     if any(layer != 'full_attention' for layer in types):
         config['layer_types'] = list(types)

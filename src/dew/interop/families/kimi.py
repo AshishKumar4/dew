@@ -81,13 +81,14 @@ from dew.interop.decoder_parts import (
     SituFields,
     WrapperFields,
     context_lengths,
+    reads,
     record_float,
     record_int,
     refuse,
     refuse_encoder_fields,
     spelled,
 )
-from dew.interop.layouts import Prefixed, Route, Slot, Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Prefixed, Route, Slot, Table
 from dew.interop.unread import Stored, held, valued
 from dew.nn.activations import Situ
 from dew.nn.attention_residuals import AttentionResiduals
@@ -426,11 +427,10 @@ def _kimi_k3_prepare(tensors: Mapping[str, Stored],
 # Kimi Linear's released remote code; provenance-only, like K2.5.
 KIMI_LINEAR = DecoderFamily(
     ('kimi_linear',),
-    _kimi_linear_config,
+    ConfigLayout(ConfigPart(reads(_kimi_linear_config), lambda model: {})),
     lambda fields: False,
     'kimi_linear',
     'KimiLinearForCausalLM',
-    lambda model: {},
     routes=_KIMI_ROUTES,
     prepare=_kimi_linear_prepare,
     preserve_source_layout=True,
@@ -440,11 +440,10 @@ KIMI_LINEAR = DecoderFamily(
 # Kimi K3's text decoder under its vision wrapper; provenance-only, like K2.5.
 KIMI_K3 = DecoderFamily(
     ('kimi_k3',),
-    _kimi_k3_config,
+    ConfigLayout(ConfigPart(reads(_kimi_k3_config), lambda model: {})),
     lambda fields: False,
     'kimi_k3',
     'KimiK3ForConditionalGeneration',
-    lambda model: {},
     routes=_KIMI_K3_ROUTES,
     prepare=_kimi_k3_prepare,
     zero_padded=_KDA_ZERO_PADDED,

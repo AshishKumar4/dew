@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 from dew import _records
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_parts import in_trunk, record_bool, record_int
+from dew.interop.decoder_parts import in_trunk, record_bool, record_int, refuse_export
 from dew.interop.layouts import Route, Routes, Table
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -100,6 +100,28 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
                          num_layers=integer("num_hidden_layers", 64),
                          tie_embeddings=boolean("tie_word_embeddings", default=False),
                          residual_in_fp32=boolean("residual_in_fp32", default=True))
+
+
+def export_fields(model: CausalTransformer) -> Mapping[str, object]:
+    """`config_from_hf` backwards: the SSD layer's geometry (its width over the model's as `expand`, whole
+    as the reference's validate_architecture requires), its bounds and biases, the norms' epsilon, the
+    residual's dtype, and the shared decoder's attention fields cleared, which `Mamba2Config` declares
+    none of (its `head_dim` and `num_heads` are the SSD's)."""
+    mixer = model.mixer
+    assert isinstance(mixer, Mamba2Mixer), "the family matches a Mamba-2 mixer alone"
+    expand, remainder = divmod(mixer.num_heads * mixer.head_dim, model.emb_features)
+    if remainder:
+        refuse_export('mixer', f"Mamba2Config states the SSD width as a whole multiple of hidden_size "
+                               f"{model.emb_features}, not {mixer.num_heads * mixer.head_dim}")
+    return {
+        'expand': expand, 'num_heads': mixer.num_heads, 'head_dim': mixer.head_dim,
+        'state_size': mixer.state_size, 'n_groups': mixer.n_groups, 'conv_kernel': mixer.conv_kernel,
+        'chunk_size': mixer.chunk_size, 'use_bias': mixer.use_bias, 'use_conv_bias': mixer.use_conv_bias,
+        'time_step_limit': list(mixer.time_step_limit), 'hidden_act': 'silu',
+        'layer_norm_epsilon': model.norm_eps, 'residual_in_fp32': model.residual_in_fp32,
+        'num_attention_heads': None, 'num_key_value_heads': None, 'intermediate_size': None,
+        'rms_norm_eps': None, 'attention_bias': None, 'rope_theta': None, 'max_position_embeddings': None,
+    }
 
 
 def mixer_decoder(hf_config: Mapping[str, object], hidden: int, mixer: MixerBase, *, vocab_size: int,

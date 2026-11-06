@@ -12,9 +12,11 @@ from dew.interop.decoder_parts import (
     Packed,
     base_config,
     qkv_widths,
+    reads,
     refuse,
     rope_records,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import LongRopeScaling
 
@@ -113,9 +115,9 @@ def _phi3_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 PHI3 = DecoderFamily(
-    ('phi3',), _phi3_config,
+    ('phi3',), ConfigLayout(ConfigPart(reads(_phi3_config), _phi3_export)),
     lambda fields: isinstance(fields.rope_scaling, LongRopeScaling),
-    'phi3', 'Phi3ForCausalLM', _phi3_export,
+    'phi3', 'Phi3ForCausalLM',
     packed=_PHI3_PACKED, preserve_source_layout=True,
     # Phi3Config's norm epsilon and context.
     defaults={'rms_norm_eps': 1e-5, 'max_position_embeddings': 4096, 'pad_token_id': 32000},
