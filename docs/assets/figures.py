@@ -1531,15 +1531,15 @@ def world_rssm_figure():
              "Training pulls the prior toward the posterior. The two together feed heads that rebuild the "
              "observation and predict reward and continuation.")
     for narrow in (False, True):
-        width, height = (360, 392) if narrow else (440, 310)
+        width, height = (360, 392) if narrow else (440, 246)
         svg = Figure(width, height, seconds=11, label=label)
         svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
 
         def draws(x, y, fill, dashed):
-            for k in range(8):
+            for k in range(7):
                 svg.rect(x + k * 17, y, 13, 20, fill=fill,
                          stroke="muted" if dashed else "none", rx=3)
-            svg.text(x + 8 * 17 + 4, y + 15, "…", size=14, color="muted")
+            svg.text(x + 7 * 17 + 4, y + 15, "…", size=14, color="muted")
 
         if narrow:
             with svg.group() as memory:
@@ -1573,7 +1573,7 @@ def world_rssm_figure():
                                 anchor="middle"), 6.2)
         else:
             with svg.group() as memory:
-                box(svg, 18, 28, 140, 66, "h (512)", ["GRU memory", "of the past"])
+                box(svg, 18, 28, 140, 80, "h (512)", ["GRU memory", "of the past"])
                 box(svg, 18, 150, 140, 56, "observation", ["this step's"])
             svg.appear(memory, 0.3)
             with svg.group() as posterior:
@@ -1584,7 +1584,7 @@ def world_rssm_figure():
             svg.appear(posterior, 1.4)
             with svg.group() as prior:
                 svg.arrow(160, 82, 186, 114)
-                svg.text(190, 98, "prior: h alone", size=12, color="muted")
+                svg.text(214, 98, "prior: h alone", size=12, color="muted")
                 draws(190, 106, "tint1", True)
             svg.appear(prior, 2.8)
             pull = svg.line(202, 104, 202, 76, color="accent", width=1.5, dash="3 3")
@@ -1598,7 +1598,7 @@ def world_rssm_figure():
                     svg.rect(352, 52 + k * 38, 72, 28, fill="raised", stroke="rule", rx=5)
                     svg.text(388, 70 + k * 38, name, size=12, anchor="middle")
             svg.appear(heads, 5.0)
-            svg.appear(svg.text(width / 2, 278, "watching uses the top row; imagining, the bottom one",
+            svg.appear(svg.text(width / 2, 232, "watching uses the top row; imagining, the bottom one",
                                 size=13, color="muted", anchor="middle"), 6.0)
         save_both(svg, "world-rssm", narrow)
 
@@ -1622,7 +1622,7 @@ def world_imagine_figure():
     svg.appear(svg.text((x0 + x1) / 2, y + 30, "32 steps, posterior", size=12, color="muted",
                         anchor="middle"), 2.4)
     svg.line(x1, 66, x1, 236, color="rule", dash="4 4")
-    svg.appear(svg.text(x1, y - 18, "observations stop", size=12, color="muted", anchor="middle"), 2.8)
+    svg.appear(svg.text(x1 - 8, y - 36, "observations stop", size=12, color="muted", anchor="end"), 2.8)
     for j, drift in enumerate((-52, 0, 52)):
         path = [(x1 + k * (x2 - x1) / 7, y + drift * (k / 7) ** 1.4) for k in range(8)]
         line = svg.polyline(path, color="accent", width=2 if drift == 0 else 1.25)
@@ -1703,7 +1703,7 @@ def world_racing_figure():
              "policy sees that image alone, the next gate lit. The camera picture shown is a frame "
              "recorded in the tutorial.")
     for narrow in (False, True):
-        width, height = (360, 540) if narrow else (440, 300)
+        width, height = (360, 540) if narrow else (440, 314)
         svg = Figure(width, height, seconds=11, label=label)
         svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
         if narrow:
@@ -1737,7 +1737,7 @@ def world_racing_figure():
                     for c in range(6):
                         svg.circle(36 + c * 16, 142 + r * 16, 4, fill="tint1")
                 svg.text(126, 150, "4096 at once", size=12, color="muted")
-                box(svg, 20, 202, 186, 66, "teacher reads", ["state, gate corners,", "obstacles"],
+                box(svg, 20, 202, 186, 78, "teacher reads", ["state, gate corners,", "obstacles"],
                     accent=True)
             svg.appear(physics, 0.4)
             with svg.group() as camera:
@@ -1746,13 +1746,13 @@ def world_racing_figure():
                 camera_tile(svg, 234, 132, 64, frame)
                 svg.text(306, 160, "camera image,", size=12, color="muted")
                 svg.text(306, 178, "next gate lit", size=12, color="muted")
-                box(svg, 234, 202, 186, 66, "policy reads", ["the image alone"], accent=True)
+                box(svg, 234, 202, 186, 78, "policy reads", ["the image alone"], accent=True)
             svg.appear(camera, 2.2)
             with svg.group() as shared:
                 svg.arrow(208, 84, 232, 84, color="accent", width=1.5)
                 svg.arrow(232, 100, 208, 100, color="accent", width=1.5)
             svg.appear(shared, 3.8)
-            svg.appear(svg.text(width / 2, 288, "actions cross; only the drawing stays outside", size=12,
+            svg.appear(svg.text(width / 2, 302, "actions cross; only the drawing stays outside", size=12,
                                 color="muted", anchor="middle"), 4.8)
         save_both(svg, "world-racing", narrow)
 
