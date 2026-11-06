@@ -517,10 +517,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_pipeline_streaming.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_plan.py": {
    "comparisons": 1,
    "lane": "Training"
