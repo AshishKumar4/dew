@@ -279,23 +279,38 @@ class Conv(nn.Conv):
 
     @nn.nowrap
     def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
-        """The native convolution's output geometry, without allocating its arrays."""
-        spatial = shape[:-1]
+        """The native convolution's output geometry, without allocating its arrays, as `__call__` computes
+        it: an input padded by wrapping, reflecting or causally first, or as stated or as 'SAME' pads it,
+        and read by the dilated kernel at its strides; an input dilated (`input_dilation`, its extent
+        `(size - 1) * rate + 1`) padded by the amounts stated, and refused padded by name, as
+        `lax.conv_general_dilated` computes none so (ledger 4399)."""
         kernel = (self.kernel_size,) if isinstance(self.kernel_size, int) else tuple(self.kernel_size)
-        strides = ((self.strides,) * len(kernel) if isinstance(self.strides, int) else
-                   (1,) * len(kernel) if self.strides is None else tuple(self.strides))
-        dilation = ((self.kernel_dilation,) * len(kernel) if isinstance(self.kernel_dilation, int) else
-                    (1,) * len(kernel) if self.kernel_dilation is None else tuple(self.kernel_dilation))
-        effective = tuple((tap - 1) * rate + 1 for tap, rate in zip(kernel, dilation, strict=True))
+
+        def each(value: int | Sequence[int] | None) -> tuple[int, ...]:
+            value = 1 if value is None else value
+            return (value,) * len(kernel) if isinstance(value, int) else tuple(value)
+
+        strides, rates = each(self.strides), each(self.input_dilation)
+        effective = tuple((tap - 1) * rate + 1 for tap, rate in zip(kernel, each(self.kernel_dilation),
+                                                                    strict=True))
         padding = canonicalize_padding(self.padding, len(kernel))
-        if isinstance(padding, str):
-            if padding == 'VALID':
-                padding = ((0, 0),) * len(kernel)
-            else:
-                return (*tuple((size + step - 1) // step
-                               for size, step in zip(spatial, strides, strict=True)), self.features)
-        sizes = tuple((size + sum(pad) - tap) // step + 1
-                      for size, tap, step, pad in zip(spatial, effective, strides, padding, strict=True))
+        if isinstance(padding, str) and any(rate != 1 for rate in rates):
+            raise ValueError(f"a convolution over an input dilated by {rates} pads it by amounts stated, "
+                             f"not {padding!r}, as lax.conv_general_dilated pads it")
+        spatial = shape[:-1]
+        if padding in ('CIRCULAR', 'REFLECT', 'CAUSAL'):
+            # `__call__` pads the undilated input by the dilated kernel's extent less one, then reads it
+            # VALID.
+            spatial = tuple(size + tap - 1 for size, tap in zip(spatial, effective, strict=True))
+            padding = 'VALID'
+        extents = tuple((size - 1) * rate + 1 for size, rate in zip(spatial, rates, strict=True))
+        if padding == 'SAME':
+            sizes = tuple((size + step - 1) // step for size, step in zip(spatial, strides, strict=True))
+            return (*sizes, self.features)
+        if padding == 'VALID':
+            padding = ((0, 0),) * len(kernel)
+        sizes = tuple((extent + sum(pad) - tap) // step + 1
+                      for extent, tap, step, pad in zip(extents, effective, strides, padding, strict=True))
         return (*sizes, self.features)
 
     @nn.nowrap
