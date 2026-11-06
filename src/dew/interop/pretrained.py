@@ -1024,8 +1024,9 @@ class PretrainedPipeline(Pretrained):
 
         self._quantization()
         self._text_encoder("a saved pipeline writes it back")
-        # A stage-local fit's store is read by its layers' names (`stored_layers`).
-        values = stored_layers(self.model, self.variables if variables is None else variables)
+        # A stage-local fit's store, and a banked one, is read by its layers' names (`stored_layers`), a
+        # bank's rows read home as they are written.
+        values = stored_layers(self.model, self.variables if variables is None else variables, banks=True)
         if self.adapter is not None:
             values = self.adapter.merge(values)
         diffusion.save_source(self, values, Path(directory), max_shard_size)
