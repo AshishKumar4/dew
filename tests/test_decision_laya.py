@@ -246,9 +246,9 @@ def test_the_released_english_checkpoint_matches_laya():
     the CUDA GPU the test runs Dew on).
 
     It runs on a GPU at HIGHEST precision (`REAL_dew`): XLA:CPU's fp32 dot accumulates with 2.3 times the
-    RMS error of
-    the MKL dot torch runs (a [96, 1024] x [1024, 1024] product, 5.7e-7 against 2.5e-7, equal at a
-    reduction of 64), which ModernBERT-large's 1024- and 2624-long reductions carry through 28 layers."""
+    RMS error of the MKL dot torch runs (a [96, 1024] x [1024, 1024] product, 5.7e-7 against 2.5e-7, equal
+    at a reduction of 64), which ModernBERT-large's 1024- and 2624-long reductions carry through 28
+    layers."""
     checkpoint = released()
     expected = json.loads((FIXTURES / "real" / "layouts.json").read_text())
     for parallel in (False, True):

@@ -35,7 +35,7 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                   "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c",
                   "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
          "laya-real": {"test": "test_decision_laya", "worker": "laya_worker.py", "prefix": "REAL_",
-                       "host": True,
+                       "host": True, "device": "cuda",
                        "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c on "
                                     "convaiinnovations/laya 7b928d828b7b0e022f929d9bd2e44165aa270148",
                        "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
