@@ -1245,69 +1245,91 @@ def tr(iv: Iv) -> Iv:
     return Iv(iv.lo.T, iv.hi.T)
 
 
-def back_enclosures(step: BackStep, scale: float, lane: Lane) -> dict[str, Iv]:
-    """Each launch's records of a chunk of the delta rule's fast backward (fla's DAG, its rounding:
+def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "delta") -> dict[str, Iv]:
+    """Each launch's records of a chunk of a fast backward (fla's DAG, its rounding:
     `mainloop_backward.gradients`), from the inputs it reads (`BackStep`), each register operand staged as
-    the call holds it (`staged`) and each sum of products a `dot`'s:
+    the call holds it (`staged`), each sum of products a `dot`'s over its operands' parts (the operands and
+    the output's gradient `Lane.given`'s, every stored record and staged value `Lane.held`'s):
 
     - `local`: `A^T do`, `A[t, s] = scale (q_t . k_s) exp2(E_t - E_s)` (`s <= t`), its transpose's product
       `k q^T` decayed and scaled in fp32 and staged (`algebra.local_gradient`);
-    - `dv`: `(k grad) exp2(E_last - E) + local` (`algebra.reverse_carried`), `grad` staged;
-    - `entering`: `grad exp2(E_last) + scale q^T (do exp2(E)) - w^T dv`, the memory's gradient into the chunk;
-    - `ds`: `do c^T` decayed, causal and scaled, in the held form (`algebra.scores_gradient`);
-    - `dq`, `dk`, `dw`: `scale (do h^T) exp2(E) + ds k`, `(c grad^T) exp2(E_last - E) + ds^T q`,
-      `-dv h^T` (`algebra.memory_gradients`);
-    - `d_l`: `-(X^T tril(dX, -1) X^T)` decayed, `dX = dw (k beta exp2 E)^T + dv (v beta)^T`, `X = I + a`
-      (`algebra.system_gradient`);
-    - `values`: `(X^T dv) beta` (`algebra.values_gradient`);
-    - `keys`: `(X^T dw) exp2(E) beta + (d_l k) beta + (beta d_l)^T k` (`algebra.keys_gradient`)."""
+    - `dv`: `du = (k grad) exp2(E_last - E) + local` (`algebra.reverse_carried`), `grad` staged; where the
+      write gate takes the keys' side (`write` "keys", the SSD's), the walk's gate on it, `du beta`, in the
+      operands' form (`algebra.gated_values_back`);
+    - `entering`: `grad exp2(E_last) + scale q^T (do exp2(E)) - w^T du`, the memory's gradient into the
+      chunk (no `w^T du` without the delta rule);
+    - `ds`: `do c^T` (by each value column's write gate where the keys take it) decayed, causal and scaled
+      (`algebra.scores_gradient`);
+    - `dq`, `dk`, `dw`: `scale (do h^T) exp2(E) + ds k`, `(c grad^T) exp2(E_last - E) (beta) + ds^T q`,
+      `-du h^T` (`algebra.memory_gradients`; no `dw` without the delta rule);
+    - the delta rule's `d_l`: `-(X^T tril(dX, -1) X^T)` decayed, `dX = dw (k beta exp2 E)^T + du (v beta)^T`,
+      `X = I + a` (`algebra.system_gradient`); `values`: `(X^T du) beta` (`algebra.values_gradient`); and
+      `keys`: `(X^T dw) exp2(E) beta + (d_l k) beta + (beta d_l)^T k` (`algebra.keys_gradient`)."""
     exponents = Exponents.of(step.g)
     raised, gated, pairs = exponents.raised(lane), exponents.gated(lane), exponents.pairs(lane)
+    given, held = lane.given, lane.held
     factor = point(np.float32(scale))
     zeros = point(np.zeros((CHUNK, CHUNK)))
     rows = Iv(raised.lo[:, None], raised.hi[:, None])
     ranged = Iv(gated.lo[:, None], gated.hi[:, None])
     q, k, v, do = point(step.q), point(step.k), point(step.v), point(step.do)
     beta = np.asarray(step.beta)[:, None]
+    keyed_gate = write == "keys"
+    # The corrected values: as given where the keys take the gate, else a stored record.
+    values_parts = given if keyed_gate else held
     lag = _lags()
 
-    transposed = fp32(mul(blocked(k, tr(q), lane), tr(pairs)), lane)
+    transposed = fp32(mul(blocked(k, tr(q), lane, parts=(given, given)), tr(pairs)), lane)
     scores = staged(where(lag.T >= 0, fp32(mul(transposed, factor), lane), zeros), lane)
-    local = dot(scores, do, lane)
-    dv = fp32(add(fp32(mul(blocked(k, staged(step.grad, lane), lane), ranged), lane), point(step.local)),
-              lane)
-    held = Iv(np.full(step.grad.lo.shape, raised.lo[-1]), np.full(step.grad.lo.shape, raised.hi[-1]))
+    local = dot(scores, do, lane, parts=(held, given))
+    du = fp32(add(fp32(mul(blocked(k, staged(step.grad, lane), lane, parts=(given, held)), ranged), lane),
+                  point(step.local)), lane)
+    dv = fp32(mul(du, point(beta)), lane) if keyed_gate else du
+    kept = Iv(np.full(step.grad.lo.shape, raised.lo[-1]), np.full(step.grad.lo.shape, raised.hi[-1]))
     read = staged(fp32(mul(do, rows), lane), lane)
-    reads = dot(tr(q), read, lane)
-    entering = fp32(add(fp32(add(fused(mul(step.grad, held), lane), fused(mul(reads, factor), lane)), lane),
-                        neg(dot(tr(point(step.w)), point(step.dv), lane))), lane)
-    ds = fp32(mul(fp32(mul(blocked(do, tr(point(step.c)), lane), pairs), lane), factor), lane)
+    reads = dot(tr(q), read, lane, parts=(given, held))
+    entering = fp32(add(fused(mul(step.grad, kept), lane), fused(mul(reads, factor), lane)), lane)
+    if write == "delta":
+        entering = fp32(add(entering, neg(dot(tr(point(step.w)), point(step.dv), lane, parts=(held, held)))),
+                        lane)
+    ds = blocked(do, tr(point(step.c)), lane, parts=(given, values_parts))
+    if keyed_gate:
+        ds = fp32(mul(ds, point(beta.T)), lane)
+    ds = fp32(mul(fp32(mul(ds, pairs), lane), factor), lane)
     ds = staged(where(lag >= 0, ds, zeros), lane)
-    narrow = point(step.ds)
+    narrow, scored = point(step.ds), (given if keyed_gate else held)
     entered = tr(point(step.h))
-    dq = fp32(add(fp32(mul(fp32(mul(blocked(do, entered, lane), rows), lane), factor), lane),
-                  dot(narrow, k, lane)), lane)
-    dk = fp32(mul(dot(point(step.c), tr(point(step.dh)), lane), ranged), lane)
-    dk = fp32(add(dk, dot(tr(narrow), q, lane)), lane)
-    dw = neg(dot(point(step.dv), entered, lane))
+    dq = fp32(add(fp32(mul(fp32(mul(blocked(do, entered, lane, parts=(given, held)), rows), lane), factor),
+                       lane), dot(narrow, k, lane, parts=(scored, given))), lane)
+    dk = fp32(mul(dot(point(step.c), tr(point(step.dh)), lane, parts=(values_parts, held)), ranged), lane)
+    if keyed_gate:
+        dk = fp32(mul(dk, point(beta)), lane)
+    dk = fp32(add(dk, dot(tr(narrow), q, lane, parts=(scored, given))), lane)
+    found = {"local": local, "dv": dv, "entering": entering, "ds": ds, "dq": dq, "dk": dk}
+    if write != "delta":
+        return found
+    dw = neg(dot(point(step.dv), entered, lane, parts=(held, held)))
     lower_t = tr(point(step.a))
     weighting = fp32(mul(point(np.asarray(step.beta)), raised), lane)
     keyed = staged(fp32(mul(k, Iv(weighting.lo[:, None], weighting.hi[:, None])), lane), lane)
     valued = staged(fp32(mul(v, point(beta)), lane), lane)
-    d_x = dot(point(step.dv), tr(valued), lane, into=dot(point(step.dw), tr(keyed), lane))
+    d_x = dot(point(step.dv), tr(valued), lane, parts=(held, held),
+              into=dot(point(step.dw), tr(keyed), lane, parts=(held, held)))
     d_x = where(lag > 0, d_x, zeros)
-    d_x = fp32(add(d_x, dot(staged(d_x, lane), lower_t, lane)), lane)
-    d_x = fp32(add(d_x, dot(lower_t, staged(d_x, lane), lane)), lane)
+    d_x = fp32(add(d_x, dot(staged(d_x, lane), lower_t, lane, parts=(held, held))), lane)
+    d_x = fp32(add(d_x, dot(lower_t, staged(d_x, lane), lane, parts=(held, held))), lane)
     d_l = staged(where(lag > 0, neg(fp32(mul(d_x, pairs), lane)), zeros), lane)
-    du = point(step.dv)
-    values = fp32(mul(fp32(add(du, dot(lower_t, staged(du, lane), lane)), lane), point(beta)), lane)
+    du_held = point(step.dv)
+    values = fp32(add(du_held, dot(lower_t, staged(du_held, lane), lane, parts=(held, held))), lane)
+    values = fp32(mul(values, point(beta)), lane)
     dw_held = point(step.dw)
-    through = fp32(mul(fp32(add(dw_held, dot(lower_t, staged(dw_held, lane), lane)), lane), rows), lane)
-    combined = fp32(add(through, dot(d_l, k, lane)), lane)
+    through = fp32(add(dw_held, dot(lower_t, staged(dw_held, lane), lane, parts=(held, held))), lane)
+    through = fp32(mul(through, rows), lane)
+    combined = fp32(add(through, dot(d_l, k, lane, parts=(held, given))), lane)
     weighted = staged(fp32(mul(d_l, point(beta)), lane), lane)
-    keys = fp32(add(fp32(mul(combined, point(beta)), lane), dot(tr(weighted), k, lane)), lane)
-    return {"local": local, "dv": dv, "entering": entering, "ds": ds, "dq": dq, "dk": dk, "dw": dw,
-            "d_l": d_l, "values": values, "keys": keys}
+    keys = fp32(add(fp32(mul(combined, point(beta)), lane), dot(tr(weighted), k, lane, parts=(held, given))),
+                lane)
+    return {**found, "dw": dw, "d_l": d_l, "values": values, "keys": keys}
 
 
 class BackRun(NamedTuple):
@@ -1330,17 +1352,22 @@ class BackRun(NamedTuple):
         run, records = self.run, self.records
         last = n == run.chunks - 1
         grad = point(self.dfinal[head]) if last else held_cell(self.dh[n, head], lane)
+        # Where the keys take the gate, the corrected values are the values as given.
+        corrected = run.v[n, head] if run.write == "keys" else run.c[n, head]
+        # Without the delta rule there are no weights' gradients, which nothing then reads.
+        dw = records["dw"][n, head] if "dw" in records else np.zeros_like(run.w[n, head])
         return BackStep(run.q[n, head], run.k[n, head], run.v[n, head], run.g[n, head], run.beta[n, head],
-                        run.a[n, head], run.w[n, head], run.c[n, head], run.h[n, head], self.do[n, head],
+                        run.a[n, head], run.w[n, head], corrected, run.h[n, head], self.do[n, head],
                         grad, self.dh[n, head], records["local"][n, head], records["dv"][n, head],
-                        records["ds"][n, head], records["dw"][n, head])
+                        records["ds"][n, head], dw)
 
 
-def recorded_backward(operands: tuple, seed: int = 0) -> BackRun:
-    """The fast backward of a 16-bit call under the delta rule over one row (`draw`'s `operands`), run as a
-    training step runs it (the route's VJP), and the same build's `mainloop_backward.kept_backward` at the
-    forward's kept values, checked to give the step's gradients bit for bit: each launch's outputs as stored
-    (`Kept`), laid a chunk and value head at a time, for output and final memory gradients `seed` draws."""
+def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> BackRun:
+    """The fast backward of a call over one row (`draw`'s `operands`; under the `delta` rule, or without it
+    the SSD's route's under the run's fast forms), run as a training step runs it (the route's VJP), and the
+    same build's `mainloop_backward.kept_backward` at the forward's kept values, checked to give the step's
+    gradients bit for bit: each launch's outputs as stored (`Kept`), laid a chunk and value head at a time
+    (their parts summed), for output and final memory gradients `seed` draws."""
     import jax
     import jax.numpy as jnp
 
@@ -1350,16 +1377,20 @@ def recorded_backward(operands: tuple, seed: int = 0) -> BackRun:
 
     q, k, v, _, _, h0 = operands
     dtype = jnp.result_type(q, k, v)
-    run = recorded(*operands)
+    run = recorded(*operands, delta=delta)
     rng = np.random.default_rng([2084, seed])
     do = jnp.asarray(rng.standard_normal(v.shape), dtype)
     dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
-    scale = k.shape[-1] ** -0.5
-    rounded = recurrence_chunk.chunk_rounding(delta=True, dtype=dtype)
+    scale = run.scale
+    rounded = (recurrence_chunk.chunk_rounding(delta=True, dtype=dtype) if delta
+               else recurrence_chunk.fast_rounding())
     family = mainloop.family_of(dtype) or bundles.INTERPRETED
     interpret = generation.backend() != "gpu"
 
     def route(*x):
+        if not delta:
+            return recurrence_chunk.template_rule(*x, None, scale=scale, delta=False, wide=False,
+                                                  rounded=rounded)
         return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=1.0)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
@@ -1370,10 +1401,10 @@ def recorded_backward(operands: tuple, seed: int = 0) -> BackRun:
 
         def kept(*x):
             _, _, (inverse, held) = mainloop.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
-                                                         family=family, interpret=interpret)
+                                                         delta=delta, family=family, interpret=interpret)
             return mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale, rounded=rounded,
-                                                   family=family, interpret=interpret, inverse=inverse,
-                                                   kept=held)
+                                                   delta=delta, family=family, interpret=interpret,
+                                                   inverse=inverse, kept=held)
 
         grads, saved = jax.jit(kept)(*operands)
     for mine, theirs in zip(grads[:6], native, strict=True):
@@ -1388,9 +1419,10 @@ def recorded_backward(operands: tuple, seed: int = 0) -> BackRun:
         return rows.reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
 
     named = {"local": (saved.local, value_width), "dv": (saved.dv, value_width), "ds": (saved.ds, CHUNK),
-             "dq": (saved.dq, key_width), "dk": (saved.dk, key_width), "dw": (saved.dw, key_width),
-             "d_l": (saved.d_l, CHUNK), "values": (saved.values, value_width),
-             "keys": (saved.keys, key_width)}
+             "dq": (saved.dq, key_width), "dk": (saved.dk, key_width)}
+    if delta:
+        named |= {"dw": (saved.dw, key_width), "d_l": (saved.d_l, CHUNK),
+                  "values": (saved.values, value_width), "keys": (saved.keys, key_width)}
     records = {name: chunked(x, width) for name, (x, width) in named.items()}
     dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
     dh = np.asarray(saved.dh, np.float64).reshape(laid, heads, key_width, value_width)[:chunks]
@@ -1408,11 +1440,13 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     def stored(iv: Iv, dtype) -> Iv:
         return iv if dtype == np.float32 else cast(iv, {"bfloat16": BFLOAT16, "float16": FLOAT16}[str(dtype)])
 
+    run = back.run
+    lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide)
     found: dict[str, list] = {}
-    for n in range(back.run.chunks):
-        for head in range(back.run.heads):
-            step = back_enclosures(back.step(n, head, lane), back.run.scale, lane)
-            for name in BACK_RECORDS:
+    for n in range(run.chunks):
+        for head in range(run.heads):
+            step = back_enclosures(back.step(n, head, lane), run.scale, lane, write=run.write)
+            for name in step:
                 if name == "entering":
                     record = back.dh0[head] if n == 0 else back.dh[n - 1, head]
                     dtype = np.float32 if n == 0 else back.dtypes["entering"]
@@ -1428,14 +1462,21 @@ memory's gradients (another seed's) is refused."""
 
 
 def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
-    """The step witness of the delta rule's fast backward (`back_enclosures`): a bf16 call of three chunks,
-    every record each launch keeps inside its step's enclosure; and a backward that read another output's
-    and final memory's gradients refused (`CARRIED_GRADIENT_SHARES`): its records, claimed for those given."""
+    """The step witness of the fast backward (`back_enclosures`), each form it takes: a bf16 call of three
+    chunks under the delta rule and without it (the SSD's, its keys taking the gate), and an fp32 call under
+    the delta rule (its values in parts), every record each launch keeps inside its step's enclosure; and a
+    backward that read another output's and final memory's gradients refused (`CARRIED_GRADIENT_SHARES`):
+    its records, claimed for those given."""
+    import jax.numpy as jnp
+
     operands = draw(0, "mild", heads=heads)
+    wide = draw(0, "mild", heads=heads, dtype=jnp.float32)
+    for back in (recorded_backward(operands), recorded_backward(operands, delta=False),
+                 recorded_backward(wide)):
+        held = back_witnessed(back, lane)
+        for name, inside in held.items():
+            assert np.all(inside), (back.run.write, back.run.held, name, np.mean(inside))
     back = recorded_backward(operands)
-    held = back_witnessed(back, lane)
-    for name in BACK_RECORDS:
-        assert np.all(held[name]), (name, np.mean(held[name]))
     other = recorded_backward(operands, seed=1)
     claimed = back._replace(dh=other.dh, dh0=other.dh0, records=other.records)
     refused = back_witnessed(claimed, lane)
