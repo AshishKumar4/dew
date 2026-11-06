@@ -633,7 +633,7 @@ def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapp
     (`Frontier.reading`), where the equation reads that buffer last, its other operands read none of it,
     and it is its result's size, as XLA shares a scatter's first operand's buffer with its result
     (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, xla/hlo/analysis/hlo_dataflow_analysis.cc) and
-    a GEMM's bias's that nothing else reads (`FuseMatrixBiasAdd`'s `can_overwrite_bias`,
+    a GEMM's bias's that nothing else reads, before it or after (`FuseMatrixBiasAdd`'s `can_overwrite_bias`,
     xla/backends/gpu/transforms/gemm_rewriter.cc); none for any other equation."""
     name = equation.primitive.name
     if name.startswith("scatter") and equation.invars:
@@ -652,6 +652,10 @@ def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapp
     # Its other operands read none of that buffer, which writing it in place would overwrite under them.
     others = [value for number, value in enumerate(equation.invars) if number != at]
     if buffer not in held or last.get(buffer) != index or buffer in frontier.reading(others):
+        return 0
+    # A GEMM writes in its bias only where the product is the bias's one reader (`can_overwrite_bias`),
+    # whatever read it before.
+    if at == 2 and {frontier.readers[base], frontier.readers[buffer]} != {1}:
         return 0
     if device_share(buffer) != device_share(equation.outvars[0]):
         return 0
