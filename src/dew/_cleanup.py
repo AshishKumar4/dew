@@ -117,10 +117,30 @@ def members(group: int) -> list[int]:
     return found
 
 
+GATE = ("import os, sys\n"
+        "held, failed = int(sys.argv[1]), int(sys.argv[2])\n"
+        "os.set_inheritable(failed, False)\n"
+        "if os.read(held, 1):\n"
+        "    os.close(held)\n"
+        "    try:\n"
+        "        os.execvp(sys.argv[3], sys.argv[4:])\n"
+        "    except OSError as error:\n"
+        "        os.write(failed, str(error.errno).encode())\n"
+        "os._exit(127)\n")
+"""What a `start`ed group's leader runs before its command, as the same process: it waits for its owner's
+release, given once the lifeline holds its id, then executes the command, or writes the error its
+execution raised; an owner gone before it released the command (its pipe closed with nothing written)
+leaves it to exit having run nothing."""
+
+
 def start(command: Sequence[str], **options) -> subprocess.Popen:
     """`command` as the leader of a session and process group of its own, `options` as Popen's, with its
-    lifeline (`lifeline`) started first, so no instant leaves the group without one. The lifelines of groups
-    that ended on their own are let go first, their pipes closed."""
+    lifeline (`lifeline`) started first and holding the group's id before the command runs (`GATE`), so no
+    instant leaves the group's processes without one: an owner killed between the group's start and its
+    lifeline's knowing it took the group with it, where the command had run beside a lifeline that never
+    learned it (row 4395). Returns once the command is executing, raising the error its execution raised
+    (a missing program's `FileNotFoundError`) as Popen does. The lifelines of groups that ended on their own
+    are let go first, their pipes closed."""
     with _HELD:
         ended = [_LIFELINES.pop(leader) for leader, (_, held) in list(_LIFELINES.items())
                  if held.poll() is not None]
@@ -133,15 +153,36 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
                             start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
     os.close(read)
+    held, release = os.pipe2(os.O_CLOEXEC)
+    told, failed = os.pipe2(os.O_CLOEXEC)
+    program = options.pop("executable", command[0])
+    passed = (*options.pop("pass_fds", ()), held, failed)
     try:
-        process = subprocess.Popen(command, start_new_session=True, **options)
+        process = subprocess.Popen([sys.executable, "-I", "-S", "-c", GATE, str(held), str(failed), program,
+                                    *command], start_new_session=True, pass_fds=passed, **options)
     except BaseException:
-        os.close(write)
+        for end in (write, release, told):
+            os.close(end)
         line.wait()
         raise
+    finally:
+        os.close(held)
+        os.close(failed)
+    process.args = command
     os.write(write, f"{process.pid}\n".encode())
     with _HELD:
         _LIFELINES[process.pid] = (write, line)
+    os.write(release, b"1")
+    os.close(release)
+    # Closed by the command's execution, or written with its error.
+    with open(told, "rb") as said:
+        number = said.read()
+    if number:
+        stop(process)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        raise OSError(int(number), os.strerror(int(number)), program)
     return process
 
 
