@@ -35,8 +35,8 @@ class ReleaseParity:
     site: str
     requests: Path
     """The wire requests of each seed, `[[{state, questions: {id: wire}}, ...], ...]`."""
-    gradients: Mapping[str, str] = field(default_factory=dict)
-    """Each recorded `gradient.<name>`'s head parameter, by its name in the head's tree."""
+    gradients: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """Each recorded `gradient.<name>`'s head parameter, by its path in the head's tree."""
 
 
 def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
@@ -49,48 +49,59 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
     seeds = declared_seeds(parity.recording)[parity.site]
     draw, reference, truth = indexed_recording(recording(parity.recording), parity.site, seeds)
     requests = json.loads(parity.requests.read_text())
-    head = task.model.head
 
     @jax.jit
     def forward(inputs, probe):
         states = task.model.states(task.variables, inputs)
-        table = None if head.draws_from_rows else task.model.output_table(task.variables)
+        held = dict(task.variables)
 
         def observed(params, hidden):
-            ids = head.tied_labels()
-            tied = None if ids is None else task.model.readout_logits(task.variables, hidden, inputs, ids)
-            scores = head.apply({"params": params}, hidden, inputs, table, tied=tied)[:, 0]
-            return jnp.sum(scores * probe)
+            # The head over `hidden` as the model calls it (`DecisionModel.head_logits`), its parameters
+            # these; the probe's sum over the real options.
+            variables = {**held, "head": {**held["head"], "params": params}}
+            scores = task.model.head_logits(variables, hidden, inputs)
+            return jnp.sum(jnp.where(inputs.options, scores, 0) * probe)
 
         gradient, hidden = jax.grad(observed, (0, 1))(part(task.variables, "head").get("params", {}), states)
-        return {"scores": task.model.logits(task.variables, inputs)[:, 0], "gradient.hidden": hidden,
-                **{f"gradient.{name}": gradient[native] for name, native in parity.gradients.items()}}
+
+        def at(tree, path):
+            for key in path:
+                tree = tree[key]
+            return tree
+
+        return {"scores": task.model.logits(task.variables, inputs), "gradient.hidden": hidden,
+                **{f"gradient.{name}": at(gradient, path) for name, path in parity.gradients.items()}}
 
     @as_given
     def dew(index, held):
+        # A recording of one question a row states it `[R, O]`; every question its own `[R, Q, O]`.
+        options = held["options"] if held["options"].ndim == 3 else held["options"][:, None]
+        spans = held["spans"] if held["spans"].ndim == 4 else held["spans"][:, None]
         rows = []
         for request in requests[int(index)]:
             questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
             rows.extend(task.layout.rows(task.tokenizer, task.specials, request["state"], questions))
-        laid = DecisionInputs.collate(rows, task.specials.pad, options=held["options"].shape[1])
+        laid = DecisionInputs.collate(rows, task.specials.pad, options=options.shape[2])
         mask = np.arange(held["tokens"].shape[1])[None] < held["lengths"][:, None]
         # Its rows read in blocks where Dew lays them so, as the engine numbered them; read whole, the
         # engine's numbering is unread.
         blocked = rows[0].blocks is not None
         for row, encoded in enumerate(rows):
             np.testing.assert_array_equal(encoded.tokens, held["tokens"][row, :held["lengths"][row]])
-            np.testing.assert_array_equal(encoded.questions[0].options,
-                                          held["spans"][row, held["options"][row]])
+            assert len(encoded.questions) == int(np.sum(np.any(options[row], axis=-1)))
+            for at, laid_question in enumerate(encoded.questions):
+                np.testing.assert_array_equal(laid_question.options, spans[row, at][options[row, at]])
             if blocked:
                 np.testing.assert_array_equal(encoded.blocks, held["blocks"][row, :held["lengths"][row]])
         inputs = replace(laid, tokens=jnp.asarray(held["tokens"]), segments=jnp.asarray(mask, jnp.int32),
                          positions=jnp.broadcast_to(jnp.arange(mask.shape[1]), mask.shape),
                          blocks=jnp.asarray(held["blocks"]) if blocked else None)
-        probe = np.zeros(held["options"].shape, np.float32)
-        probe[held["options"]] = held["probe"]
+        probe = np.zeros(options.shape, np.float32)
+        probe[options] = held["probe"]
         result = forward(inputs, jnp.asarray(probe))
-        assert np.isneginf(np.asarray(result["scores"])[~held["options"]]).all()
-        return {**result, "scores": np.asarray(result["scores"])[held["options"]]}
+        scores = np.asarray(result["scores"])
+        assert np.isneginf(scores[~options]).all()
+        return {**result, "scores": scores[options]}
 
     assert_as_exact(dew, reference, draw, f"{parity.name} as its engine answers", seeds=seeds,
                     truth_fn=truth)

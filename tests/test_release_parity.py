@@ -28,7 +28,7 @@ def slot_release(mode: str, attention: str):
 RELEASES = [
     *(ReleaseParity(f"slot {attention} {mode}", slot_release(mode, attention), SLOT / "reference.npz",
                     f"{attention}_{mode}", SLOT / "requests.json",
-                    {"slot": "slots", "q.weight": "q", "k.weight": "k"} if mode == "head" else {})
+                    {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)} if mode == "head" else {})
       for mode in ("slot_lm", "head") for attention in ("causal", "block")),
 ]
 """Every release declared, at every site its engine's recording holds."""

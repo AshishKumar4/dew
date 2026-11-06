@@ -178,6 +178,14 @@ class DecisionModel(HeadedModel):
         (`dew.objectives.base.Step.sown`)."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
                                            progress=progress, opened=opened)
+        return self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs), sown
+
+    def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
+                    spanned: jax.Array | None = None, *, train: bool = False,
+                    rngs: dict[str, jax.Array] | None = None) -> jax.Array:
+        """The head's option logits `[B, Q, K]` over the backbone's `states`, -inf past each question's
+        options: the head's part of `observed_logits`, which reads its questions' spans from `spanned`, the
+        pass that holds them, where the head pools them."""
         head = thaw(part(variables, "head"))
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
         # them. A head that pools none reads a question in its context through the cross-attention alone.
@@ -198,7 +206,7 @@ class DecisionModel(HeadedModel):
             logits = _array(
                 self.head.apply(head, states, inputs, table, train=train, rngs=rngs) if spans is None
                 else self.head.apply(head, states, inputs, table, spanned=spans, train=train, rngs=rngs))
-        return jnp.where(inputs.options, logits, -jnp.inf), sown
+        return jnp.where(inputs.options, logits, -jnp.inf)
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                        labels: tuple[tuple[int, ...], ...]) -> jax.Array:
