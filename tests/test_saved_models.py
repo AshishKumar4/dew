@@ -163,3 +163,15 @@ def test_a_model_release_written_before_it_stated_its_run_loads_as_it_did(tmp_pa
     assert isinstance(before, SavedModel) and before.model == today.model
     assert before.settings == today.settings
     assert_same(before.variables, today.variables)
+
+
+def test_a_run_whose_average_is_its_reference_never_reads_as_averaged():
+    """An objective whose average is its frozen reference (DPO's) releases its live weights whatever `ema`
+    asks (`SavedRun.variables`), so its run's `averaged` says so: never the average, asked or stored, which a
+    release records of the weights it holds (review of the run release)."""
+    from dew.objectives.rl.preference import DPOObjective
+    from dew.registry import import_path
+
+    run = SavedRun("a run its objective alone answers for", {"objective": import_path(DPOObjective)}, 0)
+    assert run.averaged(True) is False
+    assert run.averaged(None) is False
