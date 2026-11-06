@@ -697,9 +697,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     given). The program returns its walk (`mosaic.Walk`), which the kernel runs (`Transport.run`), or None
     where it runs its own roles (`sequence_walk`'s). `held` is what a consumer thread holds in registers
     (`Held`). Where `template.planned` collects launches, the launch's record (`Launch`, its
-    `work`) and zeros. `work` states the model's products a tile; `hardware`, where the launch's products
-    take operands of other part counts than the held operand's, their FLOPs as issued (`issued_flops`), else
-    each product's the held operand's pairs: its cost and Dew's FLOP count state them (row 4032).
+    `work`) and zeros. `work` states the model's products a tile, `hardware` their FLOPs as issued
+    (`issued_flops`, the held operand's pairs where None), which its cost and Dew's FLOP count state.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
     once, its streams' rings running on across them (`_planned_launch`): the family's `persist` takes each
@@ -717,8 +716,6 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                                                              reduces=reduces,
                                                              after=after)
     tiles = math.prod(grid)
-    # The products as issued a tile: the launch's own where its products' operands differ in their parts
-    # (`issued_flops`), else each the held operand's by the held operand's.
     hardware = issued_flops(call, work.flops) if hardware is None else hardware
     threads = 128 * family.warpgroups(consumers)
 
@@ -1233,7 +1230,6 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
                          live=chunk_liveness(4), work=work,
-                         # Its pairs' products of their own operands' parts (`_pairing_operand`).
                          hardware=issued_flops(call, work.flops, *(_pairing_operand(call),) * 2),
                          held=_intra_held(call, keys, outputs), staging=staging, landing=landing,
                          name="recurrence_intra" if scored else "recurrence_intra_system",
