@@ -2097,12 +2097,10 @@ def test_a_tip_the_land_queue_graded_green_is_proven_for_mains_push_alone(tmp_pa
     assert proven_step(tmp_path / "run", "refs/heads/fix/lane", "77\n", "") == "77"
 
 
-def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int,
-               whole: bool = False) -> list[list[str]]:
+def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int) -> list[list[str]]:
     """The armada commands ci.yml's suite step gives, its own script run in bash for a push of `ref` with
     the proven job's output `proven` and the cache's `policy`, beside an armada whose stored verdict at the
-    commit exits `verdict` (0 green, 1 red, 2 none), as main's whole run where `whole`: each call's words, a
-    call a list."""
+    commit exits `verdict` (0 green, 1 red, 2 none): each call's words, a call a list."""
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
@@ -2117,10 +2115,8 @@ def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int,
     (bin_dir / "armada").chmod(0o755)
     subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=120,
                    env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "PROVEN": proven,
-                        "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref,
-                        # As ci.yml's expressions give them: the whole run's bounded share and its mode.
-                        "BACKGROUND_POOL": "48" if whole else "", "DEW_WHOLE_SUITE": "1" if whole else "",
-                        "RUNNER_TEMP": str(tmp_path), "ARMADA_URL": "http://127.0.0.1:9", "ARMADA_TOKEN": ""})
+                        "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref, "RUNNER_TEMP": str(tmp_path),
+                        "ARMADA_URL": "http://127.0.0.1:9", "ARMADA_TOKEN": ""})
     return [line.split() for line in calls.read_text().splitlines()] if calls.exists() else []
 
 
@@ -2132,16 +2128,15 @@ def commands(calls: list[list[str]]) -> list[str]:
 def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
     """Main's push of a tip the land queue graded green, its own CI run red on a row the regrade passed,
     carries the queue's proof: the suite step submits no suite, whatever the stored verdict or the cache's
-    policy (a train that changed what every test reads runs main's push with the cache off); the daily run,
-    which reads no proof, runs it as ever on main's tip, and an unproven push with a red verdict too (train
-    237's review, P1: the proof skipped the gangs alone)."""
+    policy (a train that changed what every test reads runs main's push with the cache off); an unproven push
+    of main's tip runs it as ever, and an unproven push with a red verdict too (train 237's review, P1: the
+    proof skipped the gangs alone)."""
     def ran(ref: str, proven: str, policy: str, verdict: int) -> bool:
         place = tmp_path / ref.replace("/", "-") / policy / (proven or "unproven")
         calls = suite_step(place, ref, proven, policy, verdict)
         return "run" in commands(calls)
 
     assert not ran("main", "4242", "on", 1) and not ran("main", "4242", "off", 1)
-    # The daily run reads no proof (the proven job runs on a push alone): main's tip, run anew.
     assert ran("main", "", "off", 0) and ran("fix/lane", "", "on", 1)
 
 
@@ -2175,12 +2170,9 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     bin_dir.mkdir()
     (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
-    # Main's whole run's gates start after every lane's run at a head, as its suite does.
-    for ref, whole, priority in (("fix/lane", "", []), ("main", "", ["--priority=5"]),
-                                 ("main", "1", ["--priority=-15"])):
+    for ref, priority in (("fix/lane", []), ("main", ["--priority=5"])):
         script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
-        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref,
-                       "WHOLE": whole}
+        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref}
         ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
                              env=environment)
         assert ran.returncode == 0, ran.stderr
@@ -2214,40 +2206,6 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
         return [word for word in run if word.startswith("--deadline")]
 
     assert deadline("off") == ["--deadline=5400"] and deadline("on") == ["--deadline=2700"]
-
-
-def run_options(tmp_path: Path, ref: str, policy: str, option: str, whole: bool = False) -> list[str]:
-    """The armada run's `option` words CI's suite step gives a push of `ref` under `policy`, main's whole
-    run's where `whole` (`suite_step`)."""
-    where = tmp_path / (ref.replace("/", "-") + ("-whole" if whole else ""))
-    calls = suite_step(where, ref, "", policy, 2, whole)
-    [run] = [call for call in calls if call[0] == "run"]
-    return [word for word in run if word.startswith(option)]
-
-
-def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
-    """A push to base/kernels runs its suite at a lane's whole-suite priority, -10 as verdict.sh's, so it
-    never takes containers from a lane's precheck or targeted run (0), and a lane's branch at the default
-    (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger); a train's CI is the
-    queue's gates on the hub, which set its own (runbooks/hub.md)."""
-    def priority(ref: str) -> list[str]:
-        return run_options(tmp_path, ref, "off", "--priority")
-
-    assert priority("base/kernels") == ["--priority=-10"]
-    assert priority("fix/lane") == []
-    # Main's whole run (the schedule's, the queue's whole dispatch) is background work, below every lane's run
-    # at a head (verdict.sh's -10), so no head waits behind it (Main, 2026-11-06); a push to main stays its
-    # tip's test.
-    assert run_options(tmp_path, "main", "off", "--priority", whole=True) == ["--priority=-15"]
-    assert priority("main") == ["--priority=5"]
-    # Below every lane's, it waits for capacity within its deadlines: the suite's and its gangs' a background
-    # run's (train 663's review), on its bounded share.
-    calls = suite_step(tmp_path / "whole-deadlines", "main", "", "off", 2, whole=True)
-    assert {word for call in calls for word in call if word.startswith(("--deadline", "--pool=48"))} == {
-        "--deadline=6000", "--pool=48"}
-    # A base push, below lanes too and on the pool armada gives it, keeps the background deadline.
-    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=6000"]
-    assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
