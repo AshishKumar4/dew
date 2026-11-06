@@ -70,7 +70,8 @@ def evidence(run, state, directory: Path) -> dict:
     (tests/test_saved_runs.py): its parameters' dtypes, its compute's as its run states it, the dtypes
     one request of the task loaded from it multiplies in (`computed`), its dynamic loss scale and the
     finite steps it counted, the examples it consumed, its last step, and the rung its step compiled at,
-    the remat and the plan it was admitted under (`StepCompiled`) but the plan's probes and kernels."""
+    the remat and the plan it was admitted under (`StepCompiled`) but what the plan measured: its probes,
+    kernels and rewrites' reports, which time what they ran."""
     import jax
     from saved_run_kinds import computed
 
@@ -88,7 +89,7 @@ def evidence(run, state, directory: Path) -> dict:
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),
             "consumed": None if state.consumed is None else int(state.consumed), "remat": compiled["remat"],
             "plan": {name: value for name, value in plan.items()
-                     if name not in ("kernels", "probes", "derived")}}
+                     if name not in ("kernels", "probes", "derived", "rewrites")}}
 
 
 def main() -> None:
