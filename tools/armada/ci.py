@@ -215,11 +215,6 @@ file on a Genoa host, 1.0 on a Turin one)."""
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
-CENSUS = "DEW_GATE_CENSUS"
-"""The variable under which the accuracy gate compiles check 1's arms with XLA:CPU's YNNPACK fusions on, as
-CPU users run them (tests/reference_error.py's CENSUS, row 4471): set in every test process of the census, the
-whole suite the land queue runs every fifth publish beside main's whole run (`plan --census`), whose rows are
-no rows to reuse (`tested`)."""
 HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
@@ -1244,8 +1239,8 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     which look each up again in their containers, so the verdict names every file and containers scale with
     the change. Under the policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by
     the work, not the longest task, as warm estimates did. A site marked one of `SHARDS` runs as armada's
-    map and judge, apart from its file's tasks (`site_entries`). The `census` (`CENSUS`) is the whole suite
-    with the cache off, whatever this environment says, each entry carrying it to its task."""
+    map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is the whole
+    suite with the cache off, whatever this environment says, each entry carrying it to its task."""
     cache = "off" if census else os.environ.get("DEW_TEST_CACHE") or "on"
     # The whole suite's run alone (DEW_WHOLE_SUITE: the daily run's and the whole dispatch's, and the census)
     # runs whole_suite cells (`selected`) and every file on the newest Python.
@@ -1477,8 +1472,9 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     common = shared(python)
     names, kept = kept_of(tests)
     whole_files = {name: at for (name, group), at in kept.items() if not group}
-    # The census's tests run under CENSUS, which also keeps their rows from the records (`tested`).
-    environ = {CENSUS: "1"} if census else {}
+    # The census's tests run under check 1's CENSUS (tests/check1_wire.py, where the gate reads it), which
+    # also keeps their rows from the records (`tested`).
+    environ = {check1_wire().CENSUS: "1"} if census else {}
     code = tested(python, names, split, out, deadline, cache, grace, common, environ, coverage, whole=whole,
                   release=release, kept=whole_files)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
@@ -1761,9 +1757,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
-    if coverage is None and not release and CENSUS not in environ:
+    if coverage is None and not release and not (environ and check1_wire().CENSUS in environ):
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
-        # under its requirement's overlay and on the whole suite's run alone, nor the census's (`CENSUS`).
+        # under its requirement's overlay and on the whole suite's run alone, nor the census's (check 1's
+        # CENSUS).
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set())
     return 0
@@ -2323,7 +2320,8 @@ def plan_arguments(planning: argparse.ArgumentParser) -> None:
     planning.add_argument("--target", type=float, required=True)
     planning.add_argument("--timings", type=Path, required=True)
     planning.add_argument("--census", action="store_true",
-                          help="the census (CENSUS): the whole suite with the test cache off, every test "
+                          help="the census (check 1's CENSUS): the whole suite with the test cache off, "
+                               "every test "
                                "process compiling check 1's arms with YNNPACK's fusions on; armada passes it "
                                "after `--`, so the run's verdict is stored as no commit's")
 
@@ -2340,7 +2338,7 @@ def task_arguments(running: argparse.ArgumentParser) -> None:
     running.add_argument("--whole", choices=("0", "1"), default="0",
                          help="the plan's DEW_WHOLE_SUITE: 1 on the whole suite's run, which runs its cells")
     running.add_argument("--census", choices=("0", "1"), default="0",
-                         help="the plan's census: 1 runs the tests under CENSUS, recording no row")
+                         help="the plan's census: 1 runs the tests under check 1's CENSUS, recording no row")
     running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
