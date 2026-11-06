@@ -135,7 +135,7 @@ from dew.data.pipeline import (
     members_held,
 )
 from dew.data.plan import PLAN_VERSIONS, Manifest
-from dew.data.readers import _FillShare
+from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.sources.urls import Fetch
@@ -1932,7 +1932,9 @@ class _Build:
         elif isinstance(stage, Workers):
             # A column too small for a shared segment of its own crosses pickled (`SHARED_BYTES`).
             options = gx.DatasetOptions(min_shm_size=SHARED_BYTES)
-            rows = gx.WithOptionsIterDataset(_as_iter(rows, self.loading), options).mp_prefetch(
+            # Each worker's position carries what its process's mirrors did (`WorkerMirrors`, row 4339).
+            mirrored = WorkerMirrors(_as_iter(rows, self.loading))
+            rows = gx.WithOptionsIterDataset(mirrored, options).mp_prefetch(
                 pygrain.MultiprocessingOptions(
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
                 ),
