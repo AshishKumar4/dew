@@ -99,10 +99,10 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post55,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post56,<0.12.1`.
 <!-- END JAX requirement -->
 
-It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post55's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
+It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post56's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
 
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502)), so two checkouts share one compiled kernel. JAX is removing its Pallas Triton backend and takes no change to it, so this fix stays in the build while Dew runs Pallas Triton.
 - The device-to-host transfer guard holds on a CPU array's first implicit host read (`float`, `item`, `np.asarray`, its buffer), as on the copy an accelerator array's first read caches.
@@ -148,6 +148,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A program's compilation cache key reads each kernel its custom calls serialize in an MLIR context of its own, so threads keying programs at once, each of them holding Mosaic GPU kernels, key them alike; the program's own context, which its thread's lowerings share, is left as it was.
 - Mosaic GPU's `emit_pipeline` runs collectively over a thread axis (`thread_axis`): every thread of a kernel's warpgroups runs one input pipeline over shared buffers, each copying an equal share of a block on a pre-Hopper GPU, as an Ampere kernel with several consumer warpgroups splits its loads.
 - Pallas Mosaic GPU's `multiple_of` lowers in a warp's code (`plgpu.warp_map`): a persistent kernel's load or product warp proves a slice start's divisibility to layout inference as a warpgroup's does, so a tcgen05 GEMM's TMA row start lowers.
+- `lax.ragged_all_to_all` lowers on a CPU, whose XLA emits no ragged all-to-all: one `all_to_all` of each peer's run, padded to the operand's length, and of the offsets each sender states, each received run written where the ragged collective lands it. A program that exchanges ragged runs, as an expert-parallel MoE layer does, runs the call it runs on a GPU or TPU.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
