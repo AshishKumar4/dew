@@ -222,11 +222,6 @@ def _steps_its_gradient(name: str, model, variables, inputs, **apply) -> None:
     (`GRADIENT_COVERING`) holds its gradients to check 1 against the model's from its float64 twin, each
     parameter its own leaf (`_against_its_twin`), at the setting its truth resolves (`judged`)."""
     variables, top, record, twin, wide = _against_its_twin(model, variables)
-    if judged(model) is not model:
-        # The release's setting, whose gradient no float64 truth judges, steps finitely: one compiled step,
-        # where run op by op it took 16 s of DeepSeek V4's 87 on armada.
-        stepped = jax.jit(lambda *drawn: _stepped(top, variables, drawn, **apply))(*inputs)
-        assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(stepped))
     assert_as_exact(lambda *drawn: _stepped(judged(top), variables, drawn, **apply),
                     lambda *drawn: _stepped(judged(model), variables, drawn, **apply),
                     lambda seed: _redrawn(inputs, seed), f"gradient at {record}", seeds=GRADIENT_SEEDS[name],
@@ -249,6 +244,18 @@ def test_a_checkpoints_top_rung_steps_its_forward_as_it_does(name):
 def test_a_covering_checkpoints_top_rung_steps_its_gradient_as_it_does(name):
     source = loaded(name)
     _steps_its_gradient(name, source.model, source.variables, (tokens(name),), method="logits")
+
+
+def test_a_covering_checkpoints_top_rung_steps_its_release_setting_finitely():
+    """The hyper-connections' member, whose gradient is judged at another Sinkhorn setting than its
+    release's (`judged`), which no float64 truth judges, steps finitely at its top rung at the release's:
+    one compiled step, apart from its gradient's check so each fits its group (ledger 4327)."""
+    name = GRADIENT_COVERING["hyper-connections"][0]
+    source = loaded(name)
+    assert judged(source.model) is not source.model
+    variables, top, _, _, _ = _against_its_twin(source.model, source.variables)
+    stepped = jax.jit(lambda drawn: _stepped(top, variables, (drawn,), method="logits"))(tokens(name))
+    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(stepped))
 
 
 CONTINUUM_SEEDS = 8

@@ -73,7 +73,10 @@ DSPARK = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v4-dspark-tiny"
 def longrope_drafter():
     """The tiny DeepSeek V4-Flash-0731 (`DSPARK`) with its DSpark block drafter over a trunk of plain
     attention whose rotary switches tables past its sixth position (LongRoPE), the drafter's own sliding
-    V4 kind rotating under YaRN, which V4's attention takes where it refuses LongRoPE."""
+    V4 kind rotating under YaRN, which V4's attention takes where it refuses LongRoPE. Its trunk is the
+    three layers the drafter reads and one before them, where the checkpoint holds six: a rebuild
+    crosses every layer alike, and each fewer layer is less of the speculative program to compile
+    (ledger 4286)."""
     from dew.interop import Pretrained
     from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers.attention import AttentionMixer
@@ -83,8 +86,18 @@ def longrope_drafter():
     drafter = model.dspark.layer_type
     head = model.head_dim or model.emb_features // model.num_heads
     pairs = int(head * (model.partial_rotary_factor or 1.0)) // 2
+    assert model.dspark is not None
+    layers = len(model.dspark.target_layers) + 1
+
+    def kept(indices: tuple[int, ...] | None) -> tuple[int, ...] | None:
+        return None if indices is None else tuple(index for index in indices if index < layers)
+
+    mixture = model.mixture and dataclasses.replace(model.mixture, layers=kept(model.mixture.layers),
+                                                    hash_layers=kept(model.mixture.hash_layers))
     return model.clone(
-        layer_types=("trunk",) * model.num_layers,
+        num_layers=layers, mixture=mixture,
+        dspark=dataclasses.replace(model.dspark, target_layers=tuple(range(1, layers))),
+        layer_types=("trunk",) * layers,
         kinds={"trunk": LayerKind(mixer=AttentionMixer()),
                drafter: dataclasses.replace(model.kinds[drafter], rope_scaling=YarnScaling(
                    factor=4.0, original_max_position_embeddings=8))},

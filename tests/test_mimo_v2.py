@@ -35,15 +35,17 @@ def logits(directory):
 
 
 def fused(tensors, config):
-    """The split q, k and v projections fused as the Pro release stores them."""
-    runs, heads = config['num_key_value_heads'], config['num_attention_heads']
-    widths = (heads // runs * config['head_dim'], config['num_key_value_heads'] // runs * config['head_dim'],
-              config['num_key_value_heads'] // runs * config['v_head_dim'])
+    """The split q, k and v projections fused as the Pro release stores them, in runs over each layer's key
+    heads: a sliding layer's of its `swa_*` geometry, a full layer's of the model's."""
     out = dict(tensors)
-    for layer in range(config['num_hidden_layers']):
+    for layer, slides in enumerate(config['hybrid_layer_pattern']):
+        prefix = 'swa_' if slides else ''
+        runs, heads = config[f'{prefix}num_key_value_heads'], config[f'{prefix}num_attention_heads']
+        width = config[f'{prefix}head_dim']
+        widths = (heads // runs * width, width, config['v_head_dim'])
         stem = f'model.layers.{layer}.self_attn.'
-        parts = [out.pop(f'{stem}{part}_proj.weight').reshape(runs, width, -1)
-                 for part, width in zip('qkv', widths, strict=True)]
+        parts = [out.pop(f'{stem}{part}_proj.weight').reshape(runs, part_width, -1)
+                 for part, part_width in zip('qkv', widths, strict=True)]
         out[f'{stem}qkv_proj.weight'] = np.concatenate(parts, axis=1).reshape(-1, parts[0].shape[-1])
     return out
 
@@ -68,13 +70,39 @@ def test_a_fused_qkv_source_loads_to_the_same_model_and_saves_back_fused(tmp_pat
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
 
 
-def test_a_native_export_writes_mimo_v2_and_loads_back_the_same_model(tmp_path, monkeypatch):
+def flash_ratio_source(directory: Path) -> Path:
+    """A trunk whose sliding layers hold MiMo-V2-Flash's twice the full layers' key heads but query heads
+    and a width of their own (`SLIDING`), which Flash's attention fixes at the model's: its sliding layers'
+    projections and sinks drawn at their shapes, at `directory`."""
+    config = {**json.loads((TINY / 'config.json').read_text()), 'swa_num_attention_heads': 8,
+              'swa_num_key_value_heads': 4, 'swa_head_dim': 24}
+    rng = np.random.default_rng(4290)
+    tensors = dict(load_file(TINY / 'model.safetensors'))
+    heads, kv, width, value = 8, 4, 24, config['v_head_dim']
+    for layer, slides in enumerate(config['hybrid_layer_pattern']):
+        if not slides:
+            continue
+        stem = f'model.layers.{layer}.self_attn.'
+        for name, shape in (('q_proj.weight', (heads * width, 32)), ('k_proj.weight', (kv * width, 32)),
+                            ('v_proj.weight', (kv * value, 32)), ('o_proj.weight', (32, heads * value)),
+                            ('attention_sink_bias', (heads,))):
+            tensors[stem + name] = (0.3 * rng.normal(size=shape)).astype(np.float32)
+    directory.mkdir()
+    (directory / 'config.json').write_text(json.dumps(config))
+    save_file(tensors, directory / 'model.safetensors')
+    return directory
+
+
+@pytest.mark.parametrize('source', ['tiny', 'flash-ratio'])
+def test_a_native_export_writes_mimo_v2_and_loads_back_the_same_model(tmp_path, monkeypatch, source):
     """A MiMo-V2 model Dew holds (the fixture's: sinks on its sliding layers alone, over the full layers'
-    key heads) exports natively (`PretrainedDecoder.from_model`) as MiMo-V2 under its authors' config, with
-    its release's code named (`auto_map`) and its q, k and v stored apart, not as MiMo-V2-Flash, whose
-    sliding layers hold twice the key heads; the export loads back to the same variables, leaf for leaf
-    (ledger 2192). The release's code comes from the hub's cache, seeded offline at the commit Dew holds
-    it to from the release's files vendored into the fetched store."""
+    key heads; or over Flash's twice the key heads, its sliding query heads and width its own,
+    `flash_ratio_source`) exports natively (`PretrainedDecoder.from_model`) as MiMo-V2 under its authors'
+    config, with its release's code named (`auto_map`) and its q, k and v stored apart, not as
+    MiMo-V2-Flash, whose sliding layers hold twice the key heads and the model's query heads and width;
+    the export loads back to the same variables, leaf for leaf (ledgers 2192, 4290). The release's code
+    comes from the hub's cache, seeded offline at the commit Dew holds it to from the release's files
+    vendored into the fetched store."""
     import huggingface_hub.constants
     import jax
     from tool_support import run_from
@@ -88,7 +116,8 @@ def test_a_native_export_writes_mimo_v2_and_loads_back_the_same_model(tmp_path, 
         for file in files:
             shutil.copy(reference.release_file("mimo-v2-tiny", file), snapshot / file)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    directory = TINY if source == 'tiny' else flash_ratio_source(tmp_path / 'source')
+    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'export')
     written = json.loads((tmp_path / 'export' / 'config.json').read_text())
     assert (written['model_type'], written['architectures']) == ('mimo_v2', ['MiMoV2ForCausalLM'])
@@ -140,10 +169,10 @@ def test_the_towers_of_a_config_that_names_none_ride_along_unread(tmp_path):
 def test_a_release_with_its_towers_loads_whole_and_saves_back_as_it_came(tmp_path):
     """MiMo-V2.6 with its towers is a bundle its family reads whole (row 357): the decoder at the config's
     root, the ViT and its merger, the audio encoder over the codes of the tokenizer the release keeps in a
-    folder of its own, and the prediction layer vLLM drafts with. It saves back every tensor it read under
-    its own name, the folder's in the folder beside the folder's config, the config as it was published,
-    and loads again to the same variables; its language model alone (`text_only`) computes the bundle's
-    logits over text bit for bit."""
+    folder of its own, and the prediction layer vLLM drafts with. It saves back, and so does its language
+    model alone (`text_only`), every tensor it read under its own name, the folder's in the folder beside
+    the folder's config, the config as it was published, and loads again to the same variables; its
+    language model alone (`text_only`) computes the bundle's logits over text bit for bit."""
     import jax
 
     from dew.nn.multimodal import MultimodalTransformer
@@ -154,17 +183,21 @@ def test_a_release_with_its_towers_loads_whole_and_saves_back_as_it_came(tmp_pat
     assert None not in (model.vision, model.projection, model.audio)
     assert model.num_nextn_predict_layers == 1
     loaded.save(tmp_path / 'saved')
-    for folder in (Path(), Path('audio_tokenizer')):
-        saved, released = tmp_path / 'saved' / folder, WHOLE / folder
+    text = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference', text_only=True)
+    # Its language model alone keeps every other tensor, the folder's among them, and writes it back.
+    text.save(tmp_path / 'text')
+    for folder, root in ((Path(), 'saved'), (Path('audio_tokenizer'), 'saved'), (Path(), 'text'),
+                         (Path('audio_tokenizer'), 'text')):
+        saved, released = tmp_path / root / folder, WHOLE / folder
         assert (json.loads((saved / 'config.json').read_text())
                 == json.loads((released / 'config.json').read_text()))
         written, read = load_file(saved / 'model.safetensors'), load_file(released / 'model.safetensors')
         assert sorted(written) == sorted(read)
         for name, tensor in read.items():
             np.testing.assert_array_equal(written[name], tensor, err_msg=name)
-    again = Pretrained.load(tmp_path / 'saved', dtype='float32', attention_impl='reference')
-    jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)
-    text = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference', text_only=True)
+    for root in ('saved', 'text'):
+        again = Pretrained.load(tmp_path / root, dtype='float32', attention_impl='reference')
+        jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)
     ids = np.load(WHOLE / 'input_ids.npy')
     np.testing.assert_array_equal(np.asarray(model.apply(loaded.variables, ids)),
                                   np.asarray(text.model.apply(text.variables, ids)))
@@ -279,6 +312,59 @@ def test_a_fused_prediction_layer_of_its_own_geometry_loads_and_saves_back_as_it
     assert sorted(written) == sorted(tensors)
     for name, tensor in tensors.items():
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+
+
+SLIDING_TINY = Path(__file__).parent / 'fixtures' / 'hf' / 'mimo-v2-sliding-tiny'
+"""The tiny trunk whose sliding layers attend in a geometry of their own, half the full layers' query
+heads, one key head and twice their width, their values the model's, its weights the release's class drew
+(tools/remote_code_reference.py --draw), its logits held to that class's by tests/test_remote_code_releases.py
+(ledger 4290)."""
+
+SLIDING = ('swa_num_attention_heads', 'swa_num_key_value_heads', 'swa_head_dim')
+"""The sliding layers' own geometry, as MiMoV2Attention reads it."""
+
+
+def sliding_source(directory: Path, layout: str) -> dict:
+    """`SLIDING_TINY` stored `layout` ('split', as the release draws it, or fused in each layer's own runs,
+    'fused_qkv') at `directory`: the tensors it holds."""
+    config = {**json.loads((SLIDING_TINY / 'config.json').read_text()), 'attention_projection_layout': layout}
+    tensors = dict(load_file(SLIDING_TINY / 'model.safetensors'))
+    if layout == 'fused_qkv':
+        tensors = fused(tensors, config)
+    directory.mkdir()
+    (directory / 'config.json').write_text(json.dumps(config))
+    save_file(tensors, directory / 'model.safetensors')
+    return tensors
+
+
+def test_sliding_layers_of_their_own_geometry_load_split_or_fused_and_save_back_as_they_came(tmp_path):
+    """A trunk whose sliding layers state query heads, key heads and a width of their own (`SLIDING_TINY`,
+    MiMoV2Attention's `swa_*`) builds them in a kind of that geometry, the full layers in the model's,
+    whose logits tests/test_remote_code_releases.py holds to the release's; stored fused, each layer's runs
+    split by its own kind (`Packed.owner`), it computes the split source's logits bit for bit; each saves
+    back every tensor as it came and the `swa_*` geometry it was read with. Values of another width than
+    the model's, which no kind sets apart, are refused by name (ledger 4290)."""
+    from dew.interop.hf_decoders import translate_config
+
+    split = sliding_source(tmp_path / 'split', 'split')
+    fused_tensors = sliding_source(tmp_path / 'fused', 'fused_qkv')
+    config = json.loads((tmp_path / 'split' / 'config.json').read_text())
+    sliding = translate_config(config)['kinds']['sliding_attention']
+    assert (sliding['num_heads'], sliding['num_kv_heads'], sliding['head_dim']) == (2, 1, 24)
+    with pytest.raises(ValueError):
+        translate_config({**config, 'swa_v_head_dim': 12})
+    loaded, expected = logits(tmp_path / 'split')
+    reread, actual = logits(tmp_path / 'fused')
+    np.testing.assert_array_equal(actual, expected)
+    for source, tensors in ((loaded, split), (reread, fused_tensors)):
+        saved = tmp_path / f'saved-{len(tensors)}'
+        source.save(saved)
+        written = load_file(saved / 'model.safetensors')
+        assert sorted(written) == sorted(tensors)
+        for name, tensor in tensors.items():
+            np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+        stated = json.loads((saved / 'config.json').read_text())
+        assert {key: stated[key] for key in SLIDING} == {key: config[key] for key in SLIDING}
 
 
 def test_a_release_without_a_processor_of_its_own_refuses_raw_media_and_reads_its_fields():

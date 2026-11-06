@@ -696,9 +696,10 @@ class Pretrained:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
-        # fit's store is read by its layers' names (`stored_layers`).
+        # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
+        # home as they are written.
         values = unpacked(self.model, stored_layers(self.model, unboxed(self.variables if variables is None
-                                                                        else variables)))
+                                                                        else variables), banks=True))
         if self.adapter is not None:
             values = self.adapter.merge(values)
         if isinstance(self.model, Differential) and self.model.dex is not None:
@@ -1335,7 +1336,8 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     # A bundle may state its processing in its own config instead (MiMo-V2.6's `processor_config`).
     processor_files = config.get("processor_config") is not None or any(
         (directory / name).exists() for name in ("processor_config.json", "preprocessor_config.json"))
-    media = _media_wrapper(config) and processor_files
+    # A bundle's language model alone (`text_only`) translates to a decoder's record, which reads no media.
+    media = _media_wrapper(config) and processor_files and "tower" in record
     if media or (directory / "tokenizer_config.json").exists() or gguf_path is not None:
         from dew.data.text import load_tokenizer
         # A GGUF repo ships none; the file carries its tokenizer.
@@ -1954,6 +1956,14 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
             record = verified.translate(config, tensors, family)
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
+    # A bundle's language model alone (`text_only`) reads its decoder's tensors under the bundle's names, and
+    # retains its media's by name, unread (`decoders.bundle_media`).
+    media = decoders.bundle_media(config, tensors.keys()) if decoders.bundles(config) else frozenset()
+    held = tensors
+    if media:
+        specs = tensor_specs(tensors)
+        tensors = LazyTensors(
+            {name: spec for name, spec in specs.items() if name not in media}, tensors.__getitem__)
     placed, readings = decoders.read_decoder(tensors, record, family, param_dtype=param_dtype, lazy=lazy,
                                              checked=checked)
     variables = decoders.with_constants(placed, record, directory)
@@ -1971,6 +1981,8 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
     layouts, retained = ((), {})
     if entry.preserve_source_layout or entry.prepare is decoder_parts.DecoderFamily.prepare:
         layouts, retained = decoder_layouts(readings, record, family, variables)
+    if media:
+        retained = {**retained, **{name: held[name] for name in sorted(media)}}
     export_adapter = None
     if verified is None and not entry.preserve_source_layout:
         # The family's own encoder, the inverse `PretrainedDecoder.from_model` writes
@@ -2222,10 +2234,16 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
         config = _kept_depths(config, prediction_depths)
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
-    if language is not None:
+    if language is not None and decoders.bundles(config):
+        # A bundle its own family reads whole: its family's decoder, as its text checkpoint states it
+        # (`bundle_text_config`), over the source's own tensors, the towers' retained by name and written
+        # back with the config that names them (Kimi K2.5's under `language_model.`, MiMo-V2.6's at the
+        # root).
+        route = DecoderRoute(decoders.translate_config(decoders.bundle_text_config(config)))
+        language = None
+    elif language is not None:
         # The language model's config as its decoder reads it (`decoders.decoder_config`), a quantized
-        # wrapper's module selection renamed with its tensors; a bundle its own family reads whole keeps
-        # its decoder's names and their codec.
+        # wrapper's module selection renamed with its tensors.
         config = decoders.decoder_config(config, inventory)
         route = source_route(config, remote=remote, pinned=pinned)
     elif isinstance(route, WrapperRoute):
@@ -2428,7 +2446,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
-    if language is None and isinstance(route, WrapperRoute):
+    if language is None and (isinstance(route, WrapperRoute) or decoders.bundles(config)):
+        # A bundle's folders' tensors, read whole or, its language model alone, retained by name.
         tensors = _with_folder_tensors(tensors, config, configured, root, weights=weights)
     if prediction_depths is not None:
         # Before a wrapper's language model is taken out of it, by the wrapper's own names: a discarded

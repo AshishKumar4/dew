@@ -9,7 +9,7 @@ from typing import Any
 import jax
 import jax.extend.core as jax_core
 
-from dew.nn.derivatives import KernelGlue, declared_derivative, declared_tangent
+from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, declared_tangent
 from dew.nn.programs import CALLS, CUMULATIVE, ENTRYWISE, REDUCTIONS, equations, jax_name
 
 
@@ -142,7 +142,8 @@ def _custom(eqn, *operands, **params):
         grads = iter(_run(pullback.jaxpr, pullback.consts, [*values, *given]))
         return tuple(next(grads) if index in floating else None for index in range(len(values)))
 
-    held = declared_derivative(KernelGlue(), holding, lambda *values: (held(*values), values), held_pullback)
+    held = contracted("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order")(
+        declared_derivative(KernelGlue(), holding, lambda *values: (held(*values), values), held_pullback))
     return held(*operands)
 
 
@@ -174,7 +175,8 @@ def _held_jvp(primal, call, traced: list, floating: list[int]) -> Callable:
         both = _run(tangents.jaxpr, tangents.consts, [*values, *(directions[index] for index in floating)])
         return both[:len(both) // 2], both[len(both) // 2:]
 
-    return declared_tangent(KernelGlue(), holding, held_tangent)
+    return contracted("test_a_transposed_hooks_custom_derivative_holds_every_order")(
+        declared_tangent(KernelGlue(), holding, held_tangent))
 
 
 def _tiles_in(closed) -> bool:

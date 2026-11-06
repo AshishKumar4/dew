@@ -44,12 +44,22 @@ __all__ = [
     "Surrogate",
     "TangentKind",
     "bound_span",
+    "contracted",
     "declared_derivative",
     "declared_tangent",
     "marked",
     "marked_call_p",
     "surrogate",
 ]
+
+
+def contracted[Function](test: str, /) -> Callable[[Function], Function]:
+    """A custom derivative's contract, declared where the derivative is made: `test`, the name of the one
+    test function of tests/test_contracts_*.py that holds every order of it finite against its float64
+    truth and an independent plain formula. The function it decorates or wraps is returned unchanged;
+    tools/lint_slop.py (SLOP028) resolves the name and refuses a custom derivative without one. Its kind
+    is its maker's (`Kind`), declared there alone."""
+    return lambda function: function
 
 
 def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Value], *,
@@ -65,7 +75,8 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
     declared rule again wherever it differentiates the value (a straight-through rounding's tangent is
     never rounded at a second order)."""
     declared = tuple(nondiff_argnums)
-    rule = jax.custom_jvp(bound_span(Surrogate(), forward, static=declared), nondiff_argnums=declared)
+    rule = contracted("test_a_surrogate_holds_every_order")(
+        jax.custom_jvp(bound_span(Surrogate(), forward, static=declared), nondiff_argnums=declared))
 
     def tangent(*arguments):
         *fixed, primals, tangents = arguments
@@ -90,7 +101,8 @@ def declared_derivative[Value](kind: Kind, primal: Callable[..., Value], forward
     alone, not its primal too, and each part is traced where it runs, so a value of that trace it closes over
     is its own (`marked`). Forward mode refuses it as a bare `jax.custom_vjp` does."""
     fixed = tuple(nondiff_argnums)
-    rule = jax.custom_vjp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed)
+    rule = contracted("test_a_declared_derivative_holds_every_order")(
+        jax.custom_vjp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed))
     rule.defvjp(bound_span(kind, forward, static=fixed), bound_span(kind, backward, static=range(len(fixed))),
                 symbolic_zeros=symbolic_zeros)
     return rule
@@ -106,7 +118,8 @@ def declared_tangent[Value](kind: TangentKind, primal: Callable[..., Value], tan
     its; a surrogate's tangent is `surrogate`'s, whose rule reads the surrogate's own value, so a second
     order meets the rule again (`TangentKind`)."""
     fixed = tuple(nondiff_argnums)
-    rule = jax.custom_jvp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed)
+    rule = contracted("test_a_declared_derivative_holds_every_order")(
+        jax.custom_jvp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed))
     rule.defjvp(bound_span(kind, tangent, static=range(len(fixed))), symbolic_zeros=symbolic_zeros)
     return rule
 

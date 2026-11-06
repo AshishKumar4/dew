@@ -42,7 +42,7 @@ from jax.extend import core as jax_core
 
 from dew import _cache
 from dew.algebra import bits
-from dew.nn.derivatives import KernelGlue, declared_derivative, declared_tangent
+from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
@@ -148,8 +148,9 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                   *gradients[1:], *(() if first is None else (zero_from_primal(first),))]
         return tuple(leaves[index] for index in live)
 
-    differentiable = generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
-                                                live_cotangents=True, kind=KernelGlue())
+    differentiable = contracted("test_a_grouped_gemm_holds_every_order")(
+        generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
+                                   live_cotangents=True, kind=KernelGlue()))
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first)
 
 
@@ -386,8 +387,8 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, tile: mosaic_g
         decoded = NvFp4(words, scales, jnp.float32(1)).decoded()
         return jnp.dot(rows, decoded, preferred_element_type=jnp.float32)
 
-    differentiable = generation.linear_tangent(forward, backward, portable, live_cotangents=True,
-                                                kind=KernelGlue())
+    differentiable = contracted("test_an_nvfp4_products_kernels_hold_every_order")(
+        generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
     return differentiable(rows, words, scales)
 
 
@@ -481,8 +482,9 @@ def _low_rank_backward(out_dtype, precision, interpret_on_cpu, residuals, cotang
 
 # The launches' derivative glue (`derivatives.KernelGlue`): an operand no reverse pass reaches is a symbolic
 # zero, whose gradient is never formed.
-_low_rank = declared_derivative(KernelGlue(), _low_rank_value, _low_rank_forward, _low_rank_backward,
-                                nondiff_argnums=(5, 6, 7), symbolic_zeros=True)
+_low_rank = contracted("test_an_adapted_product_holds_every_reverse_order")(
+    declared_derivative(KernelGlue(), _low_rank_value, _low_rank_forward, _low_rank_backward,
+                        nondiff_argnums=(5, 6, 7), symbolic_zeros=True))
 
 
 def dot_general(xla):
@@ -758,7 +760,8 @@ def _prologued(prologue, prologue_jvp):
 
     # The fused kernel's derivative glue (`derivatives.KernelGlue`): the producer's own derivative, true and
     # rewritten as any other math, written once for the prologue the kernel applies to its tiles.
-    prologued = declared_tangent(KernelGlue(), lambda lhs, *sides: prologue(lhs, *sides), tangent)
+    prologued = contracted("test_a_gemm_prologue_holds_every_order")(
+        declared_tangent(KernelGlue(), lambda lhs, *sides: prologue(lhs, *sides), tangent))
     return prologued
 
 

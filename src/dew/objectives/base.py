@@ -59,7 +59,7 @@ from dew.batch import (
     unboxed,
 )
 from dew.distributed.placement import Layout, RefinesLayout
-from dew.nn.derivatives import surrogate
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options, owned_program
 from dew.nn.precision import (
@@ -688,7 +688,8 @@ def _ruled_tangent(primals, tangents, _value) -> jax.Array:
                              zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 
-_ruled = surrogate(lambda value, rule, params: value, _ruled_tangent)
+_ruled = contracted("test_a_ruled_loss_holds_every_order")(
+    surrogate(lambda value, rule, params: value, _ruled_tangent))
 """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`): a surrogate
 (`dew.nn.derivatives.surrogate`), the loss's own derivative replaced by a learning rule's."""
 
@@ -1025,8 +1026,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
-        tree = self.complete_variables(key, tree)
-        return with_projected(tree, functools.partial(self.projected, updated=True))
+        tree = with_projected(self.complete_variables(key, tree),
+                              functools.partial(self.projected, updated=True))
+        if not held:
+            # The draw `parameter_axes` reads, the names its boxes carry static under any trace.
+            self.__dict__.setdefault("_drawn_axes", boxed_axes(tree))
+        return tree
 
     @functools.cached_property
     def parameter_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
@@ -1037,12 +1042,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         held one alike. A held tree's leaves are held to the draw's shapes, a leaf of another shape
         refused by its path: its axes would name another parameter's dimensions. An objective that draws
         no fresh tree (`fresh_variables`' `NotImplementedError`, its documented answer) holds no draw to
-        read: its held tree is placed by its shapes (`dew.inference.place`), its towers by their tables."""
+        read: its held tree is placed by its shapes (`dew.inference.place`), its towers by their tables.
+        An objective that holds no tree reads the draw its `init` made first, which the trainer traces for
+        its state's shapes (`_drawn_axes`), where another trace of it was seconds of a Qwen3.5-4B step's
+        compile (row 4260)."""
+        held = self.held_variables()
+        if held is None and (drawn_axes := self.__dict__.get("_drawn_axes")) is not None:
+            return {**self.tower_axes(), **drawn_axes}
         try:
             drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
         except NotImplementedError:
             return self.tower_axes()
-        held = self.held_variables()
         if held is not None and "params" in held:
             shapes = {jax.tree_util.keystr(path): np.shape(leaf)
                       for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(drawn)))}

@@ -56,26 +56,16 @@ from dew.distributed.batches import (
     batch_shardings,
     batch_signature,
     placed_abstract,
-    prefetched_bytes,
     shard_batch,
     split_fields,
 )
 from dew.distributed.host import snapshot
-from dew.distributed.placement import (
-    Layout,
-    MeshSpec,
-    Placement,
-    Validation,
-    device_mesh,
-    placed_bytes,
-    placed_shapes,
-)
+from dew.distributed.placement import Layout, MeshSpec, Placement, Validation, device_mesh, placed_shapes
 from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
-from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
+from dew.nn.kernels.generation import gpu_target
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
@@ -95,7 +85,7 @@ from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
 from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
-from dew.training import staging
+from dew.training._candidates import candidate_for, lowered_for, prepared_for
 from dew.training._fit import (
     Emptied,
     FitPlan,
@@ -122,20 +112,11 @@ from dew.training._fit import (
     validation_read,
     waited_read,
 )
-from dew.training._lowering import KernelReport, Lowered, Routed, routed
+from dew.training._lowering import Lowered, routed
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
-from dew.training.diloco import (
-    DiLoCo,
-    dropped,
-    group_of,
-    grouped,
-    learning_rate_of,
-    rated,
-    rates_set,
-    windowed,
-)
+from dew.training.diloco import DiLoCo, dropped, grouped, learning_rate_of, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
@@ -143,7 +124,6 @@ from dew.training.distributed import (
     link_figure,
     link_figures,
     marked,
-    microbatch,
     microbatch_shapes,
     placed_start,
     resumed_link_figures,
@@ -153,7 +133,7 @@ from dew.training.distributed import (
     traced_start,
 )
 from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Split, Summary, admit_split, episodic
-from dew.training.footprint import candidate_footprint, traced_loss
+from dew.training.footprint import Footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
 from dew.training.memory import (
@@ -177,7 +157,7 @@ from dew.training.model_flops import (
     prepare_counts,
     uncounted,
 )
-from dew.training.narrow import narrow_copies, narrowed
+from dew.training.narrow import narrowed
 from dew.training.observe import Observe
 from dew.training.planning import (
     Candidate,
@@ -200,12 +180,10 @@ from dew.training.staging import fetched
 from dew.training.startup import Startup, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
-    COMMIT_FIELDS,
     Committed,
     PassesProgress,
     Transaction,
     compact_qk,
-    consumed_where_made,
     loss_scale,
     outcome,
     pooled_by_mean,
@@ -835,8 +813,9 @@ class Trainer(Generic[Loss, Effects]):
             weak_type=aval.weak_type), jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
 
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1):
+        """The loss's program (`footprint.traced_loss`, which narrow copies read) and its shapes."""
         loss, (variables, *rest) = traced_loss(self.objective, state, window, split)
-        return jax.eval_shape(loss, variables, self._model_shapes(batch), *rest)
+        return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
                                  shape_only=False):
@@ -930,7 +909,7 @@ class Trainer(Generic[Loss, Effects]):
         microbatch count, the layout's rules, which place the activations
         the model constrains (`dew.nn.sharding.constrain`) as they place the
         parameters, and the links of the axes the step measured, none by
-        default. An abstract mesh is a GPU's this process lacks (`_lowered_for`)."""
+        default. An abstract mesh is a GPU's this process lacks (`_candidates.lowered_for`)."""
         on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
         with (on, pipeline_microbatches(self.microbatches) as schedule, self._staging.held(),
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
@@ -977,7 +956,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         if (target := self.lower_for) is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
-            raise Lowered(target, *routed(lambda: self._lowered_for(state, batch, target)))
+            raise Lowered(target, *routed(lambda: lowered_for(self, state, batch, target)))
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         # A state pools its windows' microbatches where it holds a window, or saved between updates, where
         # its checkpoint holds none (`dew.state.without_empty_window`), at a split past one.
@@ -1079,10 +1058,11 @@ class Trainer(Generic[Loss, Effects]):
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
 
-        def lower(split: int, narrow: bool, lowering: bool = True) -> Candidate:
+        def lower(split: int, narrow: bool, footprint: Footprint | None = None, lowering=True) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
-            return self._candidate(state, batch, schedule, placement, replicated, split, narrow,
-                                   recorded_launches(recorded, rung), lowering=lowering, capacity=capacity)
+            return candidate_for(self, state, batch, schedule, placement, replicated, split, narrow,
+                                   recorded_launches(recorded, rung), lowering=lowering, capacity=capacity,
+                                   footprint=footprint)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1131,150 +1111,6 @@ class Trainer(Generic[Loss, Effects]):
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned, flops
 
-    def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
-                   split: int, narrow: bool | None, launches: str | None, lowering: bool = True, *,
-                   mesh: Mesh | AbstractMesh | None = None, platforms: tuple[str, ...] | None = None,
-                   capacity: int | None = None) -> Candidate:
-        """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
-        alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
-        `launches` are its kernel launches where a record holds them, which settle their configs before it
-        lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records them
-        (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`_lowered_for`). `capacity` is
-        the bytes a device that states none holds (`FitSearch.capacity`), at which its footprint is judged."""
-        micro = microbatch_shapes(batch, split)
-        shapes, copies, prepared = self._prepared(state, micro, schedule, split, narrow)
-        shardings = self.shardings(prepared)
-        if mesh is not None:
-            shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
-                                     shardings)
-        prepared = placed_shapes(prepared, shardings)
-        # The check reads the state's arguments as already on the devices. The copies and accumulators
-        # `run` builds on the first call are not yet, so they count with the prefetched batches beside
-        # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
-        last = state.window
-        rebuilt = last is not None and not last.replays(prepared.window)
-        # A step lowered for other devices is checked against none of this process's.
-        built = 0 if mesh is not None else placed_bytes([field for field, kept in (
-            (prepared.compute, state.compute), (prepared.window, None if rebuilt else last))
-            if kept is None and field is not None])
-        held = 0 if mesh is not None else prefetched_bytes(batch, placement, self._prefetch) + built
-        jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
-        part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        # The batch as shapes with the placement it is read under, whoever lowers it: a lowering over the host
-        # arrays a step compiled ahead reads (`first_step_batch`) and one over the placed arrays a run steps
-        # are two texts of one program (`dew.training.ahead.program_of`), the types of a helper call's
-        # arguments, their shardings among them, telling its functions apart in the module.
-        given = placed_shapes(batch, placement)
-        lower = Routed(functools.partial(
-            lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
-            *apart(prepared), given, part))
-        # The bytes its host-resident commit fields hold at once are its own staged cut's
-        # (`staging.measured`): read as the step is traced, by its lowering or, lowering none, a trace alone.
-        staging_measured = (self.step is None and mesh is None
-                            and bool(set(COMMIT_FIELDS) & set(self.layout.host)))
-        with staging.measured() as cuts:
-            if self.tune_kernels and lowering and platforms is None:
-                lowered, launches = tuning.tune(lower, measure=True)
-            else:
-                # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-                lowered, launches = lower() if lowering else None, launches or "[]"
-            if staging_measured and not lowering:
-                jitted.trace(*apart(prepared), given, part)
-        window = split * self.accumulation
-        footprint = None if shapes is None or mesh is not None else candidate_footprint(
-            self.objective, self._model_shapes(micro), window, prepared, held,
-            (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
-            functools.partial(self._consumes_where_made, prepared, micro, window, shapes),
-            max(cuts, default=0), capacity)
-        # The sampled step lowers as the step does, over the same arguments, for the same platforms.
-        watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
-                                                                    replicated, split, sampled=True)
-        sampled = None if watched is None else functools.partial(
-            lambda *arguments: watched.trace(*arguments).lower(lowering_platforms=platforms),
-            *apart(prepared), given, part)
-        return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
-                         lower.report() if lowering else KernelReport((), ()), footprint, sampled)
-
-    def _consumes_where_made(self, prepared: TrainState, micro: Batch, window: int, shapes) -> bool:
-        """Whether the step over `prepared` consumes each gradient where it is made
-        (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
-        (`group_of`), not the outer optimizer's."""
-        with group_of(prepared, micro) as (view, _):
-            return consumed_where_made(self.optimizer, view, window, shared=pooled_by_mean(shapes[0]),
-                                       progressed=self._examples is not None)
-
-    def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, split: int,
-                  narrow: bool | None = None):
-        """The loss's shapes (None under a custom step), the narrow copies and the state's shapes with the
-        accumulation of an update's window, `split` microbatches a step (DiLoCo's groups' `windowed`), and
-        the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
-        `narrow` is off."""
-        window = split * self.accumulation
-        with group_of(state, batch) as (view, rows):
-            shapes = None if self.step is not None else self._loss_shape(view, rows, window, split)
-        if shapes is not None:
-            self._staging.refuse_unpipelined(schedule, self.objective)
-        prepared = windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
-            state, rows, shapes, window=window, shape_only=shape_only), state, batch)
-        # DiLoCo's groups read their own parameters, which no narrow copy shadows.
-        copies = (narrow_copies(self.objective, state, batch, self._model_batch, window=window, split=split,
-                                composed=self.step is None and not self.dynamic_scale)
-                  if (self._narrow if narrow is None else narrow) and self.diloco is None else {})
-        prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
-            lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
-        return shapes, copies, prepared
-
-    def _jitted(self, shapes, copies: dict, shardings: Placement[TrainState], placement,
-                replicated: NamedSharding, split: int, sampled: bool = False):
-        """The step over one of the `split` microbatches of a batch
-        (`microbatch`), which counts the step at its last microbatch. It takes the state apart
-        (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
-        it reads and neither donates nor returns, so the frozen arrays stay the ones the run (and the
-        objective's held tree) holds, and no output copies them."""
-        # The transaction brings the optimizer state and the EMA the layout keeps on the host to the device
-        # once its gradient is ready (`Transaction.past`); a custom step, and every other field, reads them
-        # from its start.
-        late = () if self.step is not None else tuple(set(COMMIT_FIELDS) & set(self.layout.host))
-        body = self._step_body(shapes, copies, split, {field: getattr(shardings, field) for field in late},
-                               sampled, shardings.variables["params"])
-        body = body if self.diloco is None else self.diloco.step(body, self.device_mesh, split)
-        moving, frozen = apart(shardings)
-
-        def step(current, held, batch, part):
-            # The body sees every field on the device; the out shardings
-            # return the host-resident ones to pinned host memory.
-            current = together(current, held)
-            micro = microbatch(batch, part, split)
-            early = [field for field in self.layout.host if field not in late]
-            advanced, loss, aux, committed = body(self._fetched(current, shardings, early),
-                                                  self._model_batch(micro), part, batch_tokens(micro),
-                                                  micro.get(CLOSES_WINDOW))
-            stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
-                                     batch_consumed(micro))
-            return (apart(stepped)[0], *rest)
-
-        returned = (moving, replicated, replicated, replicated, replicated, replicated)
-        return owned_program(step, in_shardings=(moving, frozen, placement, replicated),
-                             out_shardings=returned, donate_argnums=0)
-
-    def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
-        """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
-        (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of that GPU's
-        devices, from which JAX's Pallas lowering reads the GPU, at the base rung and the plan's first split:
-        a run that does not fit splits its batch or recomputes more, no other kernel. A CPU-owned state's step
-        realizes its parameters on the host as it runs, and is not lowered."""
-        if self.host_master:
-            raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
-                             "the variables on the host")
-        mesh = gpu_mesh(self.device_mesh, generation)
-        self._at_base_rung(batch)
-        with assumed(generation), self._traced_on(mesh) as schedule:
-            state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
-            split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
-            placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
-            return self._candidate(state, batch, schedule, placement, replicated, split, None, None,
-                                   mesh=mesh, platforms=('cuda',)).lowered
-
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.distributed.host import transfer
         from dew.training.execution import HostExecution, stack_sites
@@ -1283,7 +1119,7 @@ class Trainer(Generic[Loss, Effects]):
                                   stack_sites(self.objective, state.variables), device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
-            shapes = self._loss_shape(state, cpu_batch, self.accumulation)
+            _, shapes = self._loss_shape(state, cpu_batch, self.accumulation)
             self._staging.refuse_unpipelined(schedule, self.objective)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, window=self.accumulation,
                                                      shape_only=True)
@@ -1762,7 +1598,7 @@ class Trainer(Generic[Loss, Effects]):
         them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
         micro = microbatch_shapes(split_fields(batch)[0], split)
         with self._traced_on(self.device_mesh) as schedule:
-            _, _, whole = self._prepared(state, micro, schedule, split, narrow=False)
+            _, _, whole = prepared_for(self, state, micro, schedule, split, narrow=False)
         return self._validated(whole, capacity)[1]
 
     def _fitting(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:

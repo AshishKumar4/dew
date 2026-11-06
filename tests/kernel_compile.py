@@ -215,11 +215,12 @@ def lowered_for(fn, args, generation: str, expected: Expected | None = None):
     (`assumed`, `gpu_mesh`) within its block's shared memory: what XLA compiles for it, never run."""
     mesh = _device(generation) if expected is None else _device(generation, expected.axes)
     specs = (None,) * len(args) if expected is None else expected.specs
-    placed = tuple(jax.tree.map(
-        lambda leaf, sharding=NamedSharding(mesh, spec or PartitionSpec()):
-        jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
-        if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, arg)
-        for arg, spec in zip(args, specs, strict=True))
+    def placed_on(arg, sharding: NamedSharding):
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
+                            if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, arg)
+
+    placed = tuple(placed_on(arg, NamedSharding(mesh, spec or PartitionSpec()))
+                   for arg, spec in zip(args, specs, strict=True))
     # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
     # Its bound checks the total allocation, including barriers outside the scratch estimate.
     with (assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),

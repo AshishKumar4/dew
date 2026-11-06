@@ -46,7 +46,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post54: a program's compilation cache key reads each serialized kernel in
+- Dew requires its JAX build 0.12.0.1.post55: Pallas Mosaic GPU's `multiple_of` lowers in a warp's code
+  (`plgpu.warp_map`), so a persistent kernel's load or product warp aligns a slice start, as a tcgen05 GEMM's
+  TMA rows do; post54: a program's compilation cache key reads each serialized kernel in
   an MLIR context of its own, so threads keying programs at once key them alike (two concurrent compiles of a
   model's steps had failed on an unregistered dialect); Mosaic GPU's `emit_pipeline` runs collectively over a
   thread axis; and a pre-Hopper pipeline's copy after a warpgroup barrier, and the GPU dialect's index reads,
@@ -60,7 +62,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   refused its kernels; and a Pallas kernel's body may call a call primitive, a span Dew marks, which lowers as
   its body on every Pallas backend and is checked within its body under `checkify`; and a step compiled ahead
   for an A100 on a host with no GPU lowers its Mosaic kernels for the A100, not an H100 (docs/installation.md
-  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post54
+  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post55
   changed Python alone, and their native code is the same.
 - FlashAttention's wrapper, `dew-flash-attn` 0.3.7, folds a mapped kernel call (`jax.vmap` over attention,
   as a batched model's step maps it) into the kernel's own batch, one launch a group of calls within its

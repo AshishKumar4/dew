@@ -147,6 +147,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A Mosaic GPU `async_load` after a warpgroup barrier and the GPU dialect's index and dimension reads or its dynamic shared memory base takes no automatic barrier of its own, as none of them touches a thread's shared memory: a pre-Hopper pipeline's step synchronizes once, which made an A100 GEMM's kernel gradient 8% faster.
 - A program's compilation cache key reads each kernel its custom calls serialize in an MLIR context of its own, so threads keying programs at once, each of them holding Mosaic GPU kernels, key them alike; the program's own context, which its thread's lowerings share, is left as it was.
 - Mosaic GPU's `emit_pipeline` runs collectively over a thread axis (`thread_axis`): every thread of a kernel's warpgroups runs one input pipeline over shared buffers, each copying an equal share of a block on a pre-Hopper GPU, as an Ampere kernel with several consumer warpgroups splits its loads.
+- Pallas Mosaic GPU's `multiple_of` lowers in a warp's code (`plgpu.warp_map`): a persistent kernel's load or product warp proves a slice start's divisibility to layout inference as a warpgroup's does, so a tcgen05 GEMM's TMA row start lowers.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
