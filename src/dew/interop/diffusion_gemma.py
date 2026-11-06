@@ -37,10 +37,11 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
-from dew.nn.vision import tower_layout, tower_variables as vision_variables
+from dew.nn.vision import tower_variables as vision_variables
 from dew.nn.vision.gemma4 import (
     Gemma4Projector,
     Gemma4Vision,
+    export_gemma4_vision_config,
     gemma4_projector_layouts,
     gemma4_tower_layouts,
     translate_gemma4_projector_config,
@@ -270,7 +271,7 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
                 and projection.clone(parent=None, name=None, dtype=None, precision=None) == expected):
             raise ValueError("DiffusionGemma's vision_config describes a Gemma 4 tower and its projector, "
                              f"not {tower!r} with {projection!r}")
-        config["vision_config"] = tower_layout("gemma4").vision_config(tower)
+        config["vision_config"] = export_gemma4_vision_config(tower)
     return config
 
 

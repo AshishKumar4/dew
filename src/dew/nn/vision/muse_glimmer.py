@@ -10,8 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
-from dew.interop.config_records import NativeFields
-from dew.interop.layouts import ConfigLayout, ConfigPart, Table
+from dew.interop.weights import in_params
 from dew.nn.activations import HIDDEN_ACT
 from dew.nn.dense import Dense
 from dew.nn.norms import RMSNorm
@@ -26,13 +25,9 @@ from .common import (
     TowerGeometry,
     TowerLayout,
     _vision_section,
-    activation_field,
     activation_name,
-    block_routes,
-    integer_field,
-    number_field,
-    rope_part,
-    tensor_routes,
+    block_tensor_path,
+    rope_base,
 )
 from .vit import LearnedPositions, MergeProjector, VisionTransformer, ViTLayout
 
@@ -137,8 +132,13 @@ _BLOCK_MAPS = {("attn", "q_proj"): ("self_attn", "q_proj"), ("attn", "k_proj"): 
                ("mlp", "fc1"): ("mlp", "up_proj"), ("mlp", "fc2"): ("mlp", "down_proj")}
 
 
-_MUSE_ROUTES = Table(*tensor_routes(_TENSORS), block_routes(_BLOCK_MAPS, prefix="layers"))
-"""A Muse Glimmer trunk's tensor names past `vision_tower.`, both ways."""
+def muse_glimmer_vision_path(hf_name: str) -> tuple[str, ...]:
+    """One Muse Glimmer trunk tensor name, its `vision_tower.` prefix off, into its path in the trunk
+    tree; anything else raises ValueError."""
+    path = _TENSORS.get(hf_name) or block_tensor_path(hf_name.split("."), _BLOCK_MAPS, prefix="layers")
+    if path is None:
+        raise ValueError(f"unknown tensor name {hf_name!r}")
+    return path
 
 
 def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -147,35 +147,27 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
     vision = _vision_section(hf_config)
     if vision.get("model_type", "muse_glimmer_vision") != "muse_glimmer_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not Muse Glimmer's trunk")
-    fields = _MUSE_CONFIG.read(vision, set(), NativeFields(MuseGlimmerVision, {}))
-    unknown = sorted(set(_records.strings(fields["layer_types"], "layer_types"))
-                     - {"full_attention", "window_attention"})
+    layers = _records.integer(vision["num_hidden_layers"], "num_hidden_layers")
+    kinds = _records.strings(vision.get("layer_types") or default_layer_types(layers), "layer_types")
+    unknown = sorted(set(kinds) - {"full_attention", "window_attention"})
     if unknown:
         raise ValueError(f"layer_types {unknown} are neither window_attention nor full_attention")
-    return {"class": "muse_glimmer", "fields": fields}
-
-
-def _read_kinds(vision: Mapping[str, object], used: set[str],
-                record: NativeFields[MuseGlimmerVision]) -> NativeFields[MuseGlimmerVision]:
-    """Each layer's kind, the reference's cadence over the depth where unstated."""
-    used.add("layer_types")
-    layers = _records.integer(record["num_hidden_layers"], "num_hidden_layers")
-    record["layer_types"] = _records.strings(vision.get("layer_types") or default_layer_types(layers),
-                                             "layer_types")
-    return record
-
-
-_MUSE_CONFIG = ConfigLayout(
-    integer_field("num_hidden_layers", required=True), integer_field("hidden_size", required=True),
-    integer_field("intermediate_size", required=True), integer_field("num_attention_heads", required=True),
-    activation_field(TOWER_ACTIVATIONS, "gelu", "hidden_act"), integer_field("patch_size", required=True),
-    integer_field("patch_temporal", default=2), integer_field("merge_size", default=2),
-    integer_field("pos_emb_height", default=32), integer_field("pos_emb_width", default=32),
-    number_field("layer_norm_eps", default=1e-5),
-    # Transformers 5.17 names its grid rotary 'axial' (MuseGlimmerVisionConfig.default_rope_type).
-    rope_part(10000.0, axial=True),
-    ConfigPart(_read_kinds, lambda tower: {"layer_types": list(tower.layer_types)}))
-"""A MuseGlimmerVisionConfig's fields, both ways."""
+    return {"class": "muse_glimmer", "fields": {
+        "num_hidden_layers": layers,
+        "hidden_size": _records.integer(vision["hidden_size"], "hidden_size"),
+        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
+        "num_attention_heads": _records.integer(vision["num_attention_heads"], "num_attention_heads"),
+        "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu"),
+        "patch_size": _records.integer(vision["patch_size"], "patch_size"),
+        "patch_temporal": _records.integer(vision.get("patch_temporal", 2), "patch_temporal"),
+        "merge_size": _records.integer(vision.get("merge_size", 2), "merge_size"),
+        "pos_emb_height": _records.integer(vision.get("pos_emb_height", 32), "pos_emb_height"),
+        "pos_emb_width": _records.integer(vision.get("pos_emb_width", 32), "pos_emb_width"),
+        "layer_norm_eps": _records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
+        # Transformers 5.17 names its grid rotary 'axial' (MuseGlimmerVisionConfig.default_rope_type).
+        "rope_theta": rope_base(vision, 10000.0, axial=True),
+        "layer_types": kinds,
+    }}
 
 
 def translate_muse_glimmer_projector_config(hf_config: Mapping[str, object]) -> Record:
@@ -200,8 +192,7 @@ def translate_muse_glimmer_projector_config(hf_config: Mapping[str, object]) -> 
     }}
 
 
-MuseGlimmerVision.checkpoint = TowerLayout("vision_tower.", _MUSE_ROUTES, config=_MUSE_CONFIG,
-                                           model_type="muse_glimmer_vision")
+MuseGlimmerVision.checkpoint = TowerLayout("vision_tower.", in_params(muse_glimmer_vision_path))
 # The adapter and the projection, each name its prefix off.
 MuseGlimmerProjector.checkpoint = ProjectorLayout(("vision_adapter.", "vision_projection."), {
     "fc1.weight": ("adapter", "fc1", "kernel"), "fc2.weight": ("adapter", "fc2", "kernel"),

@@ -231,12 +231,12 @@ def _leaves[LeafT](tensors: Mapping[str, Stored], path_of: TensorPath, param_dty
         if path is None:
             continue
         stored = held(tensor)
-        order, transpose = orders(path, stored.ndim)
+        order, transpose = _orders(path, stored.ndim)
         dtype = checkpoint_dtype(stored.dtype, param_dtype, path=path)
         yield name, path, read(stored, dtype, order), transpose
 
 
-def orders(path: tuple[str, ...], rank: int) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
+def _orders(path: tuple[str, ...], rank: int) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
     """The axis order a stored tensor of `rank` reads into its leaf at `path` by, and
     the order that writes the leaf back: a kernel's `[out, in, ...]` read as
     `[..., in, out]`; None for any other leaf."""
@@ -248,14 +248,14 @@ def orders(path: tuple[str, ...], rank: int) -> tuple[tuple[int, ...] | None, tu
 
 def native_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
     """The native shape at `path` under the same source-axis permutation the parameter reader uses."""
-    order, _ = orders(path, len(shape))
+    order, _ = _orders(path, len(shape))
     return shape if order is None else tuple(shape[axis] for axis in order)
 
 
 def stored_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
-    """The shape of the source tensor a leaf of `shape` at `path` is read from (`orders`' inverse):
+    """The shape of the source tensor a leaf of `shape` at `path` is read from (`_orders`' inverse):
     a kernel's axes as the source stores them, any other leaf's as they are."""
-    order, _ = orders(path, len(shape))
+    order, _ = _orders(path, len(shape))
     return tuple(shape) if order is None else tuple(shape[order.index(axis)] for axis in range(len(shape)))
 
 
@@ -291,7 +291,7 @@ def _layout(component: str, name: str, shape: tuple[int, ...], path: tuple[str, 
     from dew.interop.streaming import WeightLayout
 
     return WeightLayout(f"{component}/{name}" if component else name, ((*prefix, *path),), tuple(shape),
-                        orders(path, len(shape))[1])
+                        _orders(path, len(shape))[1])
 
 
 def translate_parameters[A: (np.ndarray, Stored)](tensors: Mapping[str, A], path_of: TensorPath,

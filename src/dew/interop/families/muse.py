@@ -17,19 +17,29 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_config import DecoderSpelling, decoder_layout
-from dew.interop.decoder_parts import DecoderFamily, DecoderFields, kinds_of, refuse
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, constant, unread
+from dew.interop.decoder_parts import (
+    PLAIN_SPELLING,
+    DecoderFamily,
+    DecoderFields,
+    base_config,
+    hf_activation,
+    kinds_of,
+    read_rope,
+    refuse,
+)
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import NormSpec
 from dew.nn.backbones.layer_plan import LayerKind
 
 
-def _layer_bases(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    """Each layer's rotary base, both ways: the reference reads one a layer (`layer_rope_theta`), 0 for NoPE;
-    Dew rotates every sliding layer at rope_theta and none of the full ones, each kind's mixer saying so."""
-    used.add('layer_rope_theta')
-    layer_types = _records.strings(record['layer_types'], 'layer_types')
-    rope_theta = _records.number(record['rope_theta'], 'rope_theta')
+def _muse_text_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    """Read a Muse Glimmer text config into `CausalTransformer` fields."""
+    # Each layer rotates at its own base (layer_rope_theta, below); a ramp over them stays refused
+    # until a check holds one against MuseGlimmerTextRotaryEmbedding.
+    config = base_config(hf_config, used, rope=read_rope(hf_config, used, PLAIN_SPELLING, ramps=('llama3',)),
+                         qk_norm=True, scale_after_cast=False, tie_embeddings=True)
+    layer_types = _records.strings(config['layer_types'], 'layer_types')
+    rope_theta = _records.number(config['rope_theta'], 'rope_theta')
     thetas = hf_config.get('layer_rope_theta')
     if thetas is None:
         refuse('layer_rope_theta missing', 'the reference reads one rotary base a layer, 0 for NoPE')
@@ -38,61 +48,52 @@ def _layer_bases(hf_config: Mapping[str, object], used: set[str], record: Decode
     if stated != expected:
         refuse(f'layer_rope_theta {stated!r}',
                'Dew rotates every sliding layer at rope_theta and none of the full ones')
-    kinds = kinds_of(record)
+    head_dim = _records.integer(config['head_dim'], 'head_dim')
+    post_eps = _records.number(hf_config.get('post_norm_eps', 1e-8), 'post_norm_eps')
+    kinds = kinds_of(config)
     for kind, nope in (('sliding_attention', False), ('full_attention', True)):
         kinds.setdefault(kind, native_fields(LayerKind)())['mixer'] = {
             'class': 'attention', 'fields': {'gate_projection': 'own', 'qk_norm_weight': False, 'nope': nope}}
-    record['kinds'] = kinds
-    return record
+    config.update(
+        sandwich_norms=True, scale_offset=True, output_gate=True,
+        attention_scale=_records.number(hf_config.get('qk_scale_factor', 3.87), 'qk_scale_factor')
+        * head_dim ** -0.5,
+        # MuseGlimmerTextNormedEmbedding norms the lookup; media take their slots after it.
+        embedding_norm=True, embedding_norm_reads='lookup',
+        norms={'attention_output_norm': {'eps': post_eps}, 'mlp_output_norm': {'eps': post_eps},
+               'embedding_layernorm': {'scale': False}, 'norm': {'offset': False}},
+        final_logit_softcap=_records.number(hf_config.get('final_logit_softcapping', 20.0),
+                                           'final_logit_softcapping'),
+        logits_scaling=1 / _records.number(hf_config.get('output_multiplier', 0.19611613513818404),
+                                          'output_multiplier'))
+    used.update(('layer_rope_theta', 'post_norm_eps', 'qk_scale_factor', 'final_logit_softcapping',
+                 'output_multiplier', 'initializer_range', 'attention_dropout', 'use_cache',
+                 'pad_token_id', 'bos_token_id', 'eos_token_id'))
+    return config
 
 
-def _qk_scale(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    used.add('qk_scale_factor')
-    head_dim = _records.integer(record['head_dim'], 'head_dim')
-    record['attention_scale'] = (_records.number(hf_config.get('qk_scale_factor', 3.87), 'qk_scale_factor')
-                                 * head_dim ** -0.5)
-    return record
-
-
-def _post_norms(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    used.add('post_norm_eps')
-    post_eps = _records.number(hf_config.get('post_norm_eps', 1e-8), 'post_norm_eps')
-    record['norms'] = {'attention_output_norm': {'eps': post_eps}, 'mlp_output_norm': {'eps': post_eps},
-                       'embedding_layernorm': {'scale': False}, 'norm': {'offset': False}}
-    return record
-
-
-MUSE_TEXT_CONFIG = ConfigLayout(
-    # Each layer rotates at its own base (`_layer_bases`); a ramp over them stays refused until a check
-    # holds one against MuseGlimmerTextRotaryEmbedding.
-    decoder_layout(DecoderSpelling(qk_norm=True, scale_after_cast=False, tie_embeddings=True,
-                                   ramps=('llama3',), activation='hidden_activation')),
-    ConfigPart(_layer_bases, lambda model: {'layer_rope_theta': [
-        0 if kind == 'full_attention' else model.rope_theta for kind in model.per_layer_types]}),
-    ConfigPart(_qk_scale, lambda model: {
-        'qk_scale_factor': model.attention_scale * model.features_per_head ** 0.5}),
-    ConfigPart(_post_norms, lambda model: {'post_norm_eps': (model.norms or {}).get(
-        'attention_output_norm', NormSpec()).eps or model.norm_eps}),
-    ConfigField('final_logit_softcapping', 'final_logit_softcap', 20.0, parse=_records.number),
-    ConfigField('output_multiplier', 'logits_scaling', 0.19611613513818404,
-                parse=lambda value, key: 1 / _records.number(value, key),
-                spell=lambda scaling: 1 / _records.number(scaling, 'logits_scaling')),
-    constant('sandwich_norms', value=True), constant('scale_offset', value=True),
-    constant('output_gate', value=True),
-    # MuseGlimmerTextNormedEmbedding norms the lookup; media take their slots after it.
-    constant('embedding_norm', value=True), constant('embedding_norm_reads', value='lookup'),
-    unread('initializer_range', 'attention_dropout', 'use_cache', 'pad_token_id', 'bos_token_id',
-           'eos_token_id'))
-"""Muse Glimmer's text config, both ways."""
+def _muse_text_export(model: CausalTransformer) -> Mapping[str, object]:
+    """The config fields `_muse_text_config` reads back, beside the shared ones."""
+    return {
+        'layer_rope_theta': [0 if kind == 'full_attention' else model.rope_theta
+                             for kind in model.per_layer_types],
+        'post_norm_eps': (model.norms or {}).get('attention_output_norm', NormSpec()).eps or model.norm_eps,
+        'qk_scale_factor': model.attention_scale * model.features_per_head ** 0.5,
+        'final_logit_softcapping': model.final_logit_softcap,
+        'output_multiplier': 1 / model.logits_scaling,
+        'hidden_activation': hf_activation(model.mlp),
+    }
 
 
 MUSE_GLIMMER_TEXT = DecoderFamily(
     ('muse_glimmer_text',),
-    MUSE_TEXT_CONFIG,
+    _muse_text_config,
     lambda fields: bool(fields.output_gate and fields.sandwich_norms and fields.embedding_norm
                         and fields.embedding_norm_reads == 'lookup'),
     'muse_glimmer_text',
     'MuseGlimmerTextModel',
+    _muse_text_export,
+    sandwich_norms=True,
     preserve_source_layout=True,
     # MuseGlimmerTextConfig's defaults for the fields its decoder reads.
     defaults={'rms_norm_eps': 1e-5, 'tie_word_embeddings': False, 'num_key_value_heads': 2, 'head_dim': 128,

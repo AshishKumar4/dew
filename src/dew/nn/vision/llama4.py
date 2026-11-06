@@ -10,29 +10,25 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
-from dew.interop.config_records import NativeFields
-from dew.interop.layouts import ConfigField, ConfigLayout, Table
+from dew.interop.weights import in_params
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
 from dew.nn.scan_orders import patchify
-from dew.nn.text_encoders import encoder_layer_routes
+from dew.nn.text_encoders import _encoder_layer_path
 from dew.nn.vision.vit import LearnedPositions, MergeProjector, SpecialTokens, VisionTransformer, ViTLayout
 from dew.registry import Record
 
 from .common import (
-    TRUNK_FIELDS,
     ProjectorBase,
     ProjectorLayout,
     TowerBase,
     TowerGeometry,
     TowerLayout,
+    _side,
     _vision_section,
     head_width,
-    integer_field,
-    number_field,
-    rope_part,
-    side_field,
-    tensor_routes,
+    rope_base,
+    trunk_geometry,
 )
 
 
@@ -155,9 +151,13 @@ _LLAMA4_VISION_TENSORS = {
 }
 
 
-_LLAMA4_ROUTES = Table(*tensor_routes(_LLAMA4_VISION_TENSORS),
-                       encoder_layer_routes("model", _LAYER_NORMS, _LAYER_PROJECTIONS, block="blocks"))
-"""A Llama 4 trunk's tensor names, both ways."""
+def llama4_vision_path(hf_name: str) -> tuple[str, ...] | None:
+    """One Llama 4 vision tensor name into its path in a trunk tree."""
+    path = _LLAMA4_VISION_TENSORS.get(hf_name) or _encoder_layer_path(
+        hf_name.split("."), "model", _LAYER_NORMS, _LAYER_PROJECTIONS, block="blocks")
+    if path is None:
+        raise ValueError(f"unknown tensor name {hf_name!r}")
+    return path
 
 
 def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -187,20 +187,20 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
         raise ValueError(
             f"vision_output_dim ({output_dim}) disagrees with projector_output_dim "
             f"({vision.get('projector_output_dim')}), the adapter's width")
-    return {"class": "llama4", "fields": _LLAMA4_CONFIG.read(vision, set(), NativeFields(Llama4Vision, {}))}
-
-
-_LLAMA4_CONFIG = ConfigLayout(
-    *TRUNK_FIELDS, side_field("image_size", 336), integer_field("patch_size", default=14),
-    integer_field("num_channels", default=3),
-    ConfigField("norm_eps", "layer_norm_eps", 1e-5, parse=_records.number, aliases=("layer_norm_eps",)),
-    rope_part(10000.0), number_field("pixel_shuffle_ratio", default=0.5),
-    integer_field("projector_input_dim", required=True),
-    # The adapter's width, which the vision output's width states again.
-    ConfigField("projector_output_dim", "projector_output_dim", parse=_records.integer),
-    ConfigField("vision_output_dim", "projector_output_dim", parse=_records.integer,
-                aliases=("projector_output_dim",)))
-"""A Llama4VisionConfig's fields, both ways."""
+    return {
+        "class": "llama4", "fields": {
+        **trunk_geometry(vision),
+        "image_size": _side(vision.get("image_size", 336), "image_size"),
+        "patch_size": _records.integer(vision.get("patch_size", 14), "patch_size"),
+        "num_channels": _records.integer(vision.get("num_channels", 3), "num_channels"),
+        "layer_norm_eps": _records.number(
+            vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"
+        ),
+        "rope_theta": rope_base(vision, 10000.0),
+        "pixel_shuffle_ratio": _records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
+        "projector_input_dim": _records.integer(vision["projector_input_dim"], "projector_input_dim"),
+        "projector_output_dim": _records.integer(vision["projector_output_dim"], "projector_output_dim"),
+    }}
 
 
 def translate_llama4_projector_config(text_width: int) -> Record:
@@ -208,7 +208,6 @@ def translate_llama4_projector_config(text_width: int) -> Record:
     return {"class": "llama4", "fields": {"text_width": int(text_width)}}
 
 
-Llama4Vision.checkpoint = TowerLayout("vision_model.", _LLAMA4_ROUTES, config=_LLAMA4_CONFIG,
-                                      model_type="llama4_vision_model")
+Llama4Vision.checkpoint = TowerLayout("vision_model.", in_params(llama4_vision_path))
 Llama4Projector.checkpoint = ProjectorLayout("multi_modal_projector.",
                                              {"linear_1.weight": ("linear", "kernel")})

@@ -33,7 +33,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 import numpy as np
 
@@ -49,14 +49,13 @@ from dew.interop.decoder_parts import (
     AudioFields,
     DecoderFamily,
     DecoderFields,
-    ExportRefused,
     Reading,
     SourceCode,
     WrapperFields,
     _unread,
-    decoder_tensors,
     folder_config,
     held_parts,
+    hf_activation,
     modeling_overrides,
     part_plan,
     record_float,
@@ -65,12 +64,10 @@ from dew.interop.decoder_parts import (
     refuse_drafter,
     translated,
 )
-from dew.interop.layouts import ConfigField, ConfigLayout
 from dew.interop.release import RELEASE_FILE
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
 from dew.interop.unread import Stored, equal, held
 from dew.interop.weights import checkpoint_dtype, insert, nested
-from dew.interop.wrappers import TextCorrection, WrapperLayout
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -87,9 +84,6 @@ from dew.nn.vision.muse_glimmer import (
 from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
 from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.registry import from_record, towers
-
-if TYPE_CHECKING:
-    from dew.nn.multimodal import MultimodalTransformer
 
 GENERATION_CONFIG_FILE = "generation_config.json"
 
@@ -305,11 +299,11 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     """Read a Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
     text = _wrapper_text(hf_config, used)
     tower = translate_siglip_vision_config(hf_config)
-    keys = WRAPPER_LAYOUTS["gemma3"].keys.read(hf_config, used, _wrapper_keys())
+    used.add("mm_tokens_per_image")
     projector = translate_gemma_projector_config(
         tower["fields"], _records.integer(text.get("emb_features"), "emb_features"),
-        keys["mm_tokens_per_image"])
-    image = _records.integer(keys["image_token_id"], "image_token_id")
+        hf_config.get("mm_tokens_per_image"))
+    image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     return _wrapper_fields("gemma3", used, text, tower, projector, image,
                            record_int(projector["fields"], "tokens_per_side") ** 2)
 
@@ -320,8 +314,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = translate_llama4_vision_config(hf_config)
     projector = translate_llama4_projector_config(
         _records.integer(text.get("emb_features"), "emb_features"))
-    keys = WRAPPER_LAYOUTS["llama4"].keys.read(hf_config, used, _wrapper_keys())
-    image = _records.integer(keys["image_token_id"], "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     vision = tower["fields"]
     grid = record_int(vision, "image_size") // record_int(vision, "patch_size")
     ratio = record_float(vision, "pixel_shuffle_ratio")
@@ -382,10 +375,9 @@ def _gemma4_placeholders(hf_config: Mapping[str, object], used: set[str]) -> tup
     default as Gemma4Config's and Gemma4UnifiedConfig's do, which agree (transformers 5.17.0,
     configuration_gemma4.py:349,352 and configuration_gemma4_unified.py:309,312), and both stay
     placeholders to the decoder whether or not a tower reads them."""
-    keys = ConfigLayout(*_GEMMA4_TOKENS).read(hf_config, used, _wrapper_keys())
-    return (_records.integer(keys["image_token_id"], "image_token_id"),
-            _records.integer(keys["video_token_id"], "video_token_id"),
-            _records.integer(keys["audio_token_id"], "audio_token_id"))
+    image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
+    return (image, _defaulted_token_id(hf_config, used, "video_token_id", 258884),
+            _defaulted_token_id(hf_config, used, "audio_token_id", 258881))
 
 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
@@ -423,15 +415,15 @@ def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> 
 
 def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Qwen 3.5 wrapper: NaViT-style tower, merger, decoder."""
-    keys = _QWEN35_KEYS.read(hf_config, used, _wrapper_keys())
-    if keys['language_model_only'] is not False:
+    if hf_config.get('language_model_only', False) is not False:
         refuse('language_model_only', 'the multimodal wrapper requires its vision component')
+    used.add('language_model_only')
     family = _records.text(hf_config['model_type'], 'model_type')
     text = _wrapper_text(hf_config, used)
     tower = translate_qwen35_vision_config(hf_config)
     projector = translate_qwen35_projector_config(
         hf_config, _records.integer(text.get("emb_features"), "emb_features"))
-    image = _records.integer(keys["image_token_id"], "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_id")
     # One resolution per call, so the soft-token count varies with the image
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
@@ -522,116 +514,6 @@ def _text_vlm_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrappe
     fields["unported"] = {"visual.": f"{model_type}'s vision tower has no Dew port"}
     fields["text_unprefixed"] = ("embed_tokens.", "layers.", "norm.")
     return fields
-
-
-def _token(key: str, field: str, *aliases: str, default: int | None = None,
-           value: Callable[["MultimodalTransformer"], int | None] | None = None
-           ) -> "ConfigField[MultimodalTransformer]":
-    """A placeholder id the wrapper states under `key` (or `aliases`), its config class's `default`
-    where it has one (required where None), filling `field` of the wrapper's record, written from the
-    model's (`value`, its own field where None)."""
-    if default is None:
-        return ConfigField(key, field, parse=_records.integer, value=value, aliases=aliases)
-    return ConfigField(key, field, default, parse=_records.integer, value=value, aliases=aliases)
-
-
-def _wrapper_keys() -> "NativeFields[MultimodalTransformer]":
-    """An empty record of a wrapper's own keys, which its readers fill (`WrapperLayout.keys`)."""
-    from dew.nn.multimodal import MultimodalTransformer
-
-    return NativeFields(MultimodalTransformer, {})
-
-
-def _projected(field: str) -> Callable[["MultimodalTransformer"], int]:
-    """A wrapper's projector's `field`, which the wrapper states at its own scope."""
-    return lambda model: getattr(model.projection, field)
-
-
-def _qwen35_mrope(text: Mapping[str, object]) -> Mapping[str, object]:
-    """Qwen3.5's full-attention layers rotate by the three mrope sections of its text_config's
-    rope_parameters (modeling_qwen3_5.py, Qwen3_5TextRotaryEmbedding)."""
-    rope = _records.record(text.get("rope_parameters") or {}, "rope_parameters")
-    sections = rope.get("mrope_section", [11, 11, 10])
-    if (not isinstance(sections, (list, tuple)) or len(sections) != 3
-            or any(type(value) is not int or value < 0 for value in sections)):
-        raise ValueError("mrope_section must contain three nonnegative integer widths")
-    return {"mrope_section": list(sections)}
-
-
-def _qwen35_rope(held: Mapping[str, object], text: Mapping[str, object]) -> Mapping[str, object]:
-    """The text_config's rope_parameters, the one record its text family writes (its base, rotated
-    fraction and any scaling), with the mrope sections, interleaved as the reference always reads them."""
-    return {**text, "rope_parameters": {
-        **_records.record(text["rope_parameters"], "rope_parameters"),
-        "mrope_section": list(_records.integers(held["mrope_section"], "mrope_section")),
-        "mrope_interleaved": True}}
-
-
-def _bidirectional(fields: Mapping[str, object], *, default: str | None = None
-                   ) -> Callable[[Mapping[str, object]], Mapping[str, object] | None]:
-    """A correction read where the text_config attends its vision spans both ways
-    (`use_bidirectional_attention` 'vision', `default` where unstated)."""
-    def read(text: Mapping[str, object]) -> Mapping[str, object] | None:
-        return fields if text.get("use_bidirectional_attention", default) == "vision" else None
-    return read
-
-
-def _states_vision(held: Mapping[str, object], text: Mapping[str, object]) -> Mapping[str, object]:
-    return {**text, "use_bidirectional_attention": "vision"}
-
-
-_GEMMA4_TOKENS = (_token("image_token_id", "image_token_id", "image_token_index"),
-                  _token("video_token_id", "video_token_id", default=258884,
-                         value=lambda model: model.extra_placeholder_ids[0]),
-                  _token("audio_token_id", "audio_token_id", default=258881,
-                         value=lambda model: model.extra_placeholder_ids[1]))
-"""Gemma 4's placeholder ids, the video's and audio's at Gemma4Config's defaults
-(configuration_gemma4.py:349,352, and Gemma4UnifiedConfig's alike), held among the decoder's extra
-placeholders."""
-
-_QWEN35_KEYS = ConfigLayout(
-    _token("image_token_id", "image_token_id"),
-    # Qwen 3.5's language-model-only checkpoint drops the tower this wrapper reads.
-    ConfigField("language_model_only", "language_model_only", default=False,
-                value=lambda model: False))
-
-WRAPPER_LAYOUTS: Mapping[str, WrapperLayout] = {
-    "gemma3": WrapperLayout(
-        "Gemma3ForConditionalGeneration", ConfigLayout(
-            _token("image_token_index", "image_token_id", "image_token_id"),
-            ConfigField("mm_tokens_per_image", "mm_tokens_per_image", None,
-                        value=lambda model: _projected("tokens_per_side")(model) ** 2)),
-        vision_type="siglip_vision_model",
-        corrections=(TextCorrection(None, ("bidirectional_images",),
-                                    lambda text: {"bidirectional_images": True}, lambda held, text: text),)),
-    "llama4": WrapperLayout(
-        "Llama4ForConditionalGeneration",
-        ConfigLayout(_token("image_token_index", "image_token_id", "image_token_id")),
-        root="", nests_head=True, vision_type="llama4_vision_model"),
-    "gemma4": WrapperLayout(
-        "Gemma4ForConditionalGeneration", ConfigLayout(*_GEMMA4_TOKENS),
-        corrections=(TextCorrection(("sliding_attention",), ("bidirectional_images",),
-                                    _bidirectional({"bidirectional_images": True}), _states_vision),)),
-    "gemma4_unified": WrapperLayout(
-        "Gemma4UnifiedForConditionalGeneration", ConfigLayout(*_GEMMA4_TOKENS),
-        corrections=(TextCorrection(None, ("bidirectional_blocks",),
-                                    _bidirectional({"bidirectional_blocks": True}, default="vision"),
-                                    _states_vision),)),
-    **{family: WrapperLayout(
-        architecture, _QWEN35_KEYS, tied_default=False,
-        # The merger's output width, which Qwen 3.5's vision_config states (`merger_projector`).
-        vision_keys=ConfigLayout(ConfigField("out_hidden_size", "out_hidden_size",
-                                             value=_projected("out_width"))),
-        corrections=(TextCorrection(("full_attention",), ("mrope_section",), _qwen35_mrope, _qwen35_rope),))
-       for family, architecture in (("qwen3_5", "Qwen3_5ForConditionalGeneration"),
-                                    ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
-                                    ("qwen4_exp", "Qwen4ExpForConditionalGeneration"))},
-}
-"""Each wrapper's release layout (`dew.interop.wrappers.WrapperLayout`), by its model_type: the writer of
-a wrapper built in Dew (`wrappers.wrapper_layout`) and its reader's text corrections and placeholder keys
-(`_wrapper_text_fields`, the readers above) read the same declaration. A wrapper absent here is read and
-not written: Muse Glimmer's, whose language model holds its placeholders; Gemma 3n's MobileNet; LFM3-VL's,
-whose release is its own code; and an audio tower."""
 
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
@@ -1407,8 +1289,8 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
     The family owns collection packing and any fused tensor geometry. A
     wrapper adds only its naming envelope after this shared inverse.
 
-    A config that carries `tie_word_embeddings` is read exactly as the
-    shared decoder reads it (`decoder_layout`), an explicit null included; only an absent key
+    A config that carries `tie_word_embeddings` is read exactly as
+    `base_config` reads it, an explicit null included; only an absent key
     asks the family for its own default. A derived config therefore reaches
     its weight encoder without translating geometry that encoder may not
     support.
@@ -1422,27 +1304,39 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
                        'tie_embeddings'))
     if tied != model.tie_embeddings:
         raise ValueError('tie_word_embeddings disagrees with the native model')
-    return decoder_tensors(family, model, variables, {**config, 'tie_word_embeddings': tied})
+    return family.export_weights(family, model, variables, {**config, 'tie_word_embeddings': tied})
 
 
 def export_config(model) -> Mapping[str, object]:
-    """Write a CausalTransformer's fields back into HF vocabulary as its family's config layout states
-    them (`DecoderFamily.config`, the one its reader reads), refusing a model the config would read back
-    as another computation (`refuse_lossy_export`)."""
+    """Write a CausalTransformer's fields back into HF vocabulary, refusing a model the config
+    would read back as another computation (`refuse_lossy_export`)."""
     family = _family_of(model)
     exported = family.export_fields(model)
     chunked = sorted(name for name, kind in (model.kinds or {}).items() if kind.chunk is not None)
     if chunked and 'attention_chunk_size' not in exported:
         # Llama 4's attention_chunk_size is the one config field a chunk
         # goes back out under.
-        raise ExportRefused(
+        raise ValueError(
             f"kinds {chunked} attend by chunk, which the {family.export_model_type} "
             f"config does not carry")
+    sandwich = bool(model.sandwich_norms)
     config: dict[str, object] = {
         'model_type': family.export_model_type,
         'architectures': [family.architecture],
         # The release's own code, which `PretrainedDecoder.from_model` writes beside the export.
         **({} if family.release_code is None else {'auto_map': dict(family.release_code.auto_map)}),
+        'hidden_size': model.emb_features,
+        'num_hidden_layers': model.num_layers,
+        'num_attention_heads': model.num_heads,
+        'num_key_value_heads': model.kv_heads,
+        'head_dim': model.features_per_head,
+        'intermediate_size': model.hidden_features,
+        'vocab_size': model.vocab_size,
+        'max_position_embeddings': _RESOLVED['context_length'](model),
+        'rms_norm_eps': model.norm_eps,
+        'attention_bias': model.attention_bias,
+        'tie_word_embeddings': model.tie_embeddings,
+        'hidden_act': hf_activation(model.mlp),
         'use_cache': model.causal,
     }
     from dew.nn.mixers import AttentionMixer
@@ -1453,6 +1347,75 @@ def export_config(model) -> Mapping[str, object]:
             overrides[name] = "block_bidirectional"
     if overrides:
         config["modeling_overrides"] = {"attention": overrides}
+    # A dial only some families' references read cannot ride in another
+    # family's config. Qwen2 splits the o_proj bias from the others, and
+    # Dream's reference is that block with the causal mask dropped
+    # (modeling_dream.py, DreamAttention builds o_proj bias-free over
+    # biased q/k/v); Gemma 2 alone applies the attention softcap (Gemma 3
+    # reads the field without passing it on). A checkpoint written under a
+    # family that would drop the dial is refused naming it.
+    if (model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias
+            and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo', 'llada2_moe')):
+        raise ValueError(
+                "o_proj_bias differs from attention_bias, which only the qwen2 "
+                "and dream references build, so the model cannot be written as "
+                f"{family.export_model_type}")
+    if model.attn_logit_softcap is not None and family.export_model_type != 'gemma2':
+        raise ValueError(
+            "attn_logit_softcap is applied by the gemma2 reference alone, so "
+            f"the model cannot be written as {family.export_model_type}")
+    types = model.per_layer_types
+    if any(layer != 'full_attention' for layer in types):
+        config['layer_types'] = list(types)
+    sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
+    local_theta = None if sliding is None or sliding.rope_theta == model.rope_theta else sliding.rope_theta
+    # Gemma3TextConfig and Olmo3Config give an unstated sliding base their
+    # own default rather than rope_theta (`RopeSpelling.local_theta`), so a
+    # sliding model of theirs states both bases.
+    if sliding is not None and family.export_model_type in ('gemma3_text', 'olmo3'):
+        local_theta = sliding.rope_theta or model.rope_theta
+    if local_theta is not None:
+        if sandwich:
+            config['rope_parameters'] = {
+                'full_attention': {'rope_type': 'default',
+                                   'rope_theta': model.rope_theta},
+                'sliding_attention': {'rope_type': 'default',
+                                      'rope_theta': local_theta},
+            }
+        else:
+            config['rope_theta'] = model.rope_theta
+            config['rope_local_base_freq'] = local_theta
+    else:
+        config['rope_theta'] = model.rope_theta
+    if sliding is not None and sliding.window is not None:
+        config['sliding_window'] = sliding.window
+    # A ramp, Llama 3's over the frequencies or a YaRN table in place of them,
+    # that the whole model shares writes flat beside rope_theta, which is
+    # where the single-table references read it (as Llama 3.1 ships it). A
+    # ramp that differs between the kinds is what Olmo3RotaryEmbedding
+    # builds, each kind's through its own ROPE_INIT_FUNCTIONS entry out of
+    # nested rope_parameters (modeling_olmo3.py:277-291, the spelling
+    # Olmo3Config.to_dict writes); a reference with one table for the whole
+    # model cannot say it, so that is refused naming the kinds.
+    tables = {kind: model.kind_of(kind).rope_scaling
+              for kind in sorted(set(types))}
+    ramped = {kind: table for kind, table in tables.items() if table is not None}
+    per_kind = bool(ramped) and (set(ramped) != set(tables)
+                                 or len(set(ramped.values())) > 1
+                                 or local_theta is not None)
+    if per_kind:
+        if not sandwich:
+            raise ValueError(
+                f"the rotary ramp differs between the layer kinds {sorted(tables)}, "
+                f"and the {family.export_model_type} reference rotates every layer "
+                "at one table; the model cannot be written back")
+        config['rope_parameters'] = {
+            kind: {**({'rope_type': 'default'} if table is None else dataclasses.asdict(table)),
+                   'rope_theta': model.kind_of(kind).rope_theta}
+            for kind, table in tables.items()}
+        config.pop('rope_local_base_freq', None)
+    elif ramped:
+        config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
     defaulted = family.defaults.get('pad_token_id') is not None
     if family.padding_idx and (model.padding_idx is not None or defaulted):
         # An explicit null where the class defaults to a pad id, so that id takes no row the model trains.
@@ -1508,18 +1471,12 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
     try:
         rebuilt = from_record(CausalTransformer, {**translate_config(config), 'dtype': model.dtype})
     except KeyError as error:
-        raise ExportRefused(f"the {config['model_type']} config written for this model lacks {error}, which "
-                            f"that family reads: this model's computation (its mixer or experts) has no "
-                            f"exported config; no exported family carries it") from error
+        raise ValueError(f"the {config['model_type']} config written for this model lacks {error}, which "
+                         f"that family reads: this model's computation (its mixer or experts) has no "
+                         f"exported config; no exported family carries it") from error
     except ValueError as error:
-        raise ExportRefused(f"the {config['model_type']} config written for this model does not read back: "
-                            f"{error}") from error
-    refuse_rebuilt(model, rebuilt, str(config['model_type']))
-
-
-def refuse_rebuilt(model: CausalTransformer, rebuilt: CausalTransformer, model_type: str) -> None:
-    """Refuse a decoder whose written config reads back as `rebuilt`, another computation than `model`,
-    naming the fields that differ."""
+        raise ValueError(f"the {config['model_type']} config written for this model does not read back: "
+                         f"{error}") from error
     lost: dict[str, tuple[str, str]] = {}
     for declared in dataclasses.fields(model):
         if declared.name in _RUNTIME_FIELDS:
@@ -1529,8 +1486,8 @@ def refuse_rebuilt(model: CausalTransformer, rebuilt: CausalTransformer, model_t
         if ours != theirs:
             lost[declared.name] = (repr(theirs), repr(ours))
     if lost:
-        raise ExportRefused(
-            f"{sorted(lost)} would not survive an export as {model_type}: its config reads back "
+        raise ValueError(
+            f"{sorted(lost)} would not survive an export as {config['model_type']}: its config reads back "
             f"{', '.join(f'{name}={read}' for name, (read, _) in lost.items())} where this model has "
             f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, "
             "so transformers would compute "

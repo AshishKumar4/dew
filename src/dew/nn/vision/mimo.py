@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from flax import linen as nn
 
 from dew import _records
-from dew.interop.layouts import Route, Table
+from dew.interop.weights import in_params
 from dew.registry import Record
 
 from .common import (
@@ -19,11 +19,10 @@ from .common import (
     TowerLayout,
     _vision_section,
     activation_name,
-    block_routes,
+    block_tensor_path,
     merger_projector,
-    unplaced,
 )
-from .vit import PATCH_CONVOLUTION, MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
+from .vit import MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,17 +95,18 @@ _BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("s
                ("mlp", "down_proj"): ("mlp", "down_proj")}
 
 
-_MIMO_ROUTES = Table(
-    unplaced(r"merger\..+"), Route(PATCH_CONVOLUTION, "params/patch_embed/kernel"),
-    Route("blocks.{index}.attn.sinks", "params/sinks_{index}"), block_routes(_BLOCK_MAPS, norm_bias=False))
-"""A MiMo ViT's tensor names past `visual.`, both ways; the merger maps with the projector."""
-
-
-def _patch_convolution(tower: TowerBase) -> Mapping[str, tuple[int, ...]]:
-    """The patch map as the release stores it, a `[width, channels, time, patch, patch]` convolution."""
-    assert isinstance(tower, MiMoVision)
-    return {PATCH_CONVOLUTION: (tower.hidden_size, tower.in_channels, tower.temporal_patch_size,
-                                tower.patch_size, tower.patch_size)}
+def mimo_vision_path(hf_name: str) -> tuple[str, ...] | None:
+    """One MiMo ViT tensor name, its `visual.` prefix off, into its path in the trunk tree. The
+    merger maps with the projector; anything else unknown raises ValueError."""
+    parts = hf_name.split(".")
+    if parts[0] == "merger":
+        return None
+    if len(parts) == 4 and parts[0] == "blocks" and parts[1].isdigit() and parts[2:] == ["attn", "sinks"]:
+        return (f"sinks_{parts[1]}",)
+    path = block_tensor_path(parts, _BLOCK_MAPS, norm_bias=False)
+    if path is None:
+        raise ValueError(f"unknown tensor name {hf_name!r}")
+    return path
 
 
 def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -143,8 +143,7 @@ def translate_mimo_projector_config(hf_config: Mapping[str, object], text_width:
     return merger_projector(hf_config, text_width, "mimo", bias=False)
 
 
-MiMoVision.checkpoint = TowerLayout("visual.", _MIMO_ROUTES, read=translate_vit_weights,
-                                    shapes=_patch_convolution)
+MiMoVision.checkpoint = TowerLayout("visual.", in_params(mimo_vision_path), read=translate_vit_weights)
 # MiMo's merger stores no biases (MiMoVisionPatchMerger's released tensors).
 MiMoProjector.checkpoint = ProjectorLayout("visual.merger.", {
     "ln_q.weight": ("norm", "scale"), "mlp.0.weight": ("fc1", "kernel"), "mlp.2.weight": ("fc2", "kernel"),

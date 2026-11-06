@@ -5,7 +5,7 @@ against a pinned transformers release. A `model_type` Dew does not register
 loads here as the first registered family whose convention it follows: its
 config reads as that family reads one and every tensor name maps as that
 family maps it. The candidates (`CONVENTIONS`) are the Llama convention,
-which reads every field the families share (`decoder_config.PLAIN_DECODER`), and
+which reads every field the families share (`hf_decoders.base_config`), and
 then every registered causal family in `decoder_families.ENTRIES` order.
 The fields a candidate does not read are not trusted by name. Before any
 weight downloads, the installed transformers builds its own class for the
@@ -49,7 +49,7 @@ from flax import traverse_util as flax_traverse
 
 from dew import _records
 from dew._cache import package_digest
-from dew.interop import decoder_config, decoder_parts, hf_decoders as decoders, parts, sources
+from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.nn import precision
 from dew.nn.blocks import padded_row
@@ -63,11 +63,13 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig, PreTrainedModel
 
 CONVENTIONS: tuple[tuple[str, decoder_parts.DecoderFamily], ...] = (
-    # Llama's convention reads every field the shared decoder states, windows
-    # included (`decoder_config.PLAIN_DECODER`), where the registered Llama
-    # family reads only what LlamaConfig declares; the probe, not the
-    # reference's declarations, is what admits a type's reading.
-    ('llama', replace(decoders.families()['llama'], config=decoder_config.decoder_layout())),
+    # Llama's convention reads every field `base_config` shares, windows
+    # included, where the registered Llama family reads only what
+    # LlamaConfig declares; the probe, not the reference's declarations, is
+    # what admits a type's reading.
+    ('llama', replace(decoders.families()['llama'], translate_config=lambda hf_config, used:
+                      decoder_parts.base_config(hf_config, used, rope=decoder_parts.read_rope(
+                          hf_config, used, decoder_parts.PLAIN_SPELLING)))),
     # A family whose tensors are rewritten or split before its path map
     # reads them (`prepare`, `packed`: GPT-2's buffers, fused experts) is
     # left out: its names cannot be checked before the weights are read.

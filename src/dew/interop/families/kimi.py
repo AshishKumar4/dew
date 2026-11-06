@@ -57,13 +57,11 @@ trims.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from types import MappingProxyType
 
 import numpy as np
 
 from dew import _records
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_config import read_only
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
     CODEC_FIELDS,
@@ -82,13 +80,13 @@ from dew.interop.decoder_parts import (
     SituFields,
     WrapperFields,
     context_lengths,
+    dew_path,
     record_float,
     record_int,
     refuse,
     refuse_encoder_fields,
-    spelled,
+    renamed_path,
 )
-from dew.interop.layouts import Prefixed, Route, Slot, Table
 from dew.interop.unread import Stored, held, valued
 from dew.nn.activations import Situ
 from dew.nn.attention_residuals import AttentionResiduals
@@ -360,18 +358,39 @@ _KIMI_LAYER_LEAVES: Leaves = {
 sites, KDA's (`KDA_LEAVES`) and K3's."""
 
 
-_KIMI_ROUTES = spelled(MOE_NAMES, leaves=_KIMI_LEAVES, layer_leaves=_KIMI_LAYER_LEAVES)
-"""Kimi Linear's names (model.safetensors.index.json at e1df551): the decoder under `model.*`, its MoE block
-spelled as Mixtral's (`MOE_NAMES`), the head at `lm_head.weight`."""
+def _decoder_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Return the variables-tree path of a decoder tensor named below `model.`. Kimi spells its MoE
+    block as Mixtral does (`MOE_NAMES`); only a load respells it, since the families keep their
+    source layout on export."""
+    return renamed_path(MOE_NAMES, 'model.' + name, config, leaves=_KIMI_LEAVES,
+                        layer_leaves=_KIMI_LAYER_LEAVES)
 
-_KIMI_K3_ROUTES = Table(
-    Prefixed('language_model.', _KIMI_ROUTES), _KIMI_ROUTES,
-    # The tower and the projector have no counterpart here: their tensors fill no leaf.
-    Route('{media}', None, MappingProxyType({'media': Slot(r'(?:vision_tower|mm_projector)\..+')})))
-"""Kimi K3's names: its decoder under `language_model.model.*`, the head at
-`language_model.lm_head.weight` (model.safetensors.index.json at f831ab6), and nothing for the tower and
-projector; the bundle's language model reads its own the same, past `language_model.`
-(`hf_decoders.language_family`)."""
+
+def _kimi_linear_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Return the variables-tree path of one Kimi Linear tensor: the decoder
+    under `model.*`, the head at `lm_head.weight` (model.safetensors.index.json
+    at e1df551)."""
+    if name == 'lm_head.weight':
+        return dew_path(name, config)
+    if not name.startswith('model.'):
+        raise ValueError(f"unknown tensor name {name!r}")
+    return _decoder_path(name.removeprefix('model.'), config)
+
+
+def _kimi_k3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Return the variables-tree path of one Kimi K3 tensor: the decoder under
+    `language_model.model.*`, the head at `language_model.lm_head.weight`
+    (model.safetensors.index.json at f831ab6), and nothing for the tower and
+    projector; the bundle's language model reads its own the same, past
+    `language_model.` (`hf_decoders.language_family`)."""
+    if name.startswith(('vision_tower.', 'mm_projector.')):
+        return None
+    name = name.removeprefix('language_model.')
+    if name == 'lm_head.weight':
+        return dew_path(name, config)
+    if not name.startswith('model.'):
+        raise ValueError(f"unknown tensor name {name!r}")
+    return _decoder_path(name.removeprefix('model.'), config)
 
 
 def _kimi_linear_prepare(tensors: Mapping[str, Stored],
@@ -427,12 +446,12 @@ def _kimi_k3_prepare(tensors: Mapping[str, Stored],
 # Kimi Linear's released remote code; provenance-only, like K2.5.
 KIMI_LINEAR = DecoderFamily(
     ('kimi_linear',),
-    read_only(_kimi_linear_config, "Kimi Linear is read from its release's remote code alone; no model "
-              "matches it on export"),
+    _kimi_linear_config,
     lambda fields: False,
     'kimi_linear',
     'KimiLinearForCausalLM',
-    routes=_KIMI_ROUTES,
+    lambda model: {},
+    weight_path=_kimi_linear_path,
     prepare=_kimi_linear_prepare,
     preserve_source_layout=True,
 )
@@ -441,11 +460,12 @@ KIMI_LINEAR = DecoderFamily(
 # Kimi K3's text decoder under its vision wrapper; provenance-only, like K2.5.
 KIMI_K3 = DecoderFamily(
     ('kimi_k3',),
-    read_only(_kimi_k3_config, "Kimi K3 is read from its release alone; no model matches it on export"),
+    _kimi_k3_config,
     lambda fields: False,
     'kimi_k3',
     'KimiK3ForConditionalGeneration',
-    routes=_KIMI_K3_ROUTES,
+    lambda model: {},
+    weight_path=_kimi_k3_path,
     prepare=_kimi_k3_prepare,
     zero_padded=_KDA_ZERO_PADDED,
     preserve_source_layout=True,

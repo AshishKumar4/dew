@@ -22,7 +22,6 @@ from flax.typing import Dtype, PrecisionLike
 from dew import _records
 from dew.batch import Variables, coordinates
 from dew.interop.decoder_parts import folder_name
-from dew.interop.layouts import Unwritten
 from dew.interop.unread import Stored, held
 from dew.interop.weights import Tree, checkpoint_dtype, insert, placed
 from dew.nn.conv import Conv
@@ -499,7 +498,7 @@ def _read_mimo_audio(tensors: Mapping[str, Stored], path_of, param_dtype: str
     return variables, layouts
 
 
-_LAYOUT = TowerLayout("", Unwritten(lambda name, config: mimo_audio_path(name)), read=_read_mimo_audio,
+_LAYOUT = TowerLayout("", mimo_audio_path, read=_read_mimo_audio,
                       roots=("audio_encoder.", "speech_embeddings.", _TOKENIZER_ENCODER))
 MiMoAudio.checkpoint = _LAYOUT
 

@@ -1,12 +1,12 @@
 """Read a Hugging Face `Mamba2ForCausalLM` checkpoint as a `CausalTransformer`.
 
-`CONFIG` reads `Mamba2Config`'s fields (configuration_mamba2.py) into the
-backbone's and writes them back: the SSD geometry onto the `mamba2` mixer
-value, the block without a feed-forward as `mlp_features=0`, the final norm's
-epsilon and the head's tying. `ROUTES` names the checkpoint's tensors
-(`backbone.layers.N.mixer.*`, `backbone.norm_f`, `lm_head`) both ways
-(`backbone_routes`): a load reads them onto the variables tree and an
-export writes them back.
+`config_from_hf` reads `Mamba2Config`'s fields (configuration_mamba2.py)
+into the backbone's: the SSD geometry onto the `mamba2` mixer value, the
+block without a feed-forward as `mlp_features=0`, the final norm's epsilon
+and the head's tying. `weight_path` maps the checkpoint's tensor names
+(`backbone.layers.N.mixer.*`, `backbone.norm_f`, `lm_head`) onto the
+variables tree for `dew.interop.hf_decoders.translate_weights`, and
+`export_path` maps them back.
 
 mamba_ssm's own checkpoints (state-spaces/mamba2-*) read through the same
 path: `config_from_mamba_ssm` writes their config as the `Mamba2Config` dict
@@ -21,30 +21,19 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from functools import partial
 from typing import TYPE_CHECKING
 
 from dew import _records
-from dew.interop.decoder_config import expect, flag, integer
-from dew.interop.decoder_parts import in_trunk, record_int, refuse_export
-from dew.interop.layouts import (
-    ConfigField,
-    ConfigLayout,
-    ConfigPart,
-    Nested,
-    Route,
-    Routes,
-    Table,
-    constant,
-    unread,
-)
+from dew.interop.config_records import native_fields
+from dew.interop.decoder_parts import record_bool, record_int
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 if TYPE_CHECKING:
-    from dew._records import JSON
     from dew.interop.decoder_parts import DecoderFields
-    from dew.registry import Configured
+    from dew.nn.mixer_base import MixerBase
 
 MODEL_TYPE = "mamba2"
 
@@ -52,6 +41,7 @@ MODEL_TYPE = "mamba2"
 # on export. Linear weights are kernels; the conv taps keep `[D, 1, K]`.
 TRUNK: Mapping[str, tuple[str, ...]] = {"backbone.embeddings.weight": ("embed_tokens", "embedding"),
                                          "backbone.norm_f.weight": ("norm", "scale")}
+_TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in TRUNK.items()}
 LAYER: Mapping[str, tuple[str, ...]] = {
     "norm.weight": ("input_layernorm", "scale"), "mixer.norm.weight": ("self_attn", "norm", "weight"),
     **{f"mixer.{leaf}": ("self_attn", leaf) for leaf in ("A_log", "dt_bias", "D")},
@@ -59,107 +49,110 @@ LAYER: Mapping[str, tuple[str, ...]] = {
        for linear in ("in_proj", "out_proj") for kind in ("weight", "bias")},
     **{f"mixer.conv1d.{kind}": ("self_attn", "conv1d", kind) for kind in ("weight", "bias")},
 }
+_LAYER_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in LAYER.items()}
 
 
-def _one_head(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    record.update(num_heads=1, num_kv_heads=1,
-                  head_dim=_records.integer(record['emb_features'], 'emb_features'))
-    return record
+def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None) -> DecoderFields:
+    """Read `Mamba2Config` fields into `CausalTransformer` kwargs.
 
+    `used` collects the config keys read, the set `hf_decoders.translate_config`
+    checks the rest against. The backbone's attention geometry is
+    `mixer_decoder`'s; the SSD layer reads its own heads from the mixer value.
+    """
+    read = {"model_type", "num_hidden_layers"} if used is None else used
+    integer, boolean = partial(record_int, hf_config, used=read), partial(record_bool, hf_config, used=read)
 
-def backbone_layout(*, vocab: int, hidden: int, layers: int, tied: bool) -> ConfigLayout[CausalTransformer]:
-    """The decoder of a Mamba family's model, both ways, at its class's defaults: every layer its mixer
-    alone (the family's own part), `hidden_size` wide, its norms at `layer_norm_epsilon`, its residual's
-    dtype. The attention geometry the backbone validates is one head of the model width, with no
-    feed-forward and no query and key norm, none of which a layer reads; written as nothing. The mixer's
-    conv activates with SiLU whatever else `hidden_act` names."""
-    return ConfigLayout(
-        integer('vocab_size', 'vocab_size', vocab), integer('hidden_size', 'emb_features', hidden),
-        integer('num_hidden_layers', 'num_layers', layers),
-        ConfigField('layer_norm_epsilon', 'norm_eps', 1e-5, parse=_records.number),
-        flag('tie_word_embeddings', 'tie_embeddings', default=tied),
-        flag('residual_in_fp32', 'residual_in_fp32', default=True),
-        ConfigPart(_one_head, lambda model: {}), constant('mlp_features', value=0),
-        constant('qk_norm', value=False),
-        expect('hidden_act', "the mixer's conv activates with silu", value='silu'))
-
-
-def _time_step_limit(value: Configured, key: str) -> tuple[float, float]:
-    """The step's (lower, upper) clamp. The reference leaves the upper bound open by default.
-    transformers 5.x writes an infinite bound as the {"__float__": "Infinity"} record `records` reads, and
-    every published port (AntonV/mamba2-130m-hf, Mamba-Codestral-7B) writes JSON's bare `Infinity`, which
-    json.loads (and so transformers) reads as float('inf')."""
-    def bound(stated: JSON, key: str) -> float:
-        return math.inf if stated == math.inf else _records.number(stated, key)
-    bounds = _records.listed(value, key, read=bound, what="a (lower, upper) pair")
-    if len(bounds) != 2:
-        raise ValueError(f"{key} is a (lower, upper) pair, got {value!r}")
-    return bounds[0], bounds[1]
-
-
-SSD_FIELDS: ConfigLayout[Mamba2Mixer] = ConfigLayout(
-    integer('num_heads', 'num_heads', 128), integer('head_dim', 'head_dim', 64),
-    integer('state_size', 'state_size', 128), integer('n_groups', 'n_groups', 8),
-    integer('conv_kernel', 'conv_kernel', 4), integer('chunk_size', 'chunk_size', 256),
-    flag('use_bias', 'use_bias', default=False), flag('use_conv_bias', 'use_conv_bias', default=True),
-    ConfigField('time_step_limit', 'time_step_limit', [0.0, math.inf], parse=_time_step_limit,
-                value=lambda mixer: list(mixer.time_step_limit)))
-"""`Mamba2Config`'s SSD layer (configuration_mamba2.py), every layer's mixer, both ways."""
-
-
-def _ssd(model: CausalTransformer) -> Mamba2Mixer:
-    mixer = model.mixer
-    assert isinstance(mixer, Mamba2Mixer), "the family matches a Mamba-2 mixer alone"
-    return mixer
-
-
-def _expand(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    """The SSD's width over the model's, as the reference's validate_architecture requires it whole."""
-    mixer = record['mixer']
-    assert isinstance(mixer, Mamba2Mixer), "`SSD_FIELDS` builds every layer's mixer"
-    hidden = _records.integer(record['emb_features'], 'emb_features')
-    expand = record_int(hf_config, 'expand', 2, used=used)
-    width = mixer.num_heads * mixer.head_dim
-    if hidden * expand != width:
-        raise ValueError(f"hidden_size * expand ({hidden * expand}) must equal num_heads * head_dim "
-                         f"({width}), as the reference's validate_architecture requires")
-    return record
-
-
-def _expanded(model: CausalTransformer) -> Mapping[str, object]:
-    width = _ssd(model).num_heads * _ssd(model).head_dim
-    expand, remainder = divmod(width, model.emb_features)
-    if remainder:
-        refuse_export('mixer', f"Mamba2Config states the SSD width as a whole multiple of hidden_size "
-                               f"{model.emb_features}, not {width}")
-    return {'expand': expand}
-
-
-CONFIG = ConfigLayout(
-    backbone_layout(vocab=32768, hidden=4096, layers=64, tied=False),
-    Nested('mixer', Mamba2Mixer, SSD_FIELDS, _ssd, build=lambda fields: fields.value),
-    ConfigPart(_expand, _expanded),
+    hidden, expand = integer("hidden_size", 4096), integer("expand", 2)
+    heads, head_dim = integer("num_heads", 128), integer("head_dim", 64)
+    if hidden * expand != heads * head_dim:
+        raise ValueError(
+            f"hidden_size * expand ({hidden * expand}) must equal num_heads * head_dim "
+            f"({heads * head_dim}), as the reference's validate_architecture requires")
+    read.add("hidden_act")
+    activation = hf_config.get("hidden_act", "silu")
+    if activation != "silu":
+        raise ValueError(f"hidden_act {activation!r} is not expressible: the SSD conv activates with silu")
     # Init-time fields of the reference, nothing the forward reads.
-    unread("time_step_rank", "time_step_min", "time_step_max", "time_step_floor", "rescale_prenorm_residual"))
-"""`Mamba2Config`'s fields (configuration_mamba2.py), both ways."""
+    read.update(("time_step_rank", "time_step_min", "time_step_max", "time_step_floor",
+                 "rescale_prenorm_residual", "time_step_limit", "layer_norm_epsilon"))
+    # The reference leaves the upper bound open by default. transformers
+    # 5.x writes an infinite bound as the {"__float__": "Infinity"} record
+    # `records` reads, and every published port (AntonV/mamba2-130m-hf,
+    # Mamba-Codestral-7B) writes JSON's bare `Infinity`, which json.loads
+    # (and so transformers) reads as float('inf'); the default is this
+    # module's own value and is not read from one.
+    lower, upper = 0.0, float("inf")
+    if "time_step_limit" in hf_config:
+        limit = hf_config["time_step_limit"]
+        if not isinstance(limit, (list, tuple)) or len(limit) != 2:
+            raise ValueError(f"time_step_limit is a (lower, upper) pair, got {limit!r}")
+        lower, upper = (math.inf if isinstance(bound, float) and bound == math.inf
+                        else _records.number(bound, "time_step_limit") for bound in limit)
+    mixer = Mamba2Mixer(
+        num_heads=heads, head_dim=head_dim,
+        state_size=integer("state_size", 128),
+        n_groups=integer("n_groups", 8),
+        conv_kernel=integer("conv_kernel", 4),
+        chunk_size=integer("chunk_size", 256),
+        use_bias=boolean("use_bias", default=False),
+        use_conv_bias=boolean("use_conv_bias", default=True),
+        time_step_limit=(lower, upper))
+    return mixer_decoder(hf_config, hidden, mixer, vocab_size=integer("vocab_size", 32768),
+                         num_layers=integer("num_hidden_layers", 64),
+                         tie_embeddings=boolean("tie_word_embeddings", default=False),
+                         residual_in_fp32=boolean("residual_in_fp32", default=True))
 
 
-def backbone_routes(layer: Mapping[str, tuple[str, ...]], *own: Routes) -> Table:
-    """The names of a model on the `backbone` trunk (`Mamba2ForCausalLM`'s, Mamba's, Nemotron-H's): the
-    trunk's (`TRUNK`), the head's, a tied one's copy filling no leaf, and each layer's `layer` names past
-    `backbone.layers.N.`; and the family's `own` routes before them."""
-    return Table(
-        *own,
-        *(Route(name, 'params/' + '/'.join(path)) for name, path in TRUNK.items()),
-        Route('lm_head.weight', None, when=lambda config, slots: bool(config.get('tie_embeddings'))),
-        Route('lm_head.weight', 'params/lm_head/kernel',
-              when=lambda config, slots: not config.get('tie_embeddings')),
-        *(Route('backbone.layers.{layer}.' + name, 'params/layers_{layer}/' + '/'.join(path), when=in_trunk)
-          for name, path in layer.items()))
+def mixer_decoder(hf_config: Mapping[str, object], hidden: int, mixer: MixerBase, *, vocab_size: int,
+                  num_layers: int, tie_embeddings: bool, residual_in_fp32: bool) -> DecoderFields:
+    """The decoder fields of a Mamba family's model, every layer `mixer`
+    alone, `hidden` wide, its norms at the config's `layer_norm_epsilon`. The
+    attention geometry the backbone validates is one head of the model width,
+    with no feed-forward and no query and key norm, none of which a layer
+    reads."""
+    return native_fields(CausalTransformer)(
+        vocab_size=vocab_size, emb_features=hidden, num_layers=num_layers, num_heads=1, num_kv_heads=1,
+        head_dim=hidden, mlp_features=0, qk_norm=False,
+        norm_eps=_records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
+        tie_embeddings=tie_embeddings, residual_in_fp32=residual_in_fp32, mixer=mixer)
 
 
-ROUTES = backbone_routes(LAYER)
-"""`Mamba2ForCausalLM`'s names."""
+def weight_path(name: str, config: Mapping[str, object], *, layer: Mapping[str, tuple[str, ...]] = LAYER,
+                family: str = "Mamba-2") -> tuple[str, ...] | None:
+    """Return the variables-tree path for one `Mamba2ForCausalLM` tensor name.
+
+    The tied head's copy comes back as None. An unknown name raises. Mamba's
+    checkpoints share the `backbone` trunk and pass their own `layer` names.
+    """
+    parts = name.split(".")
+    if name in TRUNK:
+        return ("params", *TRUNK[name])
+    if name == "lm_head.weight":
+        return None if config.get("tie_embeddings") else ("params", "lm_head", "kernel")
+    if len(parts) >= 4 and parts[:2] == ["backbone", "layers"] and parts[2].isdigit():
+        tail = layer.get(".".join(parts[3:]))
+        if tail is not None:
+            return ("params", f"layers_{parts[2]}", *tail)
+    raise ValueError(f"{name!r} has no place in a {family} CausalTransformer")
+
+
+def export_path(dew_name: str, config: Mapping[str, object], *,
+                layer_names: Mapping[tuple[str, ...], str] = _LAYER_NAMES,
+                family: str = "Mamba-2") -> str | None:
+    """Return the `Mamba2ForCausalLM` tensor name for one flattened dew parameter path.
+
+    The inverse of `weight_path`. The tied head comes back as None, since its
+    embedding copy is written instead. A hybrid on the same `backbone` trunk
+    (Nemotron-H) passes its own `layer_names`.
+    """
+    parts = tuple(dew_name.split("."))
+    if parts in _TRUNK_NAMES:
+        return _TRUNK_NAMES[parts]
+    if parts == ("lm_head", "kernel"):
+        return None if config.get("tie_embeddings") else "lm_head.weight"
+    if parts[0].startswith("layers_") and parts[1:] in layer_names:
+        return f"backbone.layers.{parts[0].removeprefix('layers_')}.{layer_names[parts[1:]]}"
+    raise ValueError(f"{dew_name!r} is not a {family} CausalTransformer parameter")
 
 
 # mamba_ssm's own checkpoint format (state-spaces/mamba2-*): a config.json

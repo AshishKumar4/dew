@@ -11,12 +11,11 @@ from collections.abc import Mapping
 from flax import linen as nn
 
 from dew import _records
-from dew.interop.config_records import NativeFields
-from dew.interop.layouts import ConfigField, ConfigLayout, Table
+from dew.interop.weights import in_params
 from dew.nn.norms import LayerNorm
 from dew.registry import Record
 
-from .common import TowerBase, TowerGeometry, TowerLayout, tensor_routes
+from .common import TowerBase, TowerGeometry, TowerLayout
 from .gemma4 import AxialPatchEmbedding
 
 
@@ -41,17 +40,12 @@ class Gemma4UnifiedVision(TowerBase):
                              channels=3, position_size=self.mm_posemb_size, retains_patch_slots=True)
 
 
-_UNIFIED_CONFIG = ConfigLayout(*(ConfigField(field.name, field.name, field.default, parse=_records.integer)
-                                  for field in dataclasses.fields(Gemma4UnifiedVision)))
-"""A Unified vision_config's embedding fields, both ways, each at Gemma4UnifiedVisionConfig's default where
-the config leaves it out."""
-
-
 def translate_gemma4_unified_vision_config(config: Mapping[str, object]) -> Record:
     """A Unified vision_config's embedding fields, each at Gemma4UnifiedVisionConfig's default where the
     config leaves it out. Its num_soft_tokens is the processor's budget, which this embedding never
     reads: Dew takes the processor's patches as they are."""
-    fields = _UNIFIED_CONFIG.read(config, set(), NativeFields(Gemma4UnifiedVision, {}))
+    fields = {field.name: _records.integer(config.get(field.name, field.default), field.name)
+              for field in dataclasses.fields(Gemma4UnifiedVision)}
     width = fields["mm_embed_dim"]
     if _records.integer(config.get("output_proj_dims", width), "output_proj_dims") != width:
         raise ValueError("output_proj_dims must equal mm_embed_dim for the vision embedding projection")
@@ -67,5 +61,10 @@ _TENSORS = {
 }
 
 
-Gemma4UnifiedVision.checkpoint = TowerLayout("vision_embedder.", Table(*tensor_routes(_TENSORS)),
-                                             config=_UNIFIED_CONFIG, model_type="gemma4_unified_vision")
+def vision_path(name: str) -> tuple[str, ...]:
+    if name not in _TENSORS:
+        raise ValueError(f"unknown unified vision tensor {name!r}")
+    return _TENSORS[name]
+
+
+Gemma4UnifiedVision.checkpoint = TowerLayout("vision_embedder.", in_params(vision_path))
