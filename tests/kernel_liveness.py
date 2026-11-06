@@ -75,6 +75,40 @@ def _elements(type_: ir.Type) -> list[tuple[int, bool]] | None:
     return None
 
 
+ADDRESS_ARITHMETIC = frozenset({"llvm.add", "llvm.sub", "llvm.mul", "llvm.shl", "llvm.lshr", "llvm.and",
+                                "llvm.or", "llvm.xor", "arith.addi", "arith.subi", "arith.muli", "arith.shli",
+                                "arith.shrui", "arith.andi", "arith.ori", "arith.xori"})
+"""Integer arithmetic an address is formed by (`_addressing`)."""
+
+
+def _addressing(value):
+    """The type `value`'s registers take: a 64-bit integer whose every use forms a shared-memory address (an
+    `llvm.inttoptr` to `ptr<3>`, through integer arithmetic) is a 32-bit one, as ptxas forms a shared
+    window's addresses (the fused attention backward's ring slot bases, `ptrtoint` plus a slot's offset:
+    read 4 registers past ptxas's 224, et-stats); its own type otherwise."""
+    if not (ir.IntegerType.isinstance(value.type) and ir.IntegerType(value.type).width == 64):
+        return value.type
+    pending, seen = [value], set()
+    while pending:
+        current = pending.pop()
+        if hash(current) in seen:
+            continue
+        seen.add(hash(current))
+        uses = list(current.uses)
+        if not uses:
+            return value.type
+        for use in uses:
+            op = use.owner.operation if hasattr(use.owner, "operation") else use.owner
+            name = op.name.removeprefix(PREFIX)
+            if name == "llvm.inttoptr" and SHARED.match(str(op.results[0].type)):
+                continue
+            if name in ADDRESS_ARITHMETIC and len(op.results) == 1:
+                pending.append(op.results[0])
+                continue
+            return value.type
+    return ir.IntegerType.get_signless(32)
+
+
 class Atoms:
     """The registers of every value: lists of atom ids, each atom a 32-bit register (`data` whether float)."""
 
@@ -683,7 +717,7 @@ class _Pass:
         unknown."""
         columns = self.threads.columns(value)
         if columns is None:
-            return self.atoms.fresh(value.type)
+            return self.atoms.fresh(_addressing(value))
         element = value.type
         if isinstance(element, ir.VectorType):
             element = ir.VectorType(element).element_type
@@ -705,7 +739,7 @@ class _Pass:
         registers and folds the rest into the compare (the two-launch dQ backward: 24 distinct `ISETP`
         operands, where the pass held 48 index casts a register each, 198 against 168)."""
         if self.threads.columns(value) is None:
-            return self.atoms.fresh(value.type, unpacked=unpacked)
+            return self.atoms.fresh(_addressing(value), unpacked=unpacked)
         kept = self._kept(value)
         return [] if all(atom is None for atom in kept) else kept
 
