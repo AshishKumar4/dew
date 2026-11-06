@@ -624,8 +624,9 @@ class _Observed:
         return row
 
 
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
 @pytest.mark.parametrize("workers", [2, "auto"])
-def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers):
+def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers, read):
     """A store read through Dew's mirror by loading workers: each worker opens its shards through its own
     process's mirror, and the run's statistics count every one of those opens beside the reading
     process's own (row 4339), each worker's counters carried by the position it hands the reader."""
@@ -646,7 +647,7 @@ def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers
     # An ArrayRecord shard's physical size is far past its two small records: room for every reader's pin.
     source = Files(f"dewcache::file://{root}", storage_options={
         "dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 64 << 20}})
-    loader = compile(Pipeline(source).map(_Observed(observed)).repeat(1).batch(1), read="streamed",
+    loader = compile(Pipeline(source).map(_Observed(observed)).repeat(1).batch(1), read=read,
                      loading=Loading(workers=workers, max_workers=2, threads=1, read_buffer=1,
                                      worker_buffer=1, cache=False))
     reader = loader.train(DataPartition())
