@@ -1055,12 +1055,16 @@ def release_model(name: str, kernels):
     return loaded(name, directory / "model.py")
 
 
-def release_net(model_module, engram_module, stored: dict, dtype: torch.dtype | None = None):
-    """The fixture's Transformer as the release builds it on CUDA, in bf16 (its `ModelArgs.dtype`) or, with
-    `dtype` float64, its float64 twin inside `widened`: every parameter the fixture's (`stored`, under the
-    release's names) rounded to the dtype the release keeps it in, the twin's then widened, and the engram
-    table's dequantization scales one, the dense table the fixture ships."""
+def release_net(model_module, engram_module, stored: dict, dtype: torch.dtype | None = None, *,
+                vision: bool = False):
+    """The fixture's Transformer as the release builds it on CUDA, with its vision half where `vision`, in
+    bf16 (its `ModelArgs.dtype`) or, with `dtype` float64, its float64 twin inside `widened`: every
+    parameter the fixture's (`stored`, under the release's names) rounded to the dtype the release keeps it
+    in, the twin's then widened, and the engram table's dequantization scales one, the dense table the
+    fixture ships."""
     args = model_args(model_module, engram_module)
+    for field, value in VISION.items() if vision else ():
+        setattr(args, field, value)
     with torch.device("cuda"), model_module.set_dtype(dtype or torch.bfloat16):
         net = model_module.Transformer(args, tokenizer())
     # The twin's weights float64 where the release keeps them in its storage dtype; its rotary tables are
@@ -1088,6 +1092,49 @@ def release_rows(net, ids: torch.Tensor) -> np.ndarray:
     return torch.stack(found, 1).double().cpu().numpy()
 
 
+def vision_draw(index: int) -> dict[str, np.ndarray]:
+    """The `index`-th image prompt (`vision_outputs`' form): pixels of GRID patches, bf16's values as the
+    release's processor hands them (image_processor.py's `.to(torch.bfloat16)`), drawn text with the image's
+    token span at IMAGE_START_AT, and its token types."""
+    processor = importlib.import_module("image_processor")
+    generator = torch.Generator().manual_seed(0x5649 + index)
+    patch, ratio = VISION["vision_patch_size"], VISION["vision_downsample_ratio"]
+    pixels = torch.randn(3, GRID[0] * patch, GRID[1] * patch, generator=generator).bfloat16().float()
+    types = processor.image_token_types(-(-GRID[0] // ratio), -(-GRID[1] // ratio))
+    text = torch.randint(3, IMAGE_TOKEN_ID, (1, LENGTH - types.numel()), generator=generator)
+    start = IMAGE_START_AT
+    ids = torch.cat([text[:, :start], torch.full((1, types.numel()), IMAGE_TOKEN_ID), text[:, start:]], 1)
+    token_types = torch.full(ids.shape, processor.TEXT)
+    token_types[0, start:start + types.numel()] = types
+    return {"pixels": pixels.numpy(), "input_ids": ids.numpy().astype(np.int32),
+            "token_types": token_types.numpy().astype(np.int32)}
+
+
+def release_vision(net, inputs: dict[str, np.ndarray]) -> np.ndarray:
+    """The release's logits at every position from the image prompt's last on, each a prefix's prefill
+    from position zero with its image (`Transformer.forward`, the span merged in its first chunk)."""
+    processor = importlib.import_module("image_processor")
+    wide, device = next(net.parameters()).dtype == torch.float64, next(net.parameters()).device
+    patch = VISION["vision_patch_size"]
+    # The processor's bf16 patches, widened in the twin.
+    pixels = torch.from_numpy(inputs["pixels"]).to(device, torch.float64 if wide else torch.bfloat16)
+    patches = (pixels.reshape(3, GRID[0], patch, GRID[1], patch).permute(1, 3, 0, 2, 4)
+               .reshape(-1, 3, patch, patch))
+    ids = torch.from_numpy(inputs["input_ids"].astype(np.int64)).to(device)
+    token_types = torch.from_numpy(inputs["token_types"].astype(np.int64)).to(device)
+    media = token_types[0] >= 0
+    types = token_types[0, media]
+    image = processor.ImageInput(IMAGE_START_AT, patches, GRID[0], GRID[1], types)
+    prompt = IMAGE_START_AT + types.numel() + 1
+    found = []
+    with torch.no_grad():
+        for length in range(prompt, LENGTH + 1):
+            reset(net)
+            found.append(type(net).forward.__wrapped__(net, ids[:, :length], 0, [[image]],
+                                                       token_types[:, :length])[1])
+    return torch.stack(found, 1).double().cpu().numpy()
+
+
 def write_release_recording():
     """release.npz beside the fixture, on a CUDA GPU: the release's logits at every position (`release_rows`)
     as released, bf16 over its own tilelang kernels and its activation quantizers, and their float64 truth
@@ -1098,16 +1145,19 @@ def write_release_recording():
     from recorded_references import provenance, record_case, save
     from safetensors.torch import load_file
 
-    stored = load_file(FIXTURE / "model.safetensors")
+    stored = {**load_file(FIXTURE / "model.safetensors"), **load_file(FIXTURE / "vision.safetensors")}
     engram_module = importlib.import_module("engram")
     native = release_model("deepseek_v41_release", official_kernels())
     net = release_net(native, engram_module, stored)
+    seeing = release_net(native, engram_module, stored, vision=True)
     twin_module = release_model("deepseek_v41_release_float64",
                                 importlib.import_module("tools.deepseek_v41_kernels"))
     # The twin reads the parameters the release holds, widened.
     held = {name: tensor.double() for name, tensor in net.state_dict().items()}
+    sighted = {name: tensor.double() for name, tensor in seeing.state_dict().items()}
     with widened(twin_module):
         twin = release_net(twin_module, engram_module, held, torch.float64)
+        seeing_twin = release_net(twin_module, engram_module, sighted, torch.float64, vision=True)
     install_selection_probe()
     rows: dict[int, np.ndarray] = {}
 
@@ -1131,9 +1181,15 @@ def write_release_recording():
             return {"logits": found[:, start:]}, {"logits": truth[:, start:]}
         return evaluate
 
-    # Every position's, and those a cached walk computes after its prompt's prefill.
+    def seen(inputs):
+        found = release_vision(seeing, inputs)
+        with widened(twin_module):
+            return {"logits": found}, {"logits": release_vision(seeing_twin, inputs)}
+
+    # Every position's, those a cached walk computes after its prompt's prefill, and an image prompt's.
     arrays = {**record_case("deepseek v41 release rows", draw, evaluated(0), summary=True),
-              **record_case("deepseek v41 release walk", draw, evaluated(PROMPT - 1), summary=True)}
+              **record_case("deepseek v41 release walk", draw, evaluated(PROMPT - 1), summary=True),
+              **record_case("deepseek v41 release vision", vision_draw, seen, summary=True)}
     import tilelang
 
     written = save(FIXTURE / "release.npz", {**arrays, "provenance": provenance(

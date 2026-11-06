@@ -41,7 +41,7 @@ import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import decode_through
 from quantized_basis import dequantized_in_own_basis
-from reference_error import FACTOR, as_given, assert_as_exact, distance
+from reference_error import FACTOR, as_given, assert_as_exact, declared_seeds, distance
 
 from dew.batch import coordinates
 from dew.interop import Pretrained
@@ -395,6 +395,40 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(as_run, recorded_row
 
     assert_as_exact(as_given(lambda index, inputs: {"logits": walked(jnp.asarray(inputs["input_ids"]))}),
                     recorded, draw, "a shifted cached walk", seeds=seeds, truth_fn=truth)
+
+
+def test_an_image_prompt_computes_the_releases_logits(tmp_path):
+    """The vision half as the release runs it (its ViT, aligner, span vectors and every router's image
+    bias, bf16 with its activation quantizers): over drawn image prompts, every position's logits from
+    the prompt's last on, one forward with the image, on par with the release's from its float64 run's
+    (check 1, the recording's: each a prefix's prefill with the image, row 354)."""
+    from model_support import float64_twin
+    from reference_error import indexed_recording, recording
+
+    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="bfloat16", attention_impl="reference")
+    model, variables = loaded.model, loaded.variables
+
+    def logits(model, variables, inputs):
+        ids = jnp.asarray(inputs["input_ids"])
+        media = inputs["token_types"] >= 0
+        prompt = int(np.flatnonzero(media[0])[-1]) + 2
+        return {"logits": model.apply(
+            variables, ids, image_indices=jnp.asarray(np.where(media, np.cumsum(media, -1) - 1, -1)),
+            conditioning={"pixel_values": jnp.asarray(inputs["pixels"])[None, None]})[:, prompt - 1:]}
+
+    wide = float64_twin(model)
+
+    def truth(inputs):
+        with jax.enable_x64(new_val=True):
+            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
+            return logits(wide, held, inputs)
+
+    site = "deepseek v41 release vision"
+    seeds = declared_seeds(RELEASE)[site]
+    draw, reference, truth = indexed_recording(recording(RELEASE), site, seeds, truth_fn=truth)
+    assert_as_exact(as_given(lambda index, inputs: logits(model, variables, inputs)), reference, draw,
+                    "an image prompt", seeds=seeds, truth_fn=truth)
 
 
 def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
