@@ -1713,9 +1713,9 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-GATED = ("sm90",)
+GATED = ("sm90", "sm80")
 """The GPUs whose families the mainloop qualifies (`attention_mosaic_program.QUALIFIED`): an H100's
-wgmma."""
+wgmma and an A100's mma.sync."""
 
 BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
@@ -1753,13 +1753,6 @@ def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str
                                                    natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, interpret=False)
         return op, ba, op.derived(ba, generation.gpu_target())
-
-
-@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
-def test_an_a100_derives_no_mosaic_backward(accurate):
-    """The mma.sync family is not one this mainloop qualifies (`attention_mosaic_program.QUALIFIED`, row
-    2078): an A100's backward derives no config, so the route takes another mainloop there."""
-    assert _gated_backward("sm80", 128, accurate)[2] is None
 
 
 FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED

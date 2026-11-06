@@ -24,6 +24,7 @@ from dew.nn.kernels.templates import (
     bundles,
     layout,
     mosaic,
+    mosaic_sm80,
     mosaic_sm90,
     operands,
     resources,
@@ -46,11 +47,12 @@ from dew.nn.kernels.templates.attention import (
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.programs import CALLS, equations
 
-QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
+QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name, mosaic_sm80.Mma.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
-feed their own rings (`mosaic_sm90.FED`). mma.sync's (an A100's) joins once every launch it derives
-compiles spill-free (the resource gate's sm80 cases, `GATED`; row 2078: check 1 held there,
-ET-2078-A100CHECK3); before that it takes a launch of fewer rows than a role's (`few_rows`)."""
+feed their own rings (`mosaic_sm90.FED`), and mma.sync's staged by cp.async (an A100's: every launch it
+derives compiles spill-free, the resource gate's sm80 cases, `GATED`; row 2078: check 1 held there,
+ET-2078-A100CHECK3). mma.sync's fed bundle (`bundles.MmaFed`, consumer Blackwell's) takes a launch of fewer
+rows than a role's (`few_rows`) until its gate holds."""
 
 
 def few_rows(family: mosaic.Family, rows: int | None) -> bool:
