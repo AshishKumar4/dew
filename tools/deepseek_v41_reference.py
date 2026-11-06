@@ -1156,6 +1156,9 @@ def write_release_recording():
     seeing = release_net(native, engram_module, stored, vision=True)
     twin_module = release_model("deepseek_v41_release_float64",
                                 importlib.import_module("tools.deepseek_v41_kernels"))
+    # The twin's engram lookup widened with the rest: the release rounds it to bf16 (model.py:320), one of
+    # the bf16 roundings the truth leaves out.
+    twin_module.ParallelEngramEmbedding.forward = _engram_lookup
     # The twin reads the parameters the release holds, widened.
     held = {name: tensor.double() for name, tensor in net.state_dict().items()}
     sighted = {name: tensor.double() for name, tensor in seeing.state_dict().items()}
