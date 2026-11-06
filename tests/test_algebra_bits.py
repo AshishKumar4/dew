@@ -194,9 +194,12 @@ FORMS = {
     "nvfp4-alu": lambda: bits.synthesized(dataclasses.replace(bits.NVFP4_BFLOAT16, units=ALU), reach=6),
     "nibbles": lambda: bits.synthesized(_nibbles()),
     "nibbles-alu": lambda: bits.synthesized(_nibbles(ALU)),
+    "encode-e4m3": lambda: bits.encode_form(bits.E4M3),
 }
 """Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
-and right shifts on either pipe, and a mask of one value and of two values' XOR."""
+and right shifts on either pipe, and a mask of one value and of two values' XOR; and an encode's (every
+instruction that is not linear: logic of any table, three-way adds, minima, compares, selects and shifts
+by a value)."""
 
 
 @pytest.mark.parametrize("name", FORMS)
@@ -284,8 +287,8 @@ def reference_codes(words: np.ndarray, minifloat: bits.Minifloat, dtype) -> np.n
 @pytest.mark.shards(units=192, per_task=8)
 def test_each_encode_is_the_reference_cast_on_every_fp32_word():
     """Each of e4m3's, e5m2's and e2m1's encodes (`bits.encoded`) is ml_dtypes' round-to-nearest-even cast
-    saturated to its largest finite value on every one of the 2^32 fp32 words, a NaN as its NaN code: a
-    proof by exhaustion (row 4050)."""
+    saturated to its largest finite value on every one of the 2^32 fp32 words, a NaN as its NaN code, and its
+    instruction form (`bits.encode_form`) is the encode on every word: a proof by exhaustion (row 4050)."""
     cases = list(itertools.product(MINIFLOATS, range(SLICES)))
     assert len(cases) == 192, "the shards mark counts each slice of each encode"
 
@@ -298,6 +301,10 @@ def test_each_encode_is_the_reference_cast_on_every_fp32_word():
             differ = np.flatnonzero(got != want)
             assert differ.size == 0, (name, [(hex(int(words[i])), int(got[i]), int(want[i]))
                                              for i in differ[:4]])
+            (formed,) = bits.encode_form(minifloat).decoded(words)
+            differ = np.flatnonzero(formed != got)
+            assert differ.size == 0, (name, "form", [(hex(int(words[i])), int(formed[i]), int(got[i]))
+                                                     for i in differ[:4]])
         return stop - start
 
     sharded("every fp32 word's encode", checked, len(cases))
