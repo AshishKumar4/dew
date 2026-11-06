@@ -239,9 +239,12 @@ class RMSNorm(nn.Module):
     parts of the axis, under one weight over the whole axis, as
     `K2HorizonRMSNorm` does (modeling_k2_horizon.py:613-636).
     """
-    epsilon: float = 1e-5
+    epsilon: float | None = 1e-5
     """Llama 2's and 3's and Mistral's published `rms_norm_eps`, the decoders Dew's defaults follow
-    (`CausalTransformer.norm_eps`), where Flax's RMSNorm takes 1e-6, Qwen's, which its configs set."""
+    (`CausalTransformer.norm_eps`), where Flax's RMSNorm takes 1e-6, Qwen's, which its configs set. None
+    is the machine epsilon of the dtype its input accumulates in (at least float32, `at_least_fp32`), as
+    torch's RMSNorm(eps=None) takes it (2.8, layer_norm.cpp `rms_norm_symint`: float32's for a half,
+    bfloat16 or float32 input, float64's for a float64 one), Kimi K3's MoonViT's."""
     scale_offset: bool = False
     scale_after_cast: bool = False
     with_scale: bool = True
@@ -270,7 +273,9 @@ class RMSNorm(nn.Module):
         if self.activation is not None:
             raise ValueError("a curvature bound through an RMS norm reads its derivatives, and this norm "
                              "applies an activation after it, whose derivatives it does not bound")
-        return NormBounds(_gain_of(self, offset=self.scale_offset), self.epsilon, width // self.groups)
+        # An epsilon its input's dtype decides is at least float64's, the least it takes: the bound for it.
+        epsilon = float(jnp.finfo(jnp.float64).eps) if self.epsilon is None else self.epsilon
+        return NormBounds(_gain_of(self, offset=self.scale_offset), epsilon, width // self.groups)
 
     @nn.compact
     def seam(self, x, branch=None, *, axes=None):
@@ -278,12 +283,15 @@ class RMSNorm(nn.Module):
         `x + branch` (`x` for a None branch) and its norm, whose fused kernel
         owns the add and the stream's cotangent (`stream_rms_normalized`)."""
         dtype = self.dtype if self.dtype is not None else x.dtype
+        stream_dtype = x.dtype if branch is None else jnp.result_type(x, branch)
+        epsilon = (float(jnp.finfo(at_least_fp32(stream_dtype)).eps) if self.epsilon is None
+                   else self.epsilon)
         scale = self.param(
             'scale',
             declared(nn.initializers.zeros if self.scale_offset else nn.initializers.ones, self.scale_axes),
             (x.shape[-1],), jnp.float32) if self.with_scale else None
         if self.groups == 1:
-            return stream_rms_normalized(x, branch, scale, self.epsilon, dtype, self.scale_offset,
+            return stream_rms_normalized(x, branch, scale, epsilon, dtype, self.scale_offset,
                                          self.scale_after_cast, self.fp32_statistics,
                                          implementation=self.implementation, axes=axes,
                                          activation=self.activation)
@@ -298,7 +306,7 @@ class RMSNorm(nn.Module):
         # the groups and each group's own span none.
         stream = x if branch is None else x + branch
         _, normed = stream_rms_normalized(
-            grouped(stream), None, grouped(scale), self.epsilon, dtype, self.scale_offset,
+            grouped(stream), None, grouped(scale), epsilon, dtype, self.scale_offset,
             self.scale_after_cast, self.fp32_statistics, implementation=self.implementation,
             axes=None if axes is None else (*axes, None), activation=self.activation)
         return stream, normed.reshape(stream.shape)

@@ -109,7 +109,7 @@ def gate_flops(specs: Mapping[str, NormSpec] | None, sites, width: int, lengths,
                for site in sites if site in held and norm_gated(held[site], site, routed))
 
 
-def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
+def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float | None,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
                  dtype: Dtype | None, precision: PrecisionLike = None,
                  specs: Mapping[str, NormSpec] | None = None,
@@ -121,7 +121,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
     it runs, its gate's maps at the model's `precision`. 'layer' keeps torch's
     exact variance, the reference decoders' formula; 'fast_layer' is flax's
     E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`), whose mean and square reduce
-    in one pass, which the vision towers run."""
+    in one pass, which the vision towers run. An `epsilon` of None is an RMS
+    norm's input dtype's (`RMSNorm.epsilon`); a layer norm states its own."""
 
     def build(*, name: str) -> nn.Module:
         spec = (specs or {}).get(name, NormSpec())
@@ -135,6 +136,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                 return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, precision=precision, name=name)
             return norm(name=name)
         offset = scale_offset if spec.offset is None else spec.offset
+        if eps is None:
+            raise ValueError(f"{name}, a {kind} norm, states its epsilon; its input dtype's is an RMS norm's")
         if spec.gate_rank is not None:
             raise ValueError(f"{name}, a {kind} norm, takes no gate; a gated norm is an RMS norm's")
         if spec.groups != 1 or (offset and (kind != 'layer' or not spec.scale)):
@@ -663,7 +666,8 @@ class DecoderBlock(nn.Module):
     feedforward: Callable[..., nn.Module] | None
     emb_features: int
     wiring: BlockWiring
-    norm_eps: float = 1e-5
+    norm_eps: float | None = 1e-5
+    """None: each RMS norm's input dtype's (`RMSNorm.epsilon`)."""
     norm_type: Literal['rms', 'layer', 'fast_layer'] = 'rms'
     norm_bias: bool = False
     norms: Mapping[str, NormSpec] | None = None
