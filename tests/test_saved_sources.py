@@ -26,6 +26,29 @@ from dew.sampling.solvers import Euler
 
 
 @pytest.mark.mesh(devices=8)
+def test_an_lm_run_over_a_qwen35_release_exports_in_the_releases_layout(tmp_path, monkeypatch):
+    """`dew export` of an LM run over a Qwen3.5 release, a multimodal wrapper whose language model it
+    trains, writes the release's own layout (row 4525), where a wrapper's run was refused: read back, it is
+    the run's model with the weights the run saved, which compute the run's logits."""
+    from interop_support import assert_restores
+    from saved_run_kinds import QWEN, over
+
+    from dew.interop.pretrained import Pretrained
+    from dew.nn.multimodal import MultimodalTransformer
+
+    # The run names its source by its path in the repo, read from the checkout's root.
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    trained(over(QWEN, tmp_path, drawn=False), tmp_path, "over_qwen", trainer={"checkpoint_final": True})
+    saved = SavedRun.pinned(str(tmp_path / "runs" / "over_qwen"))
+    export_run(saved, tmp_path / "exported")
+    model = Pretrained.from_saved(saved).model
+    assert isinstance(model, MultimodalTransformer)
+    restored = Pretrained.load(tmp_path / "exported", dtype="float32",
+                               attention_impl=model.language_model.attention_impl)
+    assert_restores(model, saved.variables(), restored, np.arange(1, 9, dtype=np.int32)[None])
+
+
+@pytest.mark.mesh(devices=8)
 def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_path, monkeypatch):
     """A decision run named on the command line by a saved decision run (`--pretrained <run>`,
     `--source.step latest`) starts from the weights its export does (`dew export`):
