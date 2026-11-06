@@ -75,10 +75,16 @@ for name, lhs, rhs in (
         rhs = jnp.pad(b, ((0, 0), (0, 0), (0, max(16 - columns, 0))))
         return jnp.einsum("btd,bdf->btf", a, rhs, precision=precision)[..., :columns]
 
+    def padded_held(a, b):
+        columns = b.shape[-1]
+        rhs = jnp.pad(b, ((0, 0), (0, 0), (0, max(16 - columns, 0))))
+        result = jnp.einsum("btd,bdf->btf", a, rhs, precision=precision)
+        return jax.lax.optimization_barrier(result)[..., :columns]
+
     outputs = {}
     with summed_as_run():
         for geometry, fn in (("batch", batch), ("token", token), ("transposed", transposed),
-                             ("pad16", padded)):
+                             ("pad16", padded), ("pad16-held", padded_held)):
             for mode in ("on", "off"):
                 outputs[geometry, mode] = np.asarray(jax.jit(fn, compiler_options=(
                     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))(lhs, rhs))
@@ -89,7 +95,8 @@ for name, lhs, rhs in (
                           "squared_error": float(np.sum((output - exact) ** 2)),
                           "different_from_batch_off": int(np.sum(output != outputs["batch", "off"])),
                           "matches": {label: int(np.sum(value == output))
-                                      for label, value in alternatives.items()}}), flush=True)
+                                      for label, value in alternatives.items()
+                                      if label.startswith("1-chain")}}), flush=True)
     if name == "down":
         fed = np.asarray(jax.nn.silu(jnp.asarray(outputs["batch", "off"])))
     elif name == "up":
