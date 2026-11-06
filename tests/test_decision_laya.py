@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact, indexed_recording, recording
 from reference_runs import assert_as_exact_as_recorded
 
@@ -25,12 +24,13 @@ def cases() -> dict:
     return json.loads((FIXTURES / "cases.json").read_text())
 
 
-def rows(checkpoint: Decide, *, parallel: bool):
-    """Every question of every case, laid out by Dew, keyed as the fixture keys them."""
+def rows(checkpoint: Decide, *, parallel: bool, requests: dict | None = None):
+    """Every question of every case (of `requests`, the fixture's by default), laid out by Dew, keyed as
+    the fixture keys them."""
     # The release's layout, its budgets as it states them, in each option order.
     layout = replace(checkpoint.layout, parallel=parallel)
     name = "parallel" if parallel else "sequential"
-    for case, request in cases().items():
+    for case, request in (cases() if requests is None else requests).items():
         state = layout.state(checkpoint.tokenizer, checkpoint.specials, request["state"])
         for qid, wire in request["questions"].items():
             question = Question.from_wire(wire)
@@ -172,43 +172,89 @@ def test_padded_rows_score_as_they_do_alone():
     assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw, in_one_batch, "batched Laya logits")
 
 
+REAL_FIXTURE = FIXTURES / "real" / "seeds.npz"
+REAL_SEEDS = 8
+"""The released checkpoint's declared seeds, sized by `seeds_for` paired as the recording confirmed them
+(tools/venv_reference.py's `laya-real` site)."""
+REAL_OUTPUTS = OUTPUTS
+WORDS = ("account", "billing", "charge", "refund", "march", "payment", "rent", "today", "cancel", "issue",
+         "please", "fix", "error", "login", "password", "upgrade", "plan", "price", "invoice", "card",
+         "bank", "late", "again", "twice", "need", "help", "now", "team", "support", "reply", "order",
+         "shipping", "broken", "missing", "slow", "angry", "calm", "thanks", "week", "month", "service",
+         "contract", "renewal", "discount", "trial", "email", "phone", "address", "delivery", "package")
+"""The words a drawn request's text is made of (`drawn_requests`)."""
+
+
+def drawn_requests(seed: int) -> dict:
+    """The fixture's cases with each state's text drawn (`WORDS`, each sentence as long as the case's
+    own, give or take a quarter), every question as it is: the structure the released checkpoint's site
+    holds fixed, the values a seed draws."""
+    rng = np.random.default_rng([1557, 8, seed])
+
+    def text(written: str) -> str:
+        length = max(1, int(len(written.split()) * rng.uniform(0.75, 1.25)))
+        return " ".join(rng.choice(WORDS, length))
+
+    def state(value):
+        if isinstance(value, str):
+            return value if value == "[MASK]" else text(value)
+        if isinstance(value, list):
+            return [state(item) for item in value]
+        if isinstance(value, dict):
+            return {key: state(item) for key, item in value.items()}
+        return value
+    return {case: {**request, "state": state(request["state"])} for case, request in cases().items()}
+
+
+def REAL_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's requests (`drawn_requests`), as the JSON text the worker reads."""
+    return {"requests": np.asarray(json.dumps(drawn_requests(seed)))}
+
+
+@functools.cache
+def released() -> Decide:
+    source = json.loads((FIXTURES / "real" / "source.json").read_text())
+    return Decide.from_pretrained(source["repo"], revision=source["revision"], attention_impl="xla")
+
+
+def REAL_dew(dtype, inputs) -> dict[str, np.ndarray]:
+    """The released checkpoint's option logits at `dtype` over a draw's requests, each question alone,
+    by layout, every question's concatenated in key order: on the host, its requests text."""
+    checkpoint = released()
+    model = checkpoint.model if dtype == jnp.float32 else DecisionModel(
+        checkpoint.model.backbone.clone(dtype=dtype), checkpoint.model.head.clone(dtype=dtype))
+    variables = jax.tree.map(lambda value: jnp.asarray(value, dtype), checkpoint.variables)
+    requests = json.loads(str(inputs["requests"]))
+    found = {}
+    for layout in OUTPUTS:
+        laid = sorted(rows(checkpoint, parallel=layout == "parallel", requests=requests),
+                      key=lambda row: row[0])
+        found[layout] = np.concatenate([np.asarray(model.logits(variables, DecisionInputs.collate(
+            [encoded], checkpoint.specials.pad)))[0, 0] for _, _, encoded in laid])
+    return found
+
+
 @pytest.mark.network
 @pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"), reason="downloads the 1.7 GB English checkpoint")
 @pytest.mark.gpu(reason="XLA:CPU's fp32 dot rounds more than MKL's")
 def test_the_released_english_checkpoint_matches_laya():
-    """convaiinnovations/laya at the pinned revision against tools/laya_reference.py --real.
+    """convaiinnovations/laya at the pinned revision: its layouts token for token on the fixture's cases
+    (tools/laya_reference.py --real), and its option logits over drawn requests as exact as Laya's float32
+    run against its float64 run (check 1, tools/venv_reference.py's `laya-real` recording).
 
-    It runs on a GPU at HIGHEST precision, where Dew's RMS distance from
-    float64 measured 0.89 (sequential) and 1.25 (parallel) times Laya's on
-    the RTX 4080. On the CPU it measures 2.20 and 1.70: XLA:CPU's fp32 dot
-    accumulates with 2.3 times the RMS error of the MKL dot torch runs (a
-    [96, 1024] x [1024, 1024] product, 5.7e-7 against 2.5e-7, equal at a
-    reduction of 64), which ModernBERT-large's 1024- and 2624-long
-    reductions carry through 28 layers."""
-    source = json.loads((FIXTURES / "real" / "source.json").read_text())
-    with jax.default_matmul_precision("highest"):
-        checkpoint = Decide.from_pretrained(source["repo"], revision=source["revision"], attention_impl="xla")
-        compare_released(checkpoint)
-
-
-def logits(checkpoint: Decide, *, parallel: bool) -> dict[str, np.ndarray]:
-    """Each question's option logits, one row per question as Laya runs them."""
-    found = {}
-    for key, _, encoded in rows(checkpoint, parallel=parallel):
-        inputs = DecisionInputs.collate([encoded], checkpoint.specials.pad)
-        found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[0, 0]
-    return found
-
-
-def compare_released(checkpoint: Decide) -> None:
+    It runs on a GPU at HIGHEST precision: XLA:CPU's fp32 dot accumulates with 2.3 times the RMS error of
+    the MKL dot torch runs (a [96, 1024] x [1024, 1024] product, 5.7e-7 against 2.5e-7, equal at a
+    reduction of 64), which ModernBERT-large's 1024- and 2624-long reductions carry through 28 layers."""
+    checkpoint = released()
     expected = json.loads((FIXTURES / "real" / "layouts.json").read_text())
     for parallel in (False, True):
         for key, _, encoded in rows(checkpoint, parallel=parallel):
             assert list(encoded.tokens) == expected[key]["ids"], key
-        found = logits(checkpoint, parallel=parallel)
-        keys = sorted(found)
-        with np.load(FIXTURES / "real" / "logits.npz") as reference:
-            assert_as_exact_as_the_reference(
-                np.concatenate([found[key] for key in keys]),
-                np.concatenate([reference[key] for key in keys]),
-                np.concatenate([reference[f"{key}/f64"] for key in keys]), "released Laya logits")
+    with jax.default_matmul_precision("highest"):
+        drawn, reference, truth = indexed_recording(recording(REAL_FIXTURE), "laya-real", REAL_SEEDS,
+                                                    inputs_of=REAL_draw,
+                                                    truth_fn=lambda inputs: REAL_dew(jnp.float64, inputs))
+        assert_as_exact(as_given(lambda index, inputs: REAL_dew(jnp.float32, inputs)), reference, drawn,
+                        "released Laya logits", seeds=REAL_SEEDS, truth_fn=truth)
+
+

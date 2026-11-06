@@ -136,10 +136,10 @@ def twins(agent, directory: Path):
         agent.cfg, encoder_dir=str(encoder) if encoder.exists() else None, pretrained=False))
 
 
-def laid_logits(agent, model, exact) -> tuple[dict, dict]:
+def laid_logits(agent, model, exact, cases: dict | None = None) -> tuple[dict, dict]:
     """Every case's layouts and its option logits under `model` in fp32 and `exact` in float64, keyed
     `<layout>/<case>/<id>` (the float64 ones `/f64`), each question laid out as `Agent` lays it out, in
-    the sequential and the parallel layout."""
+    the sequential and the parallel layout: of `cases`, CASES by default."""
     from torch_precision import float64
 
     agent_module, common = _laya()
@@ -147,7 +147,7 @@ def laid_logits(agent, model, exact) -> tuple[dict, dict]:
     layouts, logits = {}, {}
     for parallel in (False, True):
         name = "parallel" if parallel else "sequential"
-        for case, request in CASES.items():
+        for case, request in (CASES if cases is None else cases).items():
             state = request["state"]
             state_ids = tokenizer(common.serialize_state(state).replace(tokenizer.mask_token, " "),
                                   add_special_tokens=False)["input_ids"]

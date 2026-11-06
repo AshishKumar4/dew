@@ -9,20 +9,58 @@ tiny checkpoint's encoder, tokenizer and config (tests/fixtures/laya/tiny) give 
 case's `<case>.reference.<layout>` and `<case>.truth.<layout>`, every question's option logits of every
 request in tools/laya_reference.py's CASES, laid out as Laya's `Agent` lays them out, concatenated in key
 order (`<layout>/<case>/<id>`), for the `sequential` and the `parallel` layout, in float32 and float64.
+
+SITE `laya-real` is the released English checkpoint (tools/laya_reference.py's LAYA_REPO at
+LAYA_REVISION), its weights as released, over drawn requests: IN holds each case's `<case>.requests`, a
+JSON string of requests in CASES' structure (tests/test_decision_laya.py's `drawn_requests`), which the
+worker lays out as `Agent` does; OUT as `laya`'s.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from laya_reference import FIXTURES, _laya, laid_logits, twins
+from laya_reference import FIXTURES, LAYA_REPO, LAYA_REVISION, _laya, laid_logits, twins
 from reference_worker import serve
 
 TINY = FIXTURES / "tiny"
 LAYOUTS = ("sequential", "parallel")
+
+
+def by_layout(logits: dict) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Each layout's logits in float32 and float64, every question's concatenated in key order."""
+    held = {}
+    for layout in LAYOUTS:
+        keys = sorted(key for key in logits if key.startswith(f"{layout}/") and not key.endswith("/f64"))
+        held[layout] = (np.concatenate([logits[key] for key in keys]),
+                        np.concatenate([logits[f"{key}/f64"] for key in keys]))
+    return held
+
+
+def released():
+    """The released checkpoint's `Agent` and its directory, read from the Hub at its revision."""
+    from huggingface_hub import snapshot_download
+
+    agent_module, _ = _laya()
+    directory = Path(snapshot_download(LAYA_REPO, revision=LAYA_REVISION, allow_patterns=[
+        "model.safetensors", "encoder/*", "tokenizer/*", "rl_agent_config.json"]))
+    return agent_module.Agent(str(directory), device="cpu"), directory
+
+
+def run_released(agent, directory: Path, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Every case's logits by layout over its drawn requests, under the released weights."""
+    model, exact = twins(agent, directory)
+    out = {}
+    for name in sorted({key.split(".", 1)[0] for key in cases}):
+        requests = json.loads(str(cases[f"{name}.requests"]))
+        _, logits = laid_logits(agent, model, exact, requests)
+        for layout, (single, wide) in by_layout(logits).items():
+            out[f"{name}.reference.{layout}"], out[f"{name}.truth.{layout}"] = single, wide
+    return out
 
 
 def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -40,15 +78,17 @@ def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         if unexpected or {name for name in missing if not name.startswith(("act_head.", "temperature"))}:
             raise ValueError(f"the drawn weights do not fit Laya's model: {missing}, {unexpected}")
         _, logits = laid_logits(agent, *twins(agent, Path(TINY)))
-        for layout in LAYOUTS:
-            keys = sorted(key for key in logits if key.startswith(f"{layout}/") and not key.endswith("/f64"))
-            out[f"{name}.reference.{layout}"] = np.concatenate([logits[key] for key in keys])
-            out[f"{name}.truth.{layout}"] = np.concatenate([logits[f"{key}/f64"] for key in keys])
+        for layout, (single, wide) in by_layout(logits).items():
+            out[f"{name}.reference.{layout}"], out[f"{name}.truth.{layout}"] = single, wide
     return out
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] != ["laya"]:
+    if sys.argv[1:] == ["laya"]:
+        torch.set_num_threads(1)
+        serve(run)
+    elif sys.argv[1:] == ["laya-real"]:
+        loaded = released()
+        serve(lambda cases: run_released(*loaded, cases))
+    else:
         raise SystemExit(__doc__)
-    torch.set_num_threads(1)
-    serve(run)

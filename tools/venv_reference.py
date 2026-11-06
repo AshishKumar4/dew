@@ -34,6 +34,11 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          "laya": {"test": "test_decision_laya", "worker": "laya_worker.py",
                   "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c",
                   "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
+         "laya-real": {"test": "test_decision_laya", "worker": "laya_worker.py", "prefix": "REAL_",
+                       "host": True,
+                       "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c on "
+                                    "convaiinnovations/laya 7b928d828b7b0e022f929d9bd2e44165aa270148",
+                       "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
          "kimi-k3": {"test": "test_kimi_k3", "worker": "kimi_worker.py", "device": "cuda",
                      "reference": "moonshotai/Kimi-K3 f831ab66814297da540d832a5235f8e904f29d06",
                      "license": "other (kimi-k3)", "distribution": ("fla-core", "0.5.2")},
@@ -41,9 +46,11 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                          "reference": "moonshotai/Kimi-Linear-48B-A3B-Instruct "
                                       "e1df551a447157d4658b573f9a695d57658590e9",
                          "license": "MIT", "distribution": ("fla-core", "0.4.0")}}
-"""Each site's test module (its `FIXTURE`, `draw`, `dew` and `OUTPUTS`), worker and reference, the
-distribution and version its environment must hold, where the reference is one, and the device its
-worker's float32 run takes, the CPU unless named."""
+"""Each site's test module (its `FIXTURE`, `draw`, `dew` and `OUTPUTS`, each named with the site's
+`prefix` where it shares its module with another site, `REAL_FIXTURE`), worker and reference, the
+distribution and version its environment must hold, where the reference is one, the device its worker's
+float32 run takes, the CPU unless named, and `host` where its `dew` runs on the host as given (inputs a
+traced program cannot read, a request's text)."""
 
 
 def main() -> None:
@@ -54,6 +61,9 @@ def main() -> None:
     site, python = sys.argv[1], sys.argv[2]
     known = SITES[site]
     test = importlib.import_module(known["test"])
+    prefix = known.get("prefix", "")
+    fixture, draw, run, outputs = (getattr(test, f"{prefix}{name}")
+                                   for name in ("FIXTURE", "draw", "dew", "OUTPUTS"))
     if "distribution" in known:
         name, wanted = known["distribution"]
         held = subprocess.run([python, "-c", f"import importlib.metadata as m; print(m.version({name!r}))"],
@@ -74,14 +84,15 @@ def main() -> None:
         if worker.stdout.readline().strip() != "done":
             raise RuntimeError(f"{site}'s worker stopped")
         with np.load(out) as answered:
-            return tuple({leaf: answered[f"case.{kind}.{leaf}"] for leaf in test.OUTPUTS}
+            return tuple({leaf: answered[f"case.{kind}.{leaf}"] for leaf in outputs}
                          for kind in ("reference", "truth"))
 
-    dew = jax.jit(lambda inputs: test.dew(jnp.float32, inputs))
-    arrays = record_case(site, test.draw, evaluate, store_inputs=False, summary=True, dew=dew)
+    dew = ((lambda inputs: run(jnp.float32, inputs)) if known.get("host")
+           else jax.jit(lambda inputs: run(jnp.float32, inputs)))
+    arrays = record_case(site, draw, evaluate, store_inputs=False, summary=True, dew=dew)
     worker.stdin.close()
     worker.wait()
-    written = save(test.FIXTURE, {**arrays, "provenance": provenance(
+    written = save(fixture, {**arrays, "provenance": provenance(
         known["reference"], "", known.get("device", "cpu"),
         f"python tools/venv_reference.py {site} PYTHON{' SOURCE' if len(sys.argv) > 3 else ''}")},
         reference=known["reference"], license=known["license"])
