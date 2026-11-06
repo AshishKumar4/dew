@@ -248,8 +248,7 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     with np.load(source / "flux_transformer.npz") as arrays:
         grid = pipeline_record["size"] // 4
-        packed = np.asarray(arrays["pipeline.x_T"])
-        latent = jnp.asarray(unpacked(packed, grid, grid))
+        latent = jnp.asarray(unpacked(np.asarray(arrays["pipeline.x_T"]), grid, grid))
         condition = DenoisingCondition(
             jnp.asarray(arrays["pipeline.context"]), jnp.asarray(arrays["pipeline.pooled"]),
             guidance=jnp.full((2,), pipeline_record["default_guidance"], jnp.float32))
