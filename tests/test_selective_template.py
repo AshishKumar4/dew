@@ -144,7 +144,7 @@ def test_the_template_with_owned_partials_is_as_exact_as_the_portable_scan_inter
     """`the_template_is_as_exact_as_the_portable_scan` over packed documents where the backward's programs
     own their partial sums and walk their channels in turn (`Scan.owned`, a run asking its reductions
     ordered)."""
-    monkeypatch.setattr(selective, "deterministic_ops_requested", lambda: True)
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true")
     the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
 
 
@@ -155,7 +155,7 @@ def test_the_backward_repeats_its_state_gradients_bit_for_bit_where_reductions_a
     and C's gradients bit for bit the same over repeated runs of one compiled step, the step's other
     gradients too. With every channel adding atomically, the channels sharing a buffer added in whatever
     order their programs ran (row 4392)."""
-    monkeypatch.setattr(selective, "deterministic_ops_requested", lambda: True)
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true")
     shape = (1, 256, 512, 16)
     family = bundles.of(generation.device_generation(), jnp.float32)
     template = functools.partial(selective.selective_scan, family=family)
