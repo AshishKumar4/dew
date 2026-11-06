@@ -142,7 +142,7 @@ application's root handlers instead, remove Dew's handler and set
 | Tracker | Writes | Install |
 |---|---|---|
 | `LocalTracker(path)` | JSONL journals of scalars and typed records, written synchronously, plus preview files. | |
-| `WandbTracker` | Weights & Biases; `offline=True` opens no online session. | `dewml[wandb]` |
+| `WandbTracker` | Weights & Biases; `offline=True` opens no online session, and `shared=True` opens a run other processes write into too, each with `primary=False`, the run's `id` and a `label` of its own. | `dewml[wandb]` |
 | `MLflowTracker(experiment, name, uri=store)` | One MLflow run through `MlflowClient`. | `dewml[mlflow]` |
 | `TensorBoardTracker(path)` | One event file through TensorBoard's own `EventFileWriter`, without TensorFlow. | `dewml[tensorboard]` |
 | `Trackers(*trackers)` | Every tracker receives each report even if another fails; the first failure is raised. | |
