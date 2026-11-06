@@ -13,36 +13,41 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 
-from flax.traverse_util import flatten_dict
-
 from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import (
+    ROPE_APART,
+    DecoderSpelling,
+    decoder_layout,
+    flag,
+    integer,
+    partial_rope_part,
+    single_depth,
+)
 from dew.interop.decoder_parts import (
-    PLAIN_SPELLING,
+    DECODER_ROUTES,
+    DEEPSEEK_ROUTES,
     DecoderFamily,
     DecoderFields,
     KindFields,
     MixtureFields,
-    Ropes,
-    base_config,
-    check_decoder_tree,
     fixed_fields,
-    hf_tensor_name,
     kind_mixers,
     layer_depth,
-    layer_depth_path,
-    layout_tensors,
-    leaf_layouts,
-    read_partial_rope,
+    layer_depth_routes,
     record_float,
     record_int,
     refuse,
+    refuse_export,
     specified_layer_types,
-    translated,
 )
-from dew.interop.families.deepseek import LAYOUT_FIELDS, deepseek_config, deepseek_mixture
-from dew.interop.families.qwen import single_prediction_depth
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.families.deepseek import (
+    LAYOUT_FIELDS,
+    deepseek_layout_of,
+    deepseek_mixture,
+    deepseek_moe_export,
+)
+from dew.interop.layouts import ConfigLayout, ConfigPart, Copy, Route, Table, constant
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
@@ -65,6 +70,7 @@ def _glm5_refusals(hf_config: Mapping[str, object], used: set[str], layers: int)
             refuse(name, f'GLM-5.3-Flash requires {expected!r}')
     if hf_config.get('qk_head_dim', hf_config['qk_nope_head_dim']) != hf_config['qk_nope_head_dim']:
         refuse('qk_head_dim', 'NoPE uses qk_nope_head_dim alone')
+    used.add('num_key_value_heads')
     kv_heads = hf_config.get('num_key_value_heads')
     if kv_heads is not None and kv_heads != hf_config['num_attention_heads']:
         refuse('num_key_value_heads', 'the reference requires one KV head per query head')
@@ -130,8 +136,24 @@ def _glm5_mixture(hf_config: Mapping[str, object], used: set[str],
     return deepseek_mixture(hf_config, layers, used, sparse_layers=routed, reads_norm_topk=True), routed
 
 
-def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a GLM-5.3-Flash text config into `CausalTransformer` fields.
+def _glm5_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
+    """A GLM-5.3-Flash config's layers: linear attention, and its k-pool sparse attention as full."""
+    layers = record_int(hf_config, 'num_hidden_layers')
+    types = specified_layer_types(hf_config, used, ('linear_attention',) * 3 + ('deepseek_sparse_attention',))
+    types = tuple('full_attention' if kind == 'deepseek_sparse_attention' else kind for kind in types)
+    if len(types) != layers or set(types) - {'linear_attention', 'full_attention'}:
+        refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
+    return types
+
+
+def _glm5_pattern(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    record['layer_types'] = _glm5_types(hf_config, used)
+    return record
+
+
+def _glm5_next_config(hf_config: Mapping[str, object], used: set[str],
+                      config: DecoderFields) -> DecoderFields:
+    """Read a GLM-5.3-Flash text config's own fields beside the shared decoder's (`GLM5_NEXT_CONFIG`).
 
     The block is NoPE pooled MLA, KDA and mHC
     (modeling_glm5_next.py:1259-1329). The reader builds four things from the
@@ -141,10 +163,7 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     than dropped.
     """
     layers = record_int(hf_config, 'num_hidden_layers')
-    types = specified_layer_types(hf_config, used, ('linear_attention',) * 3 + ('deepseek_sparse_attention',))
-    types = tuple('full_attention' if kind == 'deepseek_sparse_attention' else kind for kind in types)
-    if len(types) != layers or set(types) - {'linear_attention', 'full_attention'}:
-        refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
+    types = _glm5_types(hf_config, used)
     _glm5_refusals(hf_config, used, layers)
     linear = _glm5_linear_fields(hf_config, types)
     sparse_fields = ('q_lora_rank', 'kv_lora_rank', 'qk_nope_head_dim', 'v_head_dim',
@@ -152,9 +171,7 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     sparse = {name: record_int(hf_config, name) for name in sparse_fields}
     if sparse['index_kpool'] < 1 or sparse['index_topk'] % sparse['index_kpool']:
         refuse('index_topk / index_kpool', 'the budget must contain whole positive-sized pools')
-    config = base_config({**hf_config, 'layer_types': types, 'head_dim': sparse['qk_nope_head_dim'],
-                          'num_key_value_heads': hf_config['num_attention_heads']},
-                          used, rope=Ropes(10000.0))
+    config['rope_theta'] = 10000.0
     kinds: dict[str, KindFields] = {}
     if 'linear_attention' in types:
         kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
@@ -173,7 +190,6 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
             hc_sinkhorn_iters=record_int(hf_config, "hc_sinkhorn_iters"), head="mean"),
         swiglu_limit=record_float(hf_config, "swiglu_limit"),
         index_share_for_mtp_iteration=bool(hf_config.get("index_share_for_mtp_iteration", False)),
-        num_nextn_predict_layers=single_prediction_depth(hf_config, used, "num_nextn_predict_layers"),
     )
     # Native NextN uses normalized trunk states and a plain NoPE depth, not
     # trunk mHC (SGLang 97c6978 deepseek_nextn.py:177-187,247-298). The
@@ -202,16 +218,16 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
                  'GLM5 requires {0!r}')
     hc = model.hyper_connections
     if hc is None or hc.head != 'mean':
-        refuse('hyper_connections', 'GLM5 contracts mHC streams by their unweighted mean')
+        refuse_export('hyper_connections', 'GLM5 contracts mHC streams by their unweighted mean')
     if model.sharing_layers:
-        refuse('kv_shared_layers', 'the supported GLM5 layout owns an indexer per sparse layer')
+        refuse_export('kv_shared_layers', 'the supported GLM5 layout owns an indexer per sparse layer')
     if model.num_nextn_predict_layers not in (0, 1):
-        refuse('num_nextn_predict_layers', 'GLM5 has zero or one plain prediction depth')
+        refuse_export('num_nextn_predict_layers', 'GLM5 has zero or one plain prediction depth')
     if model.swiglu_limit is None:
-        refuse('swiglu_limit', 'GLM5 clamps both dense and routed SwiGLU branches')
+        refuse_export('swiglu_limit', 'GLM5 clamps both dense and routed SwiGLU branches')
     types = model.per_layer_types
     if len(types) != model.num_layers or set(types) - {'linear_attention', 'full_attention'}:
-        refuse('layer_types', 'GLM5 uses linear and NoPE sparse attention')
+        refuse_export('layer_types', 'GLM5 uses linear and NoPE sparse attention')
     linear, sparse = KimiDeltaAttentionMixer(), KPoolSparseAttentionMixer()
     for kind_name in set(types):
         mixer = model.kind_of(kind_name).mixer or model.mixer
@@ -220,7 +236,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         elif kind_name == 'full_attention' and isinstance(mixer, KPoolSparseAttentionMixer):
             sparse = mixer
         else:
-            refuse(f'kinds.{kind_name}.mixer', 'GLM5 requires KDA or k-pool attention respectively')
+            refuse_export(f'kinds.{kind_name}.mixer', 'GLM5 requires KDA or k-pool attention respectively')
     mixture = model.mixture
     routed = model.sparse_layers
     fields: dict[str, object] = {
@@ -231,7 +247,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         'rope_theta': None, 'rope_scaling': None, 'rope_parameters': None,
         'mhc': True, 'mla_use_nope': True, 'index_kpool_compress': True,
         'hc_mult': hc.hc_mult, 'hc_eps': hc.hc_eps, 'hc_sinkhorn_iters': hc.hc_sinkhorn_iters,
-        'swiglu_limit': model.swiglu_limit, 'num_nextn_predict_layers': model.num_nextn_predict_layers,
+        'swiglu_limit': model.swiglu_limit,
         'indexer_types': ['full'] * model.num_layers,
         'index_share_for_mtp_iteration': model.index_share_for_mtp_iteration,
         'linear_attn_config': {
@@ -245,109 +261,42 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
     }
     if mixture is not None:
         width = mixture.expert_features or model.hidden_features
-        if mixture.shared_features < width or mixture.shared_features % width:
-            refuse(
-                "mixture.shared_features", "GLM5 needs an integral positive count of shared expert widths"
-            )
-        fields.update(
-            n_routed_experts=mixture.experts,
-            num_experts_per_tok=mixture.top_k,
-            moe_intermediate_size=width,
-            n_shared_experts=mixture.shared_features // width,
-            routed_scaling_factor=mixture.scaling,
-            n_group=mixture.groups,
-            topk_group=mixture.groups_per_token,
-            norm_topk_prob=mixture.norm_topk_prob,
-            scoring_func="sigmoid",
-            topk_method="noaux_tc",
-            moe_router_dtype="float32",
-        )
+        if mixture.shared_features < width:
+            refuse_export("mixture.shared_features", "GLM5 needs a positive count of shared expert widths")
+        fields.update(deepseek_moe_export(model, scheduled=False), moe_router_dtype="float32")
     return fields
 
 
-def _glm5_next_names(path: tuple[str, ...], config: Mapping[str, object],
-                     fields: DecoderFields) -> str | tuple[str, ...]:
-    """The source name of the leaf at `path`, its collection first, or of each
-    expert's slice of a stacked expert kernel, refused unless the load reads
-    it back into that leaf (`layer_depth_path`).
-
-    Prediction depth d is layer `num_layers + d`, its block's leaves named as
-    a trunk layer's and its final norm as `shared_head.norm`. mHC's site
-    tensors are `hc_{site}_{leaf}`.
-    """
-    def checked(name: str | None, leaf: tuple[str, ...]) -> str:
-        if name is None or layer_depth_path(name, fields) != leaf:
-            refuse('.'.join(path), 'the source has no matching persistent leaf')
-        return name
-
-    head, *tail = path[1:]
-    if head.startswith('layers_'):
-        prefix = f"model.layers.{int(head.removeprefix('layers_'))}."
-    elif head.startswith('mtp_'):
-        layer = _records.integer(fields['num_layers'], 'num_layers') + int(head.removeprefix('mtp_'))
-        prefix = f'model.layers.{layer}.'
-        tail = tail[1:] if tail[0] == 'block' else tail
-        if tail == ['final_norm', 'scale']:
-            tail = ['shared_head', 'norm', 'scale']
-    else:
-        return checked(hf_tensor_name('.'.join(path[1:]), config), path)
-    if len(tail) == 4 and tail[:2] == ['mlp', 'experts'] and tail[3] == 'kernel':
-        return tuple(checked(f'{prefix}mlp.experts.{expert}.{tail[2]}.weight',
-                             (*path[:-2], str(expert), *path[-2:]))
-                     for expert in range(_records.integer(config['n_routed_experts'], 'n_routed_experts')))
-    if len(tail) == 2 and tail[0] in ('attn_hc', 'ffn_hc'):
-        return checked(f"{prefix}hc_{tail[0].removesuffix('_hc')}_{tail[1]}", path)
-    ending = 'weight' if tail[-1] in ('kernel', 'scale') else tail[-1]
-    return checked(prefix + '.'.join([*tail[:-1], ending]), path)
+GLM5_NEXT_ROUTES = Table(
+    # Its depths hold no copies of the trunk's embedding and head (`Glm5NextMTP`'s state dict).
+    layer_depth_routes(DECODER_ROUTES, copies=False),
+    # transformers 5.16.1 ties the head only in the multimodal wrapper (modeling_glm5_next.py:2068), so a
+    # reader of the text model alone takes it from its own tensor: a tied export writes it too.
+    Copy(Route('lm_head.weight', 'params/embed_tokens/embedding', when=lambda config, slots: bool(
+        config['tie_embeddings']))))
+"""GLM-5 Next's names: DeepSeek-V3's, prediction depth d stored as layer `num_layers + d`, its block's
+leaves named as a trunk layer's and its final norm as `shared_head.norm`, and mHC's site tensors
+`hc_{site}_{leaf}`."""
 
 
-def _glm5_next_export_weights(family: DecoderFamily, model: CausalTransformer,
-                              variables: Mapping[str, object], config: Mapping[str, object]) -> LazyTensors:
-    """Write every collection but the decode cache under `_glm5_next_names`.
-
-    The collections are first held to the model's own (`check_decoder_tree`),
-    so a leaf the model does not declare is refused rather than dropped.
-    """
-    persistent = {name: tree for name, tree in variables.items() if name != 'cache'}
-    check_decoder_tree(persistent, model)
-    fields = translated(config, family)
-    layouts = leaf_layouts(flatten_dict(persistent), lambda path: _glm5_next_names(path, config, fields))
-    if model.tie_embeddings:
-        # transformers 5.16.1 ties the head only in the multimodal wrapper
-        # (modeling_glm5_next.py:2068), so a reader of the text model alone
-        # takes it from its own tensor.
-        layouts['lm_head.weight'] = dataclasses.replace(layouts['model.embed_tokens.weight'],
-                                                        name='lm_head.weight')
-    return layout_tensors(layouts, persistent)
+def _glm_experts(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    layers = _records.integer(record['num_layers'], 'num_layers')
+    record['mixture'] = deepseek_mixture(hf_config, layers, used)
+    return record
 
 
-def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a glm4_moe config into `CausalTransformer` fields.
-
-    GLM 4.5 and 5 bias q/k/v over a bias-free o_proj and rotate half the head
-    in the 'default' convention. Routing is DeepSeek V3's, with the shared
-    experts and the dense first layers. The MTP depths are the checkpoint's.
-    """
-    # The released configs spell the rotary flat (rope_theta beside
-    # partial_rotary_factor); a config transformers wrote nests both under
-    # rope_parameters. Glm4MoeRotaryEmbedding builds any rope_type over the
-    # rotated half (modeling_glm4_moe.py:55-59), YaRN among them, and
-    # Glm4MoeConfig sets an absent factor to half the head (configuration_glm4_moe.py:123).
-    ropes, factor = read_partial_rope(hf_config, used, PLAIN_SPELLING, default_factor=0.5)
-    used.update(('use_qk_norm', 'num_nextn_predict_layers'))
-    config = base_config(hf_config, used, rope=ropes,
-                          qk_norm=bool(hf_config.get('use_qk_norm', False)))
-    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    config.update(
-        o_proj_bias=False,
-        partial_rotary_factor=None if factor == 1.0 else factor,
-        partial_rotary_type="default",
-        mixture=deepseek_mixture(hf_config, layers, used),
-        num_nextn_predict_layers=_records.integer(
-            hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
-        ),
-    )
-    return config
+GLM4_MOE_CONFIG = ConfigLayout(
+    # The released configs spell the rotary flat (rope_theta beside partial_rotary_factor); a config
+    # transformers wrote nests both under rope_parameters. Glm4MoeRotaryEmbedding builds any rope_type
+    # over the rotated half (modeling_glm4_moe.py:55-59), YaRN among them, and Glm4MoeConfig sets an
+    # absent factor to half the head (configuration_glm4_moe.py:123).
+    decoder_layout(rope=partial_rope_part(default_factor=0.5, whole_is_none=True)),
+    flag('use_qk_norm', 'qk_norm', default=False), constant('o_proj_bias', value=False),
+    # Routing is DeepSeek V3's, with the shared experts and the dense first layers.
+    ConfigPart(_glm_experts, deepseek_moe_export),
+    integer('num_nextn_predict_layers', 'num_nextn_predict_layers', 0))
+"""GLM 4.5's and 5's MoE config, both ways: q/k/v biased over a bias-free o_proj, half the head rotated in
+the 'default' convention, DeepSeek V3's routing, and the checkpoint's MTP depths."""
 
 
 def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[str]) -> tuple[str, ...]:
@@ -392,8 +341,9 @@ def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[s
     return tuple(types)
 
 
-def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a glm_moe_dsa config into `CausalTransformer` fields.
+def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str],
+                        config: DecoderFields) -> DecoderFields:
+    """Read a glm_moe_dsa config's own fields beside DeepSeek V3.2's (`GLM_MOE_DSA_CONFIG`).
 
     GLM-5, 5.1, 5.2 and 5.3 are DeepSeek V3.2's sparse MLA block under GLM's
     choices. The indexer rotates interleaved pairs like the main rope head
@@ -402,10 +352,6 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     ships past num_hidden_layers as GLM 4.5's does.
     """
     layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    # GlmMoeDsaConfig.__post_init__:152 points head_dim at the rope slice
-    # whatever the config says (GLM-5.2 ships 192 over a rope width of 64),
-    # so the field describes nothing the reference computes.
-    config = deepseek_config({**hf_config, 'head_dim': None}, used, sparse=True)
     used.add('head_dim')
     # The indexer's rotation is not a dial: GlmMoeDsaIndexer.forward always
     # interleaves, and a flag saying otherwise describes no model the
@@ -427,24 +373,45 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
                                                          'index_rope_interleave': True}}
     if shared:
         config['kv_shared_layers'] = shared
-    config["num_nextn_predict_layers"] = _records.integer(
-        hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
-    )
     return config
+
+
+def _indexer_types(model: CausalTransformer) -> Mapping[str, object]:
+    """Each layer's indexer as a full one or one sharing the previous full layer's (its kv-shared layers)."""
+    shared = set(model.kv_shared_layers or ())
+    return {'indexer_types': ['shared' if index in shared else 'full' for index in range(model.num_layers)]}
+
+
+GLM_MOE_DSA_CONFIG = ConfigLayout(
+    # GlmMoeDsaConfig.__post_init__:152 points head_dim at the rope slice whatever the config says
+    # (GLM-5.2 ships 192 over a rope width of 64), so the field describes nothing the reference computes.
+    deepseek_layout_of(sparse=True, points_head_dim=False),
+    ConfigPart(_glm_moe_dsa_config, _indexer_types))
+"""GLM-5's to 5.3's MoE DSA config, both ways: DeepSeek V3.2's sparse MLA block under GLM's choices."""
+
+
+GLM5_NEXT_CONFIG = ConfigLayout(
+    ConfigPart(_glm5_pattern, lambda model: {}), single_depth('num_nextn_predict_layers'),
+    # Its heads are as wide as its NoPE latent's, and each attends its own key/value head; it rotates
+    # nothing (`_glm5_next_config` states the base the reference never turns).
+    decoder_layout(DecoderSpelling(reads=frozenset({'sliding_window', 'attention_bias'}),
+                                   keys={'head_dim': 'qk_nope_head_dim',
+                                         'num_key_value_heads': 'num_attention_heads'}),
+                   rope=ROPE_APART),
+    ConfigPart(_glm5_next_config, _glm5_next_export))
+"""GLM-5.3-Flash's text config, both ways."""
 
 
 GLM5_NEXT_TEXT = DecoderFamily(
     ('glm5_next_text',),
-    _glm5_next_config,
+    GLM5_NEXT_CONFIG,
     lambda fields: any(
         isinstance(mixer, (KimiDeltaAttentionMixer, KPoolSparseAttentionMixer))
         for mixer in kind_mixers(fields)
     ),
     'glm5_next_text',
     'Glm5NextTextForCausalLM',
-    _glm5_next_export,
-    weight_path=layer_depth_path, prediction_depth=layer_depth,
-    export_weights=_glm5_next_export_weights,
+    routes=GLM5_NEXT_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # The config class's norm epsilon.
     defaults={'rms_norm_eps': 1e-5, 'pad_token_id': 154820},
@@ -453,7 +420,7 @@ GLM5_NEXT_TEXT = DecoderFamily(
 
 GLM4_MOE = DecoderFamily(
     ('glm4_moe',),
-    _glm4_moe_config,
+    GLM4_MOE_CONFIG,
     lambda fields: (
         fields.partial_rotary_type == 'default'
         and (mixture := fields.mixture) is not None
@@ -461,8 +428,7 @@ GLM4_MOE = DecoderFamily(
     ),
     'glm4_moe',
     'Glm4MoeForCausalLM',
-    lambda model: {},
-    weight_path=layer_depth_path, prediction_depth=layer_depth,
+    routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # Glm4MoeConfig's defaults for the fields its decoder reads.
     defaults={'rms_norm_eps': 1e-5, 'num_key_value_heads': 8, 'max_position_embeddings': 131072,
@@ -475,7 +441,7 @@ GLM4_MOE = DecoderFamily(
 # pairs, which no DeepSeek release does, so that field names the family.
 GLM_MOE_DSA = DecoderFamily(
     ('glm_moe_dsa',),
-    _glm_moe_dsa_config,
+    GLM_MOE_DSA_CONFIG,
     lambda fields: (
         isinstance(mixer := fields.mixer, MLAMixer)
         and mixer.index_topk is not None
@@ -483,9 +449,9 @@ GLM_MOE_DSA = DecoderFamily(
     ),
     'glm_moe_dsa',
     'GlmMoeDsaForCausalLM',
-    lambda model: {},
-    weight_path=layer_depth_path, prediction_depth=layer_depth,
+    routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
+    export_nulls=('q_lora_rank',),
     # The config class's norm epsilon.
     defaults={'max_position_embeddings': 202752, 'rms_norm_eps': 1e-5},
     padding_idx=True,

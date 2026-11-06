@@ -427,14 +427,28 @@ _BESIDE_THE_TEXT_TOWER = ("vision_model.", "visual_projection.", "text_projectio
 def _encoder_layer_path(parts, root: str, norms: Mapping[str, str] = _NORMS,
                         projections: Mapping[str, str] = _PROJECTIONS, *,
                         block: str = "layers") -> tuple[str, ...] | None:
-    """`<root>.layers.N...` into the path of a `clip_layer` (`block_tensor_path`): two layer norms,
-    biased attention maps and a biased fc1/fc2 MLP, each source name mapped by `norms` or
-    `projections` (CLIP's by default) or onto the MLP's up and down maps."""
-    from dew.nn.vision.common import block_tensor_path
+    """`<root>.layers.N...` into the path of a `clip_layer` (`encoder_layer_routes`), None for any other
+    name, which the family reads or refuses."""
+    found = encoder_layer_routes(root, norms, projections, block=block).read(".".join(parts), {})
+    return None if found is None or found.path is None else found.path[1:]
 
-    maps = {**{("self_attn", source): ("self_attn", name) for source, name in projections.items()},
+
+def encoder_layer_routes(root: str, norms: Mapping[str, str] = _NORMS,
+                         projections: Mapping[str, str] = _PROJECTIONS, *, block: str = "layers"):
+    """A `clip_layer`'s names under `<root>.layers.N` both ways (`dew.nn.vision.common.block_routes`):
+    two layer norms, biased attention maps and a biased fc1/fc2 MLP, each source name mapped by `norms`
+    or `projections` (CLIP's by default) or onto the MLP's up and down maps."""
+    return _encoder_layer_routes(root, tuple(norms.items()), tuple(projections.items()), block)
+
+
+@functools.cache
+def _encoder_layer_routes(root: str, norms: tuple[tuple[str, str], ...],
+                          projections: tuple[tuple[str, str], ...], block: str):
+    from dew.nn.vision.common import block_routes
+
+    maps = {**{("self_attn", source): ("self_attn", name) for source, name in projections},
             **{("mlp", source): ("mlp", name) for source, name in _MLP.items()}}
-    return block_tensor_path(parts, maps, prefix=f"{root}.layers", block=block, norms=norms)
+    return block_routes(maps, prefix=f"{root}.layers", block=block, norms=dict(norms))
 
 
 def _tower_path(hf_name: str, prefix: str,
