@@ -30,6 +30,7 @@ from dew.decision import (
     Temperatures,
 )
 from dew.decision.calibration import softmax
+from dew.decision.laya import LAYA_OPTION_LAYOUTS, LAYA_REQUIRED
 from dew.decision.metrics import Answered
 from dew.decision.task import Finalists, Knockout, decoded_images, trained_tree
 
@@ -645,6 +646,8 @@ def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     # eleven options and more is written as the 0.5 both answer with.
     agent = json.loads((tmp_path / "rl_agent_config.json").read_text())
     published = json.loads((TINY / "rl_agent_config.json").read_text())
+    # What Laya's agent reads it by: every key it requires, an option layout of its own (row 4599).
+    assert set(LAYA_REQUIRED) <= set(agent) and agent["option_layout"] == "sequential"
     assert agent["temperature"] == published["temperature"]
     assert agent["head_layers"] == published["head_layers"]
     assert agent["temperature_by_options"] == {**published["temperature_by_options"], "choice:11+": 0.5}
@@ -746,6 +749,8 @@ def test_a_released_checkpoint_states_the_layout_its_task_was_trained_with(decid
         assert again.layout == layout, chosen
         stated = json.loads((tmp_path / str(number) / "rl_agent_config.json").read_text())
         assert stated["max_len"] == layout.max_len and stated["option_tokens"] == layout.option_tokens
+        # Laya's readers refuse a layout they would lay out otherwise (row 4599).
+        assert stated["option_layout"] not in LAYA_OPTION_LAYOUTS
     (tmp_path / "0" / "dew_release.json").unlink()
     assert Decide.from_pretrained(tmp_path / "0", attention_impl="xla").layout == MarkerLayout(
         max_len=decide.layout.max_len, head_max_len=decide.layout.head_max_len,
@@ -762,6 +767,9 @@ def test_a_released_checkpoint_states_the_calibration_laya_cannot(decide, tmp_pa
     gated = replace(gated, calibration=replace(gated.calibration, binning=Binning(
         {"choice:3-5": (0.1, 0.5, 0.9), "choice:2": (0.2, 0.8)})))
     gated.save_pretrained(tmp_path)
+    # Laya's readers refuse a calibration they would answer otherwise by (row 4599).
+    stated = json.loads((tmp_path / "rl_agent_config.json").read_text())
+    assert stated["option_layout"] not in LAYA_OPTION_LAYOUTS
     again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=gated.name)
     assert again.calibration.abstention == gated.calibration.abstention
     assert again.calibration.binning == gated.calibration.binning
