@@ -660,9 +660,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             # (`resources.CONTROL_REGISTERS`), else the staged rows above them (FS-K01 model2: 144 at 64 a
             # thread over stages 2-5, 208 at 96). A family whose products read registers holds each step's
             # fragments beside both (mma.sync's, one step's product at a time: 201 at its 128 x 128 forward
-            # tile, NSDBG-5).
-            held = plain + (accumulator if family.operands_in_registers else 0)
-            return max(2 * accumulator + resources.CONTROL_REGISTERS, held + max(phases))
+            # tile, NSDBG-5). A step's product is held apart `summed_columns` at a time.
+            fresh = -(-config.block_m * family.summed_columns(config.block_n) // config.warpgroups
+                      // resources.THREADS)
+            held = plain + (fresh if family.operands_in_registers else 0)
+            return max(accumulator + fresh + resources.CONTROL_REGISTERS, held + max(phases))
         return plain + max(phases)
 
     def _prologue_registers(self, ba, config: mosaic_gpu.Tiles) -> int:

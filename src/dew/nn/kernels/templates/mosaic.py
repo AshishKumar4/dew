@@ -1374,12 +1374,27 @@ class Issuer[Accumulator](abc.ABC):
     def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool, scale: Callable | None = None
                      ) -> jax.Array:
         """`running` plus `lhs @ rhs` summed apart (exact sums, `templates.product.promoted`): the step's own
-        fp32 sum of its products, times `scale(start, columns)` where given (its columns' multiplier from
-        `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`), added into `running`
-        by an IEEE add."""
+        fp32 sum of its products, `summed_columns` at a time, each part times `scale(start, columns)` where
+        given (its columns' multiplier from `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s
+        `step_scales`), added into `running`'s same columns by an IEEE add."""
         rows, columns = running.shape
-        fresh = self.product(lhs, rhs, (rows, columns), interpret=interpret)
-        return running + (fresh if scale is None else fresh * scale(0, columns))
+        width = self.summed_columns(columns)
+
+        def part(start: int, total):
+            fresh = self.product(lhs, rhs if width >= columns else rhs.at[:, pl.ds(start, width)],
+                                 (rows, width), interpret=interpret)
+            return total + (fresh if scale is None else fresh * scale(start, width))
+
+        if width >= columns:
+            return part(0, running)
+        return jnp.concatenate([part(start, running[:, start:start + width])
+                                for start in range(0, columns, width)], axis=1)
+
+    def summed_columns(self, columns: int) -> int:
+        """The columns of an exactly summed step's product held apart at once (`summed_apart`) of an
+        accumulator `columns` wide: all of them, unless its fresh products, scoped apart, may each be a part
+        of the accumulator's columns."""
+        return columns
 
     @abc.abstractmethod
     def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True

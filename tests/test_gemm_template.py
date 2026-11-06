@@ -1852,6 +1852,31 @@ def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
                             f"cooperative {precision} sums", seeds=SEEDS, truth_fn=plain)
 
 
+def test_a_wide_tiles_exact_sums_add_each_steps_product_in_parts():
+    """On an H100, through the template, a grouped forward of bf16 rows into an fp32 output (exactly summed:
+    `templates.product.promoted`) pinned to a 256-column tile, whose steps' products wgmma sums apart 128
+    columns at a time (`mosaic.Issuer.summed_apart`, `summed_columns`; row 3620), each part added into the
+    running sum's same columns: on par with XLA's ragged dot over the draws (check 1), from float64."""
+    sizes, wide = jnp.asarray(SIZES), mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family='wgmma')
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, 256)) / np.sqrt(DEPTH), jnp.bfloat16))
+
+    def dew(x, w):
+        return gemm.gemm(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def plain(x, w):
+        wide_ = jnp.promote_types(x.dtype, jnp.float32)
+        return jax.lax.ragged_dot(x.astype(wide_), w.astype(wide_), sizes, preferred_element_type=wide_)
+
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
+          tuning.pinned({grouped_matmul.MosaicGmm: wide})):
+        assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "256-column exact sums in parts", seeds=SEEDS,
+                        truth_fn=plain)
+
+
 def test_a_tile_states_a_schedule_the_kernels_run():
     """A pair of multiprocessors needs two warpgroups, which stream at least two stages; a warpgroup count
     or cluster outside one or two is refused where the tile is made; the kernel gradient's schedule is one
@@ -1929,8 +1954,9 @@ def test_the_forward_derives_a_legal_tile_at_every_rows_a_group_and_takes_a_pinn
 
 def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
     """The declared product promotes (`exact_sums`) for an fp32 output at the highest precision, never
-    for a 16-bit output or the default precision; Mosaic's kernel gradient keeps only tiles whose two
-    accumulators stay in registers, and Triton's only steps of at most `EXACT_STEP` rows."""
+    for a 16-bit output or the default precision; Mosaic's kernel gradient keeps only tiles whose running
+    sum and a step's product apart, a part of its columns at a time (`mosaic.Issuer.summed_columns`), stay
+    in registers, and Triton's only steps of at most `EXACT_STEP` rows."""
     assert product.promoted(above=True, outputs=("float32",))
     assert not product.promoted(above=True, outputs=("bfloat16",))
     assert not product.promoted(above=False, outputs=("float32",))
@@ -1944,16 +1970,15 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
                             interpret=False, exact_sums=True)
         plain = launch.bind(bf16((rows, 768)), bf16((rows, 1536)), sizes, (), out_dtype="float32",
                             interpret=False)
-        # Two accumulators a consumer warpgroup: its 128 threads hold its share of the tile's columns, in
-        # the registers its layout gives a consumer (`Family.registers`). The generated tile holds them; a
-        # tile that does not is no legal pin.
+        # The running sum and a step's part a consumer warpgroup: its 128 threads hold its share of the
+        # tile's columns and of a part's, in the registers its layout gives a consumer (`Family.registers`).
+        # The generated tile holds them; a tile that does not is no legal pin.
         [tile] = launch.fitting(exact, target)
-        budget = mosaic_gpu.family_of(tile, jnp.bfloat16).registers(tile.warpgroups)
-        assert 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < budget
-        narrow, wide = (mosaic_gpu.Tiles(128, width, 64, 2, 1, warpgroups=2, family='wgmma')
-                        for width in (128, 256))
-        assert launch.legal(exact, narrow, target) and launch.legal(plain, narrow, target)  # 128 a thread
-        assert not launch.legal(exact, wide, target) and launch.legal(plain, wide, target)  # 256
+        family = mosaic_gpu.family_of(tile, jnp.bfloat16)
+        held = tile.block_n + family.summed_columns(tile.block_n)
+        assert tile.block_m * held // (128 * tile.warpgroups) < family.registers(tile.warpgroups)
+        narrow = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+        assert launch.legal(exact, narrow, target) and launch.legal(plain, narrow, target)
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.
         triton = grouped_matmul.Tgmm()
         steps = {tile.block_m for tile in triton.fitting(triton.bind(
