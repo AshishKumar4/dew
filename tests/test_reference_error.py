@@ -40,17 +40,19 @@ from dew.nn.precision import accumulated
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
-def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path):
+def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path, monkeypatch):
     """Each of tests/ynn_programs.py's programs under `without_ynn` gives, bit for bit, what the same
     program gives jitted in a process whose XLA:CPU runs with every YNNPACK fusion off."""
 
     import ynn_programs
-    from reference_error import without_ynn
+    from reference_error import CENSUS, without_ynn
 
     out = tmp_path / "theirs.npz"
     flags = os.environ.get("XLA_FLAGS", "") + " --xla_cpu_experimental_ynn_fusion_type="
     subprocess.run([sys.executable, str(Path(ynn_programs.__file__)), str(out)], check=True,
                    env={**os.environ, "XLA_FLAGS": flags})
+    # The switch's own programs, the census off whatever this run is (the census pass sets it).
+    monkeypatch.delenv(CENSUS, raising=False)
     with np.load(out) as theirs:
         for name, value in ynn_programs.outputs(without_ynn).items():
             np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
