@@ -67,12 +67,13 @@ inside), and `outputs` where the recording keeps the outputs whole."""
 
 
 def site_arms(site: str):
-    """`site`'s recording's fixture, draw, Dew run and leaves: its test's `FIXTURE`, `draw`, `dew` and
-    `OUTPUTS`, or its test's `pipeline_arms` of the site's `arms`."""
+    """`site`'s recording's fixture, draw, Dew run and leaves: its test's `FIXTURE` (None for a site only
+    recorded, never saved), `draw`, `dew` and `OUTPUTS`, or its test's `pipeline_arms` of the site's
+    `arms`."""
     known = SITES[site]
     test = importlib.import_module(known["test"])
     return (test.pipeline_arms(known["arms"]) if "arms" in known
-            else (test.FIXTURE, test.draw, test.dew, test.OUTPUTS))
+            else (getattr(test, "FIXTURE", None), test.draw, test.dew, test.OUTPUTS))
 
 
 def recording(site: str, python: str, source: str | None, given=None) -> dict[str, np.ndarray]:
