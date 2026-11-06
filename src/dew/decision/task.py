@@ -928,12 +928,23 @@ class Decide(SavedRunTask, InItsForm):
                 for part in range(parts):
                     chosen = options[part * len(options) // parts:(part + 1) * len(options) // parts]
                     played[f"{name}/{part}"] = _restricted(questions[name], chosen)
-            answers = self(state, played, request=questions)
+            answers = self._played(state, played, questions)
             remaining |= {name: [_choice(answers[key]) for key in played if key.rsplit("/", 1)[0] == name]
                           for name in playing}
         final = {name: _restricted(question, remaining[name]) if name in remaining else question
                  for name, question in questions.items()}
         return self(state, final, request=questions)
+
+    def _played(self, state: JSON, played: Mapping[str, Question], request: Mapping[str, Question]
+                ) -> dict[str, Answer]:
+        """A round's answers, each group `played` under its key (`<name>/<group>`) asked as its question
+        `<name>` of the whole `request`, its row summarizing that request with it current
+        (`RequestSummary`), every group scored in one call."""
+        names = {key: key.rsplit("/", 1)[0] for key in played}
+        encoded = [self._encoded(state, {names[key]: question}, request=request)
+                   for key, question in played.items()]
+        answered = self._answered(encoded, [{names[key]: question} for key, question in played.items()])
+        return {key: answers[names[key]] for key, (answers, _) in zip(played, answered, strict=True)}
 
     def _finalists(self, state: JSON, questions: Mapping[str, Question], rounds: Finalists
                    ) -> dict[str, Answer]:
@@ -945,7 +956,7 @@ class Decide(SavedRunTask, InItsForm):
                 if isinstance(question, Choice) and len(question.options) > rounds.final}
         played = {f"{name}/{part}": _restricted(questions[name], chosen)
                   for name, groups in wide.items() for part, chosen in enumerate(groups)}
-        answers = self(state, played, request=questions) if played else {}
+        answers = self._played(state, played, questions) if played else {}
         first: dict[str, dict[str, float]] = {name: {} for name in wide}
         finalists: dict[str, list[str]] = {}
         for name, groups in wide.items():
