@@ -625,10 +625,11 @@ def encoded[Words: (np.ndarray, jax.Array)](x: Words, minifloat: Minifloat, xp=j
 def packed[Words: (np.ndarray, jax.Array)](codes: Words, minifloat: Minifloat, xp=jnp) -> Words:
     """`codes` (uint32 a code, `[..., n]`) packed into uint32 words along the last axis, `[..., n * width /
     32]`: e4m3's and e5m2's four a word little-endian (code 0 in the low byte, as `cvt ...x2` pairs and a
-    bf16-ordered store give them), e2m1's eight in the stored NVFP4 order (code `i` at bits `4 i`), which
-    `nvfp4_decoded` reads back as it stores them."""
+    bf16-ordered store give them), e2m1's eight as NVFP4's stored word (`NVFP4_BFLOAT16_FORM`'s encoder of
+    the word holding code `i` at bits `4 i`), the word `nvfp4_decoded` reads."""
     per = 32 // minifloat.width
     grouped = codes.reshape(*codes.shape[:-1], -1, per)
     places = xp.arange(per, dtype=xp.uint32) * xp.uint32(minifloat.width)
     # The codes' bits are disjoint, so their sum is their union.
-    return xp.sum(grouped << places, axis=-1, dtype=xp.uint32)
+    natural = xp.sum(grouped << places, axis=-1, dtype=xp.uint32)
+    return _parities(natural, NVFP4_BFLOAT16_FORM.encoder, xp) if minifloat is E2M1 else natural
