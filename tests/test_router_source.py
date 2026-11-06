@@ -40,7 +40,7 @@ a bias that changes choices), then the other paths: 64 experts in 8 groups, 3 gr
 best biased scores; softmax, not renormalized, with a bias; softmax over 4 groups, 2 per token by their best
 score, no bias. Each is drawn to its worker as `grouped_topk`'s arguments, its scoring function as
 whether it is the sigmoid."""
-ROUTER_SEEDS = {"kimi": 8, "grouped": 8, "softmax": 8, "unbiased": 8}
+ROUTER_SEEDS = {"kimi": 8, "grouped": 8, "softmax": 16, "unbiased": 8}
 """Each router's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
 OUTPUTS = ("weights",)
 """The leaf `dew` gives, each site's recorded leaf."""

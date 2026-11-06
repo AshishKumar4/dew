@@ -3327,7 +3327,23 @@
      "runs": "torchvision"
     }
    ],
-   "note": "Fetches and executes upstream projection loss code, REPA's SILoss with train.py's loss composition and preprocess_raw_image, and iREPA's DINOv2Encoder.preprocess and spatial_zscore, with a stand-in network and encoder; SILoss's draws are DiffusionObjective's from jax.random.key(3). composed.npz also holds the fp32 gradient's RMS distance from float64 over 52 orders of the stand-in's hidden units (order 1 checked in float64 against the identity's gradient)."
+   "note": "Fetches and executes upstream projection loss code, REPA's SILoss with train.py's loss composition and iREPA's spatial_zscore, with a stand-in network and encoder; SILoss's draws are DiffusionObjective's from jax.random.key(3). composed.npz also holds the fp32 gradient's RMS distance from float64 over 52 orders of the stand-in's hidden units (order 1 checked in float64 against the identity's gradient)."
+  },
+  "repa/preprocessed.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "sihyun-yu/REPA",
+     "revision": "67f714503e3892f993844aab088ffc5791c92613",
+     "runs": "train.py preprocess_raw_image"
+    },
+    {
+     "repo": "End2End-Diffusion/iREPA",
+     "revision": "99ad4ac234efe8de52ce157120f72856e836d09f",
+     "runs": "ldm/vision_encoder.py DINOv2Encoder.preprocess and ldm/utils.py spatial_zscore"
+    }
+   ],
+   "note": "REPA's DINOv2 preprocessing (/255, ImageNet's normalization, bicubic to 224) and iREPA's, which each run checks agree, then iREPA's spatial_zscore at gamma 0.6, run by tools/repa_worker.py repa-preprocessing on the CPU (torch 2.14.0+cpu with torchvision) over each seed's two drawn 256-pixel images, in float32 and float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "repae": {
    "tool": "tools/repae_reference.py",
@@ -3463,16 +3479,49 @@
    ],
    "note": "Executes upstream modules under their own names with training-stack imports stubbed, tools/parity_rl.py:177,197,219."
   },
-  "router/vllm.npz": {
-   "tool": "tools/vllm_router_reference.py",
+  "router/kimi.npz": {
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "vllm-project/vllm",
-     "version": "v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607)",
-     "runs": "fetched"
+     "revision": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+     "runs": "grouped_topk"
     }
    ],
-   "note": "grouped_topk's own body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py at the commit (SHA-256 checked), torch.compile decorator dropped, torch path (fused kernel off, sorted top-k); float32 and float64 (widened return cast). Torch 2.14.0+cpu."
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-kimi on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "router/grouped.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/vllm",
+     "revision": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+     "runs": "grouped_topk"
+    }
+   ],
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-grouped on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "router/softmax.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/vllm",
+     "revision": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+     "runs": "grouped_topk"
+    }
+   ],
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-softmax on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
+  },
+  "router/unbiased.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/vllm",
+     "revision": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+     "runs": "grouped_topk"
+    }
+   ],
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-unbiased on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "schedules/betas.npz": {
    "tool": "tools/beta_schedule_reference.py",
