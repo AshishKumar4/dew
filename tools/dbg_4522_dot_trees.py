@@ -54,7 +54,8 @@ for name, lhs, rhs in (
         ("up", None, level["up"]["kernel"]),
         ("head", None, variables["params"]["embed_tokens"]["embedding"].swapaxes(-1, -2))):
     lhs = hidden if name == "down" else fed if name == "up" else passed
-    precision = jax.lax.Precision.HIGHEST if name == "head" else FP32_SUMS
+    precision = (jax.lax.Precision.HIGHEST if name == "head" or os.environ.get("HIGHEST_DIRECT")
+                 else FP32_SUMS)
 
     def batch(a, b):
         return jnp.einsum("btd,bdf->btf", a, b, precision=precision)

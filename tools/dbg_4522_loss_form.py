@@ -22,6 +22,11 @@ from reference_error import with_gradients, widened
 from arm_arithmetic import summed_as_run, unrewritten
 
 from dew.objectives.lm.adaptation import _Chain
+if os.environ.get("POLICY_HIGHEST"):
+    import arm_arithmetic
+    import dew.nn.precision
+    arm_arithmetic.FP32_SUMS = "highest"
+    dew.nn.precision.FP32_SUMS = "highest"
 
 _original_scored = _Chain.scored
 

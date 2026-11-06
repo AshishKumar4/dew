@@ -10,8 +10,10 @@ from pathlib import Path
 NODE = "tests/test_chunk_adaptation.py::test_each_windows_gradient_from_its_level_is_the_literal_loops"
 judge = sys.argv[1] == "--judge"
 outcomes = {}
-for mode in ("baseline", "token"):
-    environment = {**os.environ, "PYTHONPATH": "src:tests", "DEW_DBG_TOKEN": str(int(mode == "token"))}
+modes = ("highest",) if os.environ.get("POLICY_ONLY") else ("baseline", "token")
+for mode in modes:
+    environment = {**os.environ, "PYTHONPATH": "src:tests", "DEW_DBG_TOKEN": str(int(mode == "token")),
+                   "DEW_DBG_POLICY_HIGHEST": str(int(mode == "highest"))}
     with tempfile.TemporaryDirectory(prefix="dbg-4522-") as temporary:
         if judge:
             pool = Path(temporary)
@@ -28,5 +30,6 @@ for mode in ("baseline", "token"):
         outcomes[mode] = result.returncode
         print("MODE", mode, "EXIT", result.returncode, flush=True)
 print("RESULT", json.dumps(outcomes), flush=True)
-raise SystemExit(0 if outcomes == ({"baseline": 1, "token": 0} if judge else
-                                  {"baseline": 0, "token": 0}) else 1)
+expected = ({"highest": 0} if os.environ.get("POLICY_ONLY") else
+            {"baseline": 1, "token": 0} if judge else {"baseline": 0, "token": 0})
+raise SystemExit(0 if outcomes == expected else 1)

@@ -9,6 +9,11 @@ def pytest_configure():
     from dew.objectives.lm.adaptation import _Chain
 
     reference_error.WITHOUT_YNN = {}
+    if os.environ.get("DEW_DBG_POLICY_HIGHEST") == "1":
+        import arm_arithmetic
+        import dew.nn.precision
+        arm_arithmetic.FP32_SUMS = "highest"
+        dew.nn.precision.FP32_SUMS = "highest"
     if os.environ.get("DEW_DBG_TOKEN") != "1":
         return
     original = _Chain.scored
