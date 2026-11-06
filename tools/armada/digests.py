@@ -186,6 +186,18 @@ function. A decorator of any other name may put the object where every importer 
 name), so its statement is the top level's, which every importer keys."""
 
 
+INERT_CALLS = frozenset({
+    "field", "dataclasses.field", "struct.field", "flax.struct.field", "frozenset", "tuple", "set", "dict",
+    "list", "int", "float", "str", "bytes", "bool", "complex", "slice", "range", "types.MappingProxyType",
+    "MappingProxyType", "re.compile", "typing.TypeVar", "TypeVar", "typing.NewType", "NewType",
+    "typing.get_args", "get_args", "typing.cast", "cast", "collections.namedtuple", "typing.NamedTuple",
+    "np.dtype", "jnp.dtype", "np.finfo", "jnp.finfo", "np.iinfo", "jnp.iinfo", "np.zeros", "np.int64",
+    "np.float64", "np.float32"})
+"""The calls that build a value from their arguments alone (`inert`): a dataclass field's spec, a container,
+a number, a compiled pattern, a typing construct, a dtype or its limits, an empty numpy array: each returns a
+new value and touches nothing a test sees beside it."""
+
+
 def dotted(node: ast.AST) -> str | None:
     """`node` as the dotted name it is (`jax.tree_util.register_dataclass`), a call of one by its callee's,
     None for any other expression."""
@@ -201,9 +213,10 @@ def dotted(node: ast.AST) -> str | None:
 def inert(node: ast.AST | None) -> bool:
     """Whether evaluating expression `node` as its module is imported reads names and builds values alone, so
     it runs nothing a test sees beside what it defines: a literal, a name or an attribute of one, a subscript
-    of such (a typing generic), a union, a container or a formatted string of such, a number's sign; a call of
-    an inert decorator (`INERT_DECORATORS`) with such arguments. A name it reads that is gone fails the
-    import, which the skeleton holds for every importer (`parted`)."""
+    of such (a typing generic), arithmetic, a comparison or a choice of such, a container or a formatted
+    string of such, a function value (a lambda); a call of an inert decorator or of a call that builds a value
+    (`INERT_DECORATORS`, `INERT_CALLS`) with such arguments. A name it reads that is gone fails the import,
+    which the skeleton holds for every importer (`parted`)."""
     if node is None or isinstance(node, (ast.Constant, ast.Name)):
         return True
     if isinstance(node, ast.Attribute):
@@ -219,11 +232,22 @@ def inert(node: ast.AST | None) -> bool:
     if isinstance(node, ast.FormattedValue):
         return inert(node.value)
     if isinstance(node, ast.UnaryOp):
-        return isinstance(node.op, (ast.UAdd, ast.USub)) and isinstance(node.operand, ast.Constant)
+        return inert(node.operand)
     if isinstance(node, ast.BinOp):
-        return isinstance(node.op, ast.BitOr) and inert(node.left) and inert(node.right)
+        return inert(node.left) and inert(node.right)
+    if isinstance(node, ast.BoolOp):
+        return all(inert(each) for each in node.values)
+    if isinstance(node, ast.Compare):
+        return inert(node.left) and all(inert(each) for each in node.comparators)
+    if isinstance(node, ast.IfExp):
+        return inert(node.test) and inert(node.body) and inert(node.orelse)
+    if isinstance(node, ast.Starred):
+        return inert(node.value)
+    if isinstance(node, ast.Lambda):
+        # A function value: its body runs where it is called, as a definition's reads hold it.
+        return all(inert(each) for each in (*node.args.defaults, *filter(None, node.args.kw_defaults)))
     if isinstance(node, ast.Call):
-        return (dotted(node.func) in INERT_DECORATORS and all(inert(each) for each in node.args)
+        return (dotted(node.func) in INERT_DECORATORS | INERT_CALLS and all(inert(each) for each in node.args)
                 and all(inert(each.value) for each in node.keywords))
     return False
 
@@ -273,6 +297,8 @@ def defining(statement: ast.stmt) -> list[str] | None:
     if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and inert(
             statement.annotation) and inert(statement.value):
         return [statement.target.id]
+    if isinstance(statement, ast.TypeAlias) and isinstance(statement.name, ast.Name):
+        return [statement.name.id]
     return None
 
 
@@ -395,6 +421,9 @@ def parted(body: list[ast.stmt]) -> tuple[list[ast.stmt], dict[str, list[ast.stm
     defined: dict[str, list[ast.stmt]] = collections.defaultdict(list)
     skeleton, bound = [], set()
     for statement in body:
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+            # A string beside a definition, its docstring, evaluates to nothing any run sees.
+            continue
         names = defining(statement)
         if names is None:
             effects.append(statement)

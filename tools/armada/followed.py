@@ -448,7 +448,11 @@ def recording(module: types.ModuleType, root: str, write: Callable[[str], None])
             "test_") or Path(file).name == "conftest.py":
         return
     if recorded_reads is None:
-        recorded_reads = lambda at, name: write(f"{at[len(root):]}{CODE}{TOP}{DEFINED}{name}")  # noqa: E731
+
+        def read_of(at: str, name: str) -> None:
+            write(f"{at[len(root):]}{CODE}{TOP}{DEFINED}{name}")
+
+        recorded_reads = read_of
     module.__class__ = Recorded
 
 
