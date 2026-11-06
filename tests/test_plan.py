@@ -569,9 +569,11 @@ def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1,
                     observe=Observe(1, failing))
     (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
-    (capture,) = tmp_path.glob("capture-*")
-    assert window.steps == 2
-    assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
+    # The observer runs outside the window's capture (`FitRun.outside_window`): a capture of each step.
+    captures = sorted(tmp_path.glob("capture-*"))
+    assert window.steps == 2 and captures
+    assert all(json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
+               for capture in captures)
 
 
 def test_a_run_that_stops_inside_its_profile_window_stops_its_capture_and_reports_what_it_traced(tmp_path):
@@ -599,6 +601,48 @@ def test_a_run_that_stops_inside_its_profile_window_stops_its_capture_and_report
     (capture,) = (tmp_path / "trace").glob("capture-*")
     assert window.steps == 2 and traced_steps(capture) == (1, 2)
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
+
+
+def test_a_profile_window_spanning_a_checkpoints_evaluation_holds_the_training_steps_alone(tmp_path):
+    """A window that spans the evaluation a checkpoint's ranking runs (its cadence's, every second step) and
+    the save holds the training steps alone: the work between them runs outside its capture, which
+    starts again at the next step's read, so the window's captures hold its four steps between them, each
+    once, and no evaluation, which a capture marks wherever one runs inside it (`region`); and the run
+    finishes, every checkpoint written. Inside the window an evaluation filled a step profile's capture."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import gzip
+
+    from affine_run import Replaying
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+    from dew.training import ProfileWindow
+    from dew.training.profiling import traced_steps
+
+    def regions(capture):
+        named = set()
+        for trace in capture.glob("plugins/profile/*/*.trace.json.gz"):
+            with gzip.open(trace, "rt") as stream:
+                named.update(event.get("name") for event in json.load(stream)["traceEvents"])
+        return named
+
+    tracker = RecordingTracker()
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+    checkpoints = Checkpoints(str(tmp_path / "run"), keep=3)
+    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                                 tracker=tracker, checkpoints=checkpoints,
+                                 profile=ProfileWindow(str(tmp_path / "trace"), steps=4, warmup=0)))
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    held = {"held": lambda partition: iter([{"text": np.asarray(BATCH["text"])}])}
+    trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1, checkpoint_every=2,
+                validation=held)
+    assert checkpoints.committed() == [2, 4, 6]
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
+    captures = sorted((tmp_path / "trace").glob("capture-*"))
+    assert window.steps == 4 and len(captures) > 1
+    assert sorted(step for capture in captures for step in traced_steps(capture)) == [1, 2, 3, 4]
+    assert all(traced_steps(capture) and "evaluate" not in regions(capture) for capture in captures)
 
 
 def test_a_borrowed_compile_under_autopgle_profiles_beside_the_state_only_where_the_devices_hold_both(
