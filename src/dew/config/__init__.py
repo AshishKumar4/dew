@@ -2201,7 +2201,9 @@ class RunConfig:
         """The block every program the run traces is traced within (its steps', evaluations' and samples'):
         its recorded precision policy (`generation.run_precision`) and its kernel choices
         (`dew.kernels.use`), which JAX keys its trace caches on."""
-        with generation.run_precision(self.trainer.precision), generation.chosen(**self.kernels):
+        import dew.kernels
+
+        with generation.run_precision(self.trainer.precision), dew.kernels.use(**self.kernels):
             yield
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
