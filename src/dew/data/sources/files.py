@@ -880,6 +880,17 @@ class Files(Dataset):
                        np.concatenate([np.arange(len(each), dtype=np.int32) for each in counts]),
                        np.concatenate(counts))
 
+    def _fragment_table(self, fragment: ds.Fragment) -> pa.Table:
+        """`fragment`'s rows as this store reads them, its schema, columns and filter, its file held at
+        its version through the read (`_versions_held`): a row group's (`_ParquetRows`) and a piece's
+        (`_ArrowFragment`) alike."""
+        held = (self._arrow_files[2][fragment.path],) if self._versioned else ()
+        # Kept once its file is found at its version after the read too, as the hold ends.
+        with self._versions_held(held):
+            return fragment.to_table(schema=self.arrow.schema,
+                                     columns=list(self.columns) if self.columns is not None else None,
+                                     filter=self.where)
+
     def _piece(self, index: int) -> ds.Fragment:
         """Piece `index` of the files (`_pieces`) as a fragment Arrow reads: a Parquet row group of its file,
         whose footer this process holds while it reads the file (`_Footers`), or an Arrow file."""
@@ -1211,15 +1222,7 @@ class _ParquetRows(grain.DatasetIterator):
         raise StopIteration
 
     def _read(self, group: int) -> pa.Table:
-        source = self.source
-        held = (source._arrow_files[2][self.fragment.path],) if source._versioned else ()
-        # Kept once its file is found at its version after the read too, as the hold ends.
-        with source._versions_held(held):
-            return self.fragment.subset(row_group_ids=[group]).to_table(
-                schema=source.arrow.schema,
-                columns=list(source.columns) if source.columns is not None else None,
-                filter=source.where,
-            )
+        return self.source._fragment_table(self.fragment.subset(row_group_ids=[group]))
 
     def get_state(self) -> dict[str, int]:
         return {"group": self.group, "row": self.row}
@@ -1239,16 +1242,7 @@ class _ArrowFragment:
 
     @locked_cached_property
     def table(self) -> pa.Table:
-        source = self.source
-        fragment = source._piece(self.index)
-        held = (source._arrow_files[2][fragment.path],) if source._versioned else ()
-        # Kept once its file is found at its version after the read too, as the hold ends.
-        with source._versions_held(held):
-            return fragment.to_table(
-                schema=self.source.arrow.schema,
-                columns=list(self.source.columns) if self.source.columns is not None else None,
-                filter=self.source.where,
-            )
+        return self.source._fragment_table(self.source._piece(self.index))
 
     def __len__(self) -> int:
         return self.table.num_rows
