@@ -61,13 +61,15 @@ def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
     return family if family is not None and family.name in QUALIFIED else None
 
 
-def layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family, ...]:
+def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tuple[mosaic.Family, ...]:
     """The bundles a launch of the attention mainloop takes on a device of `generation_name` for operands of
     `dtype`, in preference order (`bundles.layouts`: a producer's layout, then on warpgroup MMA the layout
-    whose consumers feed their own rings, `mosaic_sm90.FED`), where its family is qualified (`bundle`)."""
+    whose consumers feed their own rings, `mosaic_sm90.FED`; given the launch's `rows`, each issuer the
+    device has, by the share of its rows they fill), where its family is qualified (`bundle`)."""
     if generation_name is None or bundle(generation_name, dtype) is None:
         return ()
-    return tuple(family for family in bundles.layouts(generation_name, dtype) if family.name in QUALIFIED)
+    return tuple(family for family in bundles.layouts(generation_name, dtype, rows)
+                 if family.name in QUALIFIED)
 
 
 def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
@@ -75,7 +77,8 @@ def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     which their legality matched (`MosaicForward.legal`). A config names its physical layout; which configs
     a call derives is the qualification's (`layouts`), so a config pinned on a family not yet qualified (an
     A100's mma.sync, its resource witness) resolves too."""
-    found = {family.name: family for family in bundles.layouts(generation.gpu_target().generation, dtype)}
+    # Every bundle the device issues (a launch of a row each ranks them all, `bundles.layouts`).
+    found = {family.name: family for family in bundles.layouts(generation.gpu_target().generation, dtype, 1)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
