@@ -118,6 +118,16 @@ def _fact(value: Batch | bytes | Rejected | None, name: str) -> int | None:
     return int(stated)
 
 
+def _store_shards_named(source: Source, version: int, completions: Mapping[str, object]) -> bool:
+    """Whether a stream's fill keys its rows by its store's own shards at data plan `version`, or by the
+    store's finer ones (a Parquet store's row groups, `ShardManifest.parts`): a stream cut into more shards
+    than these keys its rows by its own cuts, which no generation of the store holds, and publishes
+    nothing."""
+    manifest = source.manifest(version)
+    named = {json.loads(row)[0] for row in completions}
+    stored = {shard.id for shard in manifest.shards}
+    return named <= stored or named <= {shard.id for shard in manifest.parts()}
+
 def _publish(
     cache: Cache,
     key: DependencyManifest,
@@ -136,15 +146,8 @@ def _publish(
         _retain_committed(root, current, completions, shards, pins)
     # A stream's fill numbers its rows by the shards its key says it read (`filled_version`).
     streamed, version = any(row.startswith("[") for row in completions), filled_version(key.fill)
-    if of_several and streamed:
-        manifest = source.manifest(version)
-        named = {json.loads(row)[0] for row in completions}
-        if not named <= {shard.id for shard in manifest.shards} and not named <= {
-                shard.id for shard in manifest.parts()}:
-            # A stream cut into more shards than its store's keys its rows by its own cuts, which no
-            # generation of the store holds: it publishes nothing. One read by the store's finer shards
-            # (a Parquet store's row groups) publishes them as its own (`ShardManifest.parts`).
-            return None
+    if of_several and streamed and not _store_shards_named(source, version, completions):
+        return None
     expected = tuple(_source_ids(source, version, streamed=streamed, completed=completions))
     expected_keys = {_row_key(row) for row in expected}
     missing, extra = expected_keys - completions.keys(), completions.keys() - expected_keys
