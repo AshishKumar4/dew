@@ -94,12 +94,13 @@ def exported(args) -> dict:
 
     from dew.inference.banks import HeldBanks
     from dew.interop.pretrained import Pretrained, PretrainedDecoder
+    from dew.interop.releases import ReleasePlan
     from dew.interop.saved_sources import export_run
     from dew.nn.dex import DifferentialExtension
     from dew.registry import ModelConfig, models, to_record
     from dew.training import Layout, MeshSpec
 
-    PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=SHARD)
+    ReleasePlan.write = functools.partialmethod(ReleasePlan.write, max_shard_size=SHARD)
 
     def built(fields):
         """The decoder of `fields`, its variables, those placed across the pool, every layer's attention
@@ -201,9 +202,9 @@ def released(args) -> dict:
 
     from dew._cli.main import main
     from dew.interop import saved_sources
-    from dew.interop.pretrained import PretrainedDecoder
+    from dew.interop.releases import ReleasePlan
 
-    PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=RELEASE_SHARD)
+    ReleasePlan.write = functools.partialmethod(ReleasePlan.write, max_shard_size=RELEASE_SHARD)
     rank = jax.process_index()
     scopes = scoped_growth(saved_sources)
     # The first export compiles; the second warms the already-compiled execution's native storage.
