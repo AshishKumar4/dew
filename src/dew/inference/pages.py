@@ -72,29 +72,76 @@ def segment_hash(tokens: np.ndarray, page_size: int, shared: int, salt: bytes = 
 
 class States:
     """The row states a prefix's pages are read with: `count` entries, each one slot's state after a
-    prompt's first full pages, named by the chain digest of the last of them (`prefix_hashes`). The least
-    recently used entry gives way to a new state; an entry whose page is reclaimed goes with it."""
+    prompt's first full pages, named by the chain digest of the last of them (`prefix_hashes`), and `host`
+    slots in host memory. The least recently used entry gives way to a new state, going to a host slot
+    first where the store keeps any (its own free one, or the least recently used one's), from which a
+    prompt sharing its prefix reads it back into an entry (`entry`); an entry whose page is reclaimed
+    goes with it. The moves a step owes go out with its page copies (`Transfers`)."""
 
-    def __init__(self, count: int) -> None:
+    def __init__(self, count: int, host: int = 0) -> None:
         self.count = count
         self._free: deque[int] = deque(range(count))
         self._by_hash: OrderedDict[bytes, int] = OrderedDict()
+        self._host_free: deque[int] = deque(range(host))
+        self._on_host: OrderedDict[bytes, int] = OrderedDict()
+        """States held in host slots, by their page's digest, least recently used first."""
+        self._pinned: set[int] = set()
+        """Entries a seated row restores from, an owed upload writes or an owed capture writes, kept from
+        giving way until the step's moves are made (`drained`)."""
+        self._reading: list[int] = []
+        """Host slots an owed upload still reads, free again once the moves are made."""
+        self.spills: list[tuple[int, int]] = []
+        """The (entry, host slot) moves owed: an entry giving way, out to its slot."""
+        self.uploads: list[tuple[int, int]] = []
+        """The (host slot, entry) moves owed after the spills: a host state back into an entry."""
 
     def __contains__(self, digest: bytes) -> bool:
-        return digest in self._by_hash
+        """Whether a state after `digest`'s page is held: in an entry, or in a host slot an entry can
+        take it back into."""
+        return digest in self._by_hash or (digest in self._on_host and self._vacant())
+
+    def _vacant(self) -> bool:
+        return bool(self._free) or any(entry not in self._pinned for entry in self._by_hash.values())
 
     def entry(self, digest: bytes) -> int:
-        """The entry holding the state after `digest`'s page, now the most recently used."""
-        self._by_hash.move_to_end(digest)
-        return self._by_hash[digest]
+        """The entry holding the state after `digest`'s page, now the most recently used, kept until the
+        step's moves are made: a host state comes back into one (`uploads`)."""
+        if digest in self._by_hash:
+            self._by_hash.move_to_end(digest)
+            entry = self._by_hash[digest]
+        else:
+            slot = self._on_host.pop(digest)
+            self._reading.append(slot)
+            entry = self._vacated()
+            self.uploads.append((slot, entry))
+            self._by_hash[digest] = entry
+        self._pinned.add(entry)
+        return entry
 
     def take(self, digest: bytes) -> int | None:
         """An entry to write the state after `digest`'s page into: a free one, or the least recently used
-        one's; None where a state after that page is held already or the store holds none."""
-        if digest in self._by_hash or not self.count:
+        one's, which goes to the host first; None where a state after that page is held already, the store
+        holds none, or every entry is kept for the step."""
+        if digest in self._by_hash or digest in self._on_host or not self.count or not self._vacant():
             return None
-        entry = self._free.popleft() if self._free else self._by_hash.popitem(last=False)[1]
+        entry = self._vacated()
         self._by_hash[digest] = entry
+        # Its capture is owed: no other state takes the entry, nor sends it to the host, before it.
+        self._pinned.add(entry)
+        return entry
+
+    def _vacated(self) -> int:
+        """A free entry, or the least recently used one not kept, its state out to a host slot where one
+        can take it (`spills`)."""
+        if self._free:
+            return self._free.popleft()
+        digest = next(held for held, entry in self._by_hash.items() if entry not in self._pinned)
+        entry = self._by_hash.pop(digest)
+        slot = (self._host_free.popleft() if self._host_free else
+                self._on_host.popitem(last=False)[1] if self._on_host else None)
+        if slot is not None:
+            self._on_host[digest] = slot
+            self.spills.append((entry, slot))
         return entry
 
     def drop(self, digest: bytes) -> None:
@@ -102,11 +149,27 @@ class States:
         entry = self._by_hash.pop(digest, None)
         if entry is not None:
             self._free.append(entry)
+        slot = self._on_host.pop(digest, None)
+        if slot is not None:
+            self._host_free.append(slot)
+
+    def drained(self) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        """The moves owed before the next step's restores, spills first; the kept entries and the host
+        slots the uploads read are free again after them."""
+        owed = self.spills, self.uploads
+        self.spills, self.uploads = [], []
+        self._host_free.extend(self._reading)
+        self._reading = []
+        self._pinned.clear()
+        return owed
 
     def forget(self) -> None:
         """Hold no state: the weights that wrote them are replaced."""
         self._free.extend(self._by_hash.values())
         self._by_hash.clear()
+        self._host_free.extend(self._on_host.values())
+        self._on_host.clear()
+        self._pinned.clear()
 
 
 @dataclass
