@@ -929,6 +929,12 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                                turn)
 
     def dot(lhs, rhs):
+        if isinstance(rhs, operands.Parts):
+            # An fp32 call's product of a register operand with a tile's parts: their terms' products, each
+            # its own accumulator, summed smallest first (`Family.apart`'s).
+            formed = product.formed(lhs, len(rhs.refs))
+            return functools.reduce(jnp.add, (family.registers_product(formed[i], rhs.refs[j], interpret)
+                                              for i, j in product.terms(len(formed), len(rhs.refs))))
         return family.registers_product(lhs, rhs, interpret)
 
     def step(index, slots, carry, accumulators):
