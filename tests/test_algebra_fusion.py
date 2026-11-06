@@ -143,3 +143,35 @@ def test_a_plain_programs_product_runs_the_template_its_call_names(layer):
             jax.jit(algebra.rewritten(layer)).trace(*operands)
     assert not any(route.choice == "grouped_matmul" for route in written)
     assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic_gpu" for route in passed)
+
+
+def _template_routes(trace) -> list:
+    """The grouped matmul's routes `trace()` reports that run the template."""
+    with generation.routes() as found:
+        trace()
+    return [route for route in found if route.choice == "grouped_matmul" and route.kernel == "mosaic_gpu"]
+
+
+def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew_jit():
+    """`dew.jit` over a plain JAX loss on an H100 whose template a call names: its gradient's products run
+    the template whether `jax.grad` is taken of the compiled program (inside a plain jit, the pass reads the
+    program as it traces) or the program compiles the gradient (the pass reads the joint program), each
+    the gradient as written, bitwise."""
+    import dew
+
+    operands = draw()
+    cotangent = jax.random.randint(jax.random.key(11), (256, 256), -2, 3).astype(jnp.bfloat16)
+
+    def loss(x, w, bias, other):
+        return jnp.sum((biased(x, w, bias, other) * cotangent).astype(jnp.float32))
+
+    plain = jax.grad(loss, argnums=(0, 1))
+    outside = jax.jit(jax.grad(dew.jit(loss), argnums=(0, 1)))
+    inside = dew.jit(jax.grad(loss, argnums=(0, 1)))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        assert not _template_routes(lambda: jax.jit(plain).trace(*operands))
+        assert _template_routes(lambda: outside.trace(*operands))
+        assert _template_routes(lambda: inside.trace(*operands))
+        expected = jax.jit(plain)(*operands)
+        assert_equal(outside(*operands), expected)
+        assert_equal(inside(*operands), expected)
