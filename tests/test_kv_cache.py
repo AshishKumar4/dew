@@ -75,7 +75,8 @@ def test_a_head_that_serves_as_keys_and_values_is_kept_once_where_its_layout_sto
         cache = holder.init(jax.random.key(0), keys, keys)["cache"]
         read, written = holder.apply({"cache": cache}, keys, keys, mutable=["cache"])
         leaves = jax.tree_util.tree_flatten_with_path(written)[0]
-        return read, {jax.tree_util.keystr(path): (leaf.shape, leaf.dtype) for path, leaf in leaves}
+        return read, {jax.tree_util.keystr(path): (np.shape(leaf), np.asarray(leaf).dtype)
+                      for path, leaf in leaves}
 
     (shared, shared_leaves), (separate, separate_leaves) = (kept(Holder(layout, keys_as_values=flag))
                                                            for flag in (True, False))
