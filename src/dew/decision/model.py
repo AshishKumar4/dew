@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
+from dew.decision.shared_state import entered_documents, entering
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
@@ -139,6 +140,14 @@ class DecisionModel(HeadedModel):
             if blocked or inputs.slots is not None or inputs.reads is None:
                 raise ValueError("a row in streams reads as its layout's reads say, which blocks and "
                                  "parallel options say otherwise")
+            if entering(inputs.reads):
+                # A row over one state whose questions each enter its shared part: documents every layer
+                # reads so, a recurrence from the shared part's memory too (`Entered`).
+                count = inputs.max_segments * len(inputs.reads)
+                entered = replace(laid, entered=entered_documents(inputs.streams, inputs.segments, count))
+                states, sown = applied(inputs.tokens, train=train, coordinates=entered, method=states_method,
+                                       conditioning=conditioning, rngs=rngs, **stepped)
+                return _array(states), spanned, sown
             # Each token reads the streams its record says, as runs over its document's (`stream_runs`).
             runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
             states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,

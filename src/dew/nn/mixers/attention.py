@@ -186,7 +186,12 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
         raise ValueError("a call states what its tokens read once: by the documents they enter, key runs "
                          "or a pairwise mask")
     if metadata.entered is not None:
-        metadata = metadata.replace(key_runs=metadata.entered.runs())
+        # Its runs over the call's own tokens, each key read at its own position, as a windowed layer
+        # windows them.
+        assert metadata.coordinates is not None
+        metadata = metadata.replace(key_runs=metadata.entered.runs(),
+                                    key_positions=metadata.key_positions if metadata.coordinates.positions
+                                    is None else metadata.coordinates.positions)
     key_positions = metadata.key_positions
     if key_positions is not None and key_positions.shape != (batch, keys):
         raise ValueError("attention_key_positions must be [B, keys]")
