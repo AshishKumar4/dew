@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import functools
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
@@ -16,7 +17,7 @@ import numpy as np
 
 import test_chunk_adaptation as t
 from dew.nn.categorical import label_terms
-from dew.nn.precision import compensated_sum
+from dew.nn.precision import compensated_sum, float32_einsum, float64_sum
 from reference_error import with_gradients, widened
 from arm_arithmetic import summed_as_run, unrewritten
 
@@ -65,9 +66,23 @@ def make(kind, variant):
             if variant in ("literal", "truth", "token-categorical"):
                 losses = jax.lax.map(lambda pair: single(*pair), (hidden, targets))
             else:
-                logits = t.MODEL.apply(
-                    variables, t.MODEL.apply(variables, hidden[None], method="continuum_states"),
-                    method="head_logits")[0]
+                if variant == "batch-high-silu" or variant.startswith("manual"):
+                    def dot(spec, lhs, rhs, site):
+                        if variant == "manual-wide-" + site:
+                            return float64_sum(functools.partial(jnp.einsum, spec), lhs, rhs,
+                                               dtype=lhs.dtype)
+                        return float32_einsum(spec, lhs, rhs)
+                    level = variables["params"]["continuum"]
+                    fed = dot("td,df->tf", hidden, level["down"]["kernel"], "down")
+                    fed = (fed * jax.lax.logistic(fed, accuracy=jax.lax.AccuracyMode.HIGHEST)
+                           if variant == "batch-high-silu" else jax.nn.silu(fed))
+                    passed = hidden + dot("tf,fd->td", fed, level["up"]["kernel"], "up")
+                    logits = dot("td,vd->tv", passed, variables["params"]["embed_tokens"]["embedding"],
+                                 "head")
+                else:
+                    logits = t.MODEL.apply(
+                        variables, t.MODEL.apply(variables, hidden[None], method="continuum_states"),
+                        method="head_logits")[0]
                 losses = (direct_loss(logits, targets, variant) if variant != "batch-logsoftmax" else
                           -jnp.take_along_axis(jax.nn.log_softmax(logits), targets[:, None],
                                               axis=-1)[:, 0])
@@ -79,7 +94,10 @@ def make(kind, variant):
 kind = sys.argv[1] if len(sys.argv) > 1 else "documents"
 count = int(sys.argv[2]) if len(sys.argv) > 2 else 256
 variants = ("literal", "token-categorical", "batch-categorical", "batch-logsoftmax", "batch-wide",
-            "batch-log1p", "batch-compensated", "actual", "equation")
+            "batch-log1p", "batch-compensated", "batch-high-silu", "actual", "equation")
+if os.environ.get("DOT_SITES"):
+    variants = ("literal", "batch-categorical", "batch-high-silu", "manual", "manual-wide-down",
+                "manual-wide-up", "manual-wide-head")
 programs = {(variant, mode): jax.jit(make(kind, variant), compiler_options=(
     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))
     for variant in variants for mode in ("on", "off")}
