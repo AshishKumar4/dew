@@ -432,7 +432,7 @@ def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, cho
     exactly undone); the row sums D's refinement and the hook's parameters read (`gradient.dq_rows`) from
     each tile's weights and cotangents the walk gives. The accurate form's dQ products are this mainloop's
     own (`_accurate_sums`), its cotangents' parts', and its keyed sums its own (`gradient.dq_issued`)."""
-    forms = derived_backward(grad_scale, "keys", hooked, draw is not None, how, accurate)
+    forms = derived_backward(grad_scale, "keys", hooked, draw is not None, how, accurate, anchored=True)
     call_q = by_power(q, 1.0 / prescale)
 
     def tiles_at(j):
@@ -443,8 +443,9 @@ def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, cho
             tiles["slope"] = slopes[0]
         if draw is not None:
             tiles["keep"] = draw(q_pos, columns[None, :])
-        if accurate:
-            tiles["at_anchor"] = columns[None, :] == chosen[:, None]
+        # Each row's anchor key's own term exactly 0 in either form, as this mainloop's hand form held it
+        # (`derived_backward`'s `anchored`).
+        tiles["at_anchor"] = columns[None, :] == chosen[:, None]
         return tiles, slopes, seen
 
     def step(j, carry):
@@ -518,7 +519,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         # Behind the switch, dK and dV the derived walk's over the query tiles (`derived_backward`),
         # at the dQ launch's D and denominator; else this module's contributions. Either way each tile's
         # cotangents give the key and tile parameters' gradients (`hooked`).
-        forms = (derived_backward(grad_scale, "rows", score_mod is not None, draw is not None, how, accurate)
+        forms = (derived_backward(grad_scale, "rows", score_mod is not None, draw is not None, how, accurate,
+                                  anchored=True)
                  if derived else None)
 
         def tile_at(i):
@@ -546,8 +548,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                 tiles["slope"] = slopes[0]
             if zt is not None:
                 tiles["keep"] = zt
-            if accurate:
-                tiles["at_anchor"] = columns[None, :] == key_index[row, head, rows][:, None]
+            tiles["at_anchor"] = columns[None, :] == key_index[row, head, rows][:, None]
             return tiles, slopes, seen
 
         def hooked(i, hooks, pieces):
