@@ -15,7 +15,6 @@ from residual_orders import model_axes, permuted
 from scipy.special import log_softmax
 from tool_support import run_from
 
-from dew.batch import Variables
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
@@ -105,20 +104,27 @@ def recorded_dew(directory: Path, leaves: tuple[str, ...]):
     return dew
 
 
-def assert_update_as_exact(source, directory: Path) -> Variables:
-    """One all-parameter SGD step at the reference's learning rate: the loss within 1e-5 of the
-    reference's, and the updated logits as exact over the fixture's residual orders as the
-    reference's own (`assert_as_exact_over_orders`). Returns the stepped variables."""
+def sgd_step(source):
+    """The fixture's loss over its rows and one all-parameter SGD step of it at the reference's learning
+    rate, as functions of the parameters."""
     loaded, inputs, reference = source
     objective = LMObjective(loaded, inputs.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
-
     loss = parameter_loss(objective, loaded.variables, {"text": inputs}, step)
 
     def stepped(params):
         gradient = jax.grad(loss)(params)
         return jax.tree.map(lambda weight, grad: weight - reference["learning_rate"] * grad, params, gradient)
 
+    return loss, stepped
+
+
+def assert_update_as_exact(source, directory: Path) -> None:
+    """One all-parameter SGD step at the reference's learning rate (`sgd_step`): the loss within 1e-5 of
+    the reference's, and the updated logits as exact over the fixture's residual orders as the
+    reference's own (`assert_as_exact_over_orders`)."""
+    loaded, inputs, reference = source
+    loss, stepped = sgd_step(source)
     value = jax.jit(loss)(loaded.variables["params"])
     np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
     valid = reference["attention_mask"].astype(bool)
@@ -130,18 +136,17 @@ def assert_update_as_exact(source, directory: Path) -> Variables:
     mine = [distance(np.asarray(updated(permuted(loaded.variables, order, axes)["params"]))[valid], truth)
             for order in drawn["orders"]]
     assert_as_exact_over_orders(mine, drawn["updated_logits"], "updated logits")
-    return {**loaded.variables, "params": jax.jit(stepped)(loaded.variables["params"])}
 
 
 def exported(source, directory: Path, written: Path) -> tuple[dict, dict, dict, dict]:
-    """The model stepped once (`assert_update_as_exact`) and saved to `written` with the config
-    `directory` ships: the stepped weights and the reloaded ones, flat by dotted name, and the tensors
-    it wrote and the ones `directory` ships, by name."""
+    """The model stepped once (`sgd_step`, whose numerics `assert_update_as_exact` holds) and saved to
+    `written` with the config `directory` ships: the stepped weights and the reloaded ones, flat by
+    dotted name, and the tensors it wrote and the ones `directory` ships, by name."""
     from flax.traverse_util import flatten_dict
     from safetensors.numpy import load_file
 
     loaded, _, _ = source
-    variables = assert_update_as_exact(source, directory)
+    variables = {**loaded.variables, "params": jax.jit(sgd_step(source)[1])(loaded.variables["params"])}
     loaded.save(written, variables=variables)
     assert (json.loads((written / "config.json").read_text())
             == json.loads((directory / "config.json").read_text()))
