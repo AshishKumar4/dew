@@ -229,6 +229,30 @@ def test_a_form_that_breaks_a_law_is_refused():
     assert raised.value.law == "identity"
 
 
+def test_a_step_lawful_at_two_keys_a_tile_alone_is_refused_at_three():
+    """A sum's walk whose step reduces each tile by its maximum plus its minimum, its sum at two keys a tile
+    and at no more, is refused by its certificate at its witness of three keys (`WALKED`), which a law proven
+    at two would share with a kernel's tile (row 3518)."""
+    def summed(values):
+        return jnp.sum(values, axis=0)
+
+    declaration = derive.Reduction(summed, {"values": ("keys", "width")}, walked="keys", exponent="e")
+    forms = derive.derive(declaration, accurate=False, saturation=SATURATION)
+
+    def two_only(state, tiles):
+        values = tiles["values"]
+        return (state[0] + jnp.max(values, axis=0) + jnp.min(values, axis=0),)
+
+    def certified(keys):
+        return laws.certify(init=forms.init, step=two_only, merge=forms.merge, finish=forms.finish,
+                            declared=declaration.function, shapes={"values": ((keys, 2), jnp.float32)},
+                            walked={"values": 0})
+
+    certified(min(WALKED))
+    with pytest.raises(laws.Unlawful):
+        certified(max(WALKED))
+
+
 def _biased(start: int):
     """Attention plus a bias wider than the values by one, sliced from `start`: a form over an operand the
     walk does not read, its window's place a parameter."""
