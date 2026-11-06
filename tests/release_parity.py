@@ -74,15 +74,19 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
             rows.extend(task.layout.rows(task.tokenizer, task.specials, request["state"], questions))
         laid = DecisionInputs.collate(rows, task.specials.pad, options=held["options"].shape[1])
         mask = np.arange(held["tokens"].shape[1])[None] < held["lengths"][:, None]
+        # Its rows read in blocks where Dew lays them so; an engine's rows read whole then hold none.
+        blocked = rows[0].blocks is not None
         for row, encoded in enumerate(rows):
             np.testing.assert_array_equal(encoded.tokens, held["tokens"][row, :held["lengths"][row]])
             np.testing.assert_array_equal(encoded.questions[0].options,
                                           held["spans"][row, held["options"][row]])
-            if "blocks" in held:
+            if blocked:
                 np.testing.assert_array_equal(encoded.blocks, held["blocks"][row, :held["lengths"][row]])
+            else:
+                assert not np.any(held.get("blocks", np.zeros(1))[row])
         inputs = replace(laid, tokens=jnp.asarray(held["tokens"]), segments=jnp.asarray(mask, jnp.int32),
                          positions=jnp.broadcast_to(jnp.arange(mask.shape[1]), mask.shape),
-                         blocks=jnp.asarray(held["blocks"]) if "blocks" in held else None)
+                         blocks=jnp.asarray(held["blocks"]) if blocked else None)
         probe = np.zeros(held["options"].shape, np.float32)
         probe[held["options"]] = held["probe"]
         result = forward(inputs, jnp.asarray(probe))
