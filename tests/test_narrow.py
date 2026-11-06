@@ -440,11 +440,15 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     """Each shape a run meets plans its copies itself (`_at_base_rung`): where a longer batch fits only
     without them and a shorter one with them, the steps take turns, each reading the state as its own plan
     compiled it, the copies dropped before the longer batch's step and built again before the shorter's
-    as the cast of the parameters the last update wrote (`_copies_of`). That the copies change no update
-    is the other runs' claim (`_on_par_with_the_plain_update`)."""
+    as the cast of the parameters the last update wrote (`_copies_of`), and under plain SGD the run lands
+    on par with the parameters and losses of one without copies (check 1)."""
     free = 2 ** 39
-    monkeypatch.setattr(jax.Device, "memory_stats",
-                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+
+    def stats(device):
+        # A float64 truth's wider arrays planned in the whole memory, read from the planning thread's own
+        # precision: the gate runs the truth beside the arms.
+        return {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - (2 ** 39 if x64() else free)}
+    monkeypatch.setattr(jax.Device, "memory_stats", stats)
 
     def trained(*, copies, rows=8, longer=None, steps=0):
         return _trained(optax.sgd(0.5), copies=copies, steps=steps, accumulation=2, split=1, remat="full",
@@ -459,6 +463,8 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     narrow, _, trainer = trained(copies=True, longer=64, steps=3)
     assert not trainer.plan["narrow"] and narrow.compute is not None
     assert _copies_of(narrow)
+    _on_par_with_the_plain_update(lambda: optax.sgd(0.5), "a run whose shapes plan their copies apart",
+                                  steps=3, accumulation=2, split=1, remat="full", rows=8, longer=64)
 
 
 def test_a_restored_state_drops_its_templates_copies():
