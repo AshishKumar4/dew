@@ -49,18 +49,14 @@ def test_advertised_mtp_without_weights_loads_the_actual_conditional_trunk(tmp_p
 
 
 @pytest.mark.network
-def test_published_qwen35_moe_tiny_checkpoint_logits_and_generation(tmp_path):
-    """The revision-pinned published tiny Qwen 3.5 MoE's text and image logits as near their float64
-    truth as the reference's fp32 run, and its greedy continuation the reference's where no step is near
+def test_published_qwen35_moe_tiny_checkpoint_logits_and_generation():
+    """The revision-pinned published tiny Qwen 3.5 MoE's text and image logits on par with the reference's
+    fp32 run over drawn prompts, and its greedy continuation the reference's where no step is near
     a tie (`assert_published_checkpoint`)."""
     from interop_support import assert_published_checkpoint
 
-    from tools.wrapper_checkpoint_parity import measure_checkpoint
-
-    measured = measure_checkpoint('trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6',
-                                  tmp_path / 'measurement.json',
-                                  revision='57faabc3b49ec3ae69b8d6158130ce19496bc2d3')
-    assert_published_checkpoint(measured, 'Qwen3.5 MoE')
+    assert_published_checkpoint('trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6',
+                                '57faabc3b49ec3ae69b8d6158130ce19496bc2d3', 'Qwen3.5 MoE')
 
 
 def test_images_read_through_a_config_that_leaves_the_merge_size_to_its_default(tmp_path):

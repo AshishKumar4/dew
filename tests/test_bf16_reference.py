@@ -205,6 +205,8 @@ def bfloat16(bits: np.ndarray) -> jax.Array:
 
 MAMBA2_130M = "AntonV/mamba2-130m-hf"
 MAMBA2_REVISION = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
+MAMBA2_SEEDS = 8
+"""Check 1's declared seeds for the published Mamba-2's logits, each draw a prompt of the text's tokens."""
 
 
 @pytest.mark.network
@@ -220,7 +222,8 @@ def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
     not because either computes something else. Dew in bf16 over fp32
     masters, the training configuration, sits at 0.53. In fp32 Dew is at
     8.6e-05 and transformers at 4.9e-05 (ratio 1.78: the SSD sums its chunks
-    in another order)."""
+    in another order). Each is held over MAMBA2_SEEDS prompts drawn from
+    the text's tokens (check 1)."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -229,15 +232,28 @@ def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
             "Helens, which erupted in 1980. The capital of France is")
     ids = AutoTokenizer.from_pretrained(MAMBA2_130M, revision=MAMBA2_REVISION)(
         text, return_tensors="np")["input_ids"]
-    runs = {}
-    for name, dtype in (("f64", torch.float64), ("float32", torch.float32), ("bfloat16", torch.bfloat16)):
+    tokens = np.unique(ids)
+
+    def draw(seed):
+        return (np.random.default_rng([242, seed]).choice(tokens, size=ids.shape),)
+
+    def theirs(dtype):
         reference = AutoModelForCausalLM.from_pretrained(
             MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype).eval()
-        with torch.no_grad():
-            runs[name] = reference(torch.from_numpy(ids)).logits.to(torch.float64).numpy()
-    for dtype in ("float32", "bfloat16"):
+
+        def logits(drawn):
+            with torch.no_grad():
+                return reference(torch.from_numpy(np.asarray(drawn))).logits.to(torch.float64).numpy()
+        return as_given(logits)
+
+    truth = theirs(torch.float64)
+    for dtype, torch_dtype in (("float32", torch.float32), ("bfloat16", torch.bfloat16)):
         pretrained = Pretrained.load(MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype,
                                      param_dtype=dtype, attention_impl="xla")
-        logits = pretrained.model.apply(pretrained.variables, jnp.asarray(ids, jnp.int32))
-        assert_as_exact_as_the_reference(np.asarray(logits, np.float32), runs[dtype], runs["f64"],
-                                         f"{MAMBA2_130M} {dtype}")
+
+        def ours(drawn, pretrained=pretrained):
+            logits = pretrained.model.apply(pretrained.variables, jnp.asarray(drawn, jnp.int32))
+            return np.asarray(logits, np.float32)
+
+        assert_as_exact(as_given(ours), theirs(torch_dtype), draw, f"{MAMBA2_130M} {dtype}",
+                        seeds=MAMBA2_SEEDS, truth_fn=truth)

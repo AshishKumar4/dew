@@ -6,7 +6,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/interop_support.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/kimi_support.py": {
@@ -74,7 +74,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_bf16_reference.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_block_diffusion.py": {
@@ -115,10 +115,6 @@
   },
   "tests/test_dc_ae.py": {
    "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_dduf.py": {
-   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decision_joint_checkpoint.py": {
@@ -240,10 +236,6 @@
   "tests/test_flaxdiff_family_source.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_flow_grpo.py": {
-   "comparisons": 1,
-   "lane": "Training"
   },
   "tests/test_flow_matching.py": {
    "comparisons": 1,
@@ -538,10 +530,6 @@
    "lane": "Training"
   },
   "tests/test_pretrained_sources.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_quantization.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
