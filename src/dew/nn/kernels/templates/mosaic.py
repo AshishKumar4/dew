@@ -1596,6 +1596,11 @@ class Transport[Allocated, Opened](abc.ABC):
     own, joined into one tile through registers (`mosaic_sm80.CpAsync.walk`): a paged call's key tile of
     several pages takes a copy a page."""
 
+    pieces_of_views: bool = True
+    """Whether a block's pieces (`copies_in_pieces`) may be pieces of any view (a TMA ring's: an fp32
+    operand's parts, `Pieces`), where cp.async's are a table's runs alone (`mosaic.Rows`, a paged call's
+    pages: `mosaic_sm80._run`)."""
+
     copies_vectors: bool = True
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
     warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple
