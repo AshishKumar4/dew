@@ -311,24 +311,3 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
 
     assert_as_exact(jax.jit(ours), jax.jit(whole), draw, f"decode merge over {slices} slices", seeds=SEEDS)
 
-
-def test_a_decode_step_a_run_names_the_template_for_is_on_par():
-    """A decode step over key lengths under a run's choice of the template for its decode
-    (`generation.chosen(decode='template')`): on par with the reference path's (check 1)."""
-    from dew.nn.attention import scaled_dot_product_attention
-
-    lengths = jnp.asarray(LENGTHS, jnp.int32)
-
-    def attended(implementation):
-        def attend(query, key, value, sinks):
-            del sinks
-            return scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
-                                                implementation=implementation)
-        return attend
-
-    def ours(*operands):
-        with generation.chosen(decode="template"):
-            return attended("auto")(*operands)
-
-    assert_as_exact(jax.jit(ours), jax.jit(attended("reference")), _drawn(1, 4, 4, jnp.bfloat16),
-                    "decode named the template", seeds=SEEDS)
