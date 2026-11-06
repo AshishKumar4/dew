@@ -958,8 +958,8 @@ def synced(interpret: bool) -> None:
 
 
 MAGIC_INT, MAGIC_FLOAT = 0x4B400000, 12582912.0
-"""An integer below 2**22 in magnitude added to the first in integer arithmetic is the fp32 whose value less the
-second it is (2**23 + 2**22's exponent and mantissa: Family.converted's integer codes)."""
+"""An integer below 2**22 in magnitude added to the first in integer arithmetic is the fp32 whose value less
+the second it is (2**23 + 2**22's exponent and mantissa: Family.converted's integer codes)."""
 
 
 def converts(dtype) -> bool:
