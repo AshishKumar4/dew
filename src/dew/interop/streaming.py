@@ -132,10 +132,10 @@ def materialize(tree: LazyTree) -> LazyTree:
 
 @runtime_checkable
 class HostArray(Protocol):
-    """A leaf built on the host as it is read (`np.asarray`), its shape and dtype known before: a DEX
-    layer's folded output projection (`dew.nn.dex.FoldedKernel`), which an export folds as it writes it, or a
-    layer's row of a bank (`dew.nn.backbones.layer_names.StoredRow`), read home as it is written, or what an
-    export makes of one (`Deferred`)."""
+    """A leaf built on the host as it is read (`np.asarray`), its shape and dtype known before: a layer's
+    row of a bank (`dew.nn.backbones.layer_names.StoredRow`), read home as it is written, or what an export
+    makes of a leaf as it writes it (`Deferred`: a DEX layer's folded output projection, a packed row's
+    member, an adapter's merge)."""
 
     @property
     def shape(self) -> tuple[int, ...]: ...
