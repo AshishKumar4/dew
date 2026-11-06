@@ -1414,6 +1414,54 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
     assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14, 22, 26)]
 
 
+def test_asserting_on_production_source_or_ir_text_is_reported_and_reading_structure_is_not(tmp_path):
+    """SLOP011 (row 4512): a test asserting on text it read from the package's source (a path under
+    src/sparx/, joined from "src" and the package, or a module's `__file__`, read or opened) or from a
+    program's IR (a jaxpr printed, a lowering's or compilation's `as_text()`), through the names it binds and
+    the string operations it matches with, proves text, not behaviour. The program's structure read as
+    objects, the text handed to the package's own parser, a file of the tests' own, and a name bound again
+    to something else, are not reported."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "def parse(text):\n    return text.split()\n",
+        "tests/test_graph.py": (
+            "import re\n"
+            "from pathlib import Path\n"
+            "import jax\n"
+            "import sparx.graph\n"
+            "from sparx.graph import parse\n"
+            "ROOT = Path(__file__).parents[1]\n"
+            "def test_source():\n"
+            "    text = (ROOT / 'src' / 'sparx' / 'graph.py').read_text()\n"
+            "    assert 'def parse' in text\n"
+            "def test_module_file():\n"
+            "    lines = Path(sparx.graph.__file__).read_text().splitlines()\n"
+            "    assert len(lines) > 1\n"
+            "def test_opened():\n"
+            "    with open('src/sparx/graph.py') as handle:\n"
+            "        assert handle.read()\n"
+            "def test_jaxpr(f, x):\n"
+            "    assert 'dot_general' in str(jax.make_jaxpr(f)(x))\n"
+            "def test_lowered(f, x):\n"
+            "    program = jax.jit(f).lower(x).as_text()\n"
+            "    assert not re.findall(r'while', program)\n"
+            "def test_formatted(f, x):\n"
+            "    jaxpr = jax.make_jaxpr(f)(x)\n"
+            "    assert 'sin' in f'{jaxpr}'\n"
+            "def test_structure(f, x):\n"
+            "    jaxpr = jax.make_jaxpr(f)(x)\n"
+            "    assert 'sin' in {equation.primitive.name for equation in jaxpr.eqns}\n"
+            "def test_parsed(f, x):\n"
+            "    assert parse(jax.jit(f).lower(x).as_text())\n"
+            "def test_own_file():\n"
+            "    assert (ROOT / 'tests' / 'data.txt').read_text()\n"
+            "def test_rebound(f, x):\n"
+            "    program = jax.jit(f).lower(x).as_text()\n"
+            "    program = parse(program)\n"
+            "    assert program\n"),
+    })
+    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (9, 12, 14, 15, 17, 20, 23)]
+
+
 def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_report_is_not(tmp_path):
     """SLOP011: a sentence the test spells, looked for in the output pytest captured, however the test
     holds it (`capsys.readouterr()`'s `.out`, a name for the capture or its `.out`, the pair unpacked,

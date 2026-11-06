@@ -97,7 +97,8 @@ class _Taint:
             func = node.func
             if _resolved(func, self.tables) in TEXT_CALLS:
                 return any(self.text(argument) for argument in node.args)
-            return isinstance(func, ast.Attribute) and func.attr in STRING_METHODS and self.text(func.value)
+            return (isinstance(func, ast.Attribute) and func.attr in STRING_METHODS | FILE_READERS
+                    and self.text(func.value))
         if isinstance(node, ast.Lambda | ast.Dict | ast.DictComp):
             return False
         return any(self.text(child) for child in ast.iter_child_nodes(node))
