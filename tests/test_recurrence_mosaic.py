@@ -969,9 +969,13 @@ NEIGHBOURS = 3
 side of the derived one and its stages' other depth), the resource gate's variant groups (`GATE_GROUPS`)."""
 
 
+TWO_ROLES = 'two roles'
+"""A training group's variant: its walks at two consumer roles a program (`Tiles.walkers`), compiled apart
+from its derived tiles."""
+
 GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHAPES
                for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True)
-               for training in (False, True) for variant in (None, *range(NEIGHBOURS))
+               for training in (False, True) for variant in (None, TWO_ROLES, *range(NEIGHBOURS))
                if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
                and (name != 'a 192-wide value head' or (training and dtype == jnp.bfloat16 and not packed))
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
@@ -980,15 +984,18 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                                                            ('kimi-linear-kda, no floor', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16),
                                                            ('a 192-wide value head', jnp.bfloat16)})
-               and not (variant is not None and (training or packed or dtype == jnp.float32))]
+               and not (variant == TWO_ROLES and not (training and not packed))
+               and not (isinstance(variant, int) and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
 geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the training pass of the
 gated delta rule in both and of Kimi delta attention and the SSD in 16 bits (Kimi's keys, 128 wide, past what
 an fp32 call takes under a decay a key dimension), and the 192-wide value head's 16-bit training pass alone;
 one row's 16-bit forward at its derived tiles apart from
-each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none). One test
+each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none), and one
+row's training pass at its derived tiles apart from its walks at two roles (`TWO_ROLES`). One test
 compiling them all took 674 seconds on sm90, a group with its variants 132 on sm80, and Kimi Linear's three
-variants 117 on sm80 at 9e65ee222's gate, each about the forward's 89 (armada)."""
+variants 117 on sm80 at 9e65ee222's gate, each about the forward's 89 (armada); the 27B's fp32 training pass
+with its two-role walks 130.2 s on sm90 (train 630's CI, main f424ab7d8)."""
 
 
 
@@ -1045,7 +1052,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind=kind) for tiles, kind in unheld]
             tiled = template.MOSAIC.variants(bound)
-            if variant is not None:
+            if isinstance(variant, int):
                 assert len(tiled) - 1 <= NEIGHBOURS, f"{name} has {len(tiled) - 1} variants, past NEIGHBOURS"
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind='') for tiles in tiled[1:][variant:variant + 1]]
@@ -1073,6 +1080,11 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                                        wide=derived.block_o or derived.block_v)
                if family.consumers >= 2 and not packed and value_width // derived.block_v % 2 == 0 else None)
         walked = [] if two is None else [(two, 'two roles ')]
+        if variant == TWO_ROLES:
+            return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
+                    for tiles, kind in walked]
+        # A training pass's two-role walks a group of their own (`TWO_ROLES`).
+        walked = [] if training else walked
         # A forward without a gradient at its own tiles (`Tiles.forward`), which no fast backward narrows.
         alone = [] if training or derived.forward is None else [(derived.forward, 'alone ')]
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
