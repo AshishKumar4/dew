@@ -179,6 +179,18 @@ each row's shift, reach, unshifted denominator and liveness), each held by the f
 row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`guarded_tiles`)."""
 
 
+def guarded_family(family: mosaic.Family, rows: int, block: int, columns: int) -> mosaic.Family:
+    """A guarded launch's family at its `rows` x `block` share, arranged so its keys' magnitudes
+    (`Family.key_magnitudes`: a `[columns, block]` value block read transposed in its layout) take whole row
+    atoms (`Issuer.transposed_rows`): at the share's own arrangement where they do, else at the columns'
+    rows (an A100's 256-wide softcap forward, 32 columns at a 64 x 32 share, cast to no 64-row atom,
+    et-sm80sc5)."""
+    arranged = family.specialized(rows, block)
+    if columns % arranged.transposed_rows == 0:
+        return arranged
+    return family.specialized(min(rows, columns), block)
+
+
 def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int, *,
                   held_only: bool = True) -> Tiles | None:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): the largest of the
@@ -199,8 +211,8 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     walks whatever its legality (a resource witness lowers as pinned)."""
     def held(candidate: Tiles) -> bool:
         rows, block = candidate.block_q, candidate.block_k
-        # Priced in the layout the guarded launch takes at its share (`bundle_of`).
-        arranged = family.specialized(rows, block)
+        # Priced in the layout the guarded launch takes at its share (`guarded_family`).
+        arranged = guarded_family(family, rows, block, columns)
         carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
         logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
         fragments = _products(arranged, dtype, (rows, width, block, logits, False, True),
@@ -408,7 +420,8 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
             guard = _Guard(flags.rows)
             launched = _launch(
                 q, k, v, guarded_spans, held._replace(output=()), guard, spec=form, hooks=_unhooked(hooks),
-                tiles=guarded, family=bundle_of(guarded, q.dtype), training=False, interpret=interpret,
+                tiles=guarded, training=False, interpret=interpret,
+                family=guarded_family(bundle_of(guarded, q.dtype), guarded.block_q, guarded.block_k, unit),
                 columns=first,
                 splits=rewalk_splits, table=paged, sources=sources,
                 out_dtype=jnp.float32 if hooked_blocks else out_dtype,
