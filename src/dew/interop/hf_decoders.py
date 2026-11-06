@@ -49,6 +49,7 @@ from dew.interop.decoder_parts import (
     AudioFields,
     DecoderFamily,
     DecoderFields,
+    ExportRefused,
     Reading,
     SourceCode,
     WrapperFields,
@@ -1317,7 +1318,7 @@ def export_config(model) -> Mapping[str, object]:
     if chunked and 'attention_chunk_size' not in exported:
         # Llama 4's attention_chunk_size is the one config field a chunk
         # goes back out under.
-        raise ValueError(
+        raise ExportRefused(
             f"kinds {chunked} attend by chunk, which the {family.export_model_type} "
             f"config does not carry")
     sandwich = bool(model.sandwich_norms)
@@ -1357,12 +1358,12 @@ def export_config(model) -> Mapping[str, object]:
     # family that would drop the dial is refused naming it.
     if (model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias
             and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo', 'llada2_moe')):
-        raise ValueError(
+        raise ExportRefused(
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
                 "and dream references build, so the model cannot be written as "
                 f"{family.export_model_type}")
     if model.attn_logit_softcap is not None and family.export_model_type != 'gemma2':
-        raise ValueError(
+        raise ExportRefused(
             "attn_logit_softcap is applied by the gemma2 reference alone, so "
             f"the model cannot be written as {family.export_model_type}")
     types = model.per_layer_types
@@ -1406,7 +1407,7 @@ def export_config(model) -> Mapping[str, object]:
                                  or local_theta is not None)
     if per_kind:
         if not sandwich:
-            raise ValueError(
+            raise ExportRefused(
                 f"the rotary ramp differs between the layer kinds {sorted(tables)}, "
                 f"and the {family.export_model_type} reference rotates every layer "
                 "at one table; the model cannot be written back")
@@ -1472,12 +1473,12 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
     try:
         rebuilt = from_record(CausalTransformer, {**translate_config(config), 'dtype': model.dtype})
     except KeyError as error:
-        raise ValueError(f"the {config['model_type']} config written for this model lacks {error}, which "
-                         f"that family reads: this model's computation (its mixer or experts) has no "
-                         f"exported config; no exported family carries it") from error
+        raise ExportRefused(f"the {config['model_type']} config written for this model lacks {error}, which "
+                            f"that family reads: this model's computation (its mixer or experts) has no "
+                            f"exported config; no exported family carries it") from error
     except ValueError as error:
-        raise ValueError(f"the {config['model_type']} config written for this model does not read back: "
-                         f"{error}") from error
+        raise ExportRefused(f"the {config['model_type']} config written for this model does not read back: "
+                            f"{error}") from error
     lost: dict[str, tuple[str, str]] = {}
     for declared in dataclasses.fields(model):
         if declared.name in _RUNTIME_FIELDS:
@@ -1487,7 +1488,7 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
         if ours != theirs:
             lost[declared.name] = (repr(theirs), repr(ours))
     if lost:
-        raise ValueError(
+        raise ExportRefused(
             f"{sorted(lost)} would not survive an export as {config['model_type']}: its config reads back "
             f"{', '.join(f'{name}={read}' for name, (read, _) in lost.items())} where this model has "
             f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, "

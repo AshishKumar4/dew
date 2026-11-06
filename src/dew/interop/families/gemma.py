@@ -41,6 +41,7 @@ from dew.interop.decoder_parts import (
     read_rope,
     read_rope_theta,
     refuse,
+    refuse_export,
     specified_layer_types,
 )
 from dew.interop.layouts import Condition, Config, Route, Table, one_of
@@ -422,36 +423,36 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
     for name in ('output_gate', 'attention_sinks', 'attn_logit_softcap', 'altup',
                  'laurel_rank', 'activation_sparsity_pattern', 'num_nextn_predict_layers', 'dropout_rate'):
         if getattr(model, name):
-            refuse(name, 'the standalone Gemma4 reference has no such computation')
+            refuse_export(name, 'the standalone Gemma4 reference has no such computation')
     if model.partial_rotary_factor is not None and model.partial_rotary_type != 'proportional':
-        refuse('partial_rotary_type', 'Gemma4 full layers use proportional rotary')
+        refuse_export('partial_rotary_type', 'Gemma4 full layers use proportional rotary')
     if model.layer_scalar not in ('frozen', 'trainable'):
-        refuse('layer_scalar', 'Gemma4 exports an explicit frozen or trainable scalar value')
+        refuse_export('layer_scalar', 'Gemma4 exports an explicit frozen or trainable scalar value')
     types = model.per_layer_types
     if not types or set(types) - {'sliding_attention', 'full_attention'}:
-        refuse('layer_types', 'Gemma4 has only sliding and full attention')
+        refuse_export('layer_types', 'Gemma4 has only sliding and full attention')
     if types[-1] != 'full_attention':
-        refuse('layer_types', 'Gemma4TextConfig forces the final layer to full attention')
+        refuse_export('layer_types', 'Gemma4TextConfig forces the final layer to full attention')
     for name in set(types):
         kind = model.kind_of(name)
         mixer = kind.mixer or model.mixer
         if mixer is not None and not isinstance(mixer, AttentionMixer):
-            refuse(f'kinds.{name}.mixer', 'Gemma4 uses ordinary attention')
+            refuse_export(f'kinds.{name}.mixer', 'Gemma4 uses ordinary attention')
         if isinstance(mixer, AttentionMixer) and (
             mixer.bidirectional_images or mixer.bidirectional_blocks or mixer.mrope_section is not None
         ):
-            refuse(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
+            refuse_export(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
         if kind.rope_scaling is not None:
-            refuse(f'kinds.{name}.rope', 'Gemma4 uses plain local and proportional global rotary')
+            refuse_export(f'kinds.{name}.rope', 'Gemma4 uses plain local and proportional global rotary')
     full = model.kind_of('full_attention')
     local = model.kind_of('sliding_attention') if 'sliding_attention' in types else full
     if full.window is not None:
-        refuse('kinds.full_attention.window', 'full attention is unwindowed')
+        refuse_export('kinds.full_attention.window', 'full attention is unwindowed')
     if 'sliding_attention' in types and (local.window is None or local.window < 1):
-        refuse('kinds.sliding_attention.window', 'sliding attention needs a positive window')
+        refuse_export('kinds.sliding_attention.window', 'sliding attention needs a positive window')
     sharing = model.sharing_layers
     if sharing != tuple(range(model.num_layers - len(sharing), model.num_layers)):
-        refuse('kv_shared_layers', 'Gemma4 can express only a trailing run of shared-KV layers')
+        refuse_export('kv_shared_layers', 'Gemma4 can express only a trailing run of shared-KV layers')
     mixture = model.mixture
     fields: dict[str, object] = {
         'hidden_act': None, 'hidden_activation': hf_activation(model.mlp),
@@ -477,7 +478,7 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
     }
     if mixture is not None:
         if not mixture.parallel or tuple(model.sparse_layers) != tuple(range(model.num_layers)):
-            refuse('mixture', 'Gemma4 routes a parallel expert branch on every layer')
+            refuse_export('mixture', 'Gemma4 routes a parallel expert branch on every layer')
         fields.update(num_experts=mixture.experts, top_k_experts=mixture.top_k,
                       moe_intermediate_size=mixture.expert_features or model.hidden_features)
     return fields

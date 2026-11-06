@@ -273,15 +273,26 @@ def refuse_encoder_fields(text: Mapping[str, object]) -> None:
                     "the decoder has no cross attention, no encoder to tie against and no pruned heads")
 
 
+class ExportRefused(ValueError):
+    """A model its family's layout cannot write: a field its config has no spelling for, a computation its
+    reference does not run (`refuse_export`), a config that reads back as another model
+    (`hf_decoders.refuse_lossy_export`). `dew.interop.layouts.source_layout` reports it as `Unwritable`."""
+
+
+def refuse_export(field: str, detail: str) -> NoReturn:
+    """Refuse to write a model's `field` in its family's layout, saying why (`detail`)."""
+    raise ExportRefused(f"{field}: {detail}")
+
+
 def fixed_fields(model: CausalTransformer, fixed: Mapping[str, object], message: str) -> None:
-    """Refuse `model` wherever it disagrees with a value its family fixes.
+    """Refuse to write `model` wherever it disagrees with a value its family fixes.
 
     `message` is formatted with the expected value, so each family's refusal
     names itself and what it computes.
     """
     for name, expected in fixed.items():
         if getattr(model, name) != expected:
-            refuse(name, message.format(expected))
+            refuse_export(name, message.format(expected))
 
 
 type Llama3Ramp = NativeFields[RopeScaling]
@@ -1553,8 +1564,8 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     record = model_record(model)
     missing = unrouted(family, model, variables)
     if missing:
-        raise ValueError(f"{', '.join('/'.join(path) for path in missing)} has no tensor in the "
-                         f"{family.export_model_type} layout, so the model cannot be written as it")
+        raise ExportRefused(f"{', '.join('/'.join(path) for path in missing)} has no tensor in the "
+                            f"{family.export_model_type} layout, so the model cannot be written as it")
 
     leaves = dict(_export_leaves(model, variables))
 

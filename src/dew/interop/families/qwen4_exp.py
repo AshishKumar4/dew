@@ -27,6 +27,7 @@ from dew.interop.decoder_parts import (
     LINEAR_FIELDS,
     DecoderFamily,
     DecoderFields,
+    ExportRefused,
     Renames,
     in_layer,
     kinds_of,
@@ -220,8 +221,8 @@ def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
     # The hybrid block's own fields (`qwen_hybrid_export`), its delta net's and its rotary's fraction.
     hybrid = qwen_hybrid_export(model)
     if len(qsa) + len(delta) != len(mixers) or len(qsa) > 1 or len(delta) > 1 or mixture is None:
-        raise ValueError("a qwen4_exp_text config states one QSA attention, one gated delta net and routed "
-                         f"experts in every layer; this model's layers are {list(mixers.values())}")
+        raise ExportRefused("a qwen4_exp_text config states one QSA attention, one gated delta net and "
+                            f"routed experts in every layer; this model's layers are {list(mixers.values())}")
     fields: dict[str, object] = {
         'layer_types': ['qwen_sparse_attention' if isinstance(mixers[kind], QSAAttentionMixer)
                         else 'linear_attention' for kind in model.per_layer_types],

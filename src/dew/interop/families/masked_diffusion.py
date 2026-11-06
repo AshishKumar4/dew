@@ -17,6 +17,7 @@ from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
+    ExportRefused,
     MaskedWalk,
     Packed,
     Renames,
@@ -29,6 +30,7 @@ from dew.interop.decoder_parts import (
     record_float,
     record_int,
     refuse,
+    refuse_export,
     spelled,
 )
 from dew.interop.families.deepseek import deepseek_mixture
@@ -547,14 +549,14 @@ def _llada_moe_export(model: CausalTransformer) -> Mapping[str, object]:
 def _llada2_export(model: CausalTransformer) -> Mapping[str, object]:
     mixture = model.mixture
     if mixture is None:
-        refuse('mixture', 'the LLaDA2 source format describes a routed decoder')
+        refuse_export('mixture', 'the LLaDA2 source format describes a routed decoder')
     layers = mixture.layers if mixture.layers is not None else tuple(range(model.num_layers))
     first = layers[0]
     if layers != tuple(range(first, model.num_layers)):
-        refuse('mixture.layers', 'LLaDA2 routes every layer after first_k_dense_replace')
+        refuse_export('mixture.layers', 'LLaDA2 routes every layer after first_k_dense_replace')
     width = mixture.expert_features or model.hidden_features
     if mixture.shared_features % width:
-        refuse('mixture.shared_features', 'LLaDA2 counts whole shared experts of the routed width')
+        refuse_export('mixture.shared_features', 'LLaDA2 counts whole shared experts of the routed width')
     return {
         **_mask_token_export(model), 'num_experts': mixture.experts,
         'num_experts_per_tok': mixture.top_k,
@@ -580,7 +582,7 @@ def _mask_token_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _diffusion_gemma_export(model: CausalTransformer) -> Mapping[str, object]:
-    raise ValueError(
+    raise ExportRefused(
         "diffusion_gemma_text is a cache-reading view; export the complete native DiffusionGemma wrapper"
     )
 

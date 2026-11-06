@@ -31,6 +31,7 @@ from dew.interop.decoder_parts import (
     record_float,
     record_int,
     refuse,
+    refuse_export,
     specified_layer_types,
 )
 from dew.interop.families.deepseek import LAYOUT_FIELDS, deepseek_config, deepseek_mixture
@@ -195,16 +196,16 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
                  'GLM5 requires {0!r}')
     hc = model.hyper_connections
     if hc is None or hc.head != 'mean':
-        refuse('hyper_connections', 'GLM5 contracts mHC streams by their unweighted mean')
+        refuse_export('hyper_connections', 'GLM5 contracts mHC streams by their unweighted mean')
     if model.sharing_layers:
-        refuse('kv_shared_layers', 'the supported GLM5 layout owns an indexer per sparse layer')
+        refuse_export('kv_shared_layers', 'the supported GLM5 layout owns an indexer per sparse layer')
     if model.num_nextn_predict_layers not in (0, 1):
-        refuse('num_nextn_predict_layers', 'GLM5 has zero or one plain prediction depth')
+        refuse_export('num_nextn_predict_layers', 'GLM5 has zero or one plain prediction depth')
     if model.swiglu_limit is None:
-        refuse('swiglu_limit', 'GLM5 clamps both dense and routed SwiGLU branches')
+        refuse_export('swiglu_limit', 'GLM5 clamps both dense and routed SwiGLU branches')
     types = model.per_layer_types
     if len(types) != model.num_layers or set(types) - {'linear_attention', 'full_attention'}:
-        refuse('layer_types', 'GLM5 uses linear and NoPE sparse attention')
+        refuse_export('layer_types', 'GLM5 uses linear and NoPE sparse attention')
     linear, sparse = KimiDeltaAttentionMixer(), KPoolSparseAttentionMixer()
     for kind_name in set(types):
         mixer = model.kind_of(kind_name).mixer or model.mixer
@@ -213,7 +214,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         elif kind_name == 'full_attention' and isinstance(mixer, KPoolSparseAttentionMixer):
             sparse = mixer
         else:
-            refuse(f'kinds.{kind_name}.mixer', 'GLM5 requires KDA or k-pool attention respectively')
+            refuse_export(f'kinds.{kind_name}.mixer', 'GLM5 requires KDA or k-pool attention respectively')
     mixture = model.mixture
     routed = model.sparse_layers
     fields: dict[str, object] = {
@@ -239,7 +240,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
     if mixture is not None:
         width = mixture.expert_features or model.hidden_features
         if mixture.shared_features < width or mixture.shared_features % width:
-            refuse(
+            refuse_export(
                 "mixture.shared_features", "GLM5 needs an integral positive count of shared expert widths"
             )
         fields.update(

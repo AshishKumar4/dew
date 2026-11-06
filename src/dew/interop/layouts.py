@@ -19,6 +19,8 @@ import functools
 import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from os import PathLike
+from pathlib import Path as FilePath
 from types import MappingProxyType
 from typing import Protocol
 
@@ -417,6 +419,71 @@ class Unwritable:
         return False
 
 
+@dataclass(frozen=True)
+class SourceLayout:
+    """A model's release layout (`source_layout`): the config.json it is written with (`config`), each
+    component folder a bundle keeps beside it, by the folder, with its config (`folders`; none for a
+    decoder), its variables in the release's names (`tensors`), and the modules its family's own code
+    is (`assets`), which a release transformers has no class for writes beside its weights."""
+
+    config: Mapping[str, object]
+    folders: Mapping[str, Mapping[str, object]]
+    writer: Callable[[Mapping[str, object]], Mapping[str, object]]
+    code: object | None = None
+    """The family's `SourceCode`, whose modules `assets` writes; None for a family transformers implements."""
+
+    def tensors(self, variables: Mapping[str, object]) -> Mapping[str, object]:
+        """`variables` (the model's, every collection) as the release's tensors, by their names, each built
+        when it is read (`safetensors_io.LazyTensors`)."""
+        return self.writer(variables)
+
+    def assets(self, directory: str | PathLike) -> None:
+        """Write the modules the family's own code is into `directory`, beside its weights."""
+        if self.code is None:
+            return
+        from dew.interop import sources
+
+        for name, module in sorted(sources.code_modules(self.code).items()):
+            written = FilePath(directory) / name
+            written.parent.mkdir(parents=True, exist_ok=True)
+            written.write_bytes(module.read_bytes())
+
+
+def source_layout(model: object, *, config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
+    """The layout `model` is written in as its family's release, or what it cannot write (`Unwritable`):
+    the one answer every writer asks (a run's export, a bundle's save, a decision's release). A decoder's
+    family is the one its fields match (`hf_decoders.export_config`), its config the one it writes there,
+    read back as the same model (`refuse_lossy_export`), and every parameter and router state a route of
+    the family's writes (`decoder_parts.unrouted`). `config` is a loaded source's own config.json, which a
+    save writes as published, its representability still the model's."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.interop import decoder_parts, hf_decoders
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import from_record
+
+    if not isinstance(model, CausalTransformer):
+        return Unwritable(f"no family writes a {type(model).__name__}")
+    decoder = from_record(CausalTransformer, model)
+    if decoder.cross_attention is not None or decoder.dex is not None:
+        return Unwritable("cross-attention and DEX have no layout in any family")
+    try:
+        written = hf_decoders.export_config(decoder)
+    except decoder_parts.ExportRefused as refusal:
+        return Unwritable(str(refusal))
+    family = hf_decoders.families()[str(written['model_type'])]
+    shapes = jax.eval_shape(lambda: decoder.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32)))
+    missing = decoder_parts.unrouted(family, decoder, shapes)
+    if missing:
+        return Unwritable(f"{', '.join('/'.join(path) for path in missing)} has no tensor in the "
+                          f"{family.export_model_type} layout")
+    stated = written if config is None else config
+    return SourceLayout(stated, {},
+                        lambda variables: hf_decoders.export_decoder_weights(decoder, variables, stated),
+                        hf_decoders.release_code(decoder))
+
+
 __all__ = ["INDEX", "Condition", "Config", "Copy", "Leaf", "Path", "Prefixed", "Rebased", "Renames",
-           "Route", "Routes", "Slot", "Spelled", "Table", "Unwritable", "When", "after", "mapped", "nested",
-           "one_of", "renamed"]
+           "Route", "Routes", "Slot", "SourceLayout", "Spelled", "Table", "Unwritable", "When", "after",
+           "mapped", "nested", "one_of", "renamed", "source_layout"]

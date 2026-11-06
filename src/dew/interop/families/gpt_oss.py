@@ -18,6 +18,7 @@ from dew.interop.decoder_parts import (
     base_config,
     read_rope,
     refuse,
+    refuse_export,
     spelled,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -62,7 +63,7 @@ _GPT_OSS_LEAVES: Leaves = {
 def _gpt_oss_export(model: CausalTransformer) -> Mapping[str, object]:
     mixture = model.mixture
     if mixture is None:
-        refuse('mixture', 'GPT OSS needs routed experts')
+        refuse_export('mixture', 'GPT OSS needs routed experts')
     # A plain rotary is written as a plain record: an omitted one reads as the class's YaRN.
     yarn = model.rope_scaling if isinstance(model.rope_scaling, YarnScaling) else None
     rope = ({'rope_type': 'default', 'rope_theta': model.rope_theta} if yarn is None

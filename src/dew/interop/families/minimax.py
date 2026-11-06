@@ -31,6 +31,7 @@ from dew.interop.decoder_parts import (
     MOE_NAMES,
     DecoderFamily,
     DecoderFields,
+    ExportRefused,
     RopeSpelling,
     base_config,
     kind_mixers,
@@ -172,9 +173,9 @@ def _lightning(model: CausalTransformer) -> list[LightningAttentionMixer]:
 def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
     """No config: no runtime outside Dew computes this family as its release does (the module docstring),
     so a Hugging Face checkpoint of it would open as another model."""
-    raise ValueError("MiniMax-Text-01 and M1 write no Hugging Face checkpoint: transformers' MiniMax turns "
-                     "every dimension of a head and scales its lightning rates otherwise, and the release's "
-                     "own code does not import under transformers 5 (ledgers 2534, 2535)")
+    raise ExportRefused("MiniMax-Text-01 and M1 write no Hugging Face checkpoint: transformers' MiniMax "
+                        "turns every dimension of a head and scales its lightning rates otherwise, and the "
+                        "release's own code does not import under transformers 5 (ledgers 2534, 2535)")
 
 
 MINIMAX = DecoderFamily(

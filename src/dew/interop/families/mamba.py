@@ -17,7 +17,14 @@ from functools import partial
 
 from dew import _records
 from dew.interop import mamba2
-from dew.interop.decoder_parts import DecoderFamily, DecoderFields, record_bool, record_int, refuse
+from dew.interop.decoder_parts import (
+    DecoderFamily,
+    DecoderFields,
+    record_bool,
+    record_int,
+    refuse,
+    refuse_export,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba import MambaMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
@@ -78,8 +85,9 @@ def _export(model: CausalTransformer) -> Mapping[str, object]:
     assert isinstance(mixer, MambaMixer), "the family matches a mamba mixer alone"
     expand, remainder = divmod(mixer.intermediate_size, model.emb_features)
     if remainder:
-        refuse(f"intermediate_size {mixer.intermediate_size}",
-               f"MambaConfig states the inner width as a whole multiple of hidden_size {model.emb_features}")
+        refuse_export(f"intermediate_size {mixer.intermediate_size}",
+                      "MambaConfig states the inner width as a whole multiple of hidden_size "
+                      f"{model.emb_features}")
     return {
         "expand": expand, "state_size": mixer.state_size, "time_step_rank": mixer.time_step_rank,
         "conv_kernel": mixer.conv_kernel, "use_bias": mixer.use_bias, "use_conv_bias": mixer.use_conv_bias,

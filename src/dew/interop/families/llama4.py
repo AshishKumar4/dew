@@ -16,6 +16,7 @@ from dew.interop.decoder_parts import (
     MOE_SHARED,
     DecoderFamily,
     DecoderFields,
+    ExportRefused,
     KindFields,
     Leaves,
     MixtureFields,
@@ -122,7 +123,7 @@ def _llama4_export(model: CausalTransformer) -> Mapping[str, object]:
     tunings, half-pair rotation) is refused by the export's round trip (`refuse_lossy_export`)."""
     chunks = {kind.chunk for kind in (model.kinds or {}).values() if kind.chunk is not None}
     if len(chunks) > 1:
-        raise ValueError(
+        raise ExportRefused(
             f"the kinds chunk at {sorted(chunks)}, and Llama 4's config carries one "
             "attention_chunk_size")
     types = model.per_layer_types

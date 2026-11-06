@@ -33,6 +33,7 @@ from dew.interop.decoder_parts import (
     native_fields,
     read_rope,
     refuse,
+    refuse_export,
     specified_layer_types,
 )
 from dew.interop.layouts import Config, Route, Table
@@ -204,9 +205,9 @@ def _dory_export(model: CausalTransformer) -> Mapping[str, object]:
     mlp = mixers.pop('mlp', None)
     if (ngpt is None or loop is None or not loop.reinject or model.tie_embeddings or model.mlp_features
             or set(mixers) - set(_SUBLAYERS) or not isinstance(mlp, MLPMixer | None)):
-        refuse('an nGPT decoder without a reinjecting loop, with tied embeddings, or with a block of '
-               'two sublayers or of another kind', "a Dory layer is an attention or an MLP, the "
-               "recurrent ones reinjecting the input layers' output, under a head of its own")
+        refuse_export('an nGPT decoder without a reinjecting loop, with tied embeddings, or with a block of '
+                      'two sublayers or of another kind', "a Dory layer is an attention or an MLP, the "
+                      "recurrent ones reinjecting the input layers' output, under a head of its own")
     first, end = loop.layers or (0, model.num_layers)
 
     def rope(kind: str) -> Mapping[str, object]:
