@@ -70,9 +70,13 @@ def test_every_task_a_registered_objective_saves_its_runs_as_is_a_saved_kinds(tm
     task of a kind the corpus saves a run of (`SAVED_KINDS`), so a run of it a main saved exports and loads
     back as its run (`test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run`); a
     masked-diffusion run's task had no kind."""
+    def built(kind: str):
+        # Each kind's run built in a directory of its own, as the corpus's writer builds it.
+        (tmp_path / kind).mkdir()
+        return SAVED_KINDS[kind](tmp_path / kind, drawn=False)
+
     declared = {objectives[name].saved_task for name in objectives} - {None}
-    saved = {objectives[build(tmp_path / kind, drawn=False).objective.name].saved_task
-             for kind, build in SAVED_KINDS.items()}
+    saved = {objectives[built(kind).objective.name].saved_task for kind in SAVED_KINDS}
     assert declared <= saved, sorted(task.__name__ for task in declared - saved)
 
 
