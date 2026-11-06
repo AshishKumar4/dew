@@ -201,13 +201,10 @@ class DecisionSource(SourceKind):
             layout = MarkerLayout(max_len=_records.integer(config.get("max_len", 512), "max_len"),
                                   head_max_len=head_max_len, option_tokens=option_tokens,
                                   parallel=config.get("option_layout", "sequential") == "parallel")
-            values = config.get("temperature", [1.0, 1.0, 1.0])
-            if not isinstance(values, list) or len(values) != 3:
-                raise ValueError("temperature lists choice, score and noul")
             buckets = _records.record(config.get("temperature_by_options", {}), "temperature_by_options")
+            types, default = _laya_temperature(config.get("temperature", 1.0))
             calibration = Calibration(Temperatures(
-                dict(zip(("choice", "score", "noul"), (_records.number(x, "temperature") for x in values),
-                         strict=True)), {key: _records.number(value, key) for key, value in buckets.items()}))
+                types, {key: _records.number(value, key) for key, value in buckets.items()}, default=default))
             # The layout and calibration the release states, over those Laya's own file derives.
             derived = layout
             layout, calibration = released_decision(directory, layout, calibration, kind=QuestionLayout)
@@ -234,3 +231,15 @@ class DecisionSource(SourceKind):
         return CompositeSource(backbone, head, PretrainedDecision.from_components, tokenizer_folder,
                                {"layout": layout, "calibration": calibration, "assumed": assumed,
                                 "strict_specials": strict_specials, "writer": writer, "exporter": exporter})
+
+
+
+def _laya_temperature(stated: object) -> tuple[dict[str, float], float]:
+    """Laya's `temperature` as `Temperatures`' types and default: a list of choice's, score's and noul's, or
+    one number over every type (a release's global temperature)."""
+    if isinstance(stated, list):
+        if len(stated) != 3:
+            raise ValueError("temperature lists choice, score and noul, or is one number over every type")
+        return dict(zip(("choice", "score", "noul"), (_records.number(x, "temperature") for x in stated),
+                        strict=True)), 1.0
+    return {}, _records.number(stated, "temperature")

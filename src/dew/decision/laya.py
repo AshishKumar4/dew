@@ -116,7 +116,7 @@ class LayaCheckpoint:
             "head_layers": head.layers, "max_len": self.layout.max_len,
             "head_max_len": self.layout.head_max_len, "option_tokens": self.layout.option_tokens,
             "option_layout": "parallel" if self.layout.parallel else "sequential",
-            "temperature": [applied.types.get(kind, 1.0) for kind in ("choice", "score", "noul")],
+            "temperature": [applied.types.get(kind, applied.default) for kind in ("choice", "score", "noul")],
             "temperature_by_options": dict(applied.buckets),
         }, indent=2) + "\n")
         # Laya's file holds the temperatures and no more of a calibration (its own, binning and abstention).

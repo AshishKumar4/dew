@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A decision release may state one temperature over every question type (`Temperatures.default`): Laya's
+  `rl_agent_config.json` takes a number for `temperature` beside its per-type list, and a release record's
+  calibration states it for formats whose files hold none.
 - A trained model whose objective declares no inference task (a JEPA encoder, a control policy, a DreamerV3
   agent) exports as a native release: `dew export` writes its weights as safetensors and its model, settings
   and numerics in the release record, and `dew.pipeline` loads it back from a directory or the Hub as the
