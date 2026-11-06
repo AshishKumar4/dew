@@ -39,6 +39,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
@@ -46,7 +47,7 @@ from jax.extend import core as jax_core
 
 from dew import algebra
 from dew.nn import programs
-from dew.nn.kernels import gemm
+from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
 
 FUSION_ROW = 'ledger 1295'
@@ -60,42 +61,87 @@ AXES = ('rows', 'columns')
 def fusible_gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *,
                  transpose_rhs: bool = False, interpret_on_cpu: bool = False) -> jax.Array:
     """`gemm.gemm`'s fp32 product of each group's rows of `lhs` and its matrix of `rhs`, its consumers
-    fused into the epilogue under `fuser.fuse` (the module's docstring)."""
+    fused into the epilogue under `fuser.fuse` (the module's docstring): `product` declared fp32."""
+    return product(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
+                   interpret_on_cpu=interpret_on_cpu)
+
+
+def product(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *,
+            transpose_rhs: bool = False, precision: PrecisionLike = None, out_dtype=None,
+            interpret_on_cpu: bool = False) -> jax.Array:
+    """The fusible product of each group's rows of `lhs` and its matrix of `rhs` (one matrix where
+    `group_sizes` is None, a dense dot), declared as the dot it stands for declares itself: its `precision`
+    (`gemm.gemm`'s) and its result dtype (`out_dtype`, `lhs`'s where None; a `preferred_element_type`'s).
+    Its products sum in fp32 at least and round once to `out_dtype`, the dot's own rounding, so its
+    consumers, fused into the template's epilogue under `fuser.fuse`, read the product exactly as the
+    program they came from does: the accumulator tile rounded to `out_dtype`, their first operation."""
+    declared = (precision, jnp.dtype(lhs.dtype if out_dtype is None else out_dtype))
     fusible = fuser.fusible(output_fusion_prefix=True)(
-        functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None))
+        functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None, declared))
     return fusible(lhs, rhs) if group_sizes is None else fusible(lhs, rhs, group_sizes)
 
 
-def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions):
+def fused(region, *inputs):
+    """`region(*inputs)`, a program's neighbourhood of one product written with `product` in place of its
+    dot, its producer and consumers fused into the template's prologue and epilogue where the kernels take
+    them tile by tile (`fuser.fuse`): the one entry a call site or a pass fuses a region through, so each
+    stage is its selector's decision and report (`EPILOGUE`, `PROLOGUE`)."""
+    return fuser.fuse(region)(*inputs)
+
+
+@dataclasses.dataclass(frozen=True)
+class Analysis:
+    """What `fused` makes of a region (`analysis`): each stage's route as its selector reported it
+    (`generation.Route`: the kernel it takes, its refusal's reason where the kernels cannot take it
+    tile by tile), and the product's launch's."""
+
+    epilogue: generation.Route | None
+    prologue: generation.Route | None
+    launch: generation.Route | None
+
+
+def analysis(region, *inputs) -> Analysis:
+    """`fused(region, *inputs)` traced for its shapes alone, nothing run: what its selectors decide."""
+    with generation.routes() as found:
+        jax.eval_shape(functools.partial(fused, region), *inputs)
+
+    def last(choice):
+        return next((route for route in reversed(found) if route.choice == choice), None)
+    return Analysis(last(EPILOGUE.choice), last(PROLOGUE.choice), last('grouped_matmul'))
+
+
+def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared: tuple, *fusions):
     """The fusible product: its operands from their fusions, its consumers (`fusions`' last) as the
-    template's epilogue where the kernels take them tile by tile, after its product in XLA otherwise."""
+    template's epilogue where the kernels take them tile by tile, after its product in XLA otherwise,
+    reading it as `declared` (its precision and result dtype, `product`)."""
+    precision, out_dtype = declared
     *operand_fusions, out_fusion = fusions
     lhs_fusion, *rest_fusions = operand_fusions
     lhs, prologue = _prologue(lhs_fusion)
     rhs, *rest = (fusion() for fusion in rest_fusions)
     group_sizes = None if dense else rest[0]
     if out_fusion is None:
-        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
-                             interpret_on_cpu=interpret_on_cpu, **prologue)
+        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
+                         precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
-    acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
+    acc = jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     leaves, treedef = jax.tree.flatten(values)
     axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
-        summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
-                               interpret_on_cpu=interpret_on_cpu, **prologue)
+        summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
+                           precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
         return consumer(values, summed)
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
-    epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc.shape)
+    epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc)
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
     consumed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
-                             epilogue_operands=tuple(zip(leaves, axes, strict=True)),
-                             out_dtype=dtypes[0], out_dtypes=dtypes if several else None,
-                             interpret_on_cpu=interpret_on_cpu, **prologue)
+                         epilogue_operands=tuple(zip(leaves, axes, strict=True)),
+                         out_dtype=dtypes[0], out_dtypes=dtypes if several else None, precision=precision,
+                         interpret_on_cpu=interpret_on_cpu, **prologue)
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
 
 
@@ -401,7 +447,7 @@ def _axes(consumer, values, acc) -> tuple | Refusal:
                     'value_off_axes', f"a captured {leaf.shape} array follows no launch axis tile by tile")
             named.append(AXES[axis])
         axes.append(tuple(named))
-    if _reads_position(tiled, value_specs, values, probe):
+    if _reads_position(tiled, value_specs, values, probe, acc.dtype):
         return Refusal('reads_position', "the consumer reads its tile's position")
     return tuple(axes)
 
@@ -462,25 +508,27 @@ def _is_spec(node) -> bool:
     return isinstance(node, pl.BlockSpec)
 
 
-def _reads_position(tiled, value_specs, values, probe) -> bool:
+def _reads_position(tiled, value_specs, values, probe, dtype) -> bool:
     """Whether the tiled consumer's outputs depend on the program ids it is given (an iota, a position
-    mask): the template's kernels place ragged tiles where no grid index says."""
+    mask): the template's kernels place ragged tiles where no grid index says. Its product tile is of
+    `dtype`, the product's declared one (`product`)."""
     tiles = jax.tree.map(lambda leaf, leaf_spec: jax.ShapeDtypeStruct(leaf_spec.block_shape, leaf.dtype),
                          values, value_specs, is_leaf=_is_spec)
-    tile = jax.ShapeDtypeStruct(probe, jnp.float32)
+    tile = jax.ShapeDtypeStruct(probe, dtype)
     closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
         (jnp.int32(0), jnp.int32(0)), tiles, tile)
     needed = gemm._needed(closed.jaxpr, closed.jaxpr.outvars)
     return any(var in needed for var in closed.jaxpr.invars[:2])
 
 
-def _tiled(consumer, treedef, value_types: tuple, out_treedef, whole: tuple, acc, *tiles):
-    """The consumer on one accumulator tile of `acc.shape` and the captured arrays' tiles beside it: its
-    block spec pulled at that block of the `whole` product it was traced at, so the same function serves
-    every kernel tile and XLA's whole array."""
+def _tiled(consumer, treedef, value_types: tuple, out_treedef, whole: jax.ShapeDtypeStruct, acc, *tiles):
+    """The consumer on one fp32 accumulator tile of `acc.shape`, rounded first to the product's declared
+    dtype (`whole`'s, the product it was traced at), and the captured arrays' tiles beside it: its block
+    spec pulled at that block of `whole`, so the same function serves every kernel tile and XLA's whole
+    array."""
     values = jax.tree.unflatten(treedef, [jax.ShapeDtypeStruct(t.shape, t.dtype) for t in value_types])
-    whole_acc = jax.ShapeDtypeStruct(whole, jnp.float32)
-    tiled, _, _ = fuser.pull_block_spec(consumer, _specs(consumer, values, whole_acc, acc.shape),
-                                        grid_len=2)(values, whole_acc)
-    outs = tiled((jnp.int32(0), jnp.int32(0)), (), jax.tree.unflatten(treedef, list(tiles)), acc)
+    tiled, _, _ = fuser.pull_block_spec(consumer, _specs(consumer, values, whole, acc.shape),
+                                        grid_len=2)(values, whole)
+    outs = tiled((jnp.int32(0), jnp.int32(0)), (), jax.tree.unflatten(treedef, list(tiles)),
+                 acc.astype(whole.dtype))
     return tuple(jax.tree.leaves(outs)) if out_treedef.num_leaves > 1 else jax.tree.leaves(outs)[0]
