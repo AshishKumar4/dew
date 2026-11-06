@@ -369,7 +369,8 @@ def test_a_parquet_store_reads_each_footer_once_however_many_reads_count_its_row
 def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
     """Every read builds by its data plan version (`dew.data.compile._build`): a pass, a publication and an
     export at one this Dew reads by none of is refused, as a run's compile is, where 11 read as 10 and 5 as
-    8 (train 654's review, row 4583)."""
+    8 (train 654's review, row 4583); a publication of it is refused where a version it read as already
+    published the store's generation too, which it would have returned."""
     from uuid import uuid4
 
     from dew.data.cache import Cache
@@ -378,8 +379,12 @@ def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
     chain = Pipeline(Files(written(f"version-{version}"), format="parquet"))
     with pytest.raises(ValueError):
         next(iter(iterate(chain, plan_version=version)))
+    cache = Cache(f"memory://parquet-files-refused-{uuid4().hex}")
     with pytest.raises(ValueError):
-        publish(chain, Cache(f"memory://parquet-files-refused-{uuid4().hex}"), plan_version=version)
+        publish(chain, cache, plan_version=version)
+    publish(chain, cache, plan_version=10 if version > 10 else 8)
+    with pytest.raises(ValueError):
+        publish(chain, cache, plan_version=version)
 
 
 def test_a_token_export_reads_its_documents_by_the_plan_version_it_names(tmp_path):
