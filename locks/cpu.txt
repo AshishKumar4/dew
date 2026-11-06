@@ -639,7 +639,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post59
+jax==0.12.0.1.post58
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
