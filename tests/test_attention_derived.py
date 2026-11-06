@@ -342,32 +342,47 @@ def test_the_accurate_backward_declaration_derives_on_par(walked, how):
                     f"accurate attention backward {walked}", seeds=16, truth_fn=xla_backward("causal"))
 
 
-def test_a_fast_tiles_cotangents_hold_each_anchor_keys_own_term_at_zero_where_its_mainloop_does():
-    """The fast backward tile's derived cotangents (`derived_cotangents`) where a mainloop marks each query's
-    anchor key (`anchored`, portable's and Triton's hand forms): each anchor key's dP less the anchor's own
-    held to exactly 0, so its cotangent is its weight times minus its query's D (0 where a query sees one
-    key), and every other key's the plain fast form's, bit for bit."""
+def test_a_fast_tiles_cotangents_take_their_mainloops_hand_order():
+    """The fast backward tile's derived cotangents (`derived_cotangents`) in each mainloop's own hand form's
+    order, bit for bit (each hand form's arithmetic in JAX): Mosaic's from its weights, `(e / T) ((dP - c)
+    - D)`; where a mainloop holds each query's anchor key (`anchored`, portable's and Triton's), its
+    anchor's own dP - c exactly 0 and each cotangent scaled before the denominator, `e (((dP - c) - D) /
+    T)`, so a weight below float32's least subnormal, its query resumed at a peak far above its logits,
+    keeps its cotangent (the fp32 small-weight edge), where the weights' order rounds it to 0."""
     rng = np.random.default_rng(4228)
-    logits = jnp.asarray(rng.standard_normal((16, 16)) * 3, jnp.float32)
-    products = jnp.asarray(rng.standard_normal((16, 16)), jnp.float32)
-    peak = jnp.max(logits, axis=1)
-    total = jnp.sum(jnp.exp(logits - peak[:, None]), axis=1)
-    at_anchor = jnp.arange(16)[None, :] == jnp.argmax(logits, axis=1)[:, None]
-    anchor = jnp.sum(jnp.where(at_anchor, products, 0.0), axis=1)
-    delta = jnp.asarray(rng.standard_normal(16), jnp.float32)
+    logits = rng.standard_normal((16, 16)).astype(np.float32) * 3
+    products = rng.standard_normal((16, 16)).astype(np.float32)
+    peak = logits.max(axis=1)
+    total = np.exp(logits - peak[:, None]).sum(axis=1).astype(np.float32)
+    # Query 0 resumed at a peak of 87 over a denominator of 2^25, one key's dP near 2^102.
+    logits[0], peak[0], total[0], products[0, 1] = 0.0, 87.0, 2.0 ** 25, 3.8e30
+    at_anchor = np.arange(16)[None, :] == logits.argmax(axis=1)[:, None]
+    anchor = np.where(at_anchor, products, 0).sum(axis=1).astype(np.float32)
+    delta = rng.standard_normal(16).astype(np.float32)
+    delta[0] = 0.0
     tiles = {"logits": logits, "products": products, "peak": peak, "total": total, "anchor": anchor,
              "delta": delta}
-    def cotangents(anchored: bool, tiles: dict):
+
+    def cotangents(anchored: bool, tiles: dict) -> np.ndarray:
         forms = attention_backward_algebra.derived_cotangents(keys_first=False, dropped=False, masked=False,
                                                              anchored=anchored)
-        _, weights, made = forms.mapped(tiles)
-        return np.asarray(weights), np.asarray(made)
+        return np.asarray(forms.mapped({name: jnp.asarray(value) for name, value in tiles.items()})[2])
 
-    _, plain = cotangents(anchored=False, tiles=tiles)
-    weights, anchored = cotangents(anchored=True, tiles={**tiles, "at_anchor": at_anchor})
-    held = np.asarray(at_anchor)
-    np.testing.assert_array_equal(anchored[held], (weights * (0.0 - np.asarray(delta)[:, None]))[held])
-    np.testing.assert_array_equal(anchored[~held], plain[~held])
+    @jax.jit
+    def hand(logits, products, peak, total, anchor, delta, at_anchor):
+        """Each hand form's cotangents, Mosaic's and an anchored mainloop's."""
+        e = jnp.exp(logits - peak[:, None])
+        over = (1 / total)[:, None]
+        about = products - anchor[:, None]
+        held = jnp.where(at_anchor, 0.0, about)
+        return (e * over) * (about - delta[:, None]), e * ((held - delta[:, None]) * over)
+
+    mosaic, anchored_hand = hand(*(jnp.asarray(value) for value in (*tiles.values(), at_anchor)))
+    plain = cotangents(anchored=False, tiles=tiles)
+    np.testing.assert_array_equal(plain, np.asarray(mosaic))
+    anchored = cotangents(anchored=True, tiles={**tiles, "at_anchor": at_anchor})
+    np.testing.assert_array_equal(anchored, np.asarray(anchored_hand))
+    assert anchored[0, 1] != 0 and plain[0, 1] == 0
 
 
 @contextlib.contextmanager
