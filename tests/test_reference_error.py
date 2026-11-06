@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from check1_wire import staged_units
+from check1_wire import CENSUS, staged_units
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -39,20 +39,26 @@ from reference_error import (
 from dew.nn.precision import accumulated
 
 
+@pytest.fixture
+def switched(monkeypatch):
+    """The gate's YNNPACK switch on, whatever the run (a census pass sets `CENSUS`): the switch's own tests
+    hold the switch."""
+    monkeypatch.delenv(CENSUS, raising=False)
+
+
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
-def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path, monkeypatch):
+@pytest.mark.usefixtures("switched")
+def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path):
     """Each of tests/ynn_programs.py's programs under `without_ynn` gives, bit for bit, what the same
     program gives jitted in a process whose XLA:CPU runs with every YNNPACK fusion off."""
 
     import ynn_programs
-    from reference_error import CENSUS, without_ynn
+    from reference_error import without_ynn
 
     out = tmp_path / "theirs.npz"
     flags = os.environ.get("XLA_FLAGS", "") + " --xla_cpu_experimental_ynn_fusion_type="
     subprocess.run([sys.executable, str(Path(ynn_programs.__file__)), str(out)], check=True,
                    env={**os.environ, "XLA_FLAGS": flags})
-    # The switch's own programs, the census off whatever this run is (the census pass sets it).
-    monkeypatch.delenv(CENSUS, raising=False)
     with np.load(out) as theirs:
         for name, value in ynn_programs.outputs(without_ynn).items():
             np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
@@ -64,8 +70,6 @@ def test_the_census_runs_the_gates_arms_as_xla_cpu_compiles_them_for_users(tmp_p
     fusions on: each of tests/ynn_programs.py's programs gives, bit for bit, what it gives jitted in a
     process of XLA:CPU's defaults (row 4471)."""
     import ynn_programs
-    from reference_error import CENSUS
-
     out, ours = tmp_path / "theirs.npz", tmp_path / "ours.npz"
     subprocess.run([sys.executable, str(Path(ynn_programs.__file__)), str(out)], check=True)
     census = "import sys, numpy as np, ynn_programs; from reference_error import without_ynn; " \
@@ -107,6 +111,7 @@ def written_attention(query, key, value):
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.usefixtures("switched")
 def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them(
         tmp_path, monkeypatch):
     """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
@@ -145,6 +150,7 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.usefixtures("switched")
 def test_a_process_whose_xla_refuses_the_ynn_options_moves_no_site_onto_the_fusions(monkeypatch):
     """Where XLA:CPU refuses WITHOUT_YNN's options themselves, a site of two Dew paths raises before
     deciding (`_ynn_option_held`), so it moves onto the fusions and passes nowhere."""
@@ -769,6 +775,7 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     assert_as_exact(_reordered, _product, _draw, "a compiled truth", seeds=8, truth_fn=truth)
 
 
+@pytest.mark.usefixtures("switched")
 def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm(monkeypatch):
     """Beside another Dew arm, an arm of Dew's own programs (`dew_programs`) runs with Dew's compile
     seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam
