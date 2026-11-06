@@ -60,7 +60,8 @@ def test_diagnostic():
                             "fusions": dict(operations), "dots": dict(dots)}), flush=True)
                         programs[arm_name] = "\n".join(
                             re.sub(r", metadata=\{[^}]*\}", "", line)
-                            for line in hlo.splitlines() if not line.startswith("HloModule"))
+                            for line in hlo.splitlines()
+                            if re.match(r"^(%|  (ROOT |%)|}|ENTRY)", line))
                         if "packed" in programs and "alone" in programs:
                             difference = list(difflib.unified_diff(programs["packed"].splitlines(),
                                                                  programs["alone"].splitlines()))
