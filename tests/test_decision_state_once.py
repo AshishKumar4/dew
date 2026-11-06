@@ -17,7 +17,9 @@ from test_decision_letters_context import LABELS, STATES
 from test_decision_streams import SPECIALS, TOKENIZER, in_streams
 
 from dew.batch import unboxed
+from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Example
+from dew.decision.head import JointSchemaHead, LabelReadout
 from dew.decision.layout import (
     AnswerCue,
     DecisionInputs,
@@ -28,6 +30,7 @@ from dew.decision.layout import (
     Text,
 )
 from dew.decision.model import DecisionModel, stream_runs
+from dew.decision.rows import Encoding, Fit
 from dew.decision.task import laid_out
 from dew.nn.attention_masks import visibility_mask
 
@@ -195,3 +198,80 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     assert [laid.name for laid in row.questions] == list(QUESTIONS)
     answers = decide(STATES[0], QUESTIONS)
     assert all(answers[name].choice in question.options for name, question in QUESTIONS.items())
+
+
+class Merging(ByteTokenizer):
+    """Bytes, but for "B. y", one token (256): a lettered row's tokens then depend on which option its second
+    slot shows, as a BPE vocabulary's do."""
+
+    MERGED = b"B. y"
+
+    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
+        data, ids, at = text.encode(), [], 0
+        while at < len(data):
+            merged = data.startswith(self.MERGED, at)
+            ids.append(256 if merged else data[at])
+            at += len(self.MERGED) if merged else 1
+        return ids
+
+    def decode(self, ids) -> str:
+        return b"".join(self.MERGED if int(id_) == 256 else bytes([int(id_)]) for id_ in ids).decode(
+            errors="replace")
+
+
+YES_NO = {"first": Choice("First?", ["no", "yes"]), "second": Choice("Second?", ["no", "yes"])}
+
+
+def test_a_draw_of_option_orders_that_splits_a_row_over_one_state_lays_it_as_fit_admitted():
+    """A row over one state that fits `max_len` in its questions' own option orders and would not in a
+    drawn one (a vocabulary that reads "B. yes" as fewer tokens than "B. no") is laid out, as Fit admitted
+    it, in one row of both questions, whatever order a training read draws (review of state-once)."""
+    tokenizer = Merging()
+    example = Example(STATES[0], YES_NO, {"first": "yes", "second": "yes"})
+    [row] = SHARED.rows(tokenizer, SPECIALS, STATES[0], YES_NO)
+    fitting = dataclasses.replace(SHARED, max_len=len(row.tokens))
+    assert len(fitting.rows(tokenizer, SPECIALS, STATES[0], YES_NO, orders={"first": [1, 0]})) == 2
+    encoding = Encoding(fitting, tokenizer, SPECIALS, width=4, shuffle=True)
+    for seed in range(16):
+        encoded = encoding(example, list(YES_NO), np.random.default_rng(seed))
+        assert len(encoded["tokens"]) == len(row.tokens)
+        assert int(np.sum(np.any(encoded["options"], axis=-1))) == len(YES_NO)
+
+
+def test_a_none_of_the_above_that_overfills_a_row_over_one_state_is_declined_where_it_is_fitted():
+    """Fit counts a "none of the above" whose added option leaves a row over one state no room as one row as
+    the read's declined draw (`unfit`), the row admitted as it is (review of state-once)."""
+    example = Example(STATES[0], YES_NO, {"first": "yes", "second": "yes"})
+    [row] = SHARED.rows(TOKENIZER, SPECIALS, STATES[0], YES_NO)
+    fitting = dataclasses.replace(SHARED, max_len=len(row.tokens))
+    head = LabelReadout(features=8, label_ids=(), count=4)
+    [fitted] = Fit(fitting, TOKENIZER, SPECIALS, head, none_of_the_above=1.0).map(
+        {"example": example})["decision_rows"]
+    assert fitted.names == tuple(YES_NO) and fitted.declined == "unfit"
+
+
+def test_a_head_that_reads_across_its_rows_questions_refuses_a_row_over_one_state():
+    """The joint head's own layers attend across a row's questions, which a row over one state keeps apart:
+    its rows are refused where they are fitted; a letter readout, which reads each question's own answer
+    state, takes them (review of state-once)."""
+    [example] = examples()[:1]
+    joint = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+    with pytest.raises(ValueError):
+        Fit(SHARED, TOKENIZER, SPECIALS, joint).map({"example": example})
+    readout = LabelReadout(features=8, label_ids=(), count=4)
+    assert len(Fit(SHARED, TOKENIZER, SPECIALS, readout).map({"example": example})["decision_rows"]) == 1
+
+
+def test_a_row_over_one_state_writes_its_state_before_its_question_and_its_instructions_first():
+    """A layout whose rows write the state after the question (a question-first or a re-reading order), or
+    the options before the instructions, shares no part of the state its questions read alike: it is refused
+    with shared_state set (review of state-once)."""
+    from dew.decision.layout import MarkerLayout
+
+    first, state, instructions, options, cue = OWN.segments
+    with pytest.raises(ValueError):
+        dataclasses.replace(OWN, shared_state=2, segments=(first, state, options, instructions, cue))
+    with pytest.raises(ValueError):
+        MarkerLayout(shared_state=2)
+    with pytest.raises(ValueError):
+        dataclasses.replace(OWN, shared_state=2, segments=None, order="re_read")
