@@ -305,6 +305,13 @@ class MosaicForward(_Mainloop[Tiles]):
             return False
         query, value = ba.arguments["query"], ba.arguments["value"]
         family = bundle_of(config, query.dtype)
+        # Its key tiles (the launch's, its natural rewalk's) split among the consumers that copy them
+        # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts, so no 32-key tile
+        # of two consumers, fs-qualified6).
+        if not (family.shares_rows(config.block_k, config.consumers)
+                and family.shares_rows(config.relaunch_k or config.block_k,
+                                       config.relaunch_consumers or config.consumers)):
+            return False
         if self.merges and self.splits > 1:
             # On a family that waits across programs (`Family.fixes_up`), every program of the grid resident
             # at once: the last slice's waits on the others' states. Its kernel holds that residency
