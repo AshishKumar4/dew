@@ -958,7 +958,10 @@ def test_a_tournaments_rounds_are_asked_from_the_whole_request(decide):
     summarized = replace(decide, layout=replace(decide.layout, segments=(summary, Text("\n"),
                                                                           *decide.layout.written)))
     described = dict(zip(question.options, question.descriptions, strict=True))
-    groups = [question.options[0:4], question.options[4:8], question.options[8:11], question.options[11:14]]
+    # Laya's rule (`Knockout`): groups of at most four, near-equal, the later ones the longer.
+    options, parts = list(question.options), -(-len(question.options) // 4)
+    groups = [options[part * len(options) // parts:(part + 1) * len(options) // parts]
+              for part in range(parts)]
     played = {f"intent/{part}": Choice(question.instructions,
                                        {option: described[option] for option in group})
               for part, group in enumerate(groups)}
