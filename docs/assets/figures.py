@@ -1446,17 +1446,50 @@ def architecture_cost_figure():
     drawn("architecture-cost", label, (760, 326), parts, wide, flows=range(2))
 
 
+def recorded_frames(notebook: str, cell: int) -> list[np.ndarray]:
+    """The camera frames a notebook's recorded output holds, as uint8 arrays.
+
+    A `dew.figures.images` output embeds its pictures in the output's HTML as
+    base64, so a concept figure can redraw a recorded frame instead of a
+    placeholder box, with no new run.
+    """
+    import base64
+    import io
+    import json
+    import re
+
+    path = HERE.parents[1] / "tutorials" / notebook
+    book = json.loads(path.read_text())
+    html = "".join("".join(output.get("data", {}).get("text/html", []))
+                   for output in book["cells"][cell].get("outputs", []))
+    frames = []
+    for encoded in re.findall(r"data:image/\w+;base64,([A-Za-z0-9+/=]+)", html):
+        frames.append(np.asarray(Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")))
+    if not frames:
+        raise ValueError(f"no recorded frames in {notebook} cell {cell}")
+    return frames
+
+
+def camera_tile(svg: Figure, x, y, size, frame):
+    """One recorded camera frame, `size` wide, with a rule around it."""
+    svg.image(x, y, size, frame, photo=True)
+    svg.rect(x, y, size, size, fill="none", stroke="rule", rx=3)
+
+
 def world_loop_figure():
     """One rollout loop, two kinds of step: a simulator's physics and a world model's prior both answer
-    step(state, action) with the next observation and a reward, so the same scan runs either."""
-    width, height = 440, 300
-    svg = Figure(width, height, seconds=11, label="One loop. An observation goes to the policy, the policy's "
-                 "action goes to a step, and the step answers with the next observation and a reward. The step "
-                 "can be a simulator's physics, whose state is the cartpole, or a world model's prior, whose "
-                 "state is a latent. The same scan runs both.")
+    step(state, action) with the next thing the policy reads and a reward, so the same scan runs either.
+    Only in the simulator is that thing the cartpole's five numbers; a `LatentEnv` step answers with the
+    latent's feature, [h, z] joined (512 + 32 x 4 = 640 wide at this notebook's sizes)."""
+    width, height = 440, 316
+    svg = Figure(width, height, seconds=11, label="One loop. What the policy reads goes in, the policy's "
+                 "action goes to a step, and the step answers with the next thing to read and a reward. The "
+                 "step can be a simulator's physics, whose state is the cartpole and whose observation is "
+                 "five numbers, or a world model's prior, whose state is a latent and whose answer is the "
+                 "latent feature, h and z joined. The same scan runs both.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
     with svg.group() as seen:
-        box(svg, 20, 44, 118, 62, "observation", ["5 numbers"])
+        box(svg, 20, 44, 118, 62, "observation", ["what it reads"])
     svg.appear(seen, 0.3)
     with svg.group() as chosen:
         svg.arrow(140, 75, 164, 75)
@@ -1464,7 +1497,7 @@ def world_loop_figure():
     svg.appear(chosen, 1.1)
     with svg.group() as acted:
         svg.arrow(276, 75, 300, 75)
-        box(svg, 302, 44, 118, 62, "action", ["1 number"])
+        box(svg, 302, 44, 118, 62, "action", ["1 number here"])
     svg.appear(acted, 1.9)
     with svg.group() as stepped:
         svg.arrow(361, 108, 361, 136)
@@ -1478,59 +1511,96 @@ def world_loop_figure():
     svg.appear(stepped, 2.9)
     back = svg.polyline([(166, 178), (79, 178), (79, 110)], color="accent", width=1.5)
     svg.draw(back, 4.0, 5.2)
-    svg.appear(svg.text(20, 196, "next observation", size=12, color="accent"), 4.6)
+    svg.appear(svg.text(20, 196, "next reading", size=12, color="accent"), 4.6)
     svg.appear(svg.text(20, 214, "and reward", size=12, color="accent"), 4.9)
-    svg.appear(svg.text(width / 2, 272, "one scan, env_rollout, whichever step", size=13, color="muted",
+    svg.appear(svg.text(width / 2, 262, "the policy reads 5 numbers from the simulator, or the", size=12,
+                        color="muted", anchor="middle"), 5.6)
+    svg.appear(svg.text(width / 2, 280, "640-wide [h, z] feature in imagination", size=12, color="muted",
                         anchor="middle"), 5.8)
+    svg.appear(svg.text(width / 2, 302, "one scan, env_rollout, whichever step", size=13, color="muted",
+                        anchor="middle"), 6.2)
     svg.save(HERE / "world-loop.svg")
 
 
 def world_rssm_figure():
     """One RSSM step: the deterministic state h carries the past, the categoricals z carry what h cannot
     know, drawn from the posterior with the observation and from the prior without it."""
-    width, height = 440, 310
-    svg = Figure(width, height, seconds=11, label="One step of DreamerV3's latent. The deterministic state h, "
-                 "512 numbers from a block GRU, carries the past. The stochastic part z is 32 categorical "
-                 "draws: from the posterior when the step's observation is there to read, and from the prior, "
-                 "h alone, when the model imagines. Training pulls the prior toward the posterior. The two "
-                 "together feed heads that rebuild the observation and predict reward and continuation.")
-    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
-    with svg.group() as memory:
-        box(svg, 18, 30, 126, 66, "h, 512 numbers", ["the GRU's memory", "of the past"])
-        box(svg, 18, 150, 126, 56, "observation", ["this step's"])
-    svg.appear(memory, 0.3)
+    label = ("One step of DreamerV3's latent. The deterministic state h, 512 numbers from a block GRU, "
+             "carries the past. The stochastic part z is 32 categorical draws: from the posterior when the "
+             "step's observation is there to read, and from the prior, h alone, when the model imagines. "
+             "Training pulls the prior toward the posterior. The two together feed heads that rebuild the "
+             "observation and predict reward and continuation.")
+    for narrow in (False, True):
+        width, height = (360, 392) if narrow else (440, 310)
+        svg = Figure(width, height, seconds=11, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
 
-    def draws(x, y, fill, dashed):
-        for k in range(8):
-            svg.rect(x + k * 17, y, 13, 20, fill=fill,
-                     stroke="muted" if dashed else "none", rx=3)
-        svg.text(x + 8 * 17 + 4, y + 15, "…", size=14, color="muted")
+        def draws(x, y, fill, dashed):
+            for k in range(8):
+                svg.rect(x + k * 17, y, 13, 20, fill=fill,
+                         stroke="muted" if dashed else "none", rx=3)
+            svg.text(x + 8 * 17 + 4, y + 15, "…", size=14, color="muted")
 
-    with svg.group() as posterior:
-        svg.arrow(146, 63, 176, 63)
-        svg.arrow(146, 178, 176, 84)
-        svg.text(178, 52, "posterior: h + observation", size=12, color="muted")
-        draws(178, 60, "accent", False)
-    svg.appear(posterior, 1.4)
-    with svg.group() as prior:
-        svg.arrow(146, 80, 176, 124)
-        svg.text(178, 116, "prior: h alone", size=12, color="muted")
-        draws(178, 124, "tint1", True)
-    svg.appear(prior, 2.8)
-    pull = svg.line(200, 122, 200, 84, color="accent", width=1.5, dash="3 3")
-    svg.appear(pull, 4.0)
-    svg.appear(svg.text(208, 106, "pulled close", size=12, color="accent"), 4.2)
-    svg.appear(svg.text(178, 168, "z: 32 draws, 4 classes each here", size=12, color="muted"), 3.4)
-    with svg.group() as heads:
-        svg.arrow(336, 70, 360, 70)
-        svg.text(362, 52, "[h, z] feeds", size=12, color="muted")
-        for k, name in enumerate(("rebuild", "reward", "continue")):
-            svg.rect(362, 60 + k * 38, 64, 28, fill="raised", stroke="rule", rx=5)
-            svg.text(394, 78 + k * 38, name, size=12, anchor="middle")
-    svg.appear(heads, 5.0)
-    svg.appear(svg.text(width / 2, 278, "watching uses the top row; imagining, the bottom one", size=13,
-                        color="muted", anchor="middle"), 6.0)
-    svg.save(HERE / "world-rssm.svg")
+        if narrow:
+            with svg.group() as memory:
+                box(svg, 18, 24, 150, 62, "h (512)", ["GRU memory"])
+                box(svg, 192, 24, 150, 62, "observation", ["this step's"])
+            svg.appear(memory, 0.3)
+            with svg.group() as posterior:
+                svg.arrow(93, 88, 70, 112)
+                svg.arrow(267, 88, 96, 112)
+                svg.text(18, 126, "posterior: h + observation", size=12, color="muted")
+                draws(18, 134, "accent", False)
+            svg.appear(posterior, 1.4)
+            with svg.group() as prior:
+                svg.text(18, 180, "prior: h alone", size=12, color="muted")
+                draws(18, 188, "tint1", True)
+            svg.appear(prior, 2.8)
+            pull = svg.line(166, 186, 166, 158, color="accent", width=1.5, dash="3 3")
+            svg.appear(pull, 4.0)
+            svg.appear(svg.text(18, 230, "pulled close in training", size=12, color="accent"), 4.2)
+            svg.appear(svg.text(18, 250, "z: 32 draws, 4 classes each here", size=12, color="muted"), 3.4)
+            with svg.group() as heads:
+                svg.text(18, 282, "[h, z] feeds", size=12, color="muted")
+                for k, name in enumerate(("rebuild", "reward", "continue")):
+                    x = 18 + k * 110
+                    svg.rect(x, 292, 100, 30, fill="raised", stroke="rule", rx=5)
+                    svg.text(x + 50, 311, name, size=12, anchor="middle")
+            svg.appear(heads, 5.0)
+            svg.appear(svg.text(width / 2, 352, "watching uses the top row;", size=13, color="muted",
+                                anchor="middle"), 6.0)
+            svg.appear(svg.text(width / 2, 372, "imagining, the bottom one", size=13, color="muted",
+                                anchor="middle"), 6.2)
+        else:
+            with svg.group() as memory:
+                box(svg, 18, 28, 140, 66, "h (512)", ["GRU memory", "of the past"])
+                box(svg, 18, 150, 140, 56, "observation", ["this step's"])
+            svg.appear(memory, 0.3)
+            with svg.group() as posterior:
+                svg.arrow(160, 61, 186, 61)
+                svg.arrow(160, 172, 186, 68)
+                svg.text(190, 44, "posterior: h + observation", size=12, color="muted")
+                draws(190, 52, "accent", False)
+            svg.appear(posterior, 1.4)
+            with svg.group() as prior:
+                svg.arrow(160, 82, 186, 114)
+                svg.text(190, 98, "prior: h alone", size=12, color="muted")
+                draws(190, 106, "tint1", True)
+            svg.appear(prior, 2.8)
+            pull = svg.line(202, 104, 202, 76, color="accent", width=1.5, dash="3 3")
+            svg.appear(pull, 4.0)
+            svg.appear(svg.text(190, 148, "pulled close in training", size=12, color="accent"), 4.2)
+            svg.appear(svg.text(190, 168, "z: 32 draws, 4 classes each here", size=12, color="muted"), 3.4)
+            with svg.group() as heads:
+                svg.arrow(332, 62, 350, 62)
+                svg.text(352, 44, "[h, z] feeds", size=12, color="muted")
+                for k, name in enumerate(("rebuild", "reward", "continue")):
+                    svg.rect(352, 52 + k * 38, 72, 28, fill="raised", stroke="rule", rx=5)
+                    svg.text(388, 70 + k * 38, name, size=12, anchor="middle")
+            svg.appear(heads, 5.0)
+            svg.appear(svg.text(width / 2, 278, "watching uses the top row; imagining, the bottom one",
+                                size=13, color="muted", anchor="middle"), 6.0)
+        save_both(svg, "world-rssm", narrow)
 
 
 def world_imagine_figure():
@@ -1567,242 +1637,347 @@ def world_imagine_figure():
 
 
 def world_shortcut_figure():
-    """Shortcut forcing: a step of size d must land where two of its own half steps land, so a few large
-    steps can do the work of many small ones."""
-    width, height = 440, 290
+    """Shortcut forcing: a step of size d must land where two of its own half steps land. The large
+    step's endpoint starts short of the half steps' landing and is pulled to it, which is what the
+    training objective asks for; only the smallest step size is regressed to the clean latents."""
+    width, height = 440, 300
     svg = Figure(width, height, seconds=11, label="Shortcut forcing. Each frame's latents sit somewhere "
-                 "between noise and clean, at signal level tau. A step of size d predicts the clean latents "
-                 "in one go; training asks that step to agree with two half steps of size d over 2, the "
-                 "second starting where the first lands. A model that agrees with itself at every step size "
-                 "can generate in a few large steps, here four.")
+                 "between noise and clean, at signal level tau. Two half steps of size d over 2 cross from "
+                 "tau to tau plus d, the second starting where the first lands. One step of size d covers "
+                 "the same stretch, and training pulls its endpoint to where the two half steps land. The "
+                 "notebook generates each frame in four such large steps.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
     left, right = 36, 404
+    start, mid, end = 110, 220, 330
     svg.line(left, 58, right, 58, color="rule")
     svg.text(left, 42, "noise, τ = 0", size=12, mono=True, color="muted")
     svg.text(right, 42, "clean, τ = 1", size=12, mono=True, color="muted", anchor="end")
-    start, mid, end = 110, 220, 330
     for x in (start, mid, end):
         svg.circle(x, 58, 5, fill="text")
-    svg.text(start, 80, "τ", size=13, mono=True, anchor="middle", color="muted")
-    svg.text(mid, 80, "τ + d/2", size=12, mono=True, anchor="middle", color="muted")
-    svg.text(end, 80, "τ + d", size=12, mono=True, anchor="middle", color="muted")
-    big = svg.polyline([(start, 118), (end, 118)], color="accent", width=2.5)
-    svg.draw(big, 0.6, 2.2)
-    svg.appear(svg.text((start + end) / 2, 106, "one step, size d", size=13, color="accent",
-                        anchor="middle"), 1.2)
+        svg.line(x, 66, x, 206, color="rule", width=1, dash="3 4")
+    svg.text(start, 82, "τ", size=13, mono=True, anchor="middle", color="muted")
+    svg.text(mid, 82, "τ + d/2", size=12, mono=True, anchor="middle", color="muted")
+    svg.text(end, 82, "τ + d", size=12, mono=True, anchor="middle", color="muted")
+    svg.appear(svg.text((start + end) / 2, 106, "its own two half steps, d/2 each", size=12,
+                        color="muted", anchor="middle"), 0.8)
     for j, (a, b) in enumerate(((start, mid), (mid, end))):
-        half = svg.polyline([(a, 166), (b, 166)], color="text", width=2)
-        svg.draw(half, 2.8 + j, 3.8 + j)
-    svg.appear(svg.text((start + end) / 2, 154, "its own two half steps", size=13, anchor="middle"), 3.4)
-    svg.appear(svg.text((start + end) / 2, 196, "training makes the two agree", size=13, color="accent",
-                        anchor="middle", weight=600), 5.2)
+        half = svg.polyline([(a, 124), (b, 124)], color="text", width=2.5)
+        svg.draw(half, 1.0 + 0.9 * j, 1.9 + 0.9 * j)
+    for k, x in enumerate((start, mid, end)):
+        svg.appear(svg.circle(x, 124, 5, fill="text"), 1.0 + 0.9 * k, 0.2)
+    svg.appear(svg.text((start + end) / 2, 158, "one step, size d", size=12, color="accent",
+                        anchor="middle"), 3.0)
+    short = end - start - 48
+    big = svg.polyline([(start, 176), (end, 176)], color="accent", width=2.5)
+    svg.animate(big, {3.2: {"transform": f"scaleX({short / (end - start):.3f})"},
+                      4.6: {"transform": f"scaleX({short / (end - start):.3f})"},
+                      6.0: {"transform": "scaleX(1)"}}, origin="0% 50%")
+    svg.appear(svg.circle(start, 176, 5, fill="accent"), 3.2, 0.2)
+    tip = svg.circle(start + short, 176, 6, fill="accent")
+    svg.animate(tip, {3.2: {"transform": "translateX(0px)", "opacity": 0},
+                      3.5: {"transform": "translateX(0px)", "opacity": 1},
+                      4.6: {"transform": "translateX(0px)", "opacity": 1},
+                      6.0: {"transform": "translateX(48px)", "opacity": 1}})
+    svg.appear(svg.text((start + end) / 2, 202, "training pulls its endpoint to theirs", size=13,
+                        color="accent", anchor="middle", weight=600), 6.2)
     with svg.group() as cover:
         svg.line(left, 238, right, 238, color="rule")
         for k in range(5):
             x = left + k * (right - left) / 4
             svg.line(x, 230, x, 246, color="accent", width=2)
-        svg.text(width / 2, 266, "so 4 large steps cross from noise to clean", size=13, color="muted",
+        svg.text(width / 2, 268, "so generation crosses in 4 large steps a frame", size=13, color="muted",
                  anchor="middle")
-    svg.appear(cover, 6.2)
+    svg.appear(cover, 7.0)
     svg.save(HERE / "world-shortcut.svg")
 
 
 def world_racing_figure():
     """Gate racing split in two: the physics is a JAX Env stepped thousands at a time, the camera a host
-    Simulator; a teacher reads the privileged views, the racing policy the image alone."""
-    width, height = 440, 300
-    svg = Figure(width, height, seconds=11, label="First-person gate racing, split in two. On the left, the "
-                 "quadrotor physics is a JAX environment, so 4096 drones fly inside one jitted rollout and "
-                 "a teacher learns from the privileged state, the next gates' corners and the obstacles. On "
-                 "the right, a ray tracer outside JAX draws each drone's camera, stepped from the host a "
-                 "batch at a time; the racing policy sees that image alone, the next gate lit.")
-    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
-    with svg.group() as physics:
-        svg.text(20, 36, "in JAX: an Env", size=14, weight=600)
-        box(svg, 20, 48, 186, 72, "FlightEnv", ["rotors, drag, lag,", "battery sag"])
-        for r in range(3):
-            for c in range(6):
-                svg.circle(36 + c * 16, 142 + r * 16, 4, fill="tint1")
-        svg.text(140, 150, "4096 at once", size=12, color="muted")
-        box(svg, 20, 202, 186, 66, "teacher reads", ["state, gate corners,", "obstacles"], accent=True)
-    svg.appear(physics, 0.4)
-    with svg.group() as camera:
-        svg.text(234, 36, "outside JAX: a Simulator", size=14, weight=600)
-        box(svg, 234, 48, 186, 72, "GateRace", ["drawn by a ray tracer"])
-        svg.rect(234, 132, 88, 64, fill="tint1", stroke="rule", rx=4)
-        svg.rect(262, 148, 32, 32, fill="none", stroke="accent", rx=2, width=2.5)
-        svg.text(330, 160, "camera image,", size=12, color="muted")
-        svg.text(330, 178, "next gate lit", size=12, color="muted")
-        box(svg, 234, 202, 186, 66, "policy reads", ["the image alone"], accent=True)
-    svg.appear(camera, 2.2)
-    with svg.group() as shared:
-        svg.arrow(208, 84, 232, 84, color="accent", width=1.5)
-        svg.arrow(232, 100, 208, 100, color="accent", width=1.5)
-        svg.text(220, 130, "same", size=12, color="accent", anchor="middle")
-        svg.text(220, 146, "race", size=12, color="accent", anchor="middle")
-    svg.appear(shared, 3.8)
-    svg.appear(svg.text(width / 2, 288, "actions cross; only the drawing stays outside", size=12,
-                        color="muted", anchor="middle"), 4.8)
-    svg.save(HERE / "world-racing.svg")
+    Simulator; a teacher reads the privileged views, the racing policy the image alone. The camera tile
+    is a frame recorded in tutorial 12's racing cell, not a placeholder."""
+    frame = recorded_frames("12-world-models.ipynb", 15)[0]
+    label = ("First-person gate racing, split in two. On one side, the quadrotor physics is a JAX "
+             "environment, so 4096 drones fly inside one jitted rollout and a teacher learns from the "
+             "privileged state, the next gates' corners and the obstacles. On the other, a ray tracer "
+             "outside JAX draws each drone's camera, stepped from the host a batch at a time; the racing "
+             "policy sees that image alone, the next gate lit. The camera picture shown is a frame "
+             "recorded in the tutorial.")
+    for narrow in (False, True):
+        width, height = (360, 540) if narrow else (440, 300)
+        svg = Figure(width, height, seconds=11, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        if narrow:
+            with svg.group() as physics:
+                svg.text(18, 34, "in JAX: an Env", size=14, weight=600)
+                box(svg, 18, 44, 324, 62, "FlightEnv", ["rotors, drag, lag, battery sag"])
+                for r in range(2):
+                    for c in range(8):
+                        svg.circle(30 + c * 16, 126 + r * 16, 4, fill="tint1")
+                svg.text(166, 132, "4096 at once", size=12, color="muted")
+                box(svg, 18, 160, 324, 62, "teacher reads", ["state, gate corners, obstacles"], accent=True)
+            svg.appear(physics, 0.4)
+            with svg.group() as shared:
+                svg.arrow(150, 226, 150, 252, color="accent", width=1.5)
+                svg.arrow(190, 252, 190, 226, color="accent", width=1.5)
+                svg.text(206, 244, "same race", size=12, color="accent")
+            svg.appear(shared, 2.0)
+            with svg.group() as camera:
+                svg.text(18, 282, "outside JAX: a Simulator", size=14, weight=600)
+                box(svg, 18, 292, 324, 62, "GateRace", ["drawn by a ray tracer"])
+                camera_tile(svg, 18, 366, 72, frame)
+                svg.text(102, 396, "camera image,", size=12, color="muted")
+                svg.text(102, 414, "next gate lit", size=12, color="muted")
+                box(svg, 18, 450, 324, 62, "policy reads", ["the image alone"], accent=True)
+            svg.appear(camera, 3.0)
+        else:
+            with svg.group() as physics:
+                svg.text(20, 36, "in JAX: an Env", size=14, weight=600)
+                box(svg, 20, 48, 186, 72, "FlightEnv", ["rotors, drag, lag,", "battery sag"])
+                for r in range(3):
+                    for c in range(6):
+                        svg.circle(36 + c * 16, 142 + r * 16, 4, fill="tint1")
+                svg.text(126, 150, "4096 at once", size=12, color="muted")
+                box(svg, 20, 202, 186, 66, "teacher reads", ["state, gate corners,", "obstacles"],
+                    accent=True)
+            svg.appear(physics, 0.4)
+            with svg.group() as camera:
+                svg.text(234, 36, "outside JAX: a Simulator", size=14, weight=600)
+                box(svg, 234, 48, 186, 72, "GateRace", ["drawn by a ray tracer"])
+                camera_tile(svg, 234, 132, 64, frame)
+                svg.text(306, 160, "camera image,", size=12, color="muted")
+                svg.text(306, 178, "next gate lit", size=12, color="muted")
+                box(svg, 234, 202, 186, 66, "policy reads", ["the image alone"], accent=True)
+            svg.appear(camera, 2.2)
+            with svg.group() as shared:
+                svg.arrow(208, 84, 232, 84, color="accent", width=1.5)
+                svg.arrow(232, 100, 208, 100, color="accent", width=1.5)
+            svg.appear(shared, 3.8)
+            svg.appear(svg.text(width / 2, 288, "actions cross; only the drawing stays outside", size=12,
+                                color="muted", anchor="middle"), 4.8)
+        save_both(svg, "world-racing", narrow)
 
 
 def sky_loop_figure():
-    """The pilot's loop, 90 times a second: camera, body rates, rotor speeds and the flight plan into the
-    world model's latent, the policy's thrust and body rates out; the privileged state is predicted in
-    training and never read in flight."""
-    width, height = 440, 330
-    svg = Figure(width, height, seconds=12, label="The racing pilot's loop, 90 times a second. The camera "
-                 "image, the body rates, the rotor speeds and the flight plan of the next three gates go "
-                 "into the world model's latent; the policy reads that latent and answers with a thrust "
-                 "and three body rates, which fly the quadrotor and move the camera. Below, the privileged "
-                 "state, position, velocity and orientation, reaches the latent only as something to "
-                 "predict in training. It never reaches the policy.")
-    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
-    with svg.group() as senses:
-        svg.rect(20, 36, 96, 80, fill="tint1", stroke="rule", rx=5)
-        gate = svg.rect(52, 56, 32, 40, fill="none", stroke="accent", rx=2, width=2.5)
-        svg.animate(gate, {1.0: {"transform": "scale(0.55)"}, 3.2: {"transform": "scale(1.25)"},
-                           3.6: {"transform": "scale(1.25)"}, 4.2: {"transform": "scale(0.55)"},
-                           6.4: {"transform": "scale(1.25)"}}, origin="50% 50%")
-        svg.text(68, 134, "camera 64 px", size=12, anchor="middle", color="muted")
-        svg.rect(20, 146, 96, 24, fill="raised", stroke="rule", rx=4)
-        svg.text(68, 162, "rates motors plan", size=12, mono=True, anchor="middle")
-    svg.appear(senses, 0.3)
-    with svg.group() as latent:
-        svg.arrow(118, 76, 150, 76)
-        svg.arrow(118, 157, 150, 100)
-        box(svg, 152, 52, 120, 76, "latent (h, z)", ["what the model", "keeps of the flight"], accent=True)
-    svg.appear(latent, 1.6)
-    with svg.group() as flown:
-        svg.arrow(274, 90, 306, 90)
-        box(svg, 308, 52, 112, 76, "policy", ["thrust and", "3 body rates"])
-        svg.arrow(364, 130, 364, 162)
-        box(svg, 308, 164, 112, 62, "quadrotor", ["flies, the view", "moves"])
-    svg.appear(flown, 2.8)
-    back = svg.polyline([(308, 195), (68, 195), (68, 172)], color="accent", width=1.5)
-    svg.draw(back, 4.2, 5.6)
-    svg.appear(svg.text(110, 214, "90 times a second", size=12, color="accent", anchor="middle"), 5.2)
-    with svg.group() as hidden:
-        svg.rect(152, 252, 160, 40, fill="none", stroke="muted", rx=6)
-        svg.text(232, 277, "privileged state", size=13, anchor="middle", color="muted")
-        svg.line(232, 250, 232, 132, color="muted", width=1.25, dash="4 4")
-        svg.text(224, 228, "predicted in training,", size=12, color="muted", anchor="end")
-        svg.text(224, 244, "never read in flight", size=12, color="muted", anchor="end")
-    svg.appear(hidden, 6.4)
-    svg.save(HERE / "sky-loop.svg")
+    """The pilot's loop, 90 times a second: the camera, the sensed body rates and rotor speeds and the
+    supplied flight plan into the world model's latent, the policy's thrust and body rates out; the
+    privileged state is predicted in training and never read in flight. The camera tile is a frame
+    recorded in tutorial 14's start cell."""
+    frame = recorded_frames("14-camera-only-drone-racing.ipynb", 5)[0]
+    label = ("The racing pilot's loop, 90 times a second. The camera image, the body rates and rotor "
+             "speeds the drone senses, and the supplied flight plan of the next three gates go into the "
+             "world model's latent; the policy reads that latent and answers with a thrust and three "
+             "body rates, which fly the quadrotor and move the camera. The privileged state reaches the "
+             "latent only as something to predict in training. It never reaches the policy. The camera "
+             "picture shown is a frame recorded in the tutorial.")
+    for narrow in (False, True):
+        width, height = (360, 546) if narrow else (440, 336)
+        svg = Figure(width, height, seconds=12, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        if narrow:
+            with svg.group() as senses:
+                camera_tile(svg, 132, 18, 96, frame)
+                svg.text(180, 132, "camera, 64 px", size=12, anchor="middle", color="muted")
+                for k, name in enumerate(("rates", "motors", "plan")):
+                    x = 18 + k * 112
+                    svg.rect(x, 142, 102, 24, fill="raised", stroke="rule", rx=4)
+                    svg.text(x + 51, 158, name, size=12, mono=True, anchor="middle")
+                svg.text(180, 184, "sensed: rates, motors · supplied: plan", size=12, color="muted",
+                         anchor="middle")
+            svg.appear(senses, 0.3)
+            with svg.group() as latent:
+                svg.arrow(180, 192, 180, 212)
+                box(svg, 104, 214, 152, 66, "latent (h, z)", ["what the model keeps"], accent=True)
+            svg.appear(latent, 1.6)
+            with svg.group() as flown:
+                svg.arrow(180, 282, 180, 302)
+                box(svg, 104, 304, 152, 66, "policy", ["thrust, 3 body rates"])
+                svg.arrow(180, 372, 180, 392)
+                box(svg, 104, 394, 152, 58, "quadrotor", ["flies, view moves"])
+            svg.appear(flown, 2.8)
+            back = svg.polyline([(104, 423), (12, 423), (12, 66), (128, 66)], color="accent", width=1.5)
+            svg.draw(back, 4.2, 5.6)
+            svg.appear(svg.text(width / 2, 474, "the loop closes 90 times a second", size=12,
+                                color="accent", anchor="middle"), 5.2)
+            with svg.group() as hidden:
+                svg.line(258, 247, 322, 247, color="muted", width=1.25, dash="4 4")
+                svg.line(322, 247, 322, 508, color="muted", width=1.25, dash="4 4")
+                svg.line(322, 508, 284, 508, color="muted", width=1.25, dash="4 4")
+                svg.rect(80, 484, 200, 48, fill="none", stroke="muted", rx=6)
+                svg.text(180, 505, "privileged state", size=13, anchor="middle", color="muted")
+                svg.text(180, 523, "predicted in training only", size=12, anchor="middle", color="muted")
+            svg.appear(hidden, 6.4)
+        else:
+            with svg.group() as senses:
+                camera_tile(svg, 20, 36, 84, frame)
+                svg.text(62, 138, "camera, 64 px", size=12, anchor="middle", color="muted")
+                for k, name in enumerate(("rates", "motors", "plan")):
+                    y = 148 + k * 26
+                    svg.rect(20, y, 84, 22, fill="raised", stroke="rule", rx=4)
+                    svg.text(62, y + 16, name, size=12, mono=True, anchor="middle")
+            svg.appear(senses, 0.3)
+            with svg.group() as latent:
+                svg.arrow(106, 78, 146, 78)
+                svg.arrow(106, 186, 146, 108)
+                box(svg, 150, 52, 124, 76, "latent (h, z)", ["what the model", "keeps of the flight"],
+                    accent=True)
+            svg.appear(latent, 1.6)
+            with svg.group() as flown:
+                svg.arrow(276, 90, 304, 90)
+                box(svg, 308, 52, 112, 76, "policy", ["thrust and", "3 body rates"])
+                svg.arrow(364, 130, 364, 160)
+                box(svg, 308, 164, 112, 62, "quadrotor", ["flies, the view", "moves"])
+            svg.appear(flown, 2.8)
+            back = svg.polyline([(364, 228), (364, 246), (62, 246), (62, 224)], color="accent", width=1.5)
+            svg.draw(back, 4.2, 5.6)
+            svg.appear(svg.text(150, 238, "90 times a second", size=12, color="accent",
+                                anchor="middle"), 5.2)
+            with svg.group() as hidden:
+                svg.line(212, 130, 212, 266, color="muted", width=1.25, dash="4 4")
+                svg.rect(122, 270, 220, 50, fill="none", stroke="muted", rx=6)
+                svg.text(232, 292, "privileged state", size=13, anchor="middle", color="muted")
+                svg.text(232, 310, "predicted in training only", size=12, anchor="middle", color="muted")
+            svg.appear(hidden, 6.4)
+        save_both(svg, "sky-loop", narrow)
 
 
 def sky_informed_figure():
     """The informed latent: it learns to predict the privileged state, the rates and the rotor speeds,
-    and rebuilds no image at all."""
-    width, height = 440, 290
-    svg = Figure(width, height, seconds=11, label="What the world model's latent learns to say. From the "
-                 "camera image and the sensed vectors it must predict the privileged state, the position, "
-                 "velocity and orientation the policy never reads, and also the body rates and rotor "
-                 "speeds. It rebuilds no image: that decoder's weight is zero. To predict where the drone "
-                 "is, the latent has to hold where the drone is, which is what the policy then flies from.")
-    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
-    with svg.group() as inputs:
-        svg.rect(20, 44, 72, 60, fill="tint1", stroke="rule", rx=5)
-        svg.rect(40, 58, 32, 32, fill="none", stroke="text", rx=2, width=2)
-        svg.text(56, 122, "image", size=12, mono=True, anchor="middle", color="muted")
-        svg.text(20, 156, "rates, motors,", size=12, color="muted")
-        svg.text(20, 174, "plan", size=12, color="muted")
-    svg.appear(inputs, 0.3)
-    with svg.group() as middle:
-        svg.arrow(110, 90, 150, 110)
-        box(svg, 152, 84, 118, 72, "latent (h, z)", ["2048 and 32 x 16"], accent=True)
-    svg.appear(middle, 1.2)
+    and rebuilds no image at all. The camera tile is a frame recorded in tutorial 14's start cell."""
+    frame = recorded_frames("14-camera-only-drone-racing.ipynb", 5)[1]
+    label = ("What the world model's latent learns to say. From the camera image, the sensed rates and "
+             "rotor speeds and the supplied plan it must predict the privileged state, the position, "
+             "velocity and orientation the policy never reads, and also the body rates and rotor speeds. "
+             "It rebuilds no image: that decoder's weight is zero. To predict where the drone is, the "
+             "latent has to hold where the drone is, which is what the policy then flies from.")
     heads = (("state", "where it is", True), ("rates", "how it turns", True),
              ("motors", "rotor speeds", True), ("image", "not rebuilt", False))
-    for k, (name, note, on) in enumerate(heads):
-        y = 36 + k * 58
-        with svg.group() as head:
-            svg.arrow(272, 120, 296, y + 20, color="accent" if on else "muted", width=1.5 if on else 1.0)
-            svg.rect(298, y, 122, 40, fill="accent_fill" if on else "none",
-                     stroke="accent" if on else "rule", rx=6)
-            svg.text(310, y + 19, name, size=13, mono=True, weight=600 if on else 400,
-                     color="text" if on else "muted")
-            svg.text(310, y + 34, note, size=12, color="muted")
-            if not on:
-                svg.line(302, y + 36, 416, y + 4, color="muted", width=1.25)
-        svg.appear(head, 2.2 + 0.7 * k)
-    svg.appear(svg.text(width / 2, 270, "to predict the state, the latent must hold it", size=13,
-                        color="accent", anchor="middle"), 5.6)
-    svg.save(HERE / "sky-informed.svg")
+    for narrow in (False, True):
+        width, height = (360, 478) if narrow else (440, 290)
+        svg = Figure(width, height, seconds=11, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        if narrow:
+            with svg.group() as inputs:
+                camera_tile(svg, 18, 22, 64, frame)
+                svg.text(50, 104, "image", size=12, mono=True, anchor="middle", color="muted")
+                svg.text(96, 48, "rates, motors (sensed),", size=12, color="muted")
+                svg.text(96, 66, "plan (supplied)", size=12, color="muted")
+            svg.appear(inputs, 0.3)
+            with svg.group() as middle:
+                svg.arrow(80, 86, 120, 116)
+                box(svg, 96, 118, 168, 66, "latent (h, z)", ["2048 and 32 x 16"], accent=True)
+            svg.appear(middle, 1.2)
+            svg.appear(svg.arrow(180, 186, 180, 206, color="accent", width=1.5), 2.0)
+            for k, (name, note, on) in enumerate(heads):
+                y = 210 + k * 50
+                with svg.group() as head:
+                    svg.rect(70, y, 220, 40, fill="accent_fill" if on else "surface",
+                             stroke="accent" if on else "rule", rx=6)
+                    svg.text(84, y + 19, name, size=13, mono=True, weight=600 if on else 400,
+                             color="text" if on else "muted")
+                    svg.text(84, y + 34, note, size=12, color="muted")
+                    if not on:
+                        svg.text(276, y + 27, "×", size=18, color="muted", anchor="middle")
+                svg.appear(head, 2.2 + 0.7 * k)
+            svg.appear(svg.text(width / 2, 438, "to predict the state,", size=13, color="accent",
+                                anchor="middle"), 5.6)
+            svg.appear(svg.text(width / 2, 458, "the latent must hold it", size=13, color="accent",
+                                anchor="middle"), 5.8)
+        else:
+            with svg.group() as inputs:
+                camera_tile(svg, 20, 44, 72, frame)
+                svg.text(56, 134, "image", size=12, mono=True, anchor="middle", color="muted")
+                svg.text(20, 162, "rates, motors", size=12, color="muted")
+                svg.text(20, 180, "(sensed), plan", size=12, color="muted")
+                svg.text(20, 198, "(supplied)", size=12, color="muted")
+            svg.appear(inputs, 0.3)
+            with svg.group() as middle:
+                svg.arrow(96, 90, 148, 110)
+                box(svg, 152, 84, 118, 72, "latent (h, z)", ["2048 and 32 x 16"], accent=True)
+            svg.appear(middle, 1.2)
+            for k, (name, note, on) in enumerate(heads):
+                y = 36 + k * 58
+                with svg.group() as head:
+                    svg.arrow(272, 120, 294, y + 20, color="accent" if on else "muted",
+                              width=1.5 if on else 1.0)
+                    svg.rect(298, y, 122, 40, fill="accent_fill" if on else "surface",
+                             stroke="accent" if on else "rule", rx=6)
+                    svg.text(310, y + 19, name, size=13, mono=True, weight=600 if on else 400,
+                             color="text" if on else "muted")
+                    svg.text(310, y + 34, note, size=12, color="muted")
+                    if not on:
+                        svg.text(406, y + 27, "×", size=18, color="muted", anchor="middle")
+                svg.appear(head, 2.2 + 0.7 * k)
+            svg.appear(svg.text(width / 2, 270, "to predict the state, the latent must hold it", size=13,
+                                color="accent", anchor="middle"), 5.6)
+        save_both(svg, "sky-informed", narrow)
 
 
 def sky_matched_figure():
-    """The matched evaluation: one key deals the same starts to the untrained and the trained policy, and
-    each drone's first episode is scored. The bars are the notebook's recorded gates passed."""
-    # Recorded in tutorials/14's matched evaluation cell: gates passed in a first episode of 2000 steps.
-    rows = (("untrained, evaluation", 0.0), ("untrained, held out", 0.0),
-            ("trained, evaluation", 44.4), ("trained, held out", 36.2))
-    width, height = 440, 310
+    """The matched evaluation as a procedure: one key deals the same starts to the untrained and the
+    trained policy, and each drone's first episode is scored. No run results live in this figure; the
+    recorded scores stay in the notebook's output and its prose."""
+    width, height = 440, 300
     svg = Figure(width, height, seconds=11, label="The matched evaluation. One key deals the same starts "
-                 "to both policies, and each of the 16 drones is scored on its first episode alone. The "
-                 "untrained policy passes no gates on either split. The trained one passes 44.4 gates from "
-                 "the evaluation starts and 36.2 from held-out training starts.")
+                 "to both policies: the same 16 drones, gates and first metres. The untrained policy, as "
+                 "first drawn, and the trained policy each fly those starts, and each drone is scored on "
+                 "its first episode alone.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
     with svg.group() as dealt:
-        box(svg, 20, 24, 118, 56, "one key", ["the same starts"])
-        svg.arrow(140, 52, 176, 40)
-        svg.arrow(140, 52, 176, 66)
-        svg.text(180, 44, "untrained policy", size=13)
-        svg.text(180, 70, "trained policy", size=13, color="accent", weight=600)
-        svg.text(420, 44, "first episode", size=12, color="muted", anchor="end")
-        svg.text(420, 62, "of each drone", size=12, color="muted", anchor="end")
-        svg.text(420, 80, "is scored", size=12, color="muted", anchor="end")
+        box(svg, 40, 30, 150, 60, "one key", ["deals the starts"])
+        svg.arrow(192, 60, 244, 60)
+        box(svg, 248, 30, 152, 60, "same starts", ["for all 16 drones"], accent=True)
     svg.appear(dealt, 0.4)
-    svg.text(20, 116, "gates passed in an episode of 2000 steps", size=13, color="muted")
-    left, span = 20, 330
-    for k, (name, gates) in enumerate(rows):
-        y = 128 + k * 42
-        trained = gates > 0
-        svg.text(left, y + 4, name, size=12, color="muted")
-        svg.rect(left, y + 10, span, 16, fill="rule", stroke="none", rx=3)
-        bar = svg.rect(left, y + 10, span, 16, fill="accent", stroke="none", rx=3)
-        svg.animate(bar, {1.6 + 0.5 * k: {"transform": "scaleX(0)"},
-                          2.8 + 0.5 * k: {"transform": f"scaleX({gates / 50:.3f})"}}, origin="0% 50%")
-        svg.appear(svg.text(left + span + 6, y + 23, f"{gates:.1f}", size=14, mono=True, weight=600,
-                            color="accent" if trained else "muted"), 3.0 + 0.5 * k)
-    svg.appear(svg.text(width / 2, 296, "same starts, so the gap is the training", size=13, color="muted",
-                        anchor="middle"), 5.4)
+    with svg.group() as flown:
+        svg.arrow(290, 92, 140, 132)
+        svg.arrow(330, 92, 300, 132)
+        box(svg, 40, 136, 170, 60, "untrained", ["policy, as first drawn"])
+        box(svg, 230, 136, 170, 60, "trained", ["policy, after the run"], accent=True)
+    svg.appear(flown, 2.0)
+    with svg.group() as scored:
+        svg.arrow(125, 198, 170, 230, color="accent", width=1.5)
+        svg.arrow(315, 198, 270, 230, color="accent", width=1.5)
+        svg.rect(85, 234, 270, 42, fill="raised", stroke="accent", rx=7)
+        svg.text(220, 260, "each drone's first episode is scored", size=13, anchor="middle")
+    svg.appear(scored, 3.8)
     svg.save(HERE / "sky-matched.svg")
 
 
 def sky_twin_figure():
     """The pilot's view: the 64-pixel race chooses each action and the 256-pixel race, started from the
-    same seed, flies the same action for the film."""
-    width, height = 440, 280
+    same seed, flies the same action for the film. The tiles are frames recorded in tutorial 14's start
+    cell, shown small in the deciding lane and large in the filmed one. The two races agree only while
+    an episode runs uninterrupted, since just the deciding side restarts a finished drone."""
+    frames = recorded_frames("14-camera-only-drone-racing.ipynb", 5)[:4]
+    width, height = 440, 308
     svg = Figure(width, height, seconds=11, label="How the film is made. The top race draws at 64 pixels, "
-                 "the size the policy flies from, and chooses each action. The bottom race draws the same "
-                 "flights at 256 pixels and takes the same action at every step, both races started from "
-                 "the same seed, so the film shows the flights the policy actually flew.")
+                 "the size the policy flies from, and chooses each action. The bottom race draws at 256 "
+                 "pixels and takes the same action at every step, both races started from the same seed. "
+                 "While an episode runs uninterrupted the film shows that episode; a drone whose episode "
+                 "ends is restarted on the deciding side only, which would break the match.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
-
-    def lane(y, size, label, note, at):
-        with svg.group() as row:
-            svg.text(20, y - 8, label, size=13, weight=600)
-            svg.text(420, y - 8, note, size=12, color="muted", anchor="end")
-            for k in range(4):
-                x = 20 + k * (size + 10)
-                svg.rect(x, y, size, size, fill="tint1", stroke="rule", rx=3)
-                side = size * (0.3 + 0.14 * k)
-                svg.rect(x + (size - side) / 2, y + (size - side) / 2, side, side, fill="none",
-                         stroke="accent", rx=2, width=2)
-        svg.appear(row, at)
-
-    lane(52, 52, "64 px: decides", "what the policy sees", 0.4)
-    lane(160, 72, "256 px: filmed", "what we watch", 2.2)
+    with svg.group() as deciding:
+        svg.text(20, 34, "64 px: decides", size=13, weight=600)
+        svg.text(420, 34, "what the policy sees", size=12, color="muted", anchor="end")
+        for k, frame in enumerate(frames):
+            camera_tile(svg, 20 + k * 62, 44, 52, frame)
+    svg.appear(deciding, 0.4)
     with svg.group() as shared:
-        for x in (46, 108, 170, 232):
-            svg.arrow(x, 106, x + 10, 158, color="accent", width=1.25)
-        svg.text(330, 140, "the same action", size=13, color="accent")
-        svg.text(330, 158, "at every step", size=13, color="accent")
-    svg.appear(shared, 3.6)
-    svg.appear(svg.text(width / 2, 262, "one seed, so the same starts in both races", size=13, color="muted",
-                        anchor="middle"), 4.8)
+        for k in range(4):
+            x = 46 + k * 62
+            svg.arrow(x, 100, x + 10, 146, color="accent", width=1.25)
+        svg.text(296, 118, "the same action", size=13, color="accent")
+        svg.text(296, 136, "at every step", size=13, color="accent")
+    svg.appear(shared, 2.2)
+    with svg.group() as filmed:
+        svg.text(20, 172, "256 px: filmed", size=13, weight=600)
+        svg.text(420, 172, "what we watch", size=12, color="muted", anchor="end")
+        for k, frame in enumerate(frames):
+            camera_tile(svg, 20 + k * 82, 182, 72, frame)
+    svg.appear(filmed, 3.2)
+    svg.appear(svg.text(width / 2, 276, "one seed: the same starts in both races", size=13, color="muted",
+                        anchor="middle"), 4.6)
+    svg.appear(svg.text(width / 2, 296, "identical while each episode runs uninterrupted", size=12,
+                        color="muted", anchor="middle"), 5.0)
     svg.save(HERE / "sky-twin.svg")
 
 
