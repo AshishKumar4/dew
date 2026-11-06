@@ -398,12 +398,15 @@ def _tree_added(partials: tuple, index, term) -> tuple:
     a complete subtree's sum a level, `index`'s set bits the levels held): the term carried up the held
     levels, each the earlier sum on the left, and left at the first free one; the last term leaves the total
     at the top. XLA's reduction sums pairwise: a thread's running sum of 128 keys' terms put the fused step's
-    output at 1.55 to 1.61 times the XLA form's distance from float64 (jsf-r06h)."""
+    output at 1.55 to 1.61 times the XLA form's distance from float64 (jsf-r06h). Each level's choice is the
+    loop index's, laid over the vectors (`mosaic.laid`)."""
     carry, active, found = term, jnp.ones((), bool), []
     for level, partial in enumerate(partials):
         held = ((index >> level) & 1) == 1
-        found.append(jnp.where(active & ~held, carry, jnp.where(active & held, 0.0, partial)))
-        carry = jnp.where(active & held, partial + carry, carry)
+        added = mosaic.laid(active & held, carry)
+        left = jnp.where(added, jnp.zeros_like(partial), partial)
+        found.append(jnp.where(mosaic.laid(active & ~held, carry), carry, left))
+        carry = jnp.where(added, partial + carry, carry)
         active = active & held
     return tuple(found)
 

@@ -953,6 +953,14 @@ def plain(shape: tuple, dtype):
     return plgpu.SMEM(shape, dtype, transforms=(plgpu.PlainTransform(),))
 
 
+def laid(condition, like: jax.Array) -> jax.Array:
+    """The scalar `condition` laid over `like`, a vector predicate of its shape: Mosaic GPU's warpgroup
+    semantics select under no scalar predicate (`jnp.where` passes a scalar condition as it is; the fused
+    step's compile, "Implicit broadcast not implemented with warpgroup semantics"), where a scalar added to a
+    vector is laid over it."""
+    return (jnp.zeros_like(like, jnp.float32) + jnp.asarray(condition, jnp.float32)) != 0.0
+
+
 def synced(interpret: bool) -> None:
     """The warpgroup's threads past their shared-memory reads and writes before any goes on: a tile one thread
     wrote that another reads, or one written again that another still reads (a walk's scratch tile). Mosaic
