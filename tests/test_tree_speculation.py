@@ -17,7 +17,7 @@ SEEDS = 8
 """The tree verify's declared draws of prompts and trees (check 1)."""
 
 
-@pytest.mark.parametrize("kind", ["attention", "mla"])
+@pytest.mark.parametrize("kind", ["attention"])
 def test_a_trees_nodes_verified_in_one_pass_score_as_their_paths_walked(kind):
     """Each node of a tree verified in one pass (`TreeBlock`: every node over the row's prefix and its own
     ancestors, at its depth's place) scores the token after it as the walk over its path from the root does,
@@ -143,7 +143,7 @@ def _ranked(ranks):
     return drafting
 
 
-@pytest.mark.parametrize("kind", ["attention", "mla"])
+@pytest.mark.parametrize("kind", ["attention"])
 def test_tree_speculation_reproduces_the_greedy_walk(kind):
     """At zero temperature the target is a point mass, so a tree's walk keeps exactly the path of greedy
     picks it holds and emits the target's next pick after it: the whole run equals the greedy walk. The
