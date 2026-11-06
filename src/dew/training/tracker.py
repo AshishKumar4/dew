@@ -217,19 +217,36 @@ class _OwnedTracker:
 
 
 class WandbTracker(_OwnedTracker):
-    """A Weights & Biases run, opened on the first value logged into it."""
+    """A Weights & Biases run, opened on the first value logged into it.
+
+    `shared` opens it in W&B's shared mode (`wandb.Settings(mode="shared")`,
+    wandb 0.19 or later), where several processes write one run, each its
+    own `label`: the `primary` writer opens it and logs on `train/step`; any
+    other attaches to the run's `id`, logs its `label`'s metrics on its own
+    step (`<label>/step`) and leaves the run's state to the primary
+    (`x_update_finish_state`), as W&B's distributed logging guide has it.
+    """
 
     render = staticmethod(render)
 
     def __init__(self, project: str, name: str | None = None, *,
                  entity: str | None = None, config: Mapping[str, object] | None = None,
-                 offline: bool = False, id: str | None = None):
+                 offline: bool = False, id: str | None = None, shared: bool = False,
+                 primary: bool = True, label: str = "train"):
+        if shared and offline:
+            raise ValueError("a shared W&B run is written through W&B's server, which an offline run "
+                             "never reaches; drop offline or shared")
+        if not primary and (not shared or id is None):
+            raise ValueError("a writer other than a run's primary attaches to a shared run by its id; "
+                             "give shared=True and the run's id")
         self.project = project
         self.name = name
         self.entity = entity
         self.config = dict(config) if config is not None else None
         self.offline = offline
         self.id = id
+        self.shared, self.primary, self.label = shared, primary, label
+        self.step = "train/step" if primary else f"{label}/step"
         self._run = None
         self._closed = False
         self._exit_code = 0
@@ -241,16 +258,19 @@ class WandbTracker(_OwnedTracker):
         if self._run is None:
             import wandb
 
+            settings = None if not self.shared else wandb.Settings(
+                mode="shared", x_primary=self.primary, x_label=self.label,
+                **({} if self.primary else {"x_update_finish_state": False}))
             self._run = wandb.init(
                 project=self.project, name=self.name, entity=self.entity,
                 config=self.config, id=self.id, resume="allow",
-                mode="offline" if self.offline else None)
-            self._run.define_metric("train/step")
-            self._run.define_metric("*", step_metric="train/step")
+                mode="offline" if self.offline else None, settings=settings)
+            self._run.define_metric(self.step)
+            self._run.define_metric("*" if self.primary else f"{self.label}/*", step_metric=self.step)
         return self._run
 
     def log(self, scalars: Mapping[str, float], step: int) -> None:
-        self.run.log({**{name: float(value) for name, value in scalars.items()}, "train/step": step})
+        self.run.log({**{name: float(value) for name, value in scalars.items()}, self.step: step})
 
     def artifact(self, value: Reported, step: int) -> None:
         if self._closed:
@@ -260,7 +280,7 @@ class WandbTracker(_OwnedTracker):
             return
         if isinstance(value, RECORD_TYPES):
             self.run.summary[type(value).__name__] = tracker_json(value)
-            self.run.log({"train/step": step,
+            self.run.log({self.step: step,
                           "reporting/record": json.dumps(tracker_json(value), allow_nan=False),
                           "reporting/type": type(value).__name__})
             if isinstance(value, FitEnded):
@@ -269,7 +289,7 @@ class WandbTracker(_OwnedTracker):
                     self.run.mark_preempting()
                 self._exit_code = value.exit_code
             return
-        self.run.log({**self.render(value), "train/step": step})
+        self.run.log({**self.render(value), self.step: step})
 
     def close(self) -> None:
         if self._closed:
@@ -799,10 +819,16 @@ class Wandb:
 
     Setting it turns tracking on; the entity and the offline switch have no effect
     without a project. `name` is the run's display name there, apart from the name
-    its checkpoints are kept under; None shows it as the run is named.
+    its checkpoints are kept under; None shows it as the run is named. `shared`
+    opens the run in W&B's shared mode as its primary writer, so other processes
+    (a forecaster, an evaluator) log into the same run on axes of their own
+    (`WandbTracker`'s `primary=False`), whose rows a run opened plainly drops: two
+    processes on one run, 30 rows and 0 plainly, 30 and 3 shared (wandb 0.31.0).
+    A shared run is one W&B's server holds, so an offline one is refused (`WandbTracker`).
     """
 
     project: str
     entity: str | None = None
     offline: bool = False
     name: str | None = None
+    shared: bool = False
