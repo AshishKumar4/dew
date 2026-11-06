@@ -1191,6 +1191,7 @@ def test_every_objective_carries_live_qk_statistics_to_muonclip(kind, tmp_path):
     resumes, where each refused its first update (row 1608: the objective returned no maxima)."""
     from decision_support import decision_rows
     from test_decision_objective import INTENT, LAYOUT, SPECIALS, TOKENIZER, tiny_backbone
+    from test_training_telemetry import Repeated
 
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition, Loader
@@ -1204,7 +1205,9 @@ def test_every_objective_carries_live_qk_statistics_to_muonclip(kind, tmp_path):
     from dew.training.transaction import compact_qk
 
     if kind == "decision":
-        objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+        # QK-Clip bounds the logits of a backbone that norms none of its queries and keys.
+        objective = DecisionObjective(tiny_backbone().clone(qk_norm=False), tokenizer=TOKENIZER,
+                                      specials=SPECIALS, layout=LAYOUT)
         examples = [Example(f"charged twice {index}", {"team": INTENT}, {"team": "billing"})
                     for index in range(8)]
         batch = next(iter(decision_rows(examples, 8, objective=objective.data()).train(DataPartition())))
@@ -1234,7 +1237,7 @@ def test_every_objective_carries_live_qk_statistics_to_muonclip(kind, tmp_path):
     final, *_ = trainer.compile(initial, batch)(initial, batch)
     assert int(final.updates) == 1
     # And through a run's checkpoint and its resume, the second update clipped as the first.
-    data = Loader(lambda partition: iter([batch] * 4), None, None, 8)
+    data = Loader(lambda partition: Repeated(batch), None, None, 8)
     checkpoints = str(tmp_path / "run")
     Trainer(objective, optimizer.build(2), key=0, checkpoints=Checkpoints(checkpoints)).fit(
         data, steps=1, log_every=1, checkpoint_every=1)
