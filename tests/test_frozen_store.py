@@ -184,6 +184,41 @@ class Wide(Objective):
         return Ratio(jnp.sum(error), jnp.asarray(error.size, jnp.float32)), Aux(metrics={})
 
 
+@pytest.mark.parametrize("collection", ["qk", "custom"])
+def test_a_collection_a_module_sowed_at_init_resumes_as_it_was_written(collection, tmp_path):
+    """A collection a Flax module sowed as it was initialized (`sow`, its values held in tuples) is stored and
+    read back as it was written, its tuples tuples, though Orbax's metadata holds them in lists
+    (`orbax.checkpoint.tree.serialize_tree`; row 1608: a model sowing its attention maxima at init could not
+    resume), and a part of it a template asks for, in the template's dtype."""
+    import flax.linen as nn
+
+    from dew.state import TrainState
+
+    class Sowing(nn.Module):
+        @nn.compact
+        def __call__(self, value):
+            self.sow(collection, "head_dim", jnp.asarray(value.shape[-1]))
+            self.sow(collection, "nested", ({"value": (jnp.arange(2.0),)}, jnp.asarray(3)))
+            return nn.Dense(2)(value)
+
+    variables = Sowing().init(jax.random.key(0), jnp.ones((1, 4)))
+    count = jnp.ones((), jnp.int32)
+    written = TrainState(step=count, microstep=count, updates=count, variables=variables,
+                         opt_state={"count": count}, ema=None, key=jax.random.key_data(jax.random.key(0)),
+                         scale=None, window_size=count)
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(1, written)
+    checkpoints.wait()
+    restored, _ = checkpoints.restore(written)
+    assert jax.tree.structure(restored) == jax.tree.structure(written)
+    for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(written), strict=True):
+        np.testing.assert_array_equal(got, want)
+    part = {"variables": {collection: {"head_dim": (jax.ShapeDtypeStruct((), jnp.float32),)}}}
+    asked, _ = checkpoints.restore(part)
+    (read,) = asked["variables"][collection]["head_dim"]
+    assert (read.dtype, float(read)) == (jnp.float32, 4.0)
+
+
 def test_a_collection_saved_with_x64_on_restores_with_it_off(tmp_path):
     """The digest is of the stored bytes: a float64 table written with x64
     on restores with x64 off, as host float64 bitwise and as float32 onto a

@@ -68,6 +68,7 @@ import functools
 import hashlib
 import itertools
 import math
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 
@@ -108,7 +109,7 @@ from check1_statistics import (
     row_factor,
     shown,
 )
-from check1_wire import DRAWS, REDRAW, STAGES, staged_units
+from check1_wire import CENSUS, DRAWS, REDRAW, STAGES, staged_units
 from conditioning import Conditioning, conditioned
 from float64_terms import float64_terms
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
@@ -259,8 +260,14 @@ dispatch at run time. YNNPACK picks its microkernels at run time by that instruc
 the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
 check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
 of different instruction sets, though the bits still part with the host (docs/performance.md, "The
-SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
-because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+SSD kernel's host check 1 without YNNPACK"); and XLA:CPU's fusion choices are not Dew's (rows 4520, 4522).
+The empty list, not the documented `-individual_dot`, because compiler options take no such spelling and
+that one leaves a scan's reductions fused. The census (`CENSUS`) compiles without it (`switched_off`)."""
+
+
+def switched_off() -> dict:
+    """WITHOUT_YNN, or none under the census (`CENSUS`), read when the gate compiles."""
+    return {} if os.environ.get(CENSUS) else WITHOUT_YNN
 
 
 def without_ynn(fn, **jit_options):
@@ -275,7 +282,7 @@ def without_ynn(fn, **jit_options):
     if getattr(fn, "without_ynn", False):
         return fn
     if jax.default_backend() == "cpu":
-        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
+        jit_options["compiler_options"] = {**switched_off(), **(jit_options.get("compiler_options") or {})}
     compiled = jax.jit(fn, **jit_options)
     compiled.without_ynn = True
     return compiled
@@ -491,7 +498,7 @@ def _with_ynn_off(fn):
 
     @functools.wraps(fn)
     def run(*inputs, **options):
-        with compiled_with(WITHOUT_YNN if jax.default_backend() == "cpu" else {}):
+        with compiled_with(switched_off() if jax.default_backend() == "cpu" else {}):
             return fn(*inputs, **options)
     return run
 
@@ -1451,7 +1458,6 @@ site's stage-two rate from, every attempt counted, and which sites' local errors
 
 def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
     import json
-    import os
 
     path = os.environ.get(STAGES_LOG)
     if path:

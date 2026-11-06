@@ -41,7 +41,6 @@ from dew.nn import categorical
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.inspection import INSPECTED
 from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, ProjectionGroup, TokenModel
 from dew.objectives.base import (
     OMITTED,
@@ -404,7 +403,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             progress=self.progress(step), opened=step.sown())
         loss, aux = self._charged(logits, inputs, batch)
-        return loss, replace(aux, inspected=sown.get(INSPECTED, {}) if step.watched is not None else None)
+        qk, inspected = step.observed(sown)
+        return loss, replace(aux, qk_stats=qk, inspected=inspected)
 
     def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
                  ) -> tuple[Ratio | Weighted, Aux]:

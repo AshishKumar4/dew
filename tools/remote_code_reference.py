@@ -59,17 +59,16 @@ release does (`opens`).
 """
 
 import argparse
-import io
 import json
 import runpy
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
+import reference_worker
 import torch
 import transformers
 from huggingface_hub import hf_hub_download
@@ -412,21 +411,6 @@ def opens(name: str, export: Path, scratch: Path) -> dict[str, bool]:
     return json.loads(run.stdout.strip().splitlines()[-1])
 
 
-def send(stream, arrays: dict) -> None:
-    """`arrays` over a pipe to the other side of a recording (`received`)."""
-    buffer = io.BytesIO()
-    np.savez(buffer, **arrays)
-    stream.write(struct.pack("<Q", len(buffer.getvalue())) + buffer.getvalue())
-    stream.flush()
-
-
-def received(stream) -> dict:
-    """The arrays the other side of a recording sent (`send`)."""
-    size = struct.unpack("<Q", stream.read(8))[0]
-    with np.load(io.BytesIO(stream.read(size))) as arrays:
-        return dict(arrays)
-
-
 SPELLED = {"mimo-v2-vl-tiny": {"pixel_values_videos": "video_pixel_values"}}
 """Each release's names for the media fields its forward spells otherwise than its processor's: MiMo-V2.6's
 video patches (`MiMoV2ForCausalLM.forward`)."""
@@ -496,20 +480,21 @@ def released_outputs(model, site: str, inputs: dict, name: str = "") -> dict[str
 
 
 def serve(name: str) -> None:
-    """The release's side of a recording (`--record`): its fp32 outputs and their float64 truth at each
-    site and draw the pipe brings."""
+    """The release's side of a recording (`--record`, over tools/reference_worker.py's frames): its fp32
+    outputs and their float64 truth at each site and draw the recorder sends."""
     with tempfile.TemporaryDirectory() as scratch:
         native = released_model(name, Path(scratch) / "fp32").float()
         # Its float64 twin (`float64_twin`): built inside `float64`, its constructor's tables float64's.
         wide = float64_twin(native, lambda: released_model(name, Path(scratch) / "f64"))
-        while True:
-            request = received(sys.stdin.buffer)
+
+        def run(request: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             site = str(request.pop("site"))
             reference = released_outputs(native, site, request, name)
             with float64():
                 truth = released_outputs(wide, site, request, name)
-            send(sys.stdout.buffer, {**{f"reference.{leaf}": value for leaf, value in reference.items()},
-                                     **{f"truth.{leaf}": value for leaf, value in truth.items()}})
+            return reference_worker.paired(reference, truth)
+
+        reference_worker.serve(run, frames=True)
 
 
 def record(name: str, release_python: str) -> None:
@@ -528,18 +513,13 @@ def record(name: str, release_python: str) -> None:
     config = json.loads((FIXTURES / name / "config.json").read_text())
     layouts = {layout.name: layout for layout in source.weight_layouts}
     shapes = {path: leaf.shape for path, leaf in flat_tree(source.variables).items()}
-    worker = subprocess.Popen([release_python, __file__, name, "--serve"], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE)
     arrays = {}
-    try:
+    with reference_worker.session([release_python, __file__, name, "--serve"]) as worker:
         for site in SITES[name]:
             def evaluate(inputs, site=site):
-                send(worker.stdin, {"site": np.asarray(site), **inputs})
-                returned = received(worker.stdout)
-                arms = ({leaf.removeprefix(f"{kind}."): value for leaf, value in returned.items()
-                         if leaf.startswith(f"{kind}.")} for kind in ("reference", "truth"))
+                arms = reference_worker.arms(worker.ask({"site": np.asarray(site), **inputs}))
                 if site != "gradients":
-                    return tuple(arms)
+                    return arms
                 return tuple({".".join(layouts[tensor].paths[0][1:]): layouts[tensor].restore(
                     value, shapes[".".join(layouts[tensor].paths[0])]) for tensor, value in arm.items()}
                     for arm in arms)
@@ -548,8 +528,6 @@ def record(name: str, release_python: str) -> None:
                 f"{name} {site}", lambda seed, site=site: draw(site, seed, config), evaluate,
                 remote_code_site(source, site), truth_proxy=remote_code_site(source, site, wide=True),
                 store_inputs=False, summary=True))
-    finally:
-        worker.kill()
     repo, revision = RELEASES[name][:2]
     versions = subprocess.run([release_python, "-c", "import torch, transformers; "
                                "print(transformers.__version__, torch.__version__)"],

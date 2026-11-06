@@ -2134,7 +2134,7 @@ class RunConfig:
                 # Shown under its own name where one is given, kept under the run's either way.
                 wandb_tracker = WandbTracker(
                     trainer.wandb.project, name if trainer.wandb.name is None else trainer.wandb.name,
-                    entity=trainer.wandb.entity, offline=trainer.wandb.offline)
+                    entity=trainer.wandb.entity, offline=trainer.wandb.offline, shared=trainer.wandb.shared)
             checkpoints = trainer.checkpoints(name)
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))

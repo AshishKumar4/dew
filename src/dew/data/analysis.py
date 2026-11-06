@@ -85,6 +85,7 @@ from dew.data.plan import (
     _semantic,
     filled_version,
     identified,
+    read_by,
     streams_parquet,
 )
 from dew.data.sources.base import (
@@ -647,6 +648,7 @@ def _cache_key(source: Source, prefix: Sequence[Stage], read: Read, version: int
     """`_cache_manifest`, or None where `source` states no content of its own to key. A stream's fill
     numbers its rows by its shards, which a Parquet store's are its files from `FILE_SHARDS` and its row
     groups before (`filled_version`), so the two fill caches of their own."""
+    read_by(version)
     stated = source.fingerprint()
     if not identified(json_value(stated, "source")):
         return None

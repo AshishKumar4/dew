@@ -607,14 +607,15 @@ class Decide(SavedRunTask, InItsForm):
 
     @overload
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
-                 images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]: ...
+                 images: Sequence[Image.Image] = (), context: JSON | None = None,
+                 request: Mapping[str, Question] | None = None) -> dict[str, Answer]: ...
 
     @overload
     def __call__(self, state: Sequence[tuple[JSON, Mapping[str, Question]]], questions: None = None, *,
                  contexts: Sequence[JSON | None] | None = None) -> list[dict[str, Answer]]: ...
 
     @traced_in_its_form
-    def __call__(self, state, questions=None, *, images=(), context=None, contexts=None):
+    def __call__(self, state, questions=None, *, images=(), context=None, contexts=None, request=None):
         """Return one answer per question in `questions`, about `state` and any `images`; or, given a
         sequence of `(state, questions)` requests and no `questions`, each request's answers in order.
 
@@ -623,13 +624,22 @@ class Decide(SavedRunTask, InItsForm):
         need a layout with a place for them (`Layout.images`) and the backbone's processor, as a
         joint-head release brings. `context` is a sequence the decision reads beside the state through
         the backbone's cross-attention (`Example.context`), and `contexts` each request's, in order.
+        `request` is the whole request `questions` are asked from, which a summary of it writes
+        (`RequestSummary`), where they are a part of it: a tournament's rounds (`tournament`).
         """
         if questions is None:
+            if request is not None:
+                raise ValueError("each of a batch's requests is its own whole request; ask a part of one "
+                                 "with questions= and request=")
+            if images or context is not None:
+                raise ValueError("a batch of requests reads no one request's images or context: give each "
+                                 "request's context in contexts=, and ask a request with images alone")
             return [answers for answers, _ in self._answered(self.rows(state, contexts=contexts),
                                                              [asked for _, asked in state])]
         if images:
-            return self._seen(state, questions, images, context)[0]
-        return self._answered(self.rows([(state, questions)], contexts=[context]), [questions])[0][0]
+            return self._seen(state, questions, images, context, request=request)[0]
+        return self._answered([self._encoded(state, questions, context=context, request=request)],
+                              [questions])[0][0]
 
     def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
              contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
@@ -766,17 +776,20 @@ class Decide(SavedRunTask, InItsForm):
         return self.layout.rows(self.tokenizer, self.specials, "", {"q": Choice("x", ["0"])})
 
     def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
-              context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:
-        """One request's answers and usage, its images laid out in its one row."""
-        return self._looked(questions, *self._shown(state, questions, images, context))
+              context: JSON | None = None, *, request: Mapping[str, Question] | None = None
+              ) -> tuple[dict[str, Answer], Usage]:
+        """One request's answers and usage, its images laid out in its one row, its questions asked from
+        `request` where they are a part of it."""
+        return self._looked(questions, *self._shown(state, questions, images, context, request=request))
 
     def _shown(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
-               context: JSON | None = None) -> tuple[Encoded, Images]:
+               context: JSON | None = None, *, request: Mapping[str, Question] | None = None
+               ) -> tuple[Encoded, Images]:
         """A request's one row with its images laid out before the state, and the images."""
         if self.processor is None or not self.layout.images:
             raise ValueError("images need a backbone with a vision encoder, which this task does not have")
         media = Images.of(self.processor, images, self.processor.image_text())
-        rows = self._encoded(state, questions, media.tokens, context=context)
+        rows = self._encoded(state, questions, media.tokens, context=context, request=request)
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")
         return rows[0], media
@@ -804,8 +817,11 @@ class Decide(SavedRunTask, InItsForm):
         return self.model.context_length
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
-                 media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
-        laid = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
+                 media: Sequence[int] = (), *, context: JSON | None = None,
+                 request: Mapping[str, Question] | None = None,
+                 tokens: Sequence[int] | None = None) -> list[Encoded]:
+        laid = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media, request=request,
+                                tokens=tokens)
         for row in laid:
             # A row whose declared budgets cut its options alike is answered as its release answers it,
             # the cut in its usage; training leaves such a row out (`Layout.refusal`).
@@ -923,12 +939,25 @@ class Decide(SavedRunTask, InItsForm):
                 for part in range(parts):
                     chosen = options[part * len(options) // parts:(part + 1) * len(options) // parts]
                     played[f"{name}/{part}"] = _restricted(questions[name], chosen)
-            answers = self(state, played)
+            answers = self._played(state, played, questions)
             remaining |= {name: [_choice(answers[key]) for key in played if key.rsplit("/", 1)[0] == name]
                           for name in playing}
         final = {name: _restricted(question, remaining[name]) if name in remaining else question
                  for name, question in questions.items()}
-        return self(state, final)
+        return self(state, final, request=questions)
+
+    def _played(self, state: JSON, played: Mapping[str, Question], request: Mapping[str, Question]
+                ) -> dict[str, Answer]:
+        """A round's answers, each group `played` under its key (`<name>/<group>`) asked as its question
+        `<name>` of the whole `request`, its row summarizing that request with it current
+        (`RequestSummary`), every group scored in one call."""
+        names = {key: key.rsplit("/", 1)[0] for key in played}
+        # The state's tokens encoded once for every group's row (`Layout.state`).
+        tokens = self.layout.state(self.tokenizer, self.specials, state)
+        encoded = [self._encoded(state, {names[key]: question}, request=request, tokens=tokens)
+                   for key, question in played.items()]
+        answered = self._answered(encoded, [{names[key]: question} for key, question in played.items()])
+        return {key: answers[names[key]] for key, (answers, _) in zip(played, answered, strict=True)}
 
     def _finalists(self, state: JSON, questions: Mapping[str, Question], rounds: Finalists
                    ) -> dict[str, Answer]:
@@ -940,7 +969,7 @@ class Decide(SavedRunTask, InItsForm):
                 if isinstance(question, Choice) and len(question.options) > rounds.final}
         played = {f"{name}/{part}": _restricted(questions[name], chosen)
                   for name, groups in wide.items() for part, chosen in enumerate(groups)}
-        answers = self(state, played) if played else {}
+        answers = self._played(state, played, questions) if played else {}
         first: dict[str, dict[str, float]] = {name: {} for name in wide}
         finalists: dict[str, list[str]] = {}
         for name, groups in wide.items():
@@ -956,7 +985,7 @@ class Decide(SavedRunTask, InItsForm):
                 kept = sorted(kept, key=lambda option: -first[name][option])[:rounds.final]
             finalists[name] = kept
         final = self(state, {name: _restricted(question, finalists[name]) if name in finalists else question
-                             for name, question in questions.items()})
+                             for name, question in questions.items()}, request=questions)
         for name in finalists:
             question, answer = questions[name], final[name]
             assert isinstance(answer, ChoiceAnswer)
@@ -1594,9 +1623,9 @@ def _knocked_out(final: Mapping[str, float], first: Mapping[str, float], residua
     `residual` in proportion to its probability in its group's round (shared evenly where those are all
     zero), all over their total."""
     rest = [option for option in first if option not in final]
-    mass = sum(first[option] for option in rest) or 1.0
+    mass = sum(first[option] for option in rest)
     spread = {option: float(value) * (1 - residual) for option, value in final.items()}
-    spread |= {option: residual * first[option] / mass for option in rest}
+    spread |= {option: residual * first[option] / mass if mass else residual / len(rest) for option in rest}
     total = sum(spread.values())
     return {option: value / total for option, value in spread.items()}
 

@@ -18,9 +18,10 @@
             "local": true },
   "task": {
     "command": ["python3", "tools/armada/ci.py", "task", "--python={python}", "--tests={tests}", "--split={split}",
-                "--out={out}", "--cache={cache}", "--whole={whole}"],
+                "--out={out}", "--cache={cache}", "--whole={whole}",
+                "--census={census}"],
     "timeout": 1800,
-    "mode": "fast",
+    "mode": "efficient",
     "speculative": true,
     "cpu": [{ "vendor": "AuthenticAMD", "family": 25, "model": 17 }, { "vendor": "AuthenticAMD", "family": 26, "model": 17 }],
     "secrets": ["DEW_XLA_CACHE_TOKEN"]

@@ -36,6 +36,7 @@ from process_support import (
     free_port,
     report_of,
     run_pool,
+    run_pools,
     run_worker,
     serving,
     spawn,
@@ -769,12 +770,11 @@ def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpo
     nobody stopped lands, at the same final position with the same
     parameters.
     """
-    resumed = run_pool("fit", tmp_path / "resumed", 2, name="pool",
-                       run_dir=pool_checkpoint["checkpoints"].parent, fsdp_size=2,
-                       steps=2 * POOL_STEPS, records=RECORDS)
-    whole = run_pool("fit", tmp_path / "whole", 2, name="whole",
-                     run_dir=tmp_path / "whole-run", fsdp_size=2,
-                     steps=2 * POOL_STEPS, records=RECORDS)
+    shared = {"fsdp_size": 2, "steps": 2 * POOL_STEPS, "records": RECORDS}
+    resumed, whole = run_pools(
+        ("fit", tmp_path / "resumed", 2, {"name": "pool", "run_dir": pool_checkpoint["checkpoints"].parent,
+                                          **shared}),
+        ("fit", tmp_path / "whole", 2, {"name": "whole", "run_dir": tmp_path / "whole-run", **shared}))
     for index, report in enumerate(resumed):
         assert report["restored_step"] == POOL_STEPS
         assert report["restored_dataset_state"] == pool_checkpoint["reports"][index]["dataset_state"]
@@ -984,10 +984,9 @@ def test_an_elastic_filtered_stream_resumes_on_another_process_count(tmp_path, r
     parameters, since both read the batches one process reads."""
     directory = tmp_path / "resumed-run"
     shutil.copytree(replicated_checkpoint, directory)
-    resumed = run_pool("fit", tmp_path / "resumed", processes,
-                       **replicated_flags(directory, 2 * POOL_STEPS))
-    whole = run_pool("fit", tmp_path / "whole", processes,
-                     **replicated_flags(tmp_path / "whole-run", 2 * POOL_STEPS))
+    resumed, whole = run_pools(
+        ("fit", tmp_path / "resumed", processes, replicated_flags(directory, 2 * POOL_STEPS)),
+        ("fit", tmp_path / "whole", processes, replicated_flags(tmp_path / "whole-run", 2 * POOL_STEPS)))
     for index, report in enumerate(resumed):
         assert report["restored_step"] == POOL_STEPS
         assert report["step"] == 2 * POOL_STEPS
@@ -1045,10 +1044,9 @@ def test_a_packed_pool_position_resumes_on_another_process_count(tmp_path,
     flags = {"name": "packed", "fsdp_size": 1, "steps": 2 * POOL_STEPS,
              "tokens": packed_checkpoint["corpus"].train, "seq_len": PACKED_SEQ_LEN}
 
-    resumed = run_pool("packed_fit", tmp_path / "resumed", processes,
-                       run_dir=directory, **flags)
-    whole = run_pool("packed_fit", tmp_path / "whole", processes,
-                     run_dir=tmp_path / "whole-run", **flags)
+    resumed, whole = run_pools(
+        ("packed_fit", tmp_path / "resumed", processes, {"run_dir": directory, **flags}),
+        ("packed_fit", tmp_path / "whole", processes, {"run_dir": tmp_path / "whole-run", **flags}))
 
     for index, report in enumerate(resumed):
         assert report["restored_step"] == POOL_STEPS
@@ -1326,9 +1324,8 @@ def test_a_killed_pool_resumes_from_the_newer_local_checkpoint(tmp_path, killed_
     persistent = worker.checkpoint_dir(directory / "run", "local")
     assert committed_steps(persistent) == [SAVE_EVERY, 2 * SAVE_EVERY]
     before = persistent_bytes(persistent)
-    whole = run_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
-
-    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory))
+    whole, resumed = run_pools(("fit", tmp_path / "whole", 2, local_flags(tmp_path / "whole-run")),
+                               ("fit", tmp_path / "resumed", 2, local_flags(directory)))
 
     for index, report in enumerate(resumed):
         assert report["restored_step"] == LOCAL_KILL_AFTER
@@ -1361,9 +1358,8 @@ def test_a_process_that_lost_its_local_copy_recovers_it_from_a_replica(tmp_path,
     directory = tmp_path / "lost"
     shutil.copytree(killed_local_pool, directory)
     shutil.rmtree(directory / "local" / "process1")
-    whole = run_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
-
-    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory))
+    whole, resumed = run_pools(("fit", tmp_path / "whole", 2, local_flags(tmp_path / "whole-run")),
+                               ("fit", tmp_path / "resumed", 2, local_flags(directory)))
 
     assert [report["restored_step"] for report in resumed] == [LOCAL_KILL_AFTER] * 2
     assert resumed[0]["restored_from"] == str(directory / "local" / "process0")

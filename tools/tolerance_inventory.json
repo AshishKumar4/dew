@@ -318,7 +318,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_host_training.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_image_metrics.py": {
@@ -718,7 +718,7 @@
    "lane": "Training"
   },
   "tools/check_native_diffusion.py": {
-   "comparisons": 5,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tools/classic_gpt_reference.py": {

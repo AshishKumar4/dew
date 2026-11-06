@@ -69,14 +69,21 @@ def keeps_high_water() -> bool:
     return jax.config.jax_platforms != "cpu"
 
 
+PEAK_CACHE = "DEW_PEAK_CACHE"
+"""The environment variable naming a compile cache the peak runs keep across calls (tools/perf_gate.py
+names one an arm, so each of its rounds' first runs loads what its first round compiled); a cache of the
+call's own, removed after it, where unset."""
+
+
 def measured(argv: list[str]) -> list[int | None]:
     """Each local device's high-water over `python <argv>`'s run, in a process that loaded every program
     from the cache a first run of it filled, so compiled nothing; a `CalledProcessError` where either run
-    fails, `CompiledWhileMeasured` where the second compiled."""
+    fails, `CompiledWhileMeasured` where the second compiled. The cache is PEAK_CACHE's where it names one."""
     with tempfile.TemporaryDirectory(prefix="dew-peak-") as directory:
         # JAX's settings by their environment names: every compile kept, however small or quick.
+        cache = os.environ.get(PEAK_CACHE) or str(Path(directory, "cache"))
         environment = {**os.environ, "JAX_ENABLE_COMPILATION_CACHE": "true",
-                       "JAX_COMPILATION_CACHE_DIR": str(Path(directory, "cache")),
+                       "JAX_COMPILATION_CACHE_DIR": cache,
                        "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
                        "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1"}
         out = Path(directory, "peaks.json")

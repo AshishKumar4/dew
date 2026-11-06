@@ -111,4 +111,4 @@ python examples/evaluate_and_serve.py --run runs/shakespeare/checkpoints \
 JAX_PLATFORMS=cpu python examples/evaluate_and_serve.py --smoke --out /tmp/eval-smoke
 ```
 
-The smoke run first trains a byte-level model for two steps and then scores it. Given a diffusion run with `--image-run`, the smoke run also scores CLIPScore and FID offline. A smoke run has no held-out set, so the reference images are a second draw from the same run. That exercises the metric code but says nothing about the model.
+The smoke run first trains a byte-level model for two steps and then scores it. Given a diffusion run with `--image-run` instead, the smoke run scores that run's CLIPScore and FID offline and trains no language model; outside a smoke run too, `--image-run` without `--run` scores the diffusion run alone. A smoke run has no held-out set, so the reference images are a second draw from the same run. That exercises the metric code but says nothing about the model.

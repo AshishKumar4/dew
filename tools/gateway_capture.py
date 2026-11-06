@@ -49,6 +49,7 @@ from pathlib import Path
 
 import httpx
 
+from dew._cleanup import owned_group
 from dew.interop.gateway import Gateway
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -91,13 +92,12 @@ def engine(name: str, bin: Path) -> list[str]:
 
 @contextlib.contextmanager
 def served(name: str, bin: Path, out: Path) -> Iterator[None]:
-    """The engine `name` started from `bin`, healthy and warm, stopped after; its output goes to
-    `{name}_engine.log` in `out`."""
-    log = (out / f"{name}_engine.log").open("w")
+    """The engine `name` started from `bin`, healthy and warm, stopped after, its group with it and a minute's
+    grace; its output goes to `{name}_engine.log` in `out`."""
     # The engine's own environment first on PATH: it runs build tools (SGLang's ninja) from there.
-    server = subprocess.Popen(engine(name, bin), stdout=log, stderr=subprocess.STDOUT,
-                              env={**os.environ, "PATH": os.pathsep.join((str(bin), os.environ["PATH"]))})
-    try:
+    environment = {**os.environ, "PATH": os.pathsep.join((str(bin), os.environ["PATH"]))}
+    with (out / f"{name}_engine.log").open("w") as log, owned_group(
+            engine(name, bin), grace=60, stdout=log, stderr=subprocess.STDOUT, env=environment) as server:
         deadline = time.monotonic() + 1200
         while not _answers(f"{ENGINE}/health"):
             if server.poll() is not None or time.monotonic() > deadline:
@@ -106,10 +106,6 @@ def served(name: str, bin: Path, out: Path) -> Iterator[None]:
         httpx.post(f"{ENGINE}/v1/chat/completions", timeout=900,
                    json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})
         yield
-    finally:
-        server.terminate()
-        server.wait(60)
-        log.close()
 
 
 def compact(trace: dict) -> dict:
@@ -135,30 +131,26 @@ def capture_gateway(name: str, bin: Path, gateway_bin: Path, venvs: Path, out: P
     config.write_text(json.dumps({"host": "127.0.0.1", "port": 9090, "store_worker": "memory", "sync_traces": True,
                                   "health_check_interval": 60,
                                   "workers": [{"url": f"{ENGINE}/v1", "model_name": MODEL}]}))
-    with served(name, bin, out):
-        gateway = subprocess.Popen([str(gateway_bin / "rllm-model-gateway"), "--config", str(config)],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            Gateway(GATEWAY).ready(300)
-            messages = [{"role": "system", "content": "You solve tasks with the bash tool, one command per turn."},
-                        {"role": "user", "content": "Create hello.txt containing 'Hello, world!', then check it."}]
-            for turn in range(3):
-                message = chat(f"{name}-session", messages, tools=TOOLS, max_tokens=256, temperature=1.0).json()[
-                    "choices"][0]["message"]
-                messages.append({key: message[key] for key in ("role", "content", "tool_calls") if message.get(key)})
-                messages.extend({"role": "tool", "tool_call_id": call["id"], "content": f"(turn {turn}) ok"}
-                                for call in message.get("tool_calls") or [])
-                if not message.get("tool_calls"):
-                    messages.append({"role": "user", "content": "Use the bash tool."})
-            chat(f"{name}-overflow", [{"role": "user", "content": "word " * 8000}], max_tokens=16)
-            traces = {sid: httpx.get(f"{GATEWAY}/sessions/{name}-{sid}/traces", timeout=60).json()
-                      for sid in ("session", "overflow")}
-            (out / f"{name}_session_traces.json").write_text(
-                json.dumps([compact(trace) for trace in traces["session"]]))
-            (out / f"{name}_overflow_trace.json").write_text(json.dumps(compact(traces["overflow"][0])))
-        finally:
-            gateway.terminate()
-            gateway.wait(60)
+    gateway = [str(gateway_bin / "rllm-model-gateway"), "--config", str(config)]
+    with served(name, bin, out), owned_group(gateway, grace=60, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL):
+        Gateway(GATEWAY).ready(300)
+        messages = [{"role": "system", "content": "You solve tasks with the bash tool, one command per turn."},
+                    {"role": "user", "content": "Create hello.txt containing 'Hello, world!', then check it."}]
+        for turn in range(3):
+            message = chat(f"{name}-session", messages, tools=TOOLS, max_tokens=256, temperature=1.0).json()[
+                "choices"][0]["message"]
+            messages.append({key: message[key] for key in ("role", "content", "tool_calls") if message.get(key)})
+            messages.extend({"role": "tool", "tool_call_id": call["id"], "content": f"(turn {turn}) ok"}
+                            for call in message.get("tool_calls") or [])
+            if not message.get("tool_calls"):
+                messages.append({"role": "user", "content": "Use the bash tool."})
+        chat(f"{name}-overflow", [{"role": "user", "content": "word " * 8000}], max_tokens=16)
+        traces = {sid: httpx.get(f"{GATEWAY}/sessions/{name}-{sid}/traces", timeout=60).json()
+                  for sid in ("session", "overflow")}
+        (out / f"{name}_session_traces.json").write_text(
+            json.dumps([compact(trace) for trace in traces["session"]]))
+        (out / f"{name}_overflow_trace.json").write_text(json.dumps(compact(traces["overflow"][0])))
 
 
 class _Recorded(BaseHTTPRequestHandler):

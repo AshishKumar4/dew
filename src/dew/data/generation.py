@@ -118,6 +118,16 @@ def _fact(value: Batch | bytes | Rejected | None, name: str) -> int | None:
     return int(stated)
 
 
+def _store_shards_named(source: Source, version: int, completions: Mapping[str, object]) -> bool:
+    """Whether a stream's fill keys its rows by its store's own shards at data plan `version`, or by the
+    store's finer ones (a Parquet store's row groups, `ShardManifest.parts`): a stream cut into more shards
+    than these keys its rows by its own cuts, which no generation of the store holds, and publishes
+    nothing."""
+    manifest = source.manifest(version)
+    named = {json.loads(row)[0] for row in completions}
+    stored = {shard.id for shard in manifest.shards}
+    return named <= stored or named <= {shard.id for shard in manifest.parts()}
+
 def _publish(
     cache: Cache,
     key: DependencyManifest,
@@ -136,12 +146,8 @@ def _publish(
         _retain_committed(root, current, completions, shards, pins)
     # A stream's fill numbers its rows by the shards its key says it read (`filled_version`).
     streamed, version = any(row.startswith("[") for row in completions), filled_version(key.fill)
-    if of_several and streamed:
-        stored = {shard.id for shard in source.manifest(version).shards}
-        if any(json.loads(row)[0] not in stored for row in completions):
-            # A stream cut into more shards than its store's keys its rows by its own cuts, which no
-            # generation of the store holds: it publishes nothing.
-            return None
+    if of_several and streamed and not _store_shards_named(source, version, completions):
+        return None
     expected = tuple(_source_ids(source, version, streamed=streamed, completed=completions))
     expected_keys = {_row_key(row) for row in expected}
     missing, extra = expected_keys - completions.keys(), completions.keys() - expected_keys
@@ -396,12 +402,16 @@ def _source_ids(source: Source, version: int, *, streamed: bool = False,
         return
     # Counted off its store's footers, a default read's threads at once, where its shards state no rows.
     manifest = source.manifest(version).sized(Loading().threads)
+    shards = manifest.shards
     if manifest.subdivide is not None:
-        store_shards = {shard.id for shard in manifest.shards}
-        if any(isinstance(row, list) and row[0] not in store_shards for row in map(json.loads, completed)):
-            raise ValueError("cache publication needs the store's own shards; "
-                             "row-wise node splits cannot be published")
-    for shard in manifest.shards:
+        named = {row[0] for row in map(json.loads, completed) if isinstance(row, list)}
+        if not named <= {shard.id for shard in shards}:
+            # A fill keyed by the store's finer shards numbers its rows by them (`ShardManifest.parts`).
+            shards = manifest.parts()
+            if not shards or not named <= {shard.id for shard in shards}:
+                raise ValueError("cache publication needs the store's own shards; "
+                                 "row-wise node splits cannot be published")
+    for shard in shards:
         if shard.rows is not None:
             yield from ((shard.id, index) for index in range(shard.rows))
         else:

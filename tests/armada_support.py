@@ -81,13 +81,15 @@ def commit(root: Path, message: str) -> str:
     return git(root, "rev-parse", "HEAD").strip()
 
 
-def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 300.0) -> list[dict]:
-    """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy` for tasks of `target` seconds, each run as
-    armada starts it: .armada.json's command filled from its plan entry, in .armada.json's environment, which
-    the plan's DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
+def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 300.0,
+                census: bool = False) -> list[dict]:
+    """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy` for tasks of `target` seconds, the census's
+    with `census` (`plan --census`), each run as armada starts it: .armada.json's command filled from its plan
+    entry, in .armada.json's environment, which the plan's DEW_TEST_CACHE is not part of. Their rows, in the
+    plan's order."""
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
     monkeypatch.setenv("DEW_TEST_CACHE", policy)
-    entries = [entry for entry in ci.plan(target, {}) if entry["python"] == "3.12"]
+    entries = [entry for entry in ci.plan(target, {}, census=census) if entry["python"] == "3.12"]
     monkeypatch.delenv("DEW_TEST_CACHE")
     rows = []
     for entry in entries:

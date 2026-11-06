@@ -14,11 +14,11 @@ and from the safetensors file beside it, with its PyTorch twin.
 transformers 5 ships no Flax CLIP, so a Flax text tower is read through its
 PyTorch twin alone, and the Flax pipelines themselves cannot be built here.
 
-`unet_predictor` runs the declared UNet (Flax or PyTorch) and
-`denoiser_prediction` a declared PyTorch denoiser, in float32 or in float64
-(`torch_precision.float64` for PyTorch, x64 for Flax), for a
-forward the caller holds Dew's trained one to by tests/reference_error.py's
-rule.
+`flax_unet` is the declared Flax UNet as a JAX function, `unet_predictor` runs the
+declared UNet (Flax or PyTorch) on the host, and `denoiser_prediction` a
+declared PyTorch denoiser, in float32 or in float64 (`torch_precision.float64`
+for PyTorch, x64 and `flax_precision.float64` for Flax), for a forward the
+caller holds Dew's to by tests/reference_error.py's rule.
 """
 
 from __future__ import annotations
@@ -138,34 +138,58 @@ def precision(wide: bool):
     return float64() if wide else contextlib.nullcontext()
 
 
+def flax_unet(export: Path, *, wide: bool = False):
+    """The declared Flax UNet (`load_flax`) as a JAX function of a channels-last `sample` (noise and any
+    inpaint channels), the timesteps, the prompt states and, for SDXL, the pooled embedding and the time
+    ids, its prediction channels last, in float32 or (`wide`) float64: a float64 run reads the float32 its
+    modules name as float64 (`flax_precision.float64`) while it traces. A caller jits or differentiates it."""
+    with jax.enable_x64(new_val=wide):
+        model, params = load_flax(export, "unet", wide=wide)
+    widening = flax_precision.float64 if wide else contextlib.nullcontext
+
+    def predict(sample, times, context, pooled=None, time_ids=None):
+        added = None if pooled is None else {"text_embeds": pooled, "time_ids": time_ids}
+        with widening():
+            output = model.apply({"params": params}, jnp.moveaxis(sample, -1, 1), times, context,
+                                 added_cond_kwargs=added).sample
+        return jnp.moveaxis(output, 1, -1)
+
+    return predict
+
+
 def unet_predictor(export: Path, *, wide: bool = False):
-    """The declared UNet (Flax or PyTorch), loaded once, as a function of a channels-last `sample` (noise
-    and any inpaint channels), the timestep, the prompt states and, for SDXL, the pooled embedding and
-    the time ids, in float32 or (`wide`) float64, its prediction channels last: a Flax UNet's float64 run
-    reads the float32 its modules name as float64 (`flax_precision.float64`)."""
+    """The declared UNet (Flax, `flax_unet`, or PyTorch), loaded once, as a host function of a channels-last
+    `sample` (noise and any inpaint channels), the timestep, the prompt states and, for SDXL, the pooled
+    embedding and the time ids, in float32 or (`wide`) float64, its prediction channels last."""
     dtype = np.float64 if wide else np.float32
+
+    def given(sample, timestep, context, pooled, time_ids):
+        """The call's arrays at the run's dtype, the timestep one per row."""
+        sample = np.asarray(sample, dtype)
+        return (sample, np.full((len(sample),), timestep, dtype), np.asarray(context, dtype),
+                None if pooled is None else np.asarray(pooled, dtype),
+                None if pooled is None else np.asarray(time_ids, dtype))
+
     if flax_declared(export, "unet"):
-        with jax.enable_x64(new_val=wide):
-            model, params = load_flax(export, "unet", wide=wide)
-    else:
-        with precision(wide):
-            unet = load(export, "unet", torch.float64 if wide else torch.float32)
+        arm = flax_unet(export, wide=wide)
+
+        def predict(sample, timestep, context, pooled=None, time_ids=None):
+            with jax.enable_x64(new_val=wide):
+                return np.asarray(arm(*(None if value is None else jnp.asarray(value)
+                                        for value in given(sample, timestep, context, pooled, time_ids))))
+
+        return predict
+    with precision(wide):
+        unet = load(export, "unet", torch.float64 if wide else torch.float32)
 
     def predict(sample, timestep, context, pooled=None, time_ids=None):
-        sample = np.ascontiguousarray(np.moveaxis(np.asarray(sample, dtype), -1, 1))
-        context = np.asarray(context, dtype)
-        added = None if pooled is None else {"text_embeds": np.asarray(pooled, dtype),
-                                             "time_ids": np.asarray(time_ids, dtype)}
-        times = np.full((len(sample),), timestep, dtype)
-        if flax_declared(export, "unet"):
-            with jax.enable_x64(new_val=wide), flax_precision.float64() if wide else contextlib.nullcontext():
-                output = model.apply({"params": params}, jnp.asarray(sample), jnp.asarray(times),
-                                     jnp.asarray(context), added_cond_kwargs=added).sample
-                return np.moveaxis(np.asarray(output), 1, -1)
-        tensors = None if added is None else {key: torch.from_numpy(value) for key, value in added.items()}
+        sample, times, context, pooled, time_ids = given(sample, timestep, context, pooled, time_ids)
+        added = None if pooled is None else {"text_embeds": torch.from_numpy(pooled),
+                                             "time_ids": torch.from_numpy(time_ids)}
         with precision(wide), torch.no_grad():
-            output = unet(torch.from_numpy(sample), torch.from_numpy(times),
-                          encoder_hidden_states=torch.from_numpy(context), added_cond_kwargs=tensors).sample
+            output = unet(torch.from_numpy(np.ascontiguousarray(np.moveaxis(sample, -1, 1))),
+                          torch.from_numpy(times), encoder_hidden_states=torch.from_numpy(context),
+                          added_cond_kwargs=added).sample
         return np.moveaxis(output.numpy(), 1, -1)
 
     return predict

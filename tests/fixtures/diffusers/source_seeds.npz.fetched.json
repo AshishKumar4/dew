@@ -1,9 +1,9 @@
 {
- "bytes": 65101232,
+ "bytes": 65101283,
  "license": "Apache-2.0",
- "path": "recordings/16e03f651c86d9ea0255c33cfcc4cae3f06bafa5b7ce939fc15ead6f15cdc01e.npz",
- "reference": "huggingface/diffusers 0.34.0",
+ "path": "recordings/38c9275fca7a6aa5d5240416824585106dff6078671a7519a66039572dbb0200.npz",
+ "reference": "huggingface/diffusers 0.39.0",
  "repo": "dewml/fixtures",
- "revision": "9517e78184e0429efa02841606c9a072bb0a86c8",
- "sha256": "16e03f651c86d9ea0255c33cfcc4cae3f06bafa5b7ce939fc15ead6f15cdc01e"
+ "revision": "6178df084e1d5e3377215d48f19af3b181ee0fed",
+ "sha256": "38c9275fca7a6aa5d5240416824585106dff6078671a7519a66039572dbb0200"
 }
