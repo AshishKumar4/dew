@@ -1028,6 +1028,66 @@ def test_a_dense_products_depth_split_sums_its_partials_once(generation_name, tr
                 dew(refused.pop("splits"), **refused)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_a_met_dense_walk_sums_as_its_walk_apart(generation_name):
+    """A dense product whose programs meet along the depth each two steps (`Tiles.raster`, M-FS-6's K-chunked
+    raster) walks its tiles in persistent rounds, each tile's steps in their order: over small integers,
+    bitwise the walk apart's, over two rounds (the last short) on each family; a met walk of exact sums is
+    refused."""
+    rows, depth, width = 264, 320, 256
+    keys = jax.random.split(jax.random.key(5))
+    x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (depth, width), -3, 4).astype(jnp.bfloat16)
+    tiles = (COOPERATIVE if generation_name == "sm90"
+             else mosaic_gpu.Tiles(128, 128, 64, 3, 1, family="mma.sync"))
+
+    def dew(raster, **options):
+        return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32),
+                              tiles=dataclasses.replace(tiles, raster=raster), transpose_rhs=False,
+                              out_dtype=jnp.bfloat16, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
+                              dense=True, **options)
+
+    with generation.assumed(generation_name):
+        np.testing.assert_array_equal(np.asarray(dew(2), np.float32), np.asarray(dew(0), np.float32))
+        with pytest.raises(ValueError):
+            dew(2, exact_sums=True)
+
+
+def test_a_deep_dense_walk_meets_along_its_depth_past_the_l2s_reach():
+    """`mosaic_gpu.raster_steps` on M-FS-6's A100 input gradient (8192 x 5120, 108 programs, a 40 MiB L2):
+    walked apart below `RASTER_REACH` L2s of panels (depth 40960, an 83.5% L2 hit), met each 128 steps past
+    it (45056 and 51200, where the hit fell to 72.9% and 60.5%), and apart where one round holds the call."""
+    tile = mosaic_gpu.Tiles(128, 128, 32, 4, 1, family="mma.sync")
+
+    def steps(rows, depth):
+        return mosaic_gpu.raster_steps(tile, rows=rows, depth=depth, width=5120, itemsizes=(2, 2),
+                                       programs=108, l2_bytes=40 * 2 ** 20)
+
+    assert [steps(8192, depth) for depth in (40960, 45056, 51200)] == [0, 128, 128]
+    assert steps(64, 51200) == 0
+
+
+@pytest.mark.parametrize("generation_name", ["sm90"])
+def test_a_met_dense_walk_lowers_for_cuda(generation_name):
+    """A dense product's derived tile made met (`Tiles.raster`: its programs signalling and waiting on a
+    GPU-scope semaphore a round each chunk of steps, `mosaic_gpu._met`) lowers for CUDA on the CPU on a family
+    whose programs meet across programs (`Family.fixes_up`)."""
+    rows, depth, width = 2048, 4096, 2048
+    launch = grouped_matmul.MosaicGmm()
+    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, depth, width), jnp.bfloat16), jax.ShapeDtypeStruct((1,), jnp.int32))
+    options = {"out_dtype": "bfloat16", "trans_rhs": False, "interpret": False, "dense": True}
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+        bound, target = launch.bind(*args, **options), generation.gpu_target()
+        tile = launch.derived(bound, target)
+        met = dataclasses.replace(tile, raster=8, cluster=1)
+        assert launch.legal(bound, met, target), met
+        jax.jit(functools.partial(launch.replace(config=met), **options)).trace(*args).lower(
+            lowering_platforms=("cuda",))
+
+
 def a_dense_products_exact_sums_survive_one_row_tile():
     """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
     axis one program, where a program id is a constant) through Triton's launch, named (a dense cell runs

@@ -992,7 +992,7 @@ class MosaicGmm(_Mosaic):
         # 4.7 us swapped, cuBLAS's time, row 1762). It is derived as the swapped call's own tile.
         swapped = self._swapped(ba, target)
         if swapped is None:
-            return super().derived(ba, target)
+            return self._rastered(ba, super().derived(ba, target), target)
         tile = self._derived(swapped, target, admits=lambda tile: self._left_fits(ba, tile))
         if tile is None:
             return None
@@ -1008,6 +1008,24 @@ class MosaicGmm(_Mosaic):
         swapped_tile = dataclasses.replace(tile, swapped=True)
         split = dataclasses.replace(swapped_tile, splits=splits)
         return split if splits > 1 and self.legal(ba, split, target) else swapped_tile
+
+    def _rastered(self, ba, tile: mosaic_gpu.Tiles | None, target) -> mosaic_gpu.Tiles | None:
+        """`tile`, its programs meeting along the depth where its walk outgrows the L2's reach
+        (`mosaic_gpu.raster_steps`, `Tiles.raster`): a dense product of no exact sums, split or cluster, on
+        a family whose programs walk a tile each, started staggered as the scheduler frees multiprocessors
+        (`Family.walks_scoped`, cp.async's), and meet across programs (`Family.fixes_up`)."""
+        if (tile is None or not ba.arguments.get('dense') or ba.arguments['exact_sums'] or tile.splits > 1
+                or tile.cluster > 1):
+            return tile
+        family = mosaic_gpu.family_of(tile, ba.arguments['tokens'].dtype)
+        if not (family.walks_scoped and family.fixes_up):
+            return tile
+        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
+        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        steps = mosaic_gpu.raster_steps(tile, rows=tokens.shape[0], depth=depth, width=width,
+                                        itemsizes=(tokens.dtype.itemsize, kernel.dtype.itemsize),
+                                        programs=self._programs(tile), l2_bytes=target.l2_bytes)
+        return dataclasses.replace(tile, raster=steps) if steps else tile
 
     def _left_fits(self, ba, config: mosaic_gpu.Tiles) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
