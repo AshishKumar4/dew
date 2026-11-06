@@ -2443,3 +2443,42 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
         null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
 
 
+
+
+def test_an_arm_declared_to_vary_run_to_run_is_judged_by_its_one_run_and_held_to_its_inputs_on_a_cpu(
+        monkeypatch):
+    """An arm that sums its terms in another order on each run (an atomic accumulation's arrival order):
+    where a repeat is promised on a GPU (deterministic mode, the run's XLA_FLAGS), an undeclared one is
+    refused as no function of its inputs, and one declared `run_to_run` is judged by each draw's one run
+    and passes, as exact as the reference summing in one order; on a CPU, whose interpreted programs are
+    functions of their inputs, the declared one is held to its repeat as every arm is (row 4448)."""
+    from reference_error import UnpairedDraw, run_to_run
+
+    calls = [0]
+
+    def summed(terms):
+        total = np.float32(0)
+        for term in terms:
+            total = np.float32(total + term)
+        return total
+
+    @as_given
+    def arrival(x):
+        calls[0] += 1
+        terms = np.asarray(x, np.float32) * np.float32(1.1)
+        return {"y": summed(terms if calls[0] % 2 else terms[::-1])}
+
+    @as_given
+    def ordered(x):
+        return {"y": summed(np.asarray(x, np.float32) * np.float32(1.1))}
+
+    def draw(seed):
+        return (np.random.default_rng([4448, seed]).standard_normal(64).astype(np.float32),)
+
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(run_to_run(arrival, "atomic adds"), ordered, draw, "on a CPU", seeds=16)
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true")
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(arrival, ordered, draw, "undeclared", seeds=16)
+    assert_as_exact(run_to_run(arrival, "atomic adds"), ordered, draw, "declared", seeds=16)
