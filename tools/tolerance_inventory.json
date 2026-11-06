@@ -214,7 +214,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_end_to_end.py": {
-   "comparisons": 10,
+   "comparisons": 8,
    "lane": "Training"
   },
   "tests/test_engine_replay.py": {
