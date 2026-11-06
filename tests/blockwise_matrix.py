@@ -129,13 +129,30 @@ def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     assert ("blockwise_fp8", "mosaic_gpu") in recorded and not unnamed, (sorted(recorded), unnamed)
 
 
+def grouped(group_blocks, lhs, matrices):
+    """Each group's rows of `lhs` (`group_blocks` 128-row blocks a group) times its matrix of `matrices`, in
+    the rows' order: a recipe truth's grouped product."""
+    starts = np.cumsum([0, *(128 * np.asarray(group_blocks))])
+    return jnp.concatenate([lhs[first:last] @ matrices[group]
+                            for group, (first, last) in enumerate(itertools.pairwise(starts))])
+
+
+def step_operands(seed: int) -> tuple:
+    """A projection's training step operands: 384 rows 256 deep, three 256 x 128 matrices and the output's
+    cotangent, in float32."""
+    rng = np.random.default_rng(seed)
+    return (jnp.asarray(rng.normal(size=(384, 256)), jnp.float32),
+            jnp.asarray(rng.normal(size=(3, 256, 128)) / 16, jnp.float32),
+            jnp.asarray(rng.normal(size=(384, 128)), jnp.float32))
+
+
 def recipe_truth(group_blocks) -> callable:
     """The blockwise FP8 recipe's training step in float64 (`gemm.blockwise_fp8_projection`'s truth):
     `run(x, w)` quantizing as the recipe does (`gemm.rows_quantized`, `gemm.blocks_quantized`), each group's
     product of the dequantized values in float64, and its gradients the recipe's: the cotangent quantized 1 x
-    128 along the
-    width times the dequantized blocks transposed, and the rows and the cotangent each quantized 1 x 128 along
-    the rows, their dequantized product; every product in float64 (a check-1 reference arm's truth)."""
+    128 along the width times the dequantized blocks transposed, and the rows and the cotangent each quantized
+    1 x 128 along the rows, their dequantized product; every product in float64 (a check-1 reference arm's
+    truth)."""
     sizes = np.asarray(group_blocks) * 128
     starts = np.cumsum([0, *sizes])
 
@@ -147,20 +164,17 @@ def recipe_truth(group_blocks) -> callable:
         return codes.astype(jnp.float64) * jnp.repeat(jnp.repeat(scales.astype(jnp.float64), 128, axis=1),
                                                       128, axis=2)
 
-    def grouped(lhs, matrices):
-        return jnp.concatenate([lhs[first:last] @ matrices[group]
-                                for group, (first, last) in enumerate(itertools.pairwise(starts))])
-
     @jax.custom_vjp
     def run(x, w):
-        return grouped(dequantized(*gemm.rows_quantized(x), axis=-1), blocks(w))
+        return grouped(group_blocks, dequantized(*gemm.rows_quantized(x), axis=-1), blocks(w))
 
     def forward(x, w):
         return run(x, w), (x, w)
 
     def backward(residuals, cotangent):
         x, w = residuals
-        d_x = grouped(dequantized(*gemm.rows_quantized(cotangent), axis=-1), jnp.swapaxes(blocks(w), 1, 2))
+        d_x = grouped(group_blocks, dequantized(*gemm.rows_quantized(cotangent), axis=-1),
+                      jnp.swapaxes(blocks(w), 1, 2))
         rows_t = dequantized(*gemm.rows_quantized(x.T), axis=-1)
         dy_t = dequantized(*gemm.rows_quantized(cotangent.T), axis=-1)
         d_w = jnp.stack([rows_t[:, first:last] @ dy_t[:, first:last].T

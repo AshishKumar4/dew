@@ -566,16 +566,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     lhs = rows_padded(lhs, row_axis, TMA_ROWS)
     m = lhs.shape[row_axis]
     row_tile = tiles.block_m * tiles.cluster
-    if dense:
-        table = None
-    else:
-        lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
-                                   jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
-        table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
-        if first is not None:
-            # Each tile's matrix, its group's of the stack from `first` (`GroupInfo.matrix`): the group itself
-            # stays the call's, which its validity and its side operands read.
-            table = jnp.concatenate([table, jnp.minimum(table[:, :1], g - 1) + first], axis=1)
+    table = None if dense else _grouped_table(group_sizes, m, row_tile, first)
     extent = (m if family_of(tiles, lhs.dtype).bounded_loads and not interpret
               else -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile))
     lhs = rows_extended(lhs, row_axis, extent)
@@ -957,6 +948,20 @@ def _scale_refs(refs: tuple, step_scales, mx_scales) -> tuple:
     return (step, mx), refs
 
 
+def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None) -> jax.Array:
+    """A grouped call's tile table (`tile_groups`) over its `m` padded rows at `row_tile`-row tiles: its
+    groups', then the rows past the routed ones a last group, whose tiles store zeros."""
+    g = group_sizes.shape[0]
+    lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
+                               jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
+    table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
+    if first is None:
+        return table
+    # Each tile's matrix, its group's of the stack from `first` (`GroupInfo.matrix`): the group itself stays
+    # the call's, which its validity and its side operands read.
+    return jnp.concatenate([table, jnp.minimum(table[:, :1], g - 1) + first], axis=1)
+
+
 def _gmm_refused(rhs, tiles: Tiles, extents: tuple, *, dense: bool, first, paired) -> None:
     """Dew: `gmm`'s refusal of a call its launch does not take: a dense product of several matrices, a stack
     read from its first matrix but a grouped product's of one, a paired matrix not its product's shape, or
@@ -1074,9 +1079,11 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
                 else (lhs_gmem.at[rows], lambda j: (0, first + j)))
     rhs_index = _rhs_index(transpose_rhs)
     matrix = _matrix_of(group, groups)
-    matrices = {name: (_matrix_columns(gmem.at[matrix], column_tile,
-                                       block_n=tiles.block_n, transpose_rhs=transpose_rhs),
-                       lambda j: rhs_index(first + j)) for name, gmem in matrix_gmems.items()}
+    # Each stream's view and its step's block index (`(row, column)` of a matrix, four of a scale tile's).
+    matrices: dict[str, tuple[object, Callable[..., tuple]]] = {
+        name: (_matrix_columns(gmem.at[matrix], column_tile, block_n=tiles.block_n,
+                               transpose_rhs=transpose_rhs),
+               lambda j: rhs_index(first + j)) for name, gmem in matrix_gmems.items()}
     if 'scales' in matrix_gmems:
         # A packed matrix's words, a stream for each 128 depths of a step: step j's group q, sixteen words a
         # column at the tile's columns.

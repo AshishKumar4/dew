@@ -1294,9 +1294,8 @@ class MosaicStepScaledGmm(MosaicGmm):
         del ba, target
 
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
-        # Beside the exact product's live set, a step's column scales in its accumulator's column layout.
-        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        return super().registers(ba, config) + family.column_registers(config.block_n, jnp.float32)
+        # Beside the exact product's live set, a step's column scales.
+        return super().registers(ba, config) + _column_scale_registers(ba, config)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1344,9 +1343,15 @@ class MosaicStepScaledTgmm(MosaicTgmm):
         return config.splits == 1 and super().candidate(ba, config, target)
 
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
-        # Beside the exact gradient's live set, a step's column scales in its accumulator's column layout.
-        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        return super().registers(ba, config) + family.column_registers(config.block_n, jnp.float32)
+        # Beside the exact gradient's live set, a step's column scales.
+        return super().registers(ba, config) + _column_scale_registers(ba, config)
+
+
+def _column_scale_registers(ba, config: mosaic_gpu.Tiles) -> int:
+    """The registers a step-scaled walk holds beside the exact one's: a step's fp32 column scales in its
+    accumulator's column layout (`Family.column_registers`)."""
+    family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+    return family.column_registers(config.block_n, jnp.float32)
 
 
 def _cutlass_call(target: str, out: jax.ShapeDtypeStruct) -> Callable:

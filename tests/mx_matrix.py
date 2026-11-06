@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from blockwise_matrix import grouped
 from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
@@ -131,20 +132,16 @@ def recipe_truth(group_blocks, wide=jnp.float64) -> callable:
     def decoded(values):
         return gemm.MxFp8.quantized(values).decoded().astype(wide)
 
-    def grouped(lhs, matrices):
-        return jnp.concatenate([lhs[first:last] @ matrices[group]
-                                for group, (first, last) in enumerate(itertools.pairwise(starts))])
-
     @jax.custom_vjp
     def run(x, w):
-        return grouped(decoded(x), jnp.swapaxes(decoded(jnp.swapaxes(w, 1, 2)), 1, 2))
+        return grouped(group_blocks, decoded(x), jnp.swapaxes(decoded(jnp.swapaxes(w, 1, 2)), 1, 2))
 
     def forward(x, w):
         return run(x, w), (x, w)
 
     def backward(residuals, cotangent):
         x, w = residuals
-        d_x = grouped(decoded(cotangent), jnp.swapaxes(decoded(w), 1, 2))
+        d_x = grouped(group_blocks, decoded(cotangent), jnp.swapaxes(decoded(w), 1, 2))
         rows, cotangents = decoded(x.T).T, decoded(cotangent.T).T
         d_w = jnp.stack([rows[first:last].T @ cotangents[first:last]
                          for first, last in itertools.pairwise(starts)])
