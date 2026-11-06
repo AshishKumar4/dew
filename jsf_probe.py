@@ -12,6 +12,10 @@ kw, vw, heads, length, form, seed, mode = sys.argv[1:]
 kw, vw, heads, length, seed = map(int, (kw, vw, heads, length, seed))
 T.KEY_WIDTH, T.VALUE_WIDTH = kw, vw
 hooks = T.FORMED[0] if form == 'formed' else T.HOOKS[4]
+if form == 'l2plain':
+    hooks = D.replace(T.FORMED[0], gates=None, write_bound=1.0)
+if form == 'gateonly':
+    hooks = D.replace(T.FORMED[0], l2norm=False)
 (x,) = T.draw(hooks, False, seed, length=length, value_heads=heads)
 x = D.replace(x, **{n: getattr(x, n).astype(jnp.bfloat16) for n in
                    ('query', 'key', 'value', 'beta') if getattr(x, n) is not None})

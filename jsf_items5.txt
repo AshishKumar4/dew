@@ -1,0 +1,5 @@
+16|8|2|70|l2plain|0|base
+16|8|2|70|gateonly|0|base
+16|8|2|70|formed|0|accurate
+16|8|2|70|formed|2|base
+16|8|2|70|formed|2|held32
