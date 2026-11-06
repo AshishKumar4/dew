@@ -240,7 +240,17 @@ def served(config: Config) -> dict[str, str]:
     return answers
 
 
+LANGUAGE = ("tokens", "tasks", "harness_limit", "prompt", "max_new_tokens", "sequence_length", "batch_size")
+"""The options only a language run reads."""
+
+
 def main(config: Config) -> Path:
+    if config.run is None and config.image_run is not None:
+        given = [name for name in LANGUAGE if getattr(config, name) != getattr(Config(), name)]
+        if given:
+            flags = ", ".join(f"--{name.replace('_', '-')}" for name in given)
+            raise ValueError(f"{flags} score a language run, which --run names; --image-run alone scores the "
+                             f"diffusion run")
     if config.smoke:
         config.out.mkdir(parents=True, exist_ok=True)
         config = replace(config, sequence_length=32, batch_size=2, prompt="to be", max_new_tokens=8,
@@ -251,11 +261,12 @@ def main(config: Config) -> Path:
     if config.run is None and config.image_run is None:
         raise ValueError("--run names the language run to score, or --image-run the diffusion run")
 
+    # The language run is read first, so a run of another kind is refused before the images are scored.
+    task = None if config.run is None else dew.pipeline(str(config.run))
+    if task is not None and not isinstance(task, TextGeneration):
+        raise TypeError(f"--run holds a {type(task).__name__}; --image-run takes a diffusion run")
     report = {"images": image_metrics(config), "served": served(config)}
-    if config.run is not None:
-        task = dew.pipeline(str(config.run))
-        if not isinstance(task, TextGeneration):
-            raise TypeError(f"--run holds a {type(task).__name__}; --image-run takes a diffusion run")
+    if task is not None:
         report.update(run=str(config.run), perplexity=perplexity(task, config), harness=harness(task, config),
                       greedy=task(config.prompt, config.max_new_tokens, sampling=GREEDY, key=0).text[0])
     config.out.mkdir(parents=True, exist_ok=True)
