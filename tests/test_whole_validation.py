@@ -64,7 +64,8 @@ def runnable(name: str, windows, tmp_path):
                                   {"solver": Euler(), "guidance": None, "steps": 2,
                                    "ema_decay": None})).build()
     objective = GuidanceDistillationObjective(teacher.model, teacher.process, teacher.inputs,
-                                              variables={TEACHER: teacher.init(jax.random.key(0))}, steps=2)
+                                              variables={TEACHER: jax.jit(teacher.init)(jax.random.key(0))},
+                                              steps=2)
     return objective, batch_for(teacher, 8)
 
 
@@ -156,7 +157,8 @@ def evaluated(name: str, windows, tmp_path) -> dict:
     objective, batch = runnable(name, windows, tmp_path)
     records = records_of(batch, RECORDS)
     with jax.enable_x64(new_val=True):
-        drawn = objective.init(jax.random.key(0))
+        # Compiled whole, as a run compiles them: a Flux's init and loss run op by op took most of a case.
+        drawn = jax.jit(objective.init)(jax.random.key(0))
         variables, averaged = moved(drawn, 1), moved(drawn, 2)
         records = wide(records)
         data = record_batches(records, ROWS, records, loading=Loading(workers=0, threads=1, read_buffer=1))
@@ -181,7 +183,9 @@ def evaluated(name: str, windows, tmp_path) -> dict:
         scored = variables if objective.ema_is_reference else averaged
 
         def statistics(rows, key: int):
-            return objective._loss(scored, rows, Step(jnp.asarray(0), jax.random.key(key), averaged))[0]
+            def loss(drawn):
+                return objective._loss(scored, rows, Step(jnp.asarray(0), drawn, averaged))[0]
+            return jax.jit(loss)(jax.random.key(key))
 
         # Whether the loss draws anything, on a batch the objective takes
         # whatever its own batch constraints (LADD's virtual batch of 8).
