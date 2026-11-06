@@ -189,6 +189,30 @@ class _Windowed:
                             for index in range(_window_count(arguments))])
 
 
+class _RunToRun:
+    """An arm whose outputs vary in their last bits from run to run on the same inputs (`run_to_run`):
+    the gate compiles `fn` as it compiles any arm (`_arms`) and judges each draw by the one run it makes."""
+
+    def __init__(self, fn, why: str):
+        self.fn, self.why = fn, why
+
+    def __call__(self, *inputs, **options):
+        return self.fn(*inputs, **options)
+
+    def __getattr__(self, name):
+        return getattr(self.fn, name)
+
+
+def run_to_run(fn, why: str):
+    """`fn`, an arm declared to vary from run to run on a GPU on the same inputs, for `why`: an
+    accumulation in arrival order (atomic adds), which a deterministic form would make 2-2.7 times as slow
+    (row 4448, M-JS-5). Check 1 pairs it with the other arm within each draw's one run, as it pairs every
+    arm, and never holds it to a run of itself again (`_of_its_inputs`) but on a CPU, where its interpreted
+    program is a function of its inputs: a draw's evidence is one run's, and the redraw and every further
+    seed are runs of their own, so its spread across runs is the spread across draws check 1 weighs."""
+    return _RunToRun(fn, why)
+
+
 def over_windows(fn):
     """`fn`, an arm of one draw, run over `windows`' stacked arguments window by window, each window's
     arguments sliced from the stack, with its outputs stacked on their leading axis as host arrays.
@@ -309,6 +333,8 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False):
     within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
     unrewritten (`arm_arithmetic.unrewritten`)."""
     run = unrewritten if reference else _as_is
+    if isinstance(fn, _RunToRun):
+        return _RunToRun(_compiled(fn.fn, compile, pairing, reference=reference), fn.why)
     if _given(fn) or getattr(fn, "without_ynn", False):
         return run(fn)
     if getattr(fn, "dew_programs", False):
@@ -923,9 +949,10 @@ def _repeat_promised() -> bool:
 def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
     """Raise unless `fn`, `name` of a check's arms, gives `first` again on the same `inputs`: an arm that
     draws a noise of its own, or reads state its last call left, compares Dew with a reference on draws no
-    seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842); the
-    CPU lane runs every check-1 site, so each arm is held to it there."""
-    if not _repeat_promised():
+    seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842), and
+    of an arm declared to vary from run to run (`run_to_run`) only on a CPU; the CPU lane runs every
+    check-1 site, so each arm is held to it there."""
+    if not _repeat_promised() or (isinstance(fn, _RunToRun) and jax.default_backend() != "cpu"):
         return
     if (where := _same_bits(first, fn(*inputs))) is not None:
         raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "
