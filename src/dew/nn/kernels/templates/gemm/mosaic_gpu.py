@@ -434,7 +434,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
               else {'matrix': (rhs_block, rhs_dtype)})
     blocks = {'rows': (lhs_block, dtype), **matrix,
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
-              **({'row_scales': ((1, block_m), jnp.float32)} if step_scaled else {}),
+              **(_scale_blocks(block_m, block_n) if step_scaled else {}),
               # An MX product's rows' and matrix's E8M0 scales, a step's tiles of each (`gmm`'s `mx_scales`).
               **({'a_scales': ((block_m // 128, block_k // 128, 32, 16), jnp.float8_e8m0fnu),
                   'b_scales': ((block_n // 128, block_k // 128, 32, 16), jnp.float8_e8m0fnu)}
@@ -452,6 +452,17 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                        tuple((part, jnp.dtype(out)) for out in dtypes))
 
 
+def _scale_blocks(block_m: int, block_n: int) -> dict:
+    """Dew: a step-scaled call's scale streams (`gmm`'s and `tgmm`'s `step_scales`): a step's row of its
+    rows' scales at the tile's rows and of its columns' at the tile's columns (a row of the matrix's coarser
+    ones holding the tile's, `_column_scales`), unswizzled (`SCALE_SWIZZLES`)."""
+    return {'row_scales': ((1, block_m), jnp.float32), 'column_scales': ((1, block_n), jnp.float32)}
+
+
+SCALE_SWIZZLES = {'row_scales': mosaic.UNSWIZZLED, 'column_scales': mosaic.UNSWIZZLED}
+"""Dew: the scale streams' swizzles (`_scale_blocks`): rows of fp32 a step, read a row at a time."""
+
+
 def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dtype,
                      prologue_axes: tuple, prologue_dtypes: tuple, out_dtype, k_major: bool = False,
                      step_scaled: bool = False) -> Allocations:
@@ -464,7 +475,7 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
     # A rows-contiguous call's blocks lie depth (or width) by rows, the rows their minor axis.
     blocks = {'ring_0': ((block_m, block_k) if k_major else (block_k, block_m), lhs_dtype),
               'ring_1': ((block_n, block_k) if k_major else (block_k, block_n), rhs_dtype),
-              **({'row_scales': ((1, block_m), jnp.float32)} if step_scaled else {}),
+              **(_scale_blocks(block_m, block_n) if step_scaled else {}),
               **{f'ring_{2 + position}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i])
                  for position, i in enumerate(stepped)}}
     held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
@@ -760,8 +771,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(blocks, tiles.stages, consumers,
                                              multicast=matrices if pair > 1 else (),
-                                             swizzles={'row_scales': mosaic.UNSWIZZLED}
-                                             if step_scales is not None else None))
+                                             swizzles=SCALE_SWIZZLES if step_scales is not None
+                                             else None))
 
     # A depth split's outputs: each run's partial, a `[m, n]` slice of its own.
     out_type = tuple(jax.ShapeDtypeStruct((m, n) if tiles.splits == 1 else (tiles.splits, m, n), dtype)
@@ -1437,8 +1448,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
-                                             swizzles={'row_scales': mosaic.UNSWIZZLED}
-                                             if step_scales is not None else None))
+                                             swizzles=SCALE_SWIZZLES if step_scales is not None else None))
 
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
     # A balanced tail's partials: each program's, a consumer's share of a tile each.
