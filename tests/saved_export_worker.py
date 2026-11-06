@@ -207,6 +207,7 @@ def released(args) -> dict:
     for attempt in range(2):
         warm = Path(args.run_dir).parent / f"warm{attempt}-{rank}"
         saved_sources.export_run(saved_sources.pinned_run(args.run_dir), warm, publishes=rank == 0)
+    warm_read = list(scopes)
     scopes.clear()
     release = saved_sources.released_run(args.run_dir)
     read = list(scopes)
@@ -220,7 +221,7 @@ def released(args) -> dict:
     return {"processes": jax.process_count(), "rank": rank, "release": str(release),
             "export_code": code,
             "release_files": digests(Path(release)), "read": read, "held": held[0], "exported": list(scopes),
-            "export_files": digests(destination)}
+            "export_files": digests(destination), "warm_read": warm_read}
 
 
 MODES = {"exported": exported, "released": released}
