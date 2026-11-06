@@ -178,8 +178,8 @@ def test_a_row_writes_its_question_once_unless_a_segment_says_again():
 
 
 def test_the_new_segments_are_records_and_a_layout_without_them_records_none_of_them():
-    """A layout with each new segment and policy reads back from its record equal; the slot release's,
-    which writes none, records none of their fields, so a run saved before them reads and records alike."""
+    """A layout with each new segment and policy reads back from its record equal; a record written
+    before them, which holds none of their fields, reads as the layout it was (the slot release's)."""
     from dew.decision.layout import Again, RequestSummary, Turns, Values
 
     *_, instructions, options_text, options, _, cue = release().segments
@@ -188,5 +188,10 @@ def test_the_new_segments_are_records_and_a_layout_without_them_records_none_of_
                         instructions, options_text, dataclasses.replace(options, values=Values(indexed=3)),
                         Again(over=100), cue))
     assert from_record(QuestionLayout, to_record(layout, QuestionLayout)) == layout
-    plain = json.dumps(to_record(release(), QuestionLayout))
-    assert all(field not in plain for field in ('"values"', '"turns"'))
+    def earlier(record):
+        """`record` as a run saved before the new fields wrote it: none of them."""
+        if isinstance(record, dict):
+            return {key: earlier(value) for key, value in record.items() if key not in ("values", "turns")}
+        return [earlier(value) for value in record] if isinstance(record, list) else record
+
+    assert from_record(QuestionLayout, earlier(to_record(release(), QuestionLayout))) == release()
