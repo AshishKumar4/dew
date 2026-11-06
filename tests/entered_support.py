@@ -16,13 +16,15 @@ LAYOUTS = {
     # ids 3 and 1 enter, then id 5 a shared part of one token, shorter than a conv's history, that id 4
     # enters; two padding slots.
     "permuted": ([(2, 5), (3, 3), (1, 2), (5, 1), (4, 3)], [2, 0, 2, 5, 0], 2),
-    # One token a document and no padding: as many documents as the row has slots.
-    "one token each": ([(1, 1), (2, 1)], [0, 1], 0),
+    # One token a document and no padding: as many documents as the row has slots, three shared parts of
+    # one token each entered by one of one token, in turn.
+    "one token each": ([(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)], [0, 1, 0, 3, 0, 5], 0),
 }
 """Each layout's documents in the row's order (id, length), each id's entered id (0 for none), padding."""
 
-ENTERED_SEEDS = 12
-"""Check 1's declared seeds for documents entering another's memory and history against each one's row."""
+ENTERED_SEEDS = 32
+"""Check 1's declared seeds for documents entering another's memory and history against each one's row: at
+12, the one-token layout's parameter gradients, sums over a few tokens, were left unresolved over 60."""
 
 
 def assert_entered_as_own_rows(module, variables, width: int, layout: str, label: str) -> None:
