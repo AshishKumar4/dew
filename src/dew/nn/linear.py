@@ -40,7 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
-from dew.batch import Coordinates, prefix_sum, valid_order
+from dew.batch import Coordinates, document_ranks, prefix_sum, valid_order
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
@@ -242,6 +242,67 @@ def _stream_order(valid):
     return rank, jnp.where(jnp.arange(length)[None, :] < counts[:, None], order, length).astype(jnp.int32)
 
 
+def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, parts=None, dtype=None,
+                   activation: bool = True):
+    """`causal_conv1d` of packed documents of which each convolves after a history of its own: a tap that
+    reaches before its document's first real token reads `held` `[B, D, K - 1, C]` at the document the
+    document enters (`entered` `[B, D]`, numbered from 1 as `dew.batch.Entered` numbers them, 0 for none,
+    which reads the zeros `causal_conv1d` reads), where
+    `documents` `[B, S]` numbers each token's document from 1 (0 on padding) and `valid` marks the real
+    tokens, each document's a run of them: the questions of a row over one state, each convolving after
+    its state's last `K - 1` tokens (`document_tails`; row 1506). XLA's arithmetic, `xla_conv1d`'s."""
+    dtype = x.dtype if dtype is None else jnp.dtype(dtype)
+    batch, length, _ = x.shape
+    taps_count = kernel.shape[1]
+    wide = jnp.promote_types(at_least_fp32(x.dtype), dtype)
+    padded = jnp.pad(x, ((0, 0), (taps_count - 1, 0), (0, 0))).astype(wide)
+    real = jnp.asarray(valid, bool)
+    documents = jnp.asarray(documents, jnp.int32)
+    # Each real token's count of the real tokens before it in its document, and the history slot it enters.
+    begins = real & (jnp.pad(documents, ((0, 0), (1, 0)), constant_values=-1)[:, :-1] != documents)
+    rank = document_ranks(real, begins)
+    slot = jnp.take_along_axis(jnp.asarray(entered, jnp.int32), jnp.maximum(documents - 1, 0), axis=1) - 1
+    slot = jnp.where(documents > 0, slot, -1)
+    rows = jnp.arange(batch)[:, None]
+    history = jnp.asarray(held).astype(wide)
+
+    def read(tap):
+        """The token `K - 1 - tap` before each, of its own document, else of the history it enters."""
+        inside = padded[:, tap:tap + length]
+        if tap == taps_count - 1:
+            return inside
+        behind = history[rows, jnp.maximum(slot, 0), jnp.clip(tap + rank, 0, taps_count - 2)]
+        behind = jnp.where((slot >= 0)[..., None], behind, 0)
+        return jnp.where((rank >= taps_count - 1 - tap)[..., None], inside, behind)
+
+    taps = kernel.astype(wide)
+    windows = short_conv.preactivation([read(tap) for tap in range(taps_count)],
+                                       [taps[:, tap] for tap in range(taps_count)],
+                                       None if bias is None else bias.astype(wide))
+    if activation:
+        windows = nn.silu(windows)
+    windows = jnp.where(real[:, :, None], windows, 0)
+    return conv_pieces(windows, parts, dtype)
+
+
+def document_tails(x, valid, documents, width: int, count: int):
+    """Each document's last `width` real tokens `[B, count, width, C]`, zeros in front where it holds
+    fewer and for a document the row holds none of, `documents` `[B, S]` numbering each token's document
+    from 1 (0 on padding) and `valid` marking the real ones: the history a document that continues it
+    convolves after (`entered_conv1d`)."""
+    batch, length, _ = x.shape
+    real = jnp.asarray(valid, bool) & (documents > 0)
+    slots = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
+    rows = jnp.arange(batch)[:, None]
+    ends = jnp.full((batch, count), -1, jnp.int32).at[rows, jnp.maximum(documents - 1, 0)].max(
+        jnp.where(real, slots, -1))
+    places = ends[:, :, None] - width + 1 + jnp.arange(width)[None, None, :]
+    inside = jnp.clip(places, 0, length - 1)
+    owner = documents[rows[:, :, None], inside]
+    kept = (places >= 0) & (owner == jnp.arange(1, count + 1)[None, :, None]) & real[rows[:, :, None], inside]
+    return jnp.where(kept[..., None], x[rows[:, :, None], inside], 0)
+
+
 def real_tail(x, valid, segments, width: int):
     """The last `width` real tokens of each row of `x` `[B, S, D]` (`valid` `[B, S]`), zeros in front
     where the row holds fewer, with their documents (`segments` `[B, S]`, -1 in front; all 0 where
@@ -376,6 +437,53 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
         held.value = final.astype(held.value.dtype)
     # The scan's output under both names a remat policy reads it by (`RESIDUALS`): a mixer's
     # 'context', as MaxText's recipes keep it, and the 'scan' only a recurrence marks.
+    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+
+
+def entered_scan(mixed, taps, bias, rule, coordinates: Coordinates, state_shape: tuple[int, ...], *,
+                 parts=None, dtype=None, state_dtype=None):
+    """The conv and scan of a recurrent mixer over packed documents of which some enter another
+    (`Coordinates.entered`), each token read once, in two calls: the documents that enter none, from a zero
+    memory and no history, each one's final memory and last `K - 1` tokens kept (`document_tails`); then the
+    documents that enter one, each from that one's memory and after its history (`entered_conv1d`). `rule(
+    convolved, *, valid, starts, state, entered)` runs a call's scan over the tokens `valid` marks, a
+    document's memory a slot of `state` `[B, D, *state_shape]` (`chunk_gated_delta_rule`'s `entered`),
+    returning `(output, finals)`. The gradient of a memory or history entered sums over the documents
+    entering it."""
+    entered = coordinates.entered
+    assert entered is not None
+    real = jnp.ones(entered.documents.shape, bool) if coordinates.valid is None else coordinates.valid
+    roots = entered.roots & real
+    branches = real & (entered.documents > 0) & ~roots
+    documents, count, width = entered.documents, entered.count, taps.shape[1] - 1
+    turned = documents[:, 1:] != documents[:, :-1]
+    begins = jnp.concatenate([jnp.ones_like(documents[:, :1], bool), turned], axis=1)
+    # One slot past the documents, for a row's first slot beginning a document where none of a call does.
+    zero = jnp.zeros((documents.shape[0], count + 1, *state_shape), state_dtype or mixed.dtype)
+    convolved = causal_conv1d(mixed, taps, bias=bias, valid=roots, segments=documents, parts=parts,
+                              dtype=dtype)
+    first, finals = rule(convolved, valid=roots, starts=begins & roots, state=zero,
+                         entered=jnp.zeros((documents.shape[0], count + 1), jnp.int32))
+    held = document_tails(mixed, roots, documents, width, count)
+    convolved = entered_conv1d(mixed, taps, branches, documents, held, entered.entered, bias=bias,
+                               parts=parts, dtype=dtype)
+    # A call numbers its documents by its starts in order, a row's first slot beginning one whatever it
+    # holds (`dew.batch.document_firsts`): the first call's finals are its roots' in theirs, after one its
+    # row's first slot begins where no root does, and the second's documents its branches in theirs, after
+    # one likewise, each entering its root's place among the first call's.
+    rows = jnp.arange(documents.shape[0])[:, None]
+    exists = jnp.zeros(entered.entered.shape, bool).at[rows, jnp.maximum(documents - 1, 0)].max(documents > 0)
+    rooted = exists & (entered.entered == 0)
+    branched = exists & ~rooted
+    ahead_of_roots = (~(begins & roots)[:, :1]).astype(jnp.int32)
+    ahead_of_branches = (~(begins & branches)[:, :1]).astype(jnp.int32)
+    place = jnp.cumsum(rooted, axis=1) + ahead_of_roots
+    order = jnp.where(branched, jnp.cumsum(branched, axis=1) - 1 + ahead_of_branches, count)
+    root_place = jnp.take_along_axis(place, jnp.maximum(entered.entered - 1, 0), axis=1)
+    slots = jnp.zeros((documents.shape[0], count + 1), jnp.int32).at[rows, order].set(
+        jnp.where(branched, root_place, 0), mode="drop")
+    second, _ = rule(convolved, valid=branches, starts=begins & branches, state=finals, entered=slots)
+    out = jnp.where(roots[:, :, *([None] * (first.ndim - 2))], first, second)
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
@@ -732,9 +840,11 @@ class GatedDeltaNet(nn.Module):
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
-    of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"entered"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that enter another
+    (`dew.batch.Entered`), each read from the memory and the conv history the one it enters ends with
+    (`entered_scan`); no mask or bias, which a recurrence reading every earlier token of its document has
+    no way to narrow."""
 
     emb_features: int
     num_k_heads: int
@@ -996,7 +1106,25 @@ class GatedDeltaNet(nn.Module):
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
-        if shards > 1:
+        if tokens.entered is not None:
+            if decode or shards > 1:
+                raise LayoutRefused("documents that enter another are read whole in their rows by a training "
+                                    "or scoring call; a decode step or a sequence axis splits them")
+
+            def entered_rule(convolved, *, valid, starts, state, entered):
+                query, key, value = (self._split_heads(part, width)
+                                     for part, width in zip(convolved, widths, strict=True))
+                # A call's other tokens keep its memory, as padding does (exp(0)=1, beta=0).
+                kept = valid[:, :, None]
+                return chunk_gated_delta_rule(query, key, value, jnp.where(kept, g, 0.0),
+                                              jnp.where(kept, beta, 0.0), state, self.chunk_size,
+                                              starts=starts, max_segments=tokens.max_segments,
+                                              write_bound=1.0, entered=entered)
+
+            out = entered_scan(mixed, self.conv1d()[0], None, entered_rule, tokens,
+                               (self.num_v_heads, self.head_k_dim, self.head_v_dim), parts=heads,
+                               dtype=operand if ported else wide, state_dtype=wide)
+        elif shards > 1:
             if decode:
                 raise LayoutRefused(f"a gated delta net under a sequence axis of {shards} runs whole "
                                     f"training sequences; a decode step holds one state per row. Decode on "
