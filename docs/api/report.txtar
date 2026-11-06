@@ -213,6 +213,7 @@ class Representations(features: jax.Array, labels: jax.Array) -> None  [dew.arti
 class Step(step: jax.Array, key: jax.Array, ema: Variables | None, training: bool = True, committed: jax.Array | None = None, example_key: jax.Array | None = None, example_index: jax.Array | None = None, example_count: int | None = None, tape: Mapping[str, jax.Array] | None = None, recorder: Recorder | None = None, record: bool = False, witness: Witness | None = None, qk_stats: bool = False, equations: bool = False, watched: Watched | None = None) -> None  [dew.objectives.base]
   .boundary(self, name: str, value: jax.Array) -> jax.Array
   .examples(self, rows: int) -> jax.Array
+  .observed(self, sown: Variables) -> tuple[Variables | None, Variables | None]
   .places(self, rows: int) -> tuple[jax.Array, int]
   .replace(self, **updates)
   .sample(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None, *, dtype=None, rows: int) -> jax.Array
@@ -320,7 +321,7 @@ class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTran
   .validate(self, batch: Batch | None = None, *, steps: int | None = None, capacity: int | None = None) -> Validation
 class VideoGrid(videos: jax.Array, captions: tuple[str, ...] = ()) -> None  [dew.artifacts]
   .replace(self, **updates)
-class WandbTracker(project: str, name: str | None = None, *, entity: str | None = None, config: Mapping[str, object] | None = None, offline: bool = False, id: str | None = None)  [dew.training.tracker]
+class WandbTracker(project: str, name: str | None = None, *, entity: str | None = None, config: Mapping[str, object] | None = None, offline: bool = False, id: str | None = None, shared: bool = False, primary: bool = True, label: str = 'train')  [dew.training.tracker]
   .artifact(self, value: Reported, step: int) -> None
   .close(self) -> None
   .log(self, scalars: Mapping[str, float], step: int) -> None
@@ -969,6 +970,7 @@ dew.training.tracker.Wandb
   entity: str | None = None
   offline: bool = False
   name: str | None = None
+  shared: bool = False
 -- cli --
 dew  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew export  [dew._cli.main.Export]
