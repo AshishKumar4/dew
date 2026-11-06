@@ -172,6 +172,21 @@ def _qwen_moe_mixture(hf_config: Mapping[str, object], used: set[str], sparse: t
     return mixture
 
 
+def _qwen3_moe_export(model: CausalTransformer) -> Mapping[str, object]:
+    """`_qwen3_moe_config` backwards: its window (`_qwen3_export`) and its routed experts and the layers they
+    route (`_qwen_moe_export`)."""
+    return {**_qwen3_export(model), **_qwen_moe_export(model, scheduled=True)}
+
+
+def _qwen2_moe_export(model: CausalTransformer) -> Mapping[str, object]:
+    """`_qwen2_moe_config` backwards: its q/k/v bias as `qkv_bias`, its window switched on where a layer
+    slides (the layers' kinds go out as `layer_types`), and its routed experts and shared expert and the
+    layers they route (`_qwen_moe_export`)."""
+    return {'qkv_bias': model.attention_bias,
+            'use_sliding_window': 'sliding_attention' in model.per_layer_types,
+            **_qwen_moe_export(model, scheduled=True)}
+
+
 def _qwen2_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read Qwen2-MoE's softmax experts beside a sigmoid-gated shared MLP.
 
@@ -463,7 +478,7 @@ QWEN3_5_TEXT = DecoderFamily(
 
 QWEN3_MOE = DecoderFamily(
     ('qwen3_moe',),
-    ConfigLayout(ConfigPart(reads(_qwen3_moe_config), _qwen3_export)),
+    ConfigLayout(ConfigPart(reads(_qwen3_moe_config), _qwen3_moe_export)),
     lambda fields: bool(fields.qk_norm and fields.mixture is not None),
     'qwen3_moe',
     'Qwen3MoeForCausalLM',
@@ -513,7 +528,7 @@ QWEN3 = DecoderFamily(
 
 QWEN2_MOE = DecoderFamily(
     ('qwen2_moe',),
-    ConfigLayout(ConfigPart(reads(_qwen2_moe_config), lambda model: {})),
+    ConfigLayout(ConfigPart(reads(_qwen2_moe_config), _qwen2_moe_export)),
     lambda fields: bool(not fields.qk_norm and fields.mixture is not None
                         and fields.mixture.shared_gate),
     'qwen2_moe',

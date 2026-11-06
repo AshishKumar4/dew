@@ -30,6 +30,7 @@ from dew.interop.layouts import (
     Condition,
     Config,
     ConfigLayout,
+    ConfigPart,
     ConfigRead,
     Copy,
     Rebased,
@@ -962,6 +963,25 @@ def softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
     used.update(('num_experts_per_tok', 'output_router_logits',
                  'router_aux_loss_coef'))
     return _records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok')
+
+
+def _read_local_experts(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> None:
+    used.add('num_local_experts')
+    record['mixture'] = native_fields(Mixture)(
+        experts=_records.integer(hf_config['num_local_experts'], 'num_local_experts'),
+        top_k=softmax_top_k(hf_config, used))
+
+
+def _write_local_experts(model: CausalTransformer) -> Mapping[str, object]:
+    mixture = model.mixture
+    if mixture is None:
+        refuse_export('mixture', 'this family routes every layer')
+    return {'num_local_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k}
+
+
+LOCAL_EXPERTS = ConfigPart(_read_local_experts, _write_local_experts)
+"""Mixtral's routed experts, which GraniteMoE's share: `num_local_experts` softmax experts on every layer,
+the top `num_experts_per_tok` of them renormalized (`softmax_top_k`), both ways."""
 
 
 def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> DecoderFields:

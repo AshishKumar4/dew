@@ -115,7 +115,7 @@ MAMBA = DecoderFamily(
 
 MAMBA2 = DecoderFamily(
     ("mamba2",),
-    ConfigLayout(ConfigPart(reads(mamba2.config_from_hf), lambda model: {})),
+    ConfigLayout(ConfigPart(reads(mamba2.config_from_hf), mamba2.export_fields)),
     lambda fields: isinstance(fields.mixer, Mamba2Mixer),
     "mamba2",
     "Mamba2ForCausalLM",

@@ -35,7 +35,13 @@ from dew.interop.decoder_parts import (
     refuse_export,
     specified_layer_types,
 )
-from dew.interop.families.deepseek import LAYOUT_FIELDS, deepseek_config, deepseek_mixture
+from dew.interop.families.deepseek import (
+    LAYOUT_FIELDS,
+    deepseek_config,
+    deepseek_export,
+    deepseek_mixture,
+    deepseek_moe_export,
+)
 from dew.interop.families.qwen import single_prediction_depth
 from dew.interop.layouts import ConfigLayout, ConfigPart, Copy, Route, Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -240,23 +246,9 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
     }
     if mixture is not None:
         width = mixture.expert_features or model.hidden_features
-        if mixture.shared_features < width or mixture.shared_features % width:
-            refuse_export(
-                "mixture.shared_features", "GLM5 needs an integral positive count of shared expert widths"
-            )
-        fields.update(
-            n_routed_experts=mixture.experts,
-            num_experts_per_tok=mixture.top_k,
-            moe_intermediate_size=width,
-            n_shared_experts=mixture.shared_features // width,
-            routed_scaling_factor=mixture.scaling,
-            n_group=mixture.groups,
-            topk_group=mixture.groups_per_token,
-            norm_topk_prob=mixture.norm_topk_prob,
-            scoring_func="sigmoid",
-            topk_method="noaux_tc",
-            moe_router_dtype="float32",
-        )
+        if mixture.shared_features < width:
+            refuse_export("mixture.shared_features", "GLM5 needs a positive count of shared expert widths")
+        fields.update(deepseek_moe_export(model, scheduled=False), moe_router_dtype="float32")
     return fields
 
 
@@ -298,6 +290,21 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
         ),
     )
     return config
+
+
+def _glm4_moe_export(model: CausalTransformer) -> Mapping[str, object]:
+    """`_glm4_moe_config` backwards: the rotated fraction of a head (half where none is stated), the q/k
+    norms, the routed experts (`deepseek_moe_export`) and the prediction depths past the trunk."""
+    return {'partial_rotary_factor': model.partial_rotary_factor or 1.0, 'use_qk_norm': model.qk_norm,
+            **deepseek_moe_export(model), 'num_nextn_predict_layers': model.num_nextn_predict_layers}
+
+
+def _glm_moe_dsa_export(model: CausalTransformer) -> Mapping[str, object]:
+    """`_glm_moe_dsa_config` backwards: DeepSeek V3.2's block (`deepseek_export`), each layer's indexer
+    as a full one or one sharing the previous full layer's (`indexer_types`, its kv-shared layers)."""
+    shared = set(model.kv_shared_layers or ())
+    return {**deepseek_export(model),
+            'indexer_types': ['shared' if index in shared else 'full' for index in range(model.num_layers)]}
 
 
 def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[str]) -> tuple[str, ...]:
@@ -401,7 +408,7 @@ GLM5_NEXT_TEXT = DecoderFamily(
 
 GLM4_MOE = DecoderFamily(
     ('glm4_moe',),
-    ConfigLayout(ConfigPart(reads(_glm4_moe_config), lambda model: {})),
+    ConfigLayout(ConfigPart(reads(_glm4_moe_config), _glm4_moe_export)),
     lambda fields: (
         fields.partial_rotary_type == 'default'
         and (mixture := fields.mixture) is not None
@@ -422,7 +429,7 @@ GLM4_MOE = DecoderFamily(
 # pairs, which no DeepSeek release does, so that field names the family.
 GLM_MOE_DSA = DecoderFamily(
     ('glm_moe_dsa',),
-    ConfigLayout(ConfigPart(reads(_glm_moe_dsa_config), lambda model: {})),
+    ConfigLayout(ConfigPart(reads(_glm_moe_dsa_config), _glm_moe_dsa_export)),
     lambda fields: (
         isinstance(mixer := fields.mixer, MLAMixer)
         and mixer.index_topk is not None
