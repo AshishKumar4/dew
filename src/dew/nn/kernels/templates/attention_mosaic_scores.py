@@ -160,18 +160,28 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     exponentials, weights, cotangents = forms.mapped(tiles)
     return exponentials, weights, cotangents, slopes, seen
 
-def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None) -> None:
+def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None, *,
+              ticket: tuple | None = None) -> None:
     """A fused dK/dV consumer's tile `dq` added into dQ at its queries from `q_first` (`place` its row and
     head), its `columns` where it is a share of them (`pl.ds`), through its output stage, free until its dK
     and dV are stored (None where the family's adds read no stage, `Transport.adds_through_shared`);
     interpreted, into a copy of the consumer's own (`Family.added`). Where the stage holds several tiles'
     rows (its keys' rows twice a query tile's), a query tile's add takes the next slot of them in turn, so
     it waits for none of the earlier adds' reads of their own (`added`'s `pending`): FlashAttention 3's
-    dQ reduce runs off the consumers' path."""
+    dQ reduce runs off the consumers' path. With a `ticket` (deterministic mode: the semaphores counting
+    each query tile's adds, `[B, H, query tiles]`, and its key tile's turn), the add waits its turn and
+    completes before the next (`Family.ticketed`), so dQ sums its key tiles in their order."""
     row, head = place
     rows = dq.shape[0]
     view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
     view = view if columns is None else view.at[:, columns]
+    family = walk.program.family
+    if ticket is not None:
+        ready, turn = ticket
+        smem = None if out_smem is None else out_smem.at[index, pl.ds(0, rows)]
+        family.ticketed(None if ready is None else ready.at[row, head, lax.div(q_first, rows)], turn,
+                        lambda: family.added(dq, view, walk.interpret, smem=smem))
+        return
     if out_smem is None:
         walk.program.family.added(dq, view, walk.interpret, smem=None)
         return

@@ -11,6 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -127,17 +128,25 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     return carry, (dk_acc, dv_acc)
 
 def _fused_out(family: mosaic.Family, sums: tuple, views: tuple, index, rows: int, stage, *, grouped: bool,
-               interpret: bool) -> None:
+               interpret: bool, ticket: tuple | None = None) -> None:
     """A fused consumer `index`'s dK and dV `sums` out to their `views` through its rows of the output
-    `stage`: added into the key heads' sums where query heads share them (`grouped`), else stored in the
-    stage's dtype (`stores_typed`); once the walk's dQ adds have read the stage, whose slots they took
-    (`_dq_added`)."""
+    `stage`: added into the key heads' sums where query heads share them (`grouped`), in their heads' order
+    with a `ticket` (deterministic mode: its key tile's semaphore and its head's turn, `Family.ticketed`),
+    else stored in the stage's dtype (`stores_typed`); once the walk's dQ adds have read the stage, whose
+    slots they took (`_dq_added`)."""
     if not interpret:
         family.store_wait(0)
     smem = stage.at[index, pl.ds(0, rows)]
     if grouped:
-        for value, view in zip(sums, views, strict=True):
-            family.added(value, view, interpret, smem=smem)
+        def added():
+            for value, view in zip(sums, views, strict=True):
+                family.added(value, view, interpret, smem=smem)
+
+        if ticket is None:
+            added()
+        else:
+            ready, turn = ticket
+            family.ticketed(ready, turn, added)
     else:
         family.stored(tuple(value.astype(stage.dtype) for value in sums), views, smem=smem)
 
@@ -152,6 +161,16 @@ def _statistics(family: mosaic.Family, refs: list, row, head, block_q: int, *, s
     views = {name: (ref.at[row, head], lambda j: (j,)) for name, ref in zip(STATISTICS, refs, strict=True)}
     return views, lambda slots, first: tuple(family.rows_of(slots[name]) for name in STATISTICS)
 
+
+def _turns(family: mosaic.Family, interpret: bool, dq_tiles: tuple, dkv_tiles: tuple, *, deterministic: bool,
+           grouped: bool) -> tuple:
+    """Deterministic mode's turns (`Family.ticketed`, `partials_ready`'s semaphores): each query tile's dQ
+    adds counted (`dq_tiles`, `[B, H, query tiles]`), in their key tiles' order, and each key tile's grouped
+    dK and dV adds (`dkv_tiles`, `[B, KV, key tiles]`), in their query heads'; None for each outside it."""
+    if not deterministic:
+        return None, None
+    return (family.partials_ready(dq_tiles, interpret),
+            family.partials_ready(dkv_tiles, interpret) if grouped else None)
 
 @tuning.lowered_once(("walk",))
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None, *,
@@ -178,6 +197,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     pair = consumers * block_k
     q_steps = queries // block_q
     grouped = heads != kv_heads
+    # Deterministic mode orders every add across programs (`Family.ticketed`; `MosaicBackward.legal`).
+    deterministic, group = deterministic_ops_requested(), heads // kv_heads
     leaves, treedef = jax.tree.flatten(spans)
     # Grouped dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
     shapes = [(batch, keys_padded, kv_heads, width)] * 2
@@ -195,8 +216,11 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         k_smem, v_smem, staged, *out_smem, k_loaded, v_loaded = refs
         out_smem = out_smem[0] if out_smem else None
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
-        key_head = lax.div(head, heads // kv_heads)
+        key_head = lax.div(head, group)
         statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed)
+        dq_ready, dkv_ready = _turns(family, walk.interpret, (batch, heads, q_steps),
+                                     (batch, kv_heads, keys_padded // block_k), deterministic=deterministic,
+                                     grouped=grouped)
         views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head), **statistics}
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
@@ -211,7 +235,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first,
                                           shape=(block_q, block_k))
-            adds = functools.partial(_dq_added, walk, dq_ref, out_smem, (row, head), index)
+            k_tile = lax.div(k_first, block_k)
+            adds = functools.partial(_dq_added, walk, dq_ref, out_smem, (row, head), index,
+                                     ticket=(dq_ready, k_tile) if deterministic else None)
             step = functools.partial(_fused_step, walk, (k_smem.at[index], v_smem.at[index]), rows_of,
                                      staged.at[index], coords_of, whole, adds)
             shapes = ((block_k, width), (block_k, width))
@@ -227,8 +253,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                 lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), (), shapes,
                                                              walk.interpret, first=counted))
             outs = (dk_ref.at[keys_view], dv_ref.at[keys_view])
+            turn = (None if dkv_ready is None else dkv_ready.at[row, key_head, k_tile], lax.rem(head, group))
             finished = functools.partial(_fused_out, family, (dk, dv), outs, index, block_k, grouped=grouped,
-                                         interpret=walk.interpret)
+                                         interpret=walk.interpret, ticket=turn if deterministic else None)
             if after is None:
                 finished(out_smem)
             else:
