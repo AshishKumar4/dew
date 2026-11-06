@@ -1347,9 +1347,11 @@ def _weighted_held(call: Call, block: int) -> Held:
 @lowered_once
 def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
     """`(w [R, HV * Dk], u [R, HV * Dv])` as `call.held` (`algebra.weighted`): the inverse against the decayed
-    write-gated keys and against the write-gated values; under a decay a key dimension, also the keys decayed
-    to their chunk's end, `[R, HV * Dk]` as `call.held` (`algebra.key_decayed_write`), which the memory takes,
-    and those alone without the delta rule (`a` None)."""
+    write-gated keys and against the write-gated values; under a decay a key dimension the keys alone,
+    `(w, the keys decayed to their chunk's end [R, HV * Dk])` as `call.held` (`algebra.key_decayed_write`,
+    which the memory takes), the values' their own launch (`_weighted_values`), and the decayed keys alone
+    without the delta rule (`a` None). Formed beside the key walk at its first step, the values' products
+    held an H100 thread at 248 registers and one program a multiprocessor (kda-ncu-h100-1170e4d25)."""
     width, value_width, gates, family = call.width, call.value_width, call.gates, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
     # Under a decay a key dimension a walk of the key blocks, the block a multiprocessor holds most programs
@@ -1370,8 +1372,9 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
                          lows=gates.views(lo_ref, row, CHUNK, h * width, width))
         whole = {}
         if call.delta:
-            whole.update(inverse=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
-                         values=call.given.views(v_ref, row, CHUNK, h * value_width, value_width))
+            whole.update(inverse=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK))
+        if call.delta and not call.per_key:
+            whole.update(values=call.given.views(v_ref, row, CHUNK, h * value_width, value_width))
         # A key block a step under a decay a key dimension, the inverse and the values whole.
         views = {**stream_views(lambda i: (0, i), **given), **stream_views(lambda i: (0, 0), **whole)}
         vectors = {**({"write": beta_ref} if call.delta else {}),
@@ -1404,16 +1407,14 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
                 inverse = stream_tile(slots, "inverse", held)
                 applied = inverse, betas, issue
 
-                # The values' weights once, at the walk's first step, a value tile at a time
-                # (`Call.value_block`).
-                @pl.when(index == 0)
-                def _():
+                # The values' weights once, a value tile at a time (`Call.value_block`), under a decay a
+                # head (a key dimension's are their own launch's, `_weighted_values`).
+                for c in range(0 if call.per_key else value_width // call.value_block):
                     vb = call.value_block
-                    for c in range(value_width // vb):
-                        tile = stream_tile(slots, "values", call.given, columns=pl.ds(c * vb, vb)).value()
-                        u = algebra.weighted("apply_u", inverse, tile.astype(held.dtype), betas, issue)
-                        held.store(outs[1], u, row, CHUNK, h * value_width + c * vb, vb, family=family,
-                                   smem=landing["values"])
+                    tile = stream_tile(slots, "values", call.given, columns=pl.ds(c * vb, vb)).value()
+                    u = algebra.weighted("apply_u", inverse, tile.astype(held.dtype), betas, issue)
+                    held.store(outs[1], u, row, CHUNK, h * value_width + c * vb, vb, family=family,
+                               smem=landing["values"])
             if prefix is not None:
                 decay = lax.broadcast_in_dim(algebra.raised(*prefix), (CHUNK, keyed), (0,))
             # Under a decay a key dimension the step's own key block (its streams' slots whole), else each.
@@ -1439,10 +1440,12 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
         return mosaic.Walk(views, step, steps=steps, prologue=None if streamed else lambda: read(None))
 
     given = _weighted_blocks(call, keyed)
-    out_type = ((held.shape(call.heads * width), held.shape(call.heads * value_width)) * call.delta
+    values = 0 if call.per_key else value_width
+    out_type = ((held.shape(call.heads * width),) * call.delta
+                + (held.shape(call.heads * value_width),) * (call.delta and not call.per_key)
                 + (held.shape(call.heads * width),) * call.per_key)
     # Without the delta rule the inverse's place takes the keys, an operand no step reads.
-    work = Work(flops=2 * CHUNK * CHUNK * (width + value_width) if call.delta else 0, span=1,
+    work = Work(flops=2 * CHUNK * CHUNK * (width + values) if call.delta else 0, span=1,
                 exponentials=CHUNK * width if call.per_key else 0)
     staging, landing = _weighted_staged(call, keyed)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
@@ -1470,8 +1473,9 @@ def _weighted_blocks(call: Call, keyed: int) -> dict:
     if call.per_key:
         given.update(gates=((CHUNK, width), call.gates), lows=((CHUNK, width), call.gates))
     if call.delta:
-        given.update(inverse=((CHUNK, CHUNK), dataclasses.replace(call.held, rows=call.rows)),
-                     values=((CHUNK, call.value_width), call.given))
+        given.update(inverse=((CHUNK, CHUNK), dataclasses.replace(call.held, rows=call.rows)))
+    if call.delta and not call.per_key:
+        given.update(values=((CHUNK, call.value_width), call.given))
     return given
 
 
@@ -1486,11 +1490,68 @@ def _weighted_staged(call: Call, keyed: int) -> tuple:
     the delta rule takes them, a value tile's (`Call.value_block`) and a key block's, one set where they are
     as wide, and their landings: a value tile's, a block's and a key block's own only where it is one."""
     held = dataclasses.replace(call.held, rows=call.rows)
-    widths = ((CHUNK, call.value_block), (CHUNK, keyed if call.per_key else call.block))
+    values = () if call.per_key else ((CHUNK, call.value_block),)
+    widths = (*values, (CHUNK, keyed if call.per_key else call.block))
     staging = staging_tiles(held, *dict.fromkeys(widths)) if call.delta else ()
     return staging, {"block": held.landing(CHUNK, call.block),
-                     **({"values": held.landing(CHUNK, call.value_block)} if call.delta else {}),
+                     **({"values": held.landing(CHUNK, call.value_block)}
+                        if call.delta and not call.per_key else {}),
                      **({"keyed": held.landing(CHUNK, keyed)} if call.per_key else {})}
+
+
+def _weighted_values_held(call: Call) -> Held:
+    """`_weighted_values`' consumer thread: the inverse, a value tile and its product, the product's
+    fragments."""
+    held, vb = dataclasses.replace(call.held, rows=call.rows), call.value_block
+    return Held(phases=(held_tile(held, CHUNK, CHUNK) + held_tile(call.given, CHUNK, vb) + [f32(CHUNK, vb)]
+                        + fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, vb)),))
+
+
+@lowered_once
+def _weighted_values(v, a, beta, taken, call: Call):
+    """`u [R, HV * Dv]` as `call.held` under a decay a key dimension (`algebra.weighted`): the inverse
+    against the write-gated values, a program a chunk, head and value tile (`Call.value_block`), with no key
+    walk: beside the key walk (`_weighted`) its products held an H100 thread at 248 registers and one
+    program a multiprocessor (kda-ncu-h100-1170e4d25), alone 6 a multiprocessor's worth of the walk's
+    tiles."""
+    vb, family = call.value_block, call.family
+    held = dataclasses.replace(call.held, rows=call.rows)
+
+    def program(at, v_ref, a_ref, beta_ref, taken_ref, u_ref, *, streams, staging, landing):
+        del taken_ref
+        n, h, c = at["chunks"], at["heads"], at["values"]
+        row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
+        views = stream_views(lambda i: (0, 0), inverse=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
+                             values=call.given.views(v_ref, row, CHUNK, h * call.value_width + c * vb, vb))
+        streamed = family.copies_vectors
+        if streamed:
+            views |= vector_views(n, h, write=beta_ref)
+
+        def step(index, slots, carry, accumulators):
+            del index
+            slots.acquire_all()
+            betas = family.rows_of(slots["write0"] if streamed else beta_ref.at[h, span])
+            issue = Issuer(call, {"apply_u": staging[0]})
+            tile = stream_tile(slots, "values", call.given).value()
+            u = algebra.weighted("apply_u", stream_tile(slots, "inverse", held), tile.astype(held.dtype),
+                                 betas, issue)
+            held.store(u_ref, u, row, CHUNK, h * call.value_width + c * vb, vb, family=family,
+                       smem=landing["values"])
+            return carry, accumulators
+
+        return mosaic.Walk(views, step, steps=1)
+
+    blocks = stream_blocks(inverse=((CHUNK, CHUNK), held), values=((CHUNK, vb), call.given)) | vector_blocks(
+        call, "write")
+    work = Work(flops=2 * CHUNK * CHUNK * vb, span=1)
+    return launch_kernel(program, call, out_type=held.shape(call.heads * call.value_width),
+                         grid=(call.chunks, call.heads, call.value_width // vb),
+                         grid_names=("chunks", "heads", "values"), blocks=blocks, stages=1,
+                         live=chunk_liveness(2), work=work,
+                         held=_weighted_values_held(call),
+                         hardware=issued_flops(call, work.flops, held, call.given),
+                         staging=staging_tiles(held, (CHUNK, vb)),
+                         landing={"values": held.landing(CHUNK, vb)})(v, a, beta, taken)
 
 
 def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walked: tuple, step, start,
@@ -2447,10 +2508,12 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         # The forward's inverse given without its states (a recomputed forward, `delta_memory`): its weights
         # from the inverse, the system's launch and the solve not repeated.
         a = inverse
-        w, u, keys = _weighted(k, v, a, hi, lo, beta, taken, call)
+        w, keys = _weighted(k, v, a, hi, lo, beta, taken, call)
+        u = _weighted_values(v, a, beta, taken, call)
     elif per_key and delta:
         a = _intra_solve(system[0], taken, call)
-        w, u, keys = _weighted(k, v, a, hi, lo, beta, taken, call)
+        w, keys = _weighted(k, v, a, hi, lo, beta, taken, call)
+        u = _weighted_values(v, a, beta, taken, call)
     elif per_key:
         (keys,) = _weighted(k, v, None, hi, lo, beta, taken, call)
     elif delta and inverse is None and not states:
