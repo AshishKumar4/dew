@@ -106,3 +106,21 @@ def test_the_dense_cells_build_every_product_for_each_implementation_on_the_cpu(
         call, draw = cases.dense({"shape": "tiny", "product": product}, "xla")
         assert call(*draw(0)).shape == shape and draw(0) is not None
 
+
+def test_one_window_a_gpu_kind_is_a_timing_job_running_its_kinds_manifest(tmp_path):
+    """`jobs` writes one measurement window a GPU kind, as `node submit` takes it: a timing, alone on its GPU, at
+    the ref, running the harness over that kind's manifest, its minutes grown with its timed calls."""
+    small = {"cases": [{"name": "a", "builder": "b:c", "cells": [{}], "arms": [{"name": "x"}], "rounds": 1,
+                        "repeats": 1}]}
+    large = {"cases": [{**small["cases"][0], "cells": [{}] * 50, "arms": [{"name": "x"}, {"name": "y"}],
+                        "rounds": 5, "repeats": 5}]}
+    for name, manifest in (("a100.json", small), ("h100.json", large)):
+        (tmp_path / name).write_text(json.dumps(manifest))
+    written = subprocess.run([sys.executable, str(TIMING), "jobs", "--ref", "abc", "--name", "W",
+                              f"a100={tmp_path / 'a100.json'}", f"h100={tmp_path / 'h100.json'}"],
+                             capture_output=True, text=True, check=True)
+    a100, h100 = json.loads(written.stdout)["jobs"]
+    assert (a100["name"], a100["gpu"], a100["kind"], a100["ref"]) == ("W-a100", "a100", "timing", "abc")
+    assert "$SESSION/extra/a100.json" in a100["run"] and "$SESSION/extra/h100.json" in h100["run"]
+    assert h100["minutes"] > a100["minutes"] >= 15
+
