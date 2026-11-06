@@ -401,13 +401,13 @@ def _searched(job):
     return window, (budget - sum(step.op.issues for step in steps)) if steps else 0, steps
 
 
-def improved(form: BitForm, seconds: float = 60.0, window: int = 3, longest: int = 2) -> BitForm:
+def improved(form: BitForm, seconds: float = 60.0, widest: int = 3, longest: int = 2) -> BitForm:
     """`form` with windows replaced until none of up to three steps has a cheaper equal program: each round
     searches every window at once (a process each core), then splices the savings that touch no other,
     largest first, from the form's end so earlier places stand."""
     with concurrent.futures.ProcessPoolExecutor() as pool:
         while True:
-            jobs = [(form, place, seconds, longest) for place in windows(form, window)]
+            jobs = [(form, place, seconds, longest) for place in windows(form, widest)]
             found = [result for result in pool.map(_searched, jobs) if result[1]]
             if not found:
                 return form
