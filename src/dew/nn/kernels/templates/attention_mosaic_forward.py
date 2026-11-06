@@ -179,7 +179,7 @@ row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`g
 
 
 def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int, *,
-                  held_only: bool = True) -> Tiles | None:
+                  held_only: bool = True, parts: int = 1) -> Tiles | None:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): the largest of the
     family's row extents that divides the plain launch's query blocks (the guarded walk is a rare one's of
     its overflowed rows alone, so it takes smaller blocks where the plain launch's hold no guarded state: at
@@ -195,7 +195,10 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     fragments). Uncounted, the statistics left 64 x 64 on two consumers spilling 20 bytes a thread at heads
     128 and 256 wide (ptxas, sm90a). None where none fits: the plain launch is then illegal at `tiles`
     (`MosaicForward.legal`); unless `held_only`, its least candidate then, which a launch pinned at `tiles`
-    walks whatever its legality (a resource witness lowers as pinned)."""
+    walks whatever its legality (a resource witness lowers as pinned). An fp32 call's `parts`
+    (`MosaicForward.parts`) form its weights' parts beside them, sum each product's terms beside a fresh
+    accumulator (the consumer's `dot`), and read its keys' magnitudes from each part's tile, summed fp32
+    (et-fp32e: uncounted, 64 x 64 at width 64 spilled 1,820 bytes on an H100)."""
     def held(candidate: Tiles) -> bool:
         rows, block = candidate.block_q, candidate.block_k
         # Priced in the layout the guarded launch takes at its share (`bundle_of`).
@@ -210,6 +213,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         # every A100 guarded tile was refused, gate80 46 of 96 against 70; the A100's guarded launch at width
         # 64 still spills 40 bytes counted apart, its decode path the Triton mainloop's until it does not).
         magnitudes = [logits[0], (columns, block, jnp.float32)]
+        if parts > 1:
+            logits = [*logits, (rows, block, jnp.float32), *[(rows, block, dtype)] * parts]
+            magnitudes += [(columns, block, dtype)] * parts
         live = resources.live_registers(arranged, carried, logits + sums, magnitudes, *fragments)
         if arranged.operands_in_registers:
             # Its products' fragments loaded beside the step's tiles, which they read (mma.sync: priced
@@ -377,7 +383,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         unit = guarded_columns(family, v.shape[-1], v.dtype)
         # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`); a launch
         # pinned past it walks the least.
-        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1], held_only=False)
+        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1], held_only=False, parts=parts)
         hooked_blocks = hooks.output_mod is not None
         assert guarded is not None, at
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)

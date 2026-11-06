@@ -339,7 +339,7 @@ class MosaicForward(_Mainloop[Tiles]):
             return True
         columns = guarded_columns(family, value.shape[3], value.dtype)
         width = _width(query.shape[3], family, query.dtype)
-        return guarded_tiles(family, config, columns, value.dtype, width) is not None
+        return guarded_tiles(family, config, columns, value.dtype, width, parts=self.parts) is not None
 
     def resident(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at

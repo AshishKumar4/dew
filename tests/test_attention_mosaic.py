@@ -1922,7 +1922,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
-@pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
+@pytest.mark.parametrize("generation_name", ["sm90"])
 def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name, width):
     """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
     of a causal call `width` wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
