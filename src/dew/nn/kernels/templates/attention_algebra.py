@@ -35,7 +35,7 @@ import numpy as np
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.kernels.templates import layout, product
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, within
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, Initial, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
 
 
@@ -482,9 +482,11 @@ def reached(maxima: jax.Array, *, unseen: bool) -> jax.Array:
     return jnp.where(maxima == -jnp.inf, 0.0, reach) if unseen else reach
 
 
-type Launch[O] = Callable[..., tuple[O, jax.Array, jax.Array]]
+type Launch[O, F] = Callable[..., tuple[O, jax.Array, jax.Array] | tuple[O, None, F]]
 """A whole launch of a call in a form (`walked_launches`), `launch(form, live, again=False, into=None)`: its
-outputs, each row's running maximum and whether its weighted values overflowed; `again` a plain launch run
+outputs, each row's running maximum and whether its weighted values overflowed; or, a launch whose programs
+state their rows' rewalk flags themselves (`F`, its mainloop's own), its outputs, no maxima and those flags,
+which it takes back as `live`; `again` a plain launch run
 once more inside the guard's rare branch, a recomputation (its kernel named apart, its products counted
 once); `into` refs holding the plain launch's outputs, which it writes its rows `live` into in place
 (`walked_launches`' `in_place`)."""
@@ -500,13 +502,12 @@ def finished_form(spec: Forward) -> Forward:
 def slice_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
     """A finished slice of a row's keys as a state of their merge (`finished_merged`): its output `out`
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
-    keeps them) and its denominator folded into its maximum (`m + log(total)`, in those units) and its mass
-    1 where it saw a key, so no output multiplied back by its denominator passes fp32's largest; a slice of
-    no key the walk's start (`LEAST`), its mass 0. A row or a launch's block of rows alike."""
+    keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
+    rounded away at a large one (row 4646: at 2^30, fp32's spacing 128, slices of denominators 128 and 64
+    merged half and half). A slice of no key the walk's start (`LEAST`), its mass 0. A row or a launch's
+    block of rows alike."""
     seen = total > 0
-    units = spec.scale if spec.raw else 1.0
-    folded = jnp.where(seen, maximum + jnp.log(jnp.where(seen, total, 1.0)) / units, LEAST)
-    return Partial(out, folded, seen.astype(jnp.float32))
+    return Partial(out, jnp.where(seen, maximum, LEAST), jnp.where(seen, total, 0.0))
 
 
 def initial_state(spec: Forward, initial: Partial) -> Partial:
@@ -518,7 +519,7 @@ def initial_state(spec: Forward, initial: Partial) -> Partial:
 
 
 def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
-                  initial: Partial | None = None) -> jax.Array:
+                  initial: Initial | None = None) -> jax.Array:
     """A split walk's slices merged (`merged` of `slice_state`s, then `finish`): their outputs `out`
     `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural `spec`'s units, `finished_rows`', a
     fold's `unfolded`, raw products where it keeps them) and denominators `[B, KV, S, Q]`, and the call's
@@ -530,8 +531,9 @@ def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.
     if initial is not None:
         own = initial_state(spec, Partial(jnp.swapaxes(initial.acc, 1, 2), jnp.swapaxes(initial.m, 1, 2),
                                           jnp.swapaxes(initial.total, 1, 2)))
-        state = Partial(*(jnp.concatenate([mine, theirs[:, None]], axis=1)
-                          for mine, theirs in zip(state[:3], own[:3], strict=True)))
+        acc, m, total = (jnp.concatenate([mine, theirs[:, None]], axis=1)
+                         for mine, theirs in zip(state[:3], own[:3], strict=True))
+        state = Partial(acc, m, total)
     return finish(spec, finished_merged(spec, state, axis=1), initial=True, normalized=True)[0]
 
 
@@ -541,10 +543,14 @@ def finished_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     program's registers hold them (the in-launch merge's, `attention_mosaic_forward._Merge`)."""
     m = jnp.maximum(first.m, second.m)
     a, b = carried(spec, first.m, m) * first.total, carried(spec, second.m, m) * second.total
-    total = a + b
-    over = 1.0 / jnp.where(total > 0, total, 1.0)
+    # Each weight over the larger, so their sum is at most two whatever the masses (an initial state's may
+    # be any finite one).
+    largest = jnp.maximum(a, b)
+    safe = jnp.where(largest > 0, largest, 1.0)
+    a, b = a / safe, b / safe
+    over = 1.0 / jnp.where(a + b > 0, a + b, 1.0)
     out = expand(a * over, first.acc) * first.acc + expand(b * over, second.acc) * second.acc
-    return Partial(out, m, total)
+    return Partial(out, m, largest * (a + b))
 
 
 def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
@@ -557,28 +563,34 @@ def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     (`finish`'s `normalized`); a state of no key adds nothing."""
     m = jnp.max(stacked.m, axis=axis)
     weights = carried(spec, stacked.m, jnp.expand_dims(m, axis)) * stacked.total
-    total = jnp.sum(weights, axis=axis)
-    shares = weights * jnp.expand_dims(1.0 / jnp.where(total > 0, total, 1.0), axis)
+    # Each weight over the largest, so their sum is at most the states' count whatever the masses.
+    largest = jnp.max(weights, axis=axis)
+    weights = weights / jnp.expand_dims(jnp.where(largest > 0, largest, 1.0), axis)
+    summed = jnp.sum(weights, axis=axis)
+    shares = weights * jnp.expand_dims(1.0 / jnp.where(summed > 0, summed, 1.0), axis)
     out = jnp.sum(expand(shares, stacked.acc) * stacked.acc, axis=axis)
-    return Partial(out, m, total)
+    return Partial(out, m, largest * summed)
 
 
-def rewalks(spec: Forward, maxima: jax.Array | None, over: jax.Array | None
-            ) -> tuple[jax.Array | None, Forward]:
+def rewalks(spec: Forward, maxima: jax.Array, over: jax.Array) -> tuple[jax.Array, Forward]:
     """The rows a plain launch's guards walk again (`walked_launches`), from its rows' running `maxima` and
-    whether their weighted values `over`flowed, and the form they walk in: where the fold reaches
-    (`Forward.reaches`), those whose maximum passes `FOLD_REACH` (`reached`: a padded query's -inf, a row
-    that reads nothing, as a slice's of no keys) or that overflowed, in the natural form (`unfolded`); else
-    those that overflowed, in the call's. A launch's programs state them so of their own rows; given no
-    maxima, the form alone."""
+    whether their weighted values `over`flowed, and the form they walk in (`rewalked_form`): where the fold
+    reaches (`Forward.reaches`), those whose maximum passes `FOLD_REACH` (`reached`: a padded query's -inf, a
+    row that reads nothing, as a slice's of no keys) or that overflowed; else those that overflowed. A
+    launch's programs state them so of their own rows."""
     if spec.reaches:
-        live = None if maxima is None else (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over
-        return live, unfolded(spec)
-    return over, spec
+        return (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over, rewalked_form(spec)
+    return over, rewalked_form(spec)
 
 
-def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O], *,
-                       masked: bool = False, in_place: bool = False) -> O:
+def rewalked_form(spec: Forward) -> Forward:
+    """The form a plain launch's guards walk its rows again in (`rewalks`): the natural form where the fold
+    reaches (`unfolded`), else the call's."""
+    return unfolded(spec) if spec.reaches else spec
+
+
+def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[jax.Array, O, O], O], *,
+                          masked: bool = False, in_place: bool = False) -> O:
     """`walked`'s guards over whole launches, for a mainloop whose program walks its keys once (a producer
     streams them, so no program walks again): `launch(form, live)` runs the call in `form`, plain where
     `live` is None, else with its rows `live` shifting (`guarded`), and returns its outputs, each row's
@@ -607,18 +619,26 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     H100), and the masked launch's `kept` selected over them every call; its empty launch costs its
     prologue."""
     if masked or in_place:
-        outputs, maxima, over = launch(spec, None)
+        plain = launch(spec, None)
+        outputs = plain[0]
         if not (spec.reaches or spec.headroom):
             return outputs
         # A launch whose programs state its rows' rewalk flags themselves (`rewalks`) gives them in its
-        # overflows' place and no maxima: no array operation between the launches (ET-DPROF-h100: the two
-        # fusions forming them took 6.3 us of a batch-1 decode step's 30.7).
-        live, form = (over, rewalks(spec, None, None)[1]) if maxima is None else rewalks(spec, maxima, over)
-        if in_place:
+        # overflows' place and no maxima, and rewalks in place: no array operation between the launches
+        # (ET-DPROF-h100: the two fusions forming them took 6.3 us of a batch-1 decode step's 30.7).
+        if plain[1] is None or in_place:
+            live, form = ((plain[2], rewalked_form(spec)) if plain[1] is None
+                          else rewalks(spec, plain[1], plain[2]))
             held = jax.tree.map(jax.new_ref, outputs)
             launch(form, live, into=held)
             return jax.tree.map(jax.freeze, held)
+        live, form = rewalks(spec, plain[1], plain[2])
         return kept(live, launch(form, live)[0], outputs)
+
+    def plain_launch(form: Forward) -> tuple[O, jax.Array, jax.Array]:
+        launched = launch(form, None)
+        assert launched[1] is not None, "a launch states its rows' rewalk flags in a masked walk alone"
+        return launched
 
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
         if not form.headroom:
@@ -631,7 +651,7 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
                             lambda: kept(over, launch(form, over)[0], launch(form, None, again=True)[0]),
                             lambda: outputs)
 
-    outputs, maxima, over = launch(spec, None)
+    outputs, maxima, over = plain_launch(spec)
     if not spec.reaches:
         return guarded_launch(spec, outputs, over)
     # The call's own rows alone: a padded query's maximum is -inf, a row that reads nothing (`seen`).
@@ -640,7 +660,7 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     natural = unfolded(spec)
 
     def unfolded_launch() -> O:
-        unfolded_outputs, _, unfolded_over = launch(natural, None)
+        unfolded_outputs, _, unfolded_over = plain_launch(natural)
         return guarded_launch(natural, unfolded_outputs, unfolded_over)
 
     return jax.lax.cond(reach >= FOLD_REACH, unfolded_launch, lambda: guarded_launch(spec, outputs, over))

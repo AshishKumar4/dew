@@ -18,14 +18,14 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post60; a release sorts below it, so an
+    # first build with every fix is post61; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The CUDA and PJRT plugins the
     # cuda12 and cuda13 extras name are Dew's builds of its native code,
-    # post45's, which post46's to post60's Python fixes left as it was. A bump runs the GPU
+    # post45's, which post46's to post61's Python fixes left as it was. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.12.0.1.post60,<0.12.1",
+    "jax>=0.12.0.1.post61,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -126,9 +126,10 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 # jax, jaxlib and flax>=0.12.0 unpinned, which the pins above satisfy.
 # Dew's build of it (pypi.dewml.dev): 0.1.8, get_current_rule reaching a nested
 # provider where the outer one's rules match nothing, a public
-# qwix.is_quantized(model), and conv_general_qt's backward over grouped
-# convolutions.
-quantization = ["qwix==0.1.8.post3"]
+# qwix.is_quantized(model), conv_general_qt's backward over grouped
+# convolutions, and conv_general's scales over an integer product in at least
+# float32, CUDA convolving int8 codes exactly in float32 chunks (post4).
+quantization = ["qwix==0.1.8.post4"]
 test = [
     "pytest",
     # tools/armada/ci.py's coverage report: branch coverage of src/dew over the suite on armada.

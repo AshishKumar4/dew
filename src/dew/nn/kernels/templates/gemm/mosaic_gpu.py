@@ -131,7 +131,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
-      loads, its consumers holding the program's entry registers (`mosaic.ConsumerFed`).
+      loads, its consumers holding the program's entry registers (`fed.ConsumerFed`).
     - Shape: the tile loading its operands fewest times a FLOP within its consumers' registers: an
       accumulator of `resources.held_area` elements A reads them 1/rows + 1/columns times a FLOP, least at
       rows = columns = sqrt(A). So the rows are sqrt(A) in whole roles (no more than the call's, below);
@@ -465,8 +465,9 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
                  for position, i in enumerate(stepped)}}
     held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
                                     for i in fixed])
-    return Allocations(blocks, (held['fixed_smems'], held['fixed_barriers'],
-                                family.meeting(tiles.warpgroups)),
+    # Two consumers meet at their halves' boundaries (`_staged_halves`); one meets none.
+    meeting = (family.meeting(tiles.warpgroups),) if tiles.warpgroups > 1 else ()
+    return Allocations(blocks, (held['fixed_smems'], held['fixed_barriers'], *meeting),
                        (((block_m // tiles.warpgroups, block_n), jnp.dtype(out_dtype)),))
 
 
@@ -1323,7 +1324,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
             tiles=tiles, stepped=stepped, prologue_axes=prologue_axes, interpreted=bool(interpret),
             k_major=k_major, row_scales_gmem=scale_gmems[0])
 
-        def scope(fixed_smems, fixed_barriers, halves, *, streams):
+        def scope(fixed_smems, fixed_barriers, *meeting, streams):
+            halves = meeting[0] if meeting else None
             names = tuple(allocations.blocks)
 
             def issue(wg, tile, walk, *, active):
@@ -1354,7 +1356,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                             else (prologue, prologue_axes, stepped, fixed, fixed_refs, read_refs))
                     return _staged_halves(family, [slots[name] for name in names], (index, *group),
                                           (mine_depth, mine_columns), hook,
-                                          halves if consumers == 2 else None)
+                                          halves)
 
                 # An empty group's tile reads none and stores zeros.
                 scaling = _tgmm_scaling(scale_gmems[1], columns.start, mine_depth, start + first)

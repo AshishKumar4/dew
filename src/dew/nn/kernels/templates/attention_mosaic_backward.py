@@ -33,6 +33,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _spans_of,
     approximate,
+    backward_family,
     modelled,
     score_places,
     stated,
@@ -156,16 +157,17 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     first pass chose it. Two launches: the dQ program's sums, their finish (`gradient.dq_finish`) and the
     dK/dV program under its refined D, whose cotangents sum to 0 where the first pass's do not (a small weight
     on a large value, bf16: dK's worst row 2.5e1 at the first pass's D, where check 1 allows 1.55e-2), the
-    accurate form's always, and a score hook's and an initial state's, whose gradients need the refined D
-    (`gradient.dq_step`). The fast form's one launch (`tiles.fused`, a hookless call's): the dK/dV program
-    adding each tile's dQ atomically, under the first pass's D and the forward's denominator, the derived
-    default of a hookless fast-form call outside deterministic mode (`MosaicBackward.derived`: 1.05 to 1.4
+    accurate form's always, and a score hook's parameters', whose gradients need the refined D
+    (`gradient.dq_step`). The fast form's one launch (`tiles.fused`, a call whose score hook, if any, takes
+    no parameters, an initial state's gradient from the first pass's D): the dK/dV program adding each tile's
+    dQ atomically, under the first pass's D and the forward's denominator, the derived default of such a call
+    (`MosaicBackward.derived`; in deterministic mode a full or causal one's, its adds in turn: 1.05 to 1.4
     times as fast as two launches, FUSEDFORM-h100; 384 MB of temporaries against 258 at llama-d128 2 x 4096,
     its dQ fp32); two launches, in a fixed order, otherwise. Returns what `gradients` takes: dQ, the softmax's
-    rows, each query's anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums
-    `[1, B, H, 1]`, which `gradients` sums over the batch), then dK, dV and the dK/dV parameters'
-    (`DKV_GRADS`). The query arrives the call's own: its logits are those of the query taken by `prescale`
-    (`by_power`) at `scale`, the scale left (`gradients`), which `spec` takes."""
+    rows, each query's anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums `[1,
+    B, H, 1]`, which `gradients` sums over the batch), then dK, dV and the dK/dV parameters' (`DKV_GRADS`).
+    The query arrives the call's own: its logits are those of the query taken by `prescale` (`by_power`) at
+    `scale`, the scale left (`gradients`), which `spec` takes."""
     spec = dataclasses.replace(spec, scale=scale, prescale=prescale)
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = gradient.off_anchor_start(peak0, total0, maximum, value_width, shift)
@@ -200,7 +202,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     # The dK/dV launch on its own layout (`BackwardTiles.dkv`).
     dkv_tiles = tiles.dkv
     dkv_walk = dataclasses.replace(walk, program=dataclasses.replace(
-        program, family=bundles.named(dkv_tiles.family, query.dtype), tiles=dkv_tiles),
+        program, family=backward_family(bundles.named(dkv_tiles.family, query.dtype), dkv_tiles),
+        tiles=dkv_tiles),
         consumers=dkv_tiles.consumers)
     if walk.fused:
         if tiles.shared_keys:
@@ -213,7 +216,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                                      spans, score_params, drop, scaled, walk=dkv_walk)
         else:
             dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                       spans, walk=walk)
+                                       spans, drop, walk=walk)
         mass = gradient.split_mass(own, others_total, forward_total, shift)
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])

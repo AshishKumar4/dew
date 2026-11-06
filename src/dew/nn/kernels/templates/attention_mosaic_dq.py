@@ -29,6 +29,8 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
     _query_program,
     _query_tile_loaded,
+    _relay_tiles,
+    _relayed,
     _score_params,
     _scores,
 )
@@ -38,14 +40,16 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
                     stages: int) -> tuple[list, dict]:
     """The dQ program's allocations as `Family.scoped` takes them, in `_dq_launch`'s order: its consumers'
     query and output-cotangent stages, their dQ output stage (fp32, its share of the config's `columns`) and
-    their rows' stage, the two loads' barriers, and its key and value streams in `stages` slots
-    (`Family.streams`)."""
+    their rows' stage, the two loads' barriers, each consumer's relay tile where its score cotangents reach
+    dQ's product through shared memory (`Family.relay_bytes`, `_relayed`), and its key and value streams in
+    `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     scoped = [plgpu.SMEM((consumers, block_q, width), dtype),
               plgpu.SMEM((consumers, block_q, value_width), dtype),
               plgpu.SMEM((consumers, block_q, width // config.columns), jnp.float32),
               plgpu.SMEM((consumers, block_q), jnp.float32),
-              family.load_barriers(consumers), family.load_barriers(consumers)]
+              family.load_barriers(consumers), family.load_barriers(consumers),
+              *_relay_tiles(family, consumers, block_q, block_k, dtype)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
     # The logits' and dP's products read the keys and values transposed.
     return scoped, family.streams(blocks, stages, consumers,
@@ -159,7 +163,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         (spans_of, score_refs, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, refs = refs[0], refs[1:]
         keyed_ref, refs = (refs[0], refs[1:]) if walk.accurate else (None, refs)
-        rows_ref, (q_smem, do_smem, out_smem, row_smem, q_loaded, do_loaded) = refs[0], refs[1:]
+        rows_ref, (q_smem, do_smem, out_smem, row_smem, q_loaded, do_loaded, *relay) = refs[0], refs[1:]
         row, head, views, streams, pair_first, streamed = _query_program(
             program, streams, k_ref, v_ref, spans_of, heads=heads, kv_heads=kv_heads, queries=queries,
             consumers=consumers)
@@ -178,7 +182,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
             coords_of = functools.partial(_coords, family, spans_of, row, first, shape=shape,
                                           draw=None if drop_of is None else drop_of.draw(row, head))
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head, first)
-            step = functools.partial(_dq_step, walk, operands, stats, coords_of, params_of, whole, share)
+            step = functools.partial(_dq_step, _relayed(walk, relay, index), operands, stats, coords_of,
+                                     params_of, whole, share)
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
                      nothing + gradient.NO_SHIFT)
             # The tiles its partner reads around its own (`Family.walk_own`).

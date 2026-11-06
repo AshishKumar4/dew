@@ -76,7 +76,8 @@ BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys",
 """The backward's forms (`_backward_form`): the fast in two launches and in one each way, the raised ones
 where raises hold (`RAISED_FORMS`), and the accurate."""
 HOOKED_FORMS = ("default", "accurate")
-"""The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
+"""The forms every hooked call takes: its fast form's one launch takes a hook of no parameters, an initial
+state or a draw alone."""
 
 
 FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128, "fused-shared-dq": 128,
@@ -568,10 +569,11 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("form", HOOKED_FORMS)
+@pytest.mark.parametrize("form", [*HOOKED_FORMS, "fused"])
 def test_the_backward_is_on_par_dropping_interpreted(form):
-    """The backward in each form under probability dropout over a causal call, its D the dropped products'
-    own pass (`attention_mosaic_backward._centre_launch`), under the interpreter."""
+    """The backward in each form under probability dropout over a causal call, the fast form's one launch
+    too (each consumer's tile its own draw), its D the dropped products' own pass
+    (`attention_mosaic_backward._centre_launch`), under the interpreter."""
     _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True)
 
 
@@ -1295,6 +1297,19 @@ def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks
 
 
 @INTERPRETS
+@pytest.mark.parametrize(("hooks", "form"), [("softcap", "fused"), ("softcap", "fused-shared-keys"),
+                                             ("sinks", "fused")])
+def test_a_hooked_backward_in_one_launch_holds_check_1_interpreted(hooks, form, without_deterministic_ops):
+    """The fast form's one launch queries first under a softcap, a score hook of no parameters, each
+    consumer its own keys or its share of a shared key block (`attention_mosaic_coop`), its score
+    cotangents taken back through the cap's slope (`gradient.pulled`) before dQ's and dK's products; or
+    under sinks, the softmax's initial state, whose gradient the first pass's D and the keys' share of the
+    weights give: every gradient the reference's (check 1) over causal packed documents under a window,
+    under the interpreter, heads as wide as the form takes (`FORM_WIDTHS`)."""
+    _check_hooked_backward(hooks, form=form, interpret=True, width=FORM_WIDTHS.get(form, 64))
+
+
+@INTERPRETS
 @pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
 def test_a_width_split_backward_writes_its_score_parameters_gradients_once_interpreted(hooks):
     """The accurate backward 128 wide, its sums in two column halves (`BackwardTiles.columns`), under a hook
@@ -1831,6 +1846,29 @@ def test_an_a100_fused_backward_counts_the_shared_memory_its_lowering_asks_for()
     assert binary["shared"] == shared
 
 
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block(accurate):
+    """An A100's backward of heads 256 wide (Gemma's) on 32 x 32 tiles, two launches on mma.sync arranged by
+    their 32-row shares (`backward_family`), each register operand crossing its warps relayed through its
+    consumer's tile (`_relay_tiles`): within the A100's block, as its model sizes it, spilling nothing, every
+    launch's model ptxas's, lowered and compiled for an sm80 on this CPU, in each form."""
+    import kernel_compile
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    op, ba, _ = _gated_backward("sm80", 256, accurate)
+    config = attention_mosaic.BackwardTiles(32, 32, 2, 1, family="mma.sync")
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        assert op.staged_bytes(ba, config, target) <= target.shared_limit
+        models = _backward_models(op, ba, config)
+        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config), models)],
+                                       "sm80")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert set(models) <= kernel_compile.compiled_kernels(found[0]), (set(models), found[0].get("kernels"))
+
+
 def _forward_kernels(op, ba, config) -> dict:
     """The forward's register model by each name a launch of it takes (`attention_mosaic_forward._launch`:
     `attention_{forward, training, peaks}`, then `_natural`, `_kept`, `_guarded`, `_columns{width}` and
@@ -1956,6 +1994,25 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
             [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
             generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_a_deterministic_backward_in_one_launch_holds_check_1_interpreted(call, with_deterministic_ops):
+    """The backward under --xla_gpu_deterministic_ops on a full or causal call, its one launch's adds each
+    in its turn (`Family.ticketed`: dQ's in its key tiles' order, grouped dK's and dV's in their query
+    heads'), its gradients the reference's (check 1), under the interpreter, whose programs run in turn."""
+    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+def test_a_deterministic_backward_compiles_spill_free_as_its_model_decides(width, with_deterministic_ops):
+    """The backward under --xla_gpu_deterministic_ops at its derived tiles of a causal call `width` wide,
+    its adds ordered across programs by semaphores (`Family.ticketed`), lowered and compiled by ptxas for an
+    H100 on this CPU: within its shared memory, spilling nothing, its register model's decision ptxas's."""
+    test_the_backward_compiles_spill_free_as_its_model_decides(generation_name="sm90", width=width,
+                                                               accurate=False, hooks="none")
 
 
 @COMPILES_ON_CPU

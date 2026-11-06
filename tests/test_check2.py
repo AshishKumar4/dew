@@ -747,18 +747,28 @@ def test_the_recurrence_step_witness_holds_the_interpreted_mainloop(regime):
 
 
 @INTERPRETS
-def test_the_recurrence_step_witness_holds_a_packed_call():
+@pytest.mark.parametrize("begins", [1.0, 1.25], ids=["on the grid", "inside a chunk"])
+def test_the_recurrence_step_witness_holds_a_packed_call(begins):
     """The step witness (row 2084 (e)) on a packed bf16 call of three chunks whose second document begins at
-    the second chunk: its first chunk enters the zero memory a document starts from, held as stored, and
-    every record lies inside its step's enclosure."""
+    the second chunk or a quarter into it: the launches lay each document's chunks (`rw.laid_chunks`), its
+    first chunk entering the zero memory a document starts from, held as stored, and every record lies
+    inside its step's enclosure."""
     import jax.numpy as jnp
 
     operands = rw.draw(0, "mild")
-    starts = jnp.zeros((1, operands[0].shape[1]), bool).at[0, rw.CHUNK].set(True)
+    starts = jnp.zeros((1, operands[0].shape[1]), bool).at[0, int(begins * rw.CHUNK)].set(True)
     run = rw.recorded(*operands, starts=starts, max_segments=2)
     held = rw.witness(run, rw.interpreted_lane())
     for name in rw.RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_one_a_head():
+    """The step witness (row 2084 (e)) under a decay a key dimension (`rw.assert_key_decays_witnessed`):
+    every record of a bf16 call of three chunks inside its step's enclosure, and a kernel reading each
+    token's mean decay for all its keys refused."""
+    rw.assert_key_decays_witnessed(rw.interpreted_lane())
 
 
 @INTERPRETS
