@@ -664,7 +664,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     kernel = family.kernel(body, out_type=(*out_type, *workspace),
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
-                           resident=tiles.programs,
+                           resident=tiles.programs, scalars=0 if dense else 1,
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
                                                    *prologue_operands, *epilogue_operands, *out_type))
     outs = kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands)
@@ -1023,7 +1023,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
                            consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_tgmm",
-                           resident=tiles.programs,
+                           resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands,
                                                    out_type))
     return kernel(*groups, lhs, rhs, *prologue_operands)[0]

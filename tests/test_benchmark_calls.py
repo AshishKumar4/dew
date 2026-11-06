@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from sampling_gate import FALSE_RED
 
-from dew.telemetry.benchmark import benchmark
+from dew.telemetry.benchmark import CuptiHeld, benchmark, device_time
 
 
 class Slow:
@@ -224,3 +224,39 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
     assert {"VmRSS", "RssAnon", "RssFile", "VmHWM"} <= set(before)
     assert after["RssAnon"] > before["RssAnon"] + measured["size"] // 2
     assert after["VmHWM"] >= after["VmRSS"] >= after["RssAnon"]
+
+
+@pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
+def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however_it_ends(tmp_path):
+    """A session reads each kernel a call launched with its device time and refuses a call that launched
+    none, whose time would read as zero; a call timed behind an eviction in its program reads its own
+    kernels, the eviction's left out; the session detaches CUPTI however it ends, after a read or only a
+    refused one, so a profile capture after it records the call's kernels, and a read inside that capture
+    is refused as held. Leaving a session runs none of its calls again: an input deleted inside it stays
+    deleted."""
+    from dew.telemetry.profile import Profiler, program_kernels
+
+    def squared(a):
+        return a @ a
+    x = jnp.ones((1024, 1024))
+    matmul = jax.jit(squared)
+    used = jnp.ones((1024, 1024))
+    with pytest.raises(ZeroDivisionError), device_time() as device:
+        kernels = device.kernels(matmul, used)
+        assert kernels and all(kernel.milliseconds > 0 for kernel in kernels)
+        assert device.seconds(matmul, used) > 0
+        used.delete()
+        raise ZeroDivisionError
+    with device_time() as device:
+        with pytest.raises(ValueError):
+            device.kernels(lambda: None)
+        flush = jax.jit(lambda evictor: evictor + 1.0)
+        evicting = {kernel.name for kernel in device.kernels(flush, x)}
+        behind = device.kernels(matmul, x, before=flush, before_args=(x,))
+        assert behind and not evicting & {kernel.name for kernel in behind}
+    profiler = Profiler(tmp_path)
+    with profiler, device_time() as device:
+        jax.block_until_ready(matmul(x))
+        with pytest.raises(CuptiHeld):
+            device.kernels(matmul, x)
+    assert program_kernels(profiler.captures[-1], ["squared"])["squared"]

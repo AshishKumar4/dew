@@ -113,16 +113,29 @@ def test_an_objective_imitating_the_label_reads_it_in_the_imitation_alone():
         np.testing.assert_array_equal(metrics(taken, windows)[name], same[name])
 
 
+def prefill(params, observed, key, memory):
+    """A Dreamer rollout's prefill policy over a driven step (`DreamerRollout`): each action uniform in
+    [-1, 1]."""
+    return jax.random.uniform(key, (observed["reward"].shape[0], 1), minval=-1, maxval=1), {}, memory
+
+
+def driven_pilot(params, observed, key, memory):
+    """`pilot` reading the observation a driven step holds, as a rollout's teacher reads it."""
+    return pilot(params, observed["observation"], key, memory)
+
+
 def test_an_agent_trained_to_imitate_labels_learns_the_labels_not_the_actions_taken():
     """An agent pretrained on targets whose steps took uniformly random actions, each labelled with a pilot's,
     imitating the labels gives the pilot's actions more likelihood than it did, and more than it gives the
-    actions taken."""
-    env = Batched(TimeLimit(Target(), episode_length=20), 8)
-    seeding = DreamerRollout(DreamerV3Objective(tiny()), env, capacity=400, batch=8, length=16,
-                             train_ratio=8.0, prefill=200, teacher=Teacher(pilot, {"gain": jnp.asarray(1.0)}))
-    dreamer_fit(None, seeding.objective, seeding, 1)
-    replay = seeding.held_replay
-    assert isinstance(replay, ReplayBuffer)
+    actions taken. The replay is a labelled prefill's, 200 steps of 8 walks written as a Dreamer rollout
+    writes them (its policy labelled by its teacher, `labelled`, over `Driven` steps), flown as one scan
+    rather than through a rollout's first update, which nothing here reads."""
+    env = Driven(Batched(TimeLimit(Target(), episode_length=20), 8))
+    policy = labelled(prefill, driven_pilot)
+    _, flown = jax.jit(lambda params: env_rollout(env, policy, params, start(env, jax.random.key(1)), 200,
+                                                  reset=False))(paired({}, {"gain": jnp.asarray(1.0)}))
+    steps = {**flown.observation, "action": flown.action, LABEL: flown.extras[LABEL]}
+    replay = ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], steps), 400).add(steps)
     objective = DreamerV3Objective(tiny(), scales={"policy": 0.0, "value": 0.0, "replay_value": 0.0},
                                    imitation=1.0, imitates=LABEL)
     initial, final, windows = pretrained_on(objective, replay)
