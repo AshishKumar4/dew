@@ -51,7 +51,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     guarded_columns,
     guarded_tiles,
 )
-from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations
+from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, stores_typed
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     Tiles,
@@ -1110,7 +1110,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             # The fused launch reduces across no warps, its statistics and D its operands and its sums its
             # products' (an A100's at 64 x 64 reserves no reduction scratch, its lowering's 114,688 bytes the
             # model's without it, et-fused80).
-            launches = [(family, config, allocations(family, config, width, dtype, q_stages),
+            # The fused launch's dK and dV in the operands' dtype where it stores them so (`stores_typed`).
+            typed = {} if config.shared_keys else {"typed": stores_typed(
+                family, config, width, dtype, q_stages, grouped=query.shape[2] != key.shape[2])}
+            launches = [(family, config, allocations(family, config, width, dtype, q_stages, **typed),
                          config.shared_keys)]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
