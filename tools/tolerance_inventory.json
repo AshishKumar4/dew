@@ -434,7 +434,7 @@
    "lane": "Training"
   },
   "tests/test_mimo_audio.py": {
-   "comparisons": 5,
+   "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
   "tests/test_mimo_v2.py": {
