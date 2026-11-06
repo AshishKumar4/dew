@@ -624,30 +624,54 @@ class _Observed:
         return row
 
 
-@pytest.mark.parametrize("read", ["streamed", "indexed"])
-@pytest.mark.parametrize("workers", [2, "auto"])
-def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers, read):
-    """A store read through Dew's mirror by loading workers: each worker opens its shards through its own
-    process's mirror, and the run's statistics count every one of those opens beside the reading
-    process's own (row 4339), each worker's counters carried by the position it hands the reader."""
+COUNTED = ("data/mirror/hits", "data/mirror/misses", "data/mirror/downloaded_bytes")
+"""The mirror counters a run's statistics hold to the processes' own, each counted exactly."""
+
+
+def _mirrored_store(tmp_path):
+    """Forty records in twenty ArrayRecord shards, read through a fresh Dew mirror, each row's process's
+    counters observed (`_Observed`) in `tmp_path / "observed"`."""
     import numpy as np
 
-    from dew.data import Loading, Memory
-    from dew.data.compile import compile
-    from dew.data.dataset import DataPartition
+    from dew.data import Memory
     from dew.data.pipeline import Pipeline
     from dew.data.sinks import export
-    from dew.data.storage import mirror_metrics
 
     root = tmp_path / "records"
     export(Memory([{"id": np.int64(index)} for index in range(40)]), str(root), format="array_record",
            rows_per_shard=2)
-    observed = tmp_path / "observed"
-    observed.mkdir()
     # An ArrayRecord shard's physical size is far past its two small records: room for every reader's pin.
     source = Files(f"dewcache::file://{root}", storage_options={
         "dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 64 << 20}})
-    loader = compile(Pipeline(source).map(_Observed(observed)).repeat(1).batch(1), read=read,
+    return Pipeline(source).map(_Observed(tmp_path / "observed"))
+
+
+def _workers_counters(observed) -> dict[str, float]:
+    """The mirror counters every loading worker last observed, summed over the workers."""
+    summed = dict.fromkeys(COUNTED, 0.0)
+    for path in observed.glob("*.json"):
+        if path.stem != str(os.getpid()):
+            for name in COUNTED:
+                summed[name] += json.loads(path.read_text()).get(name, 0.0)
+    return summed
+
+
+@pytest.mark.parametrize("elastic", [False, True])
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+@pytest.mark.parametrize("workers", [2, "auto"])
+def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers, read, elastic):
+    """A store read through Dew's mirror by loading workers, per share or elastically: each worker opens its
+    shards through its own process's mirror, and the run's statistics count each of those opens and their
+    bytes beside the reading process's own (row 4339), each worker's counters carried by the position it
+    hands the reader."""
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.storage import mirror_metrics
+
+    (tmp_path / "observed").mkdir()
+    chain = _mirrored_store(tmp_path).repeat(1).batch(1)
+    loader = compile(chain.elastic() if elastic else chain, read=read,
                      loading=Loading(workers=workers, max_workers=2, threads=1, read_buffer=1,
                                      worker_buffer=1, cache=False))
     reader = loader.train(DataPartition())
@@ -656,10 +680,44 @@ def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers
         statistics = dict(loader.statistics())
     finally:
         reader.close()
-    opens = [counts.get("data/mirror/hits", 0) + counts.get("data/mirror/misses", 0)
-             for counts in (json.loads(path.read_text()) for path in observed.glob("*.json")
-                            if path.stem != str(os.getpid()))]
-    assert sum(opens) > 0
+    workers_did = _workers_counters(tmp_path / "observed")
+    assert workers_did["data/mirror/misses"] > 0
     own = mirror_metrics()
-    assert statistics["data/mirror/hits"] + statistics["data/mirror/misses"] == (
-        own["data/mirror/hits"] + own["data/mirror/misses"] + sum(opens))
+    assert {name: statistics[name] for name in COUNTED} == {name: own[name] + workers_did[name]
+                                                            for name in COUNTED}
+
+
+def test_a_reader_restored_mid_read_counts_its_own_workers_mirror_reads_alone(tmp_path):
+    """A read restored from a position saved mid-read counts what its own workers' mirrors do, not what
+    the saving read's workers did, which the position carries (row 4339)."""
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.storage import mirror_metrics
+
+    (tmp_path / "observed").mkdir()
+    chain = _mirrored_store(tmp_path).repeat(1).batch(1)
+    loading = Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1, cache=False)
+    # The observing step names no identity, so the read resumes where it left off without proving it.
+    first = compile(chain, read="streamed", loading=loading, resume="non-exact").train(DataPartition())
+    try:
+        # One row left, which one worker reads: the other is spent, and Grain keeps the position the
+        # restore handed it.
+        for _ in range(39):
+            next(first)
+        saved = first.get_state()
+    finally:
+        first.close()
+    for path in (tmp_path / "observed").glob("*.json"):
+        path.unlink()
+    loader = compile(chain, read="streamed", loading=loading, resume="non-exact")
+    reader = loader.train(DataPartition())
+    try:
+        reader.set_state(saved)
+        assert len(list(reader)) == 1
+        statistics = dict(loader.statistics())
+    finally:
+        reader.close()
+    own, workers_did = mirror_metrics(), _workers_counters(tmp_path / "observed")
+    assert {name: statistics[name] for name in COUNTED} == {name: own[name] + workers_did[name]
+                                                            for name in COUNTED}
