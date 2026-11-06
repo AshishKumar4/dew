@@ -50,6 +50,9 @@ def _ouro_window(hf_config: Mapping[str, object], used: set[str], record: Decode
     windowed = {**hf_config, 'sliding_window': hf_config.get('sliding_window')
                 if hf_config.get('use_sliding_window') else None}
     record['layer_types'] = native_layer_types(windowed, used, 'qwen2')
+    if windowed['sliding_window'] is None and 'sliding_attention' in record['layer_types']:
+        refuse("layer_types with sliding attention",
+               "use_sliding_window is not set, so the window has no size")
     return record
 
 
