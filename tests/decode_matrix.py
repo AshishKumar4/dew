@@ -28,16 +28,17 @@ from dew.nn.kv_cache import PAGED, KVCache, KVStore, PagedCase
 ROWS, CAPACITY, PAGE = 4, 512, 16
 LENGTHS = (1, 63, 300, 512)
 """A step's rows, each over its own keys of a cache `CAPACITY` slots a row: one key, part of a page, part of
-several, every slot; a paged pool's pages `PAGE` slots each, which both paged kernels read (the Pallas kernel's
-pages at most its `BLOCK`, the template's several to a key tile)."""
+several, every slot; a paged pool's pages `PAGE` slots each, which both paged kernels read (the Pallas
+kernel's pages at most its `BLOCK`, the template's several to a key tile)."""
 
 CHOICES = frozenset({"decode", "paged_decode", "attention_mainloop"})
 """The kernel choices (`generation.CHOICES`) its cells run: a dense cache's step's selector and a paged
 pool's, and the template's mainloop where a cell names the template's decode."""
-KERNELS = {"decode": frozenset({"decode", "cudnn", "template"}), "paged_decode": frozenset({"triton", "template"})}
-"""The kernels its cells run under test, each named by its choice (`generation.chosen`, the `kernel` axis): the
-decode selector's hand kernel, cuDNN's and the attention template's decode; the paged selector's Pallas kernel
-and the template's decode over the pages."""
+KERNELS = {"decode": frozenset({"decode", "cudnn", "template"}),
+           "paged_decode": frozenset({"triton", "template"})}
+"""The kernels its cells run under test, each named by its choice (`generation.chosen`, the `kernel` axis):
+the decode selector's hand kernel, cuDNN's and the attention template's decode; the paged selector's Pallas
+kernel and the template's decode over the pages."""
 
 
 def _choice(case: dict[str, str]) -> str:

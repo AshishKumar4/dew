@@ -1,6 +1,6 @@
 """The GEMM template's product of an NVFP4 matrix (`gemm.nvfp4_product`, row 3621): its weights' E2M1 codes
-and E4M3 block scales decoded exactly (`bits.nvfp4_decoded`), the deferred factor applied to the fp32
-accumulator before the one rounding."""
+and E4M3 block scales decoded exactly (`NvFp4.decoded`, its codes in the staged order a stage decodes), the
+deferred factor applied to the fp32 accumulator before the one rounding."""
 
 import jax
 import jax.numpy as jnp
@@ -16,20 +16,32 @@ E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
 def nvfp4(seed: int, depth: int, width: int, *, scale: float = 0.25) -> tuple[gemm.NvFp4, np.ndarray]:
-    """An NVFP4 matrix of random codes under power-of-two block scales (each value exact in float64), and its
-    values: code times block scale times the tensor's `scale`."""
+    """An NVFP4 matrix of random codes under power-of-two block scales (`gemm.NvFp4.of`, each value exact in
+    float64), and its values: code times block scale times the tensor's `scale`."""
     rng = np.random.default_rng(seed)
     codes = rng.integers(0, 16, size=(depth, width))
-    exponents = rng.integers(-3, 4, size=(depth // 16, width))
-    block = np.exp2(exponents).astype(np.float32)
-    packed = codes.reshape(depth // 8, 8, width).astype(np.uint64) << (
-        4 * np.arange(8, dtype=np.uint64))[None, :, None]
-    natural = jnp.asarray(packed.sum(axis=1).astype(np.uint32))
-    matrix = gemm.NvFp4(bits.NVFP4_BFLOAT16_FORM.prepared(natural), jnp.asarray(block, jnp.float8_e4m3fn),
-                        jnp.float32(scale))
-    values = (np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
-              * np.repeat(block.astype(np.float64), 16, axis=0) * scale)
-    return matrix, values
+    magnitudes = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
+    block = np.exp2(rng.integers(-3, 4, size=(depth // 16, width))).astype(np.float32)
+    matrix = gemm.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), jnp.asarray(block, jnp.float8_e4m3fn), scale)
+    return matrix, magnitudes * np.repeat(block.astype(np.float64), 16, axis=0) * scale
+
+
+def test_an_nvfp4_matrix_holds_its_codes_and_the_staged_order_reads_back():
+    """A matrix quantized from fp32 (`gemm.NvFp4.quantized`) holds `bits.nvfp4_quantized`'s codes and scales:
+    its codes read back in the depths' own order (`NvFp4.codes`) are the quantizer's natural words' codes,
+    its scales the quantizer's; and its words are K-major, in the staged order (`gemm.staged_rows`, within
+    each 128 depths word w holding depths w + 16j), not the natural one's."""
+    x = jnp.asarray(np.random.default_rng(5).standard_normal((256, 64)), jnp.float32)
+    matrix = gemm.NvFp4.quantized(x)
+    words, scales, scale = bits.nvfp4_quantized(x)
+    natural = bits.nvfp4_decoded(words, jnp.full(scales.shape, bits.NVFP4_OWED, jnp.float8_e4m3fn))
+    np.testing.assert_array_equal(np.asarray(matrix.codes()), np.asarray(natural, np.float32))
+    np.testing.assert_array_equal(np.asarray(matrix.scales.T, np.float32), np.asarray(scales, np.float32))
+    assert float(matrix.scale) == float(scale)
+    assert matrix.words.shape == (64, 256 // 8)
+    assert not np.array_equal(np.asarray(matrix.words.T), np.asarray(words))
+    order = gemm.staged_rows(256)
+    assert sorted(order) == list(range(256)) and order[8 * 3 + 5] == 16 * 5 + 3 and order[128] == 128
 
 
 def test_an_nvfp4_product_is_its_decoded_products_times_the_deferred_factor():
@@ -39,8 +51,7 @@ def test_an_nvfp4_product_is_its_decoded_products_times_the_deferred_factor():
     matrix, values = nvfp4(0, 256, 192)
     rows = jnp.asarray(np.random.default_rng(1).integers(-3, 4, size=(64, 256)), jnp.bfloat16)
     got = jax.jit(lambda x, m: gemm.nvfp4_product(x, m, out_dtype=jnp.float32))(rows, matrix)
-    decoded = bits.nvfp4_decoded(matrix.words, matrix.scales)
-    written = jnp.dot(rows, decoded, preferred_element_type=jnp.float32) * matrix.factor
+    written = jnp.dot(rows, matrix.decoded(), preferred_element_type=jnp.float32) * matrix.factor
     np.testing.assert_array_equal(np.asarray(got), np.asarray(written))
     np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
 
