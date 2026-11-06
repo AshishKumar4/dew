@@ -1920,6 +1920,28 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         self.published()
         return buffer
 
+    def converted(self, codes, into, interpret: bool, *, row_scale: jax.Array | None = None) -> Ref:
+        """A stage of quantized codes (`codes`, int8 or an FP8 in shared memory, `[rows, depth]`, a consumer's
+        rows) as the tile a product reads (`into`, a shared tile of its 16-bit dtype): each code cast
+        exactly, each row scaled by `row_scale` (fp32 `[rows]` in registers, a per-token scale) in fp32
+        before its one rounding, written and published as `staged` writes a register operand."""
+        if interpret:
+            value = codes[...].astype(jnp.float32)
+            if row_scale is not None:
+                value = value * row_scale[:, None]
+        else:
+            # Read in the accumulator's layout, whose rows a row vector broadcasts along (`as_row`); an 8-bit
+            # stage takes no ldmatrix.
+            value = plgpu.load(codes, layout=self.layout, optimized=False).astype(jnp.float32)
+            if row_scale is not None:
+                value = value * self.as_row(row_scale)[:, None]
+        if interpret:
+            into[...] = value.astype(into.dtype)
+            return into
+        plgpu.store(into, value.astype(into.dtype), optimized=False)
+        self.published()
+        return into
+
     def programs(self, consumers: int, registers: int | None = None) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
         consumer roles holding `registers` (None: the family's budget, `registers`): at warpgroup MMA's
@@ -2226,7 +2248,10 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # CAS. Interpreted, the partials are left before they are read (`tail.ordered`).
         @pl.when(start > 0)
         def _():
-            jax.tree.map(lambda leaf, ref: ref.__setitem__(program, leaf), summed, partials)
+            # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
+            # 64 bytes), which an optimized global transfer refuses.
+            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed,
+                         partials)
             if ready is not None:
                 plgpu.semaphore_signal(ready.at[program], memory_scope="gpu")
 
@@ -2236,7 +2261,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 if ready is not None:
                     plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
                 # The partials' structure read off the running value's: a ref may itself be a tree.
-                return combine(running, jax.tree.map(lambda _, ref: ref[other], running, partials))
+                return combine(running, jax.tree.map(
+                    lambda _, ref: plgpu.load(ref.at[other], optimized=False), running, partials))
 
             store(lax.fori_loop(program + 1, gathered, added, summed))
 
