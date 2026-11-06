@@ -119,7 +119,7 @@ class Plan:
 
 def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
          scale: float | None, target: generation.GpuTarget, table: jax.Array | None = None,
-         sources: jax.Array | None = None) -> Plan | None:
+         sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None) -> Plan | None:
     """The work list of a packed call (`packed`) under its `hooks` (its initial state among them) on `target`:
     the forward's derived config at the key tile its memory-bound walk streams at least
     (`MosaicForward.streaming`) and its slices; None where no launch of it derives.
@@ -132,7 +132,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     slices in the last one's program, the initial state with them (`MosaicForward.merges`); elsewhere each
     slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config derived for them."""
     found = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
-                      sources=sources, out_dtype=None)
+                      sources=sources, out_dtype=None, scales=scales)
     if found is None:
         return None
     config, op, ba = found
@@ -144,7 +144,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     if not bundle_of(config, query.dtype).fixes_up:
         walked = None if hooks is None else dataclasses.replace(hooks, initial=None)
         found = _streamed(query, key, value, spans, walked, scale=scale, target=target, table=table,
-                          sources=sources, out_dtype=jnp.float32)
+                          sources=sources, out_dtype=jnp.float32, scales=scales)
         if found is None:
             return Plan(config, 1, merges=False)
         config, op, ba = found
@@ -157,13 +157,13 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
-              target: generation.GpuTarget, table, sources, out_dtype):
+              target: generation.GpuTarget, table, sources, out_dtype, scales=None):
     """The forward's derived config for a packed call writing `out_dtype` (the query's where None) at the
     key tile its walk streams at (`MosaicForward.streaming`), with its op and bound arguments; None where
     none derives."""
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=out_dtype, masked=True, table=table,
-                                              sources=sources, subtracted=True)
+                                              sources=sources, subtracted=True, scales=scales)
     ba = op.bind(*args, residuals=Kept.OUTPUT if out_dtype is not None else Kept.NONE, interpret=False)
     config = op.derived(ba, target)
     # A decode step's few rows a key head stream its keys (`MosaicForward.streaming`).
@@ -183,7 +183,8 @@ def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | Non
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
-           sources: jax.Array | None = None) -> jax.Array:
+           sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None
+           ) -> jax.Array:
     """A decode step's attention through the template: `query` `[B, T, H, D]` over `key` `[B, K, KV, D]` and
     `value` `[B, K, KV, Dv]` (`[R, K, KV, D]` with `sources`, batch row `b` reading key row `sources[b]`;
     or a paged cache's pools `[KV, P, page, D]` and their page table, `table`: each
@@ -193,7 +194,10 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     `splits`), the slices merged with the initial state in the launch where its family waits across programs
     (`merges`), else in XLA from their fp32 states (`algebra.merged_slices`), and unpacked. Its logits folded
     where the algebra folds them, the rows the fold's reach or the headroom guard rewalks walked again
-    natural over those rows alone, with no branch read on the host (`MosaicForward.masked`, row 1978)."""
+    natural over those rows alone, with no branch read on the host (`MosaicForward.masked`, row 1978). A
+    quantized cache's keys and values are its codes (int8 or an FP8) and `scales` their keys' and values'
+    `[B, KV, K]` fp32 in each row's key order (a dense cache's head-major scales, a paged pool's gathered by
+    its table), dequantized in the walk (`attention_mosaic.forward`'s `scales`, ledger 3624)."""
     hooks = Hooks() if hooks is None else hooks
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
@@ -202,11 +206,12 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
     whole = dataclasses.replace(hooks, initial=initial)
     target = generation.gpu_target()
-    work = plan(rows, key, value, row_spans, whole, scale=scale, target=target, table=table, sources=sources)
+    work = plan(rows, key, value, row_spans, whole, scale=scale, target=target, table=table, sources=sources,
+                scales=scales)
     if work is None:
         raise NotImplementedError(f"the template's decode derives no config on {target}")
     form = {"scale": scale, "natural": False, "interpret": interpret, "masked": True, "table": table,
-            "sources": sources, "subtracted": True}
+            "sources": sources, "subtracted": True, "scales": scales}
     if work.slices == 1 or work.merges:
         # A row's walk, or its slices merged in the launch, from the initial state, finished in the query's
         # dtype, no merge past it (its fp32 rows and their merge took 45 of B128's 820 us at 4096 keys,
