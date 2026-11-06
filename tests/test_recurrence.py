@@ -246,8 +246,9 @@ def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
     state stays zero and the output is zero, in the launch and in its XLA form; and a one-tap conv's
     moved history is empty in both, its step the same as an unconvolved one's on the scaled token."""
     hooks = recurrence.Hooks(decay='none', delta=False, write_gate=True)
-    ones = jnp.ones((2, 1, 16))
-    given = recurrence.Step(jnp.zeros((2, 1, 16, 16)), query=ones, key=ones, value=ones,
+    # A warpgroup's keys, as the launch steps them (`templates.recurrence.step.fits`).
+    ones = jnp.ones((2, 1, 128))
+    given = recurrence.Step(jnp.zeros((2, 1, 128, 128)), query=ones, key=ones, value=ones,
                             beta=jnp.zeros((2, 1)))
     for step in (recurrence.step, recurrence.step_reference):
         out, _, state = step(hooks, given)
