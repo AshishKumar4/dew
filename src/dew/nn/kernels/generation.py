@@ -79,10 +79,10 @@ def _facts(value: Hashable | Mapping | list) -> Hashable:
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode', 'delta_gates', 'gate_up',
-                     'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'low_rank',
-                     'narrow_copies', 'nvfp4', 'paged_decode', 'rms_norm', 'selective_scan', 'short_conv',
-                     'ssd', 'swiglu'})
+CHOICES = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode',
+                     'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
+                     'grouped_matmul', 'low_rank', 'narrow_copies', 'nvfp4', 'paged_decode', 'rms_norm',
+                     'selective_scan', 'short_conv', 'ssd', 'swiglu'})
 """The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`): every one a
 selector serves (`selection.Op`, which refuses a choice this does not hold as it is built) or a site reads
 (`chosen_kernel`, likewise)."""

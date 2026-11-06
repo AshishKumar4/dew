@@ -31,6 +31,13 @@ memory, latent attention's index keys) reads a prefix with the state its
 prompt left at the prefix's end as well, which `States` names as vLLM's
 hybrid prefix caching does: a row reuses pages only as deep as a state is
 held, and starts from that state.
+
+A request may declare a segment its prompt shares with others that need not
+end at a page's end (`shared`: a decision's encoded state, each question past
+it its own request). The page the segment ends inside is named by its tokens
+up to the segment's end (`segment_hash`), and a prompt that shares the segment
+takes a fresh page that page is copied into before its prefill (`Transfers`'
+copies), its own tokens written past the segment's: copy on write.
 """
 
 from __future__ import annotations
@@ -52,6 +59,15 @@ def prefix_hashes(tokens: np.ndarray, page_size: int, pages: int, salt: bytes = 
         previous = hashlib.blake2b(previous + block.tobytes(), digest_size=16).digest()
         hashes.append(previous)
     return hashes
+
+
+def segment_hash(tokens: np.ndarray, page_size: int, shared: int, salt: bytes = b"") -> bytes:
+    """The hash of the page a declared shared segment of `shared` tokens ends inside: the chain after its
+    full pages (`prefix_hashes`), then its tokens in that page, apart from any full page's hash."""
+    full = shared // page_size
+    previous = prefix_hashes(tokens, page_size, full, salt)[-1] if full else salt
+    block = np.ascontiguousarray(tokens[full * page_size:shared], np.int64)
+    return hashlib.blake2b(b"segment" + previous + block.tobytes(), digest_size=16).digest()
 
 
 class States:
@@ -96,11 +112,14 @@ class States:
 @dataclass
 class Transfers:
     """The page copies a step owes before its program runs: `spills`, (device page, host slot) pairs whose
-    device page is reclaimed and goes to the host first, then `uploads`, (host slot, device page) pairs a
-    seated prompt reads back from the host into a fresh device page."""
+    device page is reclaimed and goes to the host first; `uploads`, (host slot, device page) pairs a
+    seated prompt reads back from the host into a fresh device page; then `copies`, (device page, device
+    page) pairs, a shared segment's page, resident or just uploaded, into the fresh page a prompt that
+    shares it writes past the segment."""
 
     spills: list[tuple[int, int]] = field(default_factory=list)
     uploads: list[tuple[int, int]] = field(default_factory=list)
+    copies: list[tuple[int, int]] = field(default_factory=list)
 
 
 class Pages:
@@ -132,6 +151,11 @@ class Pages:
         one's digest is `_hash_of`'s."""
         self._by_hash: dict[bytes, int] = {}
         self._hash_of: dict[int, bytes] = {}
+        self._segments: dict[int, bytes] = {}
+        """The pages a shared segment ends inside (`segment_hash`) that a full page's hash names too
+        (`_hash_of`), by that segment's hash, which goes with the page when it is reclaimed."""
+        self._copying: list[int] = []
+        """Segment pages an owed copy still reads (`Transfers.copies`), held until the copies are made."""
         self._writing: Counter[bytes] = Counter()
         """The prefix hashes of full prompt pages rows hold and have not yet published: a prompt that
         shares one waits for it (`waits`), so it reads those keys where it would write them again."""
@@ -141,77 +165,119 @@ class Pages:
         """Pages a new request can take: free ones and cached ones no row holds."""
         return len(self._free) + len(self._cached)
 
-    def shared(self, prompt: np.ndarray, salt: bytes = b"") -> list[int]:
+    def shared(self, prompt: np.ndarray, salt: bytes = b"", segment: int | None = None) -> list[int]:
         """The cached pages that hold `prompt`'s leading full pages under `salt`, in order, as deep as a
-        state after the last of them is held where the pool's rows keep states (`States`).
+        state after the last of them is held where the pool's rows keep states (`States`); or its
+        declared shared `segment`'s full pages and the page it ends inside, where that is deeper.
 
         The last prompt token is never covered, since its logits score the
         first draw and have to be computed.
         """
-        return self._matched(prompt, salt)[0]
+        return self._matched(prompt, salt, segment)[0]
 
-    def _matched(self, prompt: np.ndarray, salt: bytes) -> tuple[list[int], bytes | None]:
-        """`shared`'s pages and the digest of the last of them, None for none: a page on the device as
-        its index, one in a host slot as the slot's index, negated past one (`-1 - slot`)."""
+    def _located(self, digest: bytes) -> int | None:
+        """The page `digest` names: on the device its index, in a host slot the slot's index negated past
+        one (`-1 - slot`); None for none."""
+        page = self._by_hash.get(digest)
+        if page is None and digest in self._on_host:
+            page = -1 - self._on_host[digest]
+        return page
+
+    def _matched(self, prompt: np.ndarray, salt: bytes,
+                 segment: int | None = None) -> tuple[list[int], bytes | None, int]:
+        """`shared`'s pages, the digest of the last of them (None for none) and the prompt tokens they
+        hold; a segment's last page holds fewer than a page's (`segment_hash`)."""
         pages: list[int] = []
         depth, last = 0, None
-        if self.prefix_cache:
-            for digest in prefix_hashes(prompt, self.size, (len(prompt) - 1) // self.size, salt):
-                page = self._by_hash.get(digest)
-                if page is None and digest in self._on_host:
-                    page = -1 - self._on_host[digest]
-                if page is None:
-                    break
-                pages.append(page)
-                if self.states is None or digest in self.states:
-                    depth, last = len(pages), digest
-        return pages[:depth], last
+        if not self.prefix_cache:
+            return [], None, 0
+        for digest in prefix_hashes(prompt, self.size, (len(prompt) - 1) // self.size, salt):
+            page = self._located(digest)
+            if page is None:
+                break
+            pages.append(page)
+            if self.states is None or digest in self.states:
+                depth, last = len(pages), digest
+        if segment is not None and segment % self.size and len(pages) >= segment // self.size \
+                and segment > depth * self.size:
+            digest = segment_hash(prompt, self.size, segment, salt)
+            page = self._located(digest)
+            if page is not None and (self.states is None or digest in self.states):
+                return [*pages[:segment // self.size], page], digest, segment
+        return pages[:depth], last, depth * self.size
 
-    def waits(self, prompt: np.ndarray, salt: bytes = b"") -> bool:
+    def waits(self, prompt: np.ndarray, salt: bytes = b"", segment: int | None = None) -> bool:
         """Whether `prompt`, under `salt`, shares its next full page past those cached with a row that is
-        writing it now, so it reads that page once the row publishes it (`publish`) instead of writing
-        its keys a second time: as vLLM's prefix caching shares a running prompt's blocks, the samples of
-        one prompt prefill once."""
+        writing it now, or the page its declared shared `segment` ends inside, so it reads that page once
+        the row publishes it (`publish`) instead of writing its keys a second time: as vLLM's prefix
+        caching shares a running prompt's blocks, the samples of one prompt, and the questions of one
+        segment, prefill it once."""
         if not self.prefix_cache:
             return False
         pages = (len(prompt) - 1) // self.size
-        shared = len(self._matched(prompt, salt)[0])
-        return shared < pages and prefix_hashes(prompt, self.size, shared + 1, salt)[-1] in self._writing
+        held = self._matched(prompt, salt, segment)[2]
+        shared = held // self.size
+        if segment is not None and segment % self.size and held < segment \
+                and segment_hash(prompt, self.size, segment, salt) in self._writing:
+            return True
+        return (held % self.size == 0 and shared < pages
+                and prefix_hashes(prompt, self.size, shared + 1, salt)[-1] in self._writing)
 
-    def reserve(self, prompt: np.ndarray, total: int,
-                salt: bytes = b"") -> tuple[list[int], int, int | None, tuple[bytes, ...]] | None:
-        """Pages for a row that will hold `total` tokens of which `prompt`, under `salt`, comes first.
+    def reserve(self, prompt: np.ndarray, total: int, salt: bytes = b"",
+                segment: int | None = None) -> tuple[list[int], int, int | None, tuple[bytes, ...]] | None:
+        """Pages for a row that will hold `total` tokens of which `prompt`, under `salt`, comes first, its
+        first `segment` tokens a declared shared segment where given.
 
         Returns the row's pages, how many leading prompt tokens they
         already hold, the `States` entry holding the state the row starts
         from after them (None where it starts afresh), and the hashes of the
-        full prompt pages it writes that no page names yet, which other
-        prompts wait for (`waits`) until it publishes them or gives its pages
-        back (`written`); or None when the pool cannot cover the row; then
-        nothing changes.
+        full prompt pages it writes that no page names yet, and of its
+        segment's last page, which other prompts wait for (`waits`) until it
+        publishes them or gives its pages back (`written`); or None when the
+        pool cannot cover the row; then nothing changes. A segment's last
+        page, shared, is the row's own fresh page that it is copied into
+        (`Transfers.copies`) or read back into from the host.
         """
         needed = -(-total // self.size)
-        shared, last = self._matched(prompt, salt)
-        resident = [page for page in shared if page >= 0]
-        reclaimable = len(self._free) + sum(page not in resident for page in self._cached)
+        shared, last, held = self._matched(prompt, salt, segment)
+        whole = shared[:held // self.size]
+        source = shared[-1] if held % self.size else None
+        resident = [page for page in whole if page >= 0]
+        reclaimable = len(self._free) + sum(page not in resident and page != source for page in self._cached)
         if needed - len(resident) > reclaimable:
             return None
         for page in resident:
             self._hold(page)
+        if source is not None and source >= 0:
+            # Held until the copy out of it is made, so no reclaim the fresh pages cause takes it first.
+            self._hold(source)
+            self._copying.append(source)
         entry = None if self.states is None or last is None else self.states.entry(last)
         hashes = prefix_hashes(prompt, self.size, len(prompt) // self.size, salt) if self.prefix_cache else []
         # A page on the host comes back into a fresh device page, named by its hash there again; every
         # host copy the row reads leaves the host's ledger first, so no spill the fresh pages cause evicts it.
-        landing = {index: (-1 - page, hashes[index]) for index, page in enumerate(shared) if page < 0}
+        landing = {index: (-1 - page, hashes[index]) for index, page in enumerate(whole) if page < 0}
+        if source is not None and source < 0:
+            landing[len(whole)] = (-1 - source, segment_hash(prompt, self.size, held, salt))
         for slot, digest in landing.values():
             del self._on_host[digest]
             self._reading.append(slot)
         pages = [page if index not in landing else self._uploaded(*landing[index])
-                 for index, page in enumerate(shared)]
-        writing = tuple(digest for digest in hashes[len(shared):] if digest not in self._by_hash)
+                 for index, page in enumerate(whole)]
+        if source is not None:
+            pages.append(self._uploaded(*landing[len(whole)]) if source < 0 else self._copied(source))
+        writing = tuple(digest for digest in hashes[len(whole):] if digest not in self._by_hash)
+        if self.prefix_cache and segment is not None and segment % self.size and held < segment:
+            named = segment_hash(prompt, self.size, segment, salt)
+            writing += () if named in self._by_hash else (named,)
         self._writing.update(writing)
-        return (pages + [self._take() for _ in range(needed - len(shared))], len(shared) * self.size,
-                entry, writing)
+        return pages + [self._take() for _ in range(needed - len(pages))], held, entry, writing
+
+    def _copied(self, source: int) -> int:
+        """A fresh device page that a shared segment's last page `source` is copied into, held."""
+        page = self._take()
+        self.transfers.copies.append((source, page))
+        return page
 
     def _uploaded(self, slot: int, digest: bytes) -> int:
         """A fresh device page that host `slot`'s copy of `digest`'s page is read back into, held."""
@@ -229,6 +295,8 @@ class Pages:
         self._host_free.extend(self._reading)
         self._reading = []
         self._landing.clear()
+        copying, self._copying = self._copying, []
+        self.release(copying)
         return owed
 
     def written(self, writing: Sequence[bytes]) -> None:
@@ -237,8 +305,10 @@ class Pages:
         self._writing.subtract(writing)
         self._writing = +self._writing
 
-    def publish(self, prompt: np.ndarray, pages: Sequence[int], salt: bytes = b"") -> None:
-        """Name the row's full prompt pages by their prefix hash under `salt`, once their keys are written."""
+    def publish(self, prompt: np.ndarray, pages: Sequence[int], salt: bytes = b"",
+                segment: int | None = None) -> None:
+        """Name the row's full prompt pages by their prefix hash under `salt`, and the page its declared
+        shared `segment` ends inside by the segment's (`segment_hash`), once their keys are written."""
         if not self.prefix_cache:
             return
         for digest, page in zip(prefix_hashes(prompt, self.size, len(prompt) // self.size, salt), pages,
@@ -246,6 +316,17 @@ class Pages:
             if digest not in self._by_hash and page not in self._hash_of:
                 self._by_hash[digest] = page
                 self._hash_of[page] = digest
+        if segment is None or not segment % self.size:
+            return
+        digest, page = segment_hash(prompt, self.size, segment, salt), pages[segment // self.size]
+        if digest in self._by_hash or page in self._segments:
+            return
+        self._by_hash[digest] = page
+        # A page a full page's hash names too keeps the segment's beside it.
+        if page in self._hash_of:
+            self._segments[page] = digest
+        else:
+            self._hash_of[page] = digest
 
     def release(self, pages: Sequence[int]) -> None:
         """A row gives its pages back; a page nobody holds is cached or freed.
@@ -273,6 +354,7 @@ class Pages:
         self._cached.clear()
         self._by_hash.clear()
         self._hash_of.clear()
+        self._segments.clear()
         self._host_free.extend(self._on_host.values())
         self._on_host.clear()
         self._landing.clear()
@@ -290,6 +372,12 @@ class Pages:
             page, _ = self._cached.popitem(last=False)
             digest = self._hash_of.pop(page)
             del self._by_hash[digest]
+            segment = self._segments.pop(page, None)
+            if segment is not None:
+                # A segment its page's full hash names beside goes with the page, its state with it.
+                del self._by_hash[segment]
+                if self.states is not None:
+                    self.states.drop(segment)
             landing = self._landing.pop(page, None)
             if landing is not None:
                 # Its upload has not run: the host slot keeps the page as it was.
