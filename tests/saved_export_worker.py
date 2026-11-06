@@ -143,7 +143,8 @@ def resident_growth(into: list[int]) -> Iterator[None]:
     if memray_path is not None:
         reader = memray.FileReader(memray_path)
         record["native_peak"] = [(allocation.size, allocation.n_allocations,
-                                  list(allocation.hybrid_stack_trace())[:10])
+                                  [(frame[0][:160], frame[1], frame[2])
+                                   for frame in list(allocation.hybrid_stack_trace())[:8]])
                                  for allocation in sorted(reader.get_high_watermark_allocation_records(),
                                                           key=lambda allocation: allocation.size,
                                                           reverse=True)[:6]]
