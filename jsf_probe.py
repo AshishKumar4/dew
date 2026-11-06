@@ -9,6 +9,8 @@ from dew.nn.kernels.templates.recurrence import mainloop as ML
 from dew.nn.kernels import generation
 
 kw, vw, heads, length, form, seed, mode = sys.argv[1:]
+direct = mode.startswith('direct-')
+mode = mode.removeprefix('direct-')
 kw, vw, heads, length, seed = map(int, (kw, vw, heads, length, seed))
 T.KEY_WIDTH, T.VALUE_WIDTH = kw, vw
 hooks = T.FORMED[0] if form == 'formed' else T.HOOKS[4]
@@ -22,16 +24,24 @@ x = D.replace(x, **{n: getattr(x, n).astype(jnp.bfloat16) for n in
 prepared = ML.prepared
 def recorded_prepared(*a, **kw):
     run = prepared(*a, **kw)
-    print('K effective', run.call.given, run.call.held, 'ranged', run.call.ranged, flush=True)
+    if not recorded_prepared.printed:
+        print('K effective', run.call.given, run.call.held, 'ranged', run.call.ranged,
+              'tiles', run.tiles, flush=True)
+        recorded_prepared.printed = True
     return run
+recorded_prepared.printed = False
 ML.prepared = recorded_prepared
 if mode == 'merge32':
     ML._merged = lambda call: ML.Operand(call.rows, 3, jnp.dtype(jnp.float32))
 if mode == 'merge2':
     ML._merged = lambda call: ML.Operand(call.rows, 2, jnp.dtype(jnp.float32))
-if mode == 'held32':
+if mode in ('held32', 'storage32'):
     plain = ML._parts
     ML._parts = lambda dtype, family, fast=False: 3
+if mode == 'storage32':
+    from dew.nn.kernels.templates import product
+    terms = product.terms
+    product.terms = lambda left, right: [(i, j) for i, j in terms(left, right) if i+j < 2]
 if mode == 'given32':
     ML._parts = lambda dtype, family, fast=False: 3
 if mode in ('given32', 'heldonly32'):
@@ -61,6 +71,20 @@ if mode.startswith('exact-'):
 def run(kernel):
     def f(x):
         return T.chunk_on(kernel, hooks, x)
+    if direct and kernel == 'mosaic_gpu':
+        from dew.nn.kernels import recurrence
+        from dew.nn.precision import l2norm
+        from dew.nn.kernels.templates import bundles
+        def memory(x):
+            q, k = (l2norm(y.astype(jnp.float32)) for y in (x.query, x.key))
+            given = recurrence.read(hooks, x, optional=('state',))
+            g, beta = recurrence.log_gates(hooks, given, jnp.float32)
+            return ML.prepared(
+                q, k, x.value, g, beta, x.state, starts=None, max_segments=None,
+                scale=kw**-0.5, delta=True, tiles=ML.Tiles(64, 1),
+                family=bundles.INTERPRETED, interpret=True, rounded=True,
+                ranged=False, states=True, keeps=True).final
+        return jax.jit(memory)(x)
     # A reverse-mode forward, which keeps the template's intermediates.
     if mode == 'accurate':
         with generation.run_precision(D.replace(generation.numerics(), forms='accurate')):

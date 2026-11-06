@@ -1,0 +1,9 @@
+16|8|2|70|formed|0|direct-base
+16|8|2|70|formed|0|direct-held32
+16|8|2|70|formed|0|direct-given32
+16|8|2|70|formed|0|direct-heldonly32
+16|8|2|70|formed|1|direct-held32
+16|8|2|70|formed|2|direct-held32
+16|8|2|70|formed|0|direct-storage32
+16|8|2|70|formed|1|direct-storage32
+16|8|2|70|formed|2|direct-storage32
