@@ -1402,9 +1402,11 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
         def kept(*x):
             _, _, (inverse, held) = mainloop.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
                                                          delta=delta, family=family, interpret=interpret)
-            return mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale, rounded=rounded,
-                                                   delta=delta, family=family, interpret=interpret,
-                                                   inverse=inverse, kept=held)
+            grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
+                                                           rounded=rounded, delta=delta, family=family,
+                                                           interpret=interpret, inverse=inverse, kept=held)
+            # The prepared run stays inside the program; the witness reads its records from `Run`.
+            return grads, saved._replace(run=None)
 
         grads, saved = jax.jit(kept)(*operands)
     for mine, theirs in zip(grads[:6], native, strict=True):
@@ -1604,7 +1606,8 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
 
     q, k, v, _, _, h0 = operands
     dtype = jnp.result_type(q, k, v)
-    run = recorded(*operands)
+    # A declared floor's factored pairs, as the forward's witness holds them (`assert_key_decays_witnessed`).
+    run = recorded(*operands, floor=FLOOR)
     rng = np.random.default_rng([2084, seed])
     do = jnp.asarray(rng.standard_normal(v.shape), dtype)
     dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
@@ -1613,7 +1616,7 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
     interpret = generation.backend() != "gpu"
 
     def route(*x):
-        return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=1.0)
+        return recurrence_chunk.chunk_gated_delta_rule(*x, floor=FLOOR, write_bound=1.0)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with tuning.seen() as launches:
@@ -1623,11 +1626,12 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
 
         def kept(*x):
             _, _, (inverse, held) = mainloop.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
-                                                         family=family, interpret=interpret)
+                                                         floor=FLOOR, family=family, interpret=interpret)
             grads, saved = mainloop_backward.kept_backward(
-                *x, do, dfinal, tiles=tiles, scale=scale, rounded=rounded, family=family, interpret=interpret,
-                inverse=inverse, kept=held)
-            return grads, saved, saved.run.scores, saved.run.keys
+                *x, do, dfinal, tiles=tiles, scale=scale, rounded=rounded, floor=FLOOR, family=family,
+                interpret=interpret, inverse=inverse, kept=held)
+            # The prepared run stays inside the program: its intra scores and gated keys leave it.
+            return grads, saved._replace(run=None), saved.run.scores, saved.run.keys
 
         grads, saved, scores, gated_keys = jax.jit(kept)(*operands)
     for mine, theirs in zip(grads[:6], native, strict=True):
