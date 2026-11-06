@@ -539,8 +539,10 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
     array) hands each layer it reads a layer at a time the run's expert kernels whole and the layer's
     index, which the grouped matmul reads in place (`dew.nn.moe.Layered`): the step's loop takes every
     expert stack as a constant, whole, and copies none of them a layer at a time (no slice of a stack's
-    shape is taken in it). Its steps decode as exactly as the plain loop's, both from the loop's own
-    float64 steps (check 1). A call keeping every collection open writes none of the kernels back."""
+    shape is taken in it); every other leaf of the bank it reads in the iteration that reads it, none
+    staged a layer ahead in the loop's carry, which a bank in host memory alone needs. Its steps decode as
+    exactly as the plain loop's, both from the loop's own float64 steps (check 1). A call keeping every
+    collection open writes none of the kernels back."""
     ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
     scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
@@ -562,6 +564,10 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
               for equation in equations(scan.params["jaxpr"])
               if equation.primitive.name in ("dynamic_slice", "slice", "gather")}
     assert any(stacks <= whole for whole in handed) and not stacks & slices
+    carried = {tuple(operand.aval.shape) for scan in loops
+               for operand in scan.params["ft_in"].update(scan.invars).unpack()[1]}
+    layer = {tuple(leaf.shape[1:]) for leaf in jax.tree.leaves(banked["params"]["layers_0_3"])}
+    assert not layer & carried, layer & carried
 
     draw = drawn_ids(0x1342, 8)
 
