@@ -218,10 +218,10 @@ def test_a_plain_call_of_no_keys_reads_its_initial_state_or_zero_in_both_mainloo
 @pytest.mark.parametrize("form", ["full", "causal"])
 def test_merging_partials_of_no_keys_is_the_identity_whatever_the_form(form):
     """`empty` merged with `empty`, and ahead of a state with keys, under a full or causal spec (whose
-    tile loop takes no guard), stays finite and leaves the state as it was."""
+    tile loop takes no guard), stays a state of no key, finite, and leaves the state as it was."""
     spec = algebra.Forward(form, 64, ids=False, scale=0.125)
     nothing = algebra.merge(spec, algebra.empty(4, 8), algebra.empty(4, 8))
-    assert np.isneginf(np.asarray(nothing.m)).all()
+    assert np.asarray(algebra.unseen(nothing.m)).all()
     np.testing.assert_array_equal(np.asarray(nothing.acc), 0)
     np.testing.assert_array_equal(np.asarray(nothing.total), 0)
     filled = algebra.Partial(jnp.ones((4, 8)), jnp.full((4,), 2.0), jnp.full((4,), 3.0))
