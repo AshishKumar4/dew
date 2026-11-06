@@ -20,6 +20,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   question's row (`RequestSummary`), the question again past a long state (`Again`), a conversation state turn
   by turn (`State(turns=Turns(...))`), and value policies (`Values`: a long list indexed, an empty value
   substituted, option names normalized). Training and serving summarize the whole request alike.
+- A trained model whose objective declares no inference task (a JEPA encoder, a control policy, a DreamerV3
+  agent) exports as a native release: `dew export` writes its weights as safetensors and its model, settings
+  and numerics in the release record, and `dew.pipeline` loads it back from a directory or the Hub as the
+  model and weights its run trained (`dew.inference.models.SavedModel`), its parameters stored in the
+  `param_dtype` asked and its other state as written. Such a run saved before this release records no
+  declaration and is refused.
+- Every export states what its format's files cannot in one release record (`dew.config.Release`,
+  `dew_release.json`): a decision task's layout, its calibration beyond temperatures, a slot readout's window
+  and the numerics its task traces under, which the one decision loader reads back over the format's own files.
+  `Decide.save_pretrained` writes the format its head is released in (`Head.release_format`: Laya's, the joint
+  head's or the slot readout's), where only Laya's was written, so a task of any layout it trained with
+  exports and loads as the task it is.
 - The `cuda12` and `cuda13` extras install `dew-cutlass` 0.1.0 (`dew-cutlass-cu12` or `dew-cutlass-cu13`, on
   Linux x86_64 and aarch64), Dew's build of CUTLASS's grouped GEMMs, whose kernels are Hopper's. On an sm90
   GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells

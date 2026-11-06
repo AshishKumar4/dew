@@ -620,7 +620,10 @@ class AdapterSet:
 
     @classmethod
     def of(cls, adapters: Mapping[str, Adapter]) -> AdapterSet:
-        """The set of `adapters`, each bound over the same base model and weights, by name."""
+        """The set of `adapters`, each bound over the same base model and weights, by name: the set runs
+        every adapter's factors over the first's other variables (its base's weights, and what an adapter
+        trains beside its factors, a cross-attention block), so an adapter whose other variables differ
+        from the first's, which would run over another base than its own, is refused (ledger 4494)."""
         if not adapters:
             raise ValueError("an adapter set holds an adapter or more")
         names = tuple(adapters)
@@ -628,6 +631,12 @@ class AdapterSet:
         base = unadapted(first.model)
         if any(unadapted(adapter.model) != base for adapter in adapters.values()):
             raise ValueError("an adapter set's adapters are bound over one base model")
+        kept = _beside_factors(first.variables)
+        for name in names[1:]:
+            held = _beside_factors(adapters[name].variables)
+            if held.keys() != kept.keys() or not all(_same(held[path], kept[path]) for path in kept):
+                raise ValueError(f"adapter {name!r} is bound over other weights than {names[0]!r}'s, and an "
+                                 f"adapter set runs every adapter over one base's")
         weights = unboxed(thaw(first.variables))
         factors = {name: leaves_by_path(adapter.variables["params"]) for name, adapter in adapters.items()}
         paths = sorted({path for adapter in adapters.values() for path in adapter.targets})
@@ -652,6 +661,24 @@ class AdapterSet:
         layouts = {name: layout for adapter in adapters.values() for name, layout in adapter.layouts.items()}
         model = _adapted(base, _Bound(targets, layouts=layouts, names=names, scales=scales))
         return cls(model, {**first.variables, "params": traverse_util.unflatten_dict(trained)})
+
+
+def _beside_factors(variables: Variables) -> Mapping[tuple[str, ...], object]:
+    """Every leaf of `variables` but an adapter's low-rank factors (`FACTORS`), by its collection and path,
+    a trainer's split of them whole again (`thaw`), so adapters over one base split apart compare alike."""
+    return {(collection, *path): leaf for collection, tree in thaw(variables).items()
+            for path, leaf in leaves_by_path(tree).items() if path[-1] not in FACTORS}
+
+
+def _same(leaf, other) -> bool:
+    """Whether two variables' leaves are one: the same node, or nodes of one structure (a quantized kernel's
+    values and scales) whose arrays are of one shape, dtype and values."""
+    if leaf is other:
+        return True
+    (ours, structure), (theirs, held) = jax.tree.flatten(leaf), jax.tree.flatten(other)
+    return structure == held and all(
+        np.shape(a) == np.shape(b) and jnp.result_type(a) == jnp.result_type(b)
+        and bool(jnp.array_equal(a, b)) for a, b in zip(ours, theirs, strict=True))
 
 
 def _rank_padded(leaf: jax.Array | None, axis: int, shape: tuple[int, ...], rank: int) -> jax.Array:

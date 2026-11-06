@@ -405,3 +405,31 @@ def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path
         return {**result, "scores": np.asarray(result["scores"])[held["options"]]}
 
     assert_as_exact(native, reference, draw, f"released slot runtime {site}", seeds=seeds, truth_fn=truth)
+
+
+@pytest.mark.parametrize("readout", ["slot_lm", "head"])
+def test_a_slot_release_states_the_window_and_the_prompt_its_layout_accepted(tmp_path, readout):
+    """A slot release's layout is its prompt over its labels and blocks and the window the task accepted:
+    the window is written beside the readout and read back (a saved 4096 reloads as 4096, where it took
+    the default of an external release's 32768), the readout's own record gains no field, and a release
+    whose prompt is another than its source's is exported whole and reloaded as it is (rows 4315, 4310). A
+    Qwen3.5 backbone's bundle writes through its source's own config, which a task trained from it holds
+    no copy of."""
+    from dew.config.release import Release
+    from dew.decision.layout import Framing
+
+    source, _ = slot_release(tmp_path, readout)
+    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    assert bundle.layout.max_len == 32768
+    layout = replace(bundle.layout, max_len=4096)
+    replace(bundle, layout=layout).save(tmp_path / "narrow")
+    assert Pretrained.load(tmp_path / "narrow", dtype="float32", attention_impl="xla").layout == layout
+    assert Release.load(tmp_path / "narrow") == Release(max_length=4096)
+    assert set(json.loads((tmp_path / "narrow" / "readout.json").read_text())) <= {
+        "readout", "head_dim", "n_slots", "attention"}
+    other = replace(bundle.layout, max_len=2048, framing=Framing(system="Answer plainly.", prefill="",
+                                                                 thinking=False))
+    replace(bundle, layout=other).save(tmp_path / "other")
+    assert Pretrained.load(tmp_path / "other", dtype="float32", attention_impl="xla").layout == other
+    (tmp_path / "narrow" / "dew_release.json").unlink()
+    assert Pretrained.load(tmp_path / "narrow", dtype="float32", attention_impl="xla").layout.max_len == 32768

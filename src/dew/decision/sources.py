@@ -14,7 +14,7 @@ from typing import Self
 import numpy as np
 
 from dew import _records
-from dew.batch import Variables
+from dew.batch import Variables, part, thaw
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
@@ -27,8 +27,9 @@ from .calibration import Calibration, Temperatures
 from .head import DecisionHead, Head, JointSchemaHead
 from .joint_checkpoint import HEAD_CONFIG, HEAD_WEIGHTS, _path, _shaped
 from .laya import CONFIG_FILE, IN_PROJ, _head_path, _token, laya_tensors
-from .layout import JointLayout, Layout, MarkerLayout, Specials
+from .layout import JointLayout, Layout, MarkerLayout, QuestionLayout, Specials
 from .model import DecisionModel
+from .release import released_decision
 from .task import Decide
 
 
@@ -95,6 +96,37 @@ class PretrainedDecision(Pretrained):
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         bundle = self if variables is None else dataclasses.replace(self, variables=dict(variables))
         self.writer(bundle, directory, max_shard_size=max_shard_size)
+
+    @classmethod
+    def of(cls, task: Decide) -> Self:
+        """The release bundle of `task`, as it is written (`save`) in the format its head is read from: its
+        backbone a decoder bundle (`PretrainedDecoder.from_model`, its LoRA factors merged into their
+        kernels), its head and their variables, its layout, calibration, special tokens and tokenizer; the
+        inverse of `Decide.released`, which a run's task and a loaded release are both written through.
+        A head no format holds (Laya's, the joint head's, the slot readout's), a tokenizer with no files
+        to write and a backbone no decoder family states are refused."""
+        from .slot_source import SlotSource
+
+        if not isinstance(task.tokenizer, HFTokenizer):
+            raise ValueError("a released checkpoint holds the files of a Hugging Face tokenizer, and this "
+                             f"task's is a {type(task.tokenizer).__name__}")
+        formats = {"joint": (joint_checkpoint.save, joint_checkpoint.export),
+                   "slots": (SlotSource.save, SlotSource.export)}
+        head = task.model.head
+        if head.release_format not in formats:
+            raise ValueError(f"a {type(head).__name__} is released in {head.release_format!r}, no format a "
+                             f"decoder bundle writes: the joint head's or the slot readout's")
+        from dew.interop.pretrained import PretrainedDecoder
+
+        encoder, backbone = task.model.backbone, thaw(part(task.variables, "backbone"))
+        decoder = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
+        # The task's numerics, which a decoder bundle built of its model states none of.
+        held = {**{field.name: getattr(decoder, field.name) for field in dataclasses.fields(Pretrained)},
+                "numerics": task.precision}
+        writer, exporter = formats[head.release_format]
+        return cls(**held, head=head, head_variables=thaw(part(task.variables, "head")), layout=task.layout,
+                   specials=task.specials, calibration=task.calibration, decision_tokenizer=task.tokenizer,
+                   writer=writer, exporter=exporter)
 
     @classmethod
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,
@@ -176,6 +208,10 @@ class DecisionSource(SourceKind):
             calibration = Calibration(Temperatures(
                 dict(zip(("choice", "score", "noul"), (_records.number(x, "temperature") for x in values),
                          strict=True)), {key: _records.number(value, key) for key, value in buckets.items()}))
+            # The layout and calibration the release states, over those Laya's own file derives.
+            derived = layout
+            layout, calibration = released_decision(directory, layout, calibration, kind=QuestionLayout)
+            assumed = assumed if layout is derived else frozenset()
             tokenizer_folder, strict_specials, writer, exporter = "tokenizer", True, _save_laya, _export_laya
         elif (directory / HEAD_CONFIG).is_file():
             config = _records.record(json.loads((directory / HEAD_CONFIG).read_text()), HEAD_CONFIG)
@@ -189,7 +225,8 @@ class DecisionSource(SourceKind):
                                                           "fields": fields}, "head"),
                                       _path, IN_PROJ, HEAD_WEIGHTS,
                                       partial(_shaped, fields["hidden_size"]))
-            layout, calibration, assumed = JointLayout(), Calibration(), frozenset()
+            layout, calibration = released_decision(directory, JointLayout(), Calibration(), kind=JointLayout)
+            assumed = frozenset()
             tokenizer_folder, strict_specials = "", False
             writer, exporter = joint_checkpoint.save, joint_checkpoint.export
         else:
