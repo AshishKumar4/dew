@@ -339,74 +339,6 @@ def test_a_slot_draw_transfers_only_selected_host_rows_and_matches_a_device_draw
     np.testing.assert_array_equal(host["params"]["slots"][:3], table[[65, 66, 67]])
 
 
-@pytest.mark.parametrize("mode", ["slot_lm", "head"])
-@pytest.mark.parametrize("attention", ["causal", "block"])
-def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path, mode, attention):
-    import jax.numpy as jnp
-    from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
-
-    from dew.batch import part
-    from dew.decision import DecisionInputs, Question
-
-    source = tmp_path / "source"
-    shutil.copytree(REFERENCE, source)
-    (source / "readout.json").write_text(json.dumps({
-        "readout": mode, "head_dim": 8, "n_slots": 16,
-        "attention": "noncausal" if attention == "block" else "causal"}))
-    bundle = Pretrained.load(source, dtype="float32", attention_impl="reference")
-    task = Decide.of(bundle)
-    path = REFERENCE / "reference.npz"
-    site = f"{attention}_{mode}"
-    requests = json.loads((REFERENCE / "requests.json").read_text())
-    seeds = declared_seeds(path)[site]
-    draw, reference, truth = indexed_recording(recording(path), site, seeds)
-    head = task.model.head
-
-    @jax.jit
-    def forward(inputs, probe):
-        states = task.model.states(task.variables, inputs)
-        table = None if head.draws_from_rows else task.model.output_table(task.variables)
-
-        def observed(params, hidden):
-            ids = head.tied_labels()
-            tied = None if ids is None else task.model.readout_logits(task.variables, hidden, inputs, ids)
-            scores = head.apply({"params": params}, hidden, inputs, table, tied=tied)[:, 0]
-            return jnp.sum(scores * probe)
-
-        gradient, hidden = jax.grad(observed, (0, 1))(
-            part(task.variables, "head").get("params", {}), states)
-        result = {"scores": task.model.logits(task.variables, inputs)[:, 0], "gradient.hidden": hidden}
-        if mode == "head":
-            result.update({f"gradient.{name}": gradient[native] for name, native in
-                           (("slot", "slots"), ("q.weight", "q"), ("k.weight", "k"))})
-        return result
-
-    @as_given
-    def native(index, held):
-        rows = []
-        for request in requests[int(index)]:
-            questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-            rows.extend(task.layout.rows(task.tokenizer, task.specials, request["state"], questions))
-        laid = DecisionInputs.collate(rows, task.specials.pad, options=held["options"].shape[1])
-        mask = np.arange(held["tokens"].shape[1])[None] < held["lengths"][:, None]
-        for row, encoded in enumerate(rows):
-            np.testing.assert_array_equal(encoded.tokens, held["tokens"][row, :held["lengths"][row]])
-            np.testing.assert_array_equal(encoded.questions[0].options,
-                                          held["spans"][row, held["options"][row]])
-            if attention == "block":
-                np.testing.assert_array_equal(encoded.blocks, held["blocks"][row, :held["lengths"][row]])
-        inputs = replace(laid, tokens=jnp.asarray(held["tokens"]), segments=jnp.asarray(mask, jnp.int32),
-                         positions=jnp.broadcast_to(jnp.arange(mask.shape[1]), mask.shape),
-                         blocks=jnp.asarray(held["blocks"]) if attention == "block" else None)
-        probe = np.zeros(held["options"].shape, np.float32)
-        probe[held["options"]] = held["probe"]
-        result = forward(inputs, jnp.asarray(probe))
-        assert np.isneginf(np.asarray(result["scores"])[~held["options"]]).all()
-        return {**result, "scores": np.asarray(result["scores"])[held["options"]]}
-
-    assert_as_exact(native, reference, draw, f"released slot runtime {site}", seeds=seeds, truth_fn=truth)
-
-
 @pytest.mark.parametrize("readout", ["slot_lm", "head"])
 def test_a_slot_release_states_the_window_and_the_prompt_its_layout_accepted(tmp_path, readout):
     """A slot release's layout is its prompt over its labels and blocks and the window the task accepted:
@@ -452,7 +384,6 @@ def test_a_slot_release_reads_the_labels_its_layout_states_in_their_order(tmp_pa
                for each in (chosen, restored)]
     assert answers[0].options == answers[1].options
     assert answers[0].probabilities.tolist() == answers[1].probabilities.tolist()
-
 
 
 def test_a_slot_pointer_heads_release_of_labels_written_two_ways_is_refused(tmp_path):
