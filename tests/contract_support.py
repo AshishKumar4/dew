@@ -74,7 +74,8 @@ def orders(fn, primals, direction, cotangent):
     as programs nest it (ledger 2641): under a jit within a jit, within a scan's body, and a reverse
     derivative of the gradient along `direction` (reverse over reverse)."""
     def scalar(f):
-        return lambda *x: jnp.sum(f(*x) * cotangent)
+        return lambda *x: sum(jnp.sum(out * along) for out, along in zip(
+            jax.tree.leaves(f(*x)), jax.tree.leaves(cotangent), strict=True))
 
     def forward(f):
         return lambda *x: jax.jvp(f, x, direction)[1]
