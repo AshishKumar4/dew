@@ -948,6 +948,8 @@ class MosaicGmm(_Mosaic):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
     EXACT_SUMS: ClassVar[bool] = True
     FP8: ClassVar[bool] = True
+    STEP_SCALED: ClassVar[bool] = False
+    """Whether its kernel streams a step's rows' scales beside its ring (`MosaicStepScaledGmm`)."""
 
     def output_sides(self, ba) -> tuple[int, int]:
         return _product_sides(ba)
@@ -961,7 +963,7 @@ class MosaicGmm(_Mosaic):
             epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
             dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
-            paired=ba.arguments.get('paired') is not None)
+            paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED)
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A group's rows on average over the call's groups, which a stack read from its `first` matrix
@@ -1126,6 +1128,9 @@ class MosaicTgmm(_Mosaic):
     """`Tgmm` on Hopper (`mosaic_gpu.tgmm`): `block_m` x `block_n` tiles of each group's gradient, its rows
     `block_k` at a time."""
 
+    K_MAJOR: ClassVar[bool] = False
+    """Whether its operands lie rows-contiguous, step-scaled (`MosaicStepScaledTgmm`)."""
+
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
 
     def output_sides(self, ba) -> tuple[int, int]:
@@ -1139,7 +1144,7 @@ class MosaicTgmm(_Mosaic):
             config, family, lhs_dtype=ba.arguments['tokens'].dtype,
             rhs_dtype=ba.arguments['cotangent'].dtype, prologue_axes=ba.arguments['hooks'].prologue_axes,
             prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
-            out_dtype=ba.arguments['out_dtype'])
+            out_dtype=ba.arguments['out_dtype'], k_major=self.K_MAJOR, step_scaled=self.K_MAJOR)
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A gradient tile's rows are the tokens' width; its steps run over a group's rows, padded to whole
@@ -1250,6 +1255,56 @@ def _cutlass_registered() -> None:
     """dew_cutlass's FFI targets, registered with jax once, at the first launch that runs one."""
     for target, capsule in importlib.import_module('dew_cutlass').targets().items():
         jax.ffi.register_ffi_target(target, capsule, platform="CUDA")
+
+
+@dataclasses.dataclass(frozen=True)
+class MosaicStepScaledGmm(MosaicGmm):
+    """`MosaicGmm` of a blockwise-scaled FP8 product (`gemm.blockwise_fp8_product`, row 4518), planned on the
+    call it is: each exactly summed `mosaic_gpu.STEP_SCALE_DEPTH`-deep step's partial times its rows' and
+    columns' scales before its add (`mosaic_gpu.gmm`'s `step_scales`), its rows' scales streamed beside its
+    ring (`gmm_allocations`' `step_scaled`), a column tile within one weight block's columns, and no split,
+    swap or hook."""
+
+    STEPS: ClassVar[tuple[int, ...] | None] = (mosaic_gpu.STEP_SCALE_DEPTH,)
+    STEP_SCALED: ClassVar[bool] = True
+
+    def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        within = mosaic_gpu.STEP_SCALE_DEPTH % config.block_n == 0
+        return config.splits == 1 and not config.swapped and within and super().candidate(ba, config, target)
+
+    def _swapped(self, ba, target):
+        # Its scales are its rows' and columns': no swapped orientation reads them.
+        del ba, target
+
+    def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
+        # Beside the exact product's live set, a step's column scales in its accumulator's column layout.
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        return super().registers(ba, config) + family.column_registers(config.block_n, jnp.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class MosaicStepScaledTgmm(MosaicTgmm):
+    """`MosaicTgmm` of a blockwise FP8 recipe's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`, row
+    4518), planned on the call it is: FP8 operands rows-contiguous (`mosaic_gpu.tgmm`'s `k_major`, as
+    Hopper's FP8 tensor cores read both), each exactly summed 128-row step's partial times its depth rows' and
+    columns' scales, its rows' scales streamed beside its ring, groups of whole steps, no split or hook."""
+
+    STEPS: ClassVar[tuple[int, ...] | None] = (mosaic_gpu.STEP_SCALE_DEPTH,)
+    FP8: ClassVar[bool] = True
+    K_MAJOR: ClassVar[bool] = True
+
+    def _fp8(self, ba, dtype, family: mosaic.Family | None) -> bool:
+        # Its operands lie rows-contiguous, as Hopper's FP8 tensor cores read both.
+        return (jnp.dtype(dtype) in EIGHT and family is not None and family.takes_fp8
+                and ba.arguments['hooks'] == NO_HOOKS and bool(ba.arguments.get('exact_sums')))
+
+    def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        return config.splits == 1 and super().candidate(ba, config, target)
+
+    def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
+        # Beside the exact gradient's live set, a step's column scales in its accumulator's column layout.
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        return super().registers(ba, config) + family.column_registers(config.block_n, jnp.float32)
 
 
 def _cutlass_call(target: str, out: jax.ShapeDtypeStruct) -> Callable:
