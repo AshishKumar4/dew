@@ -12,7 +12,7 @@ from reference_error import as_given, assert_as_exact, widened, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import gemm, generation
-from dew.nn.precision import FP8, LowPrecision, Numerics, numerics_of
+from dew.nn.precision import FP8, LowPrecision, Numerics, RecipeRefused, numerics_of
 
 VOCAB, WIDTH = 256, 128
 SEEDS = 64
@@ -69,19 +69,17 @@ def test_a_grouped_output_projection_takes_the_recipe_group_by_group():
     from dew.nn.precision import projection_role
 
     layer = DenseGeneral(WIDTH, batch_dims=(0,), axis=-1, use_bias=False, dtype=jnp.float32)
-    x = jnp.asarray(np.random.default_rng(1).normal(size=(2, 3, 5, WIDTH)), jnp.float32)
-    x = jnp.moveaxis(x, 0, 1)  # [tokens, groups, ..., in] as V4's grouped output reads it
+    # [groups, ..., in], as V4's grouped output moves its groups first (`_output`).
+    x = jnp.asarray(np.random.default_rng(1).normal(size=(3, 2, 5, WIDTH)), jnp.float32)
     params = layer.init(jax.random.key(0), x)
     with generation.run_precision(FP8), projection_role("mixer"), generation.routes() as found:
         out = layer.apply(params, x)
     assert [route.kernel != "unquantized" for route in found if route.choice == "blockwise_fp8"] == [True]
     kernel = params["params"]["kernel"]
-    for group in range(x.shape[1]):
+    for group in range(x.shape[0]):
         with generation.run_precision(FP8), projection_role("mixer"):
-            alone = gemm.recipe_projection(x[:, group].reshape(-1, WIDTH), kernel[group],
-                                           out_dtype=jnp.float32)
-        np.testing.assert_array_equal(np.asarray(jnp.moveaxis(out, 1, 0)[group]).reshape(-1, WIDTH),
-                                      np.asarray(alone))
+            alone = gemm.recipe_projection(x[group].reshape(-1, WIDTH), kernel[group], out_dtype=jnp.float32)
+        np.testing.assert_array_equal(np.asarray(out[group]).reshape(-1, WIDTH), np.asarray(alone))
 
 
 def test_a_projection_the_recipe_takes_under_a_product_wrapper_is_refused():
@@ -96,10 +94,23 @@ def test_a_projection_the_recipe_takes_under_a_product_wrapper_is_refused():
     x = jnp.ones((2, WIDTH), jnp.float32)
     params = layer.init(jax.random.key(0), x)
     with generation.run_precision(FP8), _cache.INTERCEPTED(new_value=True):
-        with projection_role("mlp"), pytest.raises(ValueError, match="recipe"):
+        with projection_role("mlp"), pytest.raises(RecipeRefused):
             layer.apply(params, x)
         with projection_role("router"):
             layer.apply(params, x)
+
+
+def test_an_adapted_projection_the_recipe_takes_is_refused_on_its_fused_product():
+    """An adapter's projection the 'fp8' numerics take by role, its update fused into the base product
+    (`generation.chosen(low_rank='fused')`, `gemm.low_rank`), would train unquantized, silently, as the
+    unfused branch would: refused where the fused product is traced."""
+    from dew.lora import LoRA
+
+    model = mixed(jnp.float32).clone(mixture=None)
+    tokens = jnp.ones((1, 8), jnp.int32)
+    adapter = LoRA(rank=4, modules=("up_proj",)).apply(model, model.init(jax.random.key(0), tokens), key=0)
+    with generation.run_precision(FP8), generation.chosen(low_rank="fused"), pytest.raises(RecipeRefused):
+        adapter.model.apply(adapter.variables, tokens)
 
 
 def test_the_experts_kernel_gradient_keeps_the_master_dtype():

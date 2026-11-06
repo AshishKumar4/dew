@@ -49,7 +49,7 @@ from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded
 from dew.nn.kernels.templates.product import declared
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, refuse_recipe
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -669,7 +669,9 @@ def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scal
     `u = scale · (dy · bᵀ)` rounded once; the factors' gradients are `lhsᵀ · (scale · (dy · bᵀ))` and `tᵀ ·
     dy`, the rank-wide kernel gradients; each operand's only where it is differentiated (a frozen kernel's,
     `lhsᵀ · dy`, never). The concatenations are copies, a materialized strategy (b); a mainloop walking the
-    appended pair in place is row 1304's next form."""
+    appended pair in place is row 1304's next form. A projection the run's low-precision recipe takes by
+    its role is refused (`refuse_recipe`): the adapted product does not take the recipe."""
+    refuse_recipe("an adapter's fused product (`gemm.low_rank`)")
     return _low_rank(lhs, kernel, a, b, jnp.asarray(scale, jnp.float32), out_dtype, precision,
                      interpret_on_cpu)
 
