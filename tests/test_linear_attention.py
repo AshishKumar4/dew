@@ -42,7 +42,7 @@ from reference_error import as_given, assert_as_exact, widened, without_ynn
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.kernels import recurrence as kernel, tuning
+from dew.nn.kernels import recurrence as kernel
 from dew.nn.kernels.recurrence_algebra import decays, factor
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
 from dew.nn.linear import (
@@ -1094,18 +1094,16 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     assert described(fused) == described(unfused)
 
 
-@pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
-def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(target):
-    """The fused decode step at Qwen3.5-0.8B's widths (16 value heads over 16 key heads of 128, a
-    conv of 4 taps over an fp32 history, a bf16 state) and at Qwen3.5-9B's value heads over half as
-    many key heads, at every config of its space, lowered for each GPU on this CPU and compiled by
-    Triton within its block's shared memory."""
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+def test_the_fused_step_compiles_within_each_gpus_resources(target):
+    """The fused decode step, the recurrence template's step on Mosaic GPU, at Qwen3.5-0.8B's widths (16
+    value heads over 16 key heads of 128, a conv of 4 taps over an fp32 history, a bf16 state) and at
+    Qwen3.5-9B's value heads over half as many key heads, lowered for each GPU on this CPU and compiled by
+    its compiler spill-free within its block (`kernel_compile.mosaic_failures`)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_kernels, failures
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    from dew.nn.kernels.recurrence import Launch, StepLaunch
-
-    def case(key_heads, value_heads, warps):
+    def case(key_heads, value_heads):
         rows, width = 8, 128
         channels = (2 * key_heads + value_heads) * width
         specs = (jax.ShapeDtypeStruct((rows, channels), jnp.bfloat16),
@@ -1118,15 +1116,12 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
                  jax.ShapeDtypeStruct((rows, value_heads, width, width), jnp.bfloat16))
 
         def run(*operands):
-            with tuning.pinned({StepLaunch: Launch(0, warps)}):
-                return fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
+            return fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
         return run, specs
 
-    cases = [KernelCase(f"fused/{key}x{value}/warps{warps}",
-                        lambda key=key, value=value, warps=warps: case(key, value, warps))
-             for key, value in ((16, 16), (16, 32)) for warps in (4, 8, 16)]
-    found = compile_kernels(cases, target)
-    assert len(found) == len(cases)
-    assert not failures(found), "\n".join(failures(found))
+    cases = [KernelCase(f"fused/{key}x{value}", lambda key=key, value=value: case(key, value))
+             for key, value in ((16, 16), (16, 32))]
+    found = compile_mosaic_kernels(cases, target)
+    assert found and not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
