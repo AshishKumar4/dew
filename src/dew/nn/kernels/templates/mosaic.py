@@ -1496,6 +1496,11 @@ class Issuer[Accumulator](abc.ABC):
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
         return plgpu.load(ref, layout=self.layout, optimized=False)
 
+    def scalar_of(self, ref) -> jax.Array:
+        """The scalar at `ref[0]` (a block's index a launch reads from global memory): a GPU thread's load, a
+        TPU core's copy into its scalar memory."""
+        return ref[0]
+
     def key_magnitudes(self, tile) -> jax.Array:
         """Each key's largest value magnitude, fp32, from a values tile `tile` `[keys, columns]` in shared
         memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,

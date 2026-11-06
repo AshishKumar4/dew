@@ -752,6 +752,47 @@ def test_the_tpu_persistent_walk_lowers_for_a_v5e():
             lowering_platforms=("tpu",))
 
 
+def _read_through(x, rows, index, *, interpret):
+    """`x * index[0] + rows[:, None]` on a TPU core, each operand left in HBM and read through its family
+    (`tile_of`, `scalar_of`, `rows_of`), the result stored by a copy out of VMEM."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+
+    def body(x_hbm, rows_hbm, index_hbm, out_hbm):
+        value = (family.tile_of(x_hbm) * family.scalar_of(index_hbm).astype(jnp.float32)
+                 + family.rows_of(rows_hbm)[:, None])
+
+        def write(held):
+            held[...] = value
+            pltpu.sync_copy(held, out_hbm)
+
+        pl.run_scoped(write, pltpu.VMEM(x.shape, jnp.float32))
+
+    launch = family.kernel(body, out_type=jax.ShapeDtypeStruct(x.shape, jnp.float32), grid=(1,),
+                           grid_names=("programs",), consumers=1, interpret=interpret, name="reads")
+    return launch(x, rows, index)
+
+
+def test_a_tpu_core_reads_its_hbm_operands_through_its_family():
+    """A TPU core's tile, row vector and scalar read from operands left in HBM (`VmemRings.tile_of`,
+    `rows_of`, `scalar_of`, each through a copy): interpreted on any host, exactly `x * index[0] + rows`;
+    lowered for a TPU v5e."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    x = jnp.arange(8 * 128, dtype=jnp.float32).reshape(8, 128)
+    rows = jnp.arange(8, dtype=jnp.float32) * 1000
+    index = jnp.asarray([3], jnp.int32)
+    got = _read_through(x, rows, index, interpret=True)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(x) * 3 + np.asarray(rows)[:, None])
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    shapes = [jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (x, rows, index)]
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(functools.partial(_read_through, interpret=False)).trace(*shapes).lower(
+            lowering_platforms=("tpu",))
+
+
 def _gemm_on_a_tpu_core():
     """The GEMM template's kernel bodies on a TPU core's bundle (`mosaic_tpu.MXU`), each `(call, operands,
     expected)` at small integers, so each product is exact in fp32: a dense forward with a bias epilogue,
