@@ -34,10 +34,9 @@ def fits(width: int, head: int | None) -> bool:
 
 
 def _kept(kept, value: jax.Array) -> jax.Array:
-    """`value` where the scalar `kept` holds, else zeros: the condition laid over the vector as it is
-    (Mosaic GPU's warpgroup semantics broadcast no scalar implicitly, a `jnp.where`'s condition or branch)."""
-    laid = (jnp.zeros_like(value) + jnp.asarray(kept, jnp.float32)) != 0.0
-    return jnp.where(laid, value, jnp.zeros_like(value))
+    """`value` where the scalar `kept` holds, else zeros (`mosaic.laid`)."""
+    return jnp.where(mosaic.laid(kept, value), value, jnp.zeros_like(value))
+
 
 def _loaded(ref, row, token, columns, length: int):
     """`ref`'s `[THREADS]` channels at `token` of `row`, fp32, zero before the row's first and past its
