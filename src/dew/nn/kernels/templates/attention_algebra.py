@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import derive, rewritten
-from dew.algebra.forms import Accumulated, Added, Merged, Operand, derived_on
+from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
@@ -1195,7 +1195,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     step's scaled parts (`weights_parts`) keep it, a representation the declaration states none of."""
     # A compensated or guarded walk's step takes its dropped roundings and its shifts through the derived
     # step's own hook (`_derived_step`).
-    if derived_on() and keys.coords.drop is None:
+    if keys.coords.drop is None:
         return _derived_step(spec, state, keys)
     m, factor, p, value, held = _softmax(spec, state, keys)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
@@ -1538,19 +1538,9 @@ def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> 
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
     maximum and summed, in that order. Either may hold no key whatever the call (a slice past a row's
-    keys), so `empty` is its identity under every spec. Behind the switch, the derived forms'
-    (`dew.algebra.forms.derived`, `_derived_merge`), a guarded state's join of its sums the template's
-    (`_guarded_merge`) over the factors they evaluate."""
-    if derived_on():
-        return _derived_merge(spec, first, second)
-    m = jnp.maximum(first.m, second.m)
-    safe = jnp.where(unseen(m), 0.0, m)
-    factors = carried(spec, first.m, safe), carried(spec, second.m, safe)
-    if first.guard is None and second.guard is None:
-        a, b = factors
-        acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
-        return Partial(acc, m, a * first.total + b * second.total)
-    return _guarded_merge(first, second, m, factors)
+    keys), so `empty` is its identity under every spec. The derived forms' (`_derived_merge`), a guarded
+    state's join of its sums the template's (`_guarded_merge`) over the factors they evaluate."""
+    return _derived_merge(spec, first, second)
 
 
 def _guarded_merge(first: Partial, second: Partial, m: jax.Array, factors: tuple[jax.Array, jax.Array]
@@ -1594,31 +1584,7 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     another order, no less accurately. A slice of no key (a maximum of -inf) adds nothing. On the guarded
     path the sums join at the largest shift, and a row whose join overflows shifts as its natural sums
     need, as `merge` shifts them. Behind the switch, the derived forms' (`_derived_merged`)."""
-    if derived_on():
-        return _derived_merged(spec, stacked, axis)
-    m = jnp.max(stacked.m, axis=axis)
-    factors = carried(spec, stacked.m, jnp.expand_dims(jnp.where(unseen(m), 0.0, m), axis))
-    if stacked.guard is None:
-        acc = jnp.sum(expand(factors, stacked.acc) * stacked.acc, axis=axis)
-        return Partial(acc, m, jnp.sum(factors * stacked.total, axis=axis))
-    guard = stacked.guard
-    reach = jnp.max(guard.reach, axis=axis)
-    natural = jnp.sum(power2(factors * stacked.total, guard.shift), axis=axis)
-
-    def joined(shift):
-        # Each state's factor, then its shift's change as a power of two on the product (`carry_factor`).
-        drops = guard.shift - jnp.expand_dims(shift, axis)
-        acc = power2(expand(factors, stacked.acc) * stacked.acc, expand(drops, stacked.acc))
-        return jnp.sum(acc, axis=axis), jnp.sum(power2(factors * stacked.total, drops), axis=axis)
-
-    plain = jnp.sum(expand(factors, guard.plain) * guard.plain, axis=axis)
-    plain_total = jnp.sum(factors * guard.plain_total, axis=axis)
-    held = jnp.max(guard.shift, axis=axis)
-    acc, _ = joined(held)
-    live = overflowed(acc) | jnp.any(guard.live, axis=axis)
-    shift = jnp.where(live, jnp.maximum(held, needed(natural, reach)), held)
-    acc, total = joined(shift)
-    return Partial(acc, m, total, Guard(shift, reach, plain, plain_total, live))
+    return _derived_merged(spec, stacked, axis)
 
 
 def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.Array:
@@ -1653,10 +1619,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     ratio the derived forms' (`dew.algebra.forms.derived`, `_derived_output`), a guarded state's live rows
     taken from its unshifted sums as ever."""
     m, denominator = finished_rows(spec, state, initial=initial)
-    if derived_on():
-        out = _derived_output(spec, state)
-    else:
-        out = output_of(state.acc, state.total, guarded=spec.guarded or initial)
+    out = _derived_output(spec, state)
     fields = state.guard
     if fields is not None:
         bounded = finite(fields.plain_total)

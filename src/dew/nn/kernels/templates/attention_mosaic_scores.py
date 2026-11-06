@@ -145,29 +145,19 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
     # launch's instructions, ET-CONFLICTS-h100).
     at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if walk.accurate else None
-    if algebra.derived_on():
-        # Behind the switch, the tile's weights and cotangents the derived forms' (`derived_cotangents`), in
-        # its forward's units (`how`) and form (`accurate`, its anchor keys an operand).
-        tiles = {"logits": logits, "products": dp, "peak": read(peak), "total": read(total),
-                 "anchor": read(anchor), "delta": read(delta)}
-        if multiplier is not None:
-            tiles["keep"] = multiplier
-        if seen is not None:
-            tiles["seen"] = seen
-        if at_anchor is not None:
-            tiles["at_anchor"] = at_anchor
-        forms = derived_cotangents(bool(coords.keys_first), multiplier is not None, seen is not None, how,
-                                   walk.accurate)
-        exponentials, weights, cotangents = forms.mapped(tiles)
-        return exponentials, weights, cotangents, slopes, seen
-    inverse_total = per_query(algebra.inverse(read(total)))
-    # The fast form's exponent unclamped, its maximum safe where a query saw no key (`gradient.safe_peak`, a
-    # row's select in place of each entry's clamp).
-    fast = not walk.accurate
-    peaks = per_query(gradient.safe_peak(read(peak)) if fast else peak)
-    exponentials, weights = gradient.normalized(logits, peaks, inverse_total, how, safe=fast)
-    cotangents = gradient.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
-                                     inverse_total, multiplier=multiplier, weights=weights if fast else None)
+    # The tile's weights and cotangents the derived forms' (`derived_cotangents`), in its forward's units
+    # (`how`) and form (`accurate`, its anchor keys an operand).
+    tiles = {"logits": logits, "products": dp, "peak": read(peak), "total": read(total),
+             "anchor": read(anchor), "delta": read(delta)}
+    if multiplier is not None:
+        tiles["keep"] = multiplier
+    if seen is not None:
+        tiles["seen"] = seen
+    if at_anchor is not None:
+        tiles["at_anchor"] = at_anchor
+    forms = derived_cotangents(bool(coords.keys_first), multiplier is not None, seen is not None, how,
+                               walk.accurate)
+    exponentials, weights, cotangents = forms.mapped(tiles)
     return exponentials, weights, cotangents, slopes, seen
 
 def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None) -> None:
