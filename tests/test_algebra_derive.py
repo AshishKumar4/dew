@@ -298,6 +298,25 @@ def test_a_maximum_read_only_floored_is_carried_from_its_floor():
                     seeds=16)
 
 
+def placed(q, k, v, rows, keys):
+    """Attention whose logits are placed on a one-device mesh mid-walk (`with_sharding_constraint`), as a
+    declaration traced under a mesh places them."""
+    del rows, keys
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",))
+    s = jax.lax.with_sharding_constraint((q @ k.T) * WIDTH ** -0.5,
+                                         jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))
+    m = jnp.max(s, axis=-1)
+    p = jnp.exp(s - m[:, None])
+    return (p @ v) / jnp.sum(p, axis=-1)[:, None]
+
+
+def test_a_declaration_that_places_a_walked_value_derives_as_its_function():
+    """A declaration that places a walked value on a mesh (a sharding constraint, which leaves its values as
+    they are) derives, and its walk is on par with its function against the float64 truth (check 1)."""
+    forms = derive.derive(declared(placed), accurate=False, saturation=SATURATION)
+    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(placed)), draw, "placed walk", seeds=16)
+
+
 def natural_exp(x, scale=1.0):
     """An exponential of the declaration's own, of `x` times `scale`: `exp` by way of `exp2` (a launch's
     lowering of it)."""
