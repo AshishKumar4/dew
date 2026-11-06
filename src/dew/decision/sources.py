@@ -25,11 +25,11 @@ from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, import_path
 
 from . import joint_checkpoint
-from .calibration import Calibration, Temperatures
+from .calibration import Calibration
 from .formats import decision_format, decision_plan
 from .head import DecisionHead, Head, JointSchemaHead
 from .joint_checkpoint import HEAD_CONFIG, HEAD_WEIGHTS, _path, _shaped
-from .laya import CONFIG_FILE, IN_PROJ, _head_path, _token, laya_layout
+from .laya import CONFIG_FILE, IN_PROJ, LAYA_BUDGETS, LayaConfig, _head_path, _token
 from .layout import JointLayout, Layout, QuestionLayout, Specials
 from .model import DecisionModel
 from .release import released_decision
@@ -157,21 +157,18 @@ class DecisionSource(SourceKind):
         # A Laya or joint-head layout reads nothing a backbone's modeling_overrides change.
         if (directory / CONFIG_FILE).is_file():
             laya = decision_format("laya")
-            config = _records.record(json.loads((directory / CONFIG_FILE).read_text()), CONFIG_FILE)
+            config, stated = LayaConfig.read(
+                _records.record(json.loads((directory / CONFIG_FILE).read_text()), CONFIG_FILE))
             encoder = f"{laya.folder}/config.json"
             native = _records.record(json.loads((directory / encoder).read_text()), encoder)
             backbone = NativeComponent({**native, **laya.states}, config_folder=laya.folder,
                                        tensor_prefix=laya.prefix)
             head = DecisionHeadSource(
-                {"class": import_path(DecisionHead), "fields": {
-                    "layers": _records.integer(config.get("head_layers", 2), "head_layers")}},
+                {"class": import_path(DecisionHead), "fields": {"layers": config.head_layers}},
                 _head_path, IN_PROJ)
             # The release's own budgets, as its config states them, Laya's where it states none.
-            layout, assumed = laya_layout(config)
-            buckets = _records.record(config.get("temperature_by_options", {}), "temperature_by_options")
-            types, default = _laya_temperature(config.get("temperature", 1.0))
-            calibration = Calibration(Temperatures(
-                types, {key: _records.number(value, key) for key, value in buckets.items()}, default=default))
+            layout, assumed = config.layout(), frozenset(LAYA_BUDGETS) - stated
+            calibration = Calibration(config.temperatures())
             # The layout and calibration the release states, over those Laya's own file derives.
             derived = layout
             layout, calibration = released_decision(directory, layout, calibration, kind=QuestionLayout)
@@ -197,15 +194,3 @@ class DecisionSource(SourceKind):
         return CompositeSource(backbone, head, PretrainedDecision.from_components, tokenizer_folder,
                                {"layout": layout, "calibration": calibration, "assumed": assumed,
                                 "strict_specials": strict_specials})
-
-
-
-def _laya_temperature(stated: object) -> tuple[dict[str, float], float]:
-    """Laya's `temperature` as `Temperatures`' types and default: a list of choice's, score's and noul's, or
-    one number over every type (a release's global temperature)."""
-    if isinstance(stated, list):
-        if len(stated) != 3:
-            raise ValueError("temperature lists choice, score and noul, or is one number over every type")
-        return dict(zip(("choice", "score", "noul"), (_records.number(x, "temperature") for x in stated),
-                        strict=True)), 1.0
-    return {}, _records.number(stated, "temperature")

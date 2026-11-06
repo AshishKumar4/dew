@@ -12,7 +12,7 @@ onto `DecisionHead`.
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -20,7 +20,7 @@ import numpy as np
 from dew import _records
 from dew._files import write_atomically
 from dew.config.release import RELEASE_FILE
-from dew.decision.calibration import Calibration
+from dew.decision.calibration import Calibration, Temperatures
 from dew.decision.formats import beyond_temperatures
 from dew.decision.head import DecisionHead
 from dew.decision.layout import Layout, MarkerLayout, QuestionLayout
@@ -89,18 +89,85 @@ LAYA_BUDGETS = {"head_max_len": 192, "option_tokens": 48}
 and options share, and the most one option keeps (`QuestionLayout.head_max_len`, `option_tokens`)."""
 
 
-def laya_layout(config: Mapping[str, object]) -> tuple[MarkerLayout, frozenset[str]]:
-    """The layout Laya's `rl_agent_config.json` (`config`) states, which its readers lay rows out by, its
-    budgets Laya's own where it states none (`LAYA_BUDGETS`), and the budgets so assumed: what
-    `DecisionSource.describe` reads a release's file as, and what `head_files` holds a task's layout to.
-    A budget it states as null keeps that part of the question whole."""
-    head_max_len, option_tokens = (
-        None if (value := config.get(name, default)) is None else _records.integer(value, name)
-        for name, default in LAYA_BUDGETS.items())
-    layout = MarkerLayout(max_len=_records.integer(config.get("max_len", 512), "max_len"),
-                          head_max_len=head_max_len, option_tokens=option_tokens,
-                          parallel=config.get("option_layout", "sequential") == "parallel")
-    return layout, frozenset(name for name in LAYA_BUDGETS if name not in config)
+TEMPERATURE_TYPES = ("choice", "score", "noul")
+"""The question types Laya's `temperature` list holds a temperature of, in its order."""
+
+
+def _temperature(value: object, key: str) -> tuple[float, ...] | float:
+    """Laya's `temperature`: a list of `TEMPERATURE_TYPES`' temperatures, or one number over every type (a
+    release's global temperature)."""
+    if not isinstance(value, list):
+        return _records.number(value, key)
+    if len(value) != len(TEMPERATURE_TYPES):
+        raise ValueError(f"{key} lists {', '.join(TEMPERATURE_TYPES)}, or is one number over every type")
+    return tuple(_records.number(each, key) for each in value)
+
+
+def _budget(value: object, key: str) -> int | None:
+    """A question budget Laya's file states: a count of tokens, or null to keep that part whole."""
+    return None if value is None else _records.integer(value, key)
+
+
+@dataclass(frozen=True)
+class LayaConfig:
+    """Laya's `rl_agent_config.json`, each key declared once, a field of its name (its reader in its metadata,
+    its default where the file states none), which `read` reads and `record` writes: the encoder Laya's
+    agent names (`LAYA_REQUIRED`), the head's depth, the layout's window, question budgets (Laya's own,
+    `LAYA_BUDGETS`, where it states none) and option layout, and the temperatures by type and by type and
+    option count (`temperatures`)."""
+
+    encoder: str | None = field(default=None, metadata={"read": _records.text})
+    head_layers: int = field(default=2, metadata={"read": _records.integer})
+    max_len: int = field(default=512, metadata={"read": _records.integer})
+    head_max_len: int | None = field(default=LAYA_BUDGETS["head_max_len"], metadata={"read": _budget})
+    option_tokens: int | None = field(default=LAYA_BUDGETS["option_tokens"], metadata={"read": _budget})
+    option_layout: str = field(default="sequential", metadata={"read": _records.text})
+    temperature: tuple[float, ...] | float = field(default=1.0, metadata={"read": _temperature})
+    temperature_by_options: Mapping[str, float] = field(default_factory=dict, metadata={
+        "read": lambda value, key: {name: _records.number(each, name)
+                                    for name, each in _records.record(value, key).items()}})
+
+    @classmethod
+    def read(cls, record: Mapping[str, object]) -> "tuple[LayaConfig, frozenset[str]]":
+        """The config `record` states, each key it leaves out its field's default, and the keys it states."""
+        names = {held.name: held for held in fields(cls)}
+        stated = frozenset(record) & set(names)
+        return cls(**{name: names[name].metadata["read"](record[name], name) for name in stated}), stated
+
+    def record(self) -> dict[str, object]:
+        """The file this config writes: each key, the encoder where it names one."""
+        values = {held.name: getattr(self, held.name) for held in fields(self)}
+        if self.encoder is None:
+            values.pop("encoder")
+        temperature = self.temperature
+        values["temperature"] = list(temperature) if isinstance(temperature, tuple) else temperature
+        values["temperature_by_options"] = dict(self.temperature_by_options)
+        return values
+
+    @classmethod
+    def of(cls, layers: int, layout: QuestionLayout, calibration: Calibration,
+           encoder: str | None) -> "LayaConfig":
+        """The config of a head of `layers` over `layout`, its `calibration`'s temperatures held within their
+        bounds as the task applies them, so that a reader which does not hold them answers as it does."""
+        applied = calibration.temperatures.applied()
+        return cls(encoder=encoder, head_layers=layers, max_len=layout.max_len,
+                   head_max_len=layout.head_max_len, option_tokens=layout.option_tokens,
+                   option_layout="parallel" if layout.parallel else "sequential",
+                   temperature=tuple(applied.types.get(kind, applied.default) for kind in TEMPERATURE_TYPES),
+                   temperature_by_options=dict(applied.buckets))
+
+    def layout(self) -> MarkerLayout:
+        """The layout this config states, which Laya's readers lay rows out by."""
+        return MarkerLayout(max_len=self.max_len, head_max_len=self.head_max_len,
+                            option_tokens=self.option_tokens, parallel=self.option_layout == "parallel")
+
+    def temperatures(self) -> Temperatures:
+        """The temperatures this config states, by type (`TEMPERATURE_TYPES`) or one over every type, and
+        by type and option count."""
+        listed = isinstance(self.temperature, tuple)
+        return Temperatures(dict(zip(TEMPERATURE_TYPES, self.temperature, strict=True)) if listed else {},
+                            dict(self.temperature_by_options),
+                            default=1.0 if listed else self.temperature)
 
 
 def head_files(bundle: "PretrainedDecision") -> HeadFiles:
@@ -117,20 +184,14 @@ def head_files(bundle: "PretrainedDecision") -> HeadFiles:
     layout = bundle.layout
     if not isinstance(layout, QuestionLayout):
         raise ValueError(f"Laya's head reads rows a QuestionLayout lays out, not a {type(layout).__name__}")
-    applied = bundle.calibration.temperatures.applied()
-    config = {
-        # The encoder Laya's agent names (its tokenizer's, which the release holds under tokenizer/).
-        "encoder": bundle.decision_tokenizer.name, "head_layers": head.layers, "max_len": layout.max_len,
-        "head_max_len": layout.head_max_len, "option_tokens": layout.option_tokens,
-        "option_layout": "parallel" if layout.parallel else "sequential",
-        "temperature": [applied.types.get(kind, applied.default) for kind in ("choice", "score", "noul")],
-        "temperature_by_options": dict(applied.buckets)}
+    # The encoder Laya's agent names: its tokenizer's, which the release holds under tokenizer/.
+    config = LayaConfig.of(head.layers, layout, bundle.calibration, bundle.decision_tokenizer.name)
     # What Laya's file states of a layout, read as its readers read it; a layout that names Laya's own
     # order, question first, lays rows out as one that names none.
     held = replace(layout, order=None) if layout.order == "question_first" else layout
-    if held != laya_layout(config)[0] or beyond_temperatures(bundle.calibration) is not None:
-        config["option_layout"] = RELEASE_FILE
-    written = json.dumps(config, indent=2) + "\n"
+    if held != config.layout() or beyond_temperatures(bundle.calibration) is not None:
+        config = replace(config, option_layout=RELEASE_FILE)
+    written = json.dumps(config.record(), indent=2) + "\n"
     return HeadFiles(_head_tensors(bundle.head_variables["params"]), merged=True,
                      files={CONFIG_FILE: lambda path: write_atomically(str(path), written)})
 
