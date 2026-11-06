@@ -106,14 +106,6 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
    "note": "--granitemoe-only; PowerMoE embedding/residual/attention/logit multipliers, packed input_linear/output_linear and nested router names."
   },
-  "laya/tiny/logits.npz": {
-   "tool": "tools/laya_reference.py",
-   "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "laya/real/logits.npz": {
-   "tool": "tools/laya_reference.py",
-   "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/diffusion-gemma-window-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]

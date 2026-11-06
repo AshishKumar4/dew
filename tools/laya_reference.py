@@ -5,25 +5,25 @@ Laya is NandhaKishorM/laya at LAYA_COMMIT; install it with
     uv pip install "laya @ git+https://github.com/NandhaKishorM/laya@a4a8921afebfd852bba0000475cfb6ab737a124c"
 
 beside transformers 5.16.1. For each request in CASES and each option layout
-(sequential, the published one, and parallel), this runs what `Agent`
-runs: `Agent._check_question` and `_to_internal`, `build_sequence` over
-the state tokenized once, `collate_items`, and `DecisionModel.forward`, in
-fp32 and again in float64, and writes
+(sequential, the published one, and parallel), this lays each question out
+as `Agent` does: `Agent._check_question` and `_to_internal`, `build_sequence`
+over the state tokenized once, and `collate_items` (`laid`), and writes
 
 - layouts.json: each question's token ids and option markers, which Dew's
   layout must reproduce exactly;
-- logits.npz: each question's option logits, fp32 under `<layout>/<case>/<id>`
-  and float64 under `<layout>/<case>/<id>/f64`;
-- answers.json: `Agent.system_one` on each request, the published wire
-  answers, in fp32 on the CPU;
+- answers.json, for the tiny checkpoint: `Agent.system_one` on each
+  request, the published wire answers, in fp32 on the CPU;
 
 and the requests themselves to tests/fixtures/laya/cases.json.
 
 Two checkpoints: `tiny`, a random three-layer encoder and two-layer head
 with a byte-level BPE vocabulary trained here, written whole under
 tests/fixtures/laya/tiny; and with `--real`, the released English
-checkpoint at LAYA_REVISION, whose references go to tests/fixtures/laya/real
-for the network test.
+checkpoint at LAYA_REVISION, whose layouts and revision go to
+tests/fixtures/laya/real for the network test. Laya's `DecisionModel.forward`
+over drawn weights or drawn requests, in fp32 and float64 (`laid_logits`), is
+tools/laya_worker.py's, for tools/venv_reference.py's `laya` and `laya-real`
+recordings.
 
     PYTHONPATH=src:tools python tools/laya_reference.py [--real]
 """
@@ -31,6 +31,7 @@ for the network test.
 import argparse
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -136,18 +137,14 @@ def twins(agent, directory: Path):
         agent.cfg, encoder_dir=str(encoder) if encoder.exists() else None, pretrained=False))
 
 
-def laid_logits(agent, model, exact, cases: dict | None = None) -> tuple[dict, dict]:
-    """Every case's layouts and its option logits under `model` in fp32 and `exact` in float64, keyed
-    `<layout>/<case>/<id>` (the float64 ones `/f64`), each question laid out as `Agent` lays it out, in
-    the sequential and the parallel layout: of `cases`, CASES by default."""
-    from torch_precision import float64
-
+def laid(agent, cases: dict | None = None) -> Iterator[tuple[str, bool, dict, dict]]:
+    """Each question of every case of `cases` (CASES by default) laid out as `Agent` lays it out, in the
+    sequential and the parallel layout: its key `<layout>/<case>/<id>`, whether the layout is parallel,
+    its token ids and option markers (and the parallel layout's positions and slots), and its batch."""
     agent_module, common = _laya()
     tokenizer, config = agent.tok, agent.cfg
-    device = next(model.parameters()).device
-    layouts, logits = {}, {}
     for parallel in (False, True):
-        name = "parallel" if parallel else "sequential"
+        layout = "parallel" if parallel else "sequential"
         for case, request in (CASES if cases is None else cases).items():
             state = request["state"]
             state_ids = tokenizer(common.serialize_state(state).replace(tokenizer.mask_token, " "),
@@ -155,40 +152,42 @@ def laid_logits(agent, model, exact, cases: dict | None = None) -> tuple[dict, d
             for qid, question in request["questions"].items():
                 agent_module.Agent._check_question(qid, question)
                 internal = agent_module.Agent._to_internal(question)
-                ids, markers, *layout = common.build_sequence(
+                ids, markers, *placed = common.build_sequence(
                     tokenizer, state, internal, config["max_len"], config["head_max_len"],
                     truncate_left=isinstance(state, list), state_ids=state_ids, return_layout=parallel)
                 item = {"ids": ids, "markers": markers, "qtype": common.QTYPES[internal["t"]]}
                 if parallel:
-                    item["layout"] = layout[0]
-                key = f"{name}/{case}/{qid}"
-                layouts[key] = {"ids": ids, "markers": markers,
-                                **({"positions": layout[0]["position_ids"], "slots": layout[0]["option_ids"]}
-                                   if parallel else {})}
-                batch = {name: value.to(device) for name, value in
-                         common.collate_items([[item]], tokenizer.pad_token_id).items()}
-                arguments = (batch["input_ids"], batch["attention_mask"], batch["marker_pos"],
-                             batch["marker_mask"], batch["qtype"])
-                extra = ({"position_ids": batch["position_ids"], "option_ids": batch["option_ids"]}
+                    item["layout"] = placed[0]
+                where = ({"positions": placed[0]["position_ids"], "slots": placed[0]["option_ids"]}
                          if parallel else {})
-                with torch.no_grad():
-                    logits[key] = model(*arguments, **extra)[0][0].cpu().numpy()
-                with float64(), torch.no_grad():
-                    logits[f"{key}/f64"] = exact(*arguments, **extra)[0][0].double().cpu().numpy()
-    return layouts, logits
+                yield (f"{layout}/{case}/{qid}", parallel, {"ids": ids, "markers": markers, **where},
+                       common.collate_items([[item]], tokenizer.pad_token_id))
 
 
-def references(directory: Path, out: Path) -> None:
-    """Laya's layouts, logits in fp32 and float64, and agent answers for `directory`."""
-    agent_module, _ = _laya()
-    agent = agent_module.Agent(str(directory), device="cpu")
-    layouts, logits = laid_logits(agent, *twins(agent, directory))
-    answers = {case: agent.system_one(request["state"], request["questions"])
-               for case, request in CASES.items()}
+def laid_logits(agent, model, exact, cases: dict | None = None) -> dict[str, np.ndarray]:
+    """Every case's option logits under `model` in fp32 and `exact` in float64, on `model`'s device, keyed
+    as `laid` keys them (the float64 ones `/f64`)."""
+    from torch_precision import float64
+
+    device = next(model.parameters()).device
+    logits = {}
+    for key, parallel, _, collated in laid(agent, cases):
+        batch = {field: value.to(device) for field, value in collated.items()}
+        arguments = (batch["input_ids"], batch["attention_mask"], batch["marker_pos"], batch["marker_mask"],
+                     batch["qtype"])
+        extra = {"position_ids": batch["position_ids"], "option_ids": batch["option_ids"]} if parallel else {}
+        with torch.no_grad():
+            logits[key] = model(*arguments, **extra)[0][0].cpu().numpy()
+        with float64(), torch.no_grad():
+            logits[f"{key}/f64"] = exact(*arguments, **extra)[0][0].double().cpu().numpy()
+    return logits
+
+
+def write_layouts(agent, out: Path) -> None:
+    """Laya's layout of every case's questions for `agent` (`laid`), to `out`'s layouts.json."""
     out.mkdir(parents=True, exist_ok=True)
+    layouts = {key: layout for key, _, layout, _ in laid(agent)}
     (out / "layouts.json").write_text(json.dumps(layouts) + "\n")
-    np.savez(out / "logits.npz", **logits)
-    (out / "answers.json").write_text(json.dumps(answers, indent=1) + "\n")
 
 
 def main() -> None:
@@ -199,13 +198,18 @@ def main() -> None:
     (FIXTURES / "cases.json").write_text(json.dumps(CASES, indent=1, ensure_ascii=False) + "\n")
     tiny = FIXTURES / "tiny"
     write_tiny(tiny)
-    references(tiny, tiny)
+    agent_module, _ = _laya()
+    agent = agent_module.Agent(str(tiny), device="cpu")
+    write_layouts(agent, tiny)
+    answers = {case: agent.system_one(request["state"], request["questions"])
+               for case, request in CASES.items()}
+    (tiny / "answers.json").write_text(json.dumps(answers, indent=1) + "\n")
     if args.real:
         from huggingface_hub import snapshot_download
 
         directory = Path(snapshot_download(LAYA_REPO, revision=LAYA_REVISION, allow_patterns=[
             "model.safetensors", "encoder/*", "tokenizer/*", "rl_agent_config.json"]))
-        references(directory, FIXTURES / "real")
+        write_layouts(agent_module.Agent(str(directory), device="cpu"), FIXTURES / "real")
         (FIXTURES / "real" / "source.json").write_text(
             json.dumps({"repo": LAYA_REPO, "revision": LAYA_REVISION}) + "\n")
     print(sorted(path.name for path in FIXTURES.rglob("*") if path.is_file()), file=sys.stderr)

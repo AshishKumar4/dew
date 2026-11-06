@@ -59,7 +59,7 @@ def run_released(agent, model, exact, cases: dict[str, np.ndarray]) -> dict[str,
     out = {}
     for name in sorted({key.split(".", 1)[0] for key in cases}):
         requests = json.loads(str(cases[f"{name}.requests"]))
-        _, logits = laid_logits(agent, model, exact, requests)
+        logits = laid_logits(agent, model, exact, requests)
         for layout, (single, wide) in by_layout(logits).items():
             out[f"{name}.reference.{layout}"], out[f"{name}.truth.{layout}"] = single, wide
     return out
@@ -79,7 +79,7 @@ def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         missing, unexpected = agent.model.load_state_dict(weights, strict=False)
         if unexpected or {name for name in missing if not name.startswith(("act_head.", "temperature"))}:
             raise ValueError(f"the drawn weights do not fit Laya's model: {missing}, {unexpected}")
-        _, logits = laid_logits(agent, *twins(agent, Path(TINY)))
+        logits = laid_logits(agent, *twins(agent, Path(TINY)))
         for layout, (single, wide) in by_layout(logits).items():
             out[f"{name}.reference.{layout}"], out[f"{name}.truth.{layout}"] = single, wide
     return out
