@@ -70,9 +70,10 @@ import numpy as np
 import tyro
 
 from dew._files import write_atomically
+from dew._pool import joins_pool
+from dew.clusters import detected_environment
 from dew.nn.attention import AttentionImpl
 from dew.nn.flops import MissingFlopsCount
-from dew._pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
 from dew.telemetry.profile import Profiler
@@ -573,7 +574,7 @@ def main(config: BenchmarkConfig) -> list[Row]:
         # rounds load what its first compiled) keeps it, and its own switch (JAX_ENABLE_COMPILATION_CACHE).
         jax.config.update("jax_enable_compilation_cache", val=False)
     # Before this process opens a backend, which would hold the device each case's peak process needs.
-    measuring = not (joins_pool(None, pool_cluster(None)) or config.peak_run)
+    measuring = not (joins_pool(None, detected_environment()) or config.peak_run)
     peaks = [measured_peak(case, config) for case in build_cases(config)] if measuring else None
     # Joins a `dew launch` pool when one launched this process, and applies
     # the flags before the backend opens either way.

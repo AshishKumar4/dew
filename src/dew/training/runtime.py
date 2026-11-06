@@ -35,16 +35,8 @@ from dew._devices import (
     xla_flag,
 )
 from dew._logging import configure as configure_logging
-from dew._pool import (
-    PREEMPTED_EXIT,
-    PROCESS_COUNT,
-    PROCESS_ID,
-    joins_pool,
-    pool_cluster,
-    refuse_idle_gpus,
-    runs_on_gpu,
-    slurm_tasks_here,
-)
+from dew._pool import PREEMPTED_EXIT, joins_pool, refuse_idle_gpus, runs_on_gpu, slurm_tasks_here
+from dew.clusters import ClusterEnvironment, detected_environment
 
 _log = logging.getLogger(__name__)
 
@@ -73,7 +65,8 @@ another."""
 def prepare_process(wandb: Wandb | None = None,
                     multi_host: bool | None = None,
                     xla_flags: str | None = None,
-                    compilation_cache_dir: str | None = None) -> None:
+                    compilation_cache_dir: str | None = None,
+                    cluster: ClusterEnvironment | None = None) -> None:
     """Set the environment variables and XLA flags, raise the soft file
     descriptor limit, and join the JAX process pool.
 
@@ -81,6 +74,11 @@ def prepare_process(wandb: Wandb | None = None,
     tracker. Only its offline switch is read, and it has to be read before
     wandb opens a run. `multi_host=True` requires a pool, False never joins
     one, and None joins the pool the environment describes, if any.
+    `cluster` is the scheduler that started the run's processes
+    (`dew.clusters.ClusterEnvironment`): its pool is joined, whatever
+    `multi_host` would detect, and given with multi_host=False it is refused,
+    as the two contradict each other. None reads the first of
+    `dew.clusters.ENVIRONMENTS` this process runs under, `dew launch`'s first.
     `compilation_cache_dir` names the directory of JAX's persistent
     compilation cache, which a pool across hosts must keep on storage they
     share; without one the process caches under the user's cache directory
@@ -99,9 +97,13 @@ def prepare_process(wandb: Wandb | None = None,
     device per local accelerator, which the trainer checks on its own mesh
     (`dew.distributed.host.companion_mesh`).
     """
-    _set_environment(wandb, xla_flags, compilation_cache_dir, multi_host)
+    if cluster is not None and multi_host is False:
+        raise ValueError(f"multi_host=False joins no pool, and the run names {cluster.name!r}'s; drop one")
+    environment = cluster if cluster is not None or multi_host is False else detected_environment()
+    joins = cluster is not None or joins_pool(multi_host, environment)
+    _set_environment(wandb, xla_flags, compilation_cache_dir, joins)
     _raise_limits()
-    _join_process_pool(multi_host)
+    _join_process_pool(environment, joins)
     ready_process()
     _log.info("Number of devices: %s", jax.device_count())
 
@@ -139,10 +141,10 @@ def ready_process() -> None:
 
 
 def _set_environment(wandb: Wandb | None, xla_flags: str | None,
-                     compilation_cache_dir: str | None, multi_host: bool | None = None) -> None:
+                     compilation_cache_dir: str | None, joins: bool = False) -> None:
     """The env vars wandb and the tokenizers read, the run's XLA flags and
     Dew's defaults beside them, the GPU pool's share sized to leave its
-    communicators room (`dew.communicators`, a process of one host
+    communicators room (`dew.communicators`, a process that `joins` no pool
     alone), and the compilation cache: everything read before a backend opens."""
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
@@ -161,7 +163,7 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
                      "whose XLA may have parsed its flags since: they are unproven. Set XLA_FLAGS before "
                      "the process starts, as `dew train` does, to make them certain", xla_flags)
     preallocate_gpu_pool()
-    if not joins_pool(multi_host, pool_cluster(multi_host)):
+    if not joins:
         communicators.hold(communicators.sized_pool())
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
@@ -182,46 +184,35 @@ def _raise_limits() -> None:
         resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
 
 
-def _join_process_pool(multi_host: bool | None) -> None:
-    """Join the JAX process pool the environment describes, if any.
+def _join_process_pool(environment: ClusterEnvironment | None, joins: bool) -> None:
+    """Join the JAX process pool `environment` describes, where the process `joins` one.
 
-    jax.distributed.initialize() finds the coordinator from the environment on
-    TPU pods and Slurm/GKE/Open MPI clusters. `dew launch` leaves the process
-    count and rank in DEW_PROCESS_COUNT and DEW_PROCESS_ID, which jax has no
-    variable for, and those are passed to it with JAX's cluster detection
-    off: the launcher placed its processes, and a Slurm step around it would
-    otherwise pin each to the GPU at SLURM_LOCALID. A process that nothing
-    declares a pool for (no cluster JAX would detect, no process count or
+    The environment states its scheduler's facts and leaves the rest to JAX's
+    own detection of it (`dew.clusters.Joining`): a Slurm step's or an Open
+    MPI run's coordinator, a Cloud TPU's whole place. `dew launch` states its
+    pool whole, and JAX's detection is turned off for it: the launcher placed
+    its processes, and a Slurm step around it would otherwise pin each to the
+    GPU at SLURM_LOCALID. A process that joins none (no scheduler, no
     coordinator a launcher set) runs alone without asking JAX; every failure
     to join a pool propagates, since a pod run would otherwise continue on
-    one host. multi_host=True
-    requires the pool, multi_host=False never asks for it. A Slurm step of
-    one task forms no pool unless the run asks for one with multi_host=True
-    or mpirun started its ranks there, which JAX's detection reads before
-    Slurm's: JAX would still start a pool of that one task, at a coordinator
-    named after the node, which a container on the node need not resolve.
-    A Slurm step of several tasks with fewer on this node than the GPUs its
-    task sees is refused: JAX gives each task the GPU at its SLURM_LOCALID,
-    and the others would sit idle.
+    one host. A Slurm step of one task forms no pool unless the run asks for
+    one (`dew._pool.joins_pool`): JAX would still start a pool of that one
+    task, at a coordinator named after the node, which a container on the
+    node need not resolve. A Slurm step of several tasks with fewer on this
+    node than the GPUs its task sees is refused: JAX gives each task the GPU
+    at its SLURM_LOCALID, and the others would sit idle.
     """
-    # The cluster JAX's detection would take, in its own order: Open MPI's
-    # ranks when mpirun started them, then Slurm's tasks.
-    cluster = pool_cluster(multi_host)
+    joining = None if environment is None else environment.joining()
     tasks = slurm_tasks_here()
-    if (cluster is not None and cluster.name == "slurm" and cluster.count > 1 and tasks is not None
-            and runs_on_gpu(os.environ)):
+    if (environment is not None and environment.name == "slurm" and joining is not None
+            and (joining.process_count or 0) > 1 and tasks is not None and runs_on_gpu(os.environ)):
         # Before joining: a pool whose ranks see GPUs they will not use
         # trains on fewer than it was given, and nothing reports it.
         gpus = communicators.local_gpus()
         refuse_idle_gpus(tasks, None if gpus is None else len(gpus), "this slurm step")
-    if not joins_pool(multi_host, cluster):
+    if not joins:
         return
-    if PROCESS_COUNT in os.environ:
-        jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
-                                   process_id=int(os.environ[PROCESS_ID]),
-                                   cluster_detection_method="deactivate")
-    else:
-        jax.distributed.initialize()
+    jax.distributed.initialize(**({} if joining is None else joining.arguments()))
     _joined()
 
 
