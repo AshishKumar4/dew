@@ -542,6 +542,25 @@ def test_a_gemm_writes_in_its_bias_only_where_it_is_its_one_reader():
     assert (peak(alone), peak(read_before)) == (matrix, 2 * matrix + 4)
 
 
+def test_a_loops_slice_offset_computed_through_a_product_and_its_sum_is_evaluated():
+    """A loop's slice offset computed from its counter through a product and a sum, which the derivation
+    reads as one product with its bias (`biased`), is evaluated as the product plus its bias
+    (`compiled_program._evaluated`, as XLA's evaluator finds a slice's offset at each turn), where binding
+    the three operands to a product raised (review of row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    def program(x):
+        def turn(counter, total):
+            matrix = jnp.broadcast_to(counter.astype(jnp.float32), (16, 16))
+            offset = jnp.sum(matrix @ matrix + matrix).astype(jnp.int32)
+            return total + jnp.sum(jax.lax.dynamic_slice(x, (offset,), (64,)))
+        return jax.lax.fori_loop(jnp.int32(0), jnp.int32(4), turn, jnp.float32(0))
+
+    traced = jax.make_jaxpr(program)(jax.ShapeDtypeStruct((32768,), jnp.float32)).jaxpr
+    derived = peak_bytes(simplified(traced, "gpu"), "gpu", Workspace(0, 0))
+    assert derived >= 0
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
