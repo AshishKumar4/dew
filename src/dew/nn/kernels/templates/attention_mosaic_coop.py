@@ -1,9 +1,9 @@
 """The attention template's Mosaic GPU fused backward over shared keys (`attention_mosaic_backward`): the fast
-form's one launch of a hookless call whose consumers share one key block, each forming the logits and score
-cotangents of its share of the keys, the weights and cotangents exchanged through shared memory, and each
-holding its share of the head's columns of dK, dV and dQ (FlashAttention 3's sm90 backward at width 256,
-hopper/flash_bwd_launch_template.h's run_mha_bwd_hdim256: two MMA warpgroups splitting dK's, dV's and dQ's
-columns, one stage of dO and dS)."""
+form's one launch of a call whose score hook takes no parameters and whose consumers share one key block,
+each forming the logits and score cotangents of its share of the keys, the weights and cotangents exchanged
+through shared memory, and each holding its share of the head's columns of dK, dV and dQ (FlashAttention
+3's sm90 backward at width 256, hopper/flash_bwd_launch_template.h's run_mha_bwd_hdim256: two MMA
+warpgroups splitting dK's, dV's and dQ's columns, one stage of dO and dS)."""
 
 import functools
 

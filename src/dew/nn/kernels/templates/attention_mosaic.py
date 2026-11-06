@@ -927,8 +927,10 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         carried = [(block_k, width // share, jnp.float32), (block_k, value_width // share, jnp.float32)]
         products = [(block_q, block_k // share, jnp.float32)] * 2 + [(block_q, block_k // share, jnp.int8)]
         statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
-        return resources.live_registers(family, carried, products, [(block_q, width // share, jnp.float32)]
-                                        ) + statistics
+        # A score hook's pullback (its slopes, `gradient.pulled`) beside the output cotangents' product.
+        pullback = products[1:] + [(block_q, block_k // share, jnp.float32)] * slopes
+        return resources.live_registers(family, carried, products, pullback,
+                                        [(block_q, width // share, jnp.float32)]) + statistics
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
     if config.fused and not split and not config.shared_dq:
@@ -1034,12 +1036,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # layout or keys first on one whose consumers share a key block (`split_queries`), each consumer's
         # share of a slot's queries a warpgroup MMA's rows (dQ's product's M), or keys first each consumer
         # its own keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`). A score hook's
-        # only queries first, each consumer its own keys, and one of no parameters, whose gradients no
-        # launch writes (Gemma 2's softcap, FlashAttention 3's).
+        # only queries first, and one of no parameters, whose gradients no launch writes (Gemma 2's softcap,
+        # FlashAttention 3's; at width 256 its consumers sharing a key block, `attention_mosaic_coop`).
         hooked = (bool(self.score_kinds) or ba.arguments["initial"] is not None
                   or ba.arguments["drop"] is not None)
-        if (config.fused and self.score_mod is not None
-                and not (config.queries_first and not config.shared_keys)):
+        if config.fused and self.score_mod is not None and not config.queries_first:
             return False
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         dkv_family = found.get(config.dkv.family)
