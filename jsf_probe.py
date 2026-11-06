@@ -75,3 +75,41 @@ for kernel in ('xla', 'mosaic_gpu'):
     rel = np.max(np.sqrt(np.mean(delta ** 2, axis=-1)) /
                  np.maximum(np.sqrt(np.mean(truth ** 2, axis=-1)), 1e-30))
     print('K', sys.argv[1:], kernel, 'rms', rms, 'worst-row', rel, flush=True)
+
+if mode == 'capture':
+    captured = {}
+    def capture(name, labels):
+        plain = getattr(ML, name)
+        def wrapped(*args, **kwargs):
+            out = plain(*args, **kwargs)
+            call = kwargs.get('call')
+            if call is None:
+                call = next(a for a in args if isinstance(a, ML.Call))
+            used = ['A'] if name == '_solved' and len(out) == 1 else labels
+            for label, value in zip(used, out):
+                if value is None:
+                    continue
+                parts = 1 if label == 'F' else call.held.parts
+                def save(v, label=label, parts=parts):
+                    v = np.asarray(v, np.float64)
+                    captured[label] = v.reshape(parts, -1, v.shape[-1]).sum(0)
+                jax.debug.callback(save, value)
+            return out
+        setattr(ML, name, wrapped)
+    capture('_solved', ['A', 'W', 'U'])
+    capture('_weighted', ['W', 'U'])
+    capture('_states', ['H', 'C', 'F'])
+    # New jit identity, because the earlier plain run had no callbacks.
+    def captured_run():
+        return jax.jit(lambda y: jax.vjp(lambda z: T.chunk_on('mosaic_gpu', hooks, z), y)[0])(x)
+    captured_run()
+    jax.effects_barrier()
+    baseline = dict(captured)
+    ML._parts = lambda dtype, family, fast=False: 3
+    captured.clear()
+    captured_run()
+    jax.effects_barrier()
+    for label in baseline:
+        a, b = baseline[label], captured[label]
+        print('K launch', label, a.shape, 'base-full3 rms',
+              np.sqrt(np.mean((a-b)**2)), 'size', np.sqrt(np.mean(b*b)), flush=True)
