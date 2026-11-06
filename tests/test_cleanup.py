@@ -89,6 +89,45 @@ def test_a_group_whose_leader_was_reaped_is_signalled_only_where_its_owner_start
         owned.stdout.close()
 
 
+def test_a_group_whose_owner_is_killed_before_its_lifeline_knows_it_ends_with_its_owner(tmp_path):
+    """An owner killed between its group's start and its lifeline's reading the group's id (the window an
+    owner busy elsewhere, its other thread holding the interpreter, keeps open while its command already
+    runs) takes the group with it: the command runs only once its lifeline holds the group (row 4395),
+    where the group had outlived its owner in its session of its own. The command here kills the owner
+    itself, as soon as it runs."""
+    recorded = tmp_path / "pid"
+    command = ["sh", "-c", f'echo $$ > {recorded}; kill -9 "$PPID"; exec sleep 600']
+    program = ("import random, sys, threading, time\n"
+               "from dew._cleanup import start\n"
+               "numbers = [random.random() for _ in range(2_000_000)]\n"
+               "def busy():\n"
+               "    while True:\n"
+               "        sorted(numbers)\n"
+               "threading.Thread(target=busy, daemon=True).start()\n"
+               f"start({command!r})\n"
+               "time.sleep(600)\n")
+    owner = subprocess.Popen([sys.executable, "-c", program], start_new_session=True)
+    try:
+        assert owner.wait(timeout=120) == -signal.SIGKILL
+        command_pid = int(recorded.read_text())
+        try:
+            assert gone_within(command_pid, 30)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(command_pid, signal.SIGKILL)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(owner.pid, signal.SIGKILL)
+        owner.wait()
+
+
+def test_a_started_command_that_cannot_execute_raises_its_error_as_popen_does_and_leaves_no_group():
+    """A program `start` cannot execute raises from `start` the error Popen raises for it, naming it."""
+    with pytest.raises(FileNotFoundError) as raised:
+        start(["a-program-no-path-holds"], stdout=subprocess.PIPE)
+    assert raised.value.filename == "a-program-no-path-holds"
+
+
 class Own(Exception):
     """A block's own error, which no cleanup failure may replace."""
 
