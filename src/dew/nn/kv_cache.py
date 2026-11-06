@@ -671,15 +671,19 @@ class KVStore:
                          named='auto')
         return not next(kernel for kernel in PAGED.kernels if kernel.name == 'template').failed(case)
 
-    def attend_rows(self, query: jax.Array, spans, sources: jax.Array, softcap: float | None) -> jax.Array:
+    def attend_rows(self, query: jax.Array, spans, sources: jax.Array, softcap: float | None,
+                    sinks: jax.Array | None = None) -> jax.Array:
         """`query` `[B, T, H, D]` through the attention template's decode over this cache's rows
         (`attends_rows`):
         batch row `b` over row `sources[b]`'s keys under `spans` (`attention.KeySpans`), read where they
-        lie: a dense cache's rows by `sources`, a paged pool's by those rows' tables. One call over a serving
-        step's work list (ledger 3623)."""
+        lie: a dense cache's rows by `sources`, a paged pool's by those rows' tables, each query head from
+        its sink's value-free logit where the layer has `sinks` `[H]`. One call over a serving step's work
+        list (ledger 3623)."""
         from dew.nn.kernels.templates import attention as template, attention_decode
 
-        hooks = template.Hooks(None if softcap is None else template.Capped(softcap))
+        initial = None if sinks is None else template.sinks(sinks, query.shape[0], query.shape[1],
+                                                             self._get(self.payloads[-1][0]).shape[-1])
+        hooks = template.Hooks(None if softcap is None else template.Capped(softcap), initial=initial)
         interpret = generation.placed_platform() != "gpu"
         if self.layout.page_size is None:
             keys, values = self.read()

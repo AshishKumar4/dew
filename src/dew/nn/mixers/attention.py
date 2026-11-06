@@ -131,8 +131,7 @@ def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool, bidirectional_ima
         "a quantized or rotated cache": (layout.quantized is not None
                                           or layout.key_rotation(ctx.head_dim) is not None),
         "a page pool split into groups": layout.page_size is not None and layout.groups != 1,
-        "a sliding window or chunk": ctx.sliding_window is not None or ctx.attention_chunk is not None,
-        "attention sinks": ctx.attention_sinks,
+        "an attention chunk": ctx.attention_chunk is not None,
         "ALiBi": alibi,
         "keys shared from another layer": ctx.kv_shared,
         "bidirectional attention": not ctx.causal,
@@ -1398,16 +1397,25 @@ class CausalSelfAttention(nn.Module):
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
+        # A windowed layer's window where it narrows the cache: each decoding row from its first key under
+        # it (`_decode_masks`, a block read whole from its start), each piece's query over its own window.
+        window = self.ctx.sliding_window
+        window = None if window is None or window >= self.ctx.max_seq_len else window
+        history = {name: store.read_groups(name)[:rows] for name in groups}
+        starts = (None if window is None else
+                  self._decode_masks(positions[:rows, None], rows, self.ctx.max_seq_len, None, history)[1])
         # A piece reading its groups whole sees its group's keys past its own slot (`visibility_mask`), which
         # the work list's spans, each its query's slot, do not state: its keys by the mask below.
         if not groups and self._one_work_list(store, query):
-            return self._worked(store, query, index.value, positions[:rows], prompt, admitted.slots)
-        if self._pages(store, query[0, :rows], windowed=False):
-            decoded = store.decode(query[0, :rows], held_reads(index.value, positions[:rows]),
-                                   self.ctx.attn_logit_softcap)
+            return self._worked(store, query, index.value, positions[:rows], prompt, admitted.slots, starts,
+                                window)
+        reads = held_reads(index.value, positions[:rows])
+        if self._pages(store, query[0, :rows], windowed=starts is not None, sunk=self.sinks is not None):
+            decoded = store.decode(query[0, :rows], reads, self.ctx.attn_logit_softcap, starts, self.sinks)
             decoded = checkpoint_name(decoded[:, None], 'context')
         else:
-            decoded = self._decode_attention(query[0, :rows, None], *store.read(), positions[:rows])
+            decoded = self._decode_attention(query[0, :rows, None], *store.read(), positions[:rows], starts,
+                                             self.sinks)
         queries = query[0, rows:].reshape(pieces, width, *query.shape[2:])
         if admitted.continuing:
             # A padding piece's row is past the cache's; it reads row 0 and is never drawn from.
@@ -1423,7 +1431,7 @@ class CausalSelfAttention(nn.Module):
             key_groups = {name: held[rows:].reshape(pieces, width) for name, held in groups.items()}
         # Each query's keys up to its own slot, widened by the groups it reads whole as a prefill's are
         # (`visibility_mask`: a block or an image holding its key runs on to its end).
-        keep = visibility_mask(width, keys.shape[1], causal=True, sliding_window=None, key_valid=real,
+        keep = visibility_mask(width, keys.shape[1], causal=True, sliding_window=window, key_valid=real,
                                query_slots=slots, block_groups=key_groups.get("block_groups"),
                                image_groups=key_groups.get("image_groups"))
         # A padding query reads one key, so its (unused) output stays finite.
@@ -1432,7 +1440,7 @@ class CausalSelfAttention(nn.Module):
             queries, keys, values, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
             implementation=self._mask_kernel(queries, keys, decode=True), causal=False, mask=keep,
-            softcap=self.ctx.attn_logit_softcap)
+            softcap=self.ctx.attn_logit_softcap, sinks=self.sinks)
         return jnp.concatenate([decoded.reshape(1, rows, *decoded.shape[2:]),
                                 prefilled.reshape(1, -1, *prefilled.shape[2:])], axis=1)
 
@@ -1440,7 +1448,7 @@ class CausalSelfAttention(nn.Module):
         """Whether a mixed call's attention runs as one work list through the attention template (`_worked`):
         where the attention selector takes the template for the call's queries over its cache
         (`attention_kernels.ATTENTION`) and the template reads the cache's rows (`KVStore.attends_rows`)."""
-        if self.ctx.attention_sinks or not store.attends_rows(query, self.ctx.attn_logit_softcap):
+        if not store.attends_rows(query, self.ctx.attn_logit_softcap):
             return False
         keys = jax.ShapeDtypeStruct((1, self.ctx.max_seq_len, self.ctx.num_kv_heads, self.ctx.head_dim),
                                     query.dtype)
@@ -1450,12 +1458,15 @@ class CausalSelfAttention(nn.Module):
         return select(ATTENTION, case, None if self.ctx.attention_impl == 'auto'
                       else self.ctx.attention_impl).kernel == 'template'
 
-    def _worked(self, store: KVStore, query, index, positions, prompt, slots) -> jax.Array:
+    def _worked(self, store: KVStore, query, index, positions, prompt, slots, starts=None,
+                window: int | None = None) -> jax.Array:
         """A mixed call's attention as one work list (ledger 3623): its decoding rows' one query each and its
         prompt pieces' queries, a batch row each, `[rows + pieces, W]`, through the attention template's
         decode over the cache's rows where they lie (`KVStore.attend_rows`): a decoding row over its row's
-        filled slots (`held_reads`), a piece's query over its row's slots up to its own (its prefix and its
-        own earlier keys, written this step), a padding query over none. No mask, no row copied."""
+        filled slots (`held_reads`) from its window's first key (`starts`), a piece's query over its row's
+        slots up to its own (its prefix and its own earlier keys, written this step) within the layer's
+        `window`, a padding query over none, each head from its sink where the layer has them. No mask, no
+        row copied."""
         rows, (pieces, width) = index.shape[0], prompt.shape
         # A padding piece's row is past the cache's; it reads row 0 over no key.
         sources = jnp.concatenate([jnp.arange(rows, dtype=jnp.int32), jnp.where(slots < rows, slots, 0)])
@@ -1463,8 +1474,12 @@ class CausalSelfAttention(nn.Module):
         queries = jnp.concatenate([decoding, query[0, rows:].reshape(pieces, width, *query.shape[2:])])
         decoded = jnp.zeros((rows, width), jnp.int32).at[:, 0].set(held_reads(index, positions))
         ends = jnp.concatenate([decoded, jnp.where(prompt >= 0, prompt + 1, 0)])
-        spans = template.KeySpans(jnp.zeros_like(ends), ends, None, None, keys=self.ctx.max_seq_len)
-        out = store.attend_rows(queries, spans, sources, self.ctx.attn_logit_softcap)
+        firsts = jnp.zeros_like(ends)
+        if window is not None:
+            firsts = jnp.concatenate([jnp.zeros((rows, width), jnp.int32).at[:, 0].set(starts),
+                                      jnp.maximum(ends[rows:] - window, 0)])
+        spans = template.KeySpans(firsts, ends, None, None, keys=self.ctx.max_seq_len)
+        out = store.attend_rows(queries, spans, sources, self.ctx.attn_logit_softcap, self.sinks)
         return jnp.concatenate([out[:rows, :1].reshape(1, rows, *out.shape[2:]),
                                 out[rows:].reshape(1, pieces * width, *out.shape[2:])], axis=1)
 
