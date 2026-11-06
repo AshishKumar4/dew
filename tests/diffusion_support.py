@@ -172,7 +172,8 @@ def trained_step(objective, batch, checkpoints=None):
     from dew.training import Trainer
 
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3), checkpoints=checkpoints)
-    initial = trainer.initial_state()
+    # Placed as a run places it, its init one program rather than each of its operations apart.
+    initial, _, _ = trainer.place()
     fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
 
     @jax.jit
@@ -217,7 +218,8 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
     task = config.build()
     batch = batch(task) if callable(batch) else batch
     trainer = Trainer(task, optax.adam(rate), key=jax.random.PRNGKey(key))
-    state = trainer.initial_state()
+    # Placed as a run places it, its init one program rather than each of its operations apart.
+    state, _, _ = trainer.place()
     state, *_ = trainer.compile(state, batch)(state, batch)
     checkpoints = Checkpoints(str(directory))
     checkpoints.save(1, state, None, artifact=task.inference_record())

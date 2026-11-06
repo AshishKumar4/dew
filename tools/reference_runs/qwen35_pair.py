@@ -2,11 +2,14 @@
 """Run Dew and the pinned torch reference consecutively in this session.
 
 Each round starts fresh processes from this checkout on the same device, with
-the same weights/seed and a 20-warmup/200-timed-step window. Only the window's
-endpoint-synchronized wall throughput decides the gate. Two or more rounds
-measure min-max throughput spread; per-step event/synchronized diagnostics
-never enter the ratio. A deficit beyond the larger relative spread fails.
-Within-spread differences mean level, not evidence of a speedup.
+the same weights/seed and a 20-warmup/200-timed-step window: Dew's, torch's, and
+torch's again (`torch~aa`, its A/A), in an order drawn at random each round and
+kept. Only the window's endpoint-synchronized wall throughput decides the gate:
+each round's Dew over its torch, judged against each round's torch~aa over its
+torch by Dew's one judgment of a time against another
+(`dew.telemetry.benchmark.judged`, `performance_verdict`); per-step
+event/synchronized diagnostics never enter the ratio. Dew slower, the judgment
+differing below 1, fails; level means no difference found, not parity proven.
 
 Use --torch-python /path/to/pinned/bin/python; the reference validates its
 complete lock before running. The caller's interpreter supplies Dew unless
@@ -20,6 +23,7 @@ import argparse
 import json
 import math
 import os
+import secrets
 import statistics
 import subprocess
 import sys
@@ -30,26 +34,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
-def performance_verdict(dew: list[float], torch: list[float]) -> dict:
-    """Judge repeated-window throughputs; missing/invalid samples never pass.
+ROUNDS = 6
+"""The pairing's rounds unless it names its own: the fewest whose ratios reach an interval at `LEVEL`."""
+LEVEL = 0.95
+ARMS = ("dew", "torch", "torch~aa")
+"""The pairing's arms: Dew's step, torch's, and torch's again, its A/A, each round."""
 
-    The band is the larger framework's full observed throughput range divided
-    by its median. There is no arbitrary percentage floor and no per-step
-    noise substituted for window noise. At least two windows on each side are
-    needed to observe a spread. A level verdict allows statistical parity,
-    not the assertion that Dew is faster.
-    """
-    if len(dew) != len(torch) or any(len(samples) < 2 or any(
-            not math.isfinite(value) or value <= 0 for value in samples) for samples in (dew, torch)):
-        raise ValueError("need equal counts of at least two finite positive window throughputs")
-    medians = [statistics.median(samples) for samples in (dew, torch)]
-    band = max((max(samples) - min(samples)) / median
-               for samples, median in zip((dew, torch), medians, strict=True))
-    ratio = medians[0] / medians[1]
-    state = "slower" if ratio < 1 - band else "faster" if ratio > 1 + band else "level"
-    return {"verdict": state, "passed": state != "slower", "dew_over_torch": ratio,
-            "tolerance": band, "dew_tokens_per_s": medians[0], "torch_tokens_per_s": medians[1],
-            "spread_scope": "min-max of repeated endpoint-synchronized window throughputs"}
+
+def framework_of(arm: str) -> str:
+    """The framework an arm runs: `torch~aa` runs torch's step, as torch, and is validated as torch's."""
+    return arm.removesuffix("~aa")
+
+
+def performance_verdict(dew: list[float], torch: list[float], alone: list[float]) -> dict:
+    """Judge repeated-window throughputs, a round's each: each round's Dew over its torch, against each
+    round's torch~aa over its torch (`dew.telemetry.benchmark.judged` at `LEVEL`). Dew is slower where the
+    judgment differs below 1, faster where it differs above it, and level otherwise: no difference found,
+    not parity proven. Missing or invalid samples never pass; too few rounds reach no interval and raise."""
+    from dew.telemetry import benchmark
+
+    if not len(dew) == len(torch) == len(alone) or any(
+            not math.isfinite(value) or value <= 0 for samples in (dew, torch, alone) for value in samples):
+        raise ValueError("need equal counts of finite positive window throughputs, one an arm a round")
+    judged = benchmark.judged([mine / theirs for mine, theirs in zip(dew, torch, strict=True)],
+                              [again / theirs for again, theirs in zip(alone, torch, strict=True)],
+                              level=LEVEL)
+    state = "level" if not judged.differs else "slower" if judged.interval[1] < 1 else "faster"
+    return {"verdict": state, "passed": state != "slower", "dew_over_torch": judged.ratio,
+            "interval": list(judged.interval), "alone": list(judged.alone), "differs": judged.differs,
+            "rounds": len(dew), "dew_tokens_per_s": statistics.median(dew),
+            "torch_tokens_per_s": statistics.median(torch),
+            "spread_scope": "each round's endpoint-synchronized window throughputs, paired"}
 
 
 def compare(records: dict[str, list[dict]], session: str, smoke: bool) -> dict:
@@ -64,9 +79,10 @@ def compare(records: dict[str, list[dict]], session: str, smoke: bool) -> dict:
     expected = {**workload(config["seed"], config["vocab"], config["hidden"], config["batch"],
                           config["sequence"], smoke, config["warmup"], config["steps"]),
                 "work": reference["work"]}
-    for framework, rounds in records.items():
+    for arm, rounds in records.items():
         for record in rounds:
-            if record["framework"] != framework or record["session"] != session or record["smoke"] != smoke:
+            if (record["framework"] != framework_of(arm) or record["session"] != session
+                    or record["smoke"] != smoke):
                 raise ValueError("record belongs to a different framework, session or smoke mode")
             if record["commit"] != reference["commit"]:
                 raise ValueError("checkout changed during the paired session")
@@ -90,9 +106,9 @@ def compare(records: dict[str, list[dict]], session: str, smoke: bool) -> dict:
                 raise ValueError("missing whole-run peak")
             if not record["checks"]["finite_losses"] or not record["checks"]["no_timing_window_compilation"]:
                 raise ValueError("non-finite loss or compilation in timing window")
-    rates = {framework: [record["steady"]["window_tokens_per_s"] for record in rounds]
-             for framework, rounds in records.items()}
-    decision = performance_verdict(rates["dew"], rates["torch"])
+    rates = {arm: [record["steady"]["window_tokens_per_s"] for record in rounds]
+             for arm, rounds in records.items()}
+    decision = performance_verdict(rates["dew"], rates["torch"], rates["torch~aa"])
     return {**decision, "performance_claim_passed": decision["passed"] and not smoke,
             "speedup_claim_passed": decision["verdict"] == "faster" and not smoke,
             "window_tokens_per_s": rates,
@@ -108,13 +124,18 @@ def arguments(argv=None):
     parser.add_argument("--torch-python", required=True)
     parser.add_argument("--dew-python", default=sys.executable)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--rounds", type=int, default=ROUNDS)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--claim", action="store_true")
     parser.add_argument("--seed", type=int, default=17)
     args = parser.parse_args(argv)
-    if args.rounds < 2:
-        parser.error("at least two windows per framework are required to measure spread")
+    from dew.telemetry import benchmark
+
+    try:
+        # The judgment's own word on whether these rounds can reach an interval, before any runs.
+        benchmark.judged([1.0] * args.rounds, [1.0] * args.rounds, level=LEVEL)
+    except ValueError as few:
+        parser.error(f"--rounds {args.rounds}: {few}")
     if args.claim and args.smoke:
         parser.error("CPU smoke cannot qualify a performance claim")
     return args
@@ -130,7 +151,7 @@ def run(args) -> int:
     directory = args.out.with_suffix("")
     directory.mkdir(parents=True, exist_ok=False)
     session = str(uuid.uuid4())
-    records = {"torch": [], "dew": []}
+    records: dict[str, list[dict]] = {arm: [] for arm in ARMS}
     result = {"schema": "dew.qwen35-pair.v1", "session": session, "smoke": args.smoke,
               "commit": git_head(root), "host": host(), "started_ns": time.time_ns(),
               "records": records, "commands": [], "comparison": None}
@@ -143,25 +164,39 @@ def run(args) -> int:
         command += ["--smoke", "--dtype", "float32"]
     counted = subprocess.run(command, cwd=root, env=environment, check=True)
     result["commands"].append({"argv": command, "returncode": counted.returncode})
+    fixture = directory / "tiny"
+
+    def step(arm: str, out: Path, *extra: str) -> int:
+        """`arm`'s step in a fresh process, its record at `out`, as its framework runs it (`framework_of`)."""
+        framework = framework_of(arm)
+        script = root / "tools/reference_runs" / f"{framework}_qwen35_step.py"
+        if not script.is_file():
+            script = Path(__file__).resolve().with_name(script.name)
+        command = [args.torch_python if framework == "torch" else args.dew_python, str(script),
+                   "--out", str(out), "--work", str(work), "--seed", str(args.seed), "--session", session,
+                   *(["--smoke", "--warmup", "3", "--steps", "4"] if args.smoke else []), *extra]
+        done = subprocess.run(command, cwd=root, env=environment, check=False)
+        result["commands"].append({"argv": command, "returncode": done.returncode})
+        return done.returncode
+
+    # A smoke's tiny checkpoint, seeded, exported by torch's step before the session, so that whichever arm a
+    # round draws first, Dew's step loads the weights torch's start from.
+    if args.smoke and step("torch", directory / "fixture.json", "--smoke-fixture", str(fixture)):
+        result["error"] = "torch's step did not export the smoke's checkpoint"
+        write_record(args.out, result)
+        return 1
+    places = secrets.SystemRandom()
+    result["orders"] = []
     for round_ in range(args.rounds):
-        for framework in ("torch", "dew"):
-            out = directory / f"{round_}-{framework}.json"
-            script = root / "tools/reference_runs" / f"{framework}_qwen35_step.py"
-            if not script.is_file():
-                script = Path(__file__).resolve().with_name(script.name)
-            command = [args.torch_python if framework == "torch" else args.dew_python,
-                       str(script),
-                       "--out", str(out), "--work", str(work), "--seed", str(args.seed), "--session", session]
-            if args.smoke:
-                command += ["--smoke", "--smoke-fixture", str(directory / f"tiny-{round_}"),
-                            "--warmup", "3", "--steps", "4"]
-            done = subprocess.run(command, cwd=root, env=environment, check=False)
-            result["commands"].append({"argv": command, "returncode": done.returncode})
-            if done.returncode:
-                result["error"] = f"{framework} round {round_} exited {done.returncode}"
+        order = places.sample(ARMS, len(ARMS))
+        result["orders"].append(order)
+        for arm in order:
+            out = directory / f"{round_}-{arm}.json"
+            if step(arm, out, *(["--smoke-fixture", str(fixture)] if args.smoke and arm == "dew" else [])):
+                result["error"] = f"{arm} round {round_} exited {result['commands'][-1]['returncode']}"
                 write_record(args.out, result)
                 return 1
-            records[framework].append(json.loads(out.read_text()))
+            records[arm].append(json.loads(out.read_text()))
             write_record(args.out, result)
     result["finished_ns"] = time.time_ns()
     try:

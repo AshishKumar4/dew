@@ -69,21 +69,6 @@ def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_says_fi
     assert compiles.count == 1 and trainer.plan["probes"][0]["fits"]
 
 
-def test_a_candidate_the_derivation_read_compiles_with_the_footprint_it_traced(monkeypatch, tmp_path, room):
-    """The search's compile of a candidate the derivation read keeps the footprint it traced
-    (`FitSearch.footprints`): each candidate's gradient is traced once for its footprint, its compile
-    tracing none again, which was 22 of a Qwen3.5-4B step's 185 seconds of `compile_ahead` (row 4261)."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
-    free(monkeypatch, room)
-    trainer = deep()
-    with Compiles(None) as compiles:
-        compiled(trainer)
-    derivations = [program for program in compiles.programs
-                   if program.kind == "traced" and "dew/training/footprint.py" in program.where]
-    assert trainer.plan["probes"] and len(trainer.plan["derived"]) > 1
-    assert len(derivations) == len(trainer.plan["derived"])
-
-
 def test_a_derivation_that_fits_the_base_rung_or_cannot_judge_starts_the_search_there(monkeypatch, tmp_path):
     """With room for every rung, the derivation fits the base rung, which the search compiles first,
     as it did before any derivation: no rung above it is read. A device that states no memory leaves

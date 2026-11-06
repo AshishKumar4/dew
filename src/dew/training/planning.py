@@ -974,17 +974,25 @@ class FitSearch[LossT, EffectsT]:
         (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
         (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
         else untouched. A run that inspects compiles the candidate's sampled step too
-        (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
+        (`Candidate.sampled`), at once with the step (`report.attempts`), or takes the one compiled ahead
+        with the step (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
         options = self.compiled_options(candidate)
         taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
+        early, firsts, relowered = None, [], None
         if ahead is not None:
             executable, self.ahead = ahead.taken(candidate.lowered), None
         else:
+            # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
+            # its compile kept only where the step fits, as the step's own is kept first.
+            early = None if candidate.sampled is None else candidate.sampled()
+            firsts = report.attempts([(candidate.lowered, options)]
+                                     + ([] if early is None else [(early, options)]))
             relowered = Relowered(lambda: self.relowering(split))
-            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
+            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
+                                             first=firsts[0])
             candidate = relowered.candidate(candidate)
             if relowered.last is not None:
                 # A spill's refusal changes the configs every derivation traced: each is traced again.
@@ -998,7 +1006,10 @@ class FitSearch[LossT, EffectsT]:
                 sampled = candidate.sampled()
             self.sampled = SampledStep(ahead.sampled.program, ahead.sampled.taken(sampled, jax.devices()))
         elif fit and candidate.sampled is not None:
-            lowered = [candidate.sampled()]
+            # The one compiled beside the step's, but where the step was lowered afresh past a spill, which
+            # its sampled step is then too, as one lowered after the step's compile would be.
+            beside = early if relowered is not None and relowered.last is None else None
+            lowered = [candidate.sampled() if beside is None else beside]
 
             def resampled() -> jax.stages.Lowered:
                 """The sampled step lowered afresh, its launches derived past a spilled one's config."""
@@ -1006,7 +1017,8 @@ class FitSearch[LossT, EffectsT]:
                 assert again is not None
                 lowered.append(again())
                 return lowered[-1]
-            compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled)
+            compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
+                                           first=None if beside is None else firsts[1])
             if len(lowered) > 1:
                 self.footprints.clear()
             self.sampled = None if compiled is None else SampledStep(program_of(lowered[-1]), compiled)

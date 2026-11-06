@@ -53,6 +53,7 @@ from dew.interop.decoder_parts import (
     nested_ramp,
     partial_rope_entry,
     plain_partial_rope,
+    prediction_name,
     prediction_path,
     record_int,
     refuse,
@@ -479,20 +480,20 @@ def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
 def _mimo_v2_name(dew_name: str, config: Mapping[str, object]) -> str | None:
     """`_mimo_v2_path` backwards: a prediction depth's leaf under its `model.mtp.layers.{d}.` name, any
     other under the shared map's."""
-    parts = dew_name.split('.')
-    if not parts[0].startswith('mtp_'):
+    if not dew_name.startswith('mtp_'):
         return renamed_name(_NAMES, dew_name, config)
-    stem = f"model.mtp.layers.{parts[0].removeprefix('mtp_')}."
-    own = {path: name for name, path in _PREDICTION_LEAVES.items()}.get(tuple(parts[1:]))
-    if own is not None:
-        return stem + own
-    trunk = renamed_name(_NAMES, '.'.join(('layers_0', *parts[2:])), config)
-    if trunk is None:
-        return None
-    tail = trunk.removeprefix('model.layers.0.')
-    for vllm, layer in _PREDICTION_NAMES:
-        tail = tail.replace(layer, vllm)
-    return stem + tail
+
+    def block(path: tuple[str, ...]) -> str | None:
+        trunk = renamed_name(_NAMES, '.'.join(('layers_0', *path)), config)
+        if trunk is None:
+            return None
+        tail = trunk.removeprefix('model.layers.0.')
+        for vllm, layer in _PREDICTION_NAMES:
+            tail = tail.replace(layer, vllm)
+        return tail
+
+    depth, tail = prediction_name(dew_name, 'mtp', _PREDICTION_LEAVES, block)
+    return None if tail is None else f"model.mtp.layers.{depth}.{tail}"
 
 
 def _mimo_v2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:

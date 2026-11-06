@@ -44,6 +44,7 @@ from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.backbones.layer_names import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
 from dew.nn.kernels.options import program
+from dew.nn.protocols import BankedStacks
 
 if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
@@ -79,7 +80,7 @@ class LayerBanks(Protocol):
         """
         ...
 
-    def place(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
+    def place(self, model: BankedStacks, *, mesh: MeshSpec | Mesh | None = None,
               layout: Layout | None = None) -> Variables:
         """Build, from these weights, the banked store that `model`'s runs read.
 
@@ -98,7 +99,7 @@ class LayerBanks(Protocol):
         return _stored(self, model, mesh, layout, self.entry, self.bank)
 
 
-def _stored(source: LayerBanks, model: BankedModel, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+def _stored(source: LayerBanks, model: BankedStacks, mesh: MeshSpec | Mesh | None, layout: Layout | None,
             entry: Callable[[Placement], Variables], bank: Callable[..., Variables]) -> Variables:
     """`LayerBanks.place` of `source`, its entries read by `entry` and each bank by `bank`."""
     sites, shapes, _device_mesh, placement, entries = _bank_plan(model, source, mesh, layout)
@@ -228,7 +229,7 @@ class CheckpointBanks(LayerBanks):
         with self._reader() as checkpoints:
             return self._bank(checkpoints, layers, placement, namespace=namespace)
 
-    def place(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
+    def place(self, model: BankedStacks, *, mesh: MeshSpec | Mesh | None = None,
               layout: Layout | None = None) -> Variables:
         """`LayerBanks.place`, every entry and bank of the load read through one reader of the run, so the
         checkpoint's metadata is read once a load, not once a layer."""
@@ -399,7 +400,7 @@ class SafetensorsBanks(LayerBanks):
         bank = jax.tree.map(lambda *leaves: np.stack(leaves), *rows)
         return jax.device_put(bank, placement)
 
-    def stream(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
+    def stream(self, model: BankedStacks, *, mesh: MeshSpec | Mesh | None = None,
                layout: Layout | None = None) -> Variables:
         """Return variables whose decoder layers the banked inference loop reads from disk, on one device.
 
@@ -856,11 +857,7 @@ def _bank_placement(placement: Placement, shapes: Variables, stacked: bool) -> P
     return jax.tree.map(place, placement, shapes)
 
 
-class BankedModel(Protocol):
-    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]: ...
-
-
-def bank_sites(model: BankedModel, store: Variables) -> tuple[DecoderBank, ...]:
+def bank_sites(model: BankedStacks, store: Variables) -> tuple[DecoderBank, ...]:
     """Return the model's declared stacks over `store`, the variables (or their shapes) the banks are
     drawn from, deduplicated by canonical namespace.
 
@@ -960,7 +957,7 @@ def _check_shapes(shapes: Variables, site: DecoderBank) -> None:
                 raise ValueError(f"namespace {site.namespace} layers {first} and {index} "
                                  "must have identical leaf paths, shapes and dtypes within one bank")
 
-def _bank_plan(model: BankedModel, source: LayerBanks, mesh: MeshSpec | Mesh | None,
+def _bank_plan(model: BankedStacks, source: LayerBanks, mesh: MeshSpec | Mesh | None,
                layout: Layout | None):
     """Validate canonical ownership and placement before either loader reads a value."""
     from dew.distributed.placement import (
@@ -1026,7 +1023,6 @@ def _check_consumers(placement: Placement, groups: Sequence[tuple[int, int]]) ->
 
 
 __all__ = [
-    "BankedModel",
     "CheckpointBanks",
     "DiskBankStats",
     "HeldBanks",

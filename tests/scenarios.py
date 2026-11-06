@@ -11,7 +11,8 @@ their own function into, each scenario judged by the gate's existing checks, nev
 - Masked rows filled with what no unmasked output may read (`assert_masked_rows_unread`): NaN, the infinities
   and float32's largest, every unmasked output bit for bit what a zero fill gives.
 - Examples reordered or split into parts (`assert_examples_independent`): a function of independent examples
-  gives each example's output bit for bit whatever its neighbours, order or partition.
+  gives each example's output whatever its neighbours: reordered, bit for bit (one program on the same
+  values); split into parts, each another program at its part's shape, on par by check 1.
 - A run restarted midstream (`assert_restartable`): steps carried in two runs from the state the first leaves
   are the steps of one run, bit for bit.
 
@@ -25,7 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from contract_support import orders
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 FILLS = (np.nan, np.inf, -np.inf, float(np.finfo(np.float32).max))
 """What a masked row holds in `assert_masked_rows_unread`: values any arithmetic that reads them carries into
@@ -115,22 +116,29 @@ def assert_masked_rows_unread(fn: Callable, inputs: tuple, masked: Callable, lab
             np.testing.assert_array_equal(found, expected, err_msg=f"{label}, a masked row of {fill}")
 
 
-def assert_examples_independent(fn: Callable, examples: tuple, label: str, *, parts: int = 2) -> None:
-    """`fn` over a batch of independent examples (each input's leading axis) gives each example's outputs
-    bit for bit whatever the batch around it: the batch reversed gives the outputs reversed, and the batch in
-    `parts` consecutive parts gives the parts' outputs concatenated."""
+def assert_examples_independent(fn: Callable, draw: Callable, label: str, *, seeds: int, parts: int = 2,
+                                truth_fn: Callable | None = None) -> None:
+    """`fn` over a batch of independent examples (each input's leading axis, `draw(seed)`'s) gives each
+    example's outputs whatever the batch around it: the batch reversed gives the outputs reversed bit for
+    bit (one program on the same values), and the batch in `parts` consecutive parts, each another
+    program at its own batch's shape, gives outputs on par with the whole batch's (check 1 over `seeds`,
+    the truth `truth_fn` or the whole batch's widened)."""
+    examples = draw(0)
     whole = fn(*examples)
     reverse = fn(*(value[::-1] for value in examples))
     for kept, reordered in zip(jax.tree.leaves(whole), jax.tree.leaves(reverse), strict=True):
         np.testing.assert_array_equal(np.asarray(reordered)[::-1], np.asarray(kept),
                                       err_msg=f"{label}, reversed")
-    size = len(examples[0])
-    bounds = np.linspace(0, size, parts + 1).astype(int)
-    pieces = [fn(*(value[start:stop] for value in examples)) for start, stop in itertools.pairwise(bounds)
-              if stop > start]
-    for index, kept in enumerate(jax.tree.leaves(whole)):
-        joined = np.concatenate([np.asarray(jax.tree.leaves(piece)[index]) for piece in pieces])
-        np.testing.assert_array_equal(joined, np.asarray(kept), err_msg=f"{label}, in {parts} parts")
+    bounds = np.linspace(0, len(examples[0]), parts + 1).astype(int)
+    # Each part's program compiled at its shape, as the gate compiles an arm (`jax.jit`).
+    part = jax.jit(fn)
+
+    def joined(*examples):
+        pieces = [part(*(value[start:stop] for value in examples))
+                  for start, stop in itertools.pairwise(bounds) if stop > start]
+        return jax.tree.map(lambda *leaves: np.concatenate([np.asarray(leaf) for leaf in leaves]), *pieces)
+
+    assert_as_exact(as_given(joined), fn, draw, f"{label}, in {parts} parts", seeds=seeds, truth_fn=truth_fn)
 
 
 def assert_restartable(step: Callable, state, inputs: Sequence, label: str, *, at: int) -> None:

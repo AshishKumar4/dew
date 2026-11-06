@@ -31,6 +31,7 @@ import optax
 import pytest
 from affine_run import BATCH, Counting, Features, Spread, val_batches
 from flax import linen as nn
+from layout_parity import layouts_agree
 from model_support import float64_twin
 from process_support import run_pool
 from reference_error import assert_as_exact
@@ -64,6 +65,23 @@ def fit(layout, directory, steps, optimizer=None, **options):
     return state
 
 
+def trained(layout, seed, steps, optimizer=None, **options):
+    """`steps` updates of the affine model from the start `seed` draws, without evaluation or checkpoints:
+    a check-1 arm's run (`layouts_agree`), in float64 where the process runs in it."""
+    wide = jax.config.read("jax_enable_x64")
+
+    def stream(partition):
+        def held(value):
+            floating = np.issubdtype(np.asarray(value).dtype, np.floating)
+            return np.asarray(value, np.float64) if wide and floating else value
+        return (jax.tree.map(held, batch) for batch in Counting())
+
+    trainer = Trainer(Features(), optimizer or optax.adam(0.1), key=jax.random.key(int(seed)),
+                      layout=layout, **options)
+    return trainer.fit(Loader(train=stream, val=None, records=None, batch=BATCH), steps=steps,
+                       log_every=steps)
+
+
 def identical(left, right):
     return all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(
         jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
@@ -74,35 +92,35 @@ def memory_kinds(tree):
 
 
 def test_host_resident_state_trains_the_same_model(tmp_path):
+    """A run whose optimizer state and average sit in host memory trains the model, moments and average
+    the device-resident run trains, by check 1 over drawn starts, the device's run in float64 the truth."""
+    layouts_agree(lambda layout, seed: trained(layout, seed, 4), lambda seed: (np.int32(seed),),
+                  "four updates with the optimizer state and average in host memory", HOST, DEVICE)
     on_device = fit(DEVICE, tmp_path / "device", 4)
     on_host = fit(HOST, tmp_path / "host", 4)
     assert memory_kinds(on_host.opt_state) == memory_kinds(on_host.ema) == {"pinned_host"}
     assert memory_kinds(on_host.variables) == memory_kinds(on_device.opt_state) == {"device"}
-    assert identical(on_host.variables, on_device.variables)
-    assert identical(on_host.opt_state, on_device.opt_state)
-    assert identical(on_host.ema, on_device.ema)
 
 
 def test_host_resident_state_trains_the_same_model_over_a_scaled_window(tmp_path):
     """A window of two microbatches commits under a conditional, and a dynamically scaled loss admits it
     on the finiteness of the whole committed state: each reads every leaf of the host-resident state at
     once, which its commit then stages as one chunk (`dew.training.staging`), and a clipped Adam's run
-    trains the model, moments and average the device-resident run trains, bit for bit."""
+    trains the model, moments and average the device-resident run trains, by check 1 over drawn starts."""
     options = {"optimizer": optax.chain(optax.clip_by_global_norm(1.0), optax.adam(0.1)), "accumulation": 2,
                "dynamic_scale": True}
-    on_device = fit(DEVICE, tmp_path / "device", 4, **options)
+    layouts_agree(lambda layout, seed: trained(layout, seed, 4, **options), lambda seed: (np.int32(seed),),
+                  "a scaled window of two microbatches with the state in host memory", HOST, DEVICE)
     on_host = fit(HOST, tmp_path / "host", 4, **options)
     assert memory_kinds(on_host.opt_state) == memory_kinds(on_host.ema) == {"pinned_host"}
-    assert identical(on_host.variables, on_device.variables)
-    assert identical(on_host.opt_state, on_device.opt_state)
-    assert identical(on_host.ema, on_device.ema)
 
 
 def test_host_resident_state_resumes_from_its_checkpoint(tmp_path):
+    """A host-resident run resumed from its checkpoint continues as the run that never stopped, bit for bit:
+    one program over restored values."""
     saved = fit(HOST, tmp_path / "host", 4)
-    fit(DEVICE, tmp_path / "device", 4)
     resumed = fit(HOST, tmp_path / "host", 6)
-    reference = fit(DEVICE, tmp_path / "device", 6)
+    reference = fit(HOST, tmp_path / "whole", 6)
     assert int(resumed.step) == 6
     assert memory_kinds(resumed.opt_state) == memory_kinds(resumed.ema) == {"pinned_host"}
     assert identical(resumed.variables, reference.variables)
@@ -339,6 +357,87 @@ def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
         # parameter axes.
         assert all(value["spec"].startswith("P(None") for value in banks.values())
         assert any(value["shard"] != value["shape"] for value in banks.values())
+
+
+def test_a_banked_store_packed_for_serving_or_adapted_exports_as_its_layers_do(tmp_path):
+    """A scanned decoder's banked store (`HeldBanks.place`) exports as the plain decoder's per-layer tree
+    does, tensor for tensor: packed for serving (`inference_projections`, its q, k and v one kernel a bank's
+    row splits back as it is written, `StoredRow.split`), and under a LoRA adapter the export merges into
+    its kernels as it writes them (`Adapter.merge` over a bank's rows, `Deferred`, ledger 4103), and the
+    adapter's own save writes its factors as the plain decoder's adapter does (ledger 4566)."""
+    from safetensors.numpy import load_file
+
+    from dew.batch import thaw
+    from dew.inference.projections import inference_projections
+    from dew.interop.pretrained import PretrainedDecoder
+    from dew.lora import LoRA
+
+    plain, scanned, variables, _ = pair(num_layers=3)
+    banked = HeldBanks(variables).place(scanned, layout=DEVICE)
+
+    def written(model, tree, name):
+        PretrainedDecoder.from_model(model, tree).save(tmp_path / name)
+        return load_file(tmp_path / name / "model.safetensors")
+
+    expected = written(plain, variables, "plain")
+    packed = written(scanned, inference_projections(scanned, banked), "packed")
+    assert packed.keys() == expected.keys()
+    for key, tensor in expected.items():
+        np.testing.assert_array_equal(packed[key], tensor, err_msg=key)
+    # Factors drawn whole, so each merge moves its kernel (a fresh adapter's B is zero), the base and the
+    # factors one collection, as the bank holds them.
+    spec = LoRA(rank=2, modules=("q_proj", "v_proj"))
+    lone = PretrainedDecoder.from_model(plain, variables).adapt(spec, key=1)
+    stacked = PretrainedDecoder.from_model(scanned, variables).adapt(spec, key=1)
+    rng = np.random.default_rng(4103)
+    tuned = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.asarray(rng.normal(size=leaf.shape) / 4, leaf.dtype)
+        if str(getattr(path[-1], "key", "")) == "lora_B" else leaf, thaw(lone.variables))
+    lone.save(tmp_path / "lone", variables=tuned)
+    stacked.save(tmp_path / "adapted", variables=HeldBanks(tuned).place(stacked.model, layout=DEVICE))
+    merged, adapted = (load_file(tmp_path / name / "model.safetensors") for name in ("lone", "adapted"))
+    assert adapted.keys() == merged.keys()
+    for key, tensor in merged.items():
+        np.testing.assert_array_equal(adapted[key], tensor, err_msg=key)
+    # The adapter's own save reads its factors by their layers' names too, a bank's rows read home as they
+    # are written (ledger 4566).
+    assert lone.adapter is not None and stacked.adapter is not None
+    lone.adapter.save(tuned, tmp_path / "factors")
+    stacked.adapter.save(HeldBanks(tuned).place(stacked.model, layout=DEVICE), tmp_path / "banked_factors")
+    factors, banked = (load_file(tmp_path / name / "adapter_model.safetensors")
+                       for name in ("factors", "banked_factors"))
+    assert banked.keys() == factors.keys()
+    for key, tensor in factors.items():
+        np.testing.assert_array_equal(banked[key], tensor, err_msg=key)
+
+
+class RecordedBank:
+    """A bank that records the shape of each piece of it read to the host (`np.asarray`), its pieces taken
+    by indexing as an array's are."""
+
+    def __init__(self, held: np.ndarray, read: list):
+        self.held, self.read = held, read
+        self.shape, self.dtype = held.shape, held.dtype
+
+    def __getitem__(self, key):
+        return RecordedBank(self.held[key], self.read)
+
+    def __array__(self, dtype=None, copy=None):
+        self.read.append(self.held.shape)
+        return self.held if dtype is None else self.held.astype(dtype)
+
+
+def test_a_packed_rows_members_each_read_home_their_own_share():
+    """A bank's packed row split into its members (`StoredRow.split`, a packed projection's q, k and v) has
+    each member sliced where the bank lies and read home alone, its own width of the row, so a row's
+    members read it home once between them rather than once each (ledger 4574), each as the row holds it."""
+    from dew.nn.backbones.layer_names import StoredRow
+
+    held, read = np.arange(2 * 3 * 7, dtype=np.float32).reshape(2, 3, 7), []
+    members = StoredRow(RecordedBank(held, read), (1,)).split([2, 4, 1])
+    for member, (start, stop) in zip(members, ((0, 2), (2, 6), (6, 7)), strict=True):
+        np.testing.assert_array_equal(np.asarray(member), held[1][..., start:stop])
+    assert read == [(3, 2), (3, 4), (3, 1)]
 
 
 @pytest.mark.parametrize("kind", ["root", "multimodal"])

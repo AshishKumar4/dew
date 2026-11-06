@@ -32,11 +32,13 @@ from dew.interop.decoder_parts import (
     kind_mixers,
     kinds_of,
     native_layer_types,
+    prediction_name,
     prediction_path,
     read_partial_rope,
     read_rope,
     record_int,
     refuse,
+    renamed_name,
     renamed_path,
     softmax_top_k,
     specified_layer_types,
@@ -241,6 +243,34 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
     return config
 
 
+def qwen_hybrid_export(model: CausalTransformer) -> Mapping[str, object]:
+    """`_qwen_hybrid_config` backwards: the hybrid Qwen block's fields the generic export writes none of,
+    its delta net's geometry (`LINEAR_FIELDS`, the layers' kinds going out as `layer_types`) and its
+    rotary's fraction, which Qwen3_5TextConfig and Qwen3NextConfig default to 0.25; a model whose layers
+    hold more than one delta net reads back as another and is refused (`refuse_lossy_export`)."""
+    delta = [mixer for mixer in (model.kind_of(kind).mixer for kind in dict.fromkeys(model.per_layer_types))
+             if isinstance(mixer, GatedDeltaNetMixer)]
+    return {**({name: getattr(delta[0], name) for name in LINEAR_FIELDS} if delta else {}),
+            'partial_rotary_factor': model.partial_rotary_factor or 1.0}
+
+
+def _qwen_moe_export(model: CausalTransformer, *, scheduled: bool) -> Mapping[str, object]:
+    """`_qwen_moe_mixture` backwards: the routed experts' count, top-k and width, the shared expert's
+    width, and, where the family `scheduled` them (`_sparse_step_layers`), their renormalization and the
+    layers they route, every one counted from one beside the dense ones (`mlp_only_layers`); none for a
+    model with no mixture."""
+    mixture = model.mixture
+    if mixture is None:
+        return {}
+    routed = set(model.sparse_layers)
+    return {'num_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
+            'moe_intermediate_size': mixture.expert_features,
+            'shared_expert_intermediate_size': mixture.shared_features,
+            **({'norm_topk_prob': mixture.norm_topk_prob, 'decoder_sparse_step': 1,
+                'mlp_only_layers': [index for index in range(model.num_layers) if index not in routed]}
+               if scheduled else {})}
+
+
 def single_prediction_depth(hf_config: Mapping[str, object], used: set[str], field: str) -> int:
     """Read an optional single shared-embedding prediction depth."""
     depth = hf_config.get(field, 0)
@@ -385,6 +415,43 @@ def qwen35_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] 
     return renamed_path(_QWEN_MOE_NAMES, name, config, layer_leaves=_QWEN_MOE_LEAVES)
 
 
+def _qwen35_moe_export(model: CausalTransformer) -> Mapping[str, object]:
+    """The `qwen3_5_moe_text` fields the generic export writes none of: the hybrid block's
+    (`qwen_hybrid_export`), its routed and shared experts (`_qwen_moe_export`, every layer routed and
+    renormalized, as Qwen3_5MoeTopKRouter always does) and its prediction depth."""
+    return {**qwen_hybrid_export(model), **_qwen_moe_export(model, scheduled=False),
+            'mtp_num_hidden_layers': model.num_nextn_predict_layers}
+
+
+def _qwen3_next_export(model: CausalTransformer) -> Mapping[str, object]:
+    """The `qwen3_next` fields the generic export writes none of: the hybrid block's (`qwen_hybrid_export`),
+    its routed and shared experts and the layers they route (`_qwen_moe_export`), and its prediction
+    depth."""
+    return {**qwen_hybrid_export(model), **_qwen_moe_export(model, scheduled=True),
+            'num_nextn_predict_layers': model.num_nextn_predict_layers}
+
+
+def _qwen_mtp_name(dew_name: str, config: Mapping[str, object],
+                   trunk_name: Callable[[str, Mapping[str, object]], str | None]) -> str | None:
+    """`_qwen_mtp_path` backwards (`prediction_name`): a prediction layer's leaf under `mtp.`
+    (`_QWEN_MTP_FIELDS`), its block's under `mtp.layers.0.` as `trunk_name` names the trunk's layer 0's."""
+    def block(path: tuple[str, ...]) -> str | None:
+        trunk = trunk_name('.'.join(('layers_0', *path)), config)
+        return None if trunk is None else trunk.removeprefix('model.')
+
+    _, tail = prediction_name(dew_name, 'mtp', _QWEN_MTP_FIELDS, block)
+    return None if tail is None else f'mtp.{tail}'
+
+
+def _qwen35_moe_name(dew_name: str, config: Mapping[str, object]) -> str | None:
+    """`qwen35_moe_path` backwards: a prediction layer's leaf by `_qwen_mtp_name`, any other's in the
+    family's names (`_QWEN_MOE_NAMES`, `_QWEN_MOE_LEAVES`)."""
+    def named(name: str, config: Mapping[str, object]) -> str | None:
+        return renamed_name(_QWEN_MOE_NAMES, name, config, layer_leaves=_QWEN_MOE_LEAVES)
+
+    return _qwen_mtp_name(dew_name, config, named) if dew_name.startswith('mtp_') else named(dew_name, config)
+
+
 QWEN3_NEXT = DecoderFamily(
     ('qwen3_next',),
     _qwen3_next_config,
@@ -393,8 +460,9 @@ QWEN3_NEXT = DecoderFamily(
     ),
     'qwen3_next',
     'Qwen3NextForCausalLM',
-    lambda model: {},
-    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth,
+    _qwen3_next_export,
+    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth, export_weights=decoder_tensors,
+    export_path=_qwen35_moe_name,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
     padding_idx=True,
@@ -402,30 +470,16 @@ QWEN3_NEXT = DecoderFamily(
 )
 
 def _qwen35_export(model: CausalTransformer) -> Mapping[str, object]:
-    """The `qwen3_5_text` fields of a model of this family the generic export writes none of: its delta
-    net's geometry (`LINEAR_FIELDS`, the layers' kinds going out as `layer_types`), its rotary's fraction,
-    which Qwen3_5TextConfig defaults to 0.25, and its prediction depth; a model whose layers hold more
-    than one delta net reads back as another and is refused (`refuse_lossy_export`)."""
-    delta = [mixer for mixer in (model.kind_of(kind).mixer for kind in dict.fromkeys(model.per_layer_types))
-             if isinstance(mixer, GatedDeltaNetMixer)]
-    return {**({name: getattr(delta[0], name) for name in LINEAR_FIELDS} if delta else {}),
-            'partial_rotary_factor': model.partial_rotary_factor or 1.0,
-            'mtp_num_hidden_layers': model.num_nextn_predict_layers}
+    """The `qwen3_5_text` fields of a model of this family the generic export writes none of: the hybrid
+    block's (`qwen_hybrid_export`) and its prediction depth."""
+    return {**qwen_hybrid_export(model), 'mtp_num_hidden_layers': model.num_nextn_predict_layers}
 
 
 def _qwen35_name(dew_name: str, config: Mapping[str, object]) -> str | None:
-    """`_qwen35_path` backwards: a prediction layer's leaf under `mtp.` (`_QWEN_MTP_FIELDS`), its block's
-    under `mtp.layers.0.` as the trunk's layer 0's is named, any other's as `hf_tensor_name` names it."""
-    parts = dew_name.split('.')
-    if parts[0] != 'mtp_0':
-        return hf_tensor_name(dew_name, config)
-    own: dict[tuple[str, ...], str] = {path: name for name, path in _QWEN_MTP_FIELDS.items()}
-    if tuple(parts[1:]) in own:
-        return f'mtp.{own[tuple(parts[1:])]}'
-    if parts[1] != 'block':
-        raise ValueError(f"{dew_name!r} is not a Qwen3.5 prediction layer's parameter")
-    trunk = hf_tensor_name('.'.join(('layers_0', *parts[2:])), config)
-    return None if trunk is None else 'mtp.' + trunk.removeprefix('model.')
+    """`_qwen35_path` backwards: a prediction layer's leaf by `_qwen_mtp_name`, any other's as
+    `hf_tensor_name` names it."""
+    return (_qwen_mtp_name(dew_name, config, hf_tensor_name) if dew_name.startswith('mtp_')
+            else hf_tensor_name(dew_name, config))
 
 
 QWEN3_5_MOE_TEXT = DecoderFamily(
@@ -434,8 +488,9 @@ QWEN3_5_MOE_TEXT = DecoderFamily(
     lambda fields: bool(fields.output_gate and fields.mixture is not None),
     'qwen3_5_moe_text',
     'Qwen3_5MoeForCausalLM',
-    lambda model: {},
-    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth,
+    _qwen35_moe_export,
+    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth, export_weights=decoder_tensors,
+    export_path=_qwen35_moe_name,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
     padding_idx=True,

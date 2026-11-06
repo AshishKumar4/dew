@@ -47,7 +47,7 @@ class Grain(Dataset):
             raise ValueError(f"{self.describe()} is a Grain IterDataset, read only as a stream")
         return self.dataset
 
-    def manifest(self) -> ShardManifest:
+    def manifest(self, version: int) -> ShardManifest:
         if isinstance(self.dataset, grain.MapDataset):
             rows = len(self.dataset)
             # One shard, the MapDataset's records in their index order.

@@ -674,8 +674,10 @@ TANGENT_INVERSE_SEEDS = {"cosine_general/default": 8, "cosine_general/bounded": 
 @pytest.mark.parametrize("case", FLAXDIFF_GRIDS)
 def test_the_tangent_grids_time_of_a_sigma_is_on_par_with_its_formula_rounded_in_float32(case):
     """The tangent grid's inverse, (atan(kappa sigma) - theta_min) / (theta_max - theta_min), which
-    FlaxDiff leaves unwritten, on par with the same formula in NumPy's float32 at sigmas drawn
-    log-uniform over the grid (check 1, float64 the truth)."""
+    FlaxDiff leaves unwritten, on par with the same formula with each operation correctly rounded to
+    float32 at sigmas drawn log-uniform over the grid (check 1, float64 the truth): each operation in
+    float64, then rounded, so the reference is every host's, where NumPy's float32 arctangent is the
+    host's SIMD library's (row 2301)."""
     schedule = CosineGeneralNoiseScheduler(**flaxdiff_case(case))
     t_of_sigma = jax.jit(schedule.t_of_sigma)
     low, high = (math.log(bound) for bound in schedule.sigma_range)
@@ -686,8 +688,14 @@ def test_the_tangent_grids_time_of_a_sigma_is_on_par_with_its_formula_rounded_in
     @as_given
     def reference(sigma):
         kind = sigma.dtype.type
-        return ((np.arctan(sigma * kind(schedule.kappa)) - kind(schedule.theta_min))
-                / kind(schedule.theta_max - schedule.theta_min))
+
+        def rounded(value):
+            """`value`, computed in float64, rounded to the arm's precision and held in float64."""
+            return np.asarray(value, np.float64).astype(kind).astype(np.float64)
+
+        angle = rounded(np.arctan(rounded(sigma.astype(np.float64) * rounded(schedule.kappa))))
+        above = rounded(angle - rounded(schedule.theta_min))
+        return (above / rounded(schedule.theta_max - schedule.theta_min)).astype(kind)
 
     assert_as_exact(t_of_sigma, reference, draw, f"FlaxDiff {case} t_of_sigma",
                     seeds=TANGENT_INVERSE_SEEDS[case])

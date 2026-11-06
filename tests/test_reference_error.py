@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from check1_wire import staged_units
+from check1_wire import CENSUS, staged_units
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -39,7 +39,15 @@ from reference_error import (
 from dew.nn.precision import accumulated
 
 
+@pytest.fixture
+def switched(monkeypatch):
+    """The gate's YNNPACK switch on, whatever the run (a census pass sets `CENSUS`): the switch's own tests
+    hold the switch."""
+    monkeypatch.delenv(CENSUS, raising=False)
+
+
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.usefixtures("switched")
 def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path):
     """Each of tests/ynn_programs.py's programs under `without_ynn` gives, bit for bit, what the same
     program gives jitted in a process whose XLA:CPU runs with every YNNPACK fusion off."""
@@ -54,6 +62,23 @@ def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_of
     with np.load(out) as theirs:
         for name, value in ynn_programs.outputs(without_ynn).items():
             np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_the_census_runs_the_gates_arms_as_xla_cpu_compiles_them_for_users(tmp_path):
+    """Under the census (`CENSUS` set), `without_ynn` compiles a program as plain `jax.jit` does, YNNPACK's
+    fusions on: each of tests/ynn_programs.py's programs gives, bit for bit, what it gives jitted in a
+    process of XLA:CPU's defaults (row 4471)."""
+    import ynn_programs
+    out, ours = tmp_path / "theirs.npz", tmp_path / "ours.npz"
+    subprocess.run([sys.executable, str(Path(ynn_programs.__file__)), str(out)], check=True)
+    census = "import sys, numpy as np, ynn_programs; from reference_error import without_ynn; " \
+        "np.savez(sys.argv[1], **{k: np.asarray(v) for k, v in ynn_programs.outputs(without_ynn).items()})"
+    subprocess.run([sys.executable, "-c", census, str(ours)], check=True,
+                   cwd=Path(ynn_programs.__file__).parent, env={**os.environ, CENSUS: "1"})
+    with np.load(out) as theirs, np.load(ours) as found:
+        for name in theirs:
+            np.testing.assert_array_equal(found[name], theirs[name], err_msg=name)
 
 
 def one_key_draw(seed):
@@ -86,6 +111,7 @@ def written_attention(query, key, value):
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.usefixtures("switched")
 def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them(
         tmp_path, monkeypatch):
     """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
@@ -107,9 +133,24 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
     assert lines[0]["ynn"] is not None
     assert [entry["label"] for entry in SWITCHED] == ["attention over one key"]
     SWITCHED.clear()
+    # An arm declared to vary run to run takes the site's decision as any arm does, through its declaration.
+    from reference_error import run_to_run
+
+    assert_as_exact(run_to_run(pulled_by_itself(xla_attention), "atomic adds"),
+                    pulled_by_itself(written_attention), one_key_draw, "attention over one key, declared",
+                    seeds=16)
+    SWITCHED.clear()
+    # A window loop's paired arms run each window's program, decided at their own calls.
+    from reference_error import over_windows, windows
+
+    assert_as_exact(over_windows(pulled_by_itself(written_attention)),
+                    over_windows(pulled_by_itself(written_attention)), windows(one_key_draw, 3),
+                    "attention over one key, windowed", seeds=8)
+    SWITCHED.clear()
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.usefixtures("switched")
 def test_a_process_whose_xla_refuses_the_ynn_options_moves_no_site_onto_the_fusions(monkeypatch):
     """Where XLA:CPU refuses WITHOUT_YNN's options themselves, a site of two Dew paths raises before
     deciding (`_ynn_option_held`), so it moves onto the fusions and passes nowhere."""
@@ -899,6 +940,7 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     assert_as_exact(_reordered, _product, _draw, "a compiled truth", seeds=8, truth_fn=truth)
 
 
+@pytest.mark.usefixtures("switched")
 def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm(monkeypatch):
     """Beside another Dew arm, an arm of Dew's own programs (`dew_programs`) runs with Dew's compile
     seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam
@@ -2423,23 +2465,31 @@ def bits_apart():
     return as_given(product)
 
 
-@pytest.mark.parametrize(("backend", "deterministic", "refused"), [
-    ("gpu", False, False), ("gpu", True, True), ("cpu", False, True)])
+@pytest.mark.parametrize(("backend", "deterministic", "declared", "refused"), [
+    ("gpu", False, False, False), ("gpu", True, False, True), ("cpu", False, False, True),
+    ("gpu", True, True, False), ("cpu", False, True, True)])
+@pytest.mark.parametrize("windowed", [False, True], ids=["one draw", "windowed"])
 def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
-        monkeypatch, request, backend, deterministic, refused):
+        monkeypatch, request, backend, deterministic, declared, refused, windowed):
     """Check 1 replays a site's arms on their first draw and requires their outputs again bit for bit only
     where the run promises a repeat (`_repeat_promised`, ledger 2842): on a GPU by default, whose reductions
     add with atomics in arrival order, an arm whose last bits move is not refused; on a GPU in deterministic
-    mode (`with_deterministic_ops`), and on a CPU, it is (`UnpairedDraw`)."""
-    from reference_error import UnpairedDraw
+    mode (`with_deterministic_ops`), and on a CPU, it is (`UnpairedDraw`). An arm declared to vary run to run
+    (`run_to_run`, row 4448) is judged by each draw's one run on a GPU in deterministic mode too, and held
+    to its repeat on a CPU, whose interpreted programs are functions of their inputs; through a window loop
+    (`over_windows`) and a null run's unrewritten reference alike."""
+    from reference_error import UnpairedDraw, over_windows, run_to_run, windows
 
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
     request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
     label = f"bits apart on a {backend}" + (", deterministic" if deterministic else "")
+    arm = run_to_run(bits_apart(), "atomic adds") if declared else bits_apart()
+    truth, draw = jnp.matmul, a_product_draw
+    if windowed:
+        # Three windows a draw, so a rerun's calls alternate out of phase with the first run's.
+        arm, truth, draw = over_windows(arm), over_windows(jnp.matmul), windows(a_product_draw, 3)
     if refused:
         with pytest.raises(UnpairedDraw):
-            null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
+            null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
     else:
-        null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
-
-
+        null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)

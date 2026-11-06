@@ -16,6 +16,8 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from diffusers_scheduler_pipeline_reference import SCHEDULERS
+from native_diffusion_worker import GROUPS, groups, leaves
 
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import DenoisingInputs
@@ -35,29 +37,65 @@ def bundle(directory, streamed: bool = False):
                            **({"mesh": MeshSpec()} if streamed else {}))
 
 
-TRUTH = Path(__file__).resolve().parents[1] / "tests/fixtures/tiny_diffusers_f64.npz"
-"""Each saved task's references rerun in float64 (`truth` in tools/diffusers_pipeline_reference.py
-and tools/diffusers_extended_reference.py)."""
+RECORDINGS = Path(__file__).resolve().parents[1] / "tests/fixtures/native_diffusion"
+"""Each task's recordings, `<task>-<group>.npz` (tools/venv_reference.py's `native-<task>-<group>` sites,
+tools/native_diffusion_worker.py): its saved pipeline's own Diffusers pipeline called on drawn inputs, each
+group of its leaves its own recording."""
+WALK_SEEDS = {**{task: {"prompt": 8, "autoencoder": 8, "walk": 8}
+                 for task in ("sd", "xl", "img2img", "inpaint")},
+              **{task: {"prompt": 128, "walk": 8} for task in ("xl-img2img", "xl-inpaint", "refiner")},
+              "safety": {"walk": 8, "checker": 64}}
+"""Each task's declared seeds for check 1 of each group of its leaves (tools/native_diffusion_worker.py's
+`groups`), each group's recording sized by `seeds_for` paired with Dew's computation of its leaves
+(tools/venv_reference.py, armada 11-06). The PyTorch SDXL towers' pooled embedding is heavy-tailed across
+draws (Dew's CLIP layer norms take flax's one-pass variance where torch's is exact, row 4561)."""
+SAVED = {"prompt": "cat", "negative": "dog", "prompt_2": "fox", "negative_2": "owl"}
+"""The prompts the saved references were called with, which the update and regression checks keep."""
+LETTERS = 4
+"""A drawn prompt's letters: the saved tokenizer reads each as a token, eight positions holding the start,
+the letters and the end with room to pad."""
+EXTENDED = ("xl-img2img", "xl-inpaint", "refiner")
+"""The tasks whose conditioning reads a second prompt (SDXL's second tower): the PyTorch SDXL calls'. The Flax
+SDXL call gives both towers the one prompt."""
 
 
-def held(errors, task, name, actual, reference, key):
-    """`actual` as near float64 as the source's float32 `reference`, the truth
-    the same saved pipeline computes in float64 (tests/reference_error.py)."""
-    from one_draw import assert_as_exact_as_the_reference
-    from reference_error import distance
+def draw_for(task: str):
+    """`task`'s draws: its prompts as letter codes, the noise channels last, the pixels an image call
+    starts from and the autoencoder encodes, and the safety checker's raw images and tower input; a source
+    grid's walk (`grid`) its noise alone."""
+    def draw(seed):
+        rng = np.random.default_rng([0xD1F, seed])
+        if task == "grid":
+            return {"noise": rng.standard_normal((1, 8, 8, 4)).astype(np.float32)}
 
-    with np.load(TRUTH) as truth:
-        wide = truth[f"{task}/{key}"]
-    actual = np.asarray(actual, np.float64)
-    errors[name] = {"dew": distance(actual, wide), "reference": distance(reference, wide)}
-    assert_as_exact_as_the_reference(actual, reference, wide, f"{task} {name}")
+        def letters():
+            return rng.integers(ord("a"), ord("z") + 1, LETTERS).astype(np.uint8)
+
+        inputs = {"prompt": letters(), "negative": letters()}
+        if task in EXTENDED:
+            inputs.update(prompt_2=letters(), negative_2=letters())
+        inputs["noise"] = rng.standard_normal((1, 8, 8, 4)).astype(np.float32)
+        if task == "safety":
+            inputs["checker_raw"] = rng.integers(0, 256, (1, 32, 32, 3)).astype(np.uint8)
+            inputs["checker_input"] = rng.standard_normal((1, 3, 8, 8)).astype(np.float32)
+        else:
+            inputs["pixels"] = rng.integers(0, 256, (32, 32, 3)).astype(np.uint8)
+        return inputs
+    return draw
 
 
-def conditions(source, extended=False):
+def prompts(inputs) -> dict[str, str]:
+    """A draw's prompts as text."""
+    return {name: bytes(np.asarray(inputs[name], np.uint8)).decode() for name in SAVED if name in inputs}
+
+
+def conditions(source, texts=SAVED, extended=False):
+    """The conditions of `texts`' prompt and negative, SDXL's second tower's with them where `extended`."""
     encoder = source.inputs.conditions["conditioning"].encoder
     params = source.variables["encoders"]["conditioning"]
-    positive = {"text": "cat", **({"second": "fox"} if extended else {})}
-    negative = {"text": "dog", "negative": True, **({"second": "owl"} if extended else {})}
+    positive = {"text": texts["prompt"], **({"second": texts["prompt_2"]} if extended else {})}
+    negative = {"text": texts["negative"], "negative": True,
+                **({"second": texts["negative_2"]} if extended else {})}
     return ({"conditioning": encoder.encode(params, encoder.tokenize([positive]))},
             {"conditioning": encoder.encode(params, encoder.tokenize([negative]))})
 
@@ -69,12 +107,12 @@ def task_kind(source, meta):
     return "inpaint" if "Inpaint" in name else "img2img" if "Img2Img" in name else "text"
 
 
-def selection(source, meta):
-    """The text conditions and the times the source's call walks: all of
+def selection(source, meta, texts=SAVED):
+    """The conditions of `texts` and the times the source's call walks: all of
     them, or those its strength or the refiner's denoising_start selects,
     which is the caller's conversion."""
     kind = task_kind(source, meta)
-    given, null = conditions(source, kind.startswith("xl-") or kind == "refiner")
+    given, null = conditions(source, texts, kind.startswith("xl-") or kind == "refiner")
     steps = meta.get("steps", 2)
     process, times = source.schedule.sampling(steps)
     if kind == "refiner":
@@ -96,53 +134,47 @@ def walked(prepared, given, null):
 
 def trajectory(source, prepared, given, null, process, times, key):
     """The single solver walk from the public `prepare`'s start, the one
-    path every caller starts from, and the conditions it walks under (`walked`)."""
+    path every caller starts from: its images, its images before any safety
+    checker, its last latents, and the conditions it walks under (`walked`)."""
     given, null = walked(prepared, given, null)
     denoise = process.denoiser(source.model, source.variables, given, null)
     latents = sample(denoise, prepared.noise[:prepared.rows], solver=source.solver, guidance=CFG(3.0),
                      key=key, times=times, final_denoise=False)
-    images = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], latents), -1, 1)
+    decoded = source.autoencoder.decode(source.variables["autoencoder"], latents)
+    images = unchecked = jnp.clip(decoded, -1, 1)
     if source.finish is not None:
         images = source.finish(source.variables, images)
-    return images, latents, given
+    return images, unchecked, latents, given
 
 
-def public_start(task, source, reference, meta, key, given, null, process, times):
+def public_start(task, source, start, meta, key, given, null, process, times, bypassed=False):
     """The trajectory's start through the public `prepare`, from what the
-    reference pipeline was handed: its pixels (uint8), mask, noise, clean
-    latents or already-noisy latents. Diffusers' own preparation
-    (prepare_latents, prepare_mask_latents, the refiner's denoising_start)
-    made the reference's start, so its images hold the image, image-latents,
-    mask and encode-key branches here. Strength and denoising_start reach
-    `prepare` as the selected `times`, which is the caller's conversion."""
+    reference pipeline was handed (`start`: the saved reference's or a draw's
+    pixels (uint8), noise, and the saved mask): its pixels, clean latents or
+    already-noisy latents. Diffusers' own preparation (prepare_latents,
+    prepare_mask_latents, the refiner's denoising_start) made the reference's
+    start, so its images hold the image, image-latents, mask and encode-key
+    branches here. Strength and denoising_start reach `prepare` as the
+    selected `times`, which is the caller's conversion. `bypassed` starts
+    SDXL's image call from Dew's own encoding of the pixels, as clean image
+    latents, in place of the pixels."""
     kind = task_kind(source, meta)
-    noise = jnp.asarray(reference["noise"])
-    pixels = reference["pixels"][None] if "pixels" in reference else None
+    noise = jnp.asarray(start["noise"])
+    pixels = start["pixels"][None] if "pixels" in start else None
     # The text conditions alone: `prepare` builds the spatial ones itself.
     shared = {"conditions": {"conditioning": given["conditioning"]},
               "unconditional": {"conditioning": null["conditioning"]},
               "key": key, "steps": meta.get("steps", 2), "times": times}
     if kind == "img2img":
         return task.prepare(**shared, image=pixels, noise=noise, encode_key=key)
+
     def clean():
         pixels_in_range = unit_range(jnp.asarray(pixels))
         return source.autoencoder.encode(source.variables["autoencoder"], pixels_in_range, None)
 
     if kind == "xl-img2img":
-        from one_draw import assert_as_exact_as_the_reference
-
-        prepared = task.prepare(**shared, image=pixels, noise=noise)
-        bypassed = task.prepare(**shared, image_latents=clean(), noise=noise)
-        # Both starts from Dew's own encoding (compiled in `prepare`, eager here), held to the
-        # start the source's float64 encoding makes under the same rates and noise.
-        alpha, sigma = (np.asarray(rate, np.float64).reshape(-1, 1, 1, 1)
-                        for rate in process.sampler_schedule.rates(jnp.full((1,), times[0])))
-        with np.load(TRUTH) as truth:
-            start = alpha * truth["xl-img2img/image_latents"] + sigma * np.asarray(noise, np.float64)
-        rows = prepared.rows
-        assert_as_exact_as_the_reference(np.asarray(bypassed.noise)[:rows], np.asarray(prepared.noise)[:rows],
-                                         start, "bypassed image latents")
-        return prepared
+        return task.prepare(**shared, **({"image_latents": clean()} if bypassed else {"image": pixels}),
+                            noise=noise)
     if kind == "refiner":
         return task.prepare(**shared, initial=clean())
     prior = noise * process.sampler_schedule.prior_scale()
@@ -150,23 +182,30 @@ def public_start(task, source, reference, meta, key, given, null, process, times
         # Full strength: the reference starts from noise alone, its image and
         # mask as conditions.
         encode_key = jax.random.split(key)[1] if kind == "inpaint" else None
-        return task.prepare(**shared, image=pixels, mask=reference["mask"][None, ..., None], initial=prior,
+        return task.prepare(**shared, image=pixels, mask=start["mask"][None, ..., None], initial=prior,
                             encode_key=encode_key)
     return task.prepare(**shared, initial=prior)
 
 
-def diffusers_reads(source, export, prediction, noise, given):
+TRAINED_SEEDS = 8
+"""Every task's declared seeds for check 1 of its trained UNet against Diffusers' (`diffusers_reads`),
+sized by `seeds_for` paired with Dew's on armada (11-06): 8 at each of the eight tasks."""
+TRAINED_TIME = 10.0
+"""The timestep the trained UNet is read at."""
+
+
+def diffusers_reads(task, source, export, model, variables, noise, given):
     """Diffusers' own classes load every weighted component of `export`
     cleanly (tools/diffusers_consumer.py; a component nothing here reads, the
     safety checker, is held to the `source` directory's file, which it
-    writes back untrained), and its declared UNet, over the
-    same noise, timestep and conditions in float32 and float64, holds Dew's
-    trained `prediction` to tests/reference_error.py's rule, and returns
-    the rule's ratio."""
-    from one_draw import assert_as_exact_as_the_reference
-    from reference_error import distance
+    writes back untrained), and its declared UNet holds Dew's trained one
+    on par (check 1) over drawn noise, prompt states, pooled embedding and
+    inpaint channels, of `noise`'s and `given`'s shapes, at `given`'s time
+    ids, both measured from Diffusers' own UNet run in float64."""
+    from reference_error import as_given, assert_as_exact
     from safetensors.numpy import load_file
 
+    from dew.diffusion.process import DenoisingCondition
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
@@ -176,17 +215,39 @@ def diffusers_reads(source, export, prediction, noise, given):
         for key, value in held.items():
             np.testing.assert_array_equal(written[key], value, err_msg=f"{name}/{key}")
     condition = given["conditioning"]
-    sample = np.concatenate([np.asarray(noise)] + [np.asarray(given[name]) for name in ("mask", "masked_image")
-                                                   if name in given], -1)
-    inputs = (export, sample, 10.0, np.asarray(condition.context),
-              None if condition.pooled is None else np.asarray(condition.pooled),
-              None if condition.time_ids is None else np.asarray(condition.time_ids))
-    theirs, truth = consumer.unet_prediction(*inputs), consumer.unet_prediction(*inputs, wide=True)
-    assert_as_exact_as_the_reference(np.asarray(prediction), theirs, truth, "trained UNet")
-    return distance(np.asarray(prediction), truth) / distance(theirs, truth)
+    spatial = [name for name in ("mask", "masked_image") if name in given]
+    shapes = {"noise": np.shape(noise), "context": np.shape(condition.context),
+              **({} if condition.pooled is None else {"pooled": np.shape(condition.pooled)}),
+              **{name: np.shape(given[name]) for name in spatial}}
+
+    def draw(seed):
+        rng = np.random.default_rng([0x7A2, seed])
+        return tuple(rng.standard_normal(shape).astype(np.float32) for shape in shapes.values())
+
+    def named(inputs):
+        return dict(zip(shapes, inputs, strict=True))
+
+    def dew(*inputs):
+        drawn = named(inputs)
+        conditioning = DenoisingCondition(drawn["context"], drawn.get("pooled"), condition.time_ids)
+        return model.apply(variables, drawn["noise"], jnp.full((1,), TRAINED_TIME),
+                           conditioning=conditioning, **{name: drawn[name] for name in spatial})
+
+    def diffusers(wide):
+        predict = consumer.unet_predictor(export, wide=wide)
+
+        def run(*inputs):
+            drawn = named(inputs)
+            sample = np.concatenate([drawn["noise"], *(drawn[name] for name in spatial)], -1)
+            return predict(sample, TRAINED_TIME, drawn["context"], drawn.get("pooled"),
+                           None if condition.time_ids is None else np.asarray(condition.time_ids))
+        return as_given(run)
+
+    assert_as_exact(dew, diffusers(False), draw, f"{task} trained UNet", seeds=TRAINED_SEEDS,
+                    truth_fn=diffusers(True))
 
 
-def train_and_reload(source, reference, key, given, noise):
+def train_and_reload(task, source, reference, key, given, noise):
     objective = DiffusionObjective(source.model, source.process, source.inputs, autoencoder=source.autoencoder,
                                    variables=source.variables, unconditional_prob=0.0, ema_decay=None, steps=2)
     pixels = reference["pixels"][None] if "pixels" in reference else np.rint(reference["images"] * 255).astype(np.uint8)
@@ -209,7 +270,7 @@ def train_and_reload(source, reference, key, given, noise):
         before = source.model.apply(trained, noise, jnp.asarray([10]), **given)
         loaded = restored.model.apply(restored.variables, noise, jnp.asarray([10]), **given)
         np.testing.assert_array_equal(loaded, before)
-        ratio = diffusers_reads(source.source, saved, before, noise, given)
+        diffusers_reads(task, source.source, saved, restored.model, restored.variables, noise, given)
         np.testing.assert_array_equal(restored.autoencoder.decode(restored.variables["autoencoder"], noise),
                                       source.autoencoder.decode(trained["autoencoder"], noise))
         if source.finish is not None:
@@ -220,7 +281,7 @@ def train_and_reload(source, reference, key, given, noise):
             source.save(saved, variables=blocked)
             restored = bundle(saved)
             np.testing.assert_array_equal(restored.finish(restored.variables, images), -1)
-    return {"loss_before": float(value), "loss_after": float(after), "diffusers_ratio": ratio}
+    return {"loss_before": float(value), "loss_after": float(after)}
 
 
 PARTS = ("walk", "update")
@@ -231,73 +292,105 @@ call that names no `--part` runs both in one."""
 def check_pipeline(directory, part: str, streamed: bool = False):
     """The saved pipeline against the source: its trajectory (`part` 'walk') or its update, reload and
     export ('update'). With `streamed`, the pipeline streamed onto a mesh a leaf at a time loads the
-    same tree, placed on the mesh, its trajectory's images are held to the source as the whole load's
-    are (`streamed_parity`), and it is the pipeline the update, reload and export run on, under the
+    same tree, placed on the mesh, its walk is held to the source as the whole load's is
+    (`streamed_parity`), and it is the pipeline the update, reload and export run on, under the
     conditions its public `prepare` builds."""
     directory = Path(directory)
-    reference = np.load(directory / "reference.npz")
+    reference = dict(np.load(directory / "reference.npz"))
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
-    errors, key = {}, jax.random.PRNGKey(17)
+    key = jax.random.PRNGKey(17)
     if part == "walk":
         source = bundle(directory)
-        given, null, process, times = selection(source, meta)
-        qualified(errors, directory.name, source, reference, meta, key, given, null, process, times)
+        qualified(directory.name, source, reference, meta, key)
         if streamed:
-            streamed_parity(errors, directory, source, reference, meta, key)
-        print(json.dumps({"directory": str(directory), "errors": errors}))
+            streamed_parity(directory, source, reference, meta, key)
+        print(json.dumps({"directory": str(directory), "walk": "held"}))
         return
     source = bundle(directory, streamed=streamed)
     given, null, process, times = selection(source, meta)
     prepared = public_start(source.text_to_image(), source, reference, meta, key, given, null, process, times)
     given, _ = walked(prepared, given, null)
-    training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
+    noise = jnp.asarray(reference["noise"])
+    training = train_and_reload(directory.name, source, reference, key, given, noise)
     print(json.dumps({"directory": str(directory), "reload": 0.0, "training": training}))
 
 
-def qualified(errors, name, source, reference, meta, key, given, null, process, times, label=""):
-    """`source`'s components and walk held to the source, as one load or the other loads them: the
-    conditioning (hidden, pooled), the autoencoder's encode and decode, the final latents, the
-    trajectory's images, the safety checker's pixels and features, and the public task call walking
-    to the same images. `label` prefixes each measurement's name, so two loads report apart."""
-    # The start the public `prepare` makes from what the reference pipeline was handed.
+def walk_leaves(name, source, meta, key, start, wanted=None, bypassed=False):
+    """Dew's leaves `wanted` (all of the task's `leaves`, by default) from `start`'s prompts, noise and
+    pixels: the prompt's states, the autoencoder's encode of the pixels and decode of the noise, the walk's
+    start, last latents and images before any safety checker (`public_start`, `trajectory`), and the
+    checker's transform and tower on the draw's own inputs, each as the recording keeps it. Only what the
+    wanted leaves read is computed: the walk where a walk leaf is wanted."""
+    wanted = leaves(name) if wanted is None else wanted
+    autoencoder = source.variables["autoencoder"]
+    computed = {}
+    if {"hidden", "pooled"} & set(wanted):
+        given, _ = conditions(source, prompts(start), task_kind(source, meta).startswith("xl-")
+                              or task_kind(source, meta) == "refiner")
+        computed.update(hidden=given["conditioning"].context, pooled=given["conditioning"].pooled)
+    if "encoded" in wanted:
+        pixels = unit_range(jnp.asarray(start["pixels"][None]))
+        computed["encoded"] = source.autoencoder.encode(autoencoder, pixels, key)
+    if "decoded" in wanted:
+        computed["decoded"] = source.autoencoder.decode(autoencoder, jnp.asarray(start["noise"]))
+    if set(GROUPS["walk"]) & set(wanted):
+        given, null, process, times = selection(source, meta, prompts(start))
+        prepared = public_start(source.text_to_image(), source, start, meta, key, given, null, process, times,
+                                bypassed)
+        _, unchecked, latents, _ = trajectory(source, prepared, given, null, process, times, key)
+        computed.update(start=prepared.noise[:prepared.rows], final_latents=latents,
+                        images=(np.asarray(unchecked, np.float64) + 1) / 2)
+    if set(GROUPS["checker"]) & set(wanted):
+        computed["checker_pixels"] = source.finish.transform(start["checker_raw"])
+        computed["checker_embeddings"] = source.finish.model.apply(
+            {"params": source.variables["encoders"]["safety"]}, jnp.asarray(start["checker_input"]),
+            method=source.finish.model.features)
+    return {leaf: np.asarray(computed[leaf]) for leaf in wanted}
+
+
+def qualified(name, source, reference, meta, key, label=""):
+    """`source`'s walk on par with its saved pipeline's own Diffusers pipeline over drawn prompts, noise
+    and pixels (check 1, `walk_leaves` against the task's recording), each group of its leaves on its own
+    seeds (`groups`, WALK_SEEDS), SDXL's image call from Dew's own encoding as clean image latents on par at
+    its start too, and the public task call walking to the same images on the saved reference's inputs.
+    `label` prefixes each check's name, so two loads report apart."""
+    from reference_error import as_given, assert_as_exact, indexed_recording, recording
+
+    draw = draw_for(name)
+    mask = {"mask": reference["mask"]} if "mask" in reference else {}
+
+    def dew(wanted, bypassed=False):
+        return as_given(lambda index, inputs: walk_leaves(name, source, meta, key, {**inputs, **mask}, wanted,
+                                                          bypassed))
+
+    for group, held in groups(name).items():
+        seeds, stored = WALK_SEEDS[name][group], recording(RECORDINGS / f"{name}-{group}.npz")
+        drawn, recorded, truth = indexed_recording(stored, f"native-{name}-{group}", seeds, inputs_of=draw)
+        assert_as_exact(dew(held), recorded, drawn, f"{label}{name} {group}", seeds=seeds, truth_fn=truth)
+    if task_kind(source, meta) == "xl-img2img":
+        seeds, stored = WALK_SEEDS[name]["walk"], recording(RECORDINGS / f"{name}-walk.npz")
+        drawn, recorded, truth = indexed_recording(stored, f"native-{name}-walk", seeds, inputs_of=draw,
+                                                   leaves=("start",))
+        assert_as_exact(dew(("start",), bypassed=True), recorded, drawn, f"{label}{name} bypassed start",
+                        seeds=seeds, truth_fn=truth)
+        # And on par with Dew's own start from the pixels, whose Diffusers' start may be the farther: the
+        # recorded walk's seeds, its truth recorded at those alone (a paired sizing draws past them).
+        assert_as_exact(dew(("start",), bypassed=True), dew(("start",)), drawn,
+                        f"{label}{name} bypassed start against the pixels' start", seeds=seeds,
+                        truth_fn=truth)
+    # The same walk through the task facade: the same images.
+    given, null, process, times = selection(source, meta)
     task = source.text_to_image()
     prepared = public_start(task, source, reference, meta, key, given, null, process, times)
-    images, latents, given = trajectory(source, prepared, given, null, process, times, key)
-    if "hidden" in reference:
-        held(errors, name, f"{label}hidden", given["conditioning"].context, reference["hidden"], "hidden")
-    if "pooled" in reference:
-        held(errors, name, f"{label}pooled", given["conditioning"].pooled, reference["pooled"], "pooled")
-    if "encoded" in reference:
-        pixels = unit_range(jnp.asarray(reference["pixels"][None]))
-        encoded = source.autoencoder.encode(source.variables["autoencoder"], pixels, key)
-        held(errors, name, f"{label}encode", encoded, reference["encoded"], "encoded")
-        held(errors, name, f"{label}decode",
-             source.autoencoder.decode(source.variables["autoencoder"], jnp.asarray(reference["noise"])),
-             reference["decoded"], "decoded")
-    if "final_latents" in reference:
-        held(errors, name, f"{label}latents", latents, reference["final_latents"], "final_latents")
-    shown = (np.asarray(images, np.float64) + 1) / 2
-    held(errors, name, f"{label}trajectory_images", shown, reference["images"], "images")
-    if source.finish is not None:
-        raw = np.rint(reference["images"] * 255).astype(np.uint8)
-        pixels = source.finish.transform(raw)
-        held(errors, name, f"{label}checker_pixels", pixels, reference["checker_pixels"], "checker_pixels")
-        # The tower on the source's own pixels, each stage held on the input the source gave it:
-        # Dew's pixels carry their own float32 rounding, held above, which the tower amplifies.
-        features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]},
-                                             jnp.asarray(reference["checker_pixels"]),
-                                             method=source.finish.model.features)
-        held(errors, name, f"{label}checker_features", features, reference["checker_embeddings"],
-             "checker_embeddings")
-    # The same walk through the task facade: the same images.
+    images, *_ = trajectory(source, prepared, given, null, process, times, key)
     output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
     np.testing.assert_array_equal(output.host().images, images)
 
 
-def streamed_parity(errors, directory, whole, reference, meta, key):
+def streamed_parity(directory, whole, reference, meta, key):
     """The pipeline streamed onto a mesh a leaf at a time: every leaf the whole load holds, bit for
-    bit, each placed on the mesh, and every component and its walk held to the source as the whole
-    load's are (`qualified`): another program than the whole load's, which XLA need not round alike."""
+    bit, each placed on the mesh, and its walk held to the source as the whole load's is (`qualified`):
+    another program than the whole load's, which XLA need not round alike."""
     streamed = bundle(directory, streamed=True)
     assert jax.tree.structure(streamed.variables) == jax.tree.structure(whole.variables)
     for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables):
@@ -305,54 +398,101 @@ def streamed_parity(errors, directory, whole, reference, meta, key):
     for left, right in zip(jax.tree.leaves(streamed.variables), jax.tree.leaves(whole.variables),
                            strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
-    given, null, process, times = selection(streamed, meta)
-    qualified(errors, directory.name, streamed, reference, meta, key, given, null, process, times,
-              label="streamed_")
+    qualified(directory.name, streamed, reference, meta, key, label="streamed ")
 
 
-def check_grids(directory, grids, case=None):
-    from one_draw import assert_as_exact_as_the_reference
-    from reference_error import distance
+def pipeline_arms(site, root=None):
+    """tools/venv_reference.py's `native-<site>` site, `grid-<name>` or `(task, group)`: the recording, the
+    draw, Dew's computation of a draw's leaves (`grid_walker`'s, or `walk_leaves`'s of the group) and those
+    leaves, the saved pipeline loaded from `root`, or extracted once."""
+    from interop_support import extract_fixture
 
-    oracle = np.load(grids)
+    if root is None:
+        root = extract_fixture(Path(__file__).resolve().parents[1] / "tests/fixtures/tiny_diffusers.tar.xz",
+                               Path(tempfile.mkdtemp(prefix="dew-native-arms-")))
+    if isinstance(site, str):
+        walked = grid_walker(Path(root) / "sd")
+        return (RECORDINGS / f"{site}.npz", draw_for("grid"),
+                lambda dtype, inputs: walked(site.removeprefix("grid-"), inputs), ("latents",))
+    task, group = site
+    directory = Path(root) / task
+    reference = np.load(directory / "reference.npz")
+    meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
+    mask = {"mask": reference["mask"]} if "mask" in reference else {}
+    source, key, held = bundle(directory), jax.random.PRNGKey(17), groups(task)[group]
+
+    def dew(dtype, inputs):
+        return walk_leaves(task, source, meta, key, {**inputs, **mask}, held)
+
+    return RECORDINGS / f"{task}-{group}.npz", draw_for(task), dew, held
+
+
+GRID_SEEDS = dict.fromkeys(SCHEDULERS, 8)
+"""Each source grid's declared seeds for check 1 of the SD pipeline's walk over it, sized by `seeds_for` paired
+with Dew's walk as its recording ran it (tools/venv_reference.py's `native-grid-<name>`)."""
+
+
+def grid_walker(directory):
+    """The SD pipeline at `directory` walking a draw's noise over a source scheduler's own grid, "dog"
+    unconditioned and "cat" at guidance 3, four steps, as tools/diffusers_scheduler_pipeline_reference.py's
+    `walk` does, its last latents (`{"latents": ...}`): a function of the grid's name and the draw."""
+    from diffusers_scheduler_pipeline_reference import STEPS, scheduler
+
     source = bundle(directory)
     given, null = conditions(source)
-    errors = {}
-    cases = (case,) if case else sorted(name.removesuffix(".config") for name in oracle.files
-                                        if name.endswith(".config"))
-    for name in cases:
-        schedule = SourceSchedule.from_config(json.loads(str(oracle[name + ".config"])))
-        process, times = schedule.sampling(4)
-        noise = jnp.asarray(oracle["noise"]) * process.sampler_schedule.prior_scale()
+
+    def walked(name, inputs):
+        schedule = SourceSchedule.from_config(dict(scheduler(name, directory).config))
+        process, times = schedule.sampling(STEPS)
+        noise = jnp.asarray(inputs["noise"]) * process.sampler_schedule.prior_scale()
         task = replace(source.text_to_image(), grid=lambda count: (process, times), solver=schedule.solver)
-        output = task(DenoisingInputs(noise, given, null, rows=1), steps=4, guidance=3.0, key=jax.random.PRNGKey(0),
-                      decode=False)
-        # The walk's latents, as near float64 as the source scheduler's float32 walk over the same
-        # predictions (tools/diffusers_scheduler_pipeline_reference.py --truth).
-        latents = np.asarray(output.host().latents, np.float64)
-        errors[name] = {"dew": distance(latents, oracle[name + ".latents.fp64"]),
-                        "reference": distance(oracle[name + ".latents"], oracle[name + ".latents.fp64"])}
-        # Every grid is walked in one process over the one loaded pipeline, and each case's verdict
-        # is its own: a grid off the source is reported by name and the others still run.
+        output = task(DenoisingInputs(noise, given, null, rows=1), steps=STEPS, guidance=3.0,
+                      key=jax.random.PRNGKey(0), decode=False)
+        return {"latents": np.asarray(output.host().latents)}
+
+    return walked
+
+
+def check_grids(directory, case=None):
+    """The SD pipeline's walk over each source scheduler's own grid on par with Diffusers' scheduler over the
+    pipeline's own predictions (check 1, against `native-grid-<name>`'s recording). Every grid is walked in one
+    process over the one loaded pipeline, and each case's verdict is its own: a grid off the source is
+    reported by name and the others still run."""
+    from reference_error import as_given, assert_as_exact, indexed_recording, recording
+
+    walked, errors = grid_walker(directory), {}
+    for name in (case,) if case else GRID_SEEDS:
+        stored = recording(RECORDINGS / f"grid-{name}.npz")
+        drawn, recorded, truth = indexed_recording(stored, f"native-grid-{name}", GRID_SEEDS[name],
+                                                   inputs_of=draw_for("grid"))
         try:
-            assert_as_exact_as_the_reference(latents, oracle[name + ".latents"],
-                                             oracle[name + ".latents.fp64"], f"{name} grid")
+            assert_as_exact(as_given(lambda index, inputs, name=name: walked(name, inputs)), recorded, drawn,
+                            f"{name} grid", seeds=GRID_SEEDS[name], truth_fn=truth)
+            errors[name] = {}
         except AssertionError as failed:
-            errors[name]["failed"] = str(failed)
+            errors[name] = {"failed": str(failed)}
     print(json.dumps({"grids": errors}))
     return not any("failed" in error for error in errors.values())
+
+
+HANDOFF_SEEDS = 8
+"""The SDXL handoff's declared seeds for check 1, sized by `seeds_for` paired with Dew's walk on armada."""
 
 
 def handoff(directory, source, task, key):
     """SDXL's base walks the steps at or above the cutoff and stops
     (final_denoise=False, decode=False); the refiner continues from those
     latents (`initial=`) below it, as Diffusers' denoising_end and
-    denoising_start split them. tools/diffusers_handoff_reference.py
-    recorded Diffusers' own base and refiner pipelines doing so."""
-    from one_draw import assert_as_exact_as_the_reference
+    denoising_start split them: the base's latents, the refiner's and their
+    decoded images on par with Diffusers' own base and refiner pipelines
+    doing so (tools/diffusers_handoff_reference.py's `handed`, live) over
+    drawn noise (check 1)."""
+    from reference_error import as_given, assert_as_exact
 
-    recorded = np.load(Path(__file__).resolve().parents[1] / "tests/fixtures/diffusers_handoff.npz")
-    refiner = bundle(Path(directory).parent / "refiner")
+    from tools.diffusers_handoff_reference import handed
+
+    root = Path(directory).parent
+    refiner = bundle(root / "refiner")
     steps = 4
 
     def start(task, rows):
@@ -372,20 +512,26 @@ def handoff(directory, source, task, key):
     # inputs at 1e-6 (tests/test_lora.py `torch_unet`).
     twin = replace(task.model, approximate_gelu=False, attention_norm_epsilon=1e-6)
     base_task = replace(task, model=twin, final_denoise=False)
-    given, null, process, prefix = start(base_task, "prefix")
-    initial = jnp.asarray(recorded["noise"]) * process.sampler_schedule.prior_scale()
-    prepared = base_task.prepare(conditions=given, unconditional=null, key=key, steps=steps, initial=initial,
-                                 times=prefix)
-    latents = base_task(prepared, steps=steps, guidance=3.0, key=key, decode=False).host().latents
+    base_given, base_null, process, prefix = start(base_task, "prefix")
     refiner_task = replace(refiner.text_to_image(), final_denoise=False)
     given, null, _, tail = start(refiner_task, "tail")
-    prepared = refiner_task.prepare(conditions=given, unconditional=null, key=key, steps=steps,
-                                    initial=latents, times=tail)
-    final = refiner_task(prepared, steps=steps, guidance=3.0, key=key, decode=False).host().latents
-    images = refiner.autoencoder.decode(refiner.variables["autoencoder"], jnp.asarray(final))
-    for name, ours in (("prefix", latents), ("final", final), ("images", images)):
-        assert_as_exact_as_the_reference(np.asarray(ours), recorded[f"fp32.{name}"], recorded[f"fp64.{name}"],
-                                         f"handoff {name}")
+
+    def dew(noise):
+        initial = jnp.asarray(noise) * process.sampler_schedule.prior_scale()
+        prepared = base_task.prepare(conditions=base_given, unconditional=base_null, key=key, steps=steps,
+                                     initial=initial, times=prefix)
+        latents = base_task(prepared, steps=steps, guidance=3.0, key=key, decode=False).host().latents
+        prepared = refiner_task.prepare(conditions=given, unconditional=null, key=key, steps=steps,
+                                        initial=latents, times=tail)
+        final = refiner_task(prepared, steps=steps, guidance=3.0, key=key, decode=False).host().latents
+        images = refiner.autoencoder.decode(refiner.variables["autoencoder"], jnp.asarray(final))
+        return {"prefix": np.asarray(latents), "final": np.asarray(final), "images": np.asarray(images)}
+
+    def draw(seed):
+        return (np.random.default_rng([0x4A0, seed]).standard_normal((1, 8, 8, 4)).astype(np.float32),)
+
+    assert_as_exact(as_given(dew), as_given(lambda noise: handed(root, noise, wide=False)), draw, "handoff",
+                    seeds=HANDOFF_SEEDS, truth_fn=as_given(lambda noise: handed(root, noise, wide=True)))
 
 
 def mask_levels(directory, source, task, key):
@@ -467,37 +613,72 @@ def regress(directory, case):
     print(case, "passed")
 
 
-def check_model(directory):
+MODEL_TIME = 13.0
+"""The geometry cases' UNet timestep: any fixed one, the same in every arm."""
+MODEL_ROWS = 4
+"""A draw's independent rows: the pooled embedding's gradient holds 8 values a row, too few in one row for
+its rounding to resolve over draws."""
+MODEL_SEEDS = {"sd1": 8, "sd2": 8, "sdxl-inpaint": 16, "refiner": 256}
+"""Each geometry case's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` paired with
+Dew's on armada (11-06); the reference compared with itself needed 16, 8, 256 and 256."""
+
+
+def model_site(directory):
+    """A multilevel UNet geometry's check-1 arms: Dew's UNet and Diffusers' own Flax UNet on the same
+    weights (tools/diffusers_consumer.py's `flax_unet`, at float64 for the truth), each one's prediction and
+    the gradients of its drawn inputs (the latents, the prompt states, the pooled embedding where the
+    geometry takes SDXL's added conditioning, tools/native_unet_reference.py's TIME_IDS) under a drawn
+    cotangent. Returns `(dew, reference, truth, draw)`."""
+    from native_unet_reference import POOLED, TIME_IDS
+    from reference_error import with_gradients
+
     from dew.diffusion.process import DenoisingCondition
     from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
     from dew.nn.backbones.unet_condition import UNet2DCondition
-    directory = Path(directory)
-    reference = np.load(directory / "reference.npz")
-    model = UNet2DCondition(**unet_fields(json.loads((directory / "unet/config.json").read_text()), attention_impl="xla"))
-    parameters, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
-    condition = DenoisingCondition(jnp.asarray(reference["context"]),
-        jnp.asarray(reference["pooled"]) if "pooled" in reference else None,
-        jnp.asarray(reference["time_ids"]) if "time_ids" in reference else None)
-    def predict(value):
-        return model.apply({"params": parameters}, value, jnp.asarray(reference["time"]), conditioning=condition)
-    x = jnp.asarray(reference["input"])
-    output = jax.jit(predict)(x)
-    gradient = jax.jit(jax.grad(lambda value: jnp.sum(predict(value) * reference["probe"])))(x)
-    # Held to Diffusers' own float64 run on the same weights and inputs (tools/native_unet_reference.py
-    # --float64) by the float64 rule: a constant between two float32 implementations read one input's
-    # VJP 1.1e-4 off on one CPU and within on another.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from one_draw import assert_as_exact_as_the_reference
-    from reference_error import distance
+    from tools.diffusers_consumer import flax_unet
 
-    truth = np.load(Path(__file__).resolve().parents[1] / "tests/fixtures/native_unet_float64.npz")
-    errors = {}
-    for name, ours, theirs, key in (("prediction", output, reference["output"], "output"),
-                                    ("input_vjp", gradient, reference["vjp"], "vjp")):
-        wide = truth[f"{directory.name}/{key}"]
-        errors[name] = {"dew": distance(ours, wide), "reference": distance(theirs, wide)}
-        assert_as_exact_as_the_reference(ours, theirs, wide, f"{directory.name} {name}")
-    print(json.dumps({"model": directory.name, "errors": errors}))
+    directory = Path(directory)
+    config = json.loads((directory / "unet/config.json").read_text())
+    model = UNet2DCondition(**unet_fields(config, attention_impl="xla"))
+    parameters, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
+    ids = TIME_IDS.get(directory.name)
+    time_ids = None if ids is None else jnp.asarray([ids] * MODEL_ROWS, jnp.int32)
+    shapes = [(MODEL_ROWS, 8, 12, config["in_channels"]), (MODEL_ROWS, 8, config["cross_attention_dim"]),
+              *(() if ids is None else ((MODEL_ROWS, POOLED),))]
+
+    def draw(seed):
+        """The latents (Dew's channels-last), the prompt states, any pooled embedding, and the cotangent."""
+        rng = np.random.default_rng([0x0E3, seed])
+        latents, context, *pooled = (rng.standard_normal(shape) for shape in shapes)
+        cotangent = rng.standard_normal((MODEL_ROWS, 8, 12, 4))
+        return tuple(value.astype(np.float32) for value in (latents, context * 0.1, *pooled, cotangent))
+
+    def dew(latents, context, *pooled):
+        condition = DenoisingCondition(context, *pooled, *(() if time_ids is None else (time_ids,)))
+        time = jnp.full((MODEL_ROWS,), MODEL_TIME, latents.dtype)
+        return model.apply({"params": parameters}, latents, time, conditioning=condition)
+
+    def diffusers(wide):
+        arm = flax_unet(directory, wide=wide)
+
+        def run(latents, context, *pooled):
+            # The truth's time ids in float64, as its widened projections read them.
+            added = () if time_ids is None else (pooled[0], time_ids.astype(latents.dtype))
+            return arm(latents, jnp.full((MODEL_ROWS,), MODEL_TIME, latents.dtype), context, *added)
+        return run
+
+    return with_gradients(dew), with_gradients(diffusers(False)), with_gradients(diffusers(True)), draw
+
+
+def check_model(directory):
+    """A multilevel UNet geometry on par with Diffusers' own over drawn inputs (check 1, `model_site`)."""
+    from reference_error import assert_as_exact
+
+    directory = Path(directory)
+    dew, reference, truth, draw = model_site(directory)
+    assert_as_exact(dew, reference, draw, f"{directory.name} prediction and gradients",
+                    seeds=MODEL_SEEDS[directory.name], truth_fn=truth)
+    print(json.dumps({"model": directory.name, "held": True}))
 
 
 if __name__ == "__main__":
@@ -508,7 +689,7 @@ if __name__ == "__main__":
     sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")
-    parser.add_argument("--grids")
+    parser.add_argument("--grids", action="store_true", help="the source schedulers' grids, on the SD pipeline")
     parser.add_argument("--case")
     parser.add_argument("--model", action="store_true")
     parser.add_argument("--streamed", action="store_true", help="load the pipeline streamed onto a mesh")
@@ -517,7 +698,7 @@ if __name__ == "__main__":
     if args.model:
         check_model(args.directory)
     elif args.grids:
-        sys.exit(0 if check_grids(args.directory, args.grids, args.case) else 1)
+        sys.exit(0 if check_grids(args.directory, args.case) else 1)
     elif args.case:
         regress(args.directory, args.case)
     else:

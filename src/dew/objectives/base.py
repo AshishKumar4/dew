@@ -277,6 +277,14 @@ def stream(name: str) -> int:
     return fold
 
 
+QK = "qk"
+"""The collection a model's attention sows its logit maxima in, where a step opens it (`Step.qk_stats`)."""
+
+OBSERVED = (QK, INSPECTED)
+"""The collections a model call sows what a step observes in (`Step.observed`): its attention logit maxima
+and its watched activations, each a pass's own, which no state holds (`Objective.init`)."""
+
+
 @struct.dataclass
 class Step:
     """What the trainer tells an objective about the current step.
@@ -343,8 +351,18 @@ class Step:
         objective reads, and those the step asks for, `qk` where the optimizer clips by it and
         `inspected` where the step watches activations. A call opening none returns an empty mapping
         beside its output."""
-        return [*collections, *(["qk"] if self.qk_stats else []),
+        return [*collections, *([QK] if self.qk_stats else []),
                 *([INSPECTED] if self.watched is not None else [])]
+
+    def observed(self, sown: Variables) -> tuple[Variables | None, Variables | None]:
+        """What a model call that opened `sown()` sowed for the step: the attention logit maxima where
+        the optimizer clips by them (`Aux.qk_stats`), each layer's at its weights' path, and the watched
+        activations (`Aux.inspected`). Each is None where the step asked for none: every objective that
+        opens them returns them, as a run whose optimizer clips by the maxima refuses a step returning
+        none (row 1608: a decision, supervised or continuous diffusion run under 'muonclip' took no
+        update)."""
+        return (sown.get(QK, {}) if self.qk_stats else None,
+                sown.get(INSPECTED, {}) if self.watched is not None else None)
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -1004,7 +1022,8 @@ class Objective(ABC, Generic[Loss, Effects]):
     pipeline's frozen towers) rather than a starting tree, which holds `params`."""
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        """Return the whole variables tree, every collection, from one key.
+        """Return the whole variables tree, every collection but those a pass observes (`OBSERVED`), from
+        one key.
 
         It must be pure, because the trainer traces it once for shapes and
         once for values. `variables` is the held tree the caller supplies,
@@ -1032,7 +1051,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
-        tree = with_projected(self.complete_variables(key, tree),
+        tree = self.complete_variables(key, tree)
+        # What a pass observes is that pass's own, never the state's: a module that sows its maxima or its
+        # watched activations as it initializes leaves none for a step to read before its own (`OBSERVED`).
+        tree = with_projected({name: part for name, part in tree.items() if name not in OBSERVED},
                               functools.partial(self.projected, updated=True))
         if not held:
             # The draw `parameter_axes` reads, the names its boxes carry static under any trace.

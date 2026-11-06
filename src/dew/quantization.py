@@ -1189,37 +1189,6 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     return scaled
 
 
-def _integer_convolution_on_cuda(op: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
-    """Qwix's quantized convolution `op` with an integer product computed in float32 on CUDA.
-
-    Qwix 0.1.8 convolves two integer operands into an int32 accumulator
-    (`qarray.get_accumulator_and_result_type`), and XLA:GPU runs no s8 x s8 -> s32
-    convolution at any precision (UNIMPLEMENTED on an A100, jax 0.12) while it
-    runs s8 x s8 -> f32. On CUDA the operands' integer values convolve as float32
-    instead: each product of two int8 codes is exact in float32, at most 2**14 in
-    magnitude (Qwix's symmetric int8 reaches -128), so every contraction of up to
-    1024 terms sums exactly, and a longer one rounds only where a partial sum passes
-    2**24, which int32 would have held exactly. Every other platform convolves the
-    integers as Qwix does."""
-    qwix = _qwix()
-
-    def integer(arg) -> bool:
-        return isinstance(arg, qwix.QArray) and jnp.issubdtype(arg.qvalue.dtype, jnp.integer)
-
-    def convolved(lhs, rhs, *args, **kwargs) -> jax.Array:
-        if not (integer(lhs) and integer(rhs)):
-            return op(lhs, rhs, *args, **kwargs)
-
-        def in_float32(lhs, rhs):
-            widened = (dataclasses.replace(arg, qvalue=arg.qvalue.astype(jnp.float32)) for arg in (lhs, rhs))
-            return op(*widened, *args, **kwargs)
-
-        return jax.lax.platform_dependent(lhs, rhs, cuda=in_float32,
-                                          default=lambda lhs, rhs: op(lhs, rhs, *args, **kwargs))
-
-    return convolved
-
-
 def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool, collect: bool = True):
     """`operand` quantized as Qwix's training forward quantizes it (0.1.8
     `conv_general_qt_fwd`'s `_quantize_operand`), or as it is where its
@@ -1247,16 +1216,15 @@ def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool, collect: b
 
 def _qt_forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                 feature_group_count, batch_group_count, out_sharding):
-    """Qwix's training forward with the integer convolution XLA:GPU runs
-    (`_integer_convolution_on_cuda`): the product and the quantized operands
-    the backward reads."""
+    """Qwix's training forward: the product, its integer convolution exact on CUDA too (Qwix's own,
+    from 0.1.8.post4), and the quantized operands the backward reads."""
     conv_general = _qwix("qwix._src.core.conv_general")
-    integer_convolution = _integer_convolution_on_cuda(conv_general.conv_general_dilated)
     numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
     operands = (_qt_operand(lhs, config, numbers, for_lhs=True),
                 _qt_operand(rhs, config, numbers, for_lhs=False))
-    return integer_convolution(*operands, window_strides, padding, lhs_dilation, rhs_dilation, numbers,
-                               feature_group_count, batch_group_count, out_sharding), operands
+    return conv_general.conv_general_dilated(*operands, window_strides, padding, lhs_dilation, rhs_dilation,
+                                             numbers, feature_group_count, batch_group_count,
+                                             out_sharding), operands
 
 
 @functools.cache
@@ -1305,15 +1273,13 @@ def _grouped_convolution_gradient() -> type:
         the kernel's grouped shape, which only fits one group, so `jax.grad`
         raised for the hybrid DiT's depthwise convolutions.
 
-        The forward is Qwix's with the integer convolution XLA:GPU runs
-        (`_integer_convolution_on_cuda`), for an ungrouped convolution too:
-        Qwix's own convolves its int8 operands into int32, which an A100 and
-        an H100 cannot run. The backward is the one Qwix computes for an
-        ungrouped convolution with float gradients: the float convolution's
-        transpose at the dequantized operands the forward computed with,
-        here JAX's own, which handles groups. Qwix's quantized gradients
-        (`bwd_qtype`) run Qwix's own convolution, refused on a GPU, and for a
-        grouped convolution everywhere.
+        The forward is Qwix's, for an ungrouped convolution too, whose
+        integer convolution Qwix runs on CUDA too, exactly (0.1.8.post4). The
+        backward is the one Qwix computes for an ungrouped convolution with
+        float gradients: the float convolution's transpose at the dequantized
+        operands the forward computed with, here JAX's own, which handles
+        groups. Qwix's quantized gradients (`bwd_qtype`) run Qwix's own
+        convolution, refused for a grouped convolution.
 
         An ungrouped convolution with quantized activations quantizes its
         operands in at least float32 (`at_least_fp32`, float64 for float64
@@ -1343,11 +1309,6 @@ def _grouped_convolution_gradient() -> type:
                     lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                     feature_group_count, batch_group_count, precision, preferred_element_type, out_sharding)
             if feature_group_count == 1 and rule.bwd_qtype is not None:
-                if backend() == "gpu":
-                    raise ValueError(
-                        "Qwix 0.1.8's quantized gradients of a convolution (bwd_qtype) convolve two int8 "
-                        "operands into an int32 accumulator, which XLA:GPU cannot run (UNIMPLEMENTED on "
-                        "an A100); leave bwd_qtype unset, whose float gradients Dew computes")
                 wide = at_least_fp32(jnp.result_type(lhs, rhs))
                 return super().conv_general_dilated(
                     lhs.astype(wide), rhs.astype(wide), window_strides, padding, lhs_dilation,
@@ -1543,8 +1504,7 @@ def _serving_provider() -> type:
             super().__init__(
                 rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
                 _einsum_fn=_scaled_in_float32(qwix.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(
-                    _integer_convolution_on_cuda(qwix.conv_general_dilated)))
+                _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
             # The training provider over the spec's training rules, which forms a moving weight's
             # products (`moving_weights`).
             self._moving = _providers()[0](moving)

@@ -26,6 +26,12 @@ it does not on (`map_judge.ask_later`): the plan marks a check-1 site's second-s
 armada runs only where the judge's first judgement asks for them, and the judge then judges again over all
 its map tasks."""
 
+CENSUS = "DEW_GATE_CENSUS"
+"""The environment variable whose being set runs check 1's arms with YNNPACK's fusions on (no WITHOUT_YNN,
+`reference_error.switched_off`), as CPU users compile them: the census the whole suite runs every fifth
+publish (the plan's `--census`), each red it finds filed and judged Dew's or XLA:CPU's (row 4471;
+docs/design/testing.md, "the YNNPACK switch")."""
+
 STAGES = "DEW_CHECK1_STAGES"
 """The file check 1 appends each judgement it completes to, its stage among it (`reference_error._logged`),
 which the plan reads to draw a site's later map tasks in its first wave."""

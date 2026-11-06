@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # CI's test gate: the suite on armada and, beside it, tests/test_multihost.py's multi-host gangs, and the whole
-# suite's release checks after it, from the machine that sends them (a GitHub runner, or the land queue's PC: dew-ops
-# queue/gates.py). It sends the commit, waits, prints each red row's output, and fails on a failed test, a test
-# skipped on a missing import, a file left unreported or a gang that did not pass. A commit armada already graded
-# green is not run again, nor one PROVEN.
+# suite's release checks after it, from the machine that sends them (a GitHub runner). It sends the commit, waits,
+# prints each red row's output, and fails on a failed test, a test skipped on a missing import, a file left
+# unreported or a gang that did not pass. A commit armada already graded green is not run again, nor one PROVEN.
 #
 # The suite runs both Pythons as tasks of about five minutes each on Dew's armada deployment (.armada.json,
 # tools/armada/ci.py), on at most its pool, the gangs' containers beside it. A straggler at the end runs again
@@ -39,12 +38,16 @@ jobs() {  # every armada job the clients named, kept for whoever cancels this ru
   cat "$out"/gangs.log "$out"/suite.log "$out"/suite.err "$out"/release.log 2>/dev/null |
     grep -oE '\bjob [0-9]{14}-[0-9a-f]{8}' | cut -d' ' -f2 | sort -u > "$out/jobs.txt"
 }
+# The gangs' and release checks' own deadline: a background run's (BACKGROUND, main's daily whole run below every
+# lane's), which waits for capacity behind them, a longer one (train 663's review).
+side=1800
+[ -z "${BACKGROUND:-}" ] || side=6000
 if [ -z "${PROVEN:-}" ] && [ -z "${GANGLESS:-}" ]; then
   # A gang member lost before the start fails it within 300 s (armada#22).
   items=$(python3 tools/armada/ci.py gangs)
   echo "$items" | setsid $armada map --commit="$sha" --items=- --size=medium \
     --pool="$(echo "$items" | python3 -c 'import json, sys; print(sum(gang["gang"] for gang in json.load(sys.stdin)))')" \
-    --deadline=1800 --gang-start-timeout=300 $priority --label="${LABEL:-$sha}" -- python3 tools/armada/ci.py pytest \
+    --deadline=$side --gang-start-timeout=300 $priority --label="${LABEL:-$sha}" -- python3 tools/armada/ci.py pytest \
     --python="$(tr -d '\n' < .python-version)" --report=/tmp/dew-gang.xml \
     -- -k "{select}" --basetemp=/tmp/dew-gang tests/test_multihost.py > "$out/gangs.log" 2>&1 &
   gangs=$!
@@ -80,7 +83,7 @@ if [ -n "${DEW_WHOLE_SUITE:-}" ]; then
     failed=1
   elif [ "$checks" != "[]" ]; then
     echo "$checks" | $armada map --commit="$sha" --items=- --size=medium \
-      --pool="$(echo "$checks" | jq length)" --deadline=1800 $priority --label="${LABEL:-$sha}" \
+      --pool="$(echo "$checks" | jq length)" --deadline=$side $priority --label="${LABEL:-$sha}" \
       --cpu="$(jq -r '[.task.cpu] | flatten | map("\(.vendor)/\(.family)/\(.model)") | join(",")' .armada.json)" \
       -- python3 tools/armada/ci.py release --python={python} --tests={tests} --requirement={release} \
       --out=/tmp/dew-release.json > "$out/release.log" 2>&1 || failed=1

@@ -10,6 +10,10 @@ a run directory, a published checkpoint and a Hub repository all work.
     python examples/evaluate_and_serve.py --run runs/shakespeare/checkpoints \\
         --image-run runs/flowers-tpu/checkpoints/flowers-256 \\
         --reference-images data/flowers-heldout
+    python examples/evaluate_and_serve.py --image-run runs/flowers-tpu/checkpoints/flowers-256 \\
+        --reference-images data/flowers-heldout
+
+`--run` scores a language run; `--image-run` alone scores a diffusion run and nothing else.
 
 The same suites run from the command line, which is the harness's own entry
 point with Dew's model registered:
@@ -64,7 +68,8 @@ SMOKE_INCEPTION = FIXTURES / "inception/tiny/inception_v3_fid.safetensors"
 @dataclass
 class Config:
     run: Path | None = None
-    """The run directory, published checkpoint or Hub repo to score."""
+    """The language run's directory, published checkpoint or Hub repo to score; unset with `--image-run`
+    scores that diffusion run alone."""
     tokens: Path | None = None
     """The held-out token store whose tokens are the perplexity set, as
     `dew data export --tokenizer` writes one (examples/train_lm.py)."""
@@ -95,7 +100,8 @@ class Config:
     ollama_host: str | None = None
     ollama_model: str = "llama3.2"
     smoke: bool = False
-    """Train a tiny byte-level run here first and score that instead."""
+    """Smoke-sized settings, and, unless `--image-run` names the run to score, a tiny byte-level run
+    trained here first and scored instead."""
 
 
 def smoke_run(out: Path) -> tuple[Path, Path]:
@@ -234,26 +240,45 @@ def served(config: Config) -> dict[str, str]:
     return answers
 
 
+LANGUAGE = ("tokens", "tasks", "harness_limit", "sequence_length", "batch_size")
+"""The options only a language run reads; the prompt and its length a served endpoint reads too."""
+
+
+def dropped(config: Config) -> list[str]:
+    """The options `config` gives that nothing it scores reads: with a diffusion run and no language run,
+    those only a language run reads, the prompt and its length among them unless a served endpoint reads
+    them (`served`)."""
+    if config.run is not None or config.image_run is None:
+        return []
+    endpoint = config.openai_base_url is not None or config.ollama_host is not None
+    language = LANGUAGE if endpoint else (*LANGUAGE, "prompt", "max_new_tokens")
+    defaults = Config()
+    return [f"--{name.replace('_', '-')}" for name in language
+            if getattr(config, name) != getattr(defaults, name)]
+
+
 def main(config: Config) -> Path:
+    if unread := dropped(config):
+        raise ValueError(f"{', '.join(unread)} score a language run, which --run names; --image-run alone "
+                         "scores the diffusion run")
     if config.smoke:
         config.out.mkdir(parents=True, exist_ok=True)
-        run, tokens = smoke_run(config.out)
-        config = replace(config, run=run, tokens=tokens, sequence_length=32, batch_size=2,
-                         prompt="to be", max_new_tokens=8, image_steps=2,
-                         inception_weights=str(SMOKE_INCEPTION))
-    if config.run is None:
-        raise ValueError("--run names the run directory, checkpoint or Hub repo to score")
+        config = replace(config, sequence_length=32, batch_size=2, prompt="to be", max_new_tokens=8,
+                         image_steps=2, inception_weights=str(SMOKE_INCEPTION))
+        if config.image_run is None:
+            run, tokens = smoke_run(config.out)
+            config = replace(config, run=run, tokens=tokens)
+    if config.run is None and config.image_run is None:
+        raise ValueError("--run names the language run to score, or --image-run the diffusion run")
 
-    task = dew.pipeline(str(config.run))
-    if not isinstance(task, TextGeneration):
+    # The language run is read first, so a run of another kind is refused before the images are scored.
+    task = None if config.run is None else dew.pipeline(str(config.run))
+    if task is not None and not isinstance(task, TextGeneration):
         raise TypeError(f"--run holds a {type(task).__name__}; --image-run takes a diffusion run")
-
-    report = {"run": str(config.run),
-              "perplexity": perplexity(task, config),
-              "harness": harness(task, config),
-              "images": image_metrics(config),
-              "served": served(config),
-              "greedy": task(config.prompt, config.max_new_tokens, sampling=GREEDY, key=0).text[0]}
+    report = {"images": image_metrics(config), "served": served(config)}
+    if task is not None:
+        report.update(run=str(config.run), perplexity=perplexity(task, config), harness=harness(task, config),
+                      greedy=task(config.prompt, config.max_new_tokens, sampling=GREEDY, key=0).text[0])
     config.out.mkdir(parents=True, exist_ok=True)
     path = config.out / "report.json"
     path.write_text(json.dumps(report, indent=2, sort_keys=True))

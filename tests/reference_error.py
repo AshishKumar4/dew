@@ -68,13 +68,14 @@ import functools
 import hashlib
 import itertools
 import math
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import Truth, summed_as_run, unrewritten, widened
+from arm_arithmetic import Truth, Unrewritten, summed_as_run, unrewritten, widened
 from check1_statistics import (
     CONFIDENCE,
     FACTOR,
@@ -108,7 +109,7 @@ from check1_statistics import (
     row_factor,
     shown,
 )
-from check1_wire import DRAWS, REDRAW, STAGES, staged_units
+from check1_wire import CENSUS, DRAWS, REDRAW, STAGES, staged_units
 from conditioning import Conditioning, conditioned
 from float64_terms import float64_terms
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
@@ -189,6 +190,48 @@ class _Windowed:
                             for index in range(_window_count(arguments))])
 
 
+class _RunToRun:
+    """An arm whose outputs vary in their last bits from run to run on the same inputs (`run_to_run`):
+    the gate compiles `fn` as it compiles any arm (`_arms`) and judges each draw by the one run it makes."""
+
+    def __init__(self, fn, why: str):
+        self.fn, self.why = fn, why
+
+    def __call__(self, *inputs, **options):
+        return self.fn(*inputs, **options)
+
+    def __getattr__(self, name):
+        return getattr(self.fn, name)
+
+
+def _layers(fn):
+    """`fn` and every arm it adapts, outermost first: through a declaration (`_RunToRun`), a window loop
+    (`_Windowed`) and a reference's unrewritten scope (`Unrewritten`)."""
+    while True:
+        yield fn
+        if isinstance(fn, _RunToRun | _Windowed):
+            fn = fn.fn
+        elif isinstance(fn, Unrewritten):
+            fn = fn.wrapped
+        else:
+            return
+
+
+def _varies(fn) -> bool:
+    """Whether `fn`, or an arm it adapts, is declared to vary from run to run (`run_to_run`)."""
+    return any(isinstance(layer, _RunToRun) for layer in _layers(fn))
+
+
+def run_to_run(fn, why: str):
+    """`fn`, an arm declared to vary from run to run on a GPU on the same inputs, for `why`: an
+    accumulation in arrival order (atomic adds), which a deterministic form would make 2-2.7 times as slow
+    (row 4448, M-JS-5). Check 1 pairs it with the other arm within each draw's one run, as it pairs every
+    arm, and never holds it to a run of itself again (`_of_its_inputs`) but on a CPU, where its interpreted
+    program is a function of its inputs: a draw's evidence is one run's, and the redraw and every further
+    seed are runs of their own, so its spread across runs is the spread across draws check 1 weighs."""
+    return _RunToRun(fn, why)
+
+
 def over_windows(fn):
     """`fn`, an arm of one draw, run over `windows`' stacked arguments window by window, each window's
     arguments sliced from the stack, with its outputs stacked on their leading axis as host arrays.
@@ -217,8 +260,14 @@ dispatch at run time. YNNPACK picks its microkernels at run time by that instruc
 the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
 check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
 of different instruction sets, though the bits still part with the host (docs/performance.md, "The
-SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
-because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+SSD kernel's host check 1 without YNNPACK"); and XLA:CPU's fusion choices are not Dew's (rows 4520, 4522).
+The empty list, not the documented `-individual_dot`, because compiler options take no such spelling and
+that one leaves a scan's reductions fused. The census (`CENSUS`) compiles without it (`switched_off`)."""
+
+
+def switched_off() -> dict:
+    """WITHOUT_YNN, or none under the census (`CENSUS`), read when the gate compiles."""
+    return {} if os.environ.get(CENSUS) else WITHOUT_YNN
 
 
 def without_ynn(fn, **jit_options):
@@ -233,7 +282,7 @@ def without_ynn(fn, **jit_options):
     if getattr(fn, "without_ynn", False):
         return fn
     if jax.default_backend() == "cpu":
-        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
+        jit_options["compiler_options"] = {**switched_off(), **(jit_options.get("compiler_options") or {})}
     compiled = jax.jit(fn, **jit_options)
     compiled.without_ynn = True
     return compiled
@@ -309,6 +358,8 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False):
     within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
     unrewritten (`arm_arithmetic.unrewritten`)."""
     run = unrewritten if reference else _as_is
+    if isinstance(fn, _RunToRun):
+        return _RunToRun(_compiled(fn.fn, compile, pairing, reference=reference), fn.why)
     if _given(fn) or getattr(fn, "without_ynn", False):
         return run(fn)
     if getattr(fn, "dew_programs", False):
@@ -358,9 +409,8 @@ class _Paired:
 
 
 def _paired_arms(arms) -> list[_Paired]:
-    """The paired arms among `arms`, a window loop's inner arm for it."""
-    return [arm for arm in (arm.fn if isinstance(arm, _Windowed) else arm for arm in arms)
-            if isinstance(arm, _Paired)]
+    """The paired arms among `arms`, through every arm each adapts (`_layers`)."""
+    return [layer for arm in arms for layer in _layers(arm) if isinstance(layer, _Paired)]
 
 
 SWITCHED: list[dict] = []
@@ -397,6 +447,8 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     _ynn_option_held()
     refused = None
     for arm in arms:
+        # Through a declaration alone: a window loop's arm takes each window's slices, which the draw is not.
+        arm = arm.fn if isinstance(arm, _RunToRun) else arm
         if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
             continue
         try:
@@ -446,7 +498,7 @@ def _with_ynn_off(fn):
 
     @functools.wraps(fn)
     def run(*inputs, **options):
-        with compiled_with(WITHOUT_YNN if jax.default_backend() == "cpu" else {}):
+        with compiled_with(switched_off() if jax.default_backend() == "cpu" else {}):
             return fn(*inputs, **options)
     return run
 
@@ -923,9 +975,10 @@ def _repeat_promised() -> bool:
 def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
     """Raise unless `fn`, `name` of a check's arms, gives `first` again on the same `inputs`: an arm that
     draws a noise of its own, or reads state its last call left, compares Dew with a reference on draws no
-    seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842); the
-    CPU lane runs every check-1 site, so each arm is held to it there."""
-    if not _repeat_promised():
+    seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842), and
+    of an arm declared to vary from run to run (`run_to_run`) only on a CPU; the CPU lane runs every
+    check-1 site, so each arm is held to it there."""
+    if not _repeat_promised() or (_varies(fn) and jax.default_backend() != "cpu"):
         return
     if (where := _same_bits(first, fn(*inputs))) is not None:
         raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "
@@ -1405,7 +1458,6 @@ site's stage-two rate from, every attempt counted, and which sites' local errors
 
 def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
     import json
-    import os
 
     path = os.environ.get(STAGES_LOG)
     if path:
