@@ -9,7 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 from collections.abc import Callable
-from typing import Self
+from typing import Any, Self
 
 import jax
 import jax.numpy as jnp
@@ -110,6 +110,10 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     dtype: jnp.dtype
 
     m_warps: int = 4
+
+    relay: Any = dataclasses.field(default=None, compare=False)
+    """A consumer's shared-memory tile its register left operands relay through where its warps split their
+    columns (`relaying`, `relay_bytes`)."""
 
     rows = 16
 
@@ -243,11 +247,36 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return ref
 
     def _left(self, lhs):
-        """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's
-        (an accumulator's, the fork's relayout) cast."""
-        if isinstance(lhs, jax.Array):
-            return plgpu.layout_cast(lhs.astype(self.dtype), self.lhs)
-        return plgpu.load(lhs, layout=self.lhs, optimized=self._matrix_loads)
+        """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's (an
+        accumulator's) cast, in registers where each warp holds whole rows of it, else through the bound
+        relay tile (`relaying`): every warp's columns stored, then each warp's rows read whole, a sync after
+        each so no warp reads a column not yet stored or stores over one another still reads."""
+        if not isinstance(lhs, jax.Array):
+            return plgpu.load(lhs, layout=self.lhs, optimized=self._matrix_loads)
+        value = lhs.astype(self.dtype)
+        if not self.relay_bytes(*value.shape):
+            return plgpu.layout_cast(value, self.lhs)
+        if self.relay is None:
+            raise ValueError(f"a {value.shape} register operand on {self.m_warps} row warps relays "
+                             f"through {self.relay_bytes(*value.shape)} bytes of shared memory: bind them "
+                             "(`relaying`)")
+        # A plain tile, read element-wise: a warp's replicated rows (one or two row warps) take no ldmatrix
+        # free of bank conflicts from it, and a swizzled one takes no store of the accumulator's layout.
+        tile = self.relay.at[:value.shape[0], :value.shape[1]]
+        plgpu.store(tile, value, optimized=False)
+        mosaic.synced(interpret=False)
+        loaded = plgpu.load(tile, layout=self.lhs, optimized=False)
+        mosaic.synced(interpret=False)
+        return loaded
+
+    def relay_bytes(self, rows: int, depth: int) -> int:
+        # Its warps along a tile's rows alone (four of them) hold whole rows of the accumulator and the
+        # operand alike; fewer split the accumulator's columns among warps, which no register cast crosses.
+        return 0 if self.m_warps == 4 else rows * depth * self.dtype.itemsize
+
+    def relaying(self, tile) -> Self:
+        # A plain tile (`mosaic.plain`).
+        return dataclasses.replace(self, relay=tile)
 
     @property
     def _matrix_loads(self) -> bool:
