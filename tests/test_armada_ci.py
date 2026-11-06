@@ -842,6 +842,68 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     assert short < long
 
 
+def test_the_census_plans_the_whole_suite_cold_whatever_its_environment_says(ci, tmp_path, monkeypatch,
+                                                                            capsys):
+    """`plan --census`, as armada's run passes it after `--`: every file on both Pythons, nothing only
+    collected, every entry with the cache off and the whole suite's cells, though DEW_TEST_CACHE says on and
+    DEW_WHOLE_SUITE is unset, and each carrying the census to its task; a plan without it carries none."""
+    for name in ("test_light", "test_config", "test_other"):
+        (tmp_path / "tests" / f"{name}.py").write_text("def test_ok(): pass\n")
+    monkeypatch.setattr(ci, "NEWEST_FILES", ("tests/test_config.py",))
+    monkeypatch.setenv("DEW_TEST_CACHE", "on")
+    monkeypatch.delenv("DEW_WHOLE_SUITE", raising=False)
+    timings = tmp_path / "timings.json"
+    timings.write_text("{}")
+
+    def planned(*extra):
+        monkeypatch.setattr(sys, "argv", ["ci.py", "plan", "--target=120", f"--timings={timings}", *extra])
+        assert ci.main() == 0
+        return json.loads(capsys.readouterr().out)["include"]
+
+    census = planned("--census")
+    assert {(entry["cache"], entry["whole"], entry["census"]) for entry in census} == {("off", "1", "1")}
+    for python in ("3.12", "3.14"):
+        assert {name for entry in census if entry["python"] == python for name in entry["tests"].split()} == {
+            "tests/test_config.py", "tests/test_light.py", "tests/test_other.py"}
+    assert all(entry["split"] != ci.COLLECT for entry in census)
+    pushed = planned()
+    assert {(entry["cache"], entry["census"]) for entry in pushed} == {("on", "0")}
+    assert any(entry["split"] == ci.COLLECT for entry in pushed)
+
+
+def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tmp_path, monkeypatch,
+                                                                        cache_worker):
+    """A census task, run as armada starts it from `plan --census`'s entry, runs its tests with CENSUS set,
+    where the accuracy gate compiles check 1's arms with YNNPACK's fusions on (tests/reference_error.py), and
+    writes nothing to the test cache: its green row, run in another numerical mode than its inputs say, is
+    reused by no later run, and a red one replaces no green. An ordinary task sees no CENSUS."""
+    (tmp_path / "tests/test_seen.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def test_seen():\n"
+        "    with Path('seen').open('a') as seen: seen.write(os.environ.get('DEW_GATE_CENSUS', '-'))\n")
+    interpreter(tmp_path, "3.12")
+    url, stored, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    out = tmp_path / "verdict.json"
+    [row] = armada_task(ci, monkeypatch, out, census=True)
+    assert row["exitCode"] == 0, row["output"]
+    assert (tmp_path / "seen").read_text() == "1"
+    assert stored == {}
+    # The ordinary run after it finds no row of the census's to reuse, runs the file without CENSUS, and
+    # records it; the next ordinary run reuses that.
+    armada_task(ci, monkeypatch, out)
+    assert (tmp_path / "seen").read_text() == "1-"
+    assert stored
+    kept = dict(stored)
+    armada_task(ci, monkeypatch, out)
+    assert (tmp_path / "seen").read_text() == "1-"
+    armada_task(ci, monkeypatch, out, census=True)
+    assert (tmp_path / "seen").read_text() == "1-1"
+    assert stored == kept
+
+
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,
                                                                                   cache_worker):
     """A file that ran green is reused by a later task on the same CPU class while its inputs are

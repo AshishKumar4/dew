@@ -5,7 +5,8 @@ FlashAttention-4 and Tokamax's sm100 kernel hold them, and the template's algebr
 between the products.
 
 A program is a head's query block of `TCGEN05.rows` rows, in three warpgroups (`mosaic.tabled`). The
-issuing one's load warp fills a ring of key stages and one of value stages (`mosaic_sm100.Stages`), and its
+issuing one's load warp fills a ring of key stages and one of value stages (the bundle's streams,
+`mosaic_sm100.RINGS`: their slots released by the products' commit), and its
 product warp issues each step's `S = Q Kᵀ` into tensor memory and, a step behind, `P V` into the output's
 accumulator there, so a step's `S` is computed while the last step's weights multiply their values. The
 softmax warpgroup reads `S` out of tensor memory, hands it to the algebra (`logits_of`, `peak`, `weights`,
@@ -34,7 +35,13 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, mosaic_sm100
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_portable,
+    mosaic,
+    mosaic_sm100,
+    resources,
+)
 from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
 from dew.nn.kernels.templates.mosaic_sm100 import STORED, TCGEN05, TMEM
 
@@ -119,20 +126,20 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
 
 class _Scratch(NamedTuple):
-    """A program's opened scratch: its query block and its load's signal, the key and value rings
-    (`mosaic_sm100.Ring`), `S`'s accumulator (`mosaic_sm100.Tensor`: the products commit it, the softmax
-    releases it once read), the weights' two buffers in tensor memory (a step's the turn's slot of the
-    signal publishing them), the output's accumulator and the signal each `P V` commits
-    (`mosaic_sm100.Signal`, a turn a step, two slots: a step's weights wait for the one two back), each step's
-    rescale in shared memory (two slots) and the signal the softmax gives it by, the signal the correction
-    publishes the rescaled accumulator by, the softmax's final rows in shared memory and their signal, and
-    the epilogue's stages, which it writes by item (`ref[...] = `, which no static type of JAX's refs
-    declares)."""
+    """A program's opened scratch: its query block and its load's barrier (`Family.load_barriers`), the key
+    and value rings (`mosaic_sm100.CommittedRing`), `S`'s accumulator (`mosaic_sm100.Tensor`: the products
+    commit it, the softmax releases it once read), the weights' two buffers in tensor memory (a step's the
+    turn's slot of the signal publishing them), the output's accumulator and the signal each `P V` commits
+    (`mosaic_sm100.Signal`, a turn a step, two slots: a step's weights wait for the one two back), each
+    step's rescale in shared memory (two slots) and the signal the softmax gives it by, the signal the
+    correction publishes the rescaled accumulator by, the softmax's final rows in shared memory and their
+    signal, and the epilogue's stages, which it writes by item (`ref[...] = `, which no static type of JAX's
+    refs declares)."""
 
     q_smem: mosaic.Ref
-    q_loaded: mosaic_sm100.Signal
-    keys: mosaic_sm100.Ring
-    values: mosaic_sm100.Ring
+    q_loaded: mosaic.Ref
+    keys: mosaic.Ring
+    values: mosaic.Ring
     scores: mosaic_sm100.Tensor
     p_tmems: tuple[mosaic.Ref, mosaic.Ref]
     p_full: mosaic_sm100.Signal
@@ -175,10 +182,8 @@ class _Block(NamedTuple):
         return jnp.minimum(pl.cdiv(self.first + TCGEN05.rows, self.block_k), self.blocks)
 
 
-def _load(block: _Block, scratch: _Scratch, q_ref, k_ref, v_ref, *, group: int, tiles: Tiles) -> None:
-    """The load warp: the query block once, then each key block's keys and values into their rings."""
-    queries = q_ref.at[block.row, pl.ds(block.first, TCGEN05.rows), block.head]
-    scratch.q_loaded.loaded(scratch.q_loaded.turn(0), queries, scratch.q_smem)
+def _load(block: _Block, scratch: _Scratch, k_ref, v_ref, *, group: int, tiles: Tiles) -> None:
+    """The load warp: each key block's keys and values into their rings."""
     kv_head = lax.div(block.head, group)
 
     @pl.loop(0, block.blocks)
@@ -186,24 +191,28 @@ def _load(block: _Block, scratch: _Scratch, q_ref, k_ref, v_ref, *, group: int, 
         @pl.when(index < block.steps)
         def _():
             tile = (block.row, pl.ds(index * tiles.block_k, tiles.block_k), kv_head)
-            scratch.keys.load(scratch.keys.turn(index), (k_ref.at[tile],))
-            scratch.values.load(scratch.values.turn(index), (v_ref.at[tile],))
+            scratch.keys.load(scratch.keys.turn(index), k_ref.at[tile])
+            scratch.values.load(scratch.values.turn(index), v_ref.at[tile])
 
-    # Each stage's last releases, observed so its barriers end where they began (`Ring.drain`).
-    scratch.keys.drain(1, block.steps)
-    scratch.values.drain(1, block.steps)
+    # Each slot's last releases, observed so its barriers end where they began (`Ring.drain`).
+    scratch.keys.drain(block.steps)
+    scratch.values.drain(block.steps)
 
 
-def _products(block: _Block, scratch: _Scratch) -> None:
-    """The product warp: each step's `S = Q Kᵀ` into tensor memory once the softmax has read the last one,
-    and a step behind, `P V` into the output's accumulator once its weights are there and the correction
-    has taken the accumulator to their maximum."""
-    scratch.q_loaded.wait(scratch.q_loaded.turn(0))
+def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
+    """The product warp: its query block loaded whole (the bundle's `loaded`, beside the load warp's rings),
+    then each step's `S = Q Kᵀ` into tensor memory once the softmax has read the last one, and a step behind,
+    `P V` into the output's accumulator once its weights are there and the correction has taken the
+    accumulator to their maximum."""
+    queries = q_ref.at[block.row, pl.ds(block.first, TCGEN05.rows), block.head]
+    mosaic_sm100.RINGS.loaded(((queries, scratch.q_smem, scratch.q_loaded.at[0]),))
 
     def values(index):
-        (v_smem,), consumed = scratch.values.acquire(scratch.values.turn(index))
+        turn = scratch.values.turn(index)
+        v_smem = scratch.values.acquire(turn)
         scratch.p_full.wait(scratch.p_full.turn(index))
         pl.when(index > 0)(lambda: scratch.corrected.wait(scratch.corrected.turn(index - 1)))
+        consumed = _released(scratch.values, turn)
         for slot, p_tmem in enumerate(scratch.p_tmems):
             pl.when(lax.rem(index, 2) == slot)(functools.partial(
                 TCGEN05.product, scratch.acc_tmem, p_tmem, v_smem, consumed, accumulate=index > 0))
@@ -213,15 +222,22 @@ def _products(block: _Block, scratch: _Scratch) -> None:
     def _(index):
         @pl.when(index < block.steps)
         def _():
-            (k_smem,), consumed = scratch.keys.acquire(scratch.keys.turn(index))
+            turn = scratch.keys.turn(index)
+            k_smem = scratch.keys.acquire(turn)
             scores = scratch.scores.turn(index)
             s_tmem = scratch.scores.acquire(scores)
-            TCGEN05.product(s_tmem, scratch.q_smem, k_smem.T, consumed, accumulate=False)
+            TCGEN05.product(s_tmem, scratch.q_smem, k_smem.T, _released(scratch.keys, turn), accumulate=False)
             scratch.scores.issued(scores)
             pl.when(index > 0)(functools.partial(values, index - 1))
 
     values(block.steps - 1)
     scratch.scores.drain(block.steps)
+
+
+def _released(ring: mosaic.Ring, turn: mosaic.Turn):
+    """The barrier a product reading `turn`'s slot of `ring` releases it at, by its commit
+    (`mosaic_sm100.CommittedRing`: the slot's consumed barrier, tensor-core ordered)."""
+    return ring.consumed.at[turn.slot]
 
 
 def _softmax(block: _Block, scratch: _Scratch, *, spec: algebra.Forward, tiles: Tiles, blocks: int,
@@ -350,17 +366,21 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     blocks = max(1, -(-spec.keys // block_k))
     # The GPU in effect, its tensor memory's columns the accumulators' bound (`Accumulators.scratch`).
     target = generation.gpu_target()
-    transforms = mosaic_sm100.swizzled(dtype, width)
-    key_stages = mosaic_sm100.Stages(tiles.stages, (((block_k, width), dtype, transforms),))
-    value_stages = mosaic_sm100.Stages(tiles.stages, (((block_k, value_width), dtype,
-                                                       mosaic_sm100.swizzled(dtype, value_width)),))
+    # The keys' and values' rings, the bundle's streams (`mosaic_sm100.RINGS`), each block's rows at the
+    # widest swizzle its contraction fills (`mosaic_sm100.swizzled`'s).
+    rings = mosaic_sm100.RINGS.streams(
+        {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}, tiles.stages, 1,
+        swizzles={"keys": resources.widest_swizzle(dtype, width),
+                  "values": resources.widest_swizzle(dtype, value_width)})
     scores = mosaic_sm100.Accumulators(1, rows, block_k)
 
     def kernel(q_ref, k_ref, v_ref, out_ref, maxima_ref, over_ref, *refs):
         (q_smem, q_loaded, key_refs, value_refs, score_refs, p_even, p_odd, p_full, acc_tmem, o_done, scales,
          scaled, corrected, rows_smem, finished, o_smem, l_smem) = refs
-        scratch = _Scratch(q_smem, loads.opened(q_loaded), key_stages.opened(*key_refs),
-                           value_stages.opened(*value_refs), scores.opened(*score_refs), (p_even, p_odd),
+        opened = mosaic_sm100.RINGS.opened({name: dict(zip(rings[name], refs, strict=True))
+                                            for name, refs in (("keys", key_refs), ("values", value_refs))})
+        scratch = _Scratch(q_smem, q_loaded, opened["keys"], opened["values"],
+                           scores.opened(*score_refs), (p_even, p_odd),
                            paired.opened(p_full), acc_tmem, paired.opened(o_done), scales,
                            handed.opened(scaled), signals.opened(corrected), rows_smem,
                            loads.opened(finished), o_smem, l_smem)
@@ -370,19 +390,18 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
                  (1, lambda _: _correction(block, scratch, (out_ref, maxima_ref, over_ref), spec=spec,
                                            blocks=blocks)))
         mosaic.tabled(lax.axis_index("wg"), roles, functools.partial(
-            TCGEN05.issuing, functools.partial(_load, block, scratch, q_ref, k_ref, v_ref, group=group,
-                                              tiles=tiles),
-            functools.partial(_products, block, scratch)))
+            TCGEN05.issuing, functools.partial(_load, block, scratch, k_ref, v_ref, group=group, tiles=tiles),
+            functools.partial(_products, block, scratch, q_ref)))
 
-    # The query block's load and the softmax's final rows a role's signal; the weights', each `P V`'s and
-    # each rescale's the tensor core's; each step's factor a role's in two slots, the correction reading
-    # one while the softmax writes the next.
+    # The softmax's final rows a role's signal; the weights', each `P V`'s and each rescale's the tensor
+    # core's; each step's factor a role's in two slots, the correction reading one while the softmax writes
+    # the next.
     loads, signals = mosaic_sm100.Signals(tensor_core=False), mosaic_sm100.Signals()
     handed = mosaic_sm100.Signals(count=2, tensor_core=False)
     # The weights' two buffers' signals and each `P V`'s, a slot a buffer.
     paired = mosaic_sm100.Signals(count=2)
-    scratch = (mosaic_sm100.operand((rows, width), dtype, width), loads.scratch(),
-               key_stages.scratch(), value_stages.scratch(), scores.scratch(target),
+    scratch = (mosaic_sm100.operand((rows, width), dtype, width), mosaic_sm100.RINGS.load_barriers(1),
+               tuple(rings["keys"].values()), tuple(rings["values"].values()), scores.scratch(target),
                *(mosaic_sm100.operand_columns(rows, block_k, dtype) for _ in range(2)), paired.scratch(),
                mosaic_sm100.accumulator_columns(rows, value_width), paired.scratch(),
                plgpu.SMEM((2, rows), jnp.float32), handed.scratch(), signals.scratch(),

@@ -2,9 +2,9 @@
 accumulators in tensor memory, and the warpgroups a mainloop runs them in, which the GEMM template's
 (the GEMM template's, on `RINGS`) and the attention template's Blackwell mainloops share.
 
-A program runs two warpgroups (`roles`). The first issues: one warp's TMA loads fill a ring of operand
-stages (`Stages`), one warp issues each step's products once its stage is there, the products releasing
-the stage when they have read it (a tensor-core-ordered barrier, `tcgen05_mma`'s). The second reads
+A program runs two warpgroups (`roles`). The first issues: one warp's TMA loads fill the TMA rings' operand
+stages (`RINGS`, `CommittedRing`), one warp issues each step's products once its stage is there, the products
+releasing the stage when they have read it (a tensor-core-ordered barrier, `tcgen05_mma`'s). The second reads
 finished accumulators out of tensor memory (`read`, in column chunks of tcgen05's register layout) and
 releases them for the products after next (`Accumulators`, two or more in tensor memory's columns). A
 barrier's completions no later turn waited for are observed before the program ends (`drain`).
@@ -245,66 +245,6 @@ class Signal:
 
     def wait(self, turn: mosaic.Turn) -> None:
         plgpu.barrier_wait(self.barriers.at[turn.slot], parity=turn.parity)
-
-
-@dataclasses.dataclass(frozen=True)
-class Stages:
-    """A ring of `stages` operand stages in shared memory, one buffer an operand (`blocks`, each its
-    block's shape, dtype and transforms), a load barrier an operand and stage, and a release barrier a
-    stage the products arrive at once they have read it (tensor-core ordered). A turn is a step's index
-    over the program's walk; its stage is the turn's remainder. Over a pair of CTAs (`topology`), each
-    operand's block splits along its `partitions` dimension between them."""
-    stages: int
-    blocks: tuple
-    topology: Topology = SINGLE
-    partitions: tuple[int, ...] = ()
-
-    def scratch(self) -> tuple:
-        """The ring's shared memory and barriers, in `opened`'s order."""
-        buffers = tuple(plgpu.SMEM((self.stages, *shape), dtype, transforms=transforms)
-                        for shape, dtype, transforms in self.blocks)
-        loaded = tuple(plgpu.Barrier(num_barriers=self.stages) for _ in self.blocks)
-        return (buffers, loaded, plgpu.Barrier(num_barriers=self.stages, orders_tensor_core=True))
-
-    def opened(self, buffers, loaded, consumed) -> "Ring":
-        return Ring(self.stages, buffers, loaded, consumed, self.topology, self.partitions)
-
-
-@dataclasses.dataclass(frozen=True)
-class Ring:
-    """An opened ring (`Stages.opened`)."""
-    stages: int
-    buffers: tuple[Ref, ...]
-    loaded: tuple[state_types.AbstractRef, ...]
-    consumed: state_types.AbstractRef
-    topology: Topology = SINGLE
-    partitions: tuple[int, ...] = ()
-
-    def turn(self, counter) -> mosaic.Turn:
-        """Step `counter`'s turn of the ring."""
-        return mosaic.Turn.of(counter, self.stages)
-
-    def load(self, turn: mosaic.Turn, views: tuple) -> None:
-        """The load warp's turn: each operand's `views` entry into the turn's stage, once the products
-        have read the stage's last ones (the rotation before, of the other parity)."""
-        pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
-            self.consumed.at[turn.slot], parity=turn.freed))
-        partitions = self.partitions or (0,) * len(views)
-        for view, buffer, barrier, along in zip(views, self.buffers, self.loaded, partitions, strict=True):
-            plgpu.copy_gmem_to_smem(view, buffer.at[turn.slot], barrier.at[turn.slot],
-                                    **self.topology.copied(along))
-
-    def acquire(self, turn: mosaic.Turn) -> tuple:
-        """The product warp's turn: each operand's stage once loaded, and the barrier its products
-        release it at."""
-        for barrier in self.loaded:
-            plgpu.barrier_wait(barrier.at[turn.slot], parity=turn.parity)
-        return tuple(buffer.at[turn.slot] for buffer in self.buffers), self.consumed.at[turn.slot]
-
-    def drain(self, tiles, steps: int | jax.Array) -> None:
-        """The load warp's last releases, which no later load waited for (`mosaic.drained`), after `tiles`
-        tiles of `steps` turns each."""
-        mosaic.drained(self.consumed, tiles * steps, self.stages)
 
 
 @dataclasses.dataclass(frozen=True)

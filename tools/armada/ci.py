@@ -215,6 +215,11 @@ file on a Genoa host, 1.0 on a Turin one)."""
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
+CENSUS = "DEW_GATE_CENSUS"
+"""The variable under which the accuracy gate compiles check 1's arms with XLA:CPU's YNNPACK fusions on, as
+CPU users run them (tests/reference_error.py's CENSUS, row 4471): set in every test process of the census, the
+whole suite the land queue runs every fifth publish beside main's whole run (`plan --census`), whose rows are
+no rows to reuse (`tested`)."""
 HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
@@ -1230,7 +1235,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
     return entries
 
 
-def plan(target: float, timings: dict) -> list[dict]:
+def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
     then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
@@ -1239,11 +1244,15 @@ def plan(target: float, timings: dict) -> list[dict]:
     which look each up again in their containers, so the verdict names every file and containers scale with
     the change. Under the policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by
     the work, not the longest task, as warm estimates did. A site marked one of `SHARDS` runs as armada's
-    map and judge, apart from its file's tasks (`site_entries`)."""
-    cache = os.environ.get("DEW_TEST_CACHE") or "on"
-    # The whole suite's run alone (DEW_WHOLE_SUITE: the daily run's and the whole dispatch's) runs whole_suite
-    # cells (`selected`) and every file on the newest Python.
-    cells = "1" if os.environ.get("DEW_WHOLE_SUITE") else "0"
+    map and judge, apart from its file's tasks (`site_entries`). The `census` (`CENSUS`) is the whole suite
+    with the cache off, whatever this environment says, each entry carrying it to its task."""
+    cache = "off" if census else os.environ.get("DEW_TEST_CACHE") or "on"
+    # The whole suite's run alone (DEW_WHOLE_SUITE: the daily run's and the whole dispatch's, and the census)
+    # runs whole_suite cells (`selected`) and every file on the newest Python.
+    cells = "1" if census or os.environ.get("DEW_WHOLE_SUITE") else "0"
+    # What every entry carries to its task (.armada.json's command): the cache's policy, the whole suite's
+    # cells and the census.
+    stamped = {"cache": cache, "whole": cells, "census": "1" if census else "0"}
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     # Every file's check-1 sites its marks shard, refused where one site's map tasks outnumber what its
     # judges' job takes (`refused_sites`).
@@ -1299,18 +1308,17 @@ def plan(target: float, timings: dict) -> list[dict]:
                       for name, group in held_rows]
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(tokens),
                             "split": alone, "rows": [row(python, name, group) for name, group in held_rows],
-                            "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache,
-                            "whole": cells})
+                            "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), **stamped})
         # The sites to run whose judge's last run needed its later map tasks draw them at once (`eager_sites`).
         eager = eager_sites(python, [(name, test) for name, held in marked.items() for test in held
                                      if (name, test) not in found])
         entries += [{**entry, "weight": entry["weight"] + (COLD_SECONDS if cache == "off" else 0.0),
-                     "cache": cache, "whole": cells}
+                     **stamped}
                     for entry in site_entries(python, marked, found, timings, target, eager)]
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
     rest = [] if cells == "1" else [name for name in every if name not in NEWEST_FILES]
     collecting = collect_entries(rest, timings, target)
-    return entries + [{**entry, "cache": cache, "whole": cells} for entry in collecting]
+    return entries + [{**entry, **stamped} for entry in collecting]
 
 
 def collect_entries(names: list[str], timings: dict, target: float) -> list[dict]:
@@ -1453,7 +1461,7 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
          grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
-         release: str = "") -> int:
+         release: str = "", census: bool = False) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -1469,7 +1477,9 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     common = shared(python)
     names, kept = kept_of(tests)
     whole_files = {name: at for (name, group), at in kept.items() if not group}
-    code = tested(python, names, split, out, deadline, cache, grace, common, {}, coverage, whole=whole,
+    # The census's tests run under CENSUS, which also keeps their rows from the records (`tested`).
+    environ = {CENSUS: "1"} if census else {}
+    code = tested(python, names, split, out, deadline, cache, grace, common, environ, coverage, whole=whole,
                   release=release, kept=whole_files)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
@@ -1492,7 +1502,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                          "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
             continue
         part = out.with_name(f"{out.name}.{index}")
-        code = max(code, tested(python, [name], group, part, left, cache, grace, common, {}, coverage,
+        code = max(code, tested(python, [name], group, part, left, cache, grace, common, environ, coverage,
                                 whole=whole, release=release, kept={name: at}))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
@@ -1751,9 +1761,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
-    if coverage is None and not release:
+    if coverage is None and not release and CENSUS not in environ:
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
-        # under its requirement's overlay and on the whole suite's run alone.
+        # under its requirement's overlay and on the whole suite's run alone, nor the census's (`CENSUS`).
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set())
     return 0
@@ -2307,6 +2317,17 @@ def flagged(verdict: Path, new: Path | None) -> int:
     return 1 if found and base is not None else 0
 
 
+def plan_arguments(planning: argparse.ArgumentParser) -> None:
+    """The `plan` operation's arguments, which .armada.json's plan command fills, and to which armada's `run`
+    appends what follows its `--`."""
+    planning.add_argument("--target", type=float, required=True)
+    planning.add_argument("--timings", type=Path, required=True)
+    planning.add_argument("--census", action="store_true",
+                          help="the census (CENSUS): the whole suite with the test cache off, every test "
+                               "process compiling check 1's arms with YNNPACK's fusions on; armada passes it "
+                               "after `--`, so the run's verdict is stored as no commit's")
+
+
 def task_arguments(running: argparse.ArgumentParser) -> None:
     """The `task` operation's arguments, which armada's task command fills from a plan entry."""
     running.add_argument("--python", choices=PYTHONS, required=True)
@@ -2318,6 +2339,8 @@ def task_arguments(running: argparse.ArgumentParser) -> None:
         help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
     running.add_argument("--whole", choices=("0", "1"), default="0",
                          help="the plan's DEW_WHOLE_SUITE: 1 on the whole suite's run, which runs its cells")
+    running.add_argument("--census", choices=("0", "1"), default="0",
+                         help="the plan's census: 1 runs the tests under CENSUS, recording no row")
     running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
@@ -2353,9 +2376,7 @@ def main() -> int:
     operations = parser.add_subparsers(dest="operation", required=True)
     deciding = operations.add_parser("policy", help="the test cache's policy for this checkout's change")
     deciding.add_argument("base", help="the commit the change is read from (its merge-base with HEAD)")
-    planning = operations.add_parser("plan")
-    planning.add_argument("--target", type=float, required=True)
-    planning.add_argument("--timings", type=Path, required=True)
+    plan_arguments(operations.add_parser("plan"))
     task_arguments(operations.add_parser("task"))
     selecting = operations.add_parser(
         "pytest", help="pytest on the arguments as a CI task runs it, CI's selection first; its exit status")
@@ -2455,12 +2476,12 @@ def main() -> int:
         return 0
     if args.operation == "plan":
         print(json.dumps({"include": plan(args.target, json.loads(args.timings.read_text())
-                                          if args.timings.is_file() else {})}))
+                                          if args.timings.is_file() else {}, census=args.census)}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage, whole=args.whole == "1")
+                coverage=args.coverage, whole=args.whole == "1", census=args.census == "1")
 
 
 def pinned(argv: list[str]) -> None:

@@ -1816,7 +1816,7 @@ class Transport[Allocated, Opened](abc.ABC):
         TPU's VMEM)."""
         return plgpu.SMEM(shape, dtype)
 
-    def meeting(self, consumers: int):
+    def meeting(self, consumers: int) -> object:
         """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""
         return plgpu.Barrier(num_arrivals=consumers, num_barriers=2)
 
@@ -1895,6 +1895,14 @@ class Transport[Allocated, Opened](abc.ABC):
         """The semaphores of `shape` a tile's partials are signalled on across programs (`fixed_up`); none
         interpreted, where the programs' order stands in for them (`tail.ordered`)."""
         raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
+
+    def ticketed(self, ready, ticket, body: Callable[[], None]) -> None:
+        """`body`, an add into global memory (`added`), in its turn among the programs adding there: once
+        `ticket` of them have signalled `ready` (one of `partials_ready`'s, counting the adds done), then its
+        writes complete and `ready` signalled, so the adds land in a fixed order (a deterministic sum,
+        FlashAttention 3's dQ semaphore); `body` alone where `ready` is None (interpreted, the programs'
+        order standing in)."""
+        raise NotImplementedError(f"{self.name} orders no adds across programs (`fixes_up`)")
 
     def fixed_up(self, summed, partials, ready, program, start, gathered, store,
                  combine=operator.add) -> None:
@@ -2283,6 +2291,17 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def partials_ready(self, shape: tuple[int, ...], interpret: bool):
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
+
+    def ticketed(self, ready, ticket, body: Callable[[], None]) -> None:
+        if ready is None:
+            body()
+            return
+        # Wait without taking: the semaphore counts the adds done, each program's turn the count before it.
+        plgpu.semaphore_wait(ready, ticket, decrement=False, memory_scope="gpu")
+        body()
+        # Its writes complete in global memory, not only its stage read (`store_wait`), before the next turn.
+        plgpu.wait_smem_to_gmem(0)
+        plgpu.semaphore_signal(ready, 1, memory_scope="gpu")
 
     def fixed_up(self, summed, partials, ready, program, start, gathered, store,
                  combine=operator.add) -> None:

@@ -170,12 +170,16 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     None where no tile holds."""
     # The facts the layouts share (their instruction family's); each layout's registers bound the shapes.
     family = layouts[0]
-    # Its widths in whole rows of the widest swizzle, as well as its column unit: the objective below prices
-    # reads, not a narrower staging swizzle's, and an A100's 160-wide tiles (64-byte swizzle) ran its
-    # forwards 1.13-1.24x their 128-wide time where the reads favoured them (M-FS-1, W3-a100).
-    unit = math.lcm(family.column_unit(dtype), mosaic.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize)
+    # Its widths in whole rows of the widest swizzle, as well as its column unit, where the call's width has
+    # one: the objective below prices reads, not a narrower staging swizzle's, and an A100's 160-wide tiles
+    # (64-byte swizzle) ran its forwards 1.13-1.24x their 128-wide time where the reads favoured them
+    # (M-FS-1, W3-a100); a narrower call (a swapped decode product's few rows) at its column unit.
     widest = min(width, family.widest_product or width)
-    columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
+    unit = family.column_unit(dtype)
+    swizzled = math.lcm(unit, mosaic.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize)
+    columns = ([block_n for block_n in range(widest - widest % swizzled, 0, -swizzled)
+                if width % block_n == 0]
+               or [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0])
     steps = [step for step in depths or family.depths(dtype) if depth is None or depth % step == 0]
     busy = 1 + family.loads_ahead + family.in_flight
 

@@ -55,6 +55,14 @@ pinned JAX (an XLA RET_CHECK compiling a role's thread, a tuple of 8 leaves give
 compile for a B200 does not (row 2422)."""
 
 
+
+@pytest.fixture(autouse=True)
+def _on_a_b200():
+    """Every call the Blackwell mainloop's: its kernels' facts a B200's, interpreted on this CPU too (its
+    tensor memory's columns, `attention_blackwell._forward`'s bound)."""
+    with generation.assumed("sm100"):
+        yield
+
 @INTERPRETS
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("width", list(SHAPES))

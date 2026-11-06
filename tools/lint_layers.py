@@ -42,6 +42,8 @@ LAYERS: Mapping[str, Contract] = {
         ("dew.data",), (), tuple(name for name in FEATURES if name != "dew.data")),
     "telemetry imports nothing above the network layer": Contract(
         ("dew.telemetry",), (), tuple(name for name in FEATURES if name not in ("dew.nn", "dew.telemetry"))),
+    "kernels import nothing above the network layer": Contract(
+        ("dew.nn.kernels",), (), tuple(name for name in FEATURES if name not in ("dew.nn", "dew.telemetry"))),
     "training imports no front end": Contract(("dew.training",), (), ("dew._cli", "dew.decision")),
     "checkpoints import no front end or configuration": Contract(
         ("dew.checkpoints",), (), ("dew._cli", "dew.decision", "dew.config")),

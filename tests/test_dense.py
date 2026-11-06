@@ -322,6 +322,40 @@ def test_a_biased_bf16_projection_is_as_exact_as_torchs(general):
                     truth_fn=linear(torch.float64))
 
 
+@pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
+def test_a_bf16_projection_with_an_fp32_bias_rounds_its_product_and_bias_once(general):
+    """A bfloat16 projection whose bias is stored at fp32, a mixed-precision model's, adds that bias to its
+    fp32 product and rounds once, as torch's addmm rounds product and bias (row 634): on par with torch's
+    bfloat16 nn.Linear over the same bfloat16 inputs and kernel and the bias rounded to bfloat16, as
+    autocast feeds it, from its float64 run over the drawn values (check 1)."""
+    import torch
+
+    layer = (DenseGeneral(32, dtype=jnp.bfloat16, param_dtype=jnp.float32) if general
+             else Dense(32, dtype=jnp.bfloat16, param_dtype=jnp.float32))
+
+    def draw(seed):
+        """The inputs and the kernel, each a bfloat16 value, and the bias an fp32 one."""
+        rng = np.random.default_rng(seed)
+        x, kernel = (np.asarray(jnp.asarray(value, jnp.bfloat16), np.float32)
+                     for value in (rng.standard_normal((512, 64)), rng.standard_normal((64, 32)) * 0.1))
+        return x, kernel, rng.standard_normal(32).astype(np.float32)
+
+    def projected(x, kernel, bias):
+        params = {"params": {"kernel": jnp.asarray(kernel, jnp.float32),
+                             "bias": jnp.asarray(bias, jnp.float32)}}
+        return layer.apply(params, jnp.asarray(x, jnp.bfloat16))
+
+    def linear(dtype):
+        def run(x, kernel, bias):
+            weight, shift, inputs = (torch.tensor(np.asarray(a, np.float64)).to(dtype)
+                                     for a in (kernel.T, bias, x))
+            return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
+        return as_given(run)
+
+    assert_as_exact(projected, linear(torch.bfloat16), draw, "fp32-biased projection",
+                    seeds=BIASED_SEEDS[general], truth_fn=linear(torch.float64))
+
+
 def test_an_adapter_adds_its_branch_to_the_layers_rounded_output():
     """A LoRA branch on a biased bfloat16 projection adds its delta to the layer's rounded output,
     as PEFT adds it to torch's: the adapted layer is the plain layer's output plus the branch alone
