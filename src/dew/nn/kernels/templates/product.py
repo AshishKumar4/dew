@@ -36,6 +36,11 @@ class Product:
     refusal: str | None
 
 
+SUMMED_DEPTH = 128
+"""The depth an exactly summed partial covers on a family whose accumulator carries across steps
+(`mosaic.Issuer.summed_window`): DeepSeek-V3's promotion interval for FP8 sums, 128."""
+
+
 def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
              operands: tuple = ()) -> Product:
     """The product a caller asks for with `precision` (explicitly or through

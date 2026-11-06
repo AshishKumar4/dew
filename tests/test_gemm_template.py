@@ -19,7 +19,7 @@ from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
 from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import bundles, mosaic_sm90, product, resources, tail
+from dew.nn.kernels.templates import mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import mosaic_gpu, mosaic_tpu, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -251,7 +251,7 @@ COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma')
 """A tile two consumer warpgroups compute, on one multiprocessor."""
 
 FED = dataclasses.replace(COOPERATIVE, family=mosaic_sm90.FED.name)
-"""`COOPERATIVE` without a producer: its first consumer issues the rings' loads (`mosaic.ConsumerFed`)."""
+"""`COOPERATIVE` without a producer: its first consumer issues the rings' loads (`fed.ConsumerFed`)."""
 
 PAIRED = dataclasses.replace(COOPERATIVE, cluster=2)
 """`COOPERATIVE` on a pair of multiprocessors a cluster, the forward's two row tiles of a group sharing its
@@ -1785,6 +1785,28 @@ def test_an_ampere_kernel_gradient_at_a_two_row_warp_step_holds_check_1(generati
                         seeds=SEEDS, truth_fn=lambda x, dy: _kernel_gradient(x, dy, SIZES))
 
 
+def test_an_ampere_fp32_kernel_gradient_promotes_its_sums_a_window_at_a_time():
+    """On an A100, interpreted, an fp32 kernel gradient through the template at 32-row steps, its sums
+    promoted a 128-deep window at a time (`mosaic_sm80.MmaIssuer.summed_window`: four steps, the tensor
+    cores' sum of each added into the running sum at the window's end; M-FS-4): groups of three steps (a
+    short window), five (a whole one and a step) and four (one whole), an empty one and one of a row among
+    them (`SIZES`), on par with XLA's over the draws (check 1), truth float64's."""
+    tiles = mosaic_gpu.Tiles(64, 64, 32, 2, 1, warpgroups=1, family="mma.sync")
+
+    def ampere(x, dy):
+        return gemm.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision="default",
+                           interpret_on_cpu=True)
+
+    def plain(x, dy):
+        with jax.default_matmul_precision("default"):
+            return _kernel_gradient(x, dy, SIZES)
+
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic_gpu"), \
+            tuning.pinned({grouped_matmul.MosaicTgmm: tiles}):
+        assert_as_exact(ampere, jax.jit(plain), _gradient_rows_draw, "ampere fp32 kernel gradient, windows",
+                        seeds=SEEDS, truth_fn=lambda x, dy: _kernel_gradient(x, dy, SIZES))
+
+
 def _gradient_rows_draw(seed):
     """Rows and a cotangent for a kernel gradient, both bf16."""
     rng = np.random.default_rng(seed + 4)
@@ -2291,28 +2313,6 @@ def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generati
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"paired product's two outputs ({generation_name})", seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, cast=jnp.float64)))
-
-
-def test_two_consumers_tile_streams_blocks_their_copies_share():
-    """A tile is in its family's granularity (`_Mosaic._granular`) only where each block a step streams splits
-    into its consumers' equal shares (`Family.shares_rows`): on a two-consumer mma.sync bundle, whose
-    consumers each copy whole 32-row shares, a 64-deep tile is, a 32-deep one is not, nor one whose matrix
-    read transposed streams 96-row blocks."""
-    class TwoConsumers(type(bundles.named("mma.sync", jnp.bfloat16))):
-        consumers = 2
-
-    family, launch = TwoConsumers(jnp.dtype(jnp.bfloat16)), grouped_matmul.MosaicGmm()
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
-    deep = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family="mma.sync")
-    with generation.assumed("sm80"):
-        ba = launch.bind(bf16((512, 256)), bf16((2, 256, 384)), sizes, out_dtype="bfloat16", trans_rhs=False,
-                         interpret=True)
-        transposed = launch.bind(bf16((512, 256)), bf16((2, 384, 256)), sizes, out_dtype="bfloat16",
-                                 trans_rhs=True, interpret=True)
-        assert launch._granular(ba, deep, family)
-        assert not launch._granular(ba, dataclasses.replace(deep, block_k=32), family)
-        assert not launch._granular(transposed, dataclasses.replace(deep, block_n=96), family)
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])

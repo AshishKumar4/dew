@@ -8,6 +8,7 @@ slots, double buffered, each awaited at its DMA semaphore), stores an output by 
 of static extents (`mosaic.store_rows`), and runs a persistent launch's tiles round-robin over the launch's
 programs, one a core. A program is one role: no producer runs beside it, and nothing is multicast."""
 
+import contextvars
 import dataclasses
 from collections.abc import Callable
 
@@ -24,6 +25,9 @@ from dew.nn.kernels.templates import mosaic
 STAGES = 2
 """The slots a stream's ring holds: a step's blocks arrive while the step before it multiplies (Pallas
 TPU's own pipeline's double buffering)."""
+
+_GRID_NAMES: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("tpu_grid_names", default=())
+"""The launch grid's axis names while its entry traces (`VmemRings.kernel`), which `program_index` reads."""
 
 
 class Slots:
@@ -110,14 +114,21 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         # No lane decides a column: the index is its own offset.
         return jnp.zeros((), jnp.int32), self.iota(shape, 1)
 
+    # A launch's operands stay in HBM (`VmemRings.kernel`), which a core reads only through a copy: each read
+    # copies its ref into a scoped buffer first (a VMEM ref's own copy is VMEM to VMEM).
     def rows_of(self, ref) -> jax.Array:
-        return ref[...]
+        return _read(ref)
 
     def columns_of(self, ref) -> jax.Array:
-        return ref[...]
+        return _read(ref)
 
     def tile_of(self, ref) -> jax.Array:
-        return ref[...]
+        return _read(ref)
+
+    def scalar_of(self, ref) -> jax.Array:
+        # A scalar a core's scalar unit reads: its first entry copied into SMEM.
+        return pl.run_scoped(lambda held: (pltpu.sync_copy(ref.at[pl.ds(0, 1)], held), held[0])[1],
+                             pltpu.SMEM((1,), ref.dtype))
 
     def key_magnitudes(self, tile) -> jax.Array:
         return jnp.max(jnp.abs(tile[...]), axis=1).astype(jnp.float32)
@@ -165,7 +176,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         return acc + sum(_product(part, rhs) for part in parts)
 
     def rescaled_products(self, acc: jax.Array, scale, parts, rhs, interpret: bool) -> jax.Array:
-        return self.register_products(acc * scale, parts, rhs, interpret)
+        # `scale` the factor's function of the held value (`Issuer.rescaled_products`), not a factor.
+        return self.register_products(scale(acc), parts, rhs, interpret)
 
 
 class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
@@ -187,6 +199,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     walks_scoped = False
 
+    budgets_registers = False
+
     def registers(self, consumers: int, programs: int = 1) -> int:
         raise NotImplementedError("a TPU core budgets no registers: its values spill to VMEM")
 
@@ -205,20 +219,52 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0) -> Callable:
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster.
-        del grid_names, approx_math, reducing_warpgroups, resident, model_flops
+        del approx_math, reducing_warpgroups, resident, model_flops
         _one(consumers, clustered=cluster > 1)
 
+        def named(*refs):
+            # The grid's axes by name while the entry traces (`program_index`): Pallas TPU numbers them.
+            token = _GRID_NAMES.set(tuple(grid_names))
+            try:
+                return entry(*refs)
+            finally:
+                _GRID_NAMES.reset(token)
+
         def launched(*operands):
-            # A table its programs read an element at a time in scalar memory, every other operand in HBM.
-            spaces = [pltpu.SMEM if at < scalars else pl.ANY for at in range(len(operands))]
-            return launches.pallas_call(
-                entry, name=name or self.name, out_shape=out_type, grid=grid,
+            # A table its programs read an element at a time in scalar memory, every other operand in HBM. A
+            # ref the launch adds into in place (`jax.new_ref`, `mosaic.stacked_zeros`) goes in as its value
+            # aliased to an output of its own (`input_output_aliases`), which the program reads and writes as
+            # the ref, and which is written back into the ref after the call. Its programs run in turn
+            # ("arbitrary"), so one's read-modify-write of a shared view (`added`) races no other's.
+            places = [at for at, operand in enumerate(operands)
+                      if isinstance(jax.typeof(operand), state_types.AbstractRef)]
+            values = [operand[...] if at in places else operand for at, operand in enumerate(operands)]
+            outputs, structure = jax.tree.flatten(out_type)
+            aliased = [jax.ShapeDtypeStruct(values[at].shape, values[at].dtype) for at in places]
+
+            def program(*refs):
+                given, made = list(refs[:len(values)]), refs[len(values):]
+                for at, ref in zip(places, made[len(outputs):], strict=True):
+                    given[at] = ref
+                return named(*given, *made[:len(outputs)])
+
+            spaces = [pltpu.SMEM if at < scalars else pl.ANY for at in range(len(values))]
+            results = launches.pallas_call(
+                program, name=name or self.name, out_shape=(*outputs, *aliased), grid=grid,
                 in_specs=[pl.BlockSpec(memory_space=space) for space in spaces],
-                out_specs=jax.tree.map(lambda _: pl.BlockSpec(memory_space=pl.ANY), out_type),
-                compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",) * len(grid)),
-                interpret=pltpu.InterpretParams() if interpret else False, cost_estimate=cost)(*operands)
+                out_specs=[pl.BlockSpec(memory_space=pl.ANY)] * (len(outputs) + len(aliased)),
+                input_output_aliases={at: len(outputs) + k for k, at in enumerate(places)},
+                compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",) * len(grid)),
+                interpret=pltpu.InterpretParams() if interpret else False, cost_estimate=cost)(*values)
+            for at, result in zip(places, results[len(outputs):], strict=True):
+                operands[at][...] = result
+            return jax.tree.unflatten(structure, results[:len(outputs)])
 
         return launched
+
+    def program_index(self, name: str) -> jax.Array:
+        # Pallas TPU numbers a grid's axes: `name`'s place among the launch's (`kernel`'s `grid_names`).
+        return pl.program_id(_GRID_NAMES.get().index(name))
 
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams)
@@ -262,9 +308,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 unrolled: bool = False, accumulators: tuple = ()) -> None:
         # A launch's tiles round-robin over its programs, each tile's outputs staged in VMEM and copied out
         # before the next tile's walk.
-        del axis, in_flight, unrolled, accumulators
+        del in_flight, unrolled, accumulators
         _one(consumers)
-        program, programs = pl.program_id(0), pl.num_programs(0)
+        program, programs = self.program_index(axis), pl.num_programs(_GRID_NAMES.get().index(axis))
         total = 1
         for extent in tiles:
             total *= extent
@@ -327,6 +373,13 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             carry = lax.fori_loop(lo, hi, body, carry)
         return carry
 
+    def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
+                    walk: Callable[..., R], *, between=None) -> R:
+        # One role a core: no partner reads a step it passes, so it walks its own steps alone.
+        del views, wg, between
+        lo, hi = own
+        return walk(streams, lo, hi, streamed[0])
+
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         # Its walk copies only the steps it reads: a passed step loads nothing.
         del streams, lo, hi, first
@@ -342,15 +395,18 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def load_barriers(self, count: int):
         return pltpu.SemaphoreType.DMA((count,))
 
-    def staged_memory(self, shape: tuple[int, ...], dtype):
+    def staged_memory(self, shape: tuple[int, ...], dtype, swizzle: int | None = None):
         # Its one role's staging in VMEM (`staging` keeps the GPU's up to two roles' shape, so a template
-        # indexes it alike), its copies' DMA semaphores its `load_barriers`.
+        # indexes it alike), its copies' DMA semaphores its `load_barriers`; its compiler lays the tile
+        # out, no swizzle.
+        del swizzle
         return pltpu.VMEM(shape, dtype)
 
-    def meeting(self, consumers: int) -> object:
-        # One role, which meets no other (`meet` refuses): a semaphore its scope allocates and never waits on.
+    def schedule(self, consumers: int):
+        # One role a core takes no turns (`turn` passes for one consumer): a semaphore it never signals, no
+        # byte of its VMEM (`resources.scratch_bytes`).
         _one(consumers)
-        return pltpu.SemaphoreType.REGULAR
+        return pltpu.SemaphoreType.REGULAR(())
 
     def meet(self, halves) -> None:
         raise NotImplementedError("a TPU program is one role: it meets no other")
@@ -366,9 +422,16 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             pltpu.sync_copy(smem, view)
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
-        del pending
-        raise NotImplementedError("a TPU core adds into HBM by no atomic: a split contraction's partial "
-                                  "sums take a place each")
+        # No atomic into HBM: the view read into VMEM, added to and written back, the launch's programs in
+        # turn (`kernel`'s "arbitrary" grid), so no other program's add falls between.
+        del interpret, smem, pending
+
+        def add(held):
+            pltpu.sync_copy(view, held)
+            held[...] = held[...] + value.astype(held.dtype)
+            pltpu.sync_copy(held, view)
+
+        pl.run_scoped(add, pltpu.VMEM(view.shape, view.dtype))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -378,6 +441,12 @@ class Mxu(MxuIssuer, VmemRings):
 
 MXU = Mxu()
 """The TPU bundle (`bundles.of` on a TPU)."""
+
+
+def _read(ref) -> jax.Array:
+    """`ref`'s whole value through a scoped VMEM buffer of its shape (`pltpu.sync_copy`)."""
+    return pl.run_scoped(lambda held: (pltpu.sync_copy(ref, held), held[...])[1],
+                         pltpu.VMEM(ref.shape, ref.dtype))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:

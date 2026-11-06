@@ -250,21 +250,27 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
             coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=True))
 
 
+@pytest.mark.parametrize("rows", ["repeated", "distinct"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
-def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
+def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype, rows):
     """Repeated tokens hold the row arithmetic fixed while the column sum grows to Qwen3.5-0.8B's size,
     isolating partial-sum error from bf16 midpoint flips: the weight gradient holds check 1 over the
     step's draws. Repeated rows give the output and input gradient one row's evidence a draw, so the same
-    launch holds all three over a step of distinct rows too."""
+    launch holds all three over a third of a step of distinct rows too (8192, its weight gradient's sum
+    thousands of rows long; the full step's sum is the repeated case's to hold). Each is its own case, so
+    each fits its group's 120 s: both in one ran 129 s, and the full step of distinct rows alone 121-162 s
+    (row 4458, NS4458-1)."""
     functions = norm_functions(dtype, offset=True, after_cast=True)
 
     def coefficient(operands):
         return scale_coefficient(operands[0], dtype, after_cast=True)
 
-    compare(functions, lambda draw: full_step(dtype, draw), ("y", "x", "scale"), SEEDS[(24576, 1000)],
-            coefficient=coefficient, judged=("scale",))
-    compare(functions, functools.partial(norm_operands, (24576, 1000), dtype, jnp.float32),
-            ("y", "x", "scale"), SEEDS["step of distinct rows"], coefficient=coefficient)
+    if rows == "repeated":
+        compare(functions, lambda draw: full_step(dtype, draw), ("y", "x", "scale"), SEEDS[(24576, 1000)],
+                coefficient=coefficient, judged=("scale",))
+    else:
+        compare(functions, functools.partial(norm_operands, (8192, 1000), dtype, jnp.float32),
+                ("y", "x", "scale"), SEEDS["step of distinct rows"], coefficient=coefficient)
 
 
 def test_a_weight_gradient_past_fp32s_range_is_an_infinity_as_xlas():
@@ -580,8 +586,93 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
         graph = traced(functools.partial(run, RESIDUAL, MLP_HIDDEN))
         assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
         meshed = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
+    assert_as_alone(meshed, alone)
+
+
+@pytest.mark.mesh(devices=2)
+def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_operands():
+    """On an explicit mesh splitting the rows, no logical axes named: the operands' own types place the
+    kernels per shard (`norm_swiglu._shard_spec`; row 822), the weight whole, its gradient summed over the
+    shards, their outputs and gradients on par with one device's."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32)
+    branch, ds = (jax.random.normal(jax.random.key(index), x.shape) for index in (28, 29))
+    gate, up, dout = (jax.random.normal(jax.random.key(index), (4, 8, 24)) for index in (30, 31, 32))
+
+    def run(x, branch, scale, ds, dy, gate, up, dout):
+        seam = evaluated(fused_seam(1e-5, x.dtype, offset=True, after_cast=True), (x, branch, scale),
+                         (ds, dy))
+        return seam, evaluated(fused_swiglu(), (gate, up), dout)
+
+    operands = (x, branch, scale, ds, dy, gate, up, dout)
+    alone = jax.jit(run)(*operands)
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(operand, NamedSharding(mesh, P() if operand is scale else P("data")))
+                  for operand in operands]
+        graph = traced(run, *placed)
+        assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
+        meshed = jax.jit(run)(*placed)
+    assert_as_alone(meshed, alone)
+
+
+def assert_as_alone(meshed, alone):
+    """Each of `meshed`'s leaves within 1e-6 of one device's (`alone`): a shard's rows are its own, and the
+    weight's gradient sums the shards' partials in another order."""
     for mine, theirs in zip(jax.tree.leaves(meshed), jax.tree.leaves(alone), strict=True):
         assert relative(mine, theirs) < 1e-6
+
+
+def _checked_shard_operands():
+    """The checked `shard_map` test's operands (`_checked_shard_run`'s): the seam's and SwiGLU's, and their
+    cotangents."""
+    (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32)
+    branch, ds = (jax.random.normal(jax.random.key(index), x.shape) for index in (28, 29))
+    gate, up, dout = (jax.random.normal(jax.random.key(index), (4, 8, 24)) for index in (30, 31, 32))
+    return x, branch, scale, ds, dy, gate, up, dout
+
+
+def _checked_shard_run(x, branch, scale, ds, dy, gate, up, dout):
+    """The fused seam's and SwiGLU's outputs and gradients (`evaluated`)."""
+    seam = evaluated(fused_seam(1e-5, x.dtype, offset=True, after_cast=True), (x, branch, scale), (ds, dy))
+    return seam, evaluated(fused_swiglu(), (gate, up), dout)
+
+
+def _checked_shard_specs(scale_shape, outputs):
+    """Each operand's and output's placement: rows split over `data`, the weight and its gradient whole."""
+    from jax.sharding import PartitionSpec as P
+
+    rows = P("data")
+    in_specs = (rows, rows, P(), rows, rows, rows, rows, rows)
+    return in_specs, jax.tree.map(lambda leaf: P() if leaf.shape == scale_shape else rows, outputs)
+
+
+def test_seam_and_product_launch_their_kernels_inside_a_checked_shard_map():
+    """Inside a `shard_map` that checks varying axes over a compile-only pair of H100s, each its rows, the
+    weight replicated: the fused seam's and SwiGLU's forward and backward launch their kernels, their
+    outputs' varying type stated (`norm_swiglu._varying`) and the weight's gradient summed over the shards
+    to its own type (`_typed`), the program's one collective (route evidence, row 822)."""
+    import fla_gdn_support as support
+    from kernel_compile import Expected, compile_kernels, route_failures
+
+    operands = _checked_shard_operands()
+    outputs = jax.eval_shape(_checked_shard_run, *operands)
+    in_specs, out_specs = _checked_shard_specs(operands[2].shape, outputs)
+
+    def program(*operands):
+        return jax.shard_map(_checked_shard_run, in_specs=in_specs, out_specs=out_specs,
+                             check_vma=True)(*operands)
+
+    def case():
+        return program, tuple(jax.ShapeDtypeStruct(operand.shape, operand.dtype) for operand in operands)
+
+    expected = Expected(axes=(("data", 2),), specs=in_specs,
+                        launches=frozenset({"rms_norm_forward", "rms_norm_backward", "swiglu_forward",
+                                            "swiglu_backward"}),
+                        collectives=frozenset({("all-reduce", frozenset({"data"}))}))
+    cases = [support.KernelCase("checked shard_map", case, expected=expected)]
+    assert route_failures(cases, compile_kernels(cases, "sm90")) == []
 
 
 def fused_function(name, fused: bool):

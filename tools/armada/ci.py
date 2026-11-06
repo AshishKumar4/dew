@@ -101,7 +101,6 @@ refused (`report`), its coverage partial. A target well under CI's keeps tasks s
 
 import argparse
 import ast
-import collections
 import concurrent.futures
 import contextlib
 import dataclasses
@@ -151,6 +150,8 @@ coverage_report = _loaded(HERE / "coverage_report.py")
 r2 = _loaded(HERE / "r2.py")
 watched = _loaded(HERE / "watched.py")
 followed = _loaded(HERE / "followed.py")
+digests = _loaded(HERE / "digests.py")
+code_of, unit, units = digests.code_of, digests.unit, digests.units
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
@@ -215,11 +216,6 @@ file on a Genoa host, 1.0 on a Turin one)."""
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
-CENSUS = "DEW_GATE_CENSUS"
-"""The variable under which the accuracy gate compiles check 1's arms with XLA:CPU's YNNPACK fusions on, as
-CPU users run them (tests/reference_error.py's CENSUS, row 4471): set in every test process of the census, the
-whole suite the land queue runs every fifth publish beside main's whole run (`plan --census`), whose rows are
-no rows to reuse (`tested`)."""
 HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
@@ -233,6 +229,9 @@ plan's own code (this file) runs outside the tests, so a change to it reruns non
 the durations record (`session.DURATIONS`), which only a split file's groups are cut from, so a
 group's key covers its own file's entries alone (`cache_key`); nor does a fixture or a package's data,
 which is the input of the files whose runs opened it, however they opened it (executed.py's `Opens`)."""
+WHOLE_GPU = "0.75"
+"""The share of a GPU a lane given the whole of it hands its files (`gpu_lane`): what JAX's client
+preallocates where no XLA_PYTHON_CLIENT_MEM_FRACTION is set."""
 ARMADA_SEEN = ("environment", "environments", "env")
 """.armada.json's parts a test process runs in, beside its task's command and secrets (`armada_seen`):
 its pool, size, target, plan and the task's deadline and mode decide where and when tasks run, never
@@ -303,7 +302,7 @@ def shared(python: str) -> str:
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
-        digest.update(name.encode() + contents(name))
+        digest.update(name.encode() + (code_of(name) if name.endswith(".py") else contents(name)))
     return digest.hexdigest()
 
 
@@ -311,7 +310,7 @@ def lane_inputs(python: str) -> str:
     """The hash of what a GPU lane's file shares (`gpu_lane`): what every test file's run shares (`shared`),
     and this file, which sets the environment, share and deadline each file runs under on a GPU, where a
     CPU task's are the session's."""
-    return hashlib.sha256((shared(python) + contents(__file__).hex()).encode()).hexdigest()
+    return hashlib.sha256((shared(python) + code_of(__file__).hex()).encode()).hexdigest()
 
 
 FIXTURES = Path("tests/fixtures")
@@ -367,99 +366,6 @@ def contents(name: str) -> bytes:
                          if not entry.name.startswith(".") and not built(entry))
         return hashlib.sha256("\n".join(entries).encode()).digest()
     return b"missing"
-
-
-def unit(path: str, name: str) -> bytes:
-    """The digest of unit `name` of code module `path`, which a run executed (followed.py's `code_unit`):
-    a function outside any function, by its qualified name (a method's by its class's), its text whole, the
-    functions and classes nested in it among it; or the module's top level (`followed.TOP`), its text with
-    every such function's body left out but what a function value shows without running it (its docstring,
-    whether it is a generator): its imports, its constants, its classes' bodies, and its functions'
-    signatures, defaults and decorators, which run as it is imported. Two functions of one name (a
-    property's getter and setter, a definition under each branch) are one unit. Positions are none of it, so
-    moving code reruns nothing; a run that reads a module's text (a traceback, inspect) reads its file
-    whole, which keys it whole, and one that takes a function's code (`__code__`) records its unit; a test
-    asserting a source position it never read is out of contract (the owner's test rules ban pinning source
-    text or positions). A module that does not compile is its text in every unit, and a unit it no longer
-    holds is b"missing"."""
-    found = units(path)
-    return found.get(name, b"missing") if isinstance(found, dict) else found
-
-
-UNITS: dict[bytes, dict[str, bytes] | bytes] = {}
-"""Each module text's units' digests (`digested`), by the text's digest: a plan keys a module's units for
-many files, and reads and hashes its text once a key (`cache_key`'s `read`)."""
-
-
-def units(path: str) -> dict[str, bytes] | bytes:
-    """Module `path`'s units' digests (`digested`): its text's digest where it does not compile."""
-    data = Path(path).read_bytes()
-    digest = hashlib.sha256(data).digest()
-    if digest not in UNITS:
-        UNITS[digest] = digested(data, path)
-    found = UNITS[digest]
-    return digest if found is None else found
-
-
-def digested(source: bytes, path: str) -> dict[str, bytes] | None:
-    """The digest of each unit of module text `source` (`unit`), or None where it does not compile
-    (`compiled`): a body left out would hide what fails it. The top level holds, beside its text with each
-    outermost function's body left out but its docstring, what compiling a body makes of the code around it
-    (`shapes`): whether a function is a generator or a coroutine, and the cells a class body makes for its
-    methods (super())."""
-    code = compiled(source, path)
-    if isinstance(code, str):
-        return None
-    tree = ast.parse(source)
-    found: dict[str, list[str]] = collections.defaultdict(list)
-
-    class Hollow(ast.NodeTransformer):
-        """The module's top level: each outermost function's text kept under its name, its body left out but
-        its docstring, which the function value shows without running."""
-
-        def __init__(self) -> None:
-            self.scope: list[str] = []
-
-        def visit_ClassDef(self, node):
-            self.scope.append(node.name)
-            self.generic_visit(node)
-            self.scope.pop()
-            return node
-
-        def visit_FunctionDef(self, node):
-            found[".".join([*self.scope, node.name])].append(ast.dump(node))
-            documented = ast.get_docstring(node, clean=False) is not None
-            node.body = [*node.body[:1 if documented else 0], ast.Pass()]
-            return node
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-    top = ast.dump(Hollow().visit(tree)) + json.dumps(shapes(code))
-    digests = {name: hashlib.sha256("\n".join(dumps).encode()).digest() for name, dumps in found.items()}
-    return {**digests, followed.TOP: hashlib.sha256(top.encode()).digest()}
-
-
-def compiled(source: bytes, path: str) -> types.CodeType | str:
-    """Module text `source` compiled, or why it does not compile, as Python says."""
-    try:
-        return compile(source, path, "exec", dont_inherit=True)
-    except SyntaxError as error:
-        return str(error)
-
-
-def shapes(module: types.CodeType) -> list[list]:
-    """What compiling each function body outside any function makes of the code around it, shown without
-    running it: each such function's flags (a generator's, a coroutine's), and each class body's cells for
-    its methods (super(), __class__), by qualified name."""
-    found, pending = [], [module]
-    while pending:
-        code = pending.pop()
-        for const in code.co_consts:
-            if isinstance(const, types.CodeType) and ".<locals>" not in const.co_qualname:
-                outer = bool(const.co_flags & followed.OPTIMIZED)
-                found.append([const.co_qualname, const.co_flags if outer else list(const.co_cellvars)])
-                pending.append(const)
-    return sorted(found, key=json.dumps)
 
 
 @dataclasses.dataclass
@@ -1244,8 +1150,8 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     which look each up again in their containers, so the verdict names every file and containers scale with
     the change. Under the policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by
     the work, not the longest task, as warm estimates did. A site marked one of `SHARDS` runs as armada's
-    map and judge, apart from its file's tasks (`site_entries`). The `census` (`CENSUS`) is the whole suite
-    with the cache off, whatever this environment says, each entry carrying it to its task."""
+    map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is the whole
+    suite with the cache off, whatever this environment says, each entry carrying it to its task."""
     cache = "off" if census else os.environ.get("DEW_TEST_CACHE") or "on"
     # The whole suite's run alone (DEW_WHOLE_SUITE: the daily run's and the whole dispatch's, and the census)
     # runs whole_suite cells (`selected`) and every file on the newest Python.
@@ -1477,8 +1383,9 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     common = shared(python)
     names, kept = kept_of(tests)
     whole_files = {name: at for (name, group), at in kept.items() if not group}
-    # The census's tests run under CENSUS, which also keeps their rows from the records (`tested`).
-    environ = {CENSUS: "1"} if census else {}
+    # The census's tests run under check 1's CENSUS (tests/check1_wire.py, where the gate reads it), which
+    # also keeps their rows from the records (`tested`).
+    environ = {check1_wire().CENSUS: "1"} if census else {}
     code = tested(python, names, split, out, deadline, cache, grace, common, environ, coverage, whole=whole,
                   release=release, kept=whole_files)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
@@ -1761,9 +1668,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
-    if coverage is None and not release and CENSUS not in environ:
+    if coverage is None and not release and not (environ and check1_wire().CENSUS in environ):
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
-        # under its requirement's overlay and on the whole suite's run alone, nor the census's (`CENSUS`).
+        # under its requirement's overlay and on the whole suite's run alone, nor the census's.
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set())
     return 0
@@ -2079,7 +1986,9 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
-    budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
+    # A job holding the whole GPU is given no fraction (a node sets one for a part of a GPU alone, dew-ops'
+    # session `settings`): its processes may take what one process takes by JAX's own default (row 2570).
+    budget = float(os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", WHOLE_GPU)) * total
     held = device_class(network)
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
@@ -2323,7 +2232,8 @@ def plan_arguments(planning: argparse.ArgumentParser) -> None:
     planning.add_argument("--target", type=float, required=True)
     planning.add_argument("--timings", type=Path, required=True)
     planning.add_argument("--census", action="store_true",
-                          help="the census (CENSUS): the whole suite with the test cache off, every test "
+                          help="the census (check 1's CENSUS): the whole suite with the test cache off, "
+                               "every test "
                                "process compiling check 1's arms with YNNPACK's fusions on; armada passes it "
                                "after `--`, so the run's verdict is stored as no commit's")
 
@@ -2340,7 +2250,7 @@ def task_arguments(running: argparse.ArgumentParser) -> None:
     running.add_argument("--whole", choices=("0", "1"), default="0",
                          help="the plan's DEW_WHOLE_SUITE: 1 on the whole suite's run, which runs its cells")
     running.add_argument("--census", choices=("0", "1"), default="0",
-                         help="the plan's census: 1 runs the tests under CENSUS, recording no row")
+                         help="the plan's census: 1 runs the tests under check 1's CENSUS, recording no row")
     running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,

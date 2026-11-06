@@ -24,7 +24,9 @@ from dew.nn.kernels.templates import (
     bundles,
     layout,
     mosaic,
+    mosaic_sm80,
     mosaic_sm90,
+    mosaic_tpu,
     operands,
     resources,
 )
@@ -46,11 +48,15 @@ from dew.nn.kernels.templates.attention import (
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.programs import CALLS, equations
 
-QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
+QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name, mosaic_sm80.Mma.name,
+                       mosaic_tpu.MXU.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
-feed their own rings (`mosaic_sm90.FED`). mma.sync's (an A100's) joins once every launch it derives
-compiles spill-free (the resource gate's sm80 cases, `GATED`; row 2078: check 1 held there,
-ET-2078-A100CHECK3); before that it takes a launch of fewer rows than a role's (`few_rows`)."""
+feed their own rings (`mosaic_sm90.FED`); mma.sync's staged by cp.async (an A100's: every launch it derives
+compiles spill-free, the resource gate's sm80 cases, `GATED`; row 2078: check 1 held there,
+ET-2078-A100CHECK3); and a TPU core's MXU (`mosaic_tpu.MXU`: every launch written against the family's
+seams, its forward, training forward and backward on par interpreted for a v5e). mma.sync's fed bundle
+(`bundles.MmaFed`, consumer Blackwell's) takes a launch of fewer rows than a role's (`few_rows`) until its
+gate holds."""
 
 
 def few_rows(family: mosaic.Family, rows: int | None) -> bool:
@@ -64,6 +70,15 @@ def few_rows(family: mosaic.Family, rows: int | None) -> bool:
     return family.specialized(padded, family.role_rows) != family
 
 
+def fewer_rows(family: mosaic.Family) -> tuple[int, ...]:
+    """The consumer rows below a role's a backward launch takes on `family`, largest first: whole divisors of
+    the role's rows in the issuer's, each one its warps arrange themselves by (`Issuer.specialized`:
+    mma.sync's two warps of 16 rows at 32, its register operands then relayed through shared memory where
+    they cross warps, `Issuer.relay_bytes`); none on a family whose role is one issuer's rows (wgmma's)."""
+    return tuple(rows for rows in range(family.role_rows - family.rows, 0, -family.rows)
+                 if family.role_rows % rows == 0 and family.specialized(rows, rows) != family)
+
+
 def qualified(family: mosaic.Family, rows: int | None = None) -> bool:
     """Whether the attention mainloop runs a launch of `rows` rows on `family`: a qualified bundle
     (`QUALIFIED`), or one taking them at tiles of fewer rows than its role's (`few_rows`)."""
@@ -74,7 +89,8 @@ def bundle(generation_name: str | None, dtype, rows: int | None = None) -> mosai
     """The bundle the attention mainloop runs on a device of `generation_name` for operands of `dtype` and a
     launch of `rows` rows: the shared registry's (`bundles.of`) where attention is qualified on it
     (`qualified`); None elsewhere, whose calls another mainloop takes by legality."""
-    family = None if generation_name is None else bundles.of(generation_name, dtype)
+    # Every launch of the mainloop is written against the family's seams, a TPU core's among them (`tpu`).
+    family = None if generation_name is None else bundles.of(generation_name, dtype, tpu=True)
     return family if family is not None and qualified(family, rows) else None
 
 
@@ -85,7 +101,7 @@ def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tupl
     device has, by the share of its rows they fill), where its family is qualified (`qualified`)."""
     if generation_name is None:
         return ()
-    return tuple(family for family in bundles.layouts(generation_name, dtype, rows)
+    return tuple(family for family in bundles.layouts(generation_name, dtype, rows, tpu=True)
                  if qualified(family, rows))
 
 
@@ -103,14 +119,26 @@ def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     a call derives is the qualification's (`layouts`), so a config pinned on a family not yet qualified (an
     A100's mma.sync, its resource witness) resolves too. A forward's family is arranged for its consumer's
     share, `block_q` x `block_k` (`Issuer.specialized`, as the GEMM's: mma.sync's warps by the share, whose
-    default 64-row atom no 32-row consumer's operands cast to); a backward's launches hold differing
-    shares."""
+    default 64-row atom no 32-row consumer's operands cast to); a backward's as `backward_family` arranges
+    it."""
     # Every bundle the device issues (a launch of a row each ranks them all, `bundles.layouts`).
-    found = {family.name: family for family in bundles.layouts(generation.gpu_target().generation, dtype, 1)}
+    found = {family.name: family
+             for family in bundles.layouts(generation.gpu_target().generation, dtype, 1, tpu=True)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
-    return family.specialized(tiles.block_q, tiles.block_k) if isinstance(tiles, Tiles) else family
+    if isinstance(tiles, Tiles):
+        return family.specialized(tiles.block_q, tiles.block_k)
+    return backward_family(family, tiles)
+
+
+def backward_family(family: mosaic.Family, tiles: "BackwardTiles") -> mosaic.Family:
+    """`family` arranged for a backward's `tiles`, whose launches transpose them (dQ's rows its queries,
+    dK/dV's its keys): by their smaller side where that is fewer rows than a role's (`fewer_rows`), else as
+    the family stands (four warps along a role's rows hold whole rows of the accumulators the products then
+    read from registers)."""
+    side = min(tiles.block_q, tiles.block_k)
+    return family.specialized(side, side) if side < family.role_rows else family
 """The instruction families this mainloop runs on (`generation.family`), each by its bundle: wgmma's. A
 family without one (mma.sync's, until its thin mainloop) takes another mainloop (`MosaicForward.eligible`,
 `MosaicBackward.eligible`)."""
@@ -162,7 +190,7 @@ class Tiles:
     block_k: int
     stages: int
     consumers: int
-    family: str = mosaic_sm90.WGMMA.name
+    family: str = dataclasses.field(kw_only=True)
     relaunch_k: int | None = None
     relaunch_consumers: int | None = None
     relaunch_columns: int | None = None
@@ -206,7 +234,7 @@ class BackwardTiles:
     stages: int
     consumers: int
     fused: bool = False
-    family: str = mosaic_sm90.WGMMA.name
+    family: str = dataclasses.field(kw_only=True)
     columns: int = 1
     dkv_family: str | None = None
     dkv_consumers: int | None = None
@@ -952,7 +980,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
 
     def split(self):
         """This program's slice of its query tile's keys (`splits`), 0 of one."""
-        return lax.rem(lax.axis_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
+        return lax.rem(self.family.program_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
 
     def padded(self, first) -> jax.Array | bool:
         """Whether the query tile from `first` holds padding rows past the call's queries, some or all of
@@ -965,7 +993,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
         """This program's query tile of the grid's `count`: a causal call's longest first (its last query
         tiles see the most keys), so the grid's tail holds its shortest programs, as FlashAttention-3's
         scheduler orders them; a full call's in order."""
-        index = lax.axis_index("q_tiles")
+        index = self.family.program_index("q_tiles")
         if self.splits > 1:
             index = lax.div(index, self.splits)
         return count - 1 - index if self.causal else index

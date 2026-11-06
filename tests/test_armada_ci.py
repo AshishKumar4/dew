@@ -548,6 +548,23 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
     assert not hub.exists(), "the network lane reuses its own green run on the same inputs"
 
 
+def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, tmp_path, monkeypatch,
+                                                                            cache_worker):
+    """A job holding a whole GPU, to which a node sets no XLA_PYTHON_CLIENT_MEM_FRACTION (dew-ops' session
+    gives one only to a part of a GPU), runs its lane: a file no run measured is given the lane's whole share,
+    JAX's own default for a process (`WHOLE_GPU`), rather than the lane failing before any file runs (row
+    2570)."""
+    url, _, _ = cache_worker
+    [name] = gpu_lane_at(tmp_path, monkeypatch, url, 1)
+    monkeypatch.delenv("XLA_PYTHON_CLIENT_MEM_FRACTION")
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", [name], out, cache="on", processes=1, deadline=600.0) == 0
+    [[share, *_]] = lane_runs(tmp_path, Path(name).stem)
+    assert float(share) == float(ci.WHOLE_GPU)
+
+
 def test_a_gpu_lane_names_its_files_but_with_network(ci, monkeypatch):
     """`gpu-lane` without --tests is the network lane's alone, which runs every file holding a network-marked
     test: a CUDA lane names its files, and one that names none is refused, not run over the network files'
@@ -1171,6 +1188,21 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
             ci.plan(300.0, {})
 
 
+def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does(ci, tmp_path):
+    """Every row's shared key holds the SHARED harness modules by their code (`code_of`): an edit to what one
+    says of itself, a comment or a docstring, reuses every row, as it changes no run (row 2730: a docstring
+    edit to followed.py ran a train's suite cold); an edit to what it does re-keys them all."""
+    module = tmp_path / "tools/armada/followed.py"
+    module.parent.mkdir(parents=True)
+    module.write_text('"""Followed."""\n\n\ndef read(path):\n    """The file."""\n    return path\n')
+    before = ci.shared("3.12")
+    module.write_text('"""Followed, as each run reads."""\n\n\n# A comment.\ndef read(path):\n'
+                      '    """The file, whole."""\n    return path\n')
+    assert ci.shared("3.12") == before
+    module.write_text('"""Followed."""\n\n\ndef read(path):\n    """The file."""\n    return [path]\n')
+    assert ci.shared("3.12") != before
+
+
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
     """The durations record is no file's input but a split file's groups', which are cut from that file's
     own entries: a change to another file's entries reuses every row, and so does one to the split file's
@@ -1410,10 +1442,10 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
-    runs outside every test process), another test module, or a change to a fixture it never opens (its
-    openers' input alone); it runs again once what its test process runs or reads changes: a plugin loaded
-    into it, a Python file added that can change what an import finds (a conftest.py, a top-level package
-    under src/), or the process group it runs as."""
+    runs outside every test process), another test module, a change to a fixture it never opens (its
+    openers' input alone), or a comment in a module its process runs (row 2730); it runs again once what its
+    test process runs or reads changes: a plugin's code loaded into it, a Python file added that can change
+    what an import finds (a conftest.py, a top-level package under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -1430,11 +1462,12 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     (tmp_path / "tests/fixtures/data.json").write_text("{}\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
-               ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
+               ("tools/armada/executed.py", "# a plugin loaded into it, what it says alone\n", 1),
+               ("tools/armada/executed.py", "LOADED = 1\n", 2),
                ("tests/fixtures/data.json", "{}\n", 2), ("tests/conftest.py", "VALUE = 1\n", 3),
                ("src/package/__init__.py", "", 4), ("tests/more/test_added.py", "VALUE = 2\n", 4),
-               ("tools/armada/child_groups.py", "# its process group\n", 5),
-               (str(owner), "# the group's lifetime\n", 6)]
+               ("tools/armada/child_groups.py", "GROUP = 1\n", 5),
+               (str(owner), "LIFETIME = 1\n", 6)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
@@ -1793,10 +1826,12 @@ def test_a_tip_the_land_queue_graded_green_is_proven_for_mains_push_alone(tmp_pa
     assert proven_step(tmp_path / "run", "refs/heads/fix/lane", "77\n", "") == "77"
 
 
-def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int) -> list[list[str]]:
+def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int,
+               whole: bool = False) -> list[list[str]]:
     """The armada commands ci.yml's suite step gives, its own script run in bash for a push of `ref` with
     the proven job's output `proven` and the cache's `policy`, beside an armada whose stored verdict at the
-    commit exits `verdict` (0 green, 1 red, 2 none): each call's words, a call a list."""
+    commit exits `verdict` (0 green, 1 red, 2 none), as main's whole run where `whole`: each call's words, a
+    call a list."""
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
@@ -1811,7 +1846,9 @@ def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int)
     (bin_dir / "armada").chmod(0o755)
     subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=120,
                    env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "PROVEN": proven,
-                        "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref, "BACKGROUND_POOL": "",
+                        "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref,
+                        # As ci.yml's expressions give them: the whole run's bounded share and its mode.
+                        "BACKGROUND_POOL": "48" if whole else "", "DEW_WHOLE_SUITE": "1" if whole else "",
                         "RUNNER_TEMP": str(tmp_path), "ARMADA_URL": "http://127.0.0.1:9", "ARMADA_TOKEN": ""})
     return [line.split() for line in calls.read_text().splitlines()] if calls.exists() else []
 
@@ -1867,10 +1904,13 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     bin_dir.mkdir()
     (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
-    for ref, priority in (("fix/lane", []), ("ci/batch-abc-1", ["--priority=10"]),
-                          ("ci/stage-abc-1", ["--priority=5"])):
+    # Main's whole run's gates start after every lane's run at a head, as its suite does.
+    for ref, whole, priority in (("fix/lane", "", []), ("ci/batch-abc-1", "", ["--priority=10"]),
+                                 ("ci/stage-abc-1", "", ["--priority=5"]), ("main", "", ["--priority=5"]),
+                                 ("main", "1", ["--priority=-15"])):
         script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
-        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref}
+        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref,
+                       "WHOLE": whole}
         ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
                              env=environment)
         assert ran.returncode == 0, ran.stderr
@@ -1906,9 +1946,11 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
     assert deadline("off") == ["--deadline=5400"] and deadline("on") == ["--deadline=2700"]
 
 
-def run_options(tmp_path: Path, ref: str, policy: str, option: str) -> list[str]:
-    """The armada run's `option` words CI's suite step gives a push of `ref` under `policy` (`suite_step`)."""
-    calls = suite_step(tmp_path / ref.replace("/", "-"), ref, "", policy, 2)
+def run_options(tmp_path: Path, ref: str, policy: str, option: str, whole: bool = False) -> list[str]:
+    """The armada run's `option` words CI's suite step gives a push of `ref` under `policy`, main's whole
+    run's where `whole` (`suite_step`)."""
+    where = tmp_path / (ref.replace("/", "-") + ("-whole" if whole else ""))
+    calls = suite_step(where, ref, "", policy, 2, whole)
     [run] = [call for call in calls if call[0] == "run"]
     return [word for word in run if word.startswith(option)]
 
@@ -1937,6 +1979,19 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     # 2026-10-28).
     assert priority("ci/stage-abc-1") == ["--priority=5"]
     assert priority("fix/lane") == []
+    # Main's whole run (the schedule's, the queue's whole dispatch) is background work, below every lane's run
+    # at a head (verdict.sh's -10), so no head waits behind it (Main, 2026-11-06); a push to main stays its
+    # tip's test.
+    assert run_options(tmp_path, "main", "off", "--priority", whole=True) == ["--priority=-15"]
+    assert priority("main") == ["--priority=5"]
+    # Below every lane's, it waits for capacity within its deadlines: the suite's and its gangs' a background
+    # run's (train 663's review), on its bounded share.
+    calls = suite_step(tmp_path / "whole-deadlines", "main", "", "off", 2, whole=True)
+    assert {word for call in calls for word in call if word.startswith(("--deadline", "--pool=48"))} == {
+        "--deadline=6000", "--pool=48"}
+    # A base push, below lanes too and on the pool armada gives it, keeps the background deadline.
+    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=6000"]
+    assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
