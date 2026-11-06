@@ -95,7 +95,7 @@ def _step(case: dict[str, str], *, reference: bool):
 
         def attended(query, key, value):
             return scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
-                                                implementation="reference" if reference else None, **hooks)
+                                                implementation="reference" if reference else "auto", **hooks)
 
         if case["layout"] == "paged":
             return (attended(query, key, value),)
