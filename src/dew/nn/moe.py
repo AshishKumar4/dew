@@ -70,6 +70,10 @@ EXPERT_DISPATCHES = ('global', 'exchange')
 # `ROUTER_COLLECTION` where a caller opens it, and its balancing bias is a variable of
 # `EXPERT_BIAS_COLLECTION`, which the step that balances the load rewrites (`dew.objectives.routing`).
 ROUTER_COLLECTION = 'router'
+ROUTER_SCOPES = frozenset({'gate', 'router', 'v_router'})
+"""The scope a router's score projection takes in its layer: a routed feed-forward's (`SparseMLP`'s
+`gate`), GPT OSS's and Gemma 4's `router`, and value experts' `v_router`, by which a run's split says
+whether it trains them (`dew.objectives.routing.refuse_fixed_router`)."""
 ROUTER_INDICES = 'indices'
 ROUTER_SCORES = 'scores'
 ROUTER_LOG_Z = 'log_z'

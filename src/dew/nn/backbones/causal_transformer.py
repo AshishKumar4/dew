@@ -2409,6 +2409,23 @@ class CausalTransformer(LinearProducts):
         return tuple(chunk for mixer, chunk in built if mixer.reads_blocks)
 
     @nn.nowrap
+    def fixed_routers(self) -> tuple[str, ...]:
+        """Its routers whose expert weights are fixed whatever they score, which no term of a plain loss
+        reaches (`Mixture.fixed_weights`, `ValueExperts.fixed_weights`): its feed-forward's mixture, an MLP
+        mixer's of a layer kind, its prediction depths' and its drafter's among them (`layer_kinds`, and
+        the depths' feed-forward kind), its value experts', each by name."""
+        feeding = self.mtp_feedforward_type if self.num_nextn_predict_layers else None
+        kinds = {**self.layer_kinds(self.per_layer_types),
+                 **({} if feeding is None else {feeding: self.kind_of(feeding)})}
+        mixers = {name: kind.mixer or self.mixer for name, kind in kinds.items()}
+        mixed = [kind for kind, mixer in mixers.items() if isinstance(mixer, MLPMixer)
+                 and mixer.mixture is not None and mixer.mixture.fixed_weights]
+        return ((*(("mixture",) if self.mixture is not None and self.mixture.fixed_weights else ()),
+                 *(f"the {kind} layers' MLP mixer" for kind in mixed),
+                 *(("value_experts",) if self.value_experts is not None and self.value_experts.fixed_weights
+                   else ())))
+
+    @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
         """A cache rebuilt per request, a reader beyond the token, a context
         read beside the tokens, or a layer whose mixer, over the context it is

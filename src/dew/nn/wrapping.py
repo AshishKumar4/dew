@@ -70,6 +70,10 @@ class DecoderWrapper(nn.Module):
     def vocab_size(self) -> int:
         return self._decoder.vocab_size
 
+    @nn.nowrap
+    def fixed_routers(self) -> tuple[str, ...]:
+        return self._decoder.fixed_routers()
+
     @property
     def max_seq_len(self) -> int:
         return self._decoder.max_seq_len
