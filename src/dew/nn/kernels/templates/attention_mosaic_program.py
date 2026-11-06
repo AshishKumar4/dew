@@ -76,13 +76,16 @@ def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     """The bundle `tiles` run on: the current device's (`generation.gpu_target`) layout their family names,
     which their legality matched (`MosaicForward.legal`). A config names its physical layout; which configs
     a call derives is the qualification's (`layouts`), so a config pinned on a family not yet qualified (an
-    A100's mma.sync, its resource witness) resolves too."""
+    A100's mma.sync, its resource witness) resolves too. A forward's family is arranged for its consumer's
+    share, `block_q` x `block_k` (`Issuer.specialized`, as the GEMM's: mma.sync's warps by the share, whose
+    default 64-row atom no 32-row consumer's operands cast to); a backward's launches hold differing
+    shares."""
     # Every bundle the device issues (a launch of a row each ranks them all, `bundles.layouts`).
     found = {family.name: family for family in bundles.layouts(generation.gpu_target().generation, dtype, 1)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
-    return family
+    return family.specialized(tiles.block_q, tiles.block_k) if isinstance(tiles, Tiles) else family
 """The instruction families this mainloop runs on (`generation.family`), each by its bundle: wgmma's. A
 family without one (mma.sync's, until its thin mainloop) takes another mainloop (`MosaicForward.eligible`,
 `MosaicBackward.eligible`)."""
