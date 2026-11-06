@@ -1815,9 +1815,10 @@ beside the walk's), and a softcap's inference forward 256 wide (Gemma's)."""
 def test_the_public_template_route_runs_each_shards_rows_and_heads_with_no_collective():
     """The public call on the template (`scaled_dot_product_attention`), causal, forward and backward, its
     batch split over a compile-only H100 mesh's data axis and its heads over its tensor axis, compiled for
-    them: the forward and the fused backward launch, each reading its shard's rows and heads (four query heads
-    of eight, two key heads of four, two rows of four), and the program moves and sums nothing
-    (`kernel_compile.Expected`, its route evidence): a head's softmax and its gradients are its own."""
+    them: the forward launches, reading its shard's rows and heads (four query heads of eight, two key heads
+    of four, two rows of four), and the program moves and sums nothing, its backward's launches whichever
+    the derivation takes (`kernel_compile.Expected`, its route evidence): a head's softmax and its gradients
+    are its own."""
     import fla_gdn_support as support
     from jax.sharding import PartitionSpec
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
@@ -1839,9 +1840,8 @@ def test_the_public_template_route_runs_each_shards_rows_and_heads_with_no_colle
 
     spec = PartitionSpec("data", None, "tensor", None)
     expected = Expected(axes=(("data", 2), ("tensor", 2)), specs=(spec, spec, spec),
-                        launches=frozenset({"attention_forward", "attention_dkv_fused"}),
-                        shards={"attention_forward": (rows // 2, tokens, heads // 2, width),
-                                "attention_dkv_fused": (rows // 2, tokens, kv_heads // 2, width)})
+                        launches=frozenset({"attention_forward"}),
+                        shards={"attention_forward": (rows // 2, tokens, heads // 2, width)})
     cases = [support.KernelCase("template route", call, expected=expected)]
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
 
