@@ -188,7 +188,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         return live <= family.registers(candidate.consumers)
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
-    queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0]
+    # A plain tile of fewer rows than a role's guards at its own rows (`few_rows`).
+    queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0] or [
+        tiles.block_q]
     candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)
                   for rows in queries for consumers in range(tiles.consumers, 0, -1) for block in blocks
                   for narrow in stagings(family))

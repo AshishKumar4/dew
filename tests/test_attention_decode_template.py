@@ -61,14 +61,16 @@ def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64):
 @pytest.mark.parametrize("hook", HOOKS)
 @pytest.mark.parametrize("call", CALLS)
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
-def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dtype):
-    """A decode step through the template (`attention_decode.attend`) under the interpreter as an H100 runs
-    it, on par with the reference path over the same keys (check 1): packed, sliced and merged."""
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dtype, device):
+    """A decode step through the template (`attention_decode.attend`) under the interpreter as an H100 or an
+    A100 runs it, its few packed rows a 16-row tile of mma.sync's (row 4042), on par with the reference path
+    over the same keys (check 1): packed, sliced and merged."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
 
     def ours(query, key, value, sinks):
-        with generation.assumed("sm90"):
+        with generation.assumed(device):
             return attention_decode.attend(query, key, value, spans, _hooks(hook, heads, positions, sinks),
                                            interpret=True)
 
@@ -76,7 +78,7 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
         return template.reference(query, key, value, spans, _hooks(hook, heads, positions, sinks))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(positions, heads, kv_heads, dtype),
-                    f"template decode {call} {hook} {jnp.dtype(dtype).name}", seeds=SEEDS)
+                    f"template decode {device} {call} {hook} {jnp.dtype(dtype).name}", seeds=SEEDS)
 
 
 

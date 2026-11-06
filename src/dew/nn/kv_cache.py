@@ -540,7 +540,8 @@ class KVStore:
         if pool.dtype != query.dtype:
             return False
         if self.layout.page_size is None:
-            family = attention_mosaic_program.bundle(generation.gpu_target().generation, query.dtype)
+            family = attention_mosaic_program.bundle(generation.gpu_target().generation, query.dtype,
+                                                     query.shape[1] * query.shape[2] // pool.shape[2])
             return family is not None
         case = PagedCase(heads=query.shape[2], kv_heads=pool.shape[0], head_dim=query.shape[3],
                          value_dim=self._get(self.payloads[-1][0]).shape[-1], dtype=query.dtype,
@@ -725,7 +726,9 @@ def _template_tiles(case: PagedCase) -> bool:
 
     if backend() != "gpu" or case.page_size is None:
         return False
-    family = attention_mosaic_program.bundle(generation.gpu_target().generation, case.dtype)
+    # One query a row: a key head's query heads its packed rows (`attention_decode.packed`).
+    family = attention_mosaic_program.bundle(generation.gpu_target().generation, case.dtype,
+                                             case.heads // case.kv_heads)
     if family is None:
         return False
     # Every key tile the family's copies move (a page's keys whole in it), else one of the page's.
