@@ -534,7 +534,7 @@ class NativeRolloutServer:
             return
         watched: set[Future] = set()
 
-        def word() -> dict[str, bool]:
+        def word() -> dict[str, JSON]:
             live = pending()
             for future in live:
                 if future not in watched:
@@ -547,10 +547,11 @@ class NativeRolloutServer:
             # after the read wakes the wait below.
             self._woken.clear()
             held, said = agreed_reads("rollout round", (word() for _ in range(1)), lambda held: held)
-            assert held is not None, "a round's word is read on every process"
-            if not any(each["waits"] for each in said):
+            words = [each for each in said if isinstance(each, dict)]
+            assert held is not None and len(words) == len(said), "a round's word is read on every process"
+            if not any(each["waits"] for each in words):
                 return
-            if any(each["busy"] for each in said):
+            if any(each["busy"] for each in words):
                 # Its outcome agreed before any process reads the next round: a step that fails on one
                 # process fails on every one (`agreed`'s PeerFailure), each failing its own server.
                 try:
