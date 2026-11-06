@@ -689,12 +689,8 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
     depth = value_width if width is None else width
-    # The values' product beside the weights, a training walk's the other keys' weights and the anchor
-    # test's key indices too, live across it (an A100's training forward at 64 x 128, width 64: ptxas 255
-    # registers and 48 to 56 bytes spilled where the weights alone priced it 252).
-    held = [weights, *([weights, (block_q // 2, block_k, jnp.int32)] if residuals else [])]
     products = _products(family, dtype, (block_q, depth, block_k, [logits], False, True),
-                         (block_q, block_k, value_width, held, True, False), narrow=tiles.narrow,
+                         (block_q, block_k, value_width, [weights], True, False), narrow=tiles.narrow,
                          lhs_swizzle=query_swizzle(family))
     carried = [(block_q, value_width, jnp.float32), *([weights] if deferred else [])]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
