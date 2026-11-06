@@ -18,19 +18,20 @@ SHAPE = TreeShape.widths(2, 2, 1)
 """Two children of the root, two of each, one of each of those: 2 + 4 + 4 nodes, three deep."""
 SEEDS = 8
 """The tree verify's declared draws of prompts and trees (check 1)."""
-KINDS = ["attention", "windowed"]
-"""The models a tree runs on: attention over every key, and attention windowed to its last three keys,
-which a tree's prefix reaches past."""
+KINDS = ["attention", "windowed", "recurrent", "mla"]
+"""The models a tree runs on: attention over every key, attention windowed to its last three keys, which a
+tree's prefix reaches past, a gated delta net, whose row state each node reads along its own path, and
+DeepSeek's latent attention."""
 
 
 def _model(kind: str, max_seq_len: int):
     """The tiny decoder of `kind` (`KINDS`) holding `max_seq_len` tokens a row."""
     from dew.nn.backbones.layer_plan import LayerKind
 
-    model = decoder("attention").clone(max_seq_len=max_seq_len)
     if kind == "windowed":
-        return model.clone(layer_types=("windowed",), kinds={"windowed": LayerKind(window=3)})
-    return model
+        return decoder("attention").clone(max_seq_len=max_seq_len, layer_types=("windowed",),
+                                          kinds={"windowed": LayerKind(window=3)})
+    return decoder(kind).clone(max_seq_len=max_seq_len)
 
 
 @pytest.mark.parametrize("kind", KINDS)
