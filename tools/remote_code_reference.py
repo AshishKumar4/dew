@@ -97,6 +97,10 @@ RELEASES = {
     # The family's own pin (dew.interop.release_pins), as LFM3's.
     "mimo-v2-tiny": (*_PINNED["MIMO_V2"][:2], ("configuration_mimo_v2.py", "modeling_mimo_v2.py"),
                      "AutoModelForCausalLM"),
+    # The same release's trunk whose sliding layers attend in a geometry of their own (`swa_*` heads and
+    # width), which no published checkpoint states apart (ledger 4290).
+    "mimo-v2-sliding-tiny": (*_PINNED["MIMO_V2"][:2], ("configuration_mimo_v2.py", "modeling_mimo_v2.py"),
+                             "AutoModelForCausalLM"),
     # The same release whole: its ViT and its audio encoder beside the decoder, the audio tokenizer in its
     # folder (`audio_tokenizer`, `load_audio_tokenizer`).
     "mimo-v2-vl-tiny": (*_PINNED["MIMO_V2"][:2], ("configuration_mimo_v2.py", "modeling_mimo_v2.py"),
@@ -127,7 +131,7 @@ PROCESSORS = {
 read at, and the files, its code beside the config and template that code reads (`vendor`)."""
 LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "lfm3-vl-tiny": "lfm1.0",
             "kimi-k25-tiny": "modified-mit",
-            "mimo-v2-tiny": "mit", "mimo-v2-vl-tiny": "mit",
+            "mimo-v2-tiny": "mit", "mimo-v2-sliding-tiny": "mit", "mimo-v2-vl-tiny": "mit",
             "dream-tiny": "apache-2.0", "llada-tiny": "mit"}
 """The license of each release a recording (`--record`) runs, as its Hub card states it."""
 """Each fixture's release: the Hub repo, the commit its code is read at, the
