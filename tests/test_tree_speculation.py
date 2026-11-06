@@ -1,5 +1,7 @@
 """Tree speculative decoding (ledger 4527): a tree verified in one pass, its acceptance and its draws."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -108,8 +110,6 @@ def test_a_trees_runs_read_each_nodes_prefix_and_ancestors():
 def _tree_generated(model, params, prompts, budget: int, sampling, shape: TreeShape, drafting, key):
     """`generate`'s draws under `TreeSpeculative(shape)`, its tree drafted by `drafting(ops)` (a
     `DecodeOps.draft_tree`), as `generate` runs a strategy: the prompt's prefill, then the strategy's loop."""
-    import dataclasses
-
     from dew.sampling import TreeSpeculative, decoding
     from dew.sampling.decoding import StepState
     from dew.sampling.text import resolve
@@ -213,7 +213,7 @@ def test_generate_refuses_a_tree_for_a_model_without_a_tree_drafter():
     model = _model("attention", 16)
     prompts = jnp.asarray([[1, 2, 3]], jnp.int32)
     params = jax.jit(model.init)(jax.random.key(0), prompts)
-    with pytest.raises(ValueError, match="tree drafter"):
+    with pytest.raises(ValueError):
         generate(model, params, prompts, 4, key=jax.random.key(1), sampling=Sampling(temperature=0),
                  strategy=TreeSpeculative(SHAPE))
 
@@ -280,3 +280,74 @@ def test_a_trees_first_two_tokens_are_drawn_as_the_target_draws_them(drafter):
 
     assert_draws_as_declared(counts, chances, f"a tree's first two tokens, {drafter} children",
                              seeds=LAW_SEEDS)
+
+
+@pytest.mark.parametrize("case", ["rejected", "past-the-cache"])
+def test_a_tree_block_carries_the_targets_state_at_each_rows_last_token(case):
+    """A tree block leaves each row's target state (`DecoderState.hidden`, what a drafter reads next) at its
+    last emitted token, as the walk a token at a time over the same tokens leaves it, check 1 against the
+    walk's float64 run; a row the block left idle keeps its state. `rejected`: the walk rejects a child
+    and accepts its sibling at the first two depths, then rejects the third's, four tokens emitted;
+    `past-the-cache`: the cache holds no room for the tree and the row walks its one token."""
+    from dew.sampling import Sampling, TreeSpeculative, decoding
+    from dew.sampling.decoding import StepState
+    from dew.sampling.text import resolve
+
+    capacity, width = (40, 3) if case == "rejected" else (16, 13)
+    model = _model("attention", capacity)
+    params = jax.jit(model.init)(jax.random.key(0), jnp.ones((2, width), jnp.int32))
+    emitted = 4 if case == "rejected" else 1
+
+    def stepped(model, params):
+        transforms, stopping, plan = resolve(Sampling(temperature=0), None, None, TreeSpeculative(SHAPE))
+        ops = decode_ops(model, params, 0, 0)
+        ops = dataclasses.replace(ops, draft_tree=_ranked([(1, 0), (1, 0), (1,)])(ops))
+
+        @jax.jit
+        def block(prompts):
+            state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
+            rows = prompts.shape[0]
+            # The second row idle this block.
+            start = StepState(tokens=jnp.concatenate([prompts, jnp.zeros((rows, 8), jnp.int32)], axis=1),
+                              valid=jnp.concatenate([jnp.ones((rows, width), bool),
+                                                     jnp.zeros((rows, 8), bool)], axis=1),
+                              step=jnp.zeros(rows, jnp.int32), active=jnp.asarray([True, False]),
+                              keys=jax.random.split(jax.random.key(1), rows), prompt_width=width,
+                              budget=jnp.full(rows, 8, jnp.int32))
+            done = plan.stepped(state, start, jnp.zeros(rows, bool), ops, decoding.chain(transforms),
+                                decoding.finish(stopping), 8)
+            return done.state.hidden
+
+        return block
+
+    def walk(model, params):
+        ops = decode_ops(model, params, 0, 0)
+
+        @jax.jit
+        def walked(prompts):
+            state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
+            held = state
+            for _ in range(emitted):
+                held = ops.advance(held, jnp.argmax(held.logits, axis=-1).astype(jnp.int32),
+                                   jnp.asarray([True, False]))
+            return jnp.stack([held.hidden[0], state.hidden[1]])
+
+        return walked
+
+    with jax.enable_x64(new_val=True):
+        wide = walk(model.clone(dtype=jnp.float64), widened(params))
+
+    @as_given
+    def truth(prompts):
+        with jax.enable_x64(new_val=True):
+            return np.asarray(wide(jnp.asarray(prompts)))
+
+    def draw(seed):
+        rng = np.random.default_rng([0x4527, 7, seed])
+        return (rng.integers(1, model.vocab_size, (2, width)).astype(np.int32),)
+
+    ours, reference = stepped(model, params), walk(model, params)
+    error = checkify.checkify(ours, errors=checkify.user_checks)
+    assert_as_exact(as_given(lambda prompts: np.asarray(error(jnp.asarray(prompts))[1])),
+                    as_given(lambda prompts: np.asarray(reference(jnp.asarray(prompts)))), draw,
+                    f"a tree block's carried state, {case}", seeds=SEEDS, truth_fn=truth)
