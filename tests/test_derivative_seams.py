@@ -44,6 +44,10 @@ CONTRACTED = {
         ("test_the_derived_delta_rule_chunks_hold_their_orders", NUMERICS),
     "src/dew/algebra/scan.py::_lowered_rule.linear_tangent":
         ("test_the_derived_delta_rule_chunks_hold_their_orders", NUMERICS),
+    "src/dew/algebra/scan.py::_adjoined.rule":
+        ("test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders", KERNEL),
+    "src/dew/algebra/scan.py::_kept_rule":
+        ("test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders", NUMERICS),
     "src/dew/nn/kernels/recurrence_chunk.py::_portable_rule.linear_tangent":
         ("test_the_chunked_delta_rule_holds_every_order", NUMERICS),
     "src/dew/nn/kernels/recurrence_algebra.py::decays":
