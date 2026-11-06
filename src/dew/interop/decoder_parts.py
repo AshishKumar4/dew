@@ -940,6 +940,14 @@ def read_only(translate: Callable[[Mapping[str, object], set[str]], DecoderField
     return ConfigLayout(ConfigPart(read, write))
 
 
+def unwritten(why: str) -> ConfigPart[CausalTransformer]:
+    """A family whose model is written as another (`why`: DiffusionGemma's text view, written as its
+    whole bundle): read as nothing, any write of it refused."""
+    def write(model: CausalTransformer) -> Mapping[str, object]:
+        raise ExportRefused(why)
+    return ConfigPart(lambda hf_config, used, record: record, write)
+
+
 def expect(key: str, value: object, why: str) -> ConfigPart[CausalTransformer]:
     """A key the family's reference computes only at `value` (its class's default where unstated),
     refused at any other, saying `why`; written as nothing."""
