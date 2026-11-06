@@ -114,8 +114,9 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     rows = 16
 
     # Its kernels take hooks and exact sums (their side loads, vector reads and running sum lower), but
-    # its register model does not count what they hold, and its derived tiles spilled (ns-regs2: sm86's
-    # normed forward 16 bytes, exact sums 136).
+    # its register model does not count what a hook holds, and its derived tiles spilled (ns-regs2: sm86's
+    # normed forward 16 bytes). Its running sum is counted beside the fragments its products hold
+    # (`grouped_matmul._Mosaic.registers`), which the sum's 136 spilled bytes there went uncounted.
     counts_hooks = False
 
     role_rows = 4 * 16

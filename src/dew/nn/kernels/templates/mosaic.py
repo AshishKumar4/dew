@@ -1177,9 +1177,13 @@ class Issuer[Accumulator](abc.ABC):
     a product of transposed fp32 operands there takes bf16 parts."""
 
     counts_hooks: bool = True
-    """Whether its register model counts what a template's hooks and exact sums hold (side operands' tiles,
-    a running sum), so a hooked or exactly summed call derives a tile that spills nothing; where not
-    (mma.sync's), such a call is not its launch's."""
+    """Whether its register model counts what a template's hooks hold (side operands' tiles), so a hooked
+    call derives a tile that spills nothing; where not (mma.sync's), such a call is not its launch's."""
+
+    counts_sums: bool = True
+    """Whether its register model counts an exactly summed call's running sum (a second fp32 accumulator
+    beside the first and each step's product), so such a call derives a tile that spills nothing: every
+    family's, an fp32 output of 16-bit products being exactly summed (`templates.product.promoted`)."""
 
     def column_registers(self, columns: int, dtype) -> int:
         """The registers a consumer thread holds for a vector of `columns` entries of `dtype` in the
