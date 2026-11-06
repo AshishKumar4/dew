@@ -11,6 +11,7 @@ have to be the reference's.
 """
 
 import concurrent.futures
+import itertools
 import json
 import os
 import re
@@ -68,6 +69,19 @@ def finished(process: subprocess.Popen, timeout: float = 600) -> subprocess.Comp
         stdout, stderr = process.communicate(timeout=60)
         pytest.fail(f"the pool was still running after {timeout}s\n{stdout}{stderr}")
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+
+def raised(done: subprocess.CompletedProcess) -> set[str]:
+    """The exception types the processes of `done` raised, each the type a traceback's closing line names
+    (Python's `Type: ...` after its frames), from stdout and stderr, a chained one's cause among them; none
+    where none was raised."""
+    lines = (done.stdout + "\n" + done.stderr).splitlines()
+    found = set()
+    for previous, line in itertools.pairwise(lines):
+        named = line.partition(":")[0].strip()
+        if previous.startswith("  ") and re.fullmatch(r"[\w.]+(Error|Exception|Failure|Exit)", named):
+            found.add(named)
+    return found
 
 
 def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.CompletedProcess:
@@ -165,7 +179,8 @@ def test_processes_that_hold_the_same_rows_read_the_same_share(tmp_path, mesh):
 def test_more_replicas_than_hosts_are_refused(tmp_path):
     done = launch("--", sys.executable, str(WORKER), "--out", str(tmp_path / "x.json"),
                   "--mesh", json.dumps({"fsdp": 4, "replicas": 2}), devices=8)
-    assert done.returncode != 0
+    # Refused as the mesh is built: a ValueError, and no record written.
+    assert "ValueError" in raised(done) and not (tmp_path / "x.json").exists()
 
 
 def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
@@ -269,7 +284,7 @@ def test_a_slurm_step_that_leaves_gpus_idle_is_refused_before_it_joins():
                "prepare_process()\n")
     done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=60)
-    assert done.returncode != 0, done.stdout
+    assert "ValueError" in raised(done), done.stdout
 
 
 @pytest.mark.mesh(devices=0)
@@ -711,7 +726,8 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
                "    tree[1].delete()\n"
                "coordination.collective_host(tree, phase='t')\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
-    assert done.returncode != 0, done.stdout + done.stderr
+    # Rank 1 ends with its own error, rank 0 with its peer's: neither waits in the gather.
+    assert {"RuntimeError", "dew._coordination.PeerFailure"} <= raised(done), done.stdout + done.stderr
 
 
 def a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():

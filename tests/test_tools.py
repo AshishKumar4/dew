@@ -654,12 +654,13 @@ def test_a_shared_draw_cache_computes_past_its_disk_reserve_and_keeps_nothing_th
         assert computed.loss == kept.loss and any(Path(directory).iterdir())
 
 
-def test_the_layout_parity_command_runs_its_main():
+def test_the_layout_parity_command_runs_its_main(tmp_path):
     """`python tools/layout_parity.py` runs the tool, which refuses `--prepare` with no `--references`
     directory to write, where a script whose entry point is gone exits 0 having checked nothing."""
     command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa", "--prepare"]
-    finished = subprocess.run(command, capture_output=True, text=True, timeout=600)
-    assert finished.returncode != 0, finished.stdout[-2000:]
+    finished = subprocess.run(command, capture_output=True, text=True, timeout=600, cwd=tmp_path)
+    # Its refusal is a SystemExit of its own, no traceback's error, and it wrote nothing.
+    assert finished.returncode == 1 and not any(tmp_path.iterdir()), finished.stderr[-2000:]
 
 
 def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
@@ -1294,6 +1295,8 @@ BANNED_ASSERTION_LINTS = {
             "    done = subprocess.run(['sparx', '--bad'], capture_output=True)\n"
             "    assert done.returncode != 0, done.stderr\n"
             "def test_call_refused():\n"
+            "    assert subprocess.call(['sparx', '--bad'])\n"
+            "def test_its_own_code():\n"
             "    assert subprocess.call(['sparx', '--bad']) == 2\n"
             "def test_refused_with_its_state():\n"
             "    done = subprocess.run(['sparx', '--bad'], capture_output=True)\n"
@@ -1309,8 +1312,8 @@ test made, spied on or replaced; a public attribute or a dunder is not. SLOP011 
 for in captured output that a helper returns, read through its unpacked name; a name rebound to its parse is
 not.
 SLOP029 (class 7): a test whose every assertion is that a process failed, from its exit status alone; one that
-asserts the state the refusal reports as well, or that a process ran (exit 0, its own checks inside it), is
-not."""
+asserts the state the refusal reports as well, a code of the process's own, or that a process ran (exit 0, its
+own checks inside it), is not."""
 
 
 @pytest.mark.parametrize("code", sorted(BANNED_ASSERTION_LINTS))

@@ -81,7 +81,7 @@ Scope is per rule, because the rules are not all about the same thing:
   independent plain formula) (row 4411; `lint_derivatives`).
 - SLOP029 is about `tests`: no test's every assertion is that a process
   failed, read from its exit status alone (a `returncode`, `subprocess.call`
-  or `os.system` unequal to 0, equal to another constant or tested for truth),
+  or `os.system` unequal to 0 or tested for truth),
   which a crash passes as well as the refusal it is after; it asserts the
   state the refusal reports or leaves (bible §7's class 7).
 
@@ -1269,9 +1269,8 @@ EXITS = {"subprocess.call", "os.system"}
 
 def _fails_only(test: ast.expr, table: dict[str, str]) -> bool:
     """Is assertion `test` that a process failed, read from its exit status and nothing else: its
-    `returncode` (or a call of `EXITS`) compared unequal to 0 or equal to another constant, or tested for
-    truth, or such checks joined by `and`? Any failure passes it, a crash as well as the refusal it is
-    after."""
+    `returncode` (or a call of `EXITS`) compared unequal to 0 or tested for truth, or such checks joined by
+    `and`? Any failure passes it, a crash as well as the refusal it is after."""
     if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
         return all(_fails_only(value, table) for value in test.values)
 
@@ -1282,10 +1281,10 @@ def _fails_only(test: ast.expr, table: dict[str, str]) -> bool:
     if isinstance(test, ast.Compare) and len(test.ops) == 1:
         left, right = test.left, test.comparators[0]
         constant = right if status(left) else left if status(right) else None
-        if not isinstance(constant, ast.Constant) or not isinstance(constant.value, int):
-            return False
-        return (isinstance(test.ops[0], ast.NotEq) and constant.value == 0) or (
-            isinstance(test.ops[0], ast.Eq) and constant.value != 0)
+        # A code of its own (a signal's 128 + N, a gate's 1 against its usage error's 2) is the process's own
+        # report; only "anything but 0" is any failure.
+        return (isinstance(constant, ast.Constant) and constant.value == 0
+                and isinstance(test.ops[0], ast.NotEq))
     return status(test)
 
 
