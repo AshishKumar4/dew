@@ -28,4 +28,8 @@ def test_identical_keys_through_product_boundary(monkeypatch, issue_inner_produc
     monkeypatch.setattr(forms, "float32_dot_general", inner)
     if issue_inner_product == "declaration":
         monkeypatch.setattr(attention_backward_algebra, "float32_einsum", declared)
-    identical()
+        attention_backward_algebra.derived_backward.cache_clear()
+    try:
+        identical()
+    finally:
+        attention_backward_algebra.derived_backward.cache_clear()
