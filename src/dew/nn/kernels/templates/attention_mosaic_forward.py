@@ -797,7 +797,8 @@ class _Residuals(NamedTuple):
 
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
             hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool,
-            held: tuple | None = None, product: Callable[[], jax.Array] | None = None) -> tuple:
+            held: tuple | None = None, product: Callable[[], jax.Array] | None = None,
+            interpret: bool = False) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
     every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
@@ -808,7 +809,10 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
-    s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn) if product is None else product()
+    if product is None:
+        s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn, interpret=interpret)
+    else:
+        s = product()
     slots.release("keys")
     k_first = index * tiles.block_k
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
@@ -895,7 +899,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
-                       hooks=hooks, drawn=hooked.drop is not None, held=held, product=product)
+                       hooks=hooks, drawn=hooked.drop is not None, held=held, product=product,
+                       interpret=interpret)
 
     values = functools.partial(_value_tile, (tiles.block_k, value_width), views["values"][0].dtype, turn)
 
@@ -1303,7 +1308,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     def step(index, slots, arg, accumulators):
         # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place, whole,
-                                       turn, hooks=hooks, drawn=False, held=held)
+                                       turn, hooks=hooks, drawn=False, held=held, interpret=interpret)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)
