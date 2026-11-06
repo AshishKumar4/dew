@@ -589,6 +589,34 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
     assert_as_alone(meshed, alone)
 
 
+@pytest.mark.mesh(devices=2)
+def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_operands():
+    """On an explicit mesh splitting the rows, no logical axes named: the operands' own types place the
+    kernels per shard (`norm_swiglu._shard_spec`; row 822), the weight whole, its gradient summed over the
+    shards, their outputs and gradients on par with one device's."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32)
+    branch, ds = (jax.random.normal(jax.random.key(index), x.shape) for index in (28, 29))
+    gate, up, dout = (jax.random.normal(jax.random.key(index), (4, 8, 24)) for index in (30, 31, 32))
+
+    def run(x, branch, scale, ds, dy, gate, up, dout):
+        seam = evaluated(fused_seam(1e-5, x.dtype, offset=True, after_cast=True), (x, branch, scale),
+                         (ds, dy))
+        return seam, evaluated(fused_swiglu(), (gate, up), dout)
+
+    operands = (x, branch, scale, ds, dy, gate, up, dout)
+    alone = jax.jit(run)(*operands)
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(operand, NamedSharding(mesh, P() if operand is scale else P("data")))
+                  for operand in operands]
+        graph = traced(run, *placed)
+        assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
+        meshed = jax.jit(run)(*placed)
+    assert_as_alone(meshed, alone)
+
+
 def assert_as_alone(meshed, alone):
     """Each of `meshed`'s leaves within 1e-6 of one device's (`alone`): a shard's rows are its own, and the
     weight's gradient sums the shards' partials in another order."""

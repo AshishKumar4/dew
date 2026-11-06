@@ -271,7 +271,8 @@ def _runs(case) -> bool:
 def _placed(axes, operands, *, whole_last: bool) -> bool:
     """Whether the kernel can run on its `operands`' shards: on a split mesh
     the caller names the first one's logical axes (`axes`), which with
-    `whole_last` leave its last axis whole. In a `shard_map` checking varying
+    `whole_last` leave its last axis whole, or every axis splitting it is
+    explicit, its type its placement (`_shard_spec`). In a `shard_map` checking varying
     axes, each shard its own, the launch states its outputs' varying type
     (`_varying`) where a GPU compiles it; Pallas's interpreter evaluates the
     kernel's body on the shards' varying values, whose gathers by unvarying
@@ -281,8 +282,21 @@ def _placed(axes, operands, *, whole_last: bool) -> bool:
         return False
     if not automatic_axes():
         return True
-    first = operands[0]
-    return axes is not None and (not whole_last or len(logical_spec(axes, first.shape)) < first.ndim)
+    spec = _shard_spec(axes, operands[0])
+    return spec is not None and (not whole_last or len(spec) < operands[0].ndim or spec[-1] is None)
+
+
+def _shard_spec(axes, first) -> jax.sharding.PartitionSpec | None:
+    """How a split mesh places the `first` operand: as the logical `axes` the caller names, else as its
+    own type states where every axis splitting it is explicit (`jax.typeof(first).sharding`), None where
+    neither tells (an automatic axis XLA's partitioner places)."""
+    if axes is not None:
+        return logical_spec(axes, first.shape)
+    mesh = jax.sharding.get_abstract_mesh()
+    if any(mesh.axis_types[mesh.axis_names.index(name)] != jax.sharding.AxisType.Explicit
+           for name in automatic_axes()):
+        return None
+    return jax.typeof(first).sharding.spec
 
 
 def _per_shard(local, axes, operands, replicated):
@@ -293,7 +307,7 @@ def _per_shard(local, axes, operands, replicated):
     if not automatic_axes():
         return local(*operands)
     whole = {index for index, replicated in enumerate(replicated) if replicated}
-    return on_shards(local, logical_spec(axes, operands[0].shape), operands, whole)
+    return on_shards(local, _shard_spec(axes, operands[0]), operands, whole)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -361,8 +375,8 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
     Requirement('gate', lambda case: case.gate_fits, "a gate must match the normalized input's shape",
                 row=INHERENT),
     Requirement('placement', lambda case: case.placed,
-                "a mesh splits RMSNorm's operands by axes the caller does not name or across its features",
-                row='ledger 822'),
+                "a mesh splits RMSNorm's operands by automatic axes the caller does not name, or across "
+                "its features", row='ledger 822'),
 )
 """The fused norms' requirements: a plain, stream and gated RMSNorm over fp32 or bf16 rows of at most
 8192 features, with fp32 statistics, a vector weight, and operands placed as the kernel reads them."""
@@ -441,7 +455,8 @@ SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
                 "SwiGLU needs nonempty equal shapes, not broadcasting, or a packed [..., 2, H] gate and up",
                 row=INHERENT),
     Requirement('placement', lambda case: case.placed,
-                "a mesh splits SwiGLU's operands by axes the caller does not name", row='ledger 822'),
+                "a mesh splits SwiGLU's operands by automatic axes the caller does not name",
+                row='ledger 822'),
 )
 """The fused SiLU products' requirements: fp32 or bf16 operands of one shape, apart or packed, placed
 as the kernel reads them."""
