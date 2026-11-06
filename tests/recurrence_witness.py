@@ -362,6 +362,34 @@ def output(q, k, entering, values, exponents: Exponents, scale: float, lane: Lan
     return fp32(add(fused(mul(memory, factor), lane), fused(mul(local, factor), lane)), lane)
 
 
+def keys_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, Iv]:
+    """`enclosures` of a chunk whose write gate takes the keys' side (`mainloop.Call.gated_keys`, Mamba2's SSD
+    under the fast forms): the memory it leaves, fp32 (`algebra.keys_gated_carried`: the carry decayed to the
+    chunk's end, plus each key row gated in fp32 by its write gate times its decay to the end and rounded to
+    the values' dtype, against the values as given), and its output before its store (`chunk_scores` with
+    each key column scaled by its write gate before the scores round, `chunk_output`). The scores' tile is a
+    derived form (`algebra.derived_tile`), its products, decays and gates multiplied in either association:
+    their enclosure is both's hull."""
+    exponents = Exponents.of(step.g)
+    gate = fp32(mul(exponents.gated(lane), point(step.beta)), lane)
+    keys = staged(fp32(mul(point(step.k), Iv(gate.lo[:, None], gate.hi[:, None])), lane))
+    write = dot(Iv(keys.lo.T, keys.hi.T), point(step.v), lane)
+    decay = exponents.raised(lane)
+    held = Iv(np.full(step.carry.lo.shape, decay.lo[-1]), np.full(step.carry.lo.shape, decay.hi[-1]))
+    leaving = fp32(add(fused(mul(step.carry, held), lane), write), lane)
+    products, pairs = blocked(point(step.q), point(np.asarray(step.k).T), lane), exponents.pairs(lane)
+    columns = point(np.asarray(step.beta)[None, :])
+    scores = hull(fp32(mul(fp32(mul(products, pairs), lane), columns), lane),
+                  fp32(mul(products, fp32(mul(pairs, columns), lane)), lane))
+    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))))
+    memory = fp32(mul(blocked(point(step.q), point(step.h), lane), Iv(decay.lo[:, None], decay.hi[:, None])),
+                  lane)
+    factor = point(np.float32(scale))
+    local = dot(scores, point(step.v), lane)
+    output = fp32(add(fused(mul(memory, factor), lane), fused(mul(local, factor), lane)), lane)
+    return {"h": leaving, "o": staged(output)}
+
+
 class Step(NamedTuple):
     """One chunk and head's operands as its launches read them (float64), its records' stored values, and the
     carry entering it (the fp32 values the states launch holds)."""
@@ -505,6 +533,9 @@ def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
 
 
 RECORDS = ("a", "w", "c", "o", "h", "leaving")
+KEYS_GATED_RECORDS = ("o", "h", "leaving")
+"""The records a call whose write gate takes the keys' side keeps (`keys_gated_enclosures`): its values are
+its corrected values, held as given."""
 """The records the witness holds (`enclosed`)."""
 
 
@@ -548,6 +579,11 @@ class Run:
     o: np.ndarray
     carries: np.ndarray
     begins: np.ndarray
+    scale: float
+    """The output's scale (the keys' width's inverse root, a delta rule's; 1, the SSD's)."""
+    gated: bool
+    """Whether its write gate takes the keys' side (`mainloop.Call.gated_keys`, the SSD's under the fast
+    forms): no inverse, weighted keys or corrected values of its own (`a`, `w` zero, `c` the values)."""
 
     @property
     def chunks(self) -> int:
@@ -590,7 +626,7 @@ def laid_chunks(length: int, starts, max_segments: int | None) -> np.ndarray:
 
 
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
-             floor: float | None = None, carried: bool = True) -> Run:
+             floor: float | None = None, carried: bool = True, delta: bool = True) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
     JAX's own default precision as a model trains it: `mainloop.kept_forward` at the tiles the route takes
     (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
@@ -601,7 +637,9 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     it, whose final memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`,
     each chunk's: end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's
     documents (`starts` `[1, T]`) lay their own chunks (`laid_chunks`), a document beginning inside a chunk
-    included, its first chunk entering the zero memory."""
+    included, its first chunk entering the zero memory. Without the `delta` rule, the template's op as the
+    SSD's route calls it (`recurrence_chunk.template_rule`, scale 1, its output in the operands' dtype, the
+    fast forms' keys taking the write gate, `mainloop.Call.gated_keys`)."""
     import jax
     import jax.numpy as jnp
 
@@ -615,20 +653,28 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
 
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
+    scale = k.shape[-1] ** -0.5 if delta else 1.0
+
+    def route(*x):
+        if not delta:
+            return recurrence_chunk.template_rule(*x, starts, max_segments=max_segments, scale=scale,
+                                                  delta=False, wide=False,
+                                                  rounded=recurrence_chunk.fast_rounding())
+        # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
+        return recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts, max_segments=max_segments,
+                                                       floor=floor, write_bound=1.0)
+
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with tuning.seen() as launches:
-            # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
             # The training forward: the primal of the route's VJP, as a training step runs it.
-            o, final = jax.jit(lambda *x: jax.vjp(lambda *y: recurrence_chunk.chunk_gated_delta_rule(
-                *y, starts=starts, max_segments=max_segments, floor=floor, write_bound=1.0), *x)[0])(
-                *operands)
+            o, final = jax.jit(lambda *x: jax.vjp(route, *x)[0])(*operands)
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
 
         def kept(*x, starts=starts):
             return jax.jit(lambda *x: mainloop.kept_forward(
-                *x, tiles=tiles, starts=starts, max_segments=max_segments, floor=floor,
-                scale=k.shape[-1] ** -0.5,
+                *x, tiles=tiles, starts=starts, max_segments=max_segments, floor=floor, scale=scale,
+                delta=delta, rounded=not delta and recurrence_chunk.fast_rounding(),
                 family=mainloop.family_of(dtype) or bundles.INTERPRETED,
                 interpret=generation.backend() != "gpu"))(*x)
 
@@ -647,7 +693,10 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                 for first, count in table[:-1]] if carried else []
     # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
     # call's come first.
-    laid = np.shape(a)[0] // CHUNK
+    laid = np.shape(h)[0] // (heads * key_width)
+    if not delta:
+        # Its keys take the gate: no inverse, weighted keys or corrected values of its own (`Run.gated`).
+        a, w, c = (np.zeros((laid * CHUNK, heads * width)) for width in (CHUNK, key_width, value_width))
 
     def summed(x, rows):
         return np.asarray(x, np.float64).reshape(rows, -1)
@@ -664,7 +713,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     # A document past the row's first begins on the zero memory (`chunked_launch.Sequences`).
     begins = np.asarray([first > 0 and (starts is not None and bool(np.asarray(starts)[0, first]))
                          for first, _ in table])
-    return Run(**hosted_operands, a=chunked(a, CHUNK), w=chunked(w, key_width), h=memories,
+    return Run(**hosted_operands, a=chunked(a, CHUNK), w=chunked(w, key_width), h=memories, scale=scale,
+               gated=not delta,
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -697,11 +747,11 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     """Each record's enclosure `[N, H, ...]` (`enclosures`), each chunk's step from the fp32 memory it enters:
     `a`, `w`, `c`, `o`; `h`, the memory each chunk enters as stored; and `leaving`, the fp32 memory it
     leaves."""
-    scale = run.k.shape[-1] ** -0.5
+    enclose = keys_gated_enclosures if run.gated else enclosures
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
-            step = enclosures(run.step(n, head), scale, lane)
+            step = enclose(run.step(n, head), run.scale, lane)
             step["leaving"], step["h"] = step["h"], stored_memory(point(run.entered(n, head)), lane)
             for name, iv in step.items():
                 found.setdefault(name, []).append(iv)
@@ -712,7 +762,8 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
 
 def records(run: Run) -> dict[str, np.ndarray]:
     """Each record `[N, H, ...]`, as `enclosed` names them."""
-    return {"a": run.a, "w": run.w, "c": run.c, "o": run.o, "h": run.h, "leaving": run.carries[1:]}
+    held = {"a": run.a, "w": run.w, "c": run.c, "o": run.o, "h": run.h, "leaving": run.carries[1:]}
+    return {name: held[name] for name in (KEYS_GATED_RECORDS if run.gated else RECORDS)}
 
 
 def witness(run: Run, lane: Lane) -> dict:
@@ -915,3 +966,23 @@ def assert_key_decays_witnessed(lane: Lane, heads: int = 1) -> None:
     for name in RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
     assert_refusals(shared_decay_refusals(operands, lane), KEY_DECAY_SHARES)
+
+
+UNGATED_SHARES = {"leaving": 0.5}
+"""The least share of each chunk's leaving fp32 memory at which a write gate on the keys' side read as one is
+refused."""
+
+
+def assert_keys_gated_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness where the write gate takes the keys' side (`keys_gated_enclosures`, Mamba2's SSD under
+    the fast forms): a bf16 call of three chunks without the delta rule, every record it keeps inside its
+    step's enclosure, and a kernel reading every token's write gate as one refused (`UNGATED_SHARES`)."""
+    import jax.numpy as jnp
+
+    operands = draw(0, "mild", heads=heads)
+    held = witness(recorded(*operands, delta=False), lane)
+    for name in KEYS_GATED_RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
+    q, k, v, g, beta, h0 = operands
+    faulty = recorded(q, k, v, g, jnp.ones_like(beta), h0, delta=False)
+    assert_refusals(refusals(faulty, dataclasses.replace(faulty, **hosted(operands)), lane), UNGATED_SHARES)
