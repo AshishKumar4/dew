@@ -440,7 +440,7 @@ class MosaicForward(_Mainloop[Tiles]):
         H100, and of 32 over 32768 1.35 against 1.38, its 128-wide K and V 32 KB a stage, two of them past
         the 45 KB a program keeps in flight (ET-STAGES2-h100).
         Its natural rewalk's tiles derived again (`_relaunched`); `config` itself where no smaller tile
-        holds, or the part's stream is unmeasured."""
+        dividing the call's keys holds, or the part's stream is unmeasured."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         rate, fixed = target.memory_rate, target.fixed_seconds
         if not (streams(query, target) and rate and fixed and target.multiprocessors):
@@ -449,9 +449,13 @@ class MosaicForward(_Mainloop[Tiles]):
         itemsize = jnp.dtype(query.dtype).itemsize
         per_key = sum(_width(array.shape[3], family, query.dtype) for array in (query, value)) * itemsize
         in_flight = rate / target.multiprocessors * fixed
+        # Its key tiles dividing the call's keys alone: a tile past them pads the whole cache, its keys and
+        # values copied a step (`padded_call`; a 96-key tile over 32768, 383 us a step on an A100,
+        # M-DD-5 W16, as long as its launch).
         for extent in reversed(walked_extents(family, query.dtype, config.block_k)):
             candidate = dataclasses.replace(config, block_k=extent)
-            if config.stages * extent * per_key >= in_flight and self._launch_legal(ba, candidate, target):
+            if (self.keys % extent == 0 and config.stages * extent * per_key >= in_flight
+                    and self._launch_legal(ba, candidate, target)):
                 return self._relaunched(ba, candidate, target) or config
         return config
 
