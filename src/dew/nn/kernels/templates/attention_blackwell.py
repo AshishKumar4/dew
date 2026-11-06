@@ -342,7 +342,7 @@ def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward
     acc = TCGEN05.load_columns(scratch.acc_tmem, 0, value_width)
     TCGEN05.loaded()
     m, total = (plgpu.load(scratch.rows_smem.at[place], layout=STORED.reduce(1)) for place in (0, 1))
-    out, _, _ = algebra.finish(spec, algebra.Partial(acc, m, total), initial=False)
+    out = algebra.finish(spec, algebra.Partial(acc, m, total), initial=False)[0]
     mosaic.stored((out,), (out_ref.at[block.row, pl.ds(block.first, rows), block.head],), smem=scratch.o_smem,
                   wait=False)
     places = (block.row, block.head, pl.ds(block.first, rows))

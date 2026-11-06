@@ -250,21 +250,27 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
             coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=True))
 
 
+@pytest.mark.parametrize("rows", ["repeated", "distinct"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
-def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
+def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype, rows):
     """Repeated tokens hold the row arithmetic fixed while the column sum grows to Qwen3.5-0.8B's size,
     isolating partial-sum error from bf16 midpoint flips: the weight gradient holds check 1 over the
     step's draws. Repeated rows give the output and input gradient one row's evidence a draw, so the same
-    launch holds all three over a step of distinct rows too."""
+    launch holds all three over a third of a step of distinct rows too (8192, its weight gradient's sum
+    thousands of rows long; the full step's sum is the repeated case's to hold). Each is its own case, so
+    each fits its group's 120 s: both in one ran 129 s, and the full step of distinct rows alone 121-162 s
+    (row 4458, NS4458-1)."""
     functions = norm_functions(dtype, offset=True, after_cast=True)
 
     def coefficient(operands):
         return scale_coefficient(operands[0], dtype, after_cast=True)
 
-    compare(functions, lambda draw: full_step(dtype, draw), ("y", "x", "scale"), SEEDS[(24576, 1000)],
-            coefficient=coefficient, judged=("scale",))
-    compare(functions, functools.partial(norm_operands, (24576, 1000), dtype, jnp.float32),
-            ("y", "x", "scale"), SEEDS["step of distinct rows"], coefficient=coefficient)
+    if rows == "repeated":
+        compare(functions, lambda draw: full_step(dtype, draw), ("y", "x", "scale"), SEEDS[(24576, 1000)],
+                coefficient=coefficient, judged=("scale",))
+    else:
+        compare(functions, functools.partial(norm_operands, (8192, 1000), dtype, jnp.float32),
+                ("y", "x", "scale"), SEEDS["step of distinct rows"], coefficient=coefficient)
 
 
 def test_a_weight_gradient_past_fp32s_range_is_an_infinity_as_xlas():

@@ -1711,10 +1711,9 @@ BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name 
                  for width in (64, 128, 256) for accurate in (False, True)]
 BACKWARD_GATE += [(generation_name, width, False, hooks) for generation_name in GATED for width in (64, 128)
                   for hooks in BACKWARD_HOOKS if hooks != "none"]
-BACKWARD_GATE += [(generation_name, 256, False, "softcap") for generation_name in GATED]
 """The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
-call's head widths, each form, hookless; each score hook at the widths a hooked call's derivation takes
-whole (row 2281: its live set beside the step's); and Gemma 2's softcap at width 256."""
+call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
+whole (row 2281: its live set beside the step's)."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):
@@ -1845,6 +1844,29 @@ def test_an_a100_fused_backward_counts_the_shared_memory_its_lowering_asks_for()
         (found,) = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config))], "sm80")
     (binary,) = found["binaries"]
     assert binary["shared"] == shared
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block(accurate):
+    """An A100's backward of heads 256 wide (Gemma's) on 32 x 32 tiles, two launches on mma.sync arranged by
+    their 32-row shares (`backward_family`), each register operand crossing its warps relayed through its
+    consumer's tile (`_relay_tiles`): within the A100's block, as its model sizes it, spilling nothing, every
+    launch's model ptxas's, lowered and compiled for an sm80 on this CPU, in each form."""
+    import kernel_compile
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    op, ba, _ = _gated_backward("sm80", 256, accurate)
+    config = attention_mosaic.BackwardTiles(32, 32, 2, 1, family="mma.sync")
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        assert op.staged_bytes(ba, config, target) <= target.shared_limit
+        models = _backward_models(op, ba, config)
+        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config), models)],
+                                       "sm80")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert set(models) <= kernel_compile.compiled_kernels(found[0]), (set(models), found[0].get("kernels"))
 
 
 def _forward_kernels(op, ba, config) -> dict:
