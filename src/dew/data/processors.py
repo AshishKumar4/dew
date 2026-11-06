@@ -40,8 +40,8 @@ def sampling_rate(extractor: FeatureExtractor) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class LogMel:
-    """A waveform's log mel frames `[frames, n_mels]` float32, from transformers' shared STFT and mel
-    filters (`audio_utils`, which its feature extractors compute with): centred frames of a
+    """A waveform's log mel frames `[frames, n_mels]`, float32 unless a call asks for float64, from
+    transformers' shared STFT and mel filters (`audio_utils`, which its feature extractors compute with): centred frames of a
     reflect-padded waveform under a periodic Hann window, HTK mel filters without a norm, the
     magnitude to `power`, floored at `floor` before the natural log. That is torchaudio's
     MelSpectrogram at its defaults and `power`, as MiMo-V2.6's audio tokenizer reads it at 24 kHz and
@@ -57,7 +57,7 @@ class LogMel:
     power: float = 1.0
     floor: float = 1e-7
 
-    def __call__(self, waveform) -> np.ndarray:
+    def __call__(self, waveform, dtype: np.dtype = np.float32) -> np.ndarray:
         from transformers.audio_utils import mel_filter_bank, spectrogram, window_function
 
         filters = mel_filter_bank(
@@ -65,8 +65,9 @@ class LogMel:
             max_frequency=self.sampling_rate / 2 if self.f_max is None else self.f_max,
             sampling_rate=self.sampling_rate, norm=None, mel_scale="htk")
         frames = spectrogram(
-            np.asarray(waveform, np.float32), window_function(self.win_length, "hann", periodic=True,
-                                                              frame_length=self.n_fft),
+            np.asarray(waveform, dtype), window_function(self.win_length, "hann", periodic=True,
+                                                         frame_length=self.n_fft),
             frame_length=self.n_fft, hop_length=self.hop_length, fft_length=self.n_fft, power=self.power,
-            center=True, pad_mode="reflect", mel_filters=filters, mel_floor=self.floor, log_mel="log")
-        return np.ascontiguousarray(frames.T, np.float32)
+            center=True, pad_mode="reflect", mel_filters=filters, mel_floor=self.floor, log_mel="log",
+            dtype=dtype)
+        return np.ascontiguousarray(frames.T, dtype)
