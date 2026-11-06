@@ -395,8 +395,8 @@ class Hub(Dataset):
             dataset = dataset.select_columns(list(self.columns))
         return arrow_rows(dataset)
 
-    def manifest(self) -> ShardManifest:
-        return self.files.manifest()
+    def manifest(self, version: int) -> ShardManifest:
+        return self.files.manifest(version)
 
     def stated(self) -> Mapping[str, object]:
         """Its builder's info, which its metadata is, no row read; a split never prepared, with the Hub

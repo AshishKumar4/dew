@@ -21,7 +21,10 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Pipeline, Rejected
-from dew.data.plan import Manifest
+from dew.data.plan import PLAN_VERSIONS, Manifest
+
+LATEST = PLAN_VERSIONS[-1]
+"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -315,12 +318,13 @@ def fetched_generation(chain, directory):
     manifest publication records, filled once through the cache."""
     from dew.data.analysis import _cache_manifest
     from dew.data.compile import _prepared
+    from dew.data.plan import PLAN_VERSIONS
 
     (prepared,) = _prepared((chain,), "indexed", provision=False)
     source = prepared.source
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
-    manifest = _cache_manifest(source, prepared.stages, "indexed")
+    manifest = _cache_manifest(source, prepared.stages, "indexed", PLAN_VERSIONS[-1])
     stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:
@@ -721,7 +725,7 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
     stream = datasets.IterableDataset.from_generator(hf_file_rows, gen_kwargs={"shards": [str(path)]})
     source = from_hf(stream, identity="cached-counting@1")
     cache, key = Cache((tmp_path / "cache").as_uri()), Manifest(source.fingerprint())
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key))
     actual = []
     for index in range(shares):
