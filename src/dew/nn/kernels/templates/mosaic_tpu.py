@@ -363,7 +363,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             smem[...] = part.astype(smem.dtype)
             pltpu.sync_copy(smem, view)
 
-    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+    def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
+        del pending
         raise NotImplementedError("a TPU core adds into HBM by no atomic: a split contraction's partial "
                                   "sums take a place each")
 

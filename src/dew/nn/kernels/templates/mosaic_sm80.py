@@ -434,9 +434,13 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 for shape, dtype in outputs]
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
-        # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps.
+        # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps,
+        # and where two consumers run it together the two barriers they meet at in turn (its thread axis).
         slots = streams.stages if steps is None else min(streams.stages, steps)
-        return (), (tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in streams.blocks.values()),)
+        meet = (() if streams.consumers == 1
+                else (plgpu.Barrier(num_arrivals=streams.consumers, num_barriers=2),))
+        tiles = tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in streams.blocks.values())
+        return (), ((*tiles, *meet),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -556,10 +560,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
-    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+    def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         # Element-wise atomic adds into global memory (`red.global`; no TMA reduction before Hopper), so
-        # every other role's and program's adds into the view stay whole.
-        del smem
+        # every other role's and program's adds into the view stay whole, no buffer between them.
+        del smem, pending
         if interpret:
             view[...] = view[...] + value
         else:
@@ -578,10 +582,10 @@ class Mma(MmaIssuer, CpAsync):
 
     name = "mma.sync"
 
-    # One consumer warpgroup a program; a multiprocessor runs two programs (`programs`). Two consumers in
-    # one program took 1.04 to 1.50 of one's time on an A100 (CONSUMERS1), their shared copies leaner or
-    # not, where two programs took 0.73 to 0.89 (CONSUMERS3).
-    consumers = 1
+    # One consumer warpgroup a program or two, the two running one cp.async pipeline, each copying its share
+    # of every block (`emit_pipeline`'s thread_axis, jax 0.12.0.1.post54); which a launch runs its
+    # objective decides (the GEMM's reads, `gemm.mosaic_gpu._reads`).
+    consumers = 2
 
     def column_unit(self, dtype) -> int:
         # Its stores move rows through registers, laid over the role's threads (`stores_columns`): a warp's
