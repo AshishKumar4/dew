@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from dew._records import JSON
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.condition import ConditionWork
-    from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.backbones.decoder_block import Mixture, RematPolicy
     from dew.nn.backbones.decoder_stack import DecoderBank, StackView
     from dew.nn.continuum import HeadTerms, LevelTerms
     from dew.nn.cross_attention import CrossBlocks
@@ -107,6 +107,7 @@ __all__ = [
     "Logits",
     "LogitsFromHidden",
     "Looping",
+    "Mixed",
     "ModelKwarg",
     "OutputTable",
     "Predicting",
@@ -570,6 +571,15 @@ class HiddenStates(Protocol):
 
     def hidden_states(self, tokens: jax.Array, *, train: bool = False,
                       **fields: ModelKwarg) -> jax.Array: ...
+
+
+@runtime_checkable
+class Mixed(Protocol):
+    """A model whose feed-forward may route by a mixture (`dew.nn.backbones.decoder_block.Mixture`), None
+    where it routes by none."""
+
+    @property
+    def mixture(self) -> Mixture | None: ...
 
 
 @runtime_checkable

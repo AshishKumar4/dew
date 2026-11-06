@@ -34,7 +34,7 @@ __all__ = [
 if TYPE_CHECKING:
     from dew._records import JSON
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.backbones.decoder_block import Mixture, RematPolicy
     from dew.nn.kv_cache import KVCache
 
 
@@ -69,6 +69,10 @@ class DecoderWrapper(nn.Module):
     @property
     def vocab_size(self) -> int:
         return self._decoder.vocab_size
+
+    @property
+    def mixture(self) -> Mixture | None:
+        return self._decoder.mixture
 
     @property
     def max_seq_len(self) -> int:
