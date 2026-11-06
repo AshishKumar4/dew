@@ -671,11 +671,13 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
 def once[C](taken: jax.Array, body: Callable[[C], C], carried: C) -> C:
     """`body(carried)` where `taken`, else `carried`: a loop of at most one trip, whose carry XLA keeps in its
     operand's buffer, the rare side of a branch (`walked_launches`' rare walks) with no copy on the common
-    one, whose identity a branch copies into its result (ET-MEMCPY-h100)."""
+    one, whose identity a branch copies into its result (ET-MEMCPY-h100). Its trips counted from 0 below 1,
+    beside `taken`, so a step's FLOP count bounds its body as it bounds a branch's (`instrumentation`'s
+    counted trips)."""
     def trip(state):
-        return jnp.zeros((), bool), body(state[1])
+        return state[0] + 1, body(state[1])
 
-    return jax.lax.while_loop(lambda state: state[0], trip, (jnp.asarray(taken), carried))[1]
+    return jax.lax.while_loop(lambda state: (state[0] < 1) & taken, trip, (jnp.int32(0), carried))[1]
 
 
 NATURAL_EXPONENT_REACH = 150.0

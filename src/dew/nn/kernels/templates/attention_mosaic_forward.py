@@ -625,7 +625,7 @@ def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
 
 
 def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                     scale: float, natural: bool, tiles: Tiles, interpret: bool, parts: int = 1
+                     scale: float, natural: bool, tiles: Tiles, interpret: bool
                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     """`MosaicForward`'s training launches at `tiles`, two a form: a walk of the logits alone for each row's
     anchor, its first key at the keys' largest logit (`_peak_consumer`), then the algebra's training step
@@ -637,14 +637,11 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     A program walks its keys once, so the default's guards compose over whole launches
     (`algebra.walked_launches`): the fold's rewalk is this kernel's natural launch, and rows whose weighted
     values overflowed take the plain-JAX mainloop's guarded training walk (its normalized split sums, shift
-    -1, `algebra.split_residuals`), which this kernel's single pass does not take. An fp32 call's operands
-    enter as their `parts` stacked along the batch axis (`MosaicForward.parts`), each launch reading them so;
-    the anchor's value row and the guarded walk read them whole, their parts summed exactly."""
+    -1, `algebra.split_residuals`), which this kernel's single pass does not take."""
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family)
     value_width = value.shape[3]
-    out_dtype = jnp.float32 if parts > 1 else query.dtype
 
     def launch(form: algebra.Forward, live: jax.Array | None):
         q, form = _rewalked(spec, form, raw, taken)
@@ -653,40 +650,35 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
             # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
             at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
             found = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
-                            family=family, training=False, interpret=interpret, peaks=True, counted=counted,
-                            parts=parts)
+                            family=family, training=False, interpret=interpret, peaks=True, counted=counted)
             # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`,
             # row 2526), each block's split sums side by side, their rows alike.
             launched = [_launch(q, k, values, at_spans, held, None, spec=form, hooks=hooks, tiles=at,
                                 family=family, training=True, interpret=interpret, anchors=found,
-                                counted=counted, columns=first, parts=parts)
+                                counted=counted, columns=first)
                         for first, values, held in _column_blocks(v, hooked, at.columns)]
             status, rows, anchors, _ = launched[0]
             others = jnp.concatenate([block[3] for block in launched], axis=-1)
             status = status.at[1].set(functools.reduce(jnp.maximum, [block[0][1] for block in launched]))
             split = Split(others, rows[2], rows[3], rows[4])
-            # Each row's anchor's value row (`[B, H, Qp, Dv]`): its key head's at its key, gathered, an fp32
-            # call's from its parts summed.
-            whole = _whole(v, parts)
-            batch, kv_heads, keys_count = whole.shape[0], whole.shape[2], whole.shape[1]
+            # Each row's anchor's value row (`[B, H, Qp, Dv]`): its key head's at its key, gathered.
+            batch, kv_heads, keys_count = v.shape[0], v.shape[2], v.shape[1]
             kv_of = jnp.arange(q.shape[2]) // (q.shape[2] // kv_heads)
             places = ((jnp.arange(batch)[:, None, None] * kv_heads + kv_of[None, :, None]) * keys_count
                       + anchors)
-            value_rows = jnp.take(jnp.swapaxes(whole, 1, 2).reshape(-1, whole.shape[-1]), places, axis=0)
+            value_rows = jnp.take(jnp.swapaxes(v, 1, 2).reshape(-1, v.shape[-1]), places, axis=0)
             # Under dropout the anchor's own weight takes its draw's multiplier, as `algebra.joined` does.
             own = split.own if hooks.drop is None else split.own * _anchor_multipliers(hooks.drop, anchors)
             acc = algebra.split_output(split.others, own, value_rows)
             out = algebra.output_of(acc, rows[1], guarded=form.guarded or hooks.initial is not None)
             out = _output_hooked(out, hooks, hooked)
             overflowed = (status[1] > 0) | algebra.overflowed(acc)
-            return ((jnp.swapaxes(out, 1, 2).astype(out_dtype), rows[0], rows[1], anchors, split),
-                    status[0], overflowed)
+            return ((jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0],
+                    overflowed)
         # The overflowed rows' guarded training walk, the plain-JAX mainloop's over this call's padding in
         # this launch's form (the rewalk's units kept, `algebra.unfolded`); its maxima and overflows
         # `walked_launches` does not read.
         walked = call if q is raw else dataclasses.replace(call, query=by_power(call.query, taken))
-        walked = dataclasses.replace(walked, **{name: _whole(getattr(walked, name), parts)
-                                                for name in ("query", "key", "value")})
         out, rows = attention_portable.padded_walk(form, walked, hooks, block_q=tiles.block_q,
                                                    block_k=tiles.block_k, residuals=True)
         maximum, total, anchors, split = rows
