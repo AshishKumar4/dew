@@ -18,6 +18,7 @@ case whose question is host-bound latency asks for the wall clock alone (`"clock
 Compute) run after every round, each arm's in a process of its own, never in a timed one.
 
     python tools/timing.py run MANIFEST.json --out DIR    # DIR/timing.jsonl's rows, DIR/profiles' reports
+    python tools/timing.py jobs --ref SHA KIND=MANIFEST.json ... > JOBS.json   # a window a GPU kind
     python tools/timing.py worker                         # one process's arms, JSON lines on stdin and stdout
 
 A row: case, cell, arm, tree, jax, implementation, round, repeat, order (its place in the window's run order),
@@ -29,6 +30,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -383,17 +385,47 @@ def summarized(manifest: dict, out: Path) -> None:
     (out / "summary.md").write_text("\n".join(lines))
 
 
+WINDOW_MINUTES = 15
+"""A window's minutes past its cases' own: its workers' start and its arms' builds."""
+
+
+def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
+    """One measurement window a GPU kind, as `dewops.node` takes them (`node submit`): each a timing
+    (`"kind"`), alone on its GPU, at `ref`, running this harness over that kind's manifest (beside the jobs'
+    file, which stages it as $SESSION/extra/<its name>), its minutes a minute for each 60 timed calls past
+    `WINDOW_MINUTES` (the measurement lane batches every pending measurement of a kind into its window, bible
+    §6)."""
+    windows = []
+    for kind, path in manifests.items():
+        manifest = json.loads(path.read_text())
+        calls = sum(len(case["cells"]) * (len(case["arms"]) + 1) * case.get("rounds", ROUNDS)
+                    * case.get("repeats", 5) for case in manifest["cases"])
+        windows.append({"name": f"{name}-{kind}", "ref": ref, "gpu": kind, "kind": "timing",
+                        "minutes": WINDOW_MINUTES + math.ceil(calls / 60), "keep": [],
+                        "run": f'python tools/timing.py run "$SESSION/extra/{path.name}" --out "$OUT"'})
+    return {"jobs": windows}
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     running = commands.add_parser("run")
     running.add_argument("manifest", type=Path)
     running.add_argument("--out", type=Path, required=True)
+    batching = commands.add_parser("jobs")
+    batching.add_argument("--ref", required=True)
+    batching.add_argument("--name", default="WINDOW")
+    batching.add_argument("manifests", nargs="+", help="KIND=MANIFEST.json, one a GPU kind")
     serving = commands.add_parser("worker")
     serving.add_argument("--clock", choices=("device", "wall"), default="device")
     arguments = parser.parse_args(argv)
     if arguments.command == "worker":
         return worker(arguments.clock)
+    if arguments.command == "jobs":
+        found = {kind: Path(path)
+                 for kind, _, path in (entry.partition("=") for entry in arguments.manifests)}
+        print(json.dumps(jobs(arguments.ref, found, arguments.name), indent=1))
+        return 0
     repo = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
                                check=True).stdout.strip())
     manifest = json.loads(arguments.manifest.read_text())
