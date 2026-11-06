@@ -6,7 +6,8 @@ them."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import functools
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import numpy as np
@@ -87,6 +88,15 @@ class StoredRow:
     def __getitem__(self, index: int) -> StoredRow:
         return StoredRow(self.bank, (*self.index, index))
 
+    def split(self, widths: Sequence[int]) -> list[Deferred]:
+        """The row's last axis in runs of `widths` (a packed projection's members,
+        `dew.inference.projections.unpacked`), each read from the row as it is read."""
+        starts = np.cumsum([0, *widths[:-1]])
+        return [Deferred((*self.shape[:-1], width), self.dtype,
+                         functools.partial(lambda start, width: np.asarray(self)[..., start:start + width],
+                                           int(start), int(width)))
+                for start, width in zip(starts, widths, strict=True)]
+
     def __jax_array__(self) -> jax.Array:
         return jax.numpy.asarray(self.bank[self.index])
 
@@ -94,6 +104,30 @@ class StoredRow:
         del copy
         held = read_home(self.bank[self.index])
         return held if dtype is None else held.astype(dtype)
+
+
+class Deferred:
+    """A leaf an export builds on the host as it writes it (`np.asarray`), its shape and dtype known
+    before: what a transformation makes of a bank's rows (`StoredRow`), a packed row's member
+    (`StoredRow.split`) or an adapter's merge of a row's kernel (`dew.lora.Adapter.merge`), so an export
+    of a banked store holds one tensor's work at a time."""
+
+    def __init__(self, shape: tuple[int, ...], dtype, build: Callable[[], np.ndarray | jax.Array]):
+        self.shape, self.dtype, self.build = tuple(shape), np.dtype(dtype), build
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        del copy
+        held = np.asarray(self.build())
+        return held if dtype is None else held.astype(dtype)
+
+
+def deferred(leaf) -> bool:
+    """Whether `leaf` is read as an export writes it (`StoredRow`, `Deferred`)."""
+    return isinstance(leaf, (StoredRow, Deferred))
 
 
 def stored_rows(path, leaf, shape: tuple[int, ...]) -> list[StoredRow]:

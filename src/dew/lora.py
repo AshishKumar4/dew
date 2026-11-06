@@ -72,7 +72,7 @@ from dew.batch import (
 )
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
-from dew.nn.backbones.layer_names import group_layers, stored_layers
+from dew.nn.backbones.layer_names import Deferred, deferred, group_layers, stored_layers
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.dropout import Dropout
 from dew.nn.flops import (
@@ -689,7 +689,10 @@ def _scale(target: Target, rslora: bool) -> float:
 
 def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax.Array:
     """`kernel` plus `scale` times the factors' product, summed in at least fp32 at full precision
-    and stored in the kernel's dtype, as PEFT's `merge_and_unload` does."""
+    and stored in the kernel's dtype, as PEFT's `merge_and_unload` does; over leaves an export reads as
+    it writes them (a bank's rows, `stored_layers`), the merge it builds as it writes it (`Deferred`)."""
+    if any(deferred(leaf) for leaf in (kernel, a, b)):
+        return Deferred(kernel.shape, kernel.dtype, lambda: _updated(*map(np.asarray, (kernel, a, b)), scale))
     dtype = at_least_fp32(kernel.dtype)
     delta = accumulated(functools.partial(jnp.tensordot, axes=1, precision=jax.lax.Precision.HIGHEST),
                         a.astype(dtype), b.astype(dtype))

@@ -134,7 +134,8 @@ def materialize(tree: LazyTree) -> LazyTree:
 class HostArray(Protocol):
     """A leaf built on the host as it is read (`np.asarray`), its shape and dtype known before: a DEX
     layer's folded output projection (`dew.nn.dex.FoldedKernel`), which an export folds as it writes it, or a
-    layer's row of a bank (`dew.nn.backbones.layer_names.StoredRow`), read home as it is written."""
+    layer's row of a bank (`dew.nn.backbones.layer_names.StoredRow`), read home as it is written, or what an
+    export makes of one (`Deferred`)."""
 
     @property
     def shape(self) -> tuple[int, ...]: ...
