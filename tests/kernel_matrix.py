@@ -55,6 +55,29 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "gate": ("plain", "scaled"),
         "dtype": ("bfloat16", "float16", "float32"),
     },
+    "recurrence": {
+        "generation": ("sm90", "sm80"),
+        "form": ("gated delta net", "kimi delta attention", "write gate", "rated scan"),
+        "kernel": ("mosaic_gpu", "xla"),
+        "dtype": ("bfloat16", "float32"),
+        "documents": ("one", "packed"),
+    },
+    "short_conv": {
+        "generation": ("sm90", "sm80"),
+        "model": ("0.8b", "9b"),
+        "dtype": ("bfloat16", "float32"),
+        "documents": ("one", "packed"),
+    },
+    "selective_scan": {
+        "generation": ("sm90", "sm80"),
+        "case": ("bf16", "fp32", "decays-near-one", "decays-near-zero", "saturated-steps", "documents",
+                 "long"),
+    },
+    "delta_decode": {
+        "generation": ("sm90", "sm80"),
+        "kernel": ("fused", "step"),
+        "state": ("float32", "bfloat16"),
+    },
 }
 """Each family's axes and their values. Attention's: the GPU; the head width; 8 query heads over 8 key heads,
 2, or 4; a causal, a full or a causal call over three documents and padding; no hook, two key or two tile
@@ -71,7 +94,13 @@ after the product in XLA), or both; the consumers, a bias then a cast, or a SiLU
 residual; the operands' dtype. The joined projections' (the choices `gate_up` and `delta_gates`): the GPU; a
 gated MLP's gate and up projections joined, or a gated delta net's b and a; the MLP's activation, SwiGLU or
 GeGLU (`none` for the delta net, which has no gated product); projections with no bias or one; a gate times
-its multiplier or not (`plain` for the delta net); the operands' dtype."""
+its multiplier or not (`plain` for the delta net); the operands' dtype. The recurrence's (the choices
+`gated_delta_rule` and `ssd`): the GPU; the form (tests/recurrence_matrix.py's `FORMS`); the kernel the call
+names (its form's port, fla's or mamba_ssm's, the reference); the operands' dtype; one sequence or packed
+documents. The short conv's: the GPU; a gated delta net's training shapes (Qwen3.5-0.8B's or 9B's); the
+operands' dtype; whole rows or packed documents. The selective scan's: the GPU; the recorded mamba_ssm case
+(tests/selective_support.py's `SEEDED_CASES`). The recurrent decode's: the GPU; the fused step or the step
+alone; the dtype its recurrent state is held in."""
 
 SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (
@@ -87,6 +116,10 @@ CELLS: dict[str, tuple[str, str]] = {
     "gemm": ("gemm_matrix", "a_gemm_training_step_is_on_par"),
     "fused_gemm": ("fused_gemm_matrix", "a_fused_gemm_training_step_is_on_par"),
     "join": ("join_matrix", "a_joined_layers_training_step_is_on_par"),
+    "recurrence": ("recurrence_matrix", "a_recurrences_training_step_is_on_par"),
+    "short_conv": ("short_conv_matrix", "a_short_convs_training_step_is_on_par"),
+    "selective_scan": ("selective_matrix", "a_selective_scan_is_as_exact_as_mamba_ssm"),
+    "delta_decode": ("delta_decode_matrix", "a_decode_token_is_on_par"),
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
 
@@ -96,6 +129,10 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_join_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_selective_scan_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_recurrent_decode_matrix_holds_on_this_gpu",
 )
 """The flows that run the matrices' cells, by pytest node id."""
 
