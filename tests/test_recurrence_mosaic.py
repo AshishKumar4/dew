@@ -189,9 +189,8 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     heads = given.value.shape[:3]
     g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
     beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
-    # The l2 norm takes the queries and keys to fp32 at least before the rule reads them.
-    query, key = ((x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in (given.query, given.key))
-                  if hooks.l2norm else (given.query, given.key))
+    # The l2 norm hands the rule the queries and keys in their own dtype (`recurrence_chunk.chunk`).
+    query, key = given.query, given.key
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
                                 floor=hooks.floor, bound=hooks.inverse_bound,
