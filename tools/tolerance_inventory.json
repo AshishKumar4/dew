@@ -721,10 +721,6 @@
    "comparisons": 7,
    "lane": "Models, Serving & RL"
   },
-  "tools/check_native_diffusion_edges.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tools/classic_gpt_reference.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
