@@ -801,6 +801,32 @@ def _written_pages(resident: Slots, carried: Slots, pages: jax.Array, held: Vari
     return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
 
 
+def _copied_pages(resident: Slots, carried: Slots, sources: jax.Array,
+                  targets: jax.Array) -> tuple[Slots, Slots]:
+    """The state with each pool page of `targets` set to its page of `sources` (a shared segment's last
+    page into the fresh page a prompt sharing it writes past it, `dew.inference.pages.Transfers.copies`),
+    pages of the pool's global index; a target past the pool is dropped."""
+    state = joined(resident, carried)
+
+    def copied(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array) -> jax.Array:
+        if leaf_name(path) not in POOLED:
+            return leaf
+        axis = _pages_axis(path)
+        taken = jnp.take(leaf, jnp.clip(sources, 0, leaf.shape[axis] - 1), axis=axis)
+        return leaf.at[(*(slice(None),) * axis, targets)].set(taken, mode="drop")
+
+    cache = jax.tree_util.tree_map_with_path(copied, state.decoder.cache)
+    return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
+
+
+def copy_program(formats: Formats) -> OuterProgram:
+    """The program that copies pool pages onto others in the resident state, kept in `formats`
+    (`_copied_pages`), the resident matrices donated."""
+    resident, carried = split_donated(formats)
+    return outer_program(_copied_pages, donate_argnums=(0,), in_shardings=(resident, carried, None, None),
+                         out_shardings=(resident, carried))
+
+
 def page_programs(formats: Formats, rows: NamedSharding | None) -> tuple[OuterProgram, OuterProgram]:
     """The programs that move a paged pool's pages between the resident state, kept in `formats`, and the
     host (`dew.inference.pages.Transfers`): reading pages out, and writing pages in, the pages handed in a

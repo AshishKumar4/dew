@@ -309,6 +309,36 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
         assert report.refused_launches() == refused
 
 
+
+@lowers("sm90")
+def test_programs_compiled_at_once_sharing_a_spilling_launch_keep_what_compiles_in_turn_keep():
+    """Two programs sharing a template launch whose first config spills, compiled at once
+    (`report.compiled_at_once`): the first's compile refuses that config and steps it down; the second,
+    lowered before that refusal committed, is lowered again past it, so both keep the stepped tile and the
+    refusals are those compiling them in turn leaves, the second neither refusing the first config again
+    nor stepping its own past the kept one (review of the concurrent compiles)."""
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_only_gpus
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    mesh = generation.gpu_mesh(devices, "sm90")
+    outcomes = {}
+    for mode in ("turn", "once"):
+        traced = []
+        lowered = _lowering(*_spilling_forward(Uncounted(), 4096, devices), traced)
+        with report.refusals(), generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+            programs = [(lowered(), None, lowered) for _ in range(2)]
+            if mode == "turn":
+                report.compiled(programs[0][0], relower=lowered)
+                report.compiled(lowered(), relower=lowered)
+            else:
+                report.compiled_at_once(programs)
+            # The configs each compile met spilling and whether it stepped past them, and the refusals left.
+            outcomes[mode] = ([(miss.config, miss.stepped) for miss in report.misses()],
+                              [config for _, config, _ in report.refused_launches()])
+    assert outcomes["once"] == outcomes["turn"]
+    assert outcomes["turn"][1]
+
 @lowers("sm90")
 def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kernels():
     """A run compiles its programs from several threads at once (scoring's pass shapes, row 2790). A compile
@@ -1094,3 +1124,38 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     handed = subprocess.run([sys.executable, "-c", handoff], check=True, env=environment,
                             input=exported, capture_output=True, text=True)
     assert json.loads(handed.stdout) == json.loads(exported)
+
+
+def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
+    """Programs compiled at once (`report.compiled_at_once`) keep, in turn, the executables compiling them
+    one after another keeps, in the order given, each making its first compile in a thread of its own
+    (`report.attempts`): those lowered in distinct MLIR contexts (here, each on a thread of its own, as JAX
+    lowers a thread's programs in one) and those sharing one alike, whose compiles JAX's cache key reads
+    without writing their context from 0.12.0.1.post54."""
+    import threading
+
+    from dew.nn.kernels.templates import report
+    from dew.telemetry.compiles import Compiles
+
+    square = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    functions = (lambda x, y: x @ y, lambda x, y: jnp.tanh(x) + y, lambda x, y: jnp.sum(x * y, axis=0))
+    apart: list = [None] * len(functions)
+
+    def lowered(index: int) -> None:
+        apart[index] = jax.jit(functions[index]).lower(square, square)
+    threads = [threading.Thread(target=lowered, args=(index,)) for index in range(len(functions))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    shared = [jax.jit(function).lower(square, square) for function in functions]
+    for lowerings in (apart, shared):
+        with Compiles(None) as compiles:
+            together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
+                                                for lowered in lowerings])
+        threads = [program.thread for program in compiles.programs if program.kind == "compiled"]
+        assert len(threads) == 3, threads
+        assert all(thread.startswith("dew-compile") for thread in threads), threads
+        alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
+        assert [executable.as_text() for executable in together] == [
+            executable.as_text() for executable in alone]

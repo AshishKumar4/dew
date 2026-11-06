@@ -41,13 +41,7 @@ from dew._cli import tpu_setup
 from dew._cli.gcloud import emit
 from dew._cli.tpu import reach
 from dew._pool import (
-    COORDINATOR,
-    LOCAL_DEVICES,
     PREEMPTED_EXIT,
-    PROCESS_COUNT,
-    PROCESS_ID,
-    Cluster,
-    detected_cluster,
     listed_gpus,
     local_gpu_count,
     refuse_idle_gpus,
@@ -55,6 +49,7 @@ from dew._pool import (
     slurm_tasks_here,
     visible_gpus,
 )
+from dew.clusters import LOCAL_DEVICES, SCHEDULERS, Launched, Scheduler, detected_environment
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 """What an `--env` name may be: it lands unquoted in the remote shell line."""
@@ -190,8 +185,12 @@ class Launch:
             raise ValueError(f"{self.hostfile} names no hosts")
         if hosts:
             return self.start(self.pool(hosts))
-        cluster = detected_cluster()
-        if cluster is not None and cluster.count > 1:
+        # The schedulers alone: a pool this launcher declares it starts again (`Launched`). One whose size
+        # it cannot tell without JAX (a Kubernetes Job's, which JAX reads off its API) runs in place, as
+        # JAX places each of its processes.
+        cluster = detected_environment(SCHEDULERS)
+        count = None if cluster is None else cluster.place().process_count
+        if cluster is not None and (count is None or count > 1):
             return self.in_place(cluster)
         if cluster is None and "SLURM_JOB_ID" in os.environ:
             return self.srun()
@@ -207,7 +206,7 @@ class Launch:
             ("--devices-per-process", self.devices_per_process),
             ("--port", self.port), ("--coordinator", self.coordinator)) if value is not None]
 
-    def in_place(self, cluster: Cluster) -> int:
+    def in_place(self, cluster: Scheduler) -> int:
         """Run the program as this process: whatever started it on every
         node already set what jax reads. A Slurm step with fewer tasks on
         this node than the GPUs its task sees is refused, as srun is."""
@@ -218,10 +217,12 @@ class Launch:
         tasks = slurm_tasks_here()
         if cluster.name == "slurm" and tasks is not None and runs_on_gpu(os.environ):
             refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
-        emit(f"{cluster.name}: process {cluster.process} of {cluster.count}, placed by the "
-             f"cluster; running {shlex.join(self.command)}")
-        if cluster.count > 1 and cluster.process == 0 and cluster.name in ("gcetpu", "gketpu"):
-            emit(f"every worker has to run it; `dew launch --tpu NAME` starts all {cluster.count}")
+        place = cluster.place()
+        process = "a process" if place.process_id is None else f"process {place.process_id}"
+        of = "" if place.process_count is None else f" of {place.process_count}"
+        emit(f"{cluster.name}: {process}{of}, placed by the cluster; running {shlex.join(self.command)}")
+        if cluster.name == "tpu":
+            emit("every worker of a Cloud TPU runs it; `dew launch --tpu NAME` starts them all")
         return self.execute(self.command)
 
     def srun(self) -> int:
@@ -334,7 +335,7 @@ class Launch:
         per_host, devices = self.layout(hosts[0])
         count = len(hosts) * per_host
         address = self.coordinator_address(hosts)
-        shared = {**self.extra_env(), COORDINATOR: address, PROCESS_COUNT: str(count)}
+        shared = {**self.extra_env(), **Launched.environ_of(address, count)}
         if devices is not None:
             holds = f"{devices} GPU{'s' if devices > 1 else ''} each"
         else:
@@ -344,10 +345,9 @@ class Launch:
         processes = []
         for rank in range(count):
             host = hosts[rank // per_host]
-            env = {**shared, PROCESS_ID: str(rank)}
-            if devices is not None:
-                first = (rank % per_host) * devices
-                env[LOCAL_DEVICES] = ",".join(str(device) for device in range(first, first + devices))
+            first = (rank % per_host) * (devices or 0)
+            env = {**shared, **Launched.environ_of(address, count, rank, None if devices is None
+                                                   else range(first, first + devices))}
             processes.append(Process(rank, host, self.remote_argv(host, env), env,
                                      env.get(LOCAL_DEVICES, "")))
         return processes
