@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
+from process_support import raised
 
 from dew.distributed.placement import parameter_axes
 from dew.training import MeshSpec
@@ -165,7 +166,9 @@ def test_processes_that_hold_the_same_rows_read_the_same_share(tmp_path, mesh):
 def test_more_replicas_than_hosts_are_refused(tmp_path):
     done = launch("--", sys.executable, str(WORKER), "--out", str(tmp_path / "x.json"),
                   "--mesh", json.dumps({"fsdp": 4, "replicas": 2}), devices=8)
-    assert done.returncode != 0
+    # Refused as the mesh is built (`LayoutRefused`: replicas past the granules), and no record written.
+    assert "dew.mesh.LayoutRefused" in raised(done) and not (tmp_path / "x.json").exists(), (
+        done.stdout + done.stderr)
 
 
 def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
@@ -282,7 +285,7 @@ def test_a_slurm_step_that_leaves_gpus_idle_is_refused_before_it_joins():
                "prepare_process()\n")
     done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=60)
-    assert done.returncode != 0, done.stdout
+    assert "ValueError" in raised(done), done.stdout
 
 
 @pytest.mark.mesh(devices=0)
@@ -403,7 +406,8 @@ def test_a_pool_forms_and_fails_together_after_orbaxs_public_multihost_loads():
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c",
                   "import orbax.checkpoint.multihost\n"
                   + stepping_pool("raise RuntimeError('injected failure')"), devices=1, timeout=600)
-    assert done.returncode == 1, done.stdout + done.stderr
+    # It ended with rank 1's own failure, past the pool's forming, not with an error of its start.
+    assert "injected failure" in raised(done).get("RuntimeError", []), done.stdout + done.stderr
 
 
 @pytest.mark.mesh(devices=2)
@@ -721,7 +725,8 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
                "    tree[1].delete()\n"
                "coordination.collective_host(tree, phase='t')\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
-    assert done.returncode != 0, done.stdout + done.stderr
+    # Rank 1 ends with its own error, rank 0 with its peer's: neither waits in the gather.
+    assert {"RuntimeError", "dew._coordination.PeerFailure"} <= raised(done).keys(), done.stdout + done.stderr
 
 
 def a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
