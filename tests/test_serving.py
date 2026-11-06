@@ -35,7 +35,7 @@ from dew.mesh import BATCH_AXES
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import MixerCall
-from dew.nn.kv_cache import KVCache
+from dew.nn.kv_cache import POOLED, KVCache, leaf_name, row_axis
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.protocols import held_groups
@@ -845,7 +845,7 @@ the later ones wait for the first to write it."""
      {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
       "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
     ((Served(9), Served(9, flipped=(0,)), Served(9)),
-     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 2,
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 6,
       "prefix_states": 1}, (0, 0, 8), None, NARROW_HYBRID),
     (SEGMENT, {}, (0, 6, 12), None, NARROW_HYBRID),
     (SEGMENT, {}, (12,), (3,), NARROW_HYBRID),
@@ -899,7 +899,8 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
     alone, where the store holds the state after the deepest page only, so the repeat reads nothing back;
     a store of one entry sends a prompt's state to the host tier when another prompt's takes the entry,
-    and its repeat reads it back with its pages (`dew.inference.pages.States`). A segment three prompts
+    and its repeat reads it back with its pages (`dew.inference.pages.States`; a tier holds as many states
+    as its host pages' bytes, one in six pages' here). A segment three prompts
     declare shared, ending inside a page (`SEGMENT`), is read by each later one from the state kept at
     its end, its last page copied into the prompt's own, one a round or all asked at once. With a host
     tier (`SEGMENT_HOST`): a segment two other prompts spill to the host, its page named by the segment
@@ -915,6 +916,27 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
                            serving={**HYBRID_SHARED, **options}, hits=hits, rounds=rounds, budget=site.budget,
                            seeds=(site.seeds, site.seeds))
+
+
+@pytest.mark.parametrize("host_pages", [1, 5, 6, 40])
+def test_a_hybrid_servers_host_states_fit_the_bytes_of_its_host_pages(host_pages):
+    """A hybrid server keeps as many row states on the host as the bytes of its `host_pages` pages hold
+    (ledger 4602): a state is a whole recurrent memory and conv tail, here several pages' bytes, so
+    `host_pages` states would take several times the host memory it names. Each group's state slots,
+    times one entry's bytes in the server's own store, are within its host pages' bytes in the server's
+    own pool, and one more would not be."""
+    server = Server.from_task(hybrid_task(), **{**HYBRID_SHARED, "host_pages": host_pages,
+                                                 "prefix_states": 2})
+    part = server.rows.pages[0]
+    assert part.states is not None
+    leaves = jax.tree_util.tree_leaves_with_path(server._states)
+    entry = sum(leaf.nbytes // leaf.shape[row_axis(path)] for path, leaf in leaves)
+    # The pool's leaves hold their pages on their second axis, heads first (`_pages_axis`).
+    pool = [(path, leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(server.cache)
+            if leaf_name(path) in POOLED]
+    page = sum(leaf.nbytes // leaf.shape[row_axis(path) + 1] for path, leaf in pool)
+    budget = part.host * page
+    assert part.states.host.slots * entry <= budget < (part.states.host.slots + 1) * entry
 
 
 def test_a_shared_segment_is_refused_where_no_server_keeps_it_or_it_splits_its_prompt():
