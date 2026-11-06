@@ -491,7 +491,7 @@ def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array
     return _blockwise_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
-def _rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`x` (`[..., n]`) as E4M3 codes a 1 x 128 tile at a time along its last axis and each tile's
     power-of-two scale (`[..., n / 128]` fp32)."""
     from dew.nn import fake_quant
@@ -500,7 +500,7 @@ def _rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return fake_quant.fp8_codes(blocks / scale).reshape(x.shape).astype(jnp.float8_e4m3fn), scale[..., 0]
 
 
-def _blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
+def blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`w` (`[groups, depth, width]`) as E4M3 codes a 128 x 128 block at a time and each block's power-of-two
     scale (`[groups, depth / 128, width / 128]` fp32)."""
     from dew.nn import fake_quant
@@ -515,8 +515,8 @@ def _blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def _projection_value(x, w, group_blocks, out_dtype, interpret):
-    rows, rows_scales = _rows_quantized(x)
-    blocks, blocks_scales = _blocks_quantized(w)
+    rows, rows_scales = rows_quantized(x)
+    blocks, blocks_scales = blocks_quantized(w)
     sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
     return blockwise_fp8_product(rows, jnp.swapaxes(blocks, 1, 2), sizes, rows_scales.T, blocks_scales,
                                  out_dtype=out_dtype, interpret_on_cpu=interpret)
@@ -529,12 +529,12 @@ def _projection_forward(x, w, group_blocks, out_dtype, interpret):
 def _projection_backward(out_dtype, interpret, residuals, cotangent):
     x, w, group_blocks = residuals
     sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
-    dy, dy_scales = _rows_quantized(cotangent)
-    blocks, blocks_scales = _blocks_quantized(w)
+    dy, dy_scales = rows_quantized(cotangent)
+    blocks, blocks_scales = blocks_quantized(w)
     d_x = blockwise_fp8_product(dy, blocks, sizes, dy_scales.T, jnp.swapaxes(blocks_scales, 1, 2),
                                 out_dtype=x.dtype, interpret_on_cpu=interpret)
-    rows_t, rows_t_scales = _rows_quantized(x.T)
-    dy_t, dy_t_scales = _rows_quantized(cotangent.T)
+    rows_t, rows_t_scales = rows_quantized(x.T)
+    dy_t, dy_t_scales = rows_quantized(cotangent.T)
     d_w = blockwise_fp8_kernel_gradient(rows_t, dy_t, group_blocks, rows_t_scales.T, dy_t_scales.T,
                                         out_dtype=w.dtype, interpret_on_cpu=interpret)
     return d_x, d_w, None
