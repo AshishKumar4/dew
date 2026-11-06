@@ -35,7 +35,7 @@ from dew._cache import INTERCEPTED
 
 from .derivatives import KernelGlue, contracted, declared_tangent
 from .kernels import gemm
-from .precision import accumulated, biased, float32_dot_general
+from .precision import accumulated, biased, float32_dot_general, refuse_recipe
 from .sharding import declared
 
 QWIX = importlib.util.find_spec("qwix") is not None
@@ -66,9 +66,12 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
     product with a policy of its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`)
     is the layer's own: the template reads no policy from a callable."""
     if layer.dot_general_cls is not None:
+        refuse_recipe("a quantizer's product class")
         return layer.dot_general_cls()
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     plain = layer.dot_general in (None, float32_dot_general)
+    if intercepted():
+        refuse_recipe("a wrapper's product (an adapter's, a quantizer's)")
     return gemm.dot_general(product) if plain and not intercepted() else product
 
 

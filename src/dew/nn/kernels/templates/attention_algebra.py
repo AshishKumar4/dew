@@ -502,13 +502,12 @@ def finished_form(spec: Forward) -> Forward:
 def slice_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
     """A finished slice of a row's keys as a state of their merge (`finished_merged`): its output `out`
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
-    keeps them) and its denominator folded into its maximum (`m + log(total)`, in those units) and its mass
-    1 where it saw a key, so no output multiplied back by its denominator passes fp32's largest; a slice of
-    no key the walk's start (`LEAST`), its mass 0. A row or a launch's block of rows alike."""
+    keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
+    rounded away at a large one (row 4646: at 2^30, fp32's spacing 128, slices of denominators 128 and 64
+    merged half and half). A slice of no key the walk's start (`LEAST`), its mass 0. A row or a launch's
+    block of rows alike."""
     seen = total > 0
-    units = spec.scale if spec.raw else 1.0
-    folded = jnp.where(seen, maximum + jnp.log(jnp.where(seen, total, 1.0)) / units, LEAST)
-    return Partial(out, folded, seen.astype(jnp.float32))
+    return Partial(out, jnp.where(seen, maximum, LEAST), jnp.where(seen, total, 0.0))
 
 
 def initial_state(spec: Forward, initial: Partial) -> Partial:
@@ -544,10 +543,14 @@ def finished_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     program's registers hold them (the in-launch merge's, `attention_mosaic_forward._Merge`)."""
     m = jnp.maximum(first.m, second.m)
     a, b = carried(spec, first.m, m) * first.total, carried(spec, second.m, m) * second.total
-    total = a + b
-    over = 1.0 / jnp.where(total > 0, total, 1.0)
+    # Each weight over the larger, so their sum is at most two whatever the masses (an initial state's may
+    # be any finite one).
+    largest = jnp.maximum(a, b)
+    safe = jnp.where(largest > 0, largest, 1.0)
+    a, b = a / safe, b / safe
+    over = 1.0 / jnp.where(a + b > 0, a + b, 1.0)
     out = expand(a * over, first.acc) * first.acc + expand(b * over, second.acc) * second.acc
-    return Partial(out, m, total)
+    return Partial(out, m, largest * (a + b))
 
 
 def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
@@ -560,10 +563,13 @@ def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     (`finish`'s `normalized`); a state of no key adds nothing."""
     m = jnp.max(stacked.m, axis=axis)
     weights = carried(spec, stacked.m, jnp.expand_dims(m, axis)) * stacked.total
-    total = jnp.sum(weights, axis=axis)
-    shares = weights * jnp.expand_dims(1.0 / jnp.where(total > 0, total, 1.0), axis)
+    # Each weight over the largest, so their sum is at most the states' count whatever the masses.
+    largest = jnp.max(weights, axis=axis)
+    weights = weights / jnp.expand_dims(jnp.where(largest > 0, largest, 1.0), axis)
+    summed = jnp.sum(weights, axis=axis)
+    shares = weights * jnp.expand_dims(1.0 / jnp.where(summed > 0, summed, 1.0), axis)
     out = jnp.sum(expand(shares, stacked.acc) * stacked.acc, axis=axis)
-    return Partial(out, m, total)
+    return Partial(out, m, largest * summed)
 
 
 def rewalks(spec: Forward, maxima: jax.Array, over: jax.Array) -> tuple[jax.Array, Forward]:
