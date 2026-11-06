@@ -72,6 +72,13 @@ Scope is per rule, because the rules are not all about the same thing:
   launch point's (`nn/kernels/launches.py`), which holds each launch to the
   per-shard boundary (`sharding.per_shard`), so no route launches a kernel over
   operands an automatic mesh axis splits (rows 1897, 1923, 4077).
+- SLOP028 is about `src/<package>`: every custom derivative (`DERIVATIVE_MAKERS`:
+  JAX's custom_jvp and custom_vjp, Dew's declaring functions and linear_tangent)
+  declares at its seam the contract that holds it, `contracted(test)` of
+  `dew.nn.derivatives`, decorating it or wrapping its making call: `test` the
+  name of exactly one test function of tests/test_contracts_*.py
+  (`assert_contract`: every order finite against its float64 truth and an
+  independent plain formula) (row 4411; `lint_derivatives`).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -119,6 +126,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lint_derivatives as derivative_rules
 import lint_promotions as promotion_rules
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
@@ -2305,8 +2313,16 @@ def tolerances(module: Module) -> Iterator[Finding]:
                       f"{what} compares floats within a tolerance ({why}); {gate}")
 
 
+def derivative_contracts(module: Module) -> Iterator[Finding]:
+    """SLOP028: every custom derivative of `module` declares the contract that holds it
+    (`derivative_rules.missing`)."""
+    checkout = module.path.parents[len(Path(module.relative).parts) - 1]
+    for line, col, message in derivative_rules.missing(module.relative, module.tree, checkout):
+        yield Finding(module.relative, line, col, "SLOP028", message)
+
+
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches)
+                  pallas_launches, derivative_contracts)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 

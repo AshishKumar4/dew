@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import optax
 from jax.custom_derivatives import SymbolicZero
 
-from dew.nn.derivatives import Protected, declared_tangent
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.precision import at_least_fp32
 
 __all__ = ["brier", "cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative",
@@ -71,7 +71,8 @@ def _probabilities_tangent(primals, tangents):
     return probability, jnp.where(top, -rest, tangent)
 
 
-_probabilities = declared_tangent(Protected(), _softmax, _probabilities_tangent)
+_probabilities = contracted("test_the_categorical_losses_hold_every_order")(
+    declared_tangent(Protected(), _softmax, _probabilities_tangent))
 
 
 def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -140,7 +141,8 @@ def _label_terms_tangent(primals, tangents):
                                      jnp.sum(probability * tangents[0], axis=-1))
 
 
-label_terms = declared_tangent(Protected(), _label_terms, _label_terms_tangent)
+label_terms = contracted("test_the_label_terms_hold_every_order")(
+    declared_tangent(Protected(), _label_terms, _label_terms_tangent))
 
 
 def label_entry(share: jax.Array, others: jax.Array) -> jax.Array:
@@ -208,7 +210,8 @@ def _soft_loss_tangent(primals, tangents):
     return value, tangent + jnp.sum(derivative * d_logits, axis=-1)
 
 
-_soft_loss = declared_tangent(Protected(), _soft_value, _soft_loss_tangent, symbolic_zeros=True)
+_soft_loss = contracted("test_the_categorical_losses_hold_every_order")(
+    declared_tangent(Protected(), _soft_value, _soft_loss_tangent, symbolic_zeros=True))
 
 
 def kl_divergence(logits: jax.Array, reference: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -249,7 +252,8 @@ def _divergence_tangent(primals, tangents):
     return value, tangent + jnp.sum(_divergence_derivative(logits, reference) * d_logits, axis=-1)
 
 
-_divergence = declared_tangent(Protected(), _divergence_value, _divergence_tangent, symbolic_zeros=True)
+_divergence = contracted("test_the_categorical_losses_hold_every_order")(
+    declared_tangent(Protected(), _divergence_value, _divergence_tangent, symbolic_zeros=True))
 
 
 def _divergence_derivative(logits: jax.Array, reference: jax.Array) -> jax.Array:

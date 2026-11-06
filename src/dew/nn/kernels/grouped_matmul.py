@@ -43,7 +43,7 @@ from jax._src.pallas.mosaic_gpu import (
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 
-from ..derivatives import Protected, declared_tangent, marked_call_p
+from ..derivatives import Protected, contracted, declared_tangent, marked_call_p
 from ..precision import at_least_fp32, rounded_operand
 from ..programs import equations
 from . import generation, selection, tuning
@@ -1795,7 +1795,8 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     return output, tangent
 
 
-portable_projection = declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
-                                       nondiff_argnums=(3, 4, 5), symbolic_zeros=True)
+portable_projection = contracted("test_a_portable_grouped_projection_holds_every_order")(
+    declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
+                     nondiff_argnums=(3, 4, 5), symbolic_zeros=True))
 
 

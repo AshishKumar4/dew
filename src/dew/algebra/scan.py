@@ -46,6 +46,7 @@ from jax.extend import core as jcore
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
+from dew.nn.derivatives import contracted
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum, vanishing
 
 Axes = tuple[str, ...]
@@ -569,7 +570,8 @@ def _lowered_rule() -> Callable:
         back = _applied(lower.T, d_lower)
         return (_below(-_applied(lower, back.T).T),)
 
-    return generation.linear_tangent(forward, backward, _doubled)
+    return contracted("test_the_derived_delta_rule_chunks_hold_their_orders")(
+        generation.linear_tangent(forward, backward, _doubled))
 
 
 def _compensated(values, *, reverse: bool = False, restarts=None) -> tuple[jax.Array, jax.Array]:
@@ -673,7 +675,8 @@ def _decays_rule(base2: bool) -> Callable:
         del operands
         return _decays_backward(base2, decays, cotangents)
 
-    return generation.linear_tangent(forward, backward, functools.partial(_decays_value, base2=base2))
+    return contracted("test_the_derived_delta_rule_chunks_hold_their_orders")(
+        generation.linear_tangent(forward, backward, functools.partial(_decays_value, base2=base2)))
 
 
 def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
