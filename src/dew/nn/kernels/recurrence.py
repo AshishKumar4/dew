@@ -485,8 +485,8 @@ def _launched(hooks: Hooks, operands: Step, *, dtype):
     rows, _ = grouped_heads((batch, 1, heads, width), 1)
     names = [field.name for field in dataclasses.fields(Step) if getattr(operands, field.name) is not None]
     P = jax.sharding.PartitionSpec
-    specs = [P(rows) if field.metadata.get('rows') else P() for field in dataclasses.fields(Step)
-             if field.name in names]
+    specs = tuple(P(rows) if field.metadata.get('rows') else P() for field in dataclasses.fields(Step)
+                  if field.name in names)
 
     def local(*arrays):
         return launch(dataclasses.replace(operands, **dict(zip(names, arrays, strict=True))))

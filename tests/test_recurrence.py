@@ -323,8 +323,8 @@ def test_a_step_reads_its_updated_state(delta):
 
 @pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
 def test_a_decode_tokens_launch_runs_per_shard_moving_nothing(local):
-    """A gated delta rule's decode token (`recurrence.step`, the template's step) over four rows split over two
-    compile-only H100s and compiled for them: run per shard (`manual_map`), its program launches the step
+    """A gated delta rule's decode token (`recurrence.step`, the template's step) over four rows split over
+    two compile-only H100s and compiled for them: run per shard (`manual_map`), its program launches the step
     once, each call reading its shard's two rows of the state, and moves nothing (`kernel_compile.Expected`,
     its route evidence). Left to the partitioner (the launch called on the whole batch), the same evidence
     refuses the program: its operands gathered to every device."""
