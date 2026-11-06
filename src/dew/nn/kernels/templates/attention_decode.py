@@ -81,16 +81,18 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
            ) -> tuple[jax.Array, KeySpans, Initial | None]:
     """`query` `[B, T, H, D]` as `[B, T·G, KV, D]` over its `kv_heads` key heads (`grouped_rows`), and `spans`
     `[B, T]` and `initial` `[B, H, T]` alike: each packed row sees its query's keys and starts from its head's
-    state; `ungrouped_rows` takes an output back."""
+    state; `ungrouped_rows` takes an output back. A position's interval holds its G rows
+    (`KeySpans.per_span`), read by position in the program; a call of several runs or documents an interval
+    a row."""
     batch, positions, heads, _ = query.shape
     group = heads // kv_heads
     rows = grouped_rows(query, kv_heads)
-
-    def repeated(x):
-        return None if x is None else jnp.repeat(x, group, axis=1)
-
-    spans = KeySpans(jnp.repeat(spans.start, group, axis=1), jnp.repeat(spans.end, group, axis=1),
-                     repeated(spans.query_ids), spans.key_ids, spans.keys, "spans")
+    if spans.query_ids is None and spans.start.ndim == 2:
+        spans = KeySpans(spans.start, spans.end, None, spans.key_ids, spans.keys, "spans", group)
+    else:
+        spans = KeySpans(*(None if x is None else jnp.repeat(x, group, axis=1)
+                           for x in (spans.start, spans.end, spans.query_ids)),
+                         spans.key_ids, spans.keys, "spans")
     if initial is not None:
         def heads_rows(x):
             # [B, H, T, ...] as [B, KV, T·G, ...].

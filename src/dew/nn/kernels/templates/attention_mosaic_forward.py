@@ -57,9 +57,9 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Hooked,
     _hooked_of,
     _param,
+    _per_span,
     _products,
     _Program,
-    _query_bounds,
     _Spans,
     _spans_of,
     _streamed,
@@ -548,7 +548,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
                            initial=hooks.initial is not None,
-                           queries=call.queries if call.query.shape[1] > call.queries else None,
+                           queries=(call.queries if call.query.shape[1] > call.queries or call.per_span > 1
+                                    else None),
                            prescale=power / taken, subtracted=subtracted)
     unit = family.column_unit(query.dtype)
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
@@ -764,7 +765,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                                    training=residuals is not None)
     pl.when(consumer == 1)(turn)
     # The queries' intervals and ids read once, before the walk (`_query_bounds`).
-    held = None if spans is None else _query_bounds(family, spans, row, first, tiles.block_q)
+    held = None if spans is None else program.bounds(first, spans, row)
 
     def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
@@ -1084,7 +1085,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
     pl.when(consumer == 1)(turn)
-    held = None if spans is None else _query_bounds(family, spans, place[0], first, tiles.block_q)
+    held = None if spans is None else program.bounds(first, spans, place[0])
 
     def step(index, slots, arg, accumulators):
         # The peak walk's logits draw no dropout.
@@ -1247,7 +1248,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     steps = keys_count // block_k
     # No more stages than key tiles: a slot past them would load past the keys.
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
-                       spec.queries, splits)
+                       spec.queries, splits, _per_span(spec, read.spans))
     # The output stores through the query's stage where the two are as wide (its rows are read before the
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
