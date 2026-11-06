@@ -654,12 +654,17 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
     scale = k.shape[-1] ** -0.5 if delta else 1.0
+    # Without the delta rule a 16-bit call's keys take the write gate under the fast forms
+    # (`mainloop.Call.gated_keys`), its values held as given; the accurate forms' hold them in parts, which
+    # the witness's lanes do not.
+    rounded = not delta and recurrence_chunk.fast_rounding()
+    assert delta or (rounded and jnp.dtype(dtype).itemsize == 2), \
+        "the witness holds a call without the delta rule where its keys take the write gate"
 
     def route(*x):
         if not delta:
             return recurrence_chunk.template_rule(*x, starts, max_segments=max_segments, scale=scale,
-                                                  delta=False, wide=False,
-                                                  rounded=recurrence_chunk.fast_rounding())
+                                                  delta=False, wide=False, rounded=rounded)
         # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
         return recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts, max_segments=max_segments,
                                                        floor=floor, write_bound=1.0)
@@ -674,7 +679,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         def kept(*x, starts=starts):
             return jax.jit(lambda *x: mainloop.kept_forward(
                 *x, tiles=tiles, starts=starts, max_segments=max_segments, floor=floor, scale=scale,
-                delta=delta, rounded=not delta and recurrence_chunk.fast_rounding(),
+                delta=delta, rounded=rounded,
                 family=mainloop.family_of(dtype) or bundles.INTERPRETED,
                 interpret=generation.backend() != "gpu"))(*x)
 
