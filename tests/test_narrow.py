@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from layout_parity import LAYOUT_SEEDS, layouts_agree
+from layout_parity import layouts_agree
 
 from dew.checkpoints import _filled
 from dew.nn.kernels.generation import chosen
@@ -209,7 +209,7 @@ def _copies_of(narrow):
     return paths
 
 
-@pytest.mark.check1_shards(seeds=LAYOUT_SEEDS, per_task=2)
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 @pytest.mark.parametrize("fsdp", [1, pytest.param(2, marks=pytest.mark.mesh(devices=2)),
                                   pytest.param(8, marks=pytest.mark.mesh(devices=8))])
 def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradients(fsdp):
@@ -232,7 +232,7 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     assert names and all(name.endswith("kernel") and "proj" in name for name in names), names
 
 
-@pytest.mark.check1_shards(seeds=LAYOUT_SEEDS, per_task=2)
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_same_gradients():
     """A decoder that scans its layers over their stacked weights reads each layer's projection
     kernels through bf16 copies, stacked as the scan reads them, as an unscanned decoder does: under
@@ -246,7 +246,7 @@ def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_sa
     assert {f"layers_{index}" for index in range(4)} <= layers, names
 
 
-@pytest.mark.check1_shards(seeds=LAYOUT_SEEDS, per_task=2)
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 @pytest.mark.parametrize(("accumulation", "split", "mixture", "fsdp"), [
     (2, 1, False, 1), (1, 2, True, 1),
     pytest.param(2, 1, True, 2, marks=pytest.mark.mesh(devices=2)),
@@ -278,7 +278,7 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     assert _copies_of(narrow)
 
 
-@pytest.mark.check1_shards(seeds=LAYOUT_SEEDS, per_task=2)
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 def test_a_dex_decoder_through_its_copies_trains_as_it_does_without_them():
     """A decoder whose differential lambda anneals over the run's updates reads, in training, a float32
     lambda the anneal computes on before its cast to bfloat16, which outside training (no updates) it

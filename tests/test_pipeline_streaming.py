@@ -63,16 +63,18 @@ def assert_same_bits(found, expected) -> None:
 
 
 @pytest.mark.parametrize("family", ["flux", "z_image", "wan"])
-def test_a_streamed_pipeline_samples_what_the_eager_one_does(extracted, family):
-    """The conditioner and the autoencoder hold the placed leaves, so a
-    prompt runs end to end on them."""
-    eager = Pretrained.load(str(extracted[family]), dtype="float32", attention_impl="xla")
+def test_a_streamed_pipeline_keeps_its_towers_placed_as_it_samples(extracted, family):
+    """A pipeline loaded onto a mesh samples a prompt end to end on its placed leaves: the conditioner's,
+    the denoiser's and the autoencoder's each keep the sharding it was placed with through the run. The
+    streamed and eager paths share one sampling code, so their wiring cannot differ; their numerics are
+    the per-component checks' (the conditioner by check 1, `assert_encoded_as_the_task`; the walk one
+    program, `test_on_a_mesh_an_encoded_call_is_the_prompted_call`; the streamed export bit for bit)."""
     streamed = Pretrained.load(str(extracted[family]), dtype="float32", attention_impl="xla", mesh=MeshSpec())
-
-    def sampled(source):
-        return np.asarray(source.text_to_image()(["a red bird"], steps=2, key=3).host().images)
-
-    np.testing.assert_array_equal(sampled(streamed), sampled(eager))
+    placed = {path: leaf.sharding for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables)}
+    assert placed
+    jax.block_until_ready(streamed.text_to_image()(["a red bird"], steps=2, key=3).images)
+    for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables):
+        assert leaf.sharding == placed[path], jax.tree_util.keystr(path)
 
 
 ENCODED = {"z_image": "HiddenStatesConditioner", "wan": "WanConditioner"}
