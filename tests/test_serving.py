@@ -960,9 +960,9 @@ def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
     and their repeats read each back with its own prefix (ledger 4602's review), each request drawing
     what it draws alone and scoring it as a full forward does (check 1)."""
     model = thin_hybrid_model(256)
-    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
-    task = TextGeneration(model, params, RunProcessor(Digits()),
-                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+    # It draws greedily to its budget alone, no end token, as the check scores every draw.
+    task = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
+                          sampling=Sampling(temperature=0, pad_token_id=0))
     requests = (Served(9), Served(9, flipped=(0,)), Served(9, flipped=(0, 1)), Served(9, flipped=(0, 2)),
                 Served(9, flipped=(0, 1)), Served(9, flipped=(0,)))
     serving = {**HYBRID_SHARED, "slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8),
