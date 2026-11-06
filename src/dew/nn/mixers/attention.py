@@ -207,6 +207,8 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
         raise ValueError("attention_key_positions must be [B, keys]")
     if valid is not None and (jnp.shape(valid) != (batch, keys) or jnp.asarray(valid).dtype != jnp.bool_):
         raise ValueError("attention_key_valid must be boolean [B, keys]")
+    # A cached call's queries are not its keys: they are read at their rotary positions.
+    query_places = jnp.broadcast_to(jnp.asarray(rotary_positions), (batch, queries)) if cached else None
     if metadata.pairwise_mask is not None:
         pairwise = jnp.asarray(metadata.pairwise_mask)
         if pairwise.shape != (batch, queries, keys) or pairwise.dtype != jnp.bool_:
@@ -216,14 +218,13 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
             query_positions = jnp.broadcast_to(jnp.asarray(rotary_positions), (batch, queries))
             mask = mask & windowed(query_positions[:, :, None], key_positions[:, None, :], sliding_window,
                                    causal=False)[:, None]
-        return CallVisibility(mask, None, None, key_places if key_positions is None else key_positions)
+        return CallVisibility(mask, None, None, key_places if key_positions is None else key_positions,
+                              query_places)
     runs = jnp.asarray(metadata.key_runs)
     if runs.ndim != 4 or runs.shape[:2] != (batch, queries) or runs.shape[-1] != 2:
         raise ValueError("attention_key_runs must be [B, queries, R, 2]")
     window = None if key_positions is None else sliding_window
     key_places = key_places if key_positions is None else key_positions
-    # A cached call's queries are not its keys: they are read at their rotary positions.
-    query_places = jnp.broadcast_to(jnp.asarray(rotary_positions), (batch, queries)) if cached else None
     return CallVisibility(None, runs, window, key_places, query_places, valid)
 
 
@@ -232,12 +233,13 @@ def dense_visibility(mask, documents, causal: bool, window: int | None, valid, r
                      image_groups=None) -> jax.Array:
     """The `[B, 1, queries, keys]` mask of a call's visibility as a kernel reads it: `mask` with its
     documents, causality, window, block and image groups, key validity `valid` and key runs folded in
-    (`visibility_mask`, the window counting real tokens where validity is given, or the runs' key places),
+    (`visibility_mask`, the window counting real tokens where validity is given, or a runs call's from its
+    queries' `places` over its keys'),
     joined with the layer's chunks of `chunk` places, each query and key in the chunk of its counted place
     (`places`, `key_places`), never its cache slot."""
+    counted = (places, key_places) if runs is not None else None if valid is None else places
     seen = visibility_mask(queries, keys, causal, window, mask, documents, block_groups=block_groups,
-                           image_groups=image_groups, key_valid=valid, key_runs=runs,
-                           places=(key_places if runs is not None else None if valid is None else places))
+                           image_groups=image_groups, key_valid=valid, key_runs=runs, places=counted)
     return seen if chunk is None else seen & chunk_mask(places, key_places, chunk)
 
 
@@ -1224,10 +1226,10 @@ class CausalSelfAttention(nn.Module):
                                                key_places, implementation, masked, decode)
         if own is not None:
             mask, runs, window, key_places, query_places, valid = own
-            causal, documents, groups = False, None, _Groups()
+            causal, documents, groups, places = False, None, _Groups(), (
+                key_places if query_places is None else query_places)
         if self.ctx.attention_chunk is not None:
-            counted = places if query_places is None else query_places
-            mask = self._chunked(mask, documents, causal, window, valid, runs, groups, counted, key_places, S,
+            mask = self._chunked(mask, documents, causal, window, valid, runs, groups, places, key_places, S,
                                  key.shape[-3])
             causal, window, documents, groups, valid, runs = False, None, None, _Groups(), None, None
             implementation = masked()
