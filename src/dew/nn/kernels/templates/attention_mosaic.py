@@ -435,8 +435,9 @@ class MosaicForward(_Mainloop[Tiles]):
         """`config` for a call whose walk the device's memory bounds (`streams`), its key tile the least its
         ring still streams at: a program pays its ring's first `stages` tiles before its first product, and
         a launch of more programs than the device runs at once pays it a program, so the least tile pays
-        least, where its `stages` slots hold the bytes a program's share of the device's stream keeps in
-        flight (`GpuTarget.memory_rate` over its multiprocessors, for the part's measured `Measured.fixed`):
+        least, where its resident programs' `stages` slots hold the bytes a multiprocessor's share of the
+        device's stream keeps in flight (`GpuTarget.memory_rate` over its multiprocessors, for the part's
+        measured `Measured.fixed`):
         a decode step of 128 rows over 4096 keys took 0.70 ms at 64-key tiles against 0.73 at 128 on an
         H100, and of 32 over 32768 1.35 against 1.38, its 128-wide K and V 32 KB a stage, two of them past
         the 45 KB a program keeps in flight (ET-STAGES2-h100).
@@ -452,11 +453,16 @@ class MosaicForward(_Mainloop[Tiles]):
         in_flight = rate / target.multiprocessors * fixed
         # Its key tiles dividing the call's keys alone: a tile past them pads the whole cache, its keys and
         # values copied a step (`padded_call`; a 96-key tile over 32768, 383 us a step on an A100,
-        # M-DD-5 W16, as long as its launch).
+        # M-DD-5 W16, as long as its launch). A multiprocessor's bytes in flight are its resident programs'
+        # together (`resident`): a larger tile holding fewer of them keeps no more in flight (an A100's
+        # 16-row d64 decode at 256-key tiles staged 146 KB, one program a multiprocessor, 1.17x the hand
+        # kernel's five resident programs of 20 KB, M-DD-7 W34).
         for extent in reversed(walked_extents(family, query.dtype, config.block_k)):
             candidate = dataclasses.replace(config, block_k=extent)
-            if (self.keys % extent == 0 and config.stages * extent * per_key >= in_flight
-                    and self._launch_legal(ba, candidate, target)):
+            if not (self.keys % extent == 0 and self._launch_legal(ba, candidate, target)):
+                continue
+            held = self.resident(ba, candidate, target)
+            if held * config.stages * extent * per_key >= in_flight:
                 return self._relaunched(ba, candidate, target) or config
         return config
 
