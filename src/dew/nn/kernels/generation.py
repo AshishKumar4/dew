@@ -814,8 +814,11 @@ def tpu(target: GpuTarget) -> bool:
 
 
 def shared_budget(target: GpuTarget) -> int:
-    """The shared memory, in bytes, a program on `target` may stage: the block's own, which a real
-    device reports (`runtime_facts`), else `SHARED_BUDGET`."""
+    """The scratch memory, in bytes, a program on `target` may stage: a GPU block's shared memory, which a
+    real device reports (`runtime_facts`), else `SHARED_BUDGET`; a TPU core's scoped VMEM
+    (`Architecture.scoped_vmem`), where it is known."""
+    if tpu(target) and target.scoped_vmem is not None:
+        return target.scoped_vmem
     return target.shared_limit or SHARED_BUDGET
 
 

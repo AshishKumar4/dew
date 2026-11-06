@@ -21,7 +21,7 @@ from attention_oracle import attention_terms, kept
 from gpu_flow import cell
 from kernel_matrix import AXES
 from reference_error import assert_as_exact
-from test_attention_mosaic import FED, _residuals
+from test_attention_mosaic import FED, WGMMA, _residuals
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
@@ -139,7 +139,8 @@ def _route(call: tuple[tuple[str, str], ...]):
         op, ba, target = _backward_op(case)
         if op.declined(ba, target) is not None:
             return True, None, None
-        two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1, **FED)
+        two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1,
+                                             family=WGMMA, **FED)
         return False, op.derived(ba, target), two if op.legal(ba, two, target) else None
 
 
@@ -222,23 +223,25 @@ def _drawn(case: dict[str, str]):
 CASES = (
     ('sm90', '256', 'gqa-8-4', 'causal', 'plain', 'two', 'float32', 'fast'),
     ('sm80', '64', 'mha', 'full', 'key-bias', 'two', 'bfloat16', 'accurate'),
-    ('sm90', '128', 'gqa-8-2', 'documents', 'tile-bias', 'two', 'float16', 'accurate'),
-    ('sm90', '64', 'mha', 'documents', 'plain', 'one', 'bfloat16', 'fast'),
-    ('sm80', '128', 'gqa-8-2', 'full', 'softcap', 'two', 'float32', 'fast'),
-    ('sm80', '64', 'gqa-8-4', 'causal', 'softcap', 'two', 'float16', 'accurate'),
-    ('sm90', '256', 'gqa-8-2', 'full', 'plain', 'shared-keys', 'bfloat16', 'fast'),
-    ('sm80', '256', 'mha', 'documents', 'tile-bias', 'two', 'float32', 'accurate'),
-    ('sm90', '128', 'mha', 'causal', 'key-bias', 'two', 'float16', 'fast'),
-    ('sm90', '128', 'gqa-8-4', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
-    ('sm90', '64', 'gqa-8-2', 'causal', 'tile-bias', 'two', 'bfloat16', 'fast'),
-    ('sm80', '256', 'gqa-8-4', 'full', 'plain', 'two', 'float16', 'accurate'),
-    ('sm90', '64', 'gqa-8-4', 'documents', 'key-bias', 'two', 'float32', 'fast'),
-    ('sm90', '256', 'mha', 'documents', 'softcap', 'two', 'bfloat16', 'fast'),
-    ('sm90', '64', 'gqa-8-2', 'full', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm90', '128', 'gqa-8-2', 'documents', 'softcap', 'shared-keys', 'bfloat16', 'fast'),
+    ('sm80', '128', 'gqa-8-2', 'causal', 'tile-bias', 'two', 'float16', 'accurate'),
+    ('sm80', '64', 'gqa-8-4', 'documents', 'softcap', 'two', 'float32', 'accurate'),
+    ('sm90', '64', 'mha', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm90', '128', 'gqa-8-4', 'full', 'key-bias', 'two', 'float16', 'fast'),
+    ('sm90', '256', 'mha', 'documents', 'tile-bias', 'two', 'float16', 'accurate'),
+    ('sm80', '256', 'gqa-8-2', 'full', 'plain', 'two', 'float32', 'fast'),
     ('sm90', '64', 'gqa-8-4', 'full', 'tile-bias', 'two', 'bfloat16', 'fast'),
+    ('sm90', '128', 'mha', 'documents', 'plain', 'two', 'float32', 'accurate'),
+    ('sm90', '64', 'gqa-8-2', 'full', 'softcap', 'one', 'bfloat16', 'fast'),
     ('sm90', '256', 'mha', 'causal', 'plain', 'shared-keys', 'bfloat16', 'fast'),
-    ('sm90', '256', 'gqa-8-2', 'causal', 'key-bias', 'two', 'bfloat16', 'fast'),
-    ('sm90', '256', 'gqa-8-4', 'documents', 'plain', 'shared-keys', 'bfloat16', 'fast'),
+    ('sm90', '64', 'mha', 'causal', 'softcap', 'two', 'float16', 'fast'),
+    ('sm90', '256', 'gqa-8-2', 'causal', 'key-bias', 'two', 'float32', 'fast'),
+    ('sm90', '128', 'gqa-8-4', 'documents', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm90', '128', 'gqa-8-4', 'full', 'softcap', 'shared-keys', 'bfloat16', 'fast'),
+    ('sm90', '64', 'mha', 'causal', 'plain', 'two', 'float16', 'fast'),
+    ('sm90', '64', 'mha', 'causal', 'tile-bias', 'two', 'float32', 'fast'),
+    ('sm90', '64', 'mha', 'documents', 'key-bias', 'two', 'bfloat16', 'fast'),
+    ('sm90', '256', 'mha', 'causal', 'softcap', 'two', 'bfloat16', 'fast'),
 )
 """The cells' cases, each its axis values in `AXES`' order: the cases ledger rows name and every pair of axis
 values the route serves (`kernel_matrix.covering("attention")`, regenerated where the axes or the route's

@@ -116,18 +116,25 @@ def _jax_own() -> Mapping[jcore.Primitive, str]:
     """JAX's own operations by their objects: every primitive `jax.lax`, `jax.lax.linalg` and
     `jax.extend.core.primitives` export (the random operations' `random_seed`, `random_split`,
     `random_fold_in`, `random_bits` and `random_gamma` among them, and the sum JAX's derivatives add with,
-    `add_any`), and the three its public random functions bind that no module of JAX's exports
-    (`random_wrap`, `random_unwrap`, `random_clone`), read off a trace of them once asked."""
+    `add_any`), and the four its public functions bind that no module of JAX's exports (`random_wrap`,
+    `random_unwrap`, `random_clone`, and `lax.ragged_dot`'s `ragged_dot_general`), read off a trace of them
+    once asked."""
     def keyed(seed_words):
         # A key of its own implementation, whichever the process's default is (`jax_default_prng_impl`).
         key = jax.random.wrap_key_data(seed_words, impl="threefry2x32")
         return jax.random.key_data(jax.random.clone(key))
 
-    traced = jax.make_jaxpr(keyed)(jax.ShapeDtypeStruct((2,), jax.numpy.uint32)).jaxpr
+    def ragged(rows, matrices, sizes):
+        return jax.lax.ragged_dot(rows, matrices, sizes)
+
+    traced = [*jax.make_jaxpr(keyed)(jax.ShapeDtypeStruct((2,), jax.numpy.uint32)).jaxpr.eqns,
+              *jax.make_jaxpr(ragged)(jax.ShapeDtypeStruct((1, 1), jax.numpy.float32),
+                                      jax.ShapeDtypeStruct((1, 1, 1), jax.numpy.float32),
+                                      jax.ShapeDtypeStruct((1,), jax.numpy.int32)).jaxpr.eqns]
     exported = (primitive for module in (jax.lax, jax.lax.linalg, jcore.primitives)
                 for primitive in vars(module).values() if isinstance(primitive, jcore.Primitive))
     return {primitive: primitive.name
-            for primitive in (*exported, *(equation.primitive for equation in traced.eqns), ad.add_jaxvals_p)}
+            for primitive in (*exported, *(equation.primitive for equation in traced), ad.add_jaxvals_p)}
 
 
 def jax_name(primitive) -> str | None:

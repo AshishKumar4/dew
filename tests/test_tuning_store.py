@@ -405,7 +405,7 @@ def test_a_retained_score_hook_keys_each_run_precisions_program(forms):
             assert held == direct
             programs.append(held)
             identities.append(report._identity(op, bound))
-            with report.launching(op, bound, Tiles(16, 16, 2, 1)):
+            with report.launching(op, bound, Tiles(16, 16, 2, 1, family="wgmma")):
                 names.append(report.named("attention"))
             value = contextual(jnp.ones((1, 1)), None, None)
             expected = np.full((1, 1), 2.0 if form == "accurate" else 3.0)
