@@ -17,15 +17,18 @@ never a test whose id one of them begins, as pytest's --deselect, which matches 
 `..._over_a_scaled_window`)."""
 
 
-def pytest_collection_modifyitems(config, items) -> None:
+def pytest_collection_finish(session) -> None:
     """The items whose node ids SET_ASIDE names taken out of the session, said deselected as pytest says its
-    own, which executed.py counts. This module imports no pytest: ci.py, which a planner with none runs,
-    reads PROGRESS and SET_ASIDE from it."""
+    own, which executed.py counts: once collection is finished, so after every selection, split.py's cut of a
+    group among them, which cuts its file's every test as each group's container does (train 674's review: set
+    aside before the cut, a resumed group cut the rest anew, running another group's tests and none of some).
+    This module imports no pytest: ci.py, which a planner with none runs, reads PROGRESS and SET_ASIDE from
+    it."""
     named = os.environ.get(SET_ASIDE)
     aside = set(json.loads(Path(named).read_text())) if named else set()
-    if dropped := [item for item in items if item.nodeid in aside]:
-        items[:] = [item for item in items if item.nodeid not in aside]
-        config.hook.pytest_deselected(items=dropped)
+    if dropped := [item for item in session.items if item.nodeid in aside]:
+        session.items[:] = [item for item in session.items if item.nodeid not in aside]
+        session.config.hook.pytest_deselected(items=dropped)
 
 
 _called: dict[str, float] = {}
