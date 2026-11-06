@@ -32,7 +32,8 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         Solver,
         UniPC,
     )
-    from dew.sampling.strategies import Beam, Sample, Speculative, Strategy
+    from dew.sampling.strategies import Beam, Sample, Speculative, Strategy, TreeSpeculative
+    from dew.sampling.trees import TreeShape
     from dew.sampling.text import Generation, Sampling, generate, with_ids_of
     from dew.sampling.walks import sample
 
@@ -72,6 +73,8 @@ _EXPORTS = {
     "Sample": "dew.sampling.strategies",
     "Speculative": "dew.sampling.strategies",
     "Strategy": "dew.sampling.strategies",
+    "TreeSpeculative": "dew.sampling.strategies",
+    "TreeShape": "dew.sampling.trees",
     "Generation": "dew.sampling.text",
     "Sampling": "dew.sampling.text",
     "generate": "dew.sampling.text",
@@ -118,6 +121,8 @@ __all__ = [
     "StepState",
     "Stopping",
     "Strategy",
+    "TreeShape",
+    "TreeSpeculative",
     "UniPC",
     "generate",
     "sample",
