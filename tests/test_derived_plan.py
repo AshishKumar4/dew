@@ -196,10 +196,30 @@ def test_a_compile_that_fits_past_the_derivations_corrected_refusal_lets_its_ref
     mib = 2**20
     for split, headroom in ((1, 0), (2, 50 * mib), (4, 100 * mib), (8, 150 * mib)):
         search.judged_at[search.candidate_key(split, narrow=False)] = headroom
-    search.learned(0, -200 * mib, fit=False)
+    search.learned(0, -200 * mib, fit=False, split=1, temporaries=None)
     assert search.refused(2) and search.refused(4)
-    search.learned(150 * mib, 100 * mib, fit=True)
+    search.learned(150 * mib, 100 * mib, fit=True, split=8, temporaries=None)
     assert not search.refused(2) and not search.refused(4)
+
+
+def test_a_miss_corrects_each_split_by_its_share_of_the_derived_temporaries():
+    """A compile's miss corrects the derivation at the other splits in proportion to their derived
+    temporaries (`FitSearch.shortfall`): a step of one microbatch derived at 1.2 MB of temporaries and
+    compiled 0.96 MB short corrects two microbatches derived at 0.6 MB by 0.48 MB, so one judged 0.95 MB to
+    spare is asked, where a shortfall taken whole refused it and the search compiled four (test_plan's
+    recorded run on a CPU, review of row 4089)."""
+    from dew.training.footprint import Footprint
+
+    search = bare_search(deep(split=None).objective)
+    kb = 1000
+    for split, headroom, temporaries in ((1, 357 * kb, 1229 * kb), (2, 953 * kb, 615 * kb),
+                                         (4, 1258 * kb, 307 * kb)):
+        key = search.candidate_key(split, narrow=False)
+        search.judged_at[key] = headroom
+        search.footprints[key] = Footprint(residuals=0, gradients=0, held=0, peak=temporaries)
+    search.learned(357 * kb, -606 * kb, fit=False, split=1, temporaries=1229 * kb)
+    assert not search.refused(2) and search.likely(2)
+    assert search.shortfall(2) == 963 * kb * 615 // 1229
 
 
 def test_a_split_the_derivation_refuses_is_still_asked_at_its_half_rung():
