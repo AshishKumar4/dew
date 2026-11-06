@@ -543,7 +543,8 @@ class Adapter:
         A pipeline source, whose weights are named under several components, gets the
         Diffusers file with each component's PEFT config in its header.
         """
-        variables = thaw(stored_layers(self.model, variables))
+        # Its factors by their layers' names, a banked store's rows read home as they are written.
+        variables = thaw(stored_layers(self.model, variables, banks=True))
         components = _components(self.layouts)
         names = {layout.paths[0][:-1]: name for name, layout in self.layouts.items()
                  if layout.paths[0][-1] == "kernel"}
