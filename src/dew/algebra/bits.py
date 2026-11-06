@@ -561,3 +561,74 @@ def _restored(decoded: jax.Array) -> jax.Array:
     mantissa = (bits & 0x7F).astype(jnp.float32) * np.float32(2.0 ** -7)
     subnormal = jnp.where(bits & 0x8000 != 0, -mantissa, mantissa)
     return jnp.where(bits & 0x7F80 == 0, subnormal, raised.astype(jnp.float32))
+
+
+class Minifloat(NamedTuple):
+    """A narrow float an encode rounds fp32 to (`encoded`): its exponent and mantissa bits, its bias, its
+    largest finite code (the saturated one) and the code a NaN takes (None where it has none: e2m1, whose
+    NaN saturates as the largest's)."""
+
+    exponent: int
+    mantissa: int
+    bias: int
+    largest: int
+    nan: int | None
+
+    @property
+    def width(self) -> int:
+        return 1 + self.exponent + self.mantissa
+
+    @property
+    def largest_float32(self) -> int:
+        """The largest finite code's value as fp32 bits: what a value past it saturates to."""
+        exponent, fraction = self.largest >> self.mantissa, self.largest & ((1 << self.mantissa) - 1)
+        return (exponent - self.bias + 127) << 23 | fraction << (23 - self.mantissa)
+
+
+E4M3 = Minifloat(exponent=4, mantissa=3, bias=7, largest=0x7E, nan=0x7F)
+"""FP8 e4m3fn: no infinity, its largest finite 448 (0x7E), NaN 0x7F."""
+
+E5M2 = Minifloat(exponent=5, mantissa=2, bias=15, largest=0x7B, nan=0x7F)
+"""FP8 e5m2: its largest finite 57344 (0x7B), NaN 0x7F as the saturating cvt keeps it."""
+
+E2M1 = Minifloat(exponent=2, mantissa=1, bias=1, largest=0x7, nan=None)
+"""FP4 e2m1 (NVFP4's code): its largest 6 (0x7), no NaN."""
+
+
+def encoded[Words: (np.ndarray, jax.Array)](x: Words, minifloat: Minifloat, xp=jnp) -> Words:
+    """fp32 `x` (as uint32 bits) rounded to `minifloat`'s codes, uint32 a code: to nearest, ties to even,
+    saturating finite (an infinity, or a value past the largest, as the largest), a NaN as its NaN code
+    (the largest's where it has none), as `cvt.rn.satfinite` gives it where a family has the instruction.
+    Integer arithmetic alone (a family without the cvt, sm80's and sm86's, issues it so): the magnitude
+    clipped to the largest as an unsigned minimum, then one rounding shift of the fp32 exponent and fraction
+    for a normal result, of the significand with its implicit bit past the subnormal's place otherwise, its
+    carry into the exponent the rounding's own."""
+    word = xp.uint32
+    sign = x >> word(31)
+    magnitude = xp.minimum(x & word(0x7FFFFFFF), word(minifloat.largest_float32))
+    nan = (x & word(0x7FFFFFFF)) > word(0x7F800000)
+    biased = (magnitude >> word(23)).astype(xp.int32)
+    exponent = biased - (127 - minifloat.bias)
+    fraction = magnitude & word(0x7FFFFF)
+    normal = exponent >= 1
+    significand = xp.where(normal, word(0), (biased != 0).astype(word) << word(23)) | fraction
+    value = xp.where(normal, exponent.astype(word) << word(23) | fraction, significand)
+    beyond = xp.minimum(23 - minifloat.mantissa + 1 - exponent, 31)
+    shift = xp.where(normal, 23 - minifloat.mantissa, beyond).astype(word)
+    half = (word(1) << (shift - word(1))) - word(1)
+    code = (value + half + (value >> shift & word(1))) >> shift
+    nan_code = minifloat.largest if minifloat.nan is None else minifloat.nan
+    code = xp.where(nan, word(nan_code), code)
+    return code | sign << word(minifloat.width - 1)
+
+
+def packed[Words: (np.ndarray, jax.Array)](codes: Words, minifloat: Minifloat, xp=jnp) -> Words:
+    """`codes` (uint32 a code, `[..., n]`) packed into uint32 words along the last axis, `[..., n * width /
+    32]`: e4m3's and e5m2's four a word little-endian (code 0 in the low byte, as `cvt ...x2` pairs and a
+    bf16-ordered store give them), e2m1's eight in the stored NVFP4 order (code `i` at bits `4 i`), which
+    `nvfp4_decoded` reads back as it stores them."""
+    per = 32 // minifloat.width
+    grouped = codes.reshape(*codes.shape[:-1], -1, per)
+    places = xp.arange(per, dtype=xp.uint32) * xp.uint32(minifloat.width)
+    # The codes' bits are disjoint, so their sum is their union.
+    return xp.sum(grouped << places, axis=-1, dtype=xp.uint32)
