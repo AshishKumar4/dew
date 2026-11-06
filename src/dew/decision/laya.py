@@ -12,12 +12,13 @@ onto `DecisionHead`.
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import jax
 import numpy as np
 
+from dew import _records
 from dew.batch import Variables, part, thaw
 from dew.config.release import RELEASE_FILE
 from dew.data.text import HFTokenizer
@@ -49,6 +50,24 @@ refusing any other value of `option_layout` (`uses_parallel_layout`)."""
 
 LAYA_REQUIRED = ("encoder", "head_layers")
 """The keys Laya's agent refuses a config without (`_verify_compatibility`'s `required_cfg`)."""
+
+LAYA_BUDGETS = {"head_max_len": 192, "option_tokens": 48}
+"""The question budgets Laya's release declares where its config states none: the tokens its question
+and options share, and the most one option keeps (`QuestionLayout.head_max_len`, `option_tokens`)."""
+
+
+def laya_layout(config: Mapping[str, object]) -> tuple[MarkerLayout, frozenset[str]]:
+    """The layout Laya's `rl_agent_config.json` (`config`) states, which its readers lay rows out by, its
+    budgets Laya's own where it states none (`LAYA_BUDGETS`), and the budgets so assumed: what
+    `DecisionSource.describe` reads a release's file as, and what `LayaCheckpoint.save` holds a task's
+    layout to. A budget it states as null keeps that part of the question whole."""
+    head_max_len, option_tokens = (
+        None if (value := config.get(name, default)) is None else _records.integer(value, name)
+        for name, default in LAYA_BUDGETS.items())
+    layout = MarkerLayout(max_len=_records.integer(config.get("max_len", 512), "max_len"),
+                          head_max_len=head_max_len, option_tokens=option_tokens,
+                          parallel=config.get("option_layout", "sequential") == "parallel")
+    return layout, frozenset(name for name in LAYA_BUDGETS if name not in config)
 
 # The action head and the unused temperature buffer: Laya's card reports
 # that the action head carries no signal, and the agent reads its
@@ -118,16 +137,23 @@ class LayaCheckpoint:
         refuse, so none of them lays rows out or answers unlike the task with nothing saying so.
         """
         head = from_record(DecisionHead, self.model.head)
-        # What Laya's file states of a layout and a calibration: where the task's hold more, its readers
-        # would lay rows out or answer unlike the task, so its option layout names the release that
-        # states them, which Laya's readers refuse (`LAYA_OPTION_LAYOUTS`) and Dew's reads.
         layout = self.layout
-        stated = MarkerLayout(max_len=layout.max_len, head_max_len=layout.head_max_len,
-                              option_tokens=layout.option_tokens, parallel=layout.parallel,
-                              order="question_first" if layout.order == "question_first" else None)
+        applied = self.calibration.temperatures.applied()
+        agent = {
+            # The encoder Laya's agent names (its tokenizer's, which the release holds under tokenizer/).
+            "encoder": self.tokenizer.name, "head_layers": head.layers, "max_len": layout.max_len,
+            "head_max_len": layout.head_max_len, "option_tokens": layout.option_tokens,
+            "option_layout": "parallel" if layout.parallel else "sequential",
+            "temperature": [applied.types.get(kind, applied.default) for kind in ("choice", "score", "noul")],
+            "temperature_by_options": dict(applied.buckets)}
+        # What Laya's file states of a layout and a calibration, read as its readers read it: where the
+        # task's hold more, they would lay rows out or answer unlike the task, so its option layout names
+        # the release that states them, which Laya's readers refuse (`LAYA_OPTION_LAYOUTS`) and Dew's reads.
+        # A layout that names Laya's own order, question first, lays rows out as one that names none.
+        held = replace(layout, order=None) if layout.order == "question_first" else layout
         beyond = self.calibration.binning is not None or self.calibration.abstention is not None
-        option_layout = (RELEASE_FILE if layout != stated or beyond
-                         else "parallel" if layout.parallel else "sequential")
+        if held != laya_layout(agent)[0] or beyond:
+            agent["option_layout"] = RELEASE_FILE
         tensors, config = laya_tensors(self.model, self.variables)
         root = Path(directory)
         (root / "encoder").mkdir(parents=True, exist_ok=True)
@@ -135,15 +161,7 @@ class LayaCheckpoint:
         config = {**config, "architectures": ["ModernBertModel"]}
         (root / "encoder" / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         self.tokenizer.save_pretrained(root / "tokenizer")
-        applied = self.calibration.temperatures.applied()
-        (root / CONFIG_FILE).write_text(json.dumps({
-            # The encoder Laya's agent names (its tokenizer's, which the release holds under tokenizer/).
-            "encoder": self.tokenizer.name, "head_layers": head.layers, "max_len": self.layout.max_len,
-            "head_max_len": self.layout.head_max_len, "option_tokens": self.layout.option_tokens,
-            "option_layout": option_layout,
-            "temperature": [applied.types.get(kind, applied.default) for kind in ("choice", "score", "noul")],
-            "temperature_by_options": dict(applied.buckets),
-        }, indent=2) + "\n")
+        (root / CONFIG_FILE).write_text(json.dumps(agent, indent=2) + "\n")
         compute = computed_in(self.numerics, self.model.backbone, part(self.variables, "backbone"))
         stated_release(root, self.layout, self.calibration if beyond else None, numerics=self.numerics,
                        compute=compute)

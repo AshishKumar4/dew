@@ -26,8 +26,8 @@ from . import joint_checkpoint
 from .calibration import Calibration, Temperatures
 from .head import DecisionHead, Head, JointSchemaHead
 from .joint_checkpoint import HEAD_CONFIG, HEAD_WEIGHTS, _path, _shaped
-from .laya import CONFIG_FILE, IN_PROJ, _head_path, _token, laya_tensors
-from .layout import JointLayout, Layout, MarkerLayout, QuestionLayout, Specials
+from .laya import CONFIG_FILE, IN_PROJ, _head_path, _token, laya_layout, laya_tensors
+from .layout import JointLayout, Layout, QuestionLayout, Specials
 from .model import DecisionModel
 from .release import released_decision
 from .task import Decide
@@ -150,11 +150,6 @@ class PretrainedDecision(Pretrained):
                    assumed=assumed)
 
 
-LAYA_BUDGETS = {"head_max_len": 192, "option_tokens": 48}
-"""The question budgets Laya's release declares where its config states none: the tokens its question
-and options share, and the most one option keeps (`QuestionLayout.head_max_len`, `option_tokens`)."""
-
-
 def _save_laya(bundle: PretrainedDecision, directory: str | Path, *,
                max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
     Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
@@ -192,15 +187,8 @@ class DecisionSource(SourceKind):
                 {"class": import_path(DecisionHead), "fields": {
                     "layers": _records.integer(config.get("head_layers", 2), "head_layers")}},
                 _head_path, IN_PROJ)
-            # The release's own budgets, as its config states them, Laya's where it states none; a
-            # budget it states as null keeps that part of the question whole.
-            head_max_len, option_tokens = (
-                None if (value := config.get(name, default)) is None else _records.integer(value, name)
-                for name, default in LAYA_BUDGETS.items())
-            assumed = frozenset(name for name in LAYA_BUDGETS if name not in config)
-            layout = MarkerLayout(max_len=_records.integer(config.get("max_len", 512), "max_len"),
-                                  head_max_len=head_max_len, option_tokens=option_tokens,
-                                  parallel=config.get("option_layout", "sequential") == "parallel")
+            # The release's own budgets, as its config states them, Laya's where it states none.
+            layout, assumed = laya_layout(config)
             buckets = _records.record(config.get("temperature_by_options", {}), "temperature_by_options")
             types, default = _laya_temperature(config.get("temperature", 1.0))
             calibration = Calibration(Temperatures(
