@@ -38,8 +38,8 @@ from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "nvfp4_qdq"
 
 
-draw = token_ids(2038, 96, (1, 12))
-"""A seed's a row of twelve token ids below the tiny model's 96 (the test draws them again)."""
+draw = token_ids(2038, 96, (1, 8))
+"""A seed's a row of eight token ids below the tiny model's 96 (the test draws them again), a recording small enough to keep in git."""
 
 def recorded_logits(model, exact, directory: Path) -> dict[str, np.ndarray]:
     """The float32 read's logits (`model`) and its float64 twin's (`exact`) over check 1's seeds of `draw`
