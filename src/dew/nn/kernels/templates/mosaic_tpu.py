@@ -169,7 +169,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         return acc + sum(_product(part, rhs) for part in parts)
 
     def rescaled_products(self, acc: jax.Array, scale, parts, rhs, interpret: bool) -> jax.Array:
-        return self.register_products(acc * scale, parts, rhs, interpret)
+        # `scale` the factor's function of the held value (`Issuer.rescaled_products`), not a factor.
+        return self.register_products(scale(acc), parts, rhs, interpret)
 
 
 class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
