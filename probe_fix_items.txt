@@ -1,0 +1,7 @@
+original
+output|128
+delta|128
+write|128
+write|2
+write-first
+einsum

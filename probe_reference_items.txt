@@ -1,0 +1,8 @@
+original|128|reference
+output|128|reference
+delta|128|reference
+write|128|reference
+write|2|reference
+write-first|128|reference
+einsum|128|reference
+transpose|128|reference
