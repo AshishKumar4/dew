@@ -107,10 +107,10 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                      first=first, **plain)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first):
-        return _portable_gemm(lhs if straight else lhs.astype(compute), rhs, group_sizes, prologue,
-                              prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes,
-                              dtypes, several, transpose_rhs, precision, compute if straight else None,
-                              paired=paired, dense=dense, first=first)
+        config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
+        return xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes, prologue,
+                            prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes, dtypes,
+                            several, paired=paired, first=first)
 
     def forward(*operands):
         return value(*operands), ()
@@ -1073,9 +1073,9 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         return launch()
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first):
-        return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
-                              epilogue_arrays, epilogue_axes, dtypes, several, transpose_rhs, precision,
-                              paired=paired, dense=dense, first=first)
+        return xla_mainloop(XlaConfig(transpose_rhs, precision, dense=dense), lhs, rhs, group_sizes, prologue,
+                            prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes, dtypes,
+                            several, paired=paired, first=first)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
                        epilogue_arrays, paired, first)
@@ -1094,7 +1094,7 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
         return d_accs, (), tuple(jnp.promote_types(d.dtype, compute) == compute for d in d_accs)
     rows = functools.partial(_rows, axes_of=epilogue_axes, group_sizes=group_sizes, rows=acc_shape[0])
     sides = jax.eval_shape(rows, epilogue_arrays)
-    # The accumulator the products sum in: fp32, an fp64 product's fp64 (`_portable_gemm`).
+    # The accumulator the products sum in: fp32, an fp64 product's fp64 (`xla_mainloop`).
     acc = jax.ShapeDtypeStruct(acc_shape, at_least_fp32(compute))
     if _reads_accumulators(epilogue, count, acc, sides):
         accs = _as_tuple(_gemm(lhs, matrices[0], group_sizes, prologue, prologue_arrays, prologue_axes, None,
@@ -1179,17 +1179,31 @@ def _apart(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologu
     return outs if several else outs[0]
 
 
-def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
-                   epilogue_axes, dtypes, several: bool, transpose_rhs: bool, precision: PrecisionLike,
-                   compute=None, paired: jax.Array | None = None, dense: bool = False,
-                   first: jax.Array | None = None):
-    """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype summed in at least fp32 (an fp64
-    product's in fp64, which no kernel takes), one rounding, a `dense` call's as XLA's own dot
+@dataclasses.dataclass(frozen=True)
+class XlaConfig:
+    """The plain-JAX mainloop's config (`xla_mainloop`): whether the matrices lie `[groups, width, depth]`
+    (`transpose_rhs`), the products' `precision`, the dtype the operands round to before them (`compute`,
+    None for their own), and whether the call is `dense` (one group of every row)."""
+
+    transpose_rhs: bool
+    precision: PrecisionLike
+    compute: jnp.dtype | None = None
+    dense: bool = False
+
+
+def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
+                 epilogue_arrays, epilogue_axes, dtypes, several: bool, *, paired: jax.Array | None = None,
+                 first: jax.Array | None = None):
+    """The template's portable mainloop at `config` (docs/design/kernel-templates.md's `xla_mainloop`):
+    `gemm`'s arithmetic in XLA, the kernels' products of `lhs`'s dtype summed in at least fp32 (an fp64
+    product's in fp64, which no kernel takes), one rounding, a dense call's as XLA's own dot
     (`grouped_matmul.xla_dot`: one group of every row, nothing to mask, no ragged dot to trace);
-    with `compute`, the products of the operands rounded to it, its tangent the MoE projection's
+    with `config.compute`, the products of the operands rounded to it, its tangent the MoE projection's
     (`grouped_matmul.portable_projection`, whose sum, at least fp32, it reads); with `paired`, both matrices'
     products, the epilogue's two accumulators; with `first`, the groups' matrices of a stacked `rhs` from
     that one (`_grouped`), sliced out, as XLA's ragged dot reads a matrix a group."""
+    transpose_rhs, precision, compute, dense = (config.transpose_rhs, config.precision, config.compute,
+                                                config.dense)
     if first is not None:
         rhs = jax.lax.dynamic_slice_in_dim(rhs, first, group_sizes.shape[0], 0)
     matrices = tuple(jnp.swapaxes(each, 1, 2) if transpose_rhs else each
