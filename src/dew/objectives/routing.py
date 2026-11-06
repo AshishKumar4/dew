@@ -15,8 +15,9 @@ loss's moments and the bias update's arithmetic. The counting is here, once.
 """
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -47,8 +48,9 @@ from dew.nn.moe import (
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Objective, Ratio
 
-__all__ = ["ExpertBalance", "RoutedStatistics", "apply_routed", "reduce_routed", "refuse_fixed_router",
-           "router_counts", "router_moments", "router_scores", "router_z_terms"]
+__all__ = ["Balanced", "ExpertBalance", "RoutedStatistics", "UntrainedRouter", "apply_routed",
+           "reduce_routed", "refuse_fixed_routers", "router_counts", "router_moments", "router_scores",
+           "router_z_terms"]
 
 
 @struct.dataclass
@@ -234,28 +236,42 @@ class ExpertBalance:
         return {EXPERT_BIAS_COLLECTION: merge(moe, unflatten_dict(balanced))}
 
 
-def refuse_fixed_router(model: object, balance: ExpertBalance | None, variables: Variables | None) -> None:
-    """Refuse a run that would train routers no term of its loss reaches: a model's routers whose expert
-    weights are fixed (`ExpertRouted.fixed_routers`, a softmax top-1 router renormalized over its one expert),
-    with no balance loss or z-loss to train them, one among the parameters the run trains (a parameter
-    of its in held `variables`' `params`; a tree drawn later trains them all). Its routers would keep
-    their draw, silently; the chosen expert's softmax score weighs its output where `norm_topk_prob=False`,
-    as Switch Transformer's router does, and a router learns through it."""
-    from dew.nn.protocols import ExpertRouted
+@runtime_checkable
+class Balanced(Protocol):
+    """An objective whose loss may balance its model's routers (`ExpertBalance`), None for none."""
 
-    fixed = dict(model.fixed_routers()) if isinstance(model, ExpertRouted) else {}
-    if not fixed or (balance is not None and (balance.aux_loss_alpha is not None or balance.router_z_loss)):
+    @property
+    def balance(self) -> ExpertBalance | None: ...
+
+
+class UntrainedRouter(ValueError):
+    """A training step trains a router no term of its loss reaches (`refuse_fixed_routers`)."""
+
+
+def refuse_fixed_routers(found: Sequence[tuple[str, ...]], trained: Variables,
+                         balance: ExpertBalance | None) -> None:
+    """Refuse a training step whose loss reaches none of the routers it trains: `found`, the module paths of
+    the routers its trace weighed by a fixed weight (`dew.nn.moe.fixed_routers`), each among the `trained`
+    parameters (a leaf whose path holds the router's), with no balance loss or z-loss to train them. Such a
+    router keeps its draw, silently; the chosen expert's score weighs its output where
+    `norm_topk_prob=False`, as Switch Transformer's router does, and a router learns through it. A model
+    scored, or a frozen router, a distillation's teacher among them, trains no router and is not refused."""
+    if not found or (balance is not None and (balance.aux_loss_alpha is not None or balance.router_z_loss)):
         return
-    if variables is not None:
-        trained = [tuple(map(str, path)) for path in leaves_by_path(variables.get("params", {}))]
-        fixed = {name: owns for name, owns in fixed.items() if any(map(owns, trained))}
-        if not fixed:
-            return
-    raise ValueError(f"{' and '.join(fixed)} renormalize{'s' if len(fixed) == 1 else ''} one chosen expert's "
-                     "softmax score over itself, a weight of 1 whatever the router scores, so no loss term "
-                     "reaches the router: set norm_topk_prob=False, which weighs the expert by its score, or "
-                     "train the router by a balance loss or z-loss (ExpertBalance(aux_loss_alpha=..., "
-                     "router_z_loss=...))")
+    paths = [tuple(map(str, path)) for path in leaves_by_path(trained)]
+
+    def holds(path: tuple[str, ...], router: tuple[str, ...]) -> bool:
+        # A router's path below the tree its model applies at (a decision's backbone, a wrapper's model).
+        return any(path[start:start + len(router)] == router for start in range(len(path) - len(router) + 1))
+
+    untrained = sorted({"/".join(router) for router in found if any(holds(path, router) for path in paths)})
+    if untrained:
+        named = f"the routers at {', '.join(untrained)} weigh" if len(untrained) > 1 else (
+            f"the router at {untrained[0]} weighs")
+        raise UntrainedRouter(f"{named} its one chosen expert by 1 whatever it scores, so no loss term "
+                              "reaches it: set norm_topk_prob=False, which weighs the expert by its score, "
+                              "or train the router by a balance loss or z-loss "
+                              "(ExpertBalance(aux_loss_alpha=..., router_z_loss=...))")
 
 
 def reduce_routed(balance: ExpertBalance | None,

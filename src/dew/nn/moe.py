@@ -19,9 +19,10 @@ layout `jax.lax.ragged_dot` takes and the `expert` mesh axis shards.
 """
 
 import contextlib
+import contextvars
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -70,6 +71,38 @@ EXPERT_DISPATCHES = ('global', 'exchange')
 # `ROUTER_COLLECTION` where a caller opens it, and its balancing bias is a variable of
 # `EXPERT_BIAS_COLLECTION`, which the step that balances the load rewrites (`dew.objectives.routing`).
 ROUTER_COLLECTION = 'router'
+
+_FIXED: contextvars.ContextVar[list[tuple[str, ...]] | None] = contextvars.ContextVar("dew_fixed_routers",
+                                                                                     default=None)
+"""The routers a `fixed_routers` block collects, None outside one."""
+
+
+@contextlib.contextmanager
+def fixed_routers() -> Iterator[list[tuple[str, ...]]]:
+    """Within the block, collect the module path of every router a trace calls whose expert weight is fixed
+    whatever it scores (`weighs_one`), as it reports itself (`fixed_router`): no term of a loss reaches its
+    scores through the experts' outputs (`dew.objectives.routing.refuse_fixed_routers`)."""
+    found: list[tuple[str, ...]] = []
+    token = _FIXED.set(found)
+    try:
+        yield found
+    finally:
+        _FIXED.reset(token)
+
+
+def weighs_one(top_k: int, normalized: bool, weight_sum_min: float | None = None) -> bool:
+    """Whether a router's weight is 1 whatever it scores: one expert's weight renormalized over itself
+    (`top_k` 1, `normalized`), softmax's or a sigmoid's alike (a sigmoid's over itself plus its tiny epsilon),
+    unless a floor on the weights' sum (`weight_sum_min`) keeps a small score small."""
+    return top_k == 1 and normalized and not weight_sum_min
+
+
+def fixed_router(path: tuple[str, ...]) -> None:
+    """Report the router at module `path`, whose weight is fixed (`weighs_one`), to the open
+    `fixed_routers` block."""
+    found = _FIXED.get()
+    if found is not None:
+        found.append(tuple(path))
 ROUTER_INDICES = 'indices'
 ROUTER_SCORES = 'scores'
 ROUTER_LOG_Z = 'log_z'
@@ -371,6 +404,8 @@ class Router(nn.Module):
             self.sow(ROUTER_COLLECTION, ROUTER_SCORES, scores)
             # The router z-loss squares each position's log partition.
             self.sow(ROUTER_COLLECTION, ROUTER_LOG_Z, jax.nn.logsumexp(logits, axis=-1))
+        if weighs_one(self.top_k, self.normalize_weights, self.weight_sum_min):
+            fixed_router(self.path)
         if (self.normalize_weights and self.score_function == 'softmax' and not self.bias_in_weights
                 and not self.weight_sum_min):
             weights = renormalized_softmax(logits, indices)
