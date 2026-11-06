@@ -466,7 +466,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe_exchange.py": {
-   "comparisons": 7,
+   "comparisons": 6,
    "lane": "Training"
   },
   "tests/test_moe_precision.py": {
