@@ -9,8 +9,8 @@ IN holds each draw's `<draw>.images` `[3, H, W, 3]` uint8, one in the first row 
 for a family that hears, its `<draw>.audio_<clip>` waveforms; every row's prompt is the family's
 `prompts.json`. The processor encodes the padded batch (`multimodal_reference._encode`), and the model runs
 one row of it at a time (`multimodal_reference.numerics`). OUT gets `<draw>.reference.<leaf>` and
-`<draw>.truth.<leaf>` in float32 and float64, the latter the model's float64 twin (`torch_precision.float64_twin`) inside `float64`
-over the encoding widened: the `logits` at every valid position (zero elsewhere), the summed next-token
+`<draw>.truth.<leaf>` in float32 and float64, the latter the model's float64 twin
+(`torch_precision.float64_twin`) inside `float64` over the encoding widened: the `logits` at every valid position (zero elsewhere), the summed next-token
 `loss`, its `pixel_gradient` in the processor's image order, and the `updated_logits` after one SGD step
 on every parameter.
 """
