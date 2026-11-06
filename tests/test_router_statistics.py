@@ -14,7 +14,7 @@ from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.objectives.routing import ExpertBalance, RoutedStatistics
+from dew.objectives.routing import ExpertBalance, RoutedStatistics, UntrainedRouter
 
 
 @pytest.fixture(scope="module", params=[0, 1], ids=["trunk", "mtp"])
@@ -78,14 +78,15 @@ def test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains():
     by its score, a balance loss, a z-loss, its router frozen, top-2 routing; and a model scored, which
     trains nothing, is not."""
     from dew.batch import freeze
-    from dew.nn.mixers import AttentionMixer, MLPMixer
+    from dew.nn.mixers import AttentionMixer
+    from dew.nn.mixers.mlp import MLPMixer
     from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
 
     fixed = decoder().clone(mixture=Mixture(experts=2, top_k=1, bias=True))
     sigmoid = fixed.clone(mixture=Mixture(experts=2, top_k=1, score_function="sigmoid"))
     for refused in (LMObjective(fixed, 8), LMObjective(fixed, 8, balance=ExpertBalance(balance_rate=0.05)),
                     LMObjective(sigmoid, 8)):
-        with pytest.raises(ValueError, match="norm_topk_prob=False"):
+        with pytest.raises(UntrainedRouter):
             lowered(refused)
     weighed = fixed.clone(mixture=Mixture(experts=2, top_k=1, bias=True, norm_topk_prob=False))
     drawn = nn.unbox(LMObjective(weighed, 8).init(jax.random.key(0)))
@@ -95,7 +96,7 @@ def test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains():
                    LMObjective(fixed.clone(mixture=Mixture(experts=2, top_k=2)), 8)):
         lowered(trains)
     # A split that freezes something else still trains the router.
-    with pytest.raises(ValueError, match="norm_topk_prob=False"):
+    with pytest.raises(UntrainedRouter):
         lowered(LMObjective(fixed, 8, variables=freeze(drawn,
                                                        lambda path: "embed_tokens" not in map(str, path))))
     # An MLP in the mixer's slot (Nemotron-H's) and a parallel mixer's routed branch route by their own.
@@ -104,7 +105,7 @@ def test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains():
                                        ParallelBranch("experts", routed, 1.3, 0.7)))
     for model in (decoder().clone(layer_types=("routed",), kinds={"routed": {"mixer": routed}}),
                   decoder().clone(mixer=parallel)):
-        with pytest.raises(ValueError, match="norm_topk_prob=False"):
+        with pytest.raises(UntrainedRouter):
             lowered(LMObjective(model, 8))
     # A model scored trains no router.
     scorer = LMObjective(fixed, 8)

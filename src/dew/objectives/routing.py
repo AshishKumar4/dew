@@ -48,8 +48,9 @@ from dew.nn.moe import (
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Objective, Ratio
 
-__all__ = ["Balanced", "ExpertBalance", "RoutedStatistics", "apply_routed", "reduce_routed",
-           "refuse_fixed_routers", "router_counts", "router_moments", "router_scores", "router_z_terms"]
+__all__ = ["Balanced", "ExpertBalance", "RoutedStatistics", "UntrainedRouter", "apply_routed",
+           "reduce_routed", "refuse_fixed_routers", "router_counts", "router_moments", "router_scores",
+           "router_z_terms"]
 
 
 @struct.dataclass
@@ -243,6 +244,10 @@ class Balanced(Protocol):
     def balance(self) -> ExpertBalance | None: ...
 
 
+class UntrainedRouter(ValueError):
+    """A training step trains a router no term of its loss reaches (`refuse_fixed_routers`)."""
+
+
 def refuse_fixed_routers(found: Sequence[tuple[str, ...]], trained: Variables,
                          balance: ExpertBalance | None) -> None:
     """Refuse a training step whose loss reaches none of the routers it trains: `found`, the module paths of
@@ -263,10 +268,10 @@ def refuse_fixed_routers(found: Sequence[tuple[str, ...]], trained: Variables,
     if untrained:
         named = f"the routers at {', '.join(untrained)} weigh" if len(untrained) > 1 else (
             f"the router at {untrained[0]} weighs")
-        raise ValueError(f"{named} its one chosen expert by 1 whatever it scores, so no loss term reaches "
-                         "it: set norm_topk_prob=False, which weighs the expert by its score, or train the "
-                         "router by a balance loss or z-loss (ExpertBalance(aux_loss_alpha=..., "
-                         "router_z_loss=...))")
+        raise UntrainedRouter(f"{named} its one chosen expert by 1 whatever it scores, so no loss term "
+                              "reaches it: set norm_topk_prob=False, which weighs the expert by its score, "
+                              "or train the router by a balance loss or z-loss "
+                              "(ExpertBalance(aux_loss_alpha=..., router_z_loss=...))")
 
 
 def reduce_routed(balance: ExpertBalance | None,

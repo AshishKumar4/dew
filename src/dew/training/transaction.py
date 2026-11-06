@@ -984,6 +984,15 @@ class Transaction:
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted))
 
+    def _realized(self, realize, read, batch, step_info, factor):
+        """The attempt `realize`d unscaled by `factor`, refused where its loss weighs a router it trains by a
+        fixed weight that no term of it reaches (`refuse_fixed_routers`)."""
+        with unscaled(factor), fixed_routers() as fixed:
+            realized = realize(read, batch, step_info)
+        refuse_fixed_routers(fixed, read["params"],
+                             self.objective.balance if isinstance(self.objective, Balanced) else None)
+        return realized
+
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.
 
@@ -1017,11 +1026,7 @@ class Transaction:
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             # A watched cotangent is read unscaled by the factor its backward is seeded with.
             read = self.read(state.variables, state.compute)
-            # Every router the loss weighs by a fixed weight, which no term of it trains.
-            with unscaled(factor), fixed_routers() as fixed:
-                realized = realize(read, batch, step_info)
-            refuse_fixed_routers(fixed, read["params"],
-                                 self.objective.balance if isinstance(self.objective, Balanced) else None)
+            realized = self._realized(realize, read, batch, step_info, factor)
             loss, cotangent = reduce(realized.stats, factor)
             # A step that summarizes its cotangents takes its probes' gradient from the same backward where
             # the microbatch is its update's whole window; otherwise from the pooled loss's, below.
