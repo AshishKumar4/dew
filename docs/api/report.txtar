@@ -732,6 +732,14 @@ dew.diffusion.presets.Cosine
   p2_loss_weight_k: float = 1.0
   p2_loss_weight_gamma: float = 1.0
   min_snr_gamma: float | None = None
+dew.diffusion.presets.CosineContinuous
+  min_snr_gamma: float | None = None
+dew.diffusion.presets.CosineGeneral
+  sigma_min: float = 0.02
+  sigma_max: float = 80.0
+  kappa: float = 1.0
+  sigma_data: float = 1.0
+  min_snr_gamma: float | None = None
 dew.diffusion.presets.EDM
   sigma_min: float = 0.002
   sigma_max: float = 80.0
@@ -740,6 +748,12 @@ dew.diffusion.presets.EDM
   regime: Literal['pixel', 'latent'] | None = None
   P_mean: float | None = None
   P_std: float | None = None
+  min_snr_gamma: float | None = None
+dew.diffusion.presets.Exp
+  timesteps: int = 1000
+  beta_end: float = 0.999
+  p2_loss_weight_k: float = 1.0
+  p2_loss_weight_gamma: float = 1.0
   min_snr_gamma: float | None = None
 dew.diffusion.presets.Flow
   shift: float = 1.0
