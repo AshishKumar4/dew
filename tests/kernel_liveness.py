@@ -983,6 +983,13 @@ class _Pass:
             self.open.pop(op.parent, None)
             self.stored.pop(op.parent, None)
             key, members = None, set()
+        if _optimization_barrier(op) and upstream & members:
+            # A run's product through an optimization barrier (an exact step's part added and closed, row
+            # 3620): no product after it is issued before it, as if it read the run's (NSDBG3620-14: an
+            # H100's 128 x 256 x 64 exact step in 128-column parts, read at 266 where ptxas holds 202).
+            self.open.pop(op.parent, None)
+            self.stored.pop(op.parent, None)
+            key, members = None, set()
         if _product(op):
             # A product accumulating in place onto another's accumulators (a contraction's next K step) is
             # the same accumulation: only its other operands (its left operand's registers, an address) can
@@ -1023,6 +1030,13 @@ class _Pass:
                     inner.operation.walk(visit)
         return self._read(operand for operand in captured
                           if isinstance(operand.owner, ir.Block) or operand.owner not in inside)
+
+
+def _optimization_barrier(op) -> bool:
+    """Whether `op` is an optimization barrier as Mosaic GPU lowers one (`lax.optimization_barrier`): an
+    empty assembly with side effects, each output tied to its input."""
+    return (op.name.removeprefix(PREFIX) == "llvm.inline_asm" and "asm_string" in op.attributes
+            and not _assembly(op).strip() and bool(op.operands))
 
 
 def _stores_shared(op) -> bool:
