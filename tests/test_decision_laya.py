@@ -1,5 +1,6 @@
 """dew.decision against Laya's own code (NandhaKishorM/laya a4a8921), under the float64 rule."""
 
+import functools
 import json
 import os
 from dataclasses import replace
@@ -10,8 +11,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from one_draw import assert_as_exact_as_the_reference
+from reference_runs import assert_as_exact_as_recorded
 
 from dew.decision import Decide, DecisionInputs, Encoded, Question
+from dew.decision.model import DecisionModel
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 TINY = FIXTURES / "tiny"
@@ -55,45 +58,94 @@ def markers(encoded: Encoded) -> list[int]:
     return [start for start, _ in encoded.questions[0].options]
 
 
-def logits(checkpoint: Decide, *, parallel: bool) -> dict[str, np.ndarray]:
-    """Each question's option logits, one row per question as Laya runs them."""
-    found = {}
-    for key, _, encoded in rows(checkpoint, parallel=parallel):
-        inputs = DecisionInputs.collate([encoded], checkpoint.specials.pad)
-        found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[0, 0]
-    return found
+FIXTURE = TINY / "seeds.npz"
+LAYA_SEEDS = 64
+"""The declared seeds, sized by `seeds_for` paired as the recording confirmed them
+(tools/venv_reference.py's `laya` site, tools/laya_worker.py)."""
+OUTPUTS = ("sequential", "parallel")
+"""The leaves `dew` gives: every question's option logits of every case in key order, by layout."""
+
+
+@functools.cache
+def tiny() -> Decide:
+    return Decide.from_pretrained(TINY, attention_impl="xla")
+
+
+@functools.cache
+def laid(parallel: bool) -> tuple[DecisionInputs, ...]:
+    """Each question of every case collated alone, as Laya runs them, in key order, on the host: a
+    traced `dew` reads them as constants."""
+    checkpoint = tiny()
+    with jax.ensure_compile_time_eval():
+        return tuple(jax.tree.map(np.asarray, DecisionInputs.collate([encoded], checkpoint.specials.pad))
+                     for _, _, encoded in sorted(rows(checkpoint, parallel=parallel), key=lambda row: row[0]))
+
+
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's weights for the tiny checkpoint's model: kernels and embeddings at their initializer's
+    scale, norms' scales about one and biases off zero, under Dew's paths (`dew.`) and Laya's names
+    (`param.`, `dew.decision.laya.laya_tensors`), the requests the fixture's cases."""
+    from flax.traverse_util import flatten_dict, unflatten_dict
+
+    from dew.decision.laya import laya_tensors
+
+    rng = np.random.default_rng([1557, 7, seed])
+    checkpoint = tiny()
+    drawn = {}
+    for path, value in flatten_dict(checkpoint.variables).items():
+        shape = np.shape(value)
+        if path[-1] == "scale":
+            leaf = rng.normal(1.0, 0.3, shape)
+        elif path[-1] == "bias":
+            leaf = rng.normal(0.0, 0.3, shape)
+        else:
+            leaf = rng.normal(0.0, 1.0, shape) / np.sqrt(np.prod(shape[:-1]))
+        drawn[path] = leaf.astype(np.float32)
+    tensors, _ = laya_tensors(checkpoint.model, unflatten_dict(drawn))
+    return {**{f"dew.{'/'.join(path)}": value for path, value in drawn.items()},
+            **{f"param.{name}": np.asarray(tensors[name], np.float32) for name in tensors}}
+
+
+def model_at(dtype) -> DecisionModel:
+    """The tiny checkpoint's model computing in `dtype`, its backbone's and head's."""
+    model = tiny().model
+    if dtype == jnp.float32:
+        return model
+    return DecisionModel(model.backbone.clone(dtype=dtype), model.head.clone(dtype=dtype))
+
+
+def variables_of(dtype, inputs) -> dict:
+    from flax.traverse_util import unflatten_dict
+
+    return unflatten_dict({tuple(key.removeprefix("dew.").split("/")): jnp.asarray(value, dtype)
+                           for key, value in inputs.items() if key.startswith("dew.")})
+
+
+def dew(dtype, inputs, *, typed: bool = True) -> dict:
+    """Dew's option logits at `dtype` under a draw's weights, each question alone (`laid`); `typed`
+    False drops the question type, the one place a choice and a noul differ in the head."""
+    model, variables = model_at(dtype), variables_of(dtype, inputs)
+
+    def scored(row):
+        row = row if typed else replace(row, kinds=jnp.zeros_like(row.kinds))
+        return model.logits(variables, row)[0, 0]
+    return {layout: jnp.concatenate([scored(row) for row in laid(layout == "parallel")])
+            for layout in OUTPUTS}
 
 
 @pytest.mark.parametrize("parallel", [False, True])
 def test_laya_logits_match_laya_under_the_float64_rule(parallel):
-    """Every case's option logits, sequential and parallel, held to twice
-    Laya's own fp32 distance from its float64 run."""
-    checkpoint = Decide.from_pretrained(TINY, attention_impl="xla")
-    found = logits(checkpoint, parallel=parallel)
-    with np.load(TINY / "logits.npz") as reference:
-        keys = sorted(found)
-        assert_as_exact_as_the_reference(
-            np.concatenate([found[key] for key in keys]),
-            np.concatenate([reference[key] for key in keys]),
-            np.concatenate([reference[f"{key}/f64"] for key in keys]), "Laya logits")
+    """Every case's option logits, sequential and parallel, over drawn weights, as exact as Laya's
+    float32 run against its float64 run (check 1)."""
+    assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw, dew, "Laya's option logits")
 
 
 def test_the_rule_catches_a_head_that_ignores_the_question_type():
     """The type embedding is the only place a choice and a noul differ in
     the head; dropping it moves the logits past the rule."""
-    checkpoint = Decide.from_pretrained(TINY, attention_impl="xla")
-    with np.load(TINY / "logits.npz") as reference:
-        found = {}
-        for key, _, encoded in rows(checkpoint, parallel=False):
-            inputs = DecisionInputs.collate([encoded], checkpoint.specials.pad)
-            one_type = replace(inputs, kinds=jnp.zeros_like(inputs.kinds))
-            found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, one_type))[0, 0]
-        keys = sorted(found)
-        with pytest.raises(AssertionError):
-            assert_as_exact_as_the_reference(
-                np.concatenate([found[key] for key in keys]),
-                np.concatenate([reference[key] for key in keys]),
-                np.concatenate([reference[f"{key}/f64"] for key in keys]), "Laya logits, one type")
+    with pytest.raises(AssertionError):
+        assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw,
+                                    functools.partial(dew, typed=False), "logits without the question type")
 
 
 def test_padded_rows_score_as_they_do_alone():
@@ -101,17 +153,18 @@ def test_padded_rows_score_as_they_do_alone():
     the encoder's nor the head's attention, so the batch is held to Laya's
     one-row runs under the same rule, and a short row's missing options
     score -inf."""
-    checkpoint = Decide.from_pretrained(TINY, attention_impl="xla")
-    laid = list(rows(checkpoint, parallel=False))
-    inputs = DecisionInputs.collate([encoded for _, _, encoded in laid], checkpoint.specials.pad)
-    batched = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[:, 0]
-    widths = [len(markers(encoded)) for _, _, encoded in laid]
+    checkpoint = tiny()
+    ordered = sorted(rows(checkpoint, parallel=False), key=lambda row: row[0])
+    batch = DecisionInputs.collate([encoded for _, _, encoded in ordered], checkpoint.specials.pad)
+    widths = [len(markers(encoded)) for _, _, encoded in ordered]
+    batched = np.asarray(checkpoint.model.logits(checkpoint.variables, batch))[:, 0]
     assert all(np.all(np.isneginf(batched[row, width:])) for row, width in enumerate(widths))
-    with np.load(TINY / "logits.npz") as reference:
-        assert_as_exact_as_the_reference(
-            np.concatenate([batched[row, :width] for row, width in enumerate(widths)]),
-            np.concatenate([reference[key] for key, _, _ in laid]),
-            np.concatenate([reference[f"{key}/f64"] for key, _, _ in laid]), "batched Laya logits")
+
+    def in_one_batch(dtype, inputs):
+        scores = model_at(dtype).logits(variables_of(dtype, inputs), batch)[:, 0]
+        return {**dew(dtype, inputs), "sequential": jnp.concatenate(
+            [scores[row, :width] for row, width in enumerate(widths)])}
+    assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw, in_one_batch, "batched Laya logits")
 
 
 @pytest.mark.network
@@ -131,6 +184,15 @@ def test_the_released_english_checkpoint_matches_laya():
     with jax.default_matmul_precision("highest"):
         checkpoint = Decide.from_pretrained(source["repo"], revision=source["revision"], attention_impl="xla")
         compare_released(checkpoint)
+
+
+def logits(checkpoint: Decide, *, parallel: bool) -> dict[str, np.ndarray]:
+    """Each question's option logits, one row per question as Laya runs them."""
+    found = {}
+    for key, _, encoded in rows(checkpoint, parallel=parallel):
+        inputs = DecisionInputs.collate([encoded], checkpoint.specials.pad)
+        found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[0, 0]
+    return found
 
 
 def compare_released(checkpoint: Decide) -> None:
