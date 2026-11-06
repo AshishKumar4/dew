@@ -1703,7 +1703,7 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-GATED = ("sm90",)
+GATED = ("sm90", "sm80")
 """The GPUs whose families the mainloop qualifies (`attention_mosaic_program.QUALIFIED`): an H100's
 wgmma."""
 
