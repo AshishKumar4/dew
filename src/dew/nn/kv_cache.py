@@ -666,7 +666,7 @@ class KVStore:
             return family is not None
         case = PagedCase(heads=query.shape[2], kv_heads=pool.shape[0], head_dim=query.shape[3],
                          value_dim=self._get(self.payloads[-1][0]).shape[-1], dtype=query.dtype,
-                         pool=pool.dtype, page_size=self.layout.page_size, quantized=False,
+                         pool=pool.dtype, page_size=self.layout.page_size, quantized=None,
                          groups=self.layout.groups, head_shards=1, softcap=softcap, arithmetic=False,
                          named='auto')
         return not next(kernel for kernel in PAGED.kernels if kernel.name == 'template').failed(case)
@@ -713,7 +713,7 @@ class KVStore:
         each row from its window's first key; a layer with `sinks` has attention sinks."""
         return PagedCase(heads=query.shape[-2], kv_heads=self.kv_heads, head_dim=self.head_dim,
                          value_dim=value_dim, dtype=jnp.dtype(query.dtype), pool=jnp.dtype(self.dtype),
-                         page_size=self.layout.page_size, quantized=self.layout.quantized is not None,
+                         page_size=self.layout.page_size, quantized=self.layout.quantized,
                          groups=self.layout.groups, head_shards=_head_shards(query), softcap=softcap,
                          arithmetic=arithmetic, named=named, windowed=windowed, sinks=sinks)
 
@@ -785,8 +785,8 @@ DECODE_QUERY = ("activation_batch", "activation_heads", None)
 class PagedCase:
     """A decode step over a paged pool as the paged selector reads it (`PAGED`, `KVStore.case`): the
     query's `heads` over the pool's `kv_heads`, `head_dim` wide with values `value_dim` wide; the
-    query's `dtype` and the `pool`'s; its `page_size` (None for a compact cache), whether it is
-    `quantized`, its `groups`; how many ways a mesh splits the query heads (`head_shards`); the layer's
+    query's `dtype` and the `pool`'s; its `page_size` (None for a compact cache), the format it is
+    `quantized` in (None for none), its `groups`; how many ways a mesh splits the query heads (`head_shards`); the layer's
     `softcap`; whether its arithmetic is the reference path's alone (`arithmetic`); the
     `AttentionImpl` it `named`; whether it reads each row from its window's first key
     (`windowed`); and whether the layer has attention sinks (`sinks`)."""
@@ -798,7 +798,7 @@ class PagedCase:
     dtype: jnp.dtype
     pool: jnp.dtype
     page_size: int | None
-    quantized: bool
+    quantized: KVDtype | None
     groups: int
     head_shards: int
     softcap: float | None
@@ -865,10 +865,19 @@ def _template_tiles(case: PagedCase) -> bool:
     return any(attention_mosaic._pages_hold(case.page_size, tile, family) for tile in tiles)
 
 
+def _converts(stored: KVDtype) -> bool:
+    """Whether the current GPU's template converts a pool's codes `stored` in its walk (`mosaic.converts`:
+    int8 on any, an FP8 on sm_89 on)."""
+    from dew.nn.kernels.templates import mosaic
+
+    return mosaic.converts(jnp.dtype(stored))
+
+
 TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('pages', lambda case: case.page_size is not None, "the cache keeps no pages", row=INHERENT),
     Requirement('dtype', lambda case: case.dtype in (jnp.bfloat16, jnp.float16)
-                and (case.quantized or case.pool == case.dtype),
+                and (case.pool == case.dtype if case.quantized is None
+                     else _converts(case.quantized)),
                 lambda case: f"the template's decode reads a 16-bit query over pages of its dtype or of "
                              f"codes it dequantizes, not {case.dtype} over {case.pool}", row='ledger 3624'),
     Requirement('tiles', _template_tiles,

@@ -318,6 +318,11 @@ class MosaicForward(_Mainloop[Tiles]):
         if not super().legal(ba, config, target):
             return False
         query, value = ba.arguments["query"], ba.arguments["value"]
+        # A quantized call's codes converted where the device converts them (`mosaic.converts`: an FP8 cache
+        # on sm_89 on), its call the gathered keys' path elsewhere.
+        codes = _codes_of(query, ba.arguments["key"])
+        if codes is not None and not mosaic.converts(codes):
+            return False
         family = bundle_of(config, query.dtype)
         # Its key tiles (the launch's, its natural rewalk's) split among the consumers that copy them
         # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts, so no 32-key tile
