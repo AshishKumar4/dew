@@ -210,7 +210,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_edm2.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_end_to_end.py": {
