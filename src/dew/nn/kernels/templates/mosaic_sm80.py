@@ -622,7 +622,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 return pipeline(*operands)
 
             # The joined tiles staged as the stream's whole tiles are (`lifetimes`' walk scope).
-            joins = (mosaic.staged(*blocks[name], _join_swizzle(blocks[name], streams, name))
+            joins = (mosaic.staged(blocks[name][0], blocks[name][1], _join_swizzle(blocks[name], streams, name))
                      for name in copies)
             carry = pl.run_scoped(piped, *joins) if copies else piped()
         return carry
