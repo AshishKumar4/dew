@@ -88,10 +88,11 @@ def tower_activation(hidden_act: str) -> str:
 
 
 def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: bool = False,
-               activation: str | Callable[[jax.Array], jax.Array] = "quick_gelu", eps: float = 1e-5,
+               activation: str | Callable[[jax.Array], jax.Array] = "quick_gelu", eps: float | None = 1e-5,
                rotary_axes: tuple[int, ...] | None = None,
-               rotary_pairs: Literal["half", "adjacent"] = "half", rope_theta: float = 10000.0,
-               packed: bool = False, kv_heads: int | None = None, head_dim: int | None = None,
+               rotary_pairs: Literal["half", "adjacent"] = "half", rotary_interleaved: bool = False,
+               rope_theta: float = 10000.0, packed: bool = False, kv_heads: int | None = None,
+               head_dim: int | None = None,
                norm_type: Literal["rms", "layer", "fast_layer"] = "fast_layer", norm_bias: bool = True,
                mlp_bias: bool = True, mlp_packed: bool = False, window: int | None = None,
                branch_scale: float | None = None, attention_bias: bool = True, qk_norm: bool = False,
@@ -109,26 +110,35 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     biased maps around `activation` (a feed-forward activation; `tower_activation` reads a
     checkpoint's `hidden_act`). The attention is causal in CLIP's text tower and full elsewhere,
     over `window` places either side where given; the vision towers rotate it by their patch grid
-    (`rotary_axes`, Llama 4's in adjacent pairs). A layout sets the rest: grouped `kv_heads`, a
+    (`rotary_axes`, Llama 4's in adjacent pairs, MoonViT's axes in turn: `rotary_interleaved`). A
+    layout sets the rest: grouped `kv_heads`, a
     `head_dim` beside `width // heads`, RMS norms or no norm bias, an unbiased or gated
     feed-forward whose gate and up maps are one (`mlp_packed`), queries, keys and values in
     one map (`packed`), unbiased attention maps (`attention_bias`), an RMS norm on each head's
     queries and keys at the layer's epsilon (`qk_norm`), logits formed in at least fp32
     (`wide_logits`, `MixerContext.wide_logits`: the world model's), RMS norms that weigh their
     normalized input after its cast back (`scale_after_cast`, Llama's); a `mixer` takes the attention's place
-    (LFM3-VL's grid convolution, `dew.nn.mixers.short_conv.GatedGridConv`).
+    (LFM3-VL's grid convolution, `dew.nn.mixers.short_conv.GatedGridConv`). An `eps` of None is each RMS
+    norm's input dtype's (`RMSNorm.epsilon`, Kimi K3's MoonViT).
     """
     head_dim = width // heads if head_dim is None else head_dim
+    if eps is None and qk_norm:
+        raise ValueError("a query and key norm states its epsilon; its input dtype's (None) is a block "
+                         "norm's (`RMSNorm.epsilon`)")
     attention = functools.partial(
         CausalSelfAttention, ctx=MixerContext(
             emb_features=width, num_heads=heads, num_kv_heads=heads if kv_heads is None else kv_heads,
             head_dim=head_dim, max_seq_len=positions, causal=causal, qk_norm=qk_norm, wide_logits=wide_logits,
-            attention_bias=attention_bias, norm_eps=eps, scale_after_cast=scale_after_cast,
+            # The context's own epsilon where the block's norms take their input's: no query or key norm
+            # reads it (refused above).
+            attention_bias=attention_bias, norm_eps=MixerContext.norm_eps if eps is None else eps,
+            scale_after_cast=scale_after_cast,
             rope_theta=rope_theta,
             # A window keeps the keys within `window` places: |q - k| < window + 1 (`window_sides`).
             sliding_window=None if window is None else window + 1, bidirectional_window=window is not None,
             dtype=dtype, precision=precision),
-        nope=rotary_axes is None, rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, packed=packed)
+        nope=rotary_axes is None, rotary_axes=rotary_axes, rotary_pairs=rotary_pairs,
+        rotary_interleaved=rotary_interleaved, packed=packed)
     mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width, activation=activation,
                             use_bias=mlp_bias, packed=mlp_packed, dtype=dtype, precision=precision)
     return DecoderBlock(attention if mixer is None else mixer, mlp, width,

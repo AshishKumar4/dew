@@ -785,11 +785,18 @@ def language_model_names(names: Collection[str], read: Callable[[str], Stored], 
     name of it (`wrapper_route`). The media towers' names are not among them, nor read, nor a bundle's
     decoder tensors that serve its media alone (`DecoderFamily.wrapper_media_suffixes`): only the
     language model's spellings of one tensor are compared."""
+    own = [name for name in names if language_reads(name, record)]
+    return _wrapper_sources(own, read, record, checked)[0]["language_model"]
+
+
+def language_reads(name: str, record: WrapperFields) -> bool:
+    """Whether a wrapper's language model reads its tensor `name`: one it routes to the language model
+    (`wrapper_route`) that serves no media alone (a bundle's `DecoderFamily.wrapper_media_suffixes`). The
+    one owner of that line, which a wrapper's language model reads by (`language_model_names`) and a
+    bundle's language model alone keeps the rest by (`bundle_media`)."""
     bundled = _bundled(record["model_type"])
     media = () if bundled is None else bundled.wrapper_media_suffixes
-    own = [name for name in names if wrapper_route(name, record)[0] == "language_model"
-           and not name.endswith(media)]
-    return _wrapper_sources(own, read, record, checked)[0]["language_model"]
+    return wrapper_route(name, record)[0] == "language_model" and not name.endswith(media)
 
 
 def _text_aliases(names: Collection[str], read: Callable[[str], Stored], config,
@@ -943,13 +950,22 @@ def source_depths(record: DecoderFields, model_type: str | DecoderFamily | None 
 def wrapper_source_depths(record: WrapperFields) -> Callable[[str], int | None]:
     """`source_depths` of a wrapper's tensors: its language model's, each routed as `wrapper_route`
     routes it, of the family `read_wrapper` reads it by; None for a tower's or a projector's."""
-    language = source_depths(record["text"])
+    language = source_depths(record["text"], language_family(record))
 
     def depth(name: str) -> int | None:
         component, local = wrapper_route(name, record)
         return language(local) if component == "language_model" else None
 
     return depth
+
+
+def language_family(record: WrapperFields) -> DecoderFamily | None:
+    """The family a wrapper's language model reads by: a family that reads its media bundle whole and
+    names itself its text type reads its decoder too (Kimi K3's, a decoder no family's fields match);
+    else None, the family the text record's fields match (`read_decoder`), DeepSeek V3's for Kimi
+    K2.5's."""
+    bundled = _bundled(record["model_type"])
+    return bundled if bundled is not None and record["text_model_type"] == record["model_type"] else None
 
 
 def read_wrapper(
@@ -974,8 +990,9 @@ def read_wrapper(
     sources, aliases = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record, checked)
     tables = {group: {local: hf_tensors[name] for local, name in held.items()}
               for group, held in sources.items()}
-    language, readings = read_decoder(tables["language_model"], record["text"], param_dtype=param_dtype,
-                                      lazy=lazy, checked=_renamed(checked, sources["language_model"]))
+    language, readings = read_decoder(tables["language_model"], record["text"], language_family(record),
+                                      param_dtype=param_dtype, lazy=lazy,
+                                      checked=_renamed(checked, sources["language_model"]))
     variables = {"language_model": language}
     placed = {}
     if record["tower"] is not None:
@@ -1526,6 +1543,15 @@ def decoder_config(config: Mapping[str, object],
     quantization = language_model_quantization(config, translate_wrapper_config(config), inventory)
     text = {key: value for key, value in text.items() if key != "quantization_config"}
     return text if quantization is None else {**text, "quantization_config": quantization}
+
+
+def bundle_media(config: Mapping[str, object], names: Collection[str]) -> frozenset[str]:
+    """The tensors `names` of a media bundle (`bundles`) its language model does not read: its towers' and
+    projectors' (`wrapper_route`) and its decoder's that serve its media alone
+    (`DecoderFamily.wrapper_media_suffixes`), which a load of its language model alone retains by name
+    and writes back byte for byte: those its language model does not read (`language_reads`)."""
+    record = translate_wrapper_config(config)
+    return frozenset(name for name in names if not language_reads(name, record))
 
 
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:
