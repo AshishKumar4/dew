@@ -188,19 +188,22 @@ def members(cls) -> list[str]:
 def exports() -> list[str]:
     import dew
 
-    lines = []
-    for name in sorted(dew.__all__):
-        value = getattr(dew, name)
-        if inspect.isclass(value):
-            lines.append(f"class {name}{signature(value)}  [{value.__module__}]")
-            lines.extend(members(value))
-        elif callable(value):
-            lines.append(f"def {name}{signature(value)}  [{getattr(value, '__module__', '?')}]")
-        elif name == "__version__":  # moves at every release, which the changelog records
-            lines.append(f"{name}: {type(value).__name__}")
-        else:
-            lines.append(f"{name} = {shown(value)}")
-    return lines
+    return [line for name in sorted(dew.__all__) for line in exported(name, getattr(dew, name))]
+
+
+def exported(name: str, value) -> list[str]:
+    """The report's lines for `value`, exported as `name`: a module by its name, then each name its
+    `__all__` exports, indented."""
+    if inspect.ismodule(value):
+        listed = [line for member in sorted(value.__all__) for line in exported(member, getattr(value, member))]
+        return [f"module {name}  [{value.__name__}]", *(f"  {line}" for line in listed)]
+    if inspect.isclass(value):
+        return [f"class {name}{signature(value)}  [{value.__module__}]", *members(value)]
+    if callable(value):
+        return [f"def {name}{signature(value)}  [{getattr(value, '__module__', '?')}]"]
+    if name == "__version__":  # moves at every release, which the changelog records
+        return [f"{name}: {type(value).__name__}"]
+    return [f"{name} = {shown(value)}"]
 
 
 def reaches(hint, expanded: frozenset[typing.TypeAliasType] = frozenset()) -> Iterator[type]:
