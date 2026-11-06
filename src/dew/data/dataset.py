@@ -1212,8 +1212,12 @@ class GlobalStream:
         *,
         resume: Literal["exact", "non-exact"] = "exact",
         endless: bool = True,
+        published: Callable[[Mapping[str, object] | None], None] | None = None,
     ):
         self._open = open_at
+        # Each read's Grain position handed on as it is read, a closed reader's as None: what its loading
+        # workers' positions carry beside their rows (`dew.data.readers.WorkerMirrors`, row 4339).
+        self._published = published
         self.ends: Ends = "never" if endless else "together"
         self._batch = batch
         self._order = json.dumps(plan.order, sort_keys=True)
@@ -1235,6 +1239,8 @@ class GlobalStream:
         # Counted after the batch: a step the stream did not deliver is not
         # a step a resume may skip.
         self._records += self._batch
+        if self._published is not None:
+            self._published(self._reads.get_state())
         return batch
 
     def get_state(self) -> bytes:
@@ -1291,6 +1297,8 @@ class GlobalStream:
     def close(self) -> None:
         reads, self._reads = self._reads, None
         if reads is not None:
+            if self._published is not None:
+                self._published(None)
             with self._loading.announced_stop():
                 reads.close()
 

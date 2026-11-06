@@ -337,9 +337,18 @@ class _Statistics:
     def __init__(self, counts: Mapping[str, CorpusCounts]):
         self._counts = counts
         self._published: list[_PublishedCounts] = []
+        # A global-order read's positions, read for its loading workers' mirrors alone (`mirrored`).
+        self._mirrored: list[_PublishedCounts] = []
 
     def observe(self, stream: _PerShare) -> None:
         self._published.append(stream._statistics)
+
+    def mirrored(self) -> Callable[[Mapping[str, object] | None], None]:
+        """Where a global-order read hands each position it reads (`dew.data.dataset.GlobalStream`), for
+        its loading workers' mirror counters (`WorkerMirrors`)."""
+        published = _PublishedCounts()
+        self._mirrored.append(published)
+        return published.publish
 
     def __call__(self) -> Mapping[str, float]:
         """The metrics of every corpus: the counts of the prefix a memory read ran, followed by
@@ -350,7 +359,7 @@ class _Statistics:
                   for name, counts in self._counts.items()}
         # What this process's mirrors did beside them (`mirror_metrics`, row 4299), and each loading
         # worker's, which its readers' positions carried (`WorkerMirrors`, row 4339).
-        mirrored = [mirror_metrics(), *(counts for published in self._published
+        mirrored = [mirror_metrics(), *(counts for published in (*self._published, *self._mirrored)
                                         for process, counts in published.mirrors.items()
                                         if not process.startswith(f"{os.getpid()}:"))]
         summed: dict[str, float] = {}
