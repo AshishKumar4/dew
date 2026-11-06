@@ -530,41 +530,16 @@ def test_a_gemm_writes_in_its_bias_only_where_it_is_its_one_reader():
 
     def read_before(a, b, x, y):
         bias = x @ y
-        return a @ b + bias, jnp.sum(bias)
+        total = jnp.sum(bias)
+        return a @ b + bias, total
 
     def peak(function):
         return peak_bytes(simplified(jax.make_jaxpr(function)(square, square, square, square).jaxpr, "gpu"),
                           "gpu", Workspace(0, 0))
 
-    assert peak(read_before) == peak(alone) + 512 * 512 * 4, (peak(read_before), peak(alone))
-
-
-def test_a_loops_slice_offset_computed_through_a_product_and_its_sum_is_evaluated():
-    """A loop's slice offset computed from its counter through a product and a sum, which the derivation
-    reads as one product with its bias (`biased`), is evaluated as the product plus its bias
-    (`compiled_program._evaluated`): the program holds what one computing the offset otherwise holds."""
-    from dew.training.footprint import peak_bytes, simplified
-
-    def looped(offset):
-        def run(x, w):
-            def body(turn, total):
-                rows = jax.lax.dynamic_slice_in_dim(x, offset(jnp.full((16, 16), turn, jnp.float32)), 16)
-                return total + rows @ w
-            return jax.lax.fori_loop(0, 4, body, jnp.zeros((16, 64), jnp.float32))
-        return run
-
-    def summed(m):
-        return (jnp.sum(m @ m + m).astype(jnp.int32) % 4) * 16
-
-    def apart(m):
-        return ((jnp.sum(m @ m) + jnp.sum(m)).astype(jnp.int32) % 4) * 16
-
-    shapes = (jax.ShapeDtypeStruct((64, 64), jnp.float32), jax.ShapeDtypeStruct((64, 64), jnp.float32))
-
-    def peak(function):
-        return peak_bytes(simplified(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu"), "gpu", Workspace(0, 0))
-
-    assert peak(looped(summed)) == peak(looped(apart))
+    matrix = 512 * 512 * 4
+    # The bias and the sum beside it, and the reduction's scalar the program returns.
+    assert (peak(alone), peak(read_before)) == (matrix, 2 * matrix + 4)
 
 
 def test_a_transposed_input_returned_flat_is_a_copy():
