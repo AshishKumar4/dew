@@ -1,8 +1,8 @@
 """The derivative contracts' harness (ledger 2641): each custom-derivative seam's orders (`orders`), the
 contract a seam is held to (`assert_contract`), the draws at float32's exponent edges (`EDGES`,
 `normal_draw`) and the orders a seam may not take (`FORWARD_ORDERS`, `REVERSE_ONLY` and the rest). The
-contracts themselves are tests/test_contracts_*.py, one an owning area, and tests/test_derivative_seams.py
-holds every seam to one.
+contracts themselves are tests/test_contracts_*.py, one an owning area, and each seam names its own at
+the seam (`dew.nn.derivatives.contracted`, held by tools/lint_slop.py's SLOP028).
 
 Float-range and nested-derivative contracts of Dew's custom-derivative seams (ledger row 2283, theme
 G12): each seam's primal, its forward and reverse derivatives, a forward derivative of its gradient and a

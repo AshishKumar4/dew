@@ -30,17 +30,20 @@ Tolerances and the differences actually observed, fp32 on CPU:
 """
 
 import dataclasses
+import fractions
+import functools
 import json
+import math
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from float64_terms import float64_forward
-from one_draw import assert_as_exact_as_the_reference
+from model_support import recorded_site
 from reference_error import as_given, assert_as_exact, ieee_fixture
 from safetensors.numpy import load_file
+from tool_support import run_from
 
 from dew.nn.vision import (
     gemma4,
@@ -312,34 +315,83 @@ def shared_fixture(name):
 
 
 def real(values, grid, merge: int = 1):
-    """Each row's own entries of padded `[B, L, ...]` values, a row's patches `prod(grid) / merge**2`."""
-    counts = np.prod(grid, axis=1) // merge ** 2
-    return np.concatenate([np.asarray(values)[row, :count] for row, count in enumerate(counts)])
+    """Each row's own entries of padded `[B, L, ...]` values, a row's patches `prod(grid) / merge**2`;
+    `grid` a host array, so the counts are static where the values are traced."""
+    counts = np.prod(np.asarray(grid), axis=1) // merge ** 2
+    return jnp.concatenate([values[row, :int(count)] for row, count in enumerate(counts)])
+
+
+MIMO_RECORDING = FIXTURES / "mimo-vision-tiny" / "recording.npz"
+
+
+@functools.cache
+def mimo_generator():
+    """tools/mimo_reference.py, whose seeded draws the recorded sites' inputs are drawn again by."""
+    with run_from("mimo_reference", "tools") as module:
+        return module
+
+
+def assert_projected_as_recorded(projector, family: str, tensors, grids, path, site: str, draw_of,
+                                 name: str):
+    """A recorded projector site held by check 1: `projector` over `family`'s `tensors` (its variables in
+    float32, and in float64 for its twin, the truth) on a seed's drawn trunk features of `grids`' rows,
+    each row's merged entries under `name`, on par with the recording's reference at `path`."""
+    grid = np.asarray(grids, np.int32)
+    variables = {"params": projector_variables(family, tensors, "float32")[0]}
+    wide = widened(lambda: {"params": projector_variables(family, tensors, "float64")[0]})
+
+    def twin(inputs):
+        with jax.enable_x64(new_val=True):
+            trunk = jnp.asarray(inputs["trunk"], jnp.float64)
+            return {name: real(projector.clone(dtype=jnp.float64).apply(wide, trunk), grid, 2)}
+
+    draw, reference, truth, seeds = recorded_site(path, site, draw_of, twin)
+    projected = jax.jit(lambda trunk: projector.apply(variables, trunk))
+    assert_as_exact(as_given(lambda index, inputs: {name: real(projected(inputs["trunk"]), grid, 2)}),
+                    reference, draw, site, seeds=seeds, truth_fn=truth)
+
+
+def widened(build):
+    """`build()` run with float64 enabled, its arrays float64: a module's float64 twin and its variables."""
+    with jax.enable_x64(new_val=True):
+        return build()
 
 
 def test_mimo_tower_is_as_exact_as_the_reference():
     """MiMo ViT on two rows, a 4x6 image and a two-frame 4x4 clip: full layers, a band of three keys
-    either side in the processor's order and in merge-block column order, and the sinks, within
-    the float64 gate; with the sinks zeroed the trunk leaves the reference by far more."""
-    config, tensors, _, refs = shared_fixture("mimo-vision-tiny")
+    either side in the processor's order and in merge-block column order, and the sinks; over drawn
+    pixels its trunk is on par with the release's from its float64 run's (check 1,
+    tools/mimo_reference.py --record-vision); with the sinks zeroed the trunk leaves it by far more."""
+    config, tensors, _, _ = shared_fixture("mimo-vision-tiny")
     tower = towers.from_record(mimo.translate_mimo_vision_config(config)).build()
     variables, _ = tower_variables("mimo", tensors, "float32")
-    out = tower.apply(variables, refs["pixels"], refs["grid"])
-    grid = refs["grid"]
-    _, terms = float64_forward(tower, variables, refs["pixels"], grid)
-    assert_as_exact_as_the_reference(real(out, grid), real(refs["tower"], grid),
-                                     real(refs["tower_f64"], grid), "mimo tower",
-                                     terms=real(np.asarray(terms), grid))
+    grid = np.asarray(mimo_generator().MIMO_GRIDS, np.int32)
+    wide = widened(lambda: tower_variables("mimo", tensors, "float64")[0])
+
+    def wide_trunk(inputs):
+        with jax.enable_x64(new_val=True):
+            pixels = jnp.asarray(inputs["pixels"], jnp.float64)
+            return {"tower": real(tower.clone(dtype=jnp.float64).apply(wide, pixels, grid), grid)}
+
+    draw, reference, truth, seeds = recorded_site(MIMO_RECORDING, "mimo tower", mimo_generator().vision_draw,
+                                                  wide_trunk)
+    trunk = jax.jit(lambda variables, pixels: tower.apply(variables, pixels, grid))
+
+    def dew(held):
+        return as_given(lambda index, inputs: {"tower": real(trunk(held, inputs["pixels"]), grid)})
+
+    assert_as_exact(dew(variables), reference, draw, "mimo tower", seeds=seeds, truth_fn=truth)
     sinkless = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key.startswith("sinks_") else leaf, variables)
     with pytest.raises(AssertionError):
-        assert_as_exact_as_the_reference(real(tower.apply(sinkless, refs["pixels"], refs["grid"]), grid),
-                                         real(refs["tower"], grid), real(refs["tower_f64"], grid), "sinkless")
+        assert_as_exact(dew(sinkless), reference, draw, "sinkless", seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("native", [False, True])
 def test_mimo_merger_is_as_exact_as_the_reference(native):
-    config, _, projector_tensors, refs = shared_fixture("mimo-vision-tiny")
+    """MiMo's merger, read from the release's config or built natively, over drawn trunk features of the
+    two rows, on par with the release's from its float64 run's (check 1)."""
+    config, _, projector_tensors, _ = shared_fixture("mimo-vision-tiny")
     record = mimo.translate_mimo_projector_config(config, config["text_config"]["hidden_size"])
     projector = projectors.from_record(record)
     if native:
@@ -348,42 +400,62 @@ def test_mimo_merger_is_as_exact_as_the_reference(native):
             hidden_size=vision["hidden_size"], spatial_merge_size=vision["spatial_merge_size"],
             width=vision["hidden_size"] * vision["spatial_merge_size"] ** 2,
             out_width=config["text_config"]["hidden_size"])
-    variables = {"params": projector_variables("mimo", projector_tensors, "float32")[0]}
-    out = projector.apply(variables, refs["tower"])
-    grid = refs["grid"]
-    assert_as_exact_as_the_reference(real(out, grid, 2), real(refs["projector"], grid, 2),
-                                     real(refs["projector_f64"], grid, 2), "mimo merger")
+    assert_projected_as_recorded(projector, "mimo", projector_tensors, mimo_generator().MIMO_GRIDS,
+                                 MIMO_RECORDING, "mimo merger", mimo_generator().merger_draw, "merger")
+
+
+MUSE_RECORDING = FIXTURES / "muse-glimmer-vision-tiny" / "recording.npz"
+
+
+@functools.cache
+def muse_generator():
+    """tools/muse_glimmer_reference.py, whose seeded draws the recorded sites' inputs are drawn again by."""
+    with run_from("muse_glimmer_reference", "tools") as module:
+        return module
 
 
 def test_muse_glimmer_tower_is_as_exact_as_the_reference():
     """Muse Glimmer's trunk on a 6x10 grid of 4-patch windows, some partial, and an 8x4 one: the
-    resampled table, the windows and full layers, the column-first rotary, within the float64 gate,
-    and the first row again from its NCHW image packed in the processor's time-then-channel order."""
-    config, tensors, _, refs = shared_fixture("muse-glimmer-vision-tiny")
+    resampled table, the windows and full layers, the column-first rotary, over drawn pixels on par
+    with transformers' from its float64 run's (check 1, tools/muse_glimmer_reference.py --record); and
+    the first grid again from a drawn NCHW image Dew packs as the processor does (time, then channel)."""
+    config, tensors, _, _ = shared_fixture("muse-glimmer-vision-tiny")
     tower = towers.from_record(muse_glimmer.translate_muse_glimmer_vision_config(config)).build()
     variables, _ = tower_variables("muse_glimmer", tensors, "float32")
-    grid = refs["grid"]
-    out = tower.apply(variables, refs["pixels"], grid)
-    assert_as_exact_as_the_reference(real(out, grid), real(refs["tower"], grid),
-                                     real(refs["tower_f64"], grid), "muse glimmer tower")
-    image = tower.apply(variables, refs["image"])
-    count = int(np.prod(grid[0]))
-    assert_as_exact_as_the_reference(np.asarray(image)[0], refs["tower"][0, :count],
-                                     refs["tower_f64"][0, :count], "muse glimmer image")
+    grid = np.asarray(muse_generator().MUSE_GRIDS, np.int32)
+    wide = widened(lambda: tower_variables("muse_glimmer", tensors, "float64")[0])
+
+    def wide_run(inputs, name, read):
+        with jax.enable_x64(new_val=True):
+            given = jnp.asarray(inputs[name], jnp.float64)
+            return {"tower": read(tower.clone(dtype=jnp.float64), given)}
+
+    draw, reference, truth, seeds = recorded_site(
+        MUSE_RECORDING, "muse glimmer tower", muse_generator().pixels_draw,
+        lambda inputs: wide_run(inputs, "pixels", lambda wide_tower, pixels: real(
+            wide_tower.apply(wide, pixels, grid), grid)))
+    trunk = jax.jit(lambda pixels: tower.apply(variables, pixels, grid))
+    assert_as_exact(as_given(lambda index, inputs: {"tower": real(trunk(inputs["pixels"]), grid)}),
+                    reference, draw, "muse glimmer tower", seeds=seeds, truth_fn=truth)
+    draw, reference, truth, seeds = recorded_site(
+        MUSE_RECORDING, "muse glimmer image", muse_generator().image_draw,
+        lambda inputs: wide_run(inputs, "image", lambda wide_tower, image: wide_tower.apply(wide, image)[0]))
+    image = jax.jit(lambda pixels: tower.apply(variables, pixels))
+    assert_as_exact(as_given(lambda index, inputs: {"tower": image(inputs["image"])[0]}),
+                    reference, draw, "muse glimmer image", seeds=seeds, truth_fn=truth)
 
 
 def test_muse_glimmer_projector_is_as_exact_as_the_reference():
     """The pixel shuffle channel by channel, the adapter's two activated maps, the projection and the
-    scale-free norm, each tensor named as the checkpoint router leaves it (`projector_layout`)."""
-    config, _, projector_tensors, refs = shared_fixture("muse-glimmer-vision-tiny")
+    scale-free norm, each tensor named as the checkpoint router leaves it (`projector_layout`): over
+    drawn trunk features on par with transformers' from its float64 run's (check 1)."""
+    config, _, projector_tensors, _ = shared_fixture("muse-glimmer-vision-tiny")
     projector = projectors.from_record(muse_glimmer.translate_muse_glimmer_projector_config(config))
     routed = {name[len(prefix):]: tensor for name, tensor in projector_tensors.items()
               for prefix in projector_layout("muse_glimmer").prefix if name.startswith(prefix)}
-    variables = {"params": projector_variables("muse_glimmer", routed, "float32")[0]}
-    out = projector.apply(variables, refs["tower"])
-    grid = refs["grid"]
-    assert_as_exact_as_the_reference(real(out, grid, 2), real(refs["projector"], grid, 2),
-                                     real(refs["projector_f64"], grid, 2), "muse glimmer projector")
+    assert_projected_as_recorded(projector, "muse_glimmer", routed, muse_generator().MUSE_GRIDS,
+                                 MUSE_RECORDING, "muse glimmer projector", muse_generator().trunk_draw,
+                                 "projector")
 
 
 def test_gemma4_clipping_matches_reference_forward_and_backward():
@@ -453,3 +525,89 @@ def test_a_grid_convolution_convolves_each_frames_patch_grid_whatever_the_token_
     np.testing.assert_array_equal(in_order[0, :frames * height * width], expected)
     shuffled = rng.permutation(length)
     np.testing.assert_array_equal(mixed(shuffled), in_order[:, shuffled])
+
+
+def test_a_moonvit_pools_frames_finitely_beside_a_padded_item():
+    """MoonViT's packed rows beside the padding a processor gives a row of fewer items (a grid of no frame,
+    `Processor._images`): a clip's pooled tokens its frames' mean at its first frame's places, the padded
+    row zero, and the gradient of the clip's tokens finite everywhere, the padded row's division included
+    (row 855's review)."""
+    from dew.nn.vision.moonvit import MoonViT
+
+    tower = MoonViT(vt_hidden_size=16, vt_intermediate_size=24, vt_num_attention_heads=2,
+                    vt_num_hidden_layers=1, patch_size=2, init_pos_emb_height=4, init_pos_emb_time=2)
+    module = tower.build()
+    grid = jnp.asarray([[2, 4, 4], [0, 2, 2]], jnp.int32)
+    pixels = jax.random.normal(jax.random.key(0), (2, 32, 12))
+    variables = module.init(jax.random.key(1), pixels, grid)
+    out = np.asarray(module.apply(variables, pixels, grid))
+    assert np.isfinite(out).all()
+    # The clip's 16 places of its first frame hold its tokens; the rest of its row and the padded row none.
+    assert np.abs(out[0, :16]).sum(axis=-1).min() > 0
+    assert not out[0, 16:].any() and not out[1].any()
+    gradient = jax.grad(lambda held: module.apply(held, pixels, grid)[0, :16].sum())(variables)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(gradient))
+
+
+def exact_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> list[list[fractions.Fraction]]:
+    """The `[size_out][size_in]` weights of torch's bicubic resize along one axis (`align_corners=False`),
+    exactly: without antialiasing the cubic of a = -3/4 on the four taps about each half-pixel source
+    position, clamped at the border; with it the cubic of a = -1/2 over the support widened by the
+    shrink, normalized by its total (`dew.nn.blocks.torch_bicubic_resize`, torch's upsample_bicubic2d)."""
+    half = fractions.Fraction(1, 2)
+    scale = fractions.Fraction(size_in, size_out)
+    weights = [[fractions.Fraction(0)] * size_in for _ in range(size_out)]
+    for row in range(size_out):
+        if antialias:
+            stretch, center = max(scale, 1), scale * (row + half)
+            low = max(math.floor(center - 2 * stretch + half), 0)
+            high = min(math.floor(center + 2 * stretch + half), size_in)
+            taps = {}
+            for tap in range(low, high):
+                x = abs((tap - center + half) / stretch)
+                taps[tap] = ((3 * half * x - 5 * half) * x * x + 1 if x < 1 else
+                             ((-x * half + 5 * half) * x - 4) * x + 2 if x < 2 else 0)
+            total = sum(taps.values())
+            for tap, weight in taps.items():
+                weights[row][tap] = weight / total
+            continue
+        a = fractions.Fraction(-3, 4)
+        source = scale * (row + half) - half
+        index = math.floor(source)
+        t = source - index
+        for tap, x in zip(range(index - 1, index + 3), (t + 1, t, 1 - t, 2 - t), strict=True):
+            near = ((a + 2) * x - (a + 3)) * x * x + 1
+            far = ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+            weights[row][min(max(tap, 0), size_in - 1)] += near if x <= 1 else far
+    return weights
+
+
+@pytest.mark.parametrize("antialias", [False, True], ids=["plain", "antialiased"])
+@pytest.mark.parametrize("size_out", [5, 11], ids=["shrinking", "growing"])
+def test_a_float64_bicubic_resize_weighs_each_pixel_in_float64(antialias, size_out):
+    """A float64 bicubic resize (`torch_bicubic_resize`, REPA's and RAE's preprocessing, a vision tower's
+    position table) weighs each source pixel in float64, as torch's resize of a float64 input does (row
+    4445): each unit image of seven rows (three columns wide, which a resize to three columns weighs by
+    one, exactly) resized to five or eleven rows reads out every weight of its row, within float64's
+    rounding of its own computation of their exact values (`exact_bicubic_weights`,
+    `assert_computes_the_oracle`): its host chain (the source coordinate, the cubic's Horner steps, and the
+    border's tap sum or the antialiased total and its division) and the resize's contraction
+    (`chain_roundings`). Weights built in float32 sit near 1e-8 from them, far past the bound."""
+    from reference_error import assert_computes_the_oracle, chain_roundings
+
+    from dew.nn.blocks import torch_bicubic_resize
+
+    size_in = 7
+    units = np.eye(size_in)[:, :, None, None].repeat(3, axis=2)
+    with jax.enable_x64(new_val=True):
+        resize = functools.partial(torch_bicubic_resize, height=size_out, width=3, antialias=antialias)
+        ours = np.asarray(resize(jnp.asarray(units)))
+        contraction = chain_roundings(jax.make_jaxpr(resize)(jnp.asarray(units)))
+    assert ours.dtype == np.float64
+    taps = math.ceil(4 * max(size_in / size_out, 1)) + 2
+    host = 3 + 3 + 6 + taps + 1 if antialias else 4 + 1 + 6 + 3
+    exact = np.asarray([[float(weight) for weight in row] for row in exact_bicubic_weights(
+        size_in, size_out, antialias)])
+    # Pixel by row, each column the same weight.
+    assert_computes_the_oracle(ours[..., 0].transpose(1, 0, 2), exact[..., None].repeat(3, axis=2),
+                               f"bicubic weights, {size_in} to {size_out} rows", roundings=host + contraction)

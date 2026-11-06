@@ -41,7 +41,14 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
-from dew.nn.derivatives import Protected, bound_span, declared_derivative, declared_tangent, surrogate
+from dew.nn.derivatives import (
+    Protected,
+    bound_span,
+    contracted,
+    declared_derivative,
+    declared_tangent,
+    surrogate,
+)
 from dew.nn.nested import nested
 from dew.nn.programs import equations
 from dew.nn.sharding import explicit_spec
@@ -520,7 +527,8 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
             return tuple(transposed(index) for index in live)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
-    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
+    wide = contracted("test_a_wide_cpu_sum_of_products_holds_every_order")(
+        linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True))
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
@@ -952,7 +960,8 @@ def _divide_jvp(primals, tangents):
     return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
 
 
-correctly_rounded_divide = declared_tangent(Protected(), _correctly_rounded_divide, _divide_jvp)
+correctly_rounded_divide = contracted("test_the_precision_seams_hold_every_order")(
+    declared_tangent(Protected(), _correctly_rounded_divide, _divide_jvp))
 
 
 def divided(numerator, rate):
@@ -1109,7 +1118,8 @@ def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
     return _compensated_sum(primals[0], axes), jnp.sum(tangents[0], axes)
 
 
-_compensated_sum = declared_tangent(Protected(), _compensated, _compensated_sum_jvp, nondiff_argnums=(1,))
+_compensated_sum = contracted("test_the_precision_seams_hold_every_order")(
+    declared_tangent(Protected(), _compensated, _compensated_sum_jvp, nondiff_argnums=(1,)))
 
 def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).
@@ -1125,8 +1135,9 @@ def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
 
 
-rounded_operand = surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
-                            nondiff_argnums=(1,))
+rounded_operand = contracted("test_the_precision_seams_hold_every_order")(
+    surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
+              nondiff_argnums=(1,)))
 """The value `x` takes in `dtype`, held in `x`'s own dtype (`_rounded`), with a straight-through
 derivative (`dew.nn.derivatives.surrogate`): its tangent is `x`'s, never rounded a second time."""
 
@@ -1277,7 +1288,8 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
     def forward(lhs, rhs):
         return typed(lhs, rhs, numbers)
 
-    return linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward)(lhs, rhs)
+    return contracted("test_a_bf16_dot_holds_every_order")(
+        linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward))(lhs, rhs)
 
 
 def _transposed(cotangent, operands, numbers, side: int, product) -> jax.Array:
@@ -1339,6 +1351,7 @@ def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Out
             return pullback(cotangent)
 
     # A protected span: the precision it holds is the kernels' own, which no rewrite may change.
+    @contracted("test_a_default_precision_call_holds_every_order_it_takes")
     @functools.partial(declared_derivative, Protected(), forward=forward, backward=backward)
     def run(*args):
         with jax.default_matmul_precision('default'):

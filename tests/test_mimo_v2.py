@@ -140,10 +140,10 @@ def test_the_towers_of_a_config_that_names_none_ride_along_unread(tmp_path):
 def test_a_release_with_its_towers_loads_whole_and_saves_back_as_it_came(tmp_path):
     """MiMo-V2.6 with its towers is a bundle its family reads whole (row 357): the decoder at the config's
     root, the ViT and its merger, the audio encoder over the codes of the tokenizer the release keeps in a
-    folder of its own, and the prediction layer vLLM drafts with. It saves back every tensor it read under
-    its own name, the folder's in the folder beside the folder's config, the config as it was published,
-    and loads again to the same variables; its language model alone (`text_only`) computes the bundle's
-    logits over text bit for bit."""
+    folder of its own, and the prediction layer vLLM drafts with. It saves back, and so does its language
+    model alone (`text_only`), every tensor it read under its own name, the folder's in the folder beside
+    the folder's config, the config as it was published, and loads again to the same variables; its
+    language model alone (`text_only`) computes the bundle's logits over text bit for bit."""
     import jax
 
     from dew.nn.multimodal import MultimodalTransformer
@@ -154,17 +154,21 @@ def test_a_release_with_its_towers_loads_whole_and_saves_back_as_it_came(tmp_pat
     assert None not in (model.vision, model.projection, model.audio)
     assert model.num_nextn_predict_layers == 1
     loaded.save(tmp_path / 'saved')
-    for folder in (Path(), Path('audio_tokenizer')):
-        saved, released = tmp_path / 'saved' / folder, WHOLE / folder
+    text = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference', text_only=True)
+    # Its language model alone keeps every other tensor, the folder's among them, and writes it back.
+    text.save(tmp_path / 'text')
+    for folder, root in ((Path(), 'saved'), (Path('audio_tokenizer'), 'saved'), (Path(), 'text'),
+                         (Path('audio_tokenizer'), 'text')):
+        saved, released = tmp_path / root / folder, WHOLE / folder
         assert (json.loads((saved / 'config.json').read_text())
                 == json.loads((released / 'config.json').read_text()))
         written, read = load_file(saved / 'model.safetensors'), load_file(released / 'model.safetensors')
         assert sorted(written) == sorted(read)
         for name, tensor in read.items():
             np.testing.assert_array_equal(written[name], tensor, err_msg=name)
-    again = Pretrained.load(tmp_path / 'saved', dtype='float32', attention_impl='reference')
-    jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)
-    text = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference', text_only=True)
+    for root in ('saved', 'text'):
+        again = Pretrained.load(tmp_path / root, dtype='float32', attention_impl='reference')
+        jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)
     ids = np.load(WHOLE / 'input_ids.npy')
     np.testing.assert_array_equal(np.asarray(model.apply(loaded.variables, ids)),
                                   np.asarray(text.model.apply(text.variables, ids)))

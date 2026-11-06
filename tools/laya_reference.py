@@ -123,20 +123,27 @@ def write_tiny(directory: Path) -> None:
         "temperature_by_options": {"choice:3-5": 1.2, "choice:11+": 0.3, "noul:2": 2.0}}, indent=2) + "\n")
 
 
-def references(directory: Path, out: Path) -> None:
-    """Laya's layouts, logits in fp32 and float64, and agent answers for `directory`."""
-    from torch_precision import float64, float64_twin
+def twins(agent, directory: Path):
+    """`agent`'s decision model in float32 and its float64 twin (`float64_twin`): the model built again
+    inside the widening by Laya's own builder, uninitialised for a checkpoint to fill
+    (`common.build_model`), so its inverse frequencies are float64's, the float32 model's weights in it."""
+    from torch_precision import float64_twin
+
+    _, common = _laya()
+    model = agent.model.float().eval()
+    encoder = directory / "encoder"
+    return model, float64_twin(model, lambda: common.build_model(
+        agent.cfg, encoder_dir=str(encoder) if encoder.exists() else None, pretrained=False))
+
+
+def laid_logits(agent, model, exact) -> tuple[dict, dict]:
+    """Every case's layouts and its option logits under `model` in fp32 and `exact` in float64, keyed
+    `<layout>/<case>/<id>` (the float64 ones `/f64`), each question laid out as `Agent` lays it out, in
+    the sequential and the parallel layout."""
+    from torch_precision import float64
 
     agent_module, common = _laya()
-    agent = agent_module.Agent(str(directory), device="cpu")
     tokenizer, config = agent.tok, agent.cfg
-    model = agent.model.float().eval()
-    # Its float64 twin (`float64_twin`), the decision model built again inside the widening by Laya's
-    # own builder, uninitialised for a checkpoint to fill (`common.build_model`), so its inverse
-    # frequencies are float64's, the float32 model's weights in it.
-    encoder = directory / "encoder"
-    exact = float64_twin(model, lambda: common.build_model(
-        config, encoder_dir=str(encoder) if encoder.exists() else None, pretrained=False))
     layouts, logits = {}, {}
     for parallel in (False, True):
         name = "parallel" if parallel else "sequential"
@@ -166,6 +173,14 @@ def references(directory: Path, out: Path) -> None:
                     logits[key] = model(*arguments, **extra)[0][0].numpy()
                 with float64(), torch.no_grad():
                     logits[f"{key}/f64"] = exact(*arguments, **extra)[0][0].double().numpy()
+    return layouts, logits
+
+
+def references(directory: Path, out: Path) -> None:
+    """Laya's layouts, logits in fp32 and float64, and agent answers for `directory`."""
+    agent_module, _ = _laya()
+    agent = agent_module.Agent(str(directory), device="cpu")
+    layouts, logits = laid_logits(agent, *twins(agent, directory))
     answers = {case: agent.system_one(request["state"], request["questions"])
                for case, request in CASES.items()}
     out.mkdir(parents=True, exist_ok=True)

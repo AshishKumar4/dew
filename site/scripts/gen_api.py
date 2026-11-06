@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import enum
 import functools
 import io
 import json
@@ -32,6 +33,7 @@ import tempfile
 import tokenize
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 from pathlib import Path
 
 import griffe
@@ -609,7 +611,7 @@ def reached(package: griffe.Module, dotted: str) -> griffe.Object | None:
 
 
 def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[str, Page],
-                    code: str, shown: set[int] | None, bound: dict[str, str]) -> Iterator[str]:
+                    code: str, shown: set[int] | None, bound: dict[str, str]) -> Iterator[Problem]:
     """Each dotted use of a Dew name in `code` that does not reach the
     documented API: an attribute a module or class does not have, or a
     module member no page documents. Names come from `import dew...` and
@@ -620,7 +622,7 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     try:
         tree = ast.parse(code)
     except SyntaxError as error:
-        yield f"a Python unit does not parse, so none of its names is checked: {error}"
+        yield Problem(Why.UNPARSED, "", str(error))
         return
     imports = {id(node): table for node, table in scopes.scoped(tree.body, bound, ())}
     tables = {id(node): table for node, table in
@@ -660,7 +662,7 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
             if problem is None and target.startswith(INSTANCE) and id(node) in called and len(path) == 2:
                 problem = called_attribute(found, path)
         except Unresolved as error:
-            problem = f"`{'.'.join(path)}`: {error}"
+            problem = Problem(Why.UNREADABLE, ".".join(path), str(error))
         if problem:
             yield problem
 
@@ -684,7 +686,36 @@ def held(tree: ast.Module, imports: dict[int, Mapping[str, str]], package: griff
     return instances
 
 
-def called_attribute(cls: griffe.Object, path: list[str]) -> str | None:
+class Why(enum.Enum):
+    """Why a use or an export leaves the documented API (`Problem`), with how the check states it."""
+
+    NO_PUBLIC = "`{symbol}`: {owner} has no public {member}"
+    NOT_DOCUMENTED = "`{symbol}` ({owner}) is not documented"
+    PRIVATE = "`{symbol}`: {member} is private to {owner}"
+    NO_MEMBER = "`{symbol}`: {owner} has no {member}"
+    VALUE_CALLED = "`{symbol}(...)`: {member} is a value {owner} holds, not a method"
+    PAGELESS_MODULE = "`{symbol}` is the module {owner}, which has no API page"
+    UNREADABLE = "`{symbol}`: {owner}"
+    UNPARSED = "a Python unit does not parse, so none of its names is checked: {owner}"
+    REFERENCE = "{owner}"
+    EXPORTER_WITHOUT_PAGE = "{owner} declares __all__ but has no API page; add it to the groups"
+    UNDOCUMENTED_EXPORT = "{owner}.__all__ exports {member} ({symbol}), which no API page documents"
+
+
+class Problem(NamedTuple):
+    """A use or an export that leaves the documented API: why (`Why`), the code or name it is (`symbol`),
+    the module or class it leaves through, or the error's own account (`owner`), and the member it names."""
+
+    why: Why
+    symbol: str
+    owner: str
+    member: str = ""
+
+    def __str__(self) -> str:
+        return self.why.value.format(symbol=self.symbol, owner=self.owner, member=self.member)
+
+
+def called_attribute(cls: griffe.Object, path: list[str]) -> Problem | None:
     """Why calling `path`, an instance's member, leaves the documented API:
     the member is a value an instance holds, not a method, which is what a
     method renamed to make room for a field of the same name leaves behind."""
@@ -694,7 +725,7 @@ def called_attribute(cls: griffe.Object, path: list[str]) -> str | None:
     if member is None:
         return None
     if member.is_attribute and "instance-attribute" in member.labels and "property" not in member.labels:
-        return f"`{'.'.join(path)}(...)`: {path[1]} is a value {cls.path} holds, not a method"
+        return Problem(Why.VALUE_CALLED, ".".join(path), cls.path, path[1])
     return None
 
 
@@ -714,7 +745,7 @@ def outside_bases(cls: griffe.Class) -> bool:
 
 
 def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str],
-                     pages: dict[str, Page]) -> str | None:
+                     pages: dict[str, Page]) -> Problem | None:
     """Why `path`, which starts at `start`, leaves the documented API, or None."""
     current = start
     for depth, attribute in enumerate(path[1:], 2):
@@ -724,7 +755,7 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
                 return None
             member = current.members.get(attribute)
             if member is None or attribute.startswith("_"):
-                return f"`{used}`: {current.path} has no public {attribute}"
+                return Problem(Why.NO_PUBLIC, used, current.path, attribute)
             current = inside(member)
             # `dew.pipeline` names the function its own module exports.
             if current is not None and current.is_module and f"{current.path}.{attribute}" in home:
@@ -733,14 +764,16 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
                 # Another package's object, whose members this does not read.
                 return None
             if not current.is_module and current.path not in home:
-                return f"`{used}` ({current.path}) is not documented"
+                return Problem(Why.NOT_DOCUMENTED, used, current.path)
         elif current.is_class:
             if attribute.startswith("_") and not attribute.startswith("__"):
-                return f"`{used}`: {attribute} is private to {current.path}"
+                return Problem(Why.PRIVATE, used, current.path, attribute)
             members = current.all_members
             if attribute not in members:
                 # A base outside Dew (flax, a TypedDict) may define it.
-                return None if outside_bases(current) else f"`{used}`: {current.path} has no {attribute}"
+                if outside_bases(current):
+                    return None
+                return Problem(Why.NO_MEMBER, used, current.path, attribute)
             current = inside(members[attribute])
             if current is None:
                 # Another package's object, whose members this does not read.
@@ -748,7 +781,7 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
         else:
             return None
     if current.is_module and current.path not in pages:
-        return f"`{'.'.join(path)}` is the module {current.path}, which has no API page"
+        return Problem(Why.PAGELESS_MODULE, ".".join(path), current.path)
     return None
 
 
@@ -806,7 +839,7 @@ def documented(package: griffe.Module, paths: list[str]) -> tuple[dict[str, Page
 
 
 def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str, Page],
-                  home: dict[str, str]) -> list[str]:
+                  home: dict[str, str]) -> list[Problem]:
     """Unresolved code and declaration references, with each Python unit seeing earlier units' bindings."""
     bound: dict[str, str] = {}
     problems = [problem for code, shown in usage_code(file, path)
@@ -815,21 +848,21 @@ def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str
         try:
             render_references(package, path.read_text())
         except Unresolved as error:
-            problems.append(str(error))
+            problems.append(Problem(Why.REFERENCE, "", str(error)))
     return problems
 
 
-def undocumented(package: griffe.Module, pages: dict[str, Page], home: dict[str, str]) -> list[str]:
+def undocumented(package: griffe.Module, pages: dict[str, Page], home: dict[str, str]) -> list[Problem]:
     """Each module declaring __all__ without a page, and each name it exports that no page documents."""
     problems = []
     for module in iter_modules(package):
         if module.exports is None:
             continue
         if module.path not in pages:
-            problems.append(f"{module.path} declares __all__ but has no API page; add it to the groups")
+            problems.append(Problem(Why.EXPORTER_WITHOUT_PAGE, module.path, module.path))
         for entry in public_entries(module):
             if entry.canonical not in home:
-                problems.append(f"{module.path}.__all__ exports {entry.name} ({entry.canonical}), which no API page documents")
+                problems.append(Problem(Why.UNDOCUMENTED_EXPORT, entry.canonical, module.path, entry.name))
     return problems
 
 
@@ -871,7 +904,7 @@ def main() -> None:
 
     # Coverage: every module that declares __all__ has a page, and every exported
     # name and every name the docs import is documented.
-    problems = undocumented(package, pages, home)
+    problems: list[str] = [str(problem) for problem in undocumented(package, pages, home)]
     # A file shows the API as it is, or as the commit its install pins holds it (`pinned`).
     shown: dict[str, tuple[griffe.Module, dict[str, Page], dict[str, str]]] = {}
     for file, path in usage_files():

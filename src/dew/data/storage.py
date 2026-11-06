@@ -15,7 +15,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, NamedTuple, Protocol, TypedDict, runtime_checkable
@@ -352,6 +352,60 @@ def mirror_metrics() -> dict[str, float]:
     if not held:
         return {}
     return {f"data/mirror/{name}": float(sum(stats[name] for stats in held)) for name in held[0]}
+
+
+MIRRORED = "dew_mirror"
+"""The key under which a loading worker's position carries its process's mirror counters
+(`dew.data.readers.WorkerMirrors`): `{"process": <its process>, "counts": mirror_metrics()}`."""
+
+MIRRORS = "dew_mirrors"
+"""The key under which a position that reads its loading workers' positions without keeping them (an
+elastic read's order, `dew.data.elastic_order`) carries their mirror counters, by process."""
+
+
+def carried_mirrors(state: Mapping[str, object] | Sequence[object] | None) -> dict[str, dict[str, float]]:
+    """Each loading worker's mirror counters a reader's position carries (`MIRRORED`, `MIRRORS`), by the
+    worker's process, each its latest: cumulative, so a worker's counters count once."""
+    found: dict[str, dict[str, float]] = {}
+    if isinstance(state, Mapping):
+        node = state.get(MIRRORED)
+        if isinstance(node, Mapping) and isinstance(node.get("process"), str):
+            found[str(node["process"])] = _counted(node["counts"])
+        held = state.get(MIRRORS)
+        if isinstance(held, Mapping):
+            found.update({str(process): _counted(counts) for process, counts in held.items()})
+        for value in state.values():
+            if isinstance(value, (Mapping, list, tuple)):
+                found.update(carried_mirrors(value))
+    elif isinstance(state, (list, tuple)):
+        for value in state:
+            if isinstance(value, (Mapping, list, tuple)):
+                found.update(carried_mirrors(value))
+    return found
+
+
+def _counted(counts: object) -> dict[str, float]:
+    """Mirror counters as a position carries them (`mirror_metrics`), by name."""
+    if not isinstance(counts, Mapping):
+        raise ValueError(f"a position's mirror counters are a mapping, not {counts!r}")
+    return {str(name): float(value) for name, value in counts.items()}
+
+
+def without_mirrors(state: JSON) -> JSON:
+    """A position, as JSON, with the mirror counters it carries emptied: a read's metrics, not its place,
+    which a saved position keeps none of (`carried_mirrors`); the position itself as it is."""
+    match state:
+        case dict():
+            emptied = {key: without_mirrors(value) for key, value in state.items()}
+            if isinstance(state.get(MIRRORED), dict):
+                emptied[MIRRORED] = {"process": "saved", "counts": {}}
+            if isinstance(state.get(MIRRORS), dict):
+                emptied[MIRRORS] = {}
+            return emptied
+        case list():
+            return [without_mirrors(value) for value in state]
+        case _:
+            return state
 
 
 # Registered as this module loads, which reads no configuration, so `dewcache::` URLs open through

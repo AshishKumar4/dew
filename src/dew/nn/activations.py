@@ -33,7 +33,7 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype
 
-from .derivatives import Protected, declared_tangent
+from .derivatives import Protected, contracted, declared_tangent
 from .kernels import norm_swiglu
 from .precision import at_least_fp32, capped_logits, rounded_to
 
@@ -177,7 +177,8 @@ def _exact_gelu_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]
     return output, jax.lax.optimization_barrier(tangent.astype(x.dtype))
 
 
-exact_gelu = declared_tangent(Protected(), _exact_gelu, _exact_gelu_jvp)
+exact_gelu = contracted("test_an_exact_gelu_holds_every_order")(
+    declared_tangent(Protected(), _exact_gelu, _exact_gelu_jvp))
 
 
 @dataclasses.dataclass(frozen=True)

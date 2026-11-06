@@ -72,6 +72,13 @@ Scope is per rule, because the rules are not all about the same thing:
   launch point's (`nn/kernels/launches.py`), which holds each launch to the
   per-shard boundary (`sharding.per_shard`), so no route launches a kernel over
   operands an automatic mesh axis splits (rows 1897, 1923, 4077).
+- SLOP028 is about `src/<package>`: every custom derivative (`DERIVATIVE_MAKERS`:
+  JAX's custom_jvp and custom_vjp, Dew's declaring functions and linear_tangent)
+  declares at its seam the contract that holds it, `contracted(test)` of
+  `dew.nn.derivatives`, decorating it or wrapping its making call: `test` the
+  name of exactly one test function of tests/test_contracts_*.py
+  (`assert_contract`: every order finite against its float64 truth and an
+  independent plain formula) (row 4411; `lint_derivatives`).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -104,6 +111,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import enum
 import functools
 import hashlib
 import io
@@ -118,6 +126,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lint_derivatives as derivative_rules
 import lint_promotions as promotion_rules
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
@@ -187,15 +196,32 @@ GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "puten
                  "mark_as_parsed", "register_event_listener", "filterwarnings", "simplefilter")
 
 
+class Ratchet(enum.Enum):
+    """Why SLOP020 holds the tolerance inventory (`ratchet`, `tolerances`), which a finding names beside its
+    message (`Finding.ratchet`)."""
+
+    ADDS = "a commit adds a file's entry"
+    RAISES = "a commit raises a file's count"
+    RENAMED_APART = "a merge keeps one entry under the two names its parents renamed it to"
+    REMOVES = "a commit removes the inventory"
+    SHALLOW = "the checkout's history is shallow"
+    UNREADABLE = "git cannot read the checkout's history"
+    STALE = "a file holds fewer comparisons than its entry counts"
+
+
 @dataclass(frozen=True)
 class Finding:
-    """One finding, printed as `path:line:col: SLOPxxx message`."""
+    """One finding, printed as `path:line:col: SLOPxxx message`; a ratchet's also names why (`ratchet`),
+    the commit it holds (`commit`, `HEAD` against its base) and the file whose entry it holds (`file`)."""
 
     path: str
     line: int
     col: int
     code: str
     message: str
+    ratchet: Ratchet | None = None
+    commit: str = ""
+    file: str = ""
 
     def __str__(self) -> str:
         return f"{self.path}:{self.line}:{self.col}: {self.code} {self.message}"
@@ -2083,7 +2109,7 @@ def _inventory_at(checkout: Path, commit: str) -> dict | None:
 
 def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict,
               authorized: dict[str, int] | None = None,
-              grants: dict[str, int] | None = None) -> Iterator[tuple[str, str]]:
+              grants: dict[str, int] | None = None) -> Iterator[tuple[str, Ratchet, str]]:
     """How `commit`'s inventory `mine` is looser than `parent`'s `theirs`: each file it adds or whose
     count it raises, and how. A file renamed between them carries its entry. Where the
     commit changes SLOP020's reading (`RULE`), a file it leaves unchanged may be added or raised: what
@@ -2100,10 +2126,10 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
             grants[name] = max(grants.get(name, 0), entry["comparisons"])
         if kept is None:
             if not grown:
-                yield name, f"adds {name}"
+                yield name, Ratchet.ADDS, f"adds {name}"
             continue
         if entry["comparisons"] > kept["comparisons"] and not grown:
-            yield name, f"raises {name}'s count"
+            yield name, Ratchet.RAISES, f"raises {name}'s count"
 
 
 @functools.cache
@@ -2139,7 +2165,7 @@ def _lineage(checkout: Path, walk: list[tuple[str, list[str]]]) -> dict[str, dic
     return lineage
 
 
-def _merge_loosens(name: str, per_parent: list[dict]) -> str | None:
+def _merge_loosens(name: str, per_parent: list[dict]) -> tuple[Ratchet, str] | None:
     """How a commit loosens the file `name` against all its parents at once (`_loosened` against each,
     `per_parent`), or None: its count past every parent's (each parent's own raise judged at its own
     commit, so one parent's allows it)."""
@@ -2148,7 +2174,7 @@ def _merge_loosens(name: str, per_parent: list[dict]) -> str | None:
     return None
 
 
-def _duplicated(lineage: dict[str, frozenset[str]]) -> Iterator[str]:
+def _duplicated(lineage: dict[str, frozenset[str]]) -> Iterator[tuple[str, str]]:
     """A merge keeping one entry under two names (its parents having renamed it apart): each name's
     count is that one entry's allowance, so together they hold it twice."""
     by_origin: dict[str, list[str]] = {}
@@ -2157,8 +2183,9 @@ def _duplicated(lineage: dict[str, frozenset[str]]) -> Iterator[str]:
             by_origin.setdefault(origin, []).append(name)
     for origin, names in sorted(by_origin.items()):
         if len(names) > 1:
-            yield (f"keeps the entry made as {origin.split(':', 1)[1]} as {' and '.join(names)}, its parents "
-                   f"having renamed it apart")
+            made = origin.split(':', 1)[1]
+            yield made, (f"keeps the entry made as {made} as {' and '.join(names)}, its parents "
+                         f"having renamed it apart")
 
 
 def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
@@ -2186,11 +2213,11 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
         fresh = set(_git(checkout, "rev-list", "HEAD", f"^{merged}").split()) if merged else None
     except (subprocess.CalledProcessError, FileNotFoundError) as error:
         yield Finding(INVENTORY, 1, 1, "SLOP020", "holds the inventory to its history, which git cannot "
-                      f"read here ({error}); run with the repository's history")
+                      f"read here ({error}); run with the repository's history", Ratchet.UNREADABLE)
         return
     if shallow:
         yield Finding(INVENTORY, 1, 1, "SLOP020", "holds the inventory to its history, and this checkout is "
-                      "shallow: fetch it whole (`git fetch --unshallow`)")
+                      "shallow: fetch it whole (`git fetch --unshallow`)", Ratchet.SHALLOW)
         return
     head_id = _git(checkout, "rev-parse", "HEAD").strip()
     head = _inventory_at(checkout, head_id)
@@ -2212,11 +2239,11 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
             if mine is None:
                 walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} removes the inventory "
                                       f"its parent {parent[:9]} kept; an empty inventory stays, as "
-                                      f"`files: {{}}`"))
+                                      f"`files: {{}}`", Ratchet.REMOVES, commit[:9]))
                 continue
             granting = grants if fresh is None or commit in fresh else None
             found = _loosened(checkout, commit, parent, mine, theirs, grants=granting)
-            loosened.append((parent, dict(found)))
+            loosened.append((parent, {name: (kind, text) for name, kind, text in found}))
         if not loosened:
             continue
         against = ("its parent " if len(loosened) == 1 else "its parents ") + ", ".join(
@@ -2224,18 +2251,22 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
         for name in sorted({name for _, found in loosened for name in found}):
             why = _merge_loosens(name, [found for _, found in loosened])
             if why:
-                walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} against {against} {why}"))
+                kind, text = why
+                walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} against {against} {text}",
+                                      kind, commit[:9], name))
         if len(loosened) > 1 and mine is not None:
-            walked += [Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} {why}")
-                       for why in _duplicated(lineage.get(commit, {}))]
+            walked += [Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} {text}", Ratchet.RENAMED_APART,
+                               commit[:9], made)
+                       for made, text in _duplicated(lineage.get(commit, {}))]
     if merged is not None:
         kept = _inventory_at(checkout, merged)
         if kept is not None and head is None:
             yield Finding(INVENTORY, 1, 1, "SLOP020",
-                          f"HEAD removes the inventory {base}'s {merged[:9]} keeps")
+                          f"HEAD removes the inventory {base}'s {merged[:9]} keeps", Ratchet.REMOVES, "HEAD")
         elif kept is not None:
-            for _, why in _loosened(checkout, head_id, merged, head, kept, authorized=grants):
-                yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {why}")
+            for name, kind, text in _loosened(checkout, head_id, merged, head, kept, authorized=grants):
+                yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {text}", kind,
+                              "HEAD", name)
     yield from walked
 
 
@@ -2272,7 +2303,8 @@ def tolerances(module: Module) -> Iterator[Finding]:
             yield Finding(module.relative, 1, 1, "SLOP020",
                           f"{INVENTORY} counts {entry['comparisons']} tolerance comparisons here and "
                           f"the file holds {len(found)}: "
-                          + ("remove its entry" if not found else f"lower it to {len(found)}"))
+                          + ("remove its entry" if not found else f"lower it to {len(found)}"),
+                          Ratchet.STALE, file=module.relative)
             return
         else:
             return
@@ -2281,8 +2313,16 @@ def tolerances(module: Module) -> Iterator[Finding]:
                       f"{what} compares floats within a tolerance ({why}); {gate}")
 
 
+def derivative_contracts(module: Module) -> Iterator[Finding]:
+    """SLOP028: every custom derivative of `module` declares the contract that holds it
+    (`derivative_rules.missing`)."""
+    checkout = module.path.parents[len(Path(module.relative).parts) - 1]
+    for line, col, message in derivative_rules.missing(module.relative, module.tree, checkout):
+        yield Finding(module.relative, line, col, "SLOP028", message)
+
+
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches)
+                  pallas_launches, derivative_contracts)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 
