@@ -826,6 +826,7 @@ class MultiHeadLatentAttention(LinearProducts):
         own = None if metadata is None else [
             name for name, given in (("pairwise_mask", metadata.pairwise_mask),
                                      ("key_runs", metadata.key_runs),
+                                     ("tree_parents", metadata.tree_parents),
                                      ("entered", metadata.entered),
                                      ("key_positions", metadata.key_positions),
                                      ("position_bias", metadata.position_bias)) if given is not None]
