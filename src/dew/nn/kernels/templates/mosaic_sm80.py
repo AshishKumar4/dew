@@ -249,18 +249,16 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     def _left(self, lhs):
         """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's (an
-        accumulator's) cast, in registers where each warp holds whole rows of it, else through the bound
-        relay tile (`relaying`): every warp's columns stored, then each warp's rows read whole, a sync after
-        each so no warp reads a column not yet stored or stores over one another still reads."""
+        accumulator's) cast, in registers where each warp holds whole rows of it or no relay tile is bound,
+        else through the bound one (`relaying`): every warp's columns stored, then each warp's rows read
+        whole, a sync after each so no warp reads a column not yet stored or stores over one another still
+        reads."""
         if not isinstance(lhs, jax.Array):
             return plgpu.load(lhs, layout=self.lhs, optimized=self._matrix_loads)
         value = lhs.astype(self.dtype)
-        if not self.relay_bytes(*value.shape):
+        if self.relay is None or not self.relay_bytes(*value.shape):
+            # Unbound, the cast is Mosaic's own, which crosses warps only where its layouts allow.
             return plgpu.layout_cast(value, self.lhs)
-        if self.relay is None:
-            raise ValueError(f"a {value.shape} register operand on {self.m_warps} row warps relays "
-                             f"through {self.relay_bytes(*value.shape)} bytes of shared memory: bind them "
-                             "(`relaying`)")
         # A plain tile, read element-wise: a warp's replicated rows (one or two row warps) take no ldmatrix
         # free of bank conflicts from it, and a swizzled one takes no store of the accumulator's layout.
         tile = self.relay.at[:value.shape[0], :value.shape[1]]
