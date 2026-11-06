@@ -54,6 +54,18 @@ the whole release on each host (19 to 22 MB of resident growth on armada) while 
 
 TRACE = []
 COMPILES = []
+EVENTS = []
+PEAK = 0
+
+
+def event(label):
+    global PEAK
+    from dew.telemetry.benchmark import resident_memory
+
+    memory = resident_memory()
+    if memory["VmHWM"] > PEAK + 128 * 1024:
+        PEAK = memory["VmHWM"]
+        EVENTS.append((label, memory["VmRSS"], PEAK, memory["RssAnon"]))
 
 
 def memory_detail():
@@ -97,6 +109,9 @@ def resident_growth(into: list[int]) -> Iterator[None]:
     ctypes.CDLL(None).malloc_trim(0)
     Path("/proc/self/clear_refs").write_text("5")
     before = resident_memory()["VmRSS"]
+    global PEAK
+    PEAK = before
+    EVENTS.clear()
     detail_before = memory_detail()
     modules_before = set(sys.modules)
     compiles_before = len(COMPILES)
@@ -109,7 +124,8 @@ def resident_growth(into: list[int]) -> Iterator[None]:
     record = {"before": detail_before, "after": detail_after,
               "new_modules": sorted(set(sys.modules) - modules_before),
               "compile_count": len(COMPILES) - compiles_before,
-              "compiles": [line[:120] for line in COMPILES[compiles_before:]][:8]}
+              "compiles": [line[:120] for line in COMPILES[compiles_before:]][:8],
+              "events": list(EVENTS)}
     if tracing:
         record["traced"] = tracemalloc.get_traced_memory()
         record["top"] = [str(s) for s in tracemalloc.take_snapshot().statistics("lineno")[:4]]
@@ -232,6 +248,24 @@ def released(args) -> dict:
     from dew._cli.main import main
     from dew.interop import saved_sources
     from dew.interop.pretrained import PretrainedDecoder
+    from dew.interop import safetensors_io
+    from dew.interop.streaming import WeightLayout
+
+    original_export = WeightLayout.export
+    original_publish = safetensors_io._publish
+
+    def tensor_export(self, *positional, **options):
+        value = original_export(self, *positional, **options)
+        event("tensor " + self.name)
+        return value
+
+    def publish(*positional, **options):
+        value = original_publish(*positional, **options)
+        event("publish")
+        return value
+
+    WeightLayout.export = tensor_export
+    safetensors_io._publish = publish
 
     class Capture(logging.Handler):
         def emit(self, record):
