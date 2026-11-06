@@ -71,6 +71,7 @@ def _parse_absl_flags() -> None:
 _parse_absl_flags()
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew import kernels
     from dew._version import __version__
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset
@@ -124,6 +125,7 @@ _EXPORTS = {
     "pipeline": "dew.inference",
     "Profiler": "dew.telemetry.profile",
     "gpu_facts": "dew.nn.kernels.generation", "GpuFacts": "dew.nn.kernels.generation",
+    "kernels": "dew.kernels",
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
@@ -178,6 +180,7 @@ __all__ = [
     "WandbTracker",
     "__version__",
     "gpu_facts",
+    "kernels",
     "pipeline",
     "sample",
 ]
