@@ -78,9 +78,15 @@ def _step(case: dict[str, str]):
     hooks, starts = FORMS[case["form"]], _starts(case)
 
     def ours(operands):
-        return chunk_on(_kernel(case), hooks, dataclasses.replace(operands, starts=starts))
+        return _wide(chunk_on(_kernel(case), hooks, dataclasses.replace(operands, starts=starts)))
 
     return with_gradients(ours)
+
+
+def _wide(results):
+    """A call's output and final memory in fp32, as its cotangents are drawn: the cast's pullback rounds them
+    to the call's own dtypes."""
+    return jax.tree.map(lambda x: x.astype(jnp.float32), results)
 
 
 @functools.cache
@@ -121,7 +127,7 @@ def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
     hooks, starts = FORMS[named["form"]], _starts(named)
 
     def reference(operands):
-        return token_by_token(hooks, dataclasses.replace(operands, starts=starts))
+        return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
 
     assert_as_exact(jax.jit(_step(named)), jax.jit(with_gradients(reference)),
                     functools.partial(_drawn, named), "-".join(case), seeds=FEWEST_SEEDS)
