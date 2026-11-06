@@ -323,12 +323,11 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     latent = jnp.asarray(np.load(source / "sd3_pipeline.npz")["pipeline.x_T"][:1])
     condition = DenoisingCondition(jnp.ones((1, 4, 32), jnp.float32),
                                    jnp.ones((1, 10), jnp.float32))
-    trained = loaded.model.apply({"params": state.variables["params"],
-                                  "buffers": state.variables["buffers"]},
-                                 latent, jnp.asarray([0.5]), condition)
-    reloaded = again.model.apply({"params": again.variables["params"],
-                                  "buffers": again.variables["buffers"]},
-                                 latent, jnp.asarray([0.5]), condition)
+    # The reload builds the trained model, so one compiled forward reads both trees.
+    assert again.model == loaded.model
+    forward = jax.jit(lambda tree: loaded.model.apply(tree, latent, jnp.asarray([0.5]), condition))
+    trained = forward({"params": state.variables["params"], "buffers": state.variables["buffers"]})
+    reloaded = forward({"params": again.variables["params"], "buffers": again.variables["buffers"]})
     np.testing.assert_array_equal(reloaded, trained)
 
     # Diffusers' own classes read the export: every component cleanly, the
