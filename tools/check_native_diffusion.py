@@ -301,7 +301,7 @@ def check_pipeline(directory, part: str, streamed: bool = False):
     key = jax.random.PRNGKey(17)
     if part == "walk":
         source = bundle(directory)
-        qualified(directory.name, source, reference, meta, key)
+        qualified(directory, source, reference, meta, key)
         if streamed:
             streamed_parity(directory, source, reference, meta, key)
         print(json.dumps({"directory": str(directory), "walk": "held"}))
@@ -348,14 +348,41 @@ def walk_leaves(name, source, meta, key, start, wanted=None, bypassed=False):
     return {leaf: np.asarray(computed[leaf]) for leaf in wanted}
 
 
-def qualified(name, source, reference, meta, key, label=""):
-    """`source`'s walk on par with its saved pipeline's own Diffusers pipeline over drawn prompts, noise
-    and pixels (check 1, `walk_leaves` against the task's recording), each group of its leaves on its own
-    seeds (`groups`, WALK_SEEDS), SDXL's image call from Dew's own encoding as clean image latents on par at
-    its start too, and the public task call walking to the same images on the saved reference's inputs.
-    `label` prefixes each check's name, so two loads report apart."""
+BYPASSED_SEEDS = 8
+"""The declared seeds for check 1 of SDXL's image call started from Dew's own encoding against its start
+from the pixels (`bypassed_arms`), sized by `seeds_for` paired on armada (11-06)."""
+
+
+def bypassed_arms(directory, source, meta, key, mask):
+    """SDXL's image call's start from Dew's own encoding of the pixels as clean image latents, and from the
+    pixels, each a function of a draw's inputs (`walk_leaves`), and the pixels' start with the pipeline
+    loaded at float64, its truth."""
+    from reference_error import as_given
+
+    def start(loaded, bypassed=False):
+        return lambda inputs: walk_leaves(directory.name, loaded, meta, key, {**inputs, **mask}, ("start",),
+                                          bypassed)
+
+    with jax.enable_x64(True):
+        wide = Pretrained.load(str(directory), dtype="float64", attention_impl="xla")
+
+    def truth(inputs):
+        with jax.enable_x64(True):
+            return start(wide)(inputs)
+
+    return as_given(start(source, bypassed=True)), as_given(start(source)), as_given(truth)
+
+
+def qualified(directory, source, reference, meta, key, label=""):
+    """`source`, the pipeline saved at `directory`, its walk on par with its own Diffusers pipeline over
+    drawn prompts, noise and pixels (check 1, `walk_leaves` against the task's recording), each group of
+    its leaves on its own seeds (`groups`, WALK_SEEDS), SDXL's image call from Dew's own encoding as clean
+    image latents on par at its start too, with Diffusers' and with Dew's start from the pixels
+    (`bypassed_arms`), and the public task call walking to the same images on the saved reference's
+    inputs. `label` prefixes each check's name, so two loads report apart."""
     from reference_error import as_given, assert_as_exact, indexed_recording, recording
 
+    name = Path(directory).name
     draw = draw_for(name)
     mask = {"mask": reference["mask"]} if "mask" in reference else {}
 
@@ -373,10 +400,11 @@ def qualified(name, source, reference, meta, key, label=""):
                                                    leaves=("start",))
         assert_as_exact(dew(("start",), bypassed=True), recorded, drawn, f"{label}{name} bypassed start",
                         seeds=seeds, truth_fn=truth)
-        # And on par with Dew's own start from the pixels, whose Diffusers' start may be the farther: the
-        # recorded walk's seeds, its truth recorded at those alone (a paired sizing draws past them).
-        assert_as_exact(dew(("start",), bypassed=True), dew(("start",)), drawn,
-                        f"{label}{name} bypassed start against the pixels' start", seeds=seeds,
+        # And on par with Dew's own start from the pixels, whose Diffusers' start may be the farther: two Dew
+        # arms over free draws, the pixels' start in float64 the truth.
+        bypassed, pixels, truth = bypassed_arms(directory, source, meta, key, mask)
+        assert_as_exact(bypassed, pixels, lambda seed: (draw(seed),),
+                        f"{label}{name} bypassed start against the pixels' start", seeds=BYPASSED_SEEDS,
                         truth_fn=truth)
     # The same walk through the task facade: the same images.
     given, null, process, times = selection(source, meta)
@@ -398,7 +426,7 @@ def streamed_parity(directory, whole, reference, meta, key):
     for left, right in zip(jax.tree.leaves(streamed.variables), jax.tree.leaves(whole.variables),
                            strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
-    qualified(directory.name, streamed, reference, meta, key, label="streamed ")
+    qualified(directory, streamed, reference, meta, key, label="streamed ")
 
 
 def pipeline_arms(site, root=None):
