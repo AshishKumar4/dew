@@ -1227,12 +1227,10 @@ class CausalSelfAttention(nn.Module):
             mask, runs, window, key_places, query_places, valid = own
             causal, documents, groups = False, None, _Groups()
         if self.ctx.attention_chunk is not None:
-            mask = dense_visibility(mask, documents, causal, window, valid, runs,
-                                    places if query_places is None else query_places, key_places, S,
+            mask = dense_visibility(mask, documents, causal, window, valid, runs, places, key_places, S,
                                     key.shape[-3], self.ctx.attention_chunk, block_groups=groups.block_groups,
                                     image_groups=groups.image_groups)
             causal, window, documents, groups, valid, runs = False, None, None, _Groups(), None, None
-            query_places = None
             implementation = masked()
         max_segments = (None if documents is None else 1 if isinstance(documents, CrossDocuments)
                         else coordinates_of(attention_metadata, B, S).max_segments)

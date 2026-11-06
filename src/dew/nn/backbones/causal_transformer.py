@@ -84,15 +84,7 @@ from ..hyper_connections import (
     first_stream,
     stream_head,
 )
-from ..inputs import (
-    AttentionMetadata,
-    CrossContext,
-    LayerInputs,
-    PredictionPhase,
-    check_tree,
-    coordinates_of,
-    numbered_blocks,
-)
+from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
 from ..kv_cache import DecodeCursor, KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
@@ -124,6 +116,7 @@ from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts
+from .call_metadata import call_metadata
 from .decoder_block import (
     DECODER_REMAT,
     REMAT_POLICIES,
@@ -1620,10 +1613,11 @@ class CausalTransformer(LinearProducts):
         - `progress` is a training step's (`dew.nn.progress`), which its DEX
           layers anneal over; None is the run's end, outside a training step.
         """
-        attention_metadata = self._attention_metadata(
-            tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
+        attention_metadata = call_metadata(
+            self, tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
             attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
-            key_valid=attention_key_valid,
+            key_valid=attention_key_valid, tree_ordered=self.engram is not None or (
+                self.mixture is not None and self.mixture.routing_block is not None),
             whole_blocks=whole_blocks, progress=progress, tree=attention_tree)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
@@ -1682,81 +1676,6 @@ class CausalTransformer(LinearProducts):
             self.sow('prediction_inputs', 'states', prediction,
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction
-
-    def _attention_metadata(self, tokens, decode: bool, image_groups, block_groups, rotary_positions,
-                            pairwise_mask, key_positions, key_runs, media_mask, admitted=None,
-                            coordinates: Coordinates | None = None,
-                            conditioning: Mapping[str, jax.Array] | None = None, *,
-                            whole_blocks: bool = False, progress: Progress | None = None,
-                            tree: tuple[int, ...] | None = None, key_valid=None) -> AttentionMetadata | None:
-        """What the layers read beside the residual, None for a call that
-        carries none of it: the tokens' layout `hidden_and_mtp_inputs`
-        converted (`coordinates`), the token ids a hash router selects by,
-        the engram layers' bucket ids, the media mask, which only a model
-        with engram or a router with a media bias reads, and the
-        cross-attention's context."""
-        if conditioning and self.cross_attention is None:
-            raise TypeError(f"this decoder has no cross-attention to read the conditioning "
-                            f"{sorted(conditioning)}")
-        context = CrossContext.from_conditioning(conditioning) if conditioning else None
-        if context is not None and context.embeddings.shape[0] != tokens.shape[0]:
-            raise ValueError(f"a context row per token row, got {context.embeddings.shape[0]} for "
-                             f"{tokens.shape[0]}")
-        if context is not None:
-            # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
-            # a standalone call, and a cached and a full one, project the same values.
-            context = dataclasses.replace(context, embeddings=context.embeddings.astype(self.context_dtype))
-        # A layer whose mixer reads no pairwise mask or key runs refuses one (`MixerCall`).
-        if key_positions is not None and pairwise_mask is None and key_runs is None:
-            raise ValueError("attention_key_positions requires attention_pairwise_mask or "
-                             "attention_key_runs")
-        if pairwise_mask is not None and key_runs is not None:
-            raise ValueError("attention_key_runs and attention_pairwise_mask each name a call's whole "
-                             "visibility; pass one")
-        if tree is not None:  # N-gram hashes and routing blocks read the tokens in their order.
-            routed = self.mixture is not None and self.mixture.routing_block is not None
-            positions = None if coordinates is None else coordinates.positions
-            check_tree(tree, tokens.shape[1], decode=decode, ordered=self.engram is not None or routed,
-                       positioned=positions is not None or rotary_positions is not None)
-        if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
-            media_mask = None
-        if decode and coordinates is not None and coordinates.max_segments > 1:
-            raise ValueError(
-                "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
-                "call would attend across documents; prefill each document into a row of its own")
-        engram_ids = (None if self.engram is None else self.engram_hashes(tokens, coordinates, decode,
-                                                                          media_mask))
-        if context is not None and context.segments is not None:
-            # A context of several documents is read by the call's tokens of each document alone.
-            if coordinates is None or coordinates.segments is None:
-                raise ValueError("a context of several documents is read by packed rows, which name "
-                                 "their tokens' documents (segment_ids or coordinates)")
-            context = dataclasses.replace(context, queries=coordinates.segments)
-        # A block router's blocks are numbered once for every routed layer.
-        block = None if self.mixture is None else self.mixture.routing_block
-        blocks = None if block is None else numbered_blocks(
-            coordinates_of(None, *tokens.shape[:2]) if coordinates is None else coordinates, tokens.shape[:2],
-            block)
-        if (coordinates is None and image_groups is None and block_groups is None and rotary_positions is None
-                and pairwise_mask is None and key_positions is None and key_runs is None and key_valid is None
-                and tree is None
-                and not self.hash_layers
-                and engram_ids is None and media_mask is None and admitted is None and blocks is None
-                and context is None and (progress is None or progress.updates is None)):
-            return None
-        return AttentionMetadata(
-            coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
-            rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
-            key_runs=key_runs, key_valid=key_valid, token_ids=tokens if self.hash_layers else None,
-            engram_ids=engram_ids,
-            media=media_mask,
-            admitted=admitted, blocks=blocks, context=context,
-            # One row's progress apiece, as the metadata's other inputs are held by row, which a
-            # pipeline's microbatches slice (`run_pipeline`).
-            progress=None if progress is None or progress.updates is None else jnp.broadcast_to(
-                jnp.asarray(progress.updates, jnp.int32), tokens.shape[:1]),
-            routing_block=block, tree_parents=tree,
-            whole_blocks=whole_blocks and block_groups is not None)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says (`looping.run_loop`): its block's later
