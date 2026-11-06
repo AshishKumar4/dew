@@ -10,18 +10,21 @@ revision's compiles are its own.
 
 The window builds every case's every arm first (each compile, and a first call whose output's digest is kept,
 so arms are compared bitwise), then times them in interleaved rounds: every round passes every case, its arms
-in an order reversed from the round before (ABBA), each arm timed `repeats` calls. Each round also times the
-case's reference arm against itself (`<reference>~aa`, its own build in its own place in the order), so a row
-carries the window's own noise. Time is the device's (dew.telemetry.benchmark.device_time: CUPTI, each kernel
-and their sum, an eviction's own left out where the case evicts), with each call's wall clock beside it; a
-case whose question is host-bound latency asks for the wall clock alone (`"clock": "wall"`). Profiles (Nsight
+in an order reversed from the round before (ABBA), each arm timed `repeats` calls. The first rounds are its
+warm-up (`WARMUP`): timed and kept as every round is, marked, and left out of the verdict, so a round that
+still holds an arm's first work (autotuning, allocation, clocks rising) decides nothing. Each round also times
+the case's reference arm against itself (`<reference>~aa`, its own build in its own place in the order), so a
+row carries the window's own noise. Time is the device's (dew.telemetry.benchmark.device_time: CUPTI, each
+kernel and their sum, an eviction's own left out where the case evicts), with each call's wall clock beside it;
+a case whose question is host-bound latency asks for the wall clock alone (`"clock": "wall"`). Profiles (Nsight
 Compute) run after every round, each arm's in a process of its own, never in a timed one.
 
     python tools/timing.py run MANIFEST.json --out DIR    # DIR/timing.jsonl's rows, DIR/profiles' reports
     python tools/timing.py jobs --ref SHA KIND=MANIFEST.json ... > JOBS.json   # a window a GPU kind
     python tools/timing.py worker                         # one process's arms, JSON lines on stdin and stdout
 
-A row: case, cell, arm, tree, jax, implementation, round, repeat, order (its place in the window's run order),
+A row: case, cell, arm, tree, jax, implementation, round (a warm-up's below 0), warmup, repeat, order (its
+place in the window's run order),
 device_ms (the sum), kernels ([name, ms], launch order), wall_ms, digest, evicted, cache ("cold": each
 process's compilation cache is new to its window), gpu (name, uuid, driver, clocks as the round began)."""
 import argparse
@@ -44,6 +47,9 @@ tree's: one instrument for every arm, whatever the arm's commit holds."""
 ROUNDS = 5
 """A case's rounds unless it names its own: an arm's range and the A/A band are its rounds' ratios, which
 three leave coarse enough for one outlier round to set the band."""
+WARMUP = 1
+"""A case's warm-up rounds unless it names its own, before its `ROUNDS` (the measurement lane's harness proof,
+2026-11-06, A100: the A/A's round ratios ran 0.797-1.002, a first round holding an arm's cold work)."""
 NCU_SECTIONS = ("SpeedOfLight", "MemoryWorkloadAnalysis", "SchedulerStats", "WarpStateStats", "LaunchStats",
                 "Occupancy")
 """The Nsight Compute sections a profile reads unless its case names its own."""
@@ -267,7 +273,7 @@ def run(manifest: dict, out: Path, repo: Path) -> int:
                                                 "arm": arm})
                         units.append({"key": key, "index": index, "cell": cell, "arm": arm,
                                       "process": worker_of, "built": answer})
-                for round_ in range(case.get("rounds", ROUNDS)):
+                for round_ in range(-case.get("warmup", WARMUP), case.get("rounds", ROUNDS)):
                     facts = gpu()
                     for index, _ in enumerate(case["cells"]):
                         mine = [unit for unit in units if unit["index"] == index]
@@ -281,7 +287,7 @@ def run(manifest: dict, out: Path, repo: Path) -> int:
                                     "case": case["name"], "cell": unit["cell"], "arm": unit["arm"]["name"],
                                     "tree": unit["built"]["tree"], "jax": unit["built"]["jax"],
                                     "implementation": unit["arm"].get("implementation"), "round": round_,
-                                    "repeat": repeat, "order": order, **called,
+                                    "warmup": round_ < 0, "repeat": repeat, "order": order, **called,
                                     "digest": unit["built"]["digest"], "evicted": case.get("evict", False),
                                     "cache": "cold", "gpu": facts}) + "\n")
                             order += 1
@@ -326,11 +332,11 @@ def profiled(case: dict, out: Path, repo: Path) -> None:
 def summarized(manifest: dict, out: Path) -> None:
     """The window's verdict, out/summary.json and its table out/summary.md, from its rows, so every window
     decides alike. Per case, cell and arm: the median of its measure (device ms, or wall ms where the case's
-    clock is the wall's); its paired ratio to the reference each round (the arm's round median over the
-    reference's), the ratios' median, least and most; the A/A arm's least and most ratio, the window's noise
-    band; `differs` only where the arm's whole range of ratios lies outside the band; and whether its digest
-    is the reference's. Beside them, the window's run order (each `order`'s case, cell and arm) and each
-    round's GPU."""
+    clock is the wall's); its paired ratio to the reference each round past the warm-up (the arm's round
+    median over the reference's), each round's in order, their median, least and most; the A/A arm's least
+    and most ratio, the window's noise band; `differs` only where the arm's whole range of ratios lies
+    outside the band; and whether its digest is the reference's. Beside them, the window's run order (each
+    `order`'s case, cell and arm) and each round's GPU."""
     import statistics
 
     rows = [json.loads(line) for line in (out / "timing.jsonl").read_text().splitlines()]
@@ -339,11 +345,12 @@ def summarized(manifest: dict, out: Path) -> None:
         measure = "wall_ms" if case.get("clock", manifest.get("clock", "device")) == "wall" else "device_ms"
         reference = case.get("reference", case["arms"][0]["name"])
         lines += [f"### {case['name']} ({measure}, reference {reference})", "",
-                  "| cell | arm | median | ratio median | ratio range | differs | digest |",
-                  "|---|---|---|---|---|---|---|"]
+                  "| cell | arm | median | ratio median | ratio range | ratio by round | differs | digest |",
+                  "|---|---|---|---|---|---|---|---|"]
         cells = []
         for index, cell in enumerate(case["cells"]):
-            mine = [row for row in rows if row["case"] == case["name"] and row["cell"] == cell]
+            mine = [row for row in rows if row["case"] == case["name"] and row["cell"] == cell
+                    and not row["warmup"]]
 
             def by_round(arm: str, mine: list[dict] = mine, measure: str = measure) -> dict[int, float]:
                 found: dict[int, list[float]] = {}
@@ -359,7 +366,7 @@ def summarized(manifest: dict, out: Path) -> None:
             arms = []
             for arm in [found["name"] for found in arms_of(case)]:
                 rounds = by_round(arm)
-                ratios = [value / base[round_] for round_, value in rounds.items()]
+                ratios = [rounds[round_] / base[round_] for round_ in sorted(rounds)]
                 values = [row[measure] for row in mine if row["arm"] == arm and row[measure] is not None]
                 # The reference and its A/A are the band's own ends, never judged against it.
                 differs = bool(band and ratios and arm not in (reference, f"{reference}~aa")
@@ -367,13 +374,14 @@ def summarized(manifest: dict, out: Path) -> None:
                 same = next(row["digest"] for row in mine if row["arm"] == arm) == digest
                 arms.append({"arm": arm, "median": statistics.median(values) if values else None,
                              "ratio_median": statistics.median(ratios) if ratios else None,
-                             "ratio_range": [min(ratios), max(ratios)] if ratios else None,
+                             "ratio_range": [min(ratios), max(ratios)] if ratios else None, "ratios": ratios,
                              "differs": differs, "digest_is_reference": same})
                 ranged = f"{min(ratios):.4f}-{max(ratios):.4f}" if ratios else "-"
                 median = f"{arms[-1]['median']:.4f}" if values else "-"
                 ratio = f"{arms[-1]['ratio_median']:.4f}" if ratios else "-"
+                each = " ".join(f"{value:.4f}" for value in ratios) or "-"
                 lines.append(f"| {index}: {json.dumps(cell)} | {arm} | {median} | {ratio} | {ranged} | "
-                             f"{'yes' if differs else 'no'} | {'same' if same else 'differs'} |")
+                             f"{each} | {'yes' if differs else 'no'} | {'same' if same else 'differs'} |")
             cells.append({"cell": cell, "noise_band": list(band) if band else None, "arms": arms})
         cases.append({"case": case["name"], "measure": measure, "reference": reference, "cells": cells})
         lines.append("")
@@ -398,8 +406,9 @@ def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
     windows = []
     for kind, path in manifests.items():
         manifest = json.loads(path.read_text())
-        calls = sum(len(case["cells"]) * (len(case["arms"]) + 1) * case.get("rounds", ROUNDS)
-                    * case.get("repeats", 5) for case in manifest["cases"])
+        calls = sum(len(case["cells"]) * (len(case["arms"]) + 1)
+                    * (case.get("warmup", WARMUP) + case.get("rounds", ROUNDS)) * case.get("repeats", 5)
+                    for case in manifest["cases"])
         windows.append({"name": f"{name}-{kind}", "ref": ref, "gpu": kind, "kind": "timing",
                         "minutes": WINDOW_MINUTES + math.ceil(calls / 60), "keep": [],
                         "run": f'python tools/timing.py run "$SESSION/extra/{path.name}" --out "$OUT"'})
