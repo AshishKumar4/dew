@@ -168,3 +168,23 @@ def test_a_row_over_one_state_decides_each_question_as_its_own_row_does(siblings
                     as_given(lambda variables: scored(alone, windows["alone"], variables)),
                     lambda seed: (initialized(jax.random.key(seed)),), "rows over one state",
                     seeds=STATE_ONCE_SEEDS, truth_fn=truth)
+
+
+def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_one_row(tmp_path):
+    """A decision run of a letter readout over a causal source, its rows asking a request's questions over
+    one state (`shared_state`), trains a step; the task loaded from its run lays a request's three questions
+    in one row and answers each with one of its options."""
+    from run_kinds import lettered, trained
+
+    from dew.data import Memory
+    from dew.decision import Decide, decisions
+
+    rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
+    run = dataclasses.replace(lettered(tmp_path, drawn=False), data=rows, validation=None, shared_state=3)
+    trained(run, tmp_path, "shared")
+    decide = Decide.from_run(str(tmp_path / "runs" / "shared"))
+    assert decide.layout.shared_state == 3
+    [row] = decide.layout.rows(decide.tokenizer, decide.specials, STATES[0], QUESTIONS)
+    assert [laid.name for laid in row.questions] == list(QUESTIONS)
+    answers = decide(STATES[0], QUESTIONS)
+    assert all(answers[name].choice in question.options for name, question in QUESTIONS.items())
