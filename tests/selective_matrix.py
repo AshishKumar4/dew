@@ -46,7 +46,15 @@ def supported(case: dict[str, str]) -> bool:
     return _taken(tuple(case.items()))
 
 
-CASES = ()
+CASES = (
+    ('sm90', 'bf16'),
+    ('sm90', 'fp32'),
+    ('sm90', 'decays-near-one'),
+    ('sm90', 'decays-near-zero'),
+    ('sm90', 'saturated-steps'),
+    ('sm90', 'documents'),
+    ('sm90', 'long'),
+)
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the selector serves
 (`kernel_matrix.covering("selective_scan")`, regenerated where the axes or the selector's support change)."""
 
