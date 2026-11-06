@@ -139,6 +139,8 @@ for seed in range(count):
             Path("/tmp/4522-" + "-".join(name) + ".hlo").write_text(text)
 for key, errors in totals.items():
     path, variant, mode = key
+    if path != "0":
+        continue
     base = np.asarray(totals[path, "literal", mode])
     errors = np.asarray(errors)
     if not np.any(base):
