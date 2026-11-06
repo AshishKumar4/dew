@@ -3605,8 +3605,8 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.39.0",
-     "runs": "diffusers"
+     "version": "0.34.0",
+     "runs": "diffusers-0.34"
     }
    ],
    "note": "Float64 oracle widens upstream float32 casts, tools/diffusers_wan_reference.py:95."
