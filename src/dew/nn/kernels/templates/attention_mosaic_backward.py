@@ -10,7 +10,6 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
@@ -123,9 +122,9 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
 
         family.roles(consumers, consumer, producer)
 
-    scoped = [plgpu.SMEM((consumers, block_q, width), query.dtype),
-              plgpu.SMEM((consumers, block_q, dout.shape[-1]), dout.dtype),
-              plgpu.SMEM((consumers, block_q), jnp.float32),
+    scoped = [family.staged_memory((consumers, block_q, width), query.dtype),
+              family.staged_memory((consumers, block_q, dout.shape[-1]), dout.dtype),
+              family.staged_memory((consumers, block_q), jnp.float32),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     rings = family.streams({"keys": ((block_k, width), key.dtype), "values": ((block_k, value.shape[-1]),
                                                                               value.dtype)},

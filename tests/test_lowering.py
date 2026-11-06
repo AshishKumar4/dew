@@ -1098,6 +1098,28 @@ def test_a_parts_gpu_facts_are_the_facts_its_kernels_read():
         dew.gpu_facts()
 
 
+def test_a_block_chooses_its_ops_kernels_over_a_layers_own():
+    """`dew.kernels.use`, the public kernel choice: an RMSNorm layer naming XLA's norm runs it; within a block
+    choosing the Pallas norm (beside a nested block choosing another op's), the block's choice holds over the
+    layer's, so a row past the Pallas norm's 8192-feature register tile is refused (`KernelRefused`, its op
+    and kernel the block's) rather than run on XLA's in silence; past the block the layer's own runs again;
+    a block naming no op Dew dispatches is refused."""
+    import dew
+    from dew.nn.norms import RMSNorm
+
+    x = jnp.ones((2, 16384), jnp.float32)
+    norm = RMSNorm(implementation="xla")
+    params = norm.init(jax.random.key(0), x)
+    before = norm.apply(params, x)
+    with (dew.kernels.use(rms_norm="pallas"), dew.kernels.use(attention="xla"),
+          pytest.raises(dew.kernels.KernelRefused) as refused):
+        norm.apply(params, x)
+    assert (refused.value.choice, refused.value.kernel) == ("rms_norm", "pallas")
+    np.testing.assert_array_equal(norm.apply(params, x), before)
+    with pytest.raises(ValueError), dew.kernels.use(rms_nrom="pallas"):
+        pass
+
+
 def a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
     """The default device's shared memory a block and multiprocessors come from JAX's device: a bare
     target of its generation, holding none of the table's resources, takes the same ones the
@@ -1510,7 +1532,7 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
                                                 "dense": True})
     assert gradient.padded(weights, tile) == 1 - 64 * 300 / (128 * 512)
     attention = attention_mosaic.MosaicForward()
-    tiles = attention_mosaic_program.Tiles(block_q=64, block_k=128, stages=2, consumers=2)
+    tiles = attention_mosaic_program.Tiles(block_q=64, block_k=128, stages=2, consumers=2, family="wgmma")
     scores = tokamax.BoundArguments(attention, {"query": spec(1, 100, 2, 64), "key": spec(1, 200, 2, 64)})
     assert attention.padded(scores, tiles) == 1 - 100 * 200 / (128 * 256)
 
