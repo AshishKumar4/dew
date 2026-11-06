@@ -48,7 +48,18 @@ images.json (the row's token ids) and images.npz (each question's fp32
 logits under `<id>` and float64 ones under `<id>/f64`, the vision tower
 included).
 
-    PYTHONPATH=src:tools python tools/joint_checkpoint_reference.py [--fla | --images]
+With `--parity`, it reads that head back and records the release over check 1's seeds
+(`recorded_references.record_case`), each seed's requests drawn (`drawn_requests`: states plain or
+structured, choice, score and noul questions of varied counts and options), for the release-parity
+harness (row 4485): parity.npz, its sites `joint` (the release end to end), `joint_head` (its head alone
+on the backbone's fp32 states, recorded as the input `states`) and `joint_images` (end to end with each
+request's drawn pictures, the input `images` and its `image_counts`), each seed's laid-out requests as
+inputs (`tokens`, `lengths`, `options`, `spans`, `question_spans`) and its option logits in the release's
+option order as `scores`, 0 where a question has no such option (check 1 judges finite values alone, so
+`options` marks the real ones); and requests.json, each seed's wire
+requests, a joint_images seed's with its pictures, the input `images`, besides.
+
+    PYTHONPATH=src:tools python tools/joint_checkpoint_reference.py [--fla | --images | --parity]
 """
 
 import json
@@ -255,5 +266,177 @@ def images() -> None:
     np.savez(OUT / "images.npz", **logits)
 
 
+ROWS, QUESTIONS, OPTIONS, WIDTH = 2, 3, 6, 1024
+"""A parity seed's requests, the most questions a request asks and options a question offers, and the
+tokens a laid-out request is padded to."""
+PICTURES, SIDE = 2, 64
+"""The most pictures a joint_images request carries, and their side in pixels."""
+WORDS = ("refund", "charged", "twice", "outage", "login", "invoice", "urgent", "cancel", "upgrade", "late",
+         "broken", "café", "plan", "renewal", "shipping", "password")
+NAMES = ("billing", "technical", "sales", "legal", "security", "account", "other")
+
+
+def drawn_requests(seed: int) -> list[dict]:
+    """Seed `seed`'s wire requests: a plain or structured state, and one to `QUESTIONS` questions, each a
+    noul, a score of two to `OPTIONS` levels or a choice of one to `OPTIONS` options, its criteria a list
+    or a mapping to their descriptions."""
+    rng = np.random.default_rng(seed)
+
+    def text(low: int, high: int) -> str:
+        return " ".join(rng.choice(WORDS, int(rng.integers(low, high))).tolist())
+
+    def question(kind: str) -> dict:
+        if kind == "noul":
+            return {"type": "noul", "instructions": text(3, 7)}
+        if kind == "score":
+            return {"type": "score", "instructions": text(3, 7),
+                    "criteria": [text(1, 3) for _ in range(int(rng.integers(2, OPTIONS + 1)))]}
+        names = rng.choice(NAMES, int(rng.integers(1, OPTIONS + 1)), replace=False).tolist()
+        return {"type": "choice", "instructions": text(3, 7),
+                "criteria": {name: text(1, 4) for name in names} if rng.random() < 0.5 else names}
+
+    requests = []
+    for _ in range(ROWS):
+        state = (text(3, 16) if rng.random() < 0.5 else
+                 {"event": text(2, 5), "notes": [text(1, 4) for _ in range(int(rng.integers(1, 3)))]})
+        kinds = rng.choice(("noul", "choice", "score"), int(rng.integers(1, QUESTIONS + 1)))
+        requests.append({"state": state, "questions": {f"q{index}": question(str(kind))
+                                                       for index, kind in enumerate(kinds)}})
+    return requests
+
+
+def drawn_pictures(seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Seed `seed`'s pictures `[ROWS, PICTURES, SIDE, SIDE, 3]` and how many of them each request carries."""
+    rng = np.random.default_rng((seed, 1))
+    return (rng.integers(0, 256, (ROWS, PICTURES, SIDE, SIDE, 3), np.uint8),
+            rng.integers(1, PICTURES + 1, ROWS).astype(np.int32))
+
+
+def laid(encoded, pad: int) -> dict[str, np.ndarray]:
+    """The release's layout of a seed's encoded requests as the harness reads it: the tokens padded to
+    `WIDTH`, their counts, and each question's span and its options' spans, `options` marking the real
+    ones."""
+    tokens = np.full((ROWS, WIDTH), pad, np.int32)
+    options = np.zeros((ROWS, QUESTIONS, OPTIONS), bool)
+    spans = np.zeros((ROWS, QUESTIONS, OPTIONS, 2), np.int32)
+    question_spans = np.zeros((ROWS, QUESTIONS, 2), np.int32)
+    for row, record in enumerate(encoded):
+        if len(record.input_ids) > WIDTH:
+            raise ValueError(f"a drawn request lays out {len(record.input_ids)} tokens, over {WIDTH}")
+        tokens[row, :len(record.input_ids)] = record.input_ids
+        for index, question in enumerate(record.questions):
+            question_spans[row, index] = question.question_span
+            for option, span in enumerate(question.option_spans):
+                spans[row, index, option] = span
+                options[row, index, option] = True
+    return {"tokens": tokens, "lengths": np.asarray([len(record.input_ids) for record in encoded], np.int32),
+            "options": options, "spans": spans, "question_spans": question_spans}
+
+
+def scored(found) -> np.ndarray:
+    """The release's per-request, per-question option logits as `[ROWS, QUESTIONS, OPTIONS]`, 0 past a
+    question's options and its request's questions, which `laid`'s `options` leaves out."""
+    scores = np.zeros((ROWS, QUESTIONS, OPTIONS))
+    for row, questions in enumerate(found):
+        for index, logits in enumerate(questions):
+            scores[row, index, :logits.shape[0]] = logits.double().numpy()
+    return scores
+
+
+def parity() -> None:
+    from PIL import Image
+    from recorded_references import provenance, record_case, save
+    from reference_releases import require
+    from reference_source import git_head
+    from safetensors.torch import load_file
+    from torch_precision import float64
+    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+
+    require("transformers")
+    torch.set_num_threads(1)
+    torch.set_float32_matmul_precision("highest")
+    upstream, model_class = upstream_module()
+    processor = AutoProcessor.from_pretrained(BACKBONE)
+    tokenizer, pad = processor.tokenizer, processor.tokenizer.pad_token_id
+    backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float32,
+                                                               attn_implementation="eager").eval()
+    head_config = json.loads((OUT / "joint_head_config.json").read_text())
+    head = upstream.JointSchemaHead(**head_config).eval()
+    head.load_state_dict(load_file(OUT / "joint_head.safetensors"), strict=True)
+    model = model_class(backbone, head).eval()
+    exact = joint_twin(model_class, upstream, backbone, head, head_config)
+    table = backbone.get_output_embeddings().weight
+    with float64():
+        exact_table = exact.language_model.get_output_embeddings().weight
+    cpu = torch.device("cpu")
+    # The seed's encoded requests, which `draw` lays out and its site's `evaluate` runs.
+    held: dict[str, list] = {}
+
+    def encoded(seed: int, *, pictures: bool) -> list:
+        requests = [as_upstream(request) for request in drawn_requests(seed)]
+        if not pictures:
+            return [upstream.encode_record(tokenizer, request) for request in requests]
+        images, counts = drawn_pictures(seed)
+        return [upstream.encode_record(tokenizer, {**request, "images": [
+            Image.fromarray(picture) for picture in images[row, :counts[row]]]}, processor=processor)
+                for row, request in enumerate(requests)]
+
+    def whole(*, pictures: bool):
+        def draw(seed: int) -> dict[str, np.ndarray]:
+            held["records"] = encoded(seed, pictures=pictures)
+            inputs = laid(held["records"], pad)
+            if pictures:
+                inputs["images"], inputs["image_counts"] = drawn_pictures(seed)
+            return inputs
+
+        def evaluate(inputs):
+            batch = upstream.collate_records(held["records"], pad, cpu)
+            wide = {**batch, "media": {key: value.double() if value.is_floating_point() else value
+                                       for key, value in batch["media"].items()}}
+            with torch.no_grad():
+                found = model(batch)
+            with float64(), torch.no_grad():
+                truth = exact(wide)
+            return {"scores": scored(found)}, {"scores": scored(truth)}
+        return draw, evaluate
+
+    def head_draw(seed: int) -> dict[str, np.ndarray]:
+        held["records"] = encoded(seed, pictures=False)
+        inputs = laid(held["records"], pad)
+        batch = upstream.collate_records(held["records"], pad, cpu)
+        with torch.no_grad():
+            hidden = backbone.model.language_model(input_ids=batch["input_ids"],
+                                                   attention_mask=batch["attention_mask"],
+                                                   use_cache=False).last_hidden_state
+        states = np.zeros((ROWS, WIDTH, hidden.shape[-1]), np.float32)
+        states[:, :hidden.shape[1]] = hidden.numpy()
+        return {**inputs, "states": states}
+
+    def head_evaluate(inputs):
+        batch = upstream.collate_records(held["records"], pad, cpu)
+        hidden = torch.from_numpy(inputs["states"][:, :batch["input_ids"].shape[1]])
+        with torch.no_grad():
+            found = head(hidden, batch["input_ids"], batch["attention_mask"], batch["records"], table)
+        with float64(), torch.no_grad():
+            truth = exact.head(hidden.double(), batch["input_ids"], batch["attention_mask"], batch["records"],
+                               exact_table)
+        return {"scores": scored(found)}, {"scores": scored(truth)}
+
+    recorded = {}
+    for site, (draw, evaluate) in {"joint": whole(pictures=False), "joint_head": (head_draw, head_evaluate),
+                                   "joint_images": whole(pictures=True)}.items():
+        recorded.update(record_case(site, draw, evaluate))
+    seeds = max(len(value) for name, value in recorded.items() if name.endswith(".input.tokens"))
+    source = json.loads((OUT / "source.json").read_text())
+    recorded["provenance"] = provenance(
+        f"{source['repo']}@{source['revision']}", git_head(ROOT), "cpu",
+        "PYTHONPATH=src:tools python tools/joint_checkpoint_reference.py --parity",
+        backbone=BACKBONE.relative_to(ROOT).as_posix())
+    save(OUT / "parity.npz", recorded, reference=f"https://huggingface.co/{source['repo']}",
+         license="apache-2.0")
+    (OUT / "requests.json").write_text(json.dumps([drawn_requests(seed) for seed in range(seeds)],
+                                                  ensure_ascii=False) + "\n")
+
+
 if __name__ == "__main__":
-    {"--images": images, "--fla": on_fla}.get(next(iter(sys.argv[1:]), ""), main)()
+    {"--images": images, "--fla": on_fla, "--parity": parity}.get(next(iter(sys.argv[1:]), ""), main)()
