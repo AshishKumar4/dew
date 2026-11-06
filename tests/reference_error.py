@@ -109,7 +109,7 @@ from check1_statistics import (
     row_factor,
     shown,
 )
-from check1_wire import DRAWS, REDRAW, STAGES, staged_units
+from check1_wire import CENSUS, DRAWS, REDRAW, STAGES, staged_units
 from conditioning import Conditioning, conditioned
 from float64_terms import float64_terms
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
@@ -252,11 +252,6 @@ def _one_draws_program(fn, arguments):
         return fn, arguments
     return fn.fn, jax.tree.map(lambda leaf: leaf[0], arguments)
 
-
-CENSUS = "DEW_GATE_CENSUS"
-"""The environment variable whose being set runs check 1's arms with YNNPACK's fusions on (WITHOUT_YNN
-empty), as CPU users compile them: the census the whole suite runs every fifth publish, each red it finds
-filed and judged Dew's or XLA:CPU's (row 4471; docs/design/testing.md, "the YNNPACK switch")."""
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
 """XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
