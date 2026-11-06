@@ -32,7 +32,6 @@ from dew.decision.layout import (
 )
 from dew.decision.model import DecisionModel, stream_runs
 from dew.decision.rows import Encoding, Fit
-from dew.decision.shared_state import entered_documents, entering
 from dew.decision.task import laid_out
 from dew.nn.attention_masks import visibility_mask
 
@@ -98,18 +97,16 @@ def test_questions_that_outgrow_a_row_take_several_each_repeating_the_state():
 
 
 def test_each_question_reads_the_shared_part_and_itself_and_with_siblings_those_before_it():
-    """The model's runs of a row over one state: apart, its questions' documents each entering the shared
-    part's (`entered_documents`, `Entered.runs`), with `siblings` the layout's streams
-    (`stream_runs`). A token of the shared part reads it up to itself; a question's token reads the shared
-    part whole and its own part up to itself, and with `siblings` each question before it whole; no
-    question reads one after it."""
+    """The model's runs of a row over one state, its layout's streams (`stream_runs`), siblings or not: a
+    token of the shared part reads it up to itself; a question's token reads the shared part whole and its
+    own part up to itself, and with `siblings` each question before it whole; no question reads one after
+    it."""
     for siblings in (False, True):
         layout = dataclasses.replace(SHARED, siblings=siblings)
         _, [row] = own_and_shared(layout)
         inputs = DecisionInputs.collate([row], SPECIALS.pad, attention=layout.attention)
-        assert inputs.reads is not None and entering(inputs.reads, inputs.fragments) is not siblings
-        runs = (entered_documents(inputs.streams, inputs.segments, len(inputs.reads)).runs() if not siblings
-                else stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments))
+        assert inputs.reads is not None
+        runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
         length = inputs.tokens.shape[1]
         seen = np.asarray(visibility_mask(length, length, causal=False, sliding_window=None,
                                           key_runs=runs))[0, 0]
@@ -125,13 +122,8 @@ def test_each_question_reads_the_shared_part_and_itself_and_with_siblings_those_
 
 
 def test_a_layout_of_its_own_reads_that_writes_a_stream_twice_reads_by_its_streams():
-    """A row whose streams read as a row over one state's do, its questions entering its shared part, is
-    read as entered documents only where it writes each stream as one run: a layout of its own reads that
-    writes a stream in several runs (`fragment_count`) keeps its streams' runs, which read every run of the
-    shared part (review of the entered documents)."""
-    reads = SHARED.attention[0]
-    assert entering(reads, len(reads))
-    assert not entering(reads, len(reads) + 1)
+    """A row whose streams read as a row over one state's do, written by a layout of its own reads in several
+    runs a stream (`fragment_count`), reads every run of the shared part."""
     streams = jnp.asarray([[0, 0, 1, 1, 0]], jnp.int32)
     segments = jnp.ones((1, 5), jnp.int32)
     runs = stream_runs(streams, segments, ((HOWS["causal"], 0, 0), (HOWS["causal"], HOWS["whole"], 0)), 3)
@@ -200,7 +192,7 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     lays a request's three questions in one row and answers each with one of its options. Over a source whose
     recurrent layers read no key runs (Qwen3.5's gated delta net), the run is refused, as its rows' streams
     would be read as one sequence (until a document enters from a given memory, row 1506)."""
-    from run_kinds import QWEN_TINY, lettered, trained
+    from run_kinds import QWEN_TINY, lettered, shared, trained
     from test_decision_streams import GEMMA
 
     from dew.data import Memory
@@ -211,7 +203,9 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     assert run.pretrained == str(QWEN_TINY)
     with pytest.raises(ValueError):
         trained(run, tmp_path, "hybrid")
-    run = dataclasses.replace(run, pretrained=str(GEMMA))
+    # Over a vocabulary that spells A to D as one unknown token, labels it spells apart (`run_kinds.shared`).
+    run = dataclasses.replace(shared(tmp_path, drawn=False), data=rows, validation=None)
+    assert run.pretrained == str(GEMMA)
     trained(run, tmp_path, "shared", trainer={"checkpoint_final": True})
     decide = Decide.from_run(str(tmp_path / "runs" / "shared"))
     assert decide.layout.shared_state == 3

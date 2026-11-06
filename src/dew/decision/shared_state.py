@@ -12,11 +12,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Sequence
 
-import jax
-import jax.numpy as jnp
-
-from dew.batch import Entered
-from dew.decision.layout import HOWS, Encoded
+from dew.decision.layout import Encoded
 
 
 def over_one_state(own: Sequence[Encoded], max_len: int, count: int) -> list[Encoded]:
@@ -70,31 +66,3 @@ def over_one_state_row(row: Encoded) -> bool:
     """Whether `row` asks several questions over one state (`merged`): each in a stream of its own at its
     own row's positions, which a head reading across its row's questions would join."""
     return row.streams is not None and row.positions is not None and len(row.questions) > 1
-
-
-def entering(reads: Sequence[Sequence[int]], fragments: int) -> bool:
-    """Whether a row's reads table (`QuestionLayout.attention`) is that of a row over one state whose
-    questions read none of each other: one run a stream (`fragments`, a layout of its own reads may write a
-    stream in several), its shared part, stream 0, reading itself up to each token, and each other stream
-    itself up to each token and the shared part whole; the documents `entered_documents` states."""
-    causal, whole = HOWS["causal"], HOWS["whole"]
-    one_run = len(reads) > 1 and fragments == len(reads)
-    return one_run and tuple(reads[0]) == (causal, *[0] * len(reads)) and all(
-        tuple(row) == (causal, whole, *[0] * (len(reads) - 1)) for row in reads[1:])
-
-
-def entered_documents(streams: jax.Array, segments: jax.Array, count: int) -> Entered:
-    """The documents of rows over one state (`merged`) packed in windows, `streams` `[B, L]` (-1 on padding)
-    and `segments` numbering each window's rows: each row's shared part a document and each of its
-    questions another, which enters it (`Entered`), numbered in the window from 1, `count` of them at most."""
-    real = segments > 0
-    turned = jnp.concatenate([real[:, :1], (streams[:, 1:] != streams[:, :-1])
-                              | (segments[:, 1:] != segments[:, :-1])], axis=1) & real
-    documents = jnp.where(real, jnp.cumsum(turned, axis=1, dtype=jnp.int32), 0)
-    rows = jnp.arange(streams.shape[0])[:, None]
-    # Each window row's shared part is its first document; a question's document enters it.
-    root = jnp.zeros((streams.shape[0], segments.shape[1] + 1), jnp.int32).at[rows, segments].max(
-        jnp.where(real & (streams == 0), documents, 0))
-    entered = jnp.zeros((streams.shape[0], count), jnp.int32).at[rows, jnp.maximum(documents - 1, 0)].max(
-        jnp.where(real & (streams > 0), jnp.take_along_axis(root, segments, axis=1), 0))
-    return Entered(documents, entered)
