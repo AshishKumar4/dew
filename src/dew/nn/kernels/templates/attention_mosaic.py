@@ -514,7 +514,9 @@ class MosaicForward(_Mainloop[Tiles]):
         # A paged call's key tile of several pages loaded a page at a time, as its launch loads it (a
         # cp.async stream's pages joined into one tile beside its slots, `Family.lifetimes`).
         page = _page(ba)
-        pieces = config.block_k // page if page is not None and page < config.block_k else 1
+        # (A tile no whole pages fill no launch takes, `_pages_hold`: counted whole.)
+        pieces = (config.block_k // page if page is not None and page < config.block_k
+                  and config.block_k % page == 0 else 1)
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
                                            min(config.stages, steps), out_dtype=out_dtype, pieces=pieces,
