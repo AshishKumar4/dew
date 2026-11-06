@@ -116,8 +116,7 @@ def witnessed(query, key, value, kept, *, interpret: bool, records=None) -> dict
     lane = attention_lane(interpret)
     q, k, v = (np.asarray(np.asarray(x, np.float32), np.float64) for x in (query, key, value))
     if records is None:
-        out, rows, sums = attention_mosaic.certified(query, key, value, spans_of(kept, query.shape[0]),
-                                                      interpret=interpret)
+        out, rows, sums = certified(query, key, value, spans_of(kept, query.shape[0]), interpret=interpret)
         records = {"out": np.asarray(out, np.float64), "m": np.asarray(rows[0], np.float64),
                    "l": np.asarray(rows[1], np.float64), "acc": np.asarray(sums, np.float64)}
     count = records["m"].shape[2]
@@ -153,6 +152,17 @@ def witnessed(query, key, value, kept, *, interpret: bool, records=None) -> dict
             held["out"].append((np.ones(out.lo.shape, bool), within(records["out"][b, :, h], out)))
     return {name: (np.concatenate([rows.ravel() for rows, _ in found]),
                    np.concatenate([inside.ravel() for _, inside in found])) for name, found in held.items()}
+
+
+def certified(query, key, value, spans, *, interpret: bool):
+    """The certify launch's records (`attention_mosaic.certified`): interpreted, at a Hopper's tiles, the
+    target an interpreted launch derives its config for (`generation.assumed`)."""
+    from dew.nn.kernels import generation
+
+    if not interpret:
+        return attention_mosaic.certified(query, key, value, spans)
+    with generation.assumed("sm90"):
+        return attention_mosaic.certified(query, key, value, spans, interpret=True)
 
 
 def spans_of(kept, batch: int):

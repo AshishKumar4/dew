@@ -23,12 +23,9 @@ def operands(seed: int):
 
 def records(query, key, value, mask) -> dict[str, np.ndarray]:
     """The certify launch's own records (`attention_mosaic.certified`)."""
-    from attention_witness import spans_of
+    from attention_witness import certified, spans_of
 
-    from dew.nn.kernels.templates import attention_mosaic
-
-    out, rows, sums = attention_mosaic.certified(query, key, value, spans_of(mask, query.shape[0]),
-                                                  interpret=True)
+    out, rows, sums = certified(query, key, value, spans_of(mask, query.shape[0]), interpret=True)
     return {"out": np.asarray(out, np.float64), "m": np.asarray(rows[0], np.float64),
             "l": np.asarray(rows[1], np.float64), "acc": np.asarray(sums, np.float64)}
 
