@@ -13,16 +13,17 @@ own initialized state instead, and every weight and running statistic is
 then drawn from a seed (rounded to bfloat16-representable values, so the
 fixture compresses).
 
-It records the state dict under pytorch-fid's names, 8-bit images (read as
-`pixels / 255` in [0, 1]) at a size it upsamples and one it downsamples, and the pool3 features in float32
-and float64 (the whole model in double), the truth tests/reference_error.py
-measures both from.
+It records the state dict under pytorch-fid's names and, at a size it upsamples
+and one it downsamples, the pool3 features of 8-bit images (read as `pixels / 255`
+in [0, 1]; `draw`, which the test draws again) in float32 and float64 (the whole
+model in double) over check 1's seeds (`recorded_references.record_case`).
 
 Run with the Dew test environment's torch and torchvision, on CPU:
 
     python tools/pytorch_fid_tiny_reference.py OUTPUT.npz
 """
 
+import functools
 import sys
 from pathlib import Path
 
@@ -88,27 +89,35 @@ def build():
     return model, inception
 
 
+def draw(seed: int, size: int) -> dict[str, np.ndarray]:
+    """A seed's `BATCH` 8-bit images of `size`, channels first (the test draws them again)."""
+    return {"pixels": np.random.default_rng([SEED, size, seed]).integers(0, 256, (BATCH, 3, size, size),
+                                                                         dtype=np.uint8)}
+
+
 def main():
+    from recorded_references import record_case
+
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
     torch.set_num_threads(1)
     model, inception = build()
-    rng = np.random.default_rng(SEED)
     arrays: dict[str, np.ndarray] = {}
     for name, value in inception.state_dict().items():
         if not name.endswith("num_batches_tracked") and not name.startswith("fc."):
             arrays[f"state/{name}"] = value.numpy()
-    for size in SIZES:
-        pixels = rng.integers(0, 256, (BATCH, 3, size, size), dtype=np.uint8)
-        arrays[f"{size}/pixels"] = pixels
-        images = pixels.astype(np.float32) / 255
+
+    def evaluate(inputs):
+        images = torch.from_numpy(inputs["pixels"].astype(np.float32) / 255)
         with torch.no_grad():
-            [single] = model.float()(torch.from_numpy(images))
-            [truth] = model.double()(torch.from_numpy(images).double())
-        arrays[f"{size}/fp32.features"] = single.reshape(BATCH, -1).numpy()
-        arrays[f"{size}/fp64.features"] = truth.reshape(BATCH, -1).numpy()
-        gap = np.abs(arrays[f"{size}/fp32.features"] - arrays[f"{size}/fp64.features"]).max()
-        print(f"{size}x{size}: features {single.shape[1]}, fp32 off float64 by {gap:.3g}")
+            [single] = model.float()(images)
+            [truth] = model.double()(images.double())
+        return ({"features": single.reshape(BATCH, -1).numpy()},
+                {"features": truth.reshape(BATCH, -1).numpy()})
+
+    for size in SIZES:
+        arrays.update(record_case(str(size), functools.partial(draw, size=size), evaluate,
+                                  store_inputs=False))
     meta = {"repo": REPO, "commit": COMMIT, "path": PATH, "sha256": DIGEST, "divisor": DIVISOR,
             "torch": torch.__version__, "torchvision": torchvision.__version__}
     saved_fixture(Path(sys.argv[1]), arrays, meta)

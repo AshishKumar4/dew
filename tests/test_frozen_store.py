@@ -69,7 +69,7 @@ def test_a_lora_run_writes_its_frozen_base_once_and_each_step_holds_its_factors(
     assert len(store) == 1
     held = checkpoints.stored(3)["variables"]
     assert set(held) == {"params", FROZEN}
-    written = checkpoints._open().metadata(3).item_metadata.tree["variables"]
+    written = checkpoints._open().metadata(3).item_metadata["model"].tree["variables"]
     names = {path[-1].key for path, _ in jax.tree_util.tree_flatten_with_path(written)[0]}
     assert names == {"lora_A", "lora_B"}
     restored, _ = checkpoints.restore()

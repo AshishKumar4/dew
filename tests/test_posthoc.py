@@ -11,7 +11,7 @@ from affine_run import Regression, dataset
 from model_support import largest_difference
 
 from dew.averaging import coefficients, exponent, power_decay
-from dew.checkpoints import Checkpoints, Ranking
+from dew.checkpoints import Checkpoints, Keep, Ranking
 from dew.config import RunConfig
 from dew.objectives.base import EMASpec
 from dew.optim import OptimConfig, PowerProfilesState, power_profiles
@@ -91,6 +91,50 @@ def test_an_accumulating_run_snapshotted_every_step_reconstructs_its_average(tmp
         np.testing.assert_array_equal(got, want)
 
 
+def test_an_older_snapshot_keeps_its_profiles_alone_and_rebuilds_the_same_average(tmp_path):
+    """A snapshot no other rule keeps, past the latest, holds its profiles' averages alone, none of the
+    weights, optimizer state or position its whole step held (row 4311; docs/guides/checkpoints.md's 176M
+    run: ~190 GB of profiles against ~570 GB of whole snapshots), and the post-hoc EMA rebuilt from such
+    snapshots is the one whole snapshots rebuild, bit for bit."""
+    def kept(name, keep):
+        trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0),
+                          checkpoints=Checkpoints(str(tmp_path / name), keep=keep))
+        trainer.fit(dataset(), steps=32, log_every=32, checkpoint_every=4)
+        trainer.checkpoints.wait()
+        return Checkpoints(str(tmp_path / name), keep=keep)
+
+    alone, whole = kept("alone", 1), kept("whole", 100)
+    assert {entry.step: entry.kind for entry in alone.kept()} == {
+        **dict.fromkeys(range(4, 32, 4), "profiles"), 32: "state"}
+    assert {entry.kind for entry in whole.kept()} == {"state"}
+    with pytest.raises(ValueError):
+        alone.variables(step=4)
+    for read in (alone.stored, lambda step: alone.restore(None, step)):
+        with pytest.raises(ValueError):
+            read(4)
+    for got, want in zip(jax.tree.leaves(alone.posthoc_ema(0.07)), jax.tree.leaves(whole.posthoc_ema(0.07)),
+                         strict=True):
+        np.testing.assert_array_equal(got, want)
+
+
+def test_a_snapshot_kept_for_its_model_reads_its_model_and_its_profiles(tmp_path):
+    """A step its retention keeps for its model, a profiled run's past the latest under
+    `Keep(weights_only=True)`, reads as its model to the model's readers and as its profiles to the
+    post-hoc EMA's, neither read refused for the payload the other keeps."""
+    keep = Keep(latest=1, every=4, weights_only=True)
+    trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0),
+                      checkpoints=Checkpoints(str(tmp_path / "run"), keep=keep))
+    trainer.fit(dataset(), steps=8, log_every=8, checkpoint_every=4)
+    trainer.checkpoints.wait()
+    checkpoints = Checkpoints(str(tmp_path / "run"), keep=keep)
+    assert {entry.step: entry.kind for entry in checkpoints.kept()} == {4: "weights", 8: "state"}
+    assert set(checkpoints.stored(4)) == {"step", "microstep", "updates", "variables", "ema"}
+    assert jax.tree.leaves(checkpoints.variables(step=4))
+    assert len(checkpoints.restore_profiles(4)) == 2
+
+
 def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
     """A snapshot is the ordinary checkpoint itself: averages are stored
     once in opt_state, retained, and every restore reads them bit for bit."""
@@ -101,8 +145,10 @@ def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
     Checkpoints(str(tmp_path / "run")).wait()
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    written = checkpoints._open().item_metadata(8)
-    assert dict(written)["opt_state"]["averages"] is not None
+    # The averages are the step's profiles item, and its optimizer state holds none beside them.
+    written = dict(checkpoints._open().item_metadata(8))
+    assert jax.tree.leaves(dict(written["profiles"])["averages"])
+    assert not jax.tree.leaves(dict(written["resume"])["opt_state"]["averages"])
     stored = tuple(checkpoints.stored(8)["opt_state"]["averages"])
     assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), stored) == jax.tree.map(
         lambda leaf: (leaf.shape, leaf.dtype), state.opt_state.averages)
@@ -185,7 +231,7 @@ def test_an_interrupted_snapshot_restores_the_previous_step_and_is_never_reconst
     monkeypatch.setattr(handler, 'finalize', fail_before_commit)
     interrupted._manager = ocp.CheckpointManager(
         directory, options=ocp.CheckpointManagerOptions(enable_async_checkpointing=True),
-        item_handlers=handler)
+        item_handlers=dict.fromkeys(("model", "profiles", "resume", "default"), handler))
     interrupted.save(4, state.replace(step=jnp.int32(4)), None, ranking=Ranking('train/loss', 0.1))
     with pytest.raises(OSError):
         interrupted.wait()

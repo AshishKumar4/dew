@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import exact_attention
+from attention_oracle import exact_attention, kept
 from reference_error import assert_as_exact
 
 from dew.batch import coordinates
@@ -313,7 +313,8 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     # Every tile whose entries are all visible, of one document where there are any, is in a whole range.
     tiles = padded.reshape(ROWS, padded.shape[1] // block_q, block_q, -1, block_k).all(axis=(2, 4))
     if query_doc is not None:
-        tiles &= (query_doc[:, :, None] == key_doc[:, None, :]) & (query_doc[:, :, None] != 0)
+        tiles &= kept(query_doc.shape[1], key_doc.shape[1], segment_ids=query_doc,
+                      key_segment_ids=key_doc)[:, 0]
     assert whole == tiles.sum() if blocks.ranges is None else whole <= tiles.sum()
     if (case is CASES["documents"] or case is RUN_CASES["runs"]) and (block_q, block_k) == (16, 16):
         assert whole > 0

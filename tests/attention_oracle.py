@@ -67,11 +67,13 @@ def reference(query, key, value, **kwargs):
                            precision=jax.lax.Precision.HIGHEST, **kwargs)
 
 
-def kept(q_len, k_len, *, causal=False, sliding_window=None, window=None, mask=None, segment_ids=None):
+def kept(q_len, k_len, *, causal=False, sliding_window=None, window=None, mask=None, segment_ids=None,
+         key_segment_ids=None):
     """The keys each query keeps, `[B or 1, 1, q, k]`: k <= q; a causal window's
     w most recent, or without causality the keys within w - 1 of the query; the
     `window` `(left, right)` reaches, -1 bounding neither side; the explicit
-    mask; equal segment ids, none for padding."""
+    mask; equal segment ids, none for padding, the keys' own (`key_segment_ids`)
+    where they are packed apart from the queries'."""
     rows, cols = np.arange(q_len)[:, None], np.arange(k_len)[None, :]
     keep = np.ones((1, 1, q_len, k_len), bool)
     if causal:
@@ -89,8 +91,9 @@ def kept(q_len, k_len, *, causal=False, sliding_window=None, window=None, mask=N
         keep = keep & np.asarray(mask, bool)
     if segment_ids is not None:
         ids = np.asarray(segment_ids)
+        keys = ids if key_segment_ids is None else np.asarray(key_segment_ids)
         # Segment 0 is padding, which belongs to no document (`document_mask`).
-        keep = keep & (ids[:, None, :, None] == ids[:, None, None, :]) & (ids[:, None, :, None] != 0)
+        keep = keep & (ids[:, None, :, None] == keys[:, None, None, :]) & (ids[:, None, :, None] != 0)
     return keep
 
 
