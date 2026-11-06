@@ -76,6 +76,7 @@ from dew import _cache, _coordination, _records
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
+from dew.nn import programs
 from dew.nn.kernels.options import owned_program
 
 from . import generation
@@ -870,17 +871,11 @@ def _resource_exhausted(error: Exception) -> bool:
 def materialized(op: KernelOp, ba: tokamax.BoundArguments):
     """The arrays the tuner times `ba` on, `op.operands` of its `ShapeDtypeStruct` arguments, and
     `fill(arrays) -> (args, kwargs)`, its arguments with those arrays (or traced ones) in their places."""
-    leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
-                                    is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
-    places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
+    def described(leaf) -> bool:
+        return isinstance(leaf, jax.ShapeDtypeStruct)
 
-    def fill(arrays):
-        filled = list(leaves)
-        for index, array in zip(places, arrays, strict=True):
-            filled[index] = array
-        return jax.tree.unflatten(tree, filled)
-
-    return op.operands([leaves[index] for index in places], 0), fill
+    shapes, fill = programs.holes((ba.args, ba.kwargs), described, is_leaf=described)
+    return op.operands(shapes, 0), fill
 
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
