@@ -375,6 +375,12 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         del swizzle
         return pltpu.VMEM(shape, dtype)
 
+    def schedule(self, consumers: int):
+        # One role a core takes no turns (`turn` passes for one consumer): a semaphore it never signals, no
+        # byte of its VMEM (`resources.scratch_bytes`).
+        _one(consumers)
+        return pltpu.SemaphoreType.REGULAR(())
+
     def meet(self, halves) -> None:
         raise NotImplementedError("a TPU program is one role: it meets no other")
 

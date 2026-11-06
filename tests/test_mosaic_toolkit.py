@@ -789,9 +789,9 @@ def _gemm_on_a_tpu_core():
 
 def test_a_tpu_launch_plans_one_program_within_its_cores_scoped_vmem():
     """`resources.plan` on a TPU v5e for a launch on its core's bundle (`mosaic_tpu.MXU`, which budgets no
-    registers): one program at a ring its scoped VMEM holds, its DMA semaphores no VMEM byte of it (a scope
-    holding a semaphore a stage plans as one without them); one whose floor of two stages the scoped VMEM
-    does not hold plans nothing."""
+    registers): one program at a ring its scoped VMEM holds, its DMA semaphores and its turns' schedule
+    (`schedule`, a role's) no VMEM byte of it (a scope holding them plans as one without them); one whose
+    floor of two stages the scoped VMEM does not hold plans nothing."""
     from jax.experimental.pallas import tpu as pltpu
 
     from dew.nn.kernels.templates import mosaic_tpu, resources
@@ -800,7 +800,7 @@ def test_a_tpu_launch_plans_one_program_within_its_cores_scoped_vmem():
 
     def launch(stage_bytes: int, *, signalled: bool) -> resources.Launch:
         def scope(stages: int) -> resources.Scope:
-            semaphores = (pltpu.SemaphoreType.DMA((stages,)),) if signalled else ()
+            semaphores = (pltpu.SemaphoreType.DMA((stages,)), family.schedule(1)) if signalled else ()
             return resources.Scope(program=(pltpu.VMEM((stages * stage_bytes,), jnp.uint8), *semaphores))
 
         return resources.Launch(scope, consumers=1, registers=0)
