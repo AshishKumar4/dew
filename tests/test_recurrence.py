@@ -86,6 +86,8 @@ def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32,
     if hooks.conv is not None:
         given |= {'token': normal(rows, channels), 'held': normal(rows, TAPS - 1, channels),
                   'taps': normal(channels, TAPS, scale=0.5)}
+        if hooks.conv.bias:
+            given['conv_bias'] = normal(channels, scale=0.5)
     else:
         given |= {'query': normal(rows, KEY_HEADS, key_width), 'key': normal(rows, KEY_HEADS, key_width) / 4,
                   'value': normal(rows, VALUE_HEADS, value_width)}
@@ -205,9 +207,12 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
 
 
 NARROW = {recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8,
-          recurrence.Hooks(decay='scalar'): 8}
-"""Mamba2's step (its rated decay and skip) and the gated delta rule's, over heads of 64 values, and their
-declared seeds."""
+          recurrence.Hooks(decay='scalar'): 8,
+          recurrence.Hooks(conv=recurrence.Conv('silu', order='vkq', bias=True), decay='scalar', delta=False,
+                           gates=recurrence.Gates(write='step', limit=(0.0, 0.5)), skip=True): 8}
+"""Mamba2's step (its rated decay and skip), the gated delta rule's, and Mamba2's fused token (its conv over
+x, B and C with their bias, its step's gates and skip), over heads of 64 values, and their declared
+seeds."""
 
 
 @pytest.mark.parametrize('hooks', NARROW, ids=str)

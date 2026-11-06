@@ -8,6 +8,8 @@ past its rounding (`assert_recorded_moves`). Nothing here imports torch.
 """
 
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -46,7 +48,7 @@ from ssd_support import (
 from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs
-from dew.nn.mixers.mamba2 import chunk_ssd, recurrent_ssd
+from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
 
@@ -530,3 +532,49 @@ def test_a_gated_norm_broadcasts_its_gate_in_either_order(scale_wide):
                     else normalized.astype(jnp.float64) * weight.astype(jnp.float64)).astype(jnp.float64)
         np.testing.assert_array_equal(np.asarray(first.apply({"params": {"weight": weight}}, x[:1], wide)),
                                       np.asarray(expected))
+
+
+FUSED_SEEDS = 8
+"""The fused decode token's declared draws against the unfused one (check 1): sized by `seeds_for` paired
+with the fused step."""
+
+
+def test_a_decode_token_on_the_fused_step_is_the_layers_own():
+    """A Mamba-2 mixer's decode token through the recurrence's fused step (the decode kernel named 'fused',
+    interpreted on a CPU: its conv over x, B and C with their bias, the step through softplus, the decay, the
+    update and the skip in one launch, `Mamba2._fused_token`; its gated norm after), at a model's widths
+    (four heads of 64, a group of 128 states, two heads a program's warpgroup) after a 3-token prefill: its
+    output and state on par (check 1) with the layer's own unfused token, from the float64 layer's; its conv
+    history bit for bit the unfused token's."""
+    from dew.nn.kernels.generation import chosen
+
+    module = Mamba2(emb_features=64, num_heads=4, head_dim=64, state_size=128, n_groups=1, conv_kernel=4,
+                    chunk_size=4, norm_eps=1e-5)
+    variables = nn.unbox(module.init(jax.random.key(0), jnp.zeros((3, 1, 64))))
+    wide = module.clone(dtype=jnp.float64)
+    step = MixerCall(decode=True)
+
+    def cached(seed):
+        x = jnp.asarray(np.random.default_rng(seed).standard_normal((3, 4, 64)).astype(np.float32))
+        allocated = module.apply(variables, x[:, :1], step, mutable=["cache"])[1]
+        cache = module.apply({**variables, **allocated}, x[:, :3], step, mutable=["cache"])[1]["cache"]
+        return cache, x[:, 3:4]
+
+    def token(layer, cache, x, kernel):
+        with chosen(delta_decode=kernel):
+            out, written = layer.apply({**variables, "cache": cache}, x, step, mutable=["cache"])
+        return out, written["cache"]
+
+    def unfused(layer, cache, x):
+        out, written = token(layer, cache, x, "xla")
+        return out, written["ssm_state"]
+
+    def fused(cache, x):
+        out, written = token(module, cache, x, "fused")
+        return out, written["ssm_state"]
+
+    assert_as_exact(fused, functools.partial(unfused, module), cached, "Mamba-2's fused decode token",
+                    seeds=FUSED_SEEDS, truth_fn=functools.partial(unfused, wide))
+    cache, x = cached(0)
+    np.testing.assert_array_equal(np.asarray(token(module, cache, x, "fused")[1]["conv_state"]),
+                                  np.asarray(token(module, cache, x, "xla")[1]["conv_state"]))

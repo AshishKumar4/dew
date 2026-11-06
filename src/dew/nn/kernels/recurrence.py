@@ -43,10 +43,18 @@ from .generation import linear_tangent
 
 @dataclasses.dataclass(frozen=True)
 class Conv:
-    """The prologue's short conv: a token's channels `[C]`, its queries, keys and values head by head
-    in turn, over `held` `[K - 1, C]` history with `taps` `[C, K]`, then `activation` ('silu' or None).
-    The history is read rounded to the token's dtype, as the layer's conv reads it."""
+    """The prologue's short conv: a token's channels `[C]`, its queries, keys and values head by head in
+    the `order` its layer projects them ('qkv', a delta rule's; 'vkq', Mamba2's x, B and C), over `held`
+    `[K - 1, C]` history with `taps` `[C, K]`, its `bias` `[C]` added where it has one (`Step.conv_bias`),
+    then `activation` ('silu' or None). The history is read rounded to the token's dtype, as the layer's
+    conv reads it."""
     activation: str | None = 'silu'
+    order: str = 'qkv'
+    bias: bool = False
+
+    def __post_init__(self):
+        if sorted(self.order) != ['k', 'q', 'v']:
+            raise ValueError(f"a conv's order is a permutation of 'qkv', not {self.order!r}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -228,17 +236,16 @@ class Gated:
 class Step(Gated):
     """A decode token's operands, each `[rows, ...]`; a hook's are None where it is off.
 
-    Without a conv, `query` and `key` `[rows, Hk, Dk]` and `value` `[rows, Hv, Dv]` (the query scaled
-    unless the hooks' l2 norm scales it); with one, `token` `[rows, C]`, `held` `[rows, K - 1, C]`
-    and `taps` `[C, K]`. `log_decay` is `[rows, Hv]` (scalar) or `[rows, Hv, Dk]` (vector), or with
-    the gates `gate` `[rows, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[rows, Hv]` is the write gate
-    (a raw beta with the gates), `skip` `[Hv]` the skip's `D`, `z` `[rows, Hv, Dv]` and `weight`
-    `[Dv]` the epilogue's, `rate` `[Hv]` a rated decay's, at most zero (`Hooks.rated`). `state` is
-    `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by `round_to_bf16`), or wider for the reference.
-    `active` `[rows]` marks the rows that draw. A pytree
-    of its arrays, so it crosses `jit` and a transformation as a token's operands do; the `Hooks` are
-    its static form. Its fields are the decode launch's operands and their names (`OPERANDS`, `StepLaunch`),
-    those an entry a row marked (`ROW`)."""
+    Without a conv, `query` and `key` `[rows, Hk, Dk]` and `value` `[rows, Hv, Dv]` (the query scaled unless
+    the hooks' l2 norm scales it); with one, `token` `[rows, C]`, `held` `[rows, K - 1, C]` and `taps` `[C,
+    K]`, and `conv_bias` `[C]` where the conv has a bias. `log_decay` is `[rows, Hv]` (scalar) or `[rows, Hv,
+    Dk]` (vector), or with the gates `gate` `[rows, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[rows, Hv]` is
+    the write gate (a raw beta with the gates), `skip` `[Hv]` the skip's `D`, `z` `[rows, Hv, Dv]` and
+    `weight` `[Dv]` the epilogue's, `rate` `[Hv]` a rated decay's, at most zero (`Hooks.rated`). `state` is
+    `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by `round_to_bf16`), or wider for the reference. `active`
+    `[rows]` marks the rows that draw. A pytree of its arrays, so it crosses `jit` and a transformation as a
+    token's operands do; the `Hooks` are its static form. Its fields are the decode launch's operands and
+    their names (`OPERANDS`, `StepLaunch`), those an entry a row marked (`ROW`)."""
     state: jax.Array = dataclasses.field(metadata=ROW)
     query: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     key: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
@@ -246,6 +253,7 @@ class Step(Gated):
     token: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     held: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     taps: jax.Array | None = None
+    conv_bias: jax.Array | None = None
     active: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
 
 
@@ -266,7 +274,8 @@ OPERANDS = tuple(field.name for field in dataclasses.fields(Step) if field.name 
 
 def _names(hooks: Hooks) -> tuple[str, ...]:
     """The `Step` operands a launch reads, in its order, after `active`; `state` last."""
-    streams = ('token', 'held', 'taps') if hooks.conv is not None else ('query', 'key', 'value')
+    streams = (('token', 'held', 'taps', *('conv_bias',) * hooks.conv.bias) if hooks.conv is not None
+               else ('query', 'key', 'value'))
     if hooks.gates is not None:
         gates = ('gate', *('beta',) * (hooks.gates.write == 'sigmoid'), 'log_a', 'bias')
     elif hooks.rated:
@@ -292,13 +301,26 @@ def _activated(pre, conv: Conv):
     return pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
 
 
-def _split(convolved, key_heads: int, value_heads: int, key_width: int, value_width: int):
+def conv_pieces(conv: Conv, key_heads: int, value_heads: int, key_width: int,
+                value_width: int) -> dict[str, tuple[int, int, int]]:
+    """Each stream's `(first channel, heads, width)` in a conv's channels, in its `order`: the queries and
+    keys `Hk` heads of `Dk`, the values `Hv` of `Dv`."""
+    shapes = {'q': (key_heads, key_width), 'k': (key_heads, key_width), 'v': (value_heads, value_width)}
+    found, first = {}, 0
+    for name in conv.order:
+        heads, width = shapes[name]
+        found[name] = (first, heads, width)
+        first += heads * width
+    return found
+
+
+def _split(convolved, conv: Conv, key_heads: int, value_heads: int, key_width: int, value_width: int):
     """A conv's channels `[rows, C]` as the queries and keys `[rows, Hk, Dk]` and the values `[rows, Hv,
-    Dv]` they hold, in that order: the one splitter the reference's conv and its one-tap form share."""
+    Dv]` they hold (`conv_pieces`): the one splitter the reference's conv and its one-tap form share."""
     rows = convolved.shape[0]
-    query, key, value = jnp.split(convolved, [key_heads * key_width, 2 * key_heads * key_width], axis=-1)
-    return (query.reshape(rows, key_heads, key_width), key.reshape(rows, key_heads, key_width),
-            value.reshape(rows, value_heads, value_width))
+    pieces = conv_pieces(conv, key_heads, value_heads, key_width, value_width)
+    return tuple(convolved[:, first:first + heads * width].reshape(rows, heads, width)
+                 for first, heads, width in (pieces[name] for name in 'qkv'))
 
 
 def _prologue(hooks: Hooks, given: dict, work):
@@ -314,10 +336,11 @@ def _prologue(hooks: Hooks, given: dict, work):
         taps, width = given['taps'].astype(work), window.shape[1]
         # Each tap's inputs a slice of the window and its weights a column of the taps, the conv's one
         # multiply and add a tap.
+        bias = given['conv_bias'].astype(work) if hooks.conv.bias else None
         pre = short_conv.preactivation([window[:, tap:tap + 1] for tap in range(width)],
-                                       [taps[:, tap] for tap in range(width)], None)[:, 0]
-        query, key, value = _split(_activated(pre, hooks.conv), key_heads, value_heads, key_width,
-                                   value_width)
+                                       [taps[:, tap] for tap in range(width)], bias)[:, 0]
+        query, key, value = _split(_activated(pre, hooks.conv), hooks.conv, key_heads, value_heads,
+                                   key_width, value_width)
         # The history and the token, then all but the oldest: a one-tap conv holds none.
         history = jnp.concatenate([held, token[:, None].astype(held.dtype)], axis=1)[:, 1:]
     else:
@@ -437,9 +460,11 @@ def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
     key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
     work = at_least_fp32(token.dtype)
     pre = token.astype(work) * given['taps'][:, 0].astype(work)
-    query, key, value = _split(_activated(pre, conv), key_heads, value_heads, key_width, value_width)
-    unconvolved = dataclasses.replace(operands, token=None, held=None, taps=None, query=query, key=key,
-                                      value=value)
+    if conv.bias:
+        pre = pre + given['conv_bias'].astype(work)
+    query, key, value = _split(_activated(pre, conv), conv, key_heads, value_heads, key_width, value_width)
+    unconvolved = dataclasses.replace(operands, token=None, held=None, taps=None, conv_bias=None,
+                                      query=query, key=key, value=value)
     out, _, state = step(dataclasses.replace(hooks, conv=None), unconvolved,
                          dtype=token.dtype if dtype is None else dtype)
     return out, given['held'], state

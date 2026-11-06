@@ -68,7 +68,15 @@ from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
-from dew.nn.linear import DepthwiseConv1d, decode_step, held_scan, over_sequence, sequence_conv
+from dew.nn.linear import (
+    DepthwiseConv1d,
+    decode_kernel,
+    decode_step,
+    fused_token,
+    held_scan,
+    over_sequence,
+    sequence_conv,
+)
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum, rms_statistics, rms_weighted
@@ -142,6 +150,12 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
         one_token, jnp.swapaxes(jnp.asarray(state, work), -1, -2),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
     return jnp.moveaxis(out, 0, 1), jnp.swapaxes(final, -1, -2)
+
+
+FUSED = Hooks(conv=recurrence.Conv('silu', order='vkq', bias=True), decay='scalar', delta=False, skip=True)
+"""Mamba2's decode token in the recurrence's step but its gated norm: its conv over x, B and C with their
+bias and silu (C the queries, B the keys, x the values: `ssd_as_delta`'s reading), the step's gates
+(`Mamba2._fused_token`) and the skip; its norm groups heads, so it runs after."""
 
 
 def decoded_ssd(x, dt, A, B, C, D, held=None, starts=None):
@@ -336,6 +350,17 @@ class Mamba2(nn.Module):
                                    for width, factor in zip(widths, self.section_multipliers, strict=True)])
         return projected * factors
 
+    def _fused_token(self, taps, bias, dt, valid, starts):
+        """A decode token's conv, step and skip in one launch (`linear.fused_token` under `FUSED`): its
+        x, B and C convolved with their bias, the step through softplus with its bias and limit, the
+        decay `exp(A dt)`; the gated norm over its groups after (`_gated`)."""
+        hooks = dataclasses.replace(FUSED, gates=recurrence.Gates(write='step', limit=self.time_step_limit))
+        return fused_token(hooks, taps, heads=(self.n_groups, self.n_groups, self.num_heads),
+                           widths=(self.state_size, self.state_size, self.head_dim),
+                           per_row={'gate': dt[:, 0]},
+                           per_head={'log_a': self.A_log, 'bias': self.dt_bias, 'skip': self.D},
+                           weight=None, valid=valid, starts=starts, conv_bias=bias)
+
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
@@ -373,10 +398,14 @@ class Mamba2(nn.Module):
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
             return self.out_proj(self._gated(out, gate))
-        out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
-                        (self.num_heads, self.state_size, self.head_dim),
+        state = (self.num_heads, self.state_size, self.head_dim)
+        token = None
+        if decode and length == 1 and decode_kernel(jax.ShapeDtypeStruct((batch, *state), wide), fuses=True,
+                                                    normed=False) == 'fused':
+            token = self._fused_token(taps, bias, dt, valid, tokens.starts)
+        out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads), state,
                         decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,
-                        dtype=compute)
+                        dtype=compute, token=token)
         if out is None:
             # Allocation only, as the delta net: init_cache's dummy token
             # must not consume a position or leave state behind.
