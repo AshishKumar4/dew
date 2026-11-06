@@ -940,8 +940,10 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     def dot(lhs, rhs):
         if isinstance(rhs, operands.Parts):
             # Into a fresh accumulator of the family's (`Family.summed`: wgmma's a scoped ref).
-            return family.summed((lhs.shape[0], rhs.shape[1]),
-                                 lambda acc: _parted_products(family, acc, None, lhs, rhs, interpret), interpret)
+            def issue(acc):
+                return _parted_products(family, acc, None, lhs, rhs, interpret)
+
+            return family.summed((lhs.shape[0], rhs.shape[1]), issue, interpret)
         return family.registers_product(lhs, rhs, interpret)
 
     def step(index, slots, carry, accumulators):
@@ -1293,16 +1295,27 @@ def _started(program: _Program, spec: algebra.Forward, guard: _Guard | None, hoo
 def _parted_products(family: mosaic.Family, acc, scale, weights: jax.Array, values: operands.Parts,
                      interpret: bool):
     """`acc` with an fp32 call's P·V issued into it in place, its factor `scale` first where given: the fp32
-    `weights`' bf16 parts (`product.bf16_parts`), each formed as it is taken, the largest first, each
-    product with the values' parts (`values`) the pair's orders under their count (`product.terms`'), so a
-    consumer holds one part and its remainder beside the sums, not the three."""
+    `weights`' bf16 parts (`product.bf16_parts`'), the largest first, each product with the values' parts
+    (`values`) the pair's orders under their count (`product.terms`'). Each part formed from the weights
+    alone as it is taken (`_part`), so a consumer holds the weights and one part beside the sums, no
+    remainder across the parts (with it, the guarded launch at 64 x 64 spilled on an H100, et-fp32i)."""
     count = len(values.refs)
-    for i, part in enumerate(product.bf16_parts(weights, count, saturating=count)):
+    for i in range(count):
+        part = _part(weights, i)
         for j in range(count - i):
             acc = (family.rescaled_products(acc, scale, (part,), values.refs[j], interpret)
                    if i == j == 0 and scale is not None
                    else issued_into(family, acc, (part,), values.refs[j], interpret))
     return acc
+
+
+def _part(weights: jax.Array, index: int) -> jax.Array:
+    """The `index`-th bf16 part of fp32 `weights` (`product.bf16_parts`'), each element's from its own weight:
+    its remainder past the parts before it, rounded. A weight is at most 1, no part of it saturating."""
+    rest = weights
+    for _ in range(index):
+        rest = rest - rest.astype(jnp.bfloat16).astype(jnp.float32)
+    return rest.astype(jnp.bfloat16)
 
 
 def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
