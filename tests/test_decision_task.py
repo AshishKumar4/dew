@@ -656,6 +656,28 @@ def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
         assert again.systemone(request) == decide.systemone(request)
 
 
+def test_a_laya_tasks_release_bundle_saves_and_exports_the_tasks_release(decide, tmp_path):
+    """Each decision format has one writer (export review #5): a Laya task's release bundle
+    (`PretrainedDecision.of`), as a joint or slot task's, saves the files the task saves, byte for byte,
+    and exports every tensor they hold, where the bundle of a Laya task was refused."""
+    from interop_support import written_tensors
+
+    from dew.decision.sources import PretrainedDecision
+
+    def files(root: Path) -> dict[Path, bytes]:
+        return {path.relative_to(root): path.read_bytes() for path in sorted(root.rglob("*"))
+                if path.is_file()}
+
+    decide.save_pretrained(tmp_path / "task")
+    bundle = PretrainedDecision.of(decide)
+    bundle.save(tmp_path / "bundle")
+    assert files(tmp_path / "bundle") == files(tmp_path / "task")
+    written, exported = written_tensors(tmp_path / "task"), bundle.export()
+    assert exported.keys() == written.keys()
+    for name, tensor in written.items():
+        np.testing.assert_array_equal(np.asarray(exported[name]), tensor, err_msg=name, strict=True)
+
+
 def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(decide, tmp_path):
     """A ModernBERT task whose backbone runs under LoRA, its factors moved off
     zero, saves in Laya's layout with the factors merged into their kernels
