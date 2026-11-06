@@ -282,10 +282,16 @@ class Processor:
             raise ValueError("this source ships no media processor")
         if not any((self.directory / name).exists() for name in ("processor_config.json",
                                                                  "preprocessor_config.json")):
-            # MiMo-V2.6 states its processing in its config.json (`processor_config`) and ships no code
-            # that runs it.
-            raise ValueError(f"{self.config.get('model_type')} ships no processor of its own, only its "
-                             "config's processor_config: hand the model its processed fields (`from_hf`)")
+            from transformers import PreTrainedTokenizerBase
+
+            if "processor_config" in self.config and isinstance(self.reference, PreTrainedTokenizerBase):
+                # MiMo-V2.6 states its processing in its config.json (`processor_config`) and ships no code
+                # that runs it: Dew's own, as vLLM's MiMo processor runs it (`dew.interop.mimo_media`).
+                from dew.interop.mimo_media import MiMoProcessor
+
+                return MiMoProcessor(self.reference, self.config)
+            raise ValueError(f"{self.config.get('model_type')} ships no processor of its own: hand the model "
+                             "its processed fields (`from_hf`)")
         from transformers import AutoProcessor
 
         options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
@@ -428,9 +434,13 @@ class Processor:
                     for message in messages for content in (message.get("content"),)
                     if isinstance(content, Sequence) and not isinstance(content, str)
                     for part in content)
-        if media and takes_medias(self._media_reference):
+        from dew.interop.mimo_media import MiMoProcessor
+
+        own = self._media_reference if media else None
+        if media and (takes_medias(self._media_reference) or isinstance(own, MiMoProcessor)):
             # Its template writes each image part's placeholder, and its call reads the images beside the
-            # text (`_medias_fields`), as its own call over the messages does (kimi_k25_processor.py:103-119).
+            # text (`_medias_fields`), as its own call over the messages does (kimi_k25_processor.py:103-119);
+            # MiMo-V2.6's own (`dew.interop.mimo_media`) reads the template's text and the images alike.
             text = self.reference.apply_chat_template(messages, tokenize=False,
                                                       add_generation_prompt=add_generation_prompt,
                                                       **template_options)
@@ -454,6 +464,8 @@ class Processor:
                         raise ValueError(f"an {part.type} part holds its image under one of image and "
                                          f"image_url, not {sorted(part.fields)}")
                     images.append(held[0])
+            if isinstance(own, MiMoProcessor):
+                return self._from_arrays(own(text=text, images=images))
             return self._from_arrays(self._medias_fields(images, text=text))
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(

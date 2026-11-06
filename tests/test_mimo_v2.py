@@ -367,18 +367,67 @@ def test_sliding_layers_of_their_own_geometry_load_split_or_fused_and_save_back_
         assert {key: stated[key] for key in SLIDING} == {key: config[key] for key in SLIDING}
 
 
-def test_a_release_without_a_processor_of_its_own_refuses_raw_media_and_reads_its_fields():
-    """MiMo-V2.6 ships no processor, only its config's `processor_config`: raw images are refused, and the
-    processed fields it states lay out into the model's inputs (`Processor.from_hf`)."""
-    from remote_code_draws import draw
+PROCESSOR = WHOLE / 'processor.npz'
+"""vLLM's MiMo processor over raw images, recorded by tools/mimo_reference.py --record-images."""
+
+
+def test_a_raw_image_is_processed_as_vllms_mimo_processor_processes_it():
+    """MiMo-V2.6 ships no processor, only its config's `processor_config`: Dew's own
+    (`dew.interop.mimo_media`) resizes, standardizes and cuts a drawn raw image into the tower's patch
+    rows on par with vLLM's MiMo processor from its float64 run's (check 1, the recording's); resizes a
+    table of image sizes to the sides vLLM's does; and lays a prompt around an image out as vLLM's
+    `process` does, token for token, and as the model's inputs (`Processor.from_hf`), a chat's image part
+    alike. Raw videos and audio, which it does not process, are refused (ledger 4289)."""
+    import jax
+    import jax.numpy as jnp
+    from model_support import recorded_site
+    from reference_error import as_given, assert_as_exact
+    from tool_support import run_from
+
+    from dew.interop.mimo_media import MiMoProcessor, smart_resize
 
     loaded = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    processor = loaded.processor._media_reference
+    assert isinstance(processor, MiMoProcessor)
+    with run_from('mimo_reference', 'tools') as module:
+        images_draw, sizes = module.images_draw, module.IMAGE_SIZES
+
+    def twin(inputs):
+        with jax.enable_x64(new_val=True):
+            return {'patches': processor.patch_rows(jnp.asarray(inputs['image'], jnp.float64))}
+
+    for height, width in sizes:
+        site = f'mimo image patches {height}x{width}'
+        draw, reference, truth, seeds = recorded_site(PROCESSOR, site, images_draw(height, width), twin)
+        assert_as_exact(as_given(lambda index, inputs: {'patches': processor.patches(inputs['image'])}),
+                        reference, draw, site, seeds=seeds, truth_fn=truth)
+    with np.load(PROCESSOR) as recorded:
+        sides, resized, prompt = recorded['sides'], recorded['resized'], recorded['prompt_ids']
+    factor = processor.patch * processor.merge
+    assert [smart_resize(*side, factor, processor.least, processor.most) for side in sides.tolist()] == \
+        [tuple(pair) for pair in resized.tolist()]
+    image = images_draw(*sizes[1])(0)['image']
+    fields = processor(text='w1 w2<|vision_start|><|image|><|vision_end|>w0', images=[image])
+    np.testing.assert_array_equal(fields['input_ids'][0], prompt)
+    inputs = loaded.processor('w1 w2<|vision_start|><|image|><|vision_end|>w0', images=[image])
+    np.testing.assert_array_equal(np.asarray(inputs.tokens)[0], prompt)
+    # A chat's image part, its template writing the placeholder: the images the parts hold, processed.
+    template = ("{% for message in messages %}{% for part in message['content'] %}"
+                "{% if part['type'] == 'image' %}<|vision_start|><|image|><|vision_end|>"
+                "{% else %}{{ part['text'] }}{% endif %}{% endfor %}{% endfor %}")
+    parts = [{'type': 'text', 'text': 'w1 w2'}, {'type': 'image', 'image': image},
+             {'type': 'text', 'text': 'w0'}]
+    chat = loaded.processor.chat([{'role': 'user', 'content': parts}], add_generation_prompt=False,
+                                 chat_template=template)
+    np.testing.assert_array_equal(np.asarray(chat.tokens)[0], prompt)
     with pytest.raises(ValueError):
-        loaded.processor('w1 w2', images=[np.zeros((8, 8, 3), np.uint8)])
-    drawn = draw('image', 0, dict(loaded.config))
-    fields = loaded.processor.from_hf({'input_ids': drawn['ids'], 'pixel_values': drawn['pixel_values'],
-                                       'image_grid_thw': drawn['image_grid_thw']})
-    assert int((np.asarray(fields.token_fields['image_indices']) >= 0).sum()) == 6
+        processor(text='w1', audio=[np.zeros(240, np.float32)])
+    # A text chat of the language model alone, which reads no media processor, runs its tokenizer's
+    # template.
+    text = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference', text_only=True).processor
+    held = text.chat([{'role': 'user', 'content': [{'type': 'text', 'text': 'w1 w2'}]}],
+                     add_generation_prompt=False, chat_template=template)
+    np.testing.assert_array_equal(np.asarray(held.tokens)[0], text.reference.encode('w1 w2'))
 
 
 STORED = {'quant_method': 'fp8', 'fmt': 'e4m3', 'weight_block_size': [128, 128],
