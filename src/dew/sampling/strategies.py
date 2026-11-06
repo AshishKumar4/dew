@@ -18,6 +18,7 @@ from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import struct
 from jax import lax
 from jax.experimental import checkify
@@ -30,7 +31,7 @@ from dew.nn.scatter import DROPPED, gather_positions
 from dew.sampling import decoding
 from dew.sampling.decoding import Finish, StepState
 from dew.sampling.guided import Grammar
-from dew.sampling.trees import DraftTree, TreeBlock
+from dew.sampling.trees import DraftTree, TreeBlock, TreeShape
 
 
 @struct.dataclass
@@ -651,6 +652,21 @@ class Speculative:
         return continuations(start, n, lambda drawn: _speculate(
             state, drawn, ops, transform, stopping, budget, self))
 
+    @property
+    def emits(self) -> int:
+        """The most tokens a block emits a row: its candidates and the one after them."""
+        return self.block + 1
+
+    @property
+    def reach(self) -> int:
+        """The tokens a block's candidates take a row past its last."""
+        return self.block
+
+    def stepped(self, state: DecoderState, step: StepState, terminated: jax.Array, ops: DecodeOps,
+                transform, stopping, budget: int | jax.Array) -> Block:
+        """One block (`block_step`)."""
+        return block_step(state, step, terminated, self, ops, transform, stopping, budget)
+
 
 def refuse_undrafted(ops: DecodeOps) -> None:
     """Refuse a decode that has nothing to draft with: speculative blocks (`block_step`) draft with the
@@ -868,10 +884,11 @@ class Block(NamedTuple):
     stopped: jax.Array
 
 
-def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transform, stopping, budget: int,
-           slots: jax.Array, index: jax.Array):
-    """`block_step` over `_speculate`'s carry, its kept slots written at their response positions."""
-    block = block_step(carry.state, carry.step, carry.out.terminated, plan, ops, transform, stopping, budget)
+def _block(carry: _SpeculativeCarry, plan: Speculative | TreeSpeculative, ops: DecodeOps, transform, stopping,
+           budget: int, slots: jax.Array, index: jax.Array):
+    """A plan's block (`Speculative.stepped`, `TreeSpeculative.stepped`) over `_speculate`'s carry, its kept
+    slots written at their response positions."""
+    block = plan.stepped(carry.state, carry.step, carry.out.terminated, ops, transform, stopping, budget)
     out = _written(carry.out, block.tokens, block.behavior, block.raw, block.kept, carry.step, slots, index,
                    block.terminated)
     return _SpeculativeCarry(block.state, block.step, out), None
@@ -897,7 +914,7 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
     verify, block_size = ops.verify, plan.block
     assert verify is not None
     slots = jnp.arange(block_size + 1)[None, :]
-    active, saved, rows = step.active, state.cache, step.rows
+    active, rows = step.active, step.rows
     base = _coordinates(state, step, slots)
     keys = jax.vmap(lambda key, count: jax.random.split(
         jax.random.fold_in(key, count), 2 * block_size + 1))(step.keys, step.step)
@@ -919,7 +936,21 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
                                      for at in range(1, block_size + 1)]
 
     matched, replacement = _accepted(block_size, keys, targets, drafted, step, active, budget, walking)
+    return _settled(state, step, terminated, ops, stopping, budget, matched, replacement, proposed, targets,
+                    raw)
 
+
+def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: DecodeOps, stopping,
+             budget: int | jax.Array, matched: jax.Array, replacement: jax.Array, proposed: jax.Array,
+             targets: list[jax.Array], raw: list[jax.Array]) -> Block:
+    """A verified block's end, a chain's (`block_step`) or a tree's (`tree_step`): its `matched` kept
+    candidates of `proposed` `[rows, width]` (the first the target's own draw) and the `replacement` after
+    them emitted, with the distributions each slot was drawn from (`targets`, `raw`: `width + 1` of them),
+    committed under the criteria, and replayed into the cache saved before the block, `state`'s."""
+    verify, block_size, rows = ops.verify, proposed.shape[1], step.rows
+    assert verify is not None
+    slots = jnp.arange(block_size + 1)[None, :]
+    base = _coordinates(state, step, slots)
     emitted, behavior, original = _emission(block_size, slots, matched, replacement, proposed,
                                             targets, raw, rows)
     committed, count, terminated, stopped = _committed(block_size, step, emitted, terminated, budget,
@@ -929,7 +960,7 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
         "the model produced an emitted position without a distribution to score")
     keep = slots < count[:, None]
 
-    following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
+    following, again, seen = verify(state, emitted, keep)
     assert seen is not None
     last = jnp.maximum(count - 1, 0)
     # A row whose replay rebuilt its caches across a positional table change was reseeded over its
@@ -960,15 +991,152 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
     return Block(following, committed, emitted, behavior, original, keep, terminated, stopped)
 
 
+
+@struct.dataclass
+class TreeSpeculative:
+    """Drafts a tree of candidates with the model's tree drafter (`DecodeOps.draft_tree`) and verifies the
+    whole tree with the model itself in one pass (`dew.sampling.trees.TreeBlock`), keeping the longest
+    path the target accepts (ledger 4527).
+
+    The root, the block's first token, is an ordinary target draw. From it the walk descends: at each node
+    its children are tested in their order by recursive rejection, each accepted with probability
+    `min(1, p(x) / q(x))`, `p` the target's post-transform distribution after the node and `q` the one the
+    child was drawn from (one-hot at a picked child's token), and on a rejection `p` becomes the normalized
+    positive part of `p - q` for the next child. The first child accepted is the next node; where every
+    child is rejected, or a leaf is reached, the block's last token is drawn from `p` as it then stands. So
+    each emitted token has exactly the distribution `Sample` would give it (SpecInfer, arXiv:2305.09781,
+    algorithm 2; a picked child's `q` its point mass), and at zero temperature the walk is the greedy one.
+    Each emitted token records the target's post-transform log probability and the model's own, as
+    `Speculative` records them, and the accepted path is replayed into the cache saved before the block.
+    """
+
+    shape: TreeShape = struct.field(pytree_node=False)
+
+    def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
+                 transform: Callable[[StepState, jax.Array], jax.Array],
+                 stopping: Callable[[StepState, jax.Array], Finish],
+                 budget: int, n: int) -> Draws:
+        refuse_untreed(ops)
+        return continuations(start, n, lambda drawn: _speculate(
+            state, drawn, ops, transform, stopping, budget, self))
+
+    @property
+    def emits(self) -> int:
+        """The most tokens a block emits a row: the root, a path to the deepest node and the one after it."""
+        return int(self.shape.depths.max()) + 2
+
+    @property
+    def reach(self) -> int:
+        """The tokens a block's verify takes a row past its last: the root and every node."""
+        return self.shape.nodes + 1
+
+    def stepped(self, state: DecoderState, step: StepState, terminated: jax.Array, ops: DecodeOps,
+                transform, stopping, budget: int | jax.Array) -> Block:
+        """One block (`tree_step`)."""
+        return tree_step(state, step, terminated, self, ops, transform, stopping, budget)
+
+
+def refuse_untreed(ops: DecodeOps) -> None:
+    """Refuse a tree decode that has no tree drafter or no verify (`TreeSpeculative`)."""
+    if ops.verify is None or ops.draft_tree is None:
+        raise ValueError("tree speculative decoding drafts with the model's tree drafter, and this model "
+                         "has none; choose Speculative or another strategy")
+
+
+def tree_step(state: DecoderState, step: StepState, terminated: jax.Array, plan: TreeSpeculative,
+              ops: DecodeOps, transform, stopping, budget: int | jax.Array) -> Block:
+    """One tree block: draw the root, draft the tree after it, verify the root and every node in one pass,
+    walk the longest accepted path (`TreeSpeculative`), and emit and replay it as a chain's block is
+    (`_settled`). A row whose tree would cross the model's cache rebuild keeps none and draws its one token
+    as the walk does (`block_step`)."""
+    refuse_untreed(ops)
+    verify, draft_tree, shape = ops.verify, ops.draft_tree, plan.shape
+    assert verify is not None and draft_tree is not None
+    deepest = int(shape.depths.max())
+    width = max(len(children) for children in shape.children)
+    active, rows = step.active, step.rows
+    keys = jax.vmap(lambda key, count: jax.random.split(
+        jax.random.fold_in(key, count), 3 + deepest * width))(step.keys, step.step)
+    walking = (jnp.zeros(rows, bool) if ops.crosses is None or state.lengths is None else
+               ops.crosses(state.lengths, state.lengths + shape.nodes + 1))
+
+    opening = dataclasses.replace(step, active=active & (step.step < budget))
+    first = transform(opening, state.logits.astype(jnp.float32))
+    root = select(keys[:, 0], first, opening.active)
+    drafted = draft_tree(state, root, shape, keys[:, 1])
+    fed = jnp.concatenate([root[:, None], drafted.tokens], axis=1)
+    cursor = step.total()
+    block = TreeBlock(shape, cursor, _coordinates(state, step, jnp.zeros((1, 1), jnp.int32))[:, 0])
+    _, verified, _ = verify(state, fed, jnp.broadcast_to((active & ~walking)[:, None], fed.shape),
+                            rebuilds=False, tree=block)
+    raw = verified.astype(jnp.float32)
+    # Each fed token's history (its path committed) and the target's distribution after it.
+    states = [opening.commit(root, active)]
+    for node, parent in enumerate(shape.parents):
+        states.append(states[parent + 1].commit(drafted.tokens[:, node], active))
+    targets = jnp.stack([transform(held, raw[:, at]) for at, held in enumerate(states)], axis=1)
+    ending = jnp.stack([stopping(held, fed[:, at]).done for at, held in enumerate(states)], axis=1)
+
+    children = np.full((shape.nodes + 1, width), -1, np.int32)
+    for at, kids in enumerate(shape.children):
+        children[at, :len(kids)] = 1 + np.asarray(kids, np.int32)
+    vocab = targets.shape[-1]
+
+    def row_of(table: jax.Array, at: jax.Array) -> jax.Array:
+        """Each row's entry `at` `[rows]` of `table` `[rows, 1 + N, ...]`."""
+        return jnp.take_along_axis(table, at.reshape(rows, 1, *(1,) * (table.ndim - 2)), axis=1)[:, 0]
+
+    at = jnp.zeros(rows, jnp.int32)
+    live = active & ~walking & ~ending[:, 0] & (step.step + 1 < budget)
+    p = categorical.probabilities(jnp.where(walking[:, None], first, targets[:, 0]))
+    path = []
+    for depth in range(1, deepest + 1):
+        kids = jnp.asarray(children)[at]
+        found, chosen = jnp.zeros(rows, bool), at
+        for index in range(width):
+            kid = kids[:, index]
+            tested = live & (kid >= 0) & ~found
+            held = jnp.maximum(kid, 1)
+            token = row_of(fed, held)
+            q = (jax.nn.one_hot(token, vocab, dtype=p.dtype) if drafted.log_q is None
+                 else jnp.exp(row_of(drafted.log_q, held - 1)))
+            seen = jnp.take_along_axis(p, token[:, None], axis=1)[:, 0]
+            offered = jnp.take_along_axis(q, token[:, None], axis=1)[:, 0]
+            # Each row its own key's uniform, whatever rows it is drawn beside (`counted`).
+            uniform = jax.vmap(jax.random.uniform)(counted(keys[:, 3 + (depth - 1) * width + index]))
+            accepted = tested & (uniform * offered <= seen)
+            residual = jnp.maximum(p - q, 0.0)
+            weight = jnp.sum(residual, axis=-1, keepdims=True)
+            p = jnp.where((tested & ~accepted)[:, None], residual / jnp.where(weight > 0, weight, 1.0), p)
+            found, chosen = found | accepted, jnp.where(accepted, kid, chosen)
+        path.append(jnp.where(found, chosen, -1))
+        at = chosen
+        p = jnp.where(found[:, None], categorical.probabilities(row_of(targets, at)), p)
+        live = live & found & ~row_of(ending, at) & (step.step + depth + 1 < budget)
+
+    # The fed token each emitted slot holds, the root's first, -1 past the accepted path.
+    held = jnp.stack([jnp.zeros(rows, jnp.int32), *path], axis=1)
+    accepted_count = jnp.sum((held[:, 1:] >= 0).astype(jnp.int32), axis=1)
+    matched = jnp.where(walking | ~active, 0, 1 + accepted_count).astype(jnp.int32)
+    stopped = jnp.any(jnp.take_along_axis(ending, jnp.maximum(held, 0), axis=1)
+                      & (jnp.arange(deepest + 1)[None, :] < matched[:, None]), axis=1)
+    replacement = select(keys[:, 2], jnp.log(p), active & ~stopped & (step.step + matched < budget))
+    proposed = jnp.where(held >= 0, jnp.take_along_axis(fed, jnp.maximum(held, 0), axis=1), 0)
+    # The distributions each slot was drawn from: the opening's, then each kept token's after it.
+    behind = [jnp.maximum(held[:, at], 0) for at in range(deepest + 1)]
+    return _settled(state, step, terminated, ops, stopping, budget, matched, replacement, proposed,
+                    [first] + [row_of(targets, at) for at in behind],
+                    [state.logits.astype(jnp.float32)] + [row_of(raw, at) for at in behind])
+
 def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                transform: Callable[[StepState, jax.Array], jax.Array],
                stopping: Callable[[StepState, jax.Array], Finish],
-               budget: int, plan: Speculative) -> Draws:
-    """`Speculative`'s loop of `_block`s. The carry is the model state, the
-    `StepState` the accepted tokens leave behind, and the rows emitted so
-    far, which rows ended included."""
-    block_size, rows = plan.block, start.rows
-    slots = jnp.arange(block_size + 1)[None, :]
+               budget: int, plan: Speculative | TreeSpeculative) -> Draws:
+    """A speculative plan's loop of `_block`s, a chain's (`Speculative`) or a tree's (`TreeSpeculative`).
+    The carry is the model state, the `StepState` the accepted tokens leave behind, and the rows emitted
+    so far, which rows ended included."""
+    rows = start.rows
+    slots = jnp.arange(plan.emits)[None, :]
     index = jnp.arange(rows)[:, None]
 
     def outer(carry: _SpeculativeCarry, _):
@@ -984,8 +1152,8 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                   jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32),
                   jnp.zeros(rows, bool))
     # Each block emits two tokens a row at least, but a row's walk across a rebuild, one a block over at
-    # most `block_size` blocks.
-    walks = 0 if ops.crosses is None else min(block_size, budget)
+    # most as many blocks as its candidates reach.
+    walks = 0 if ops.crosses is None else min(plan.reach, budget)
     blocks = -(-(budget + walks) // 2)
     out = lax.scan(outer, _SpeculativeCarry(state, start, empty), None, length=blocks)[0].out
     return dataclasses.replace(out, behavior_log_probs=jnp.where(out.valid, out.behavior_log_probs, 0.0),
