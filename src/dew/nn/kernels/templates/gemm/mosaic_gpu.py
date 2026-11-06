@@ -853,6 +853,10 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
         return nothing, tuple(family.register_products(acc, (left,), oriented[name], interpret)
                               for acc, name in zip(accumulators, matrices, strict=True))
     if apart is not None:
+        if interpret:
+            # The fresh product's own arithmetic: the CPU's dots sum in IEEE fp32 either way.
+            return nothing, tuple(family.products(family.zeros(apart), mine, oriented[name], interpret=True)
+                                  for name in matrices)
         return nothing, tuple(family.product(mine, oriented[name], apart) for name in matrices)
     return nothing, tuple(family.products(acc, mine, oriented[name], interpret)
                           for acc, name in zip(accumulators, matrices, strict=True))

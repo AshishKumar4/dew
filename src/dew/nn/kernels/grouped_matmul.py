@@ -653,9 +653,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             # staged rows above them (FS-K01 model2: 144 at 64 a thread over stages 2-5, 208 at 96). A family
             # whose products read registers holds each step's fragments beside both (mma.sync's: its running
             # sum spilled 136 bytes at a tile the larger of the two admitted, ns-regs2).
-            if family.operands_in_registers:
-                return plain + accumulator + max(phases)
-            return max(2 * accumulator + resources.CONTROL_REGISTERS, plain + max(phases))
+            held = plain + (accumulator if family.operands_in_registers else 0)
+            return max(2 * accumulator + resources.CONTROL_REGISTERS, held + max(phases))
         return plain + max(phases)
 
     def _prologue_registers(self, ba, config: mosaic_gpu.Tiles) -> int:
