@@ -377,7 +377,7 @@ def test_the_decode_step_holds_every_order(edge):
     flat_cotangent = jnp.concatenate([cotangent[0][:, 0].ravel(), cotangent[1].ravel()])
     assert_contract(flattened(stepped), (query, key, value, g, beta, state, skip),
                     (*direction, skip_direction), flat_cotangent, f"the decode step {edge}",
-                    truth_fn=flattened(plain), plain_fn=flattened(plain))
+                    truth_fn=flattened(plain), plain_fn=flattened(plain), without=INTERPRETED_REMAT)
 
 
 def ssd_draw(seed: int, scale: float):
