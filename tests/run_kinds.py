@@ -33,6 +33,7 @@ from dew.training import Layout, LocalTracker, MeshSpec
 
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
+GEMMA_TINY = Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"
 DIFFUSION_GEMMA = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-sft"
 RATE = 0.0123
 """A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
@@ -218,6 +219,12 @@ def lettered(root: Path, drawn: bool) -> RunConfig:
                                source=SourceOptions(text_only=True))
 
 
+def shared(root: Path, drawn: bool) -> RunConfig:
+    """A decision run of a fresh letter readout over the tiny Gemma's text decoder, whose every layer reads a
+    row's key runs, its rows asking a request's questions over one copy of its state (`shared_state`)."""
+    return dataclasses.replace(lettered(root, drawn), pretrained=str(GEMMA_TINY), shared_state=3)
+
+
 def merged(root: Path, drawn: bool) -> RunConfig:
     """A decision run of a fresh head over the tiny causal source with a tokenizer that merges "n" and "c"
     (`merging_source`), where a row encoded whole and one encoded piece by piece are other tokens, which
@@ -282,6 +289,7 @@ def requested(task) -> object:
     generation's budget of two tokens, its answers: a decision's with a context beside its state where its
     backbone reads one."""
     from dew.decision import Choice
+    from dew.decision.layout import QuestionLayout
     from dew.decision.task import Decide
     from dew.inference.images import TextToImage
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -301,6 +309,10 @@ def requested(task) -> object:
         # unless its layout reads the question there (`spans_in_context`), which reads no other.
         reads = task.context_length is not None and not task.layout.spans_in_context
         context = {"plan": "enterprise"} if reads else None
+        if isinstance(task.layout, QuestionLayout) and task.layout.shared_state is not None:
+            # Two questions, which a row over one state asks together, each reading the state once.
+            question = {**question,
+                        "urgent": Choice("how urgent", {"now": "blocks work", "later": "can wait"})}
         # A state of plain text, which a row lays as written, its last word "down".
         return task([("the site is down", question)], contexts=[context])
     if isinstance(task, TextToImage):

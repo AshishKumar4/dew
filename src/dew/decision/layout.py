@@ -701,12 +701,12 @@ class QuestionLayout(Layout):
     option's text, which a fresh head reads (`default_layout`), so a key that only identifies the
     option (`option_0`) writes nothing the row reads. An option with no description is its key."""
 
-    shared_state: int | None = dataclasses.field(default=None, metadata={_records.ADDED: True})
+    shared_state: int | None = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
     """The most questions a row asks over one copy of their request's state (None: a row a question). Each
     reads what its own row writes before it, written once, and itself, at its own row's positions, so it
     decides as its own row does (`dew.decision.shared_state`); questions that outgrow a row take several,
     each repeating the state, and one whose own row cuts the state is a row of its own."""
-    siblings: bool = dataclasses.field(default=False, metadata={_records.ADDED: True})
+    siblings: bool = dataclasses.field(default=False, repr=False, metadata={_records.ADDED: True})
     """Whether a question of a row of several (`shared_state`) also reads the questions before it in its
     row, whole; off, each reads the shared part and itself alone."""
 
