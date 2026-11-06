@@ -195,8 +195,7 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
                                 floor=hooks.floor, bound=hooks.inverse_bound,
-                                rounded=fast_rounding() if hooks.rated else chunk_rounding(
-                                    hooks.delta, jnp.result_type(query, key, given.value)))
+                                rounded=fast_rounding() if hooks.rated else chunk_rounding(hooks.delta))
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
@@ -718,29 +717,30 @@ Their draws are fp32, whose delta-rule and per-key calls the template refuses (a
 per-key decay's factoring): the cases that run check 1 are the fp32 calls without the delta rule, a decay a
 head or none, natively (template numerics review 2026-10-26, P2-3: the other forms, the delta rule without
 a decay, the gated linear attentions, the rated scan in bf16 and the formed hooks, hold no float64
-evidence on the template; their reference arm in a 16-bit call is open)."""
+evidence on the template; their reference arm in a 16-bit call is open). Under the run's own forms: a call
+without the delta rule takes three parts under either (`recurrence_chunk.chunk_rounding`)."""
 
 
 def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
-    """The chunked op on the mainloop under the accurate forms, each hook combination it takes, its output and
-    final memory on par with the recurrence a token at a time's from float64 over the site's declared draws
-    (check 1), as test_recurrence_chunk holds the portable math; a call the template refuses (a launch's
-    registers past a thread's) is checked refused, its arithmetic the forward check's (`on_the_mainloop`).
-    The draws are fp32, whose products the accurate forms take in three bf16 parts, an fp32 product's
-    accuracy, as the fp32 recurrence's; under the fast forms an fp32 call's are two (`mainloop.FAST_PARTS`),
-    held to recorded fla-core instead (`the_mosaic_forward_is_as_exact_as_its_reference`): run under the
-    fast forms, the run's default since 82e5eabd30, this check put the template 42 to 83 times the fp32
-    recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a)."""
+    """The chunked op on the mainloop under the run's own forms (the fast forms), each hook combination it
+    takes, its output and final memory on par with the recurrence a token at a time's from float64 over the
+    site's declared draws (check 1), as test_recurrence_chunk holds the portable math; a call the template
+    refuses (a launch's registers past a thread's) is checked refused, its arithmetic the forward check's
+    (`on_the_mainloop`). The draws are fp32; a call without the delta rule, whose bar is the portable math,
+    takes its products in three bf16 parts, an fp32 product's accuracy, under the fast forms too
+    (`recurrence_chunk.chunk_rounding`): in two (`mainloop.FAST_PARTS`, the delta rule's, held to recorded
+    fla-core, `the_mosaic_forward_is_as_exact_as_its_reference`) this check put the template 42 to 83 times
+    the fp32 recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu,
+    gpuflow-a), and row 184's write gate cell 30 to 69 times the portable math's on every leaf."""
     (sample,) = hooked_draw(hooks, packed, 0)
-    if not formed('accurate', taken)(sample, hooks):
+    if not taken(sample, hooks):
         with pytest.raises(REFUSED):
-            formed('accurate', jax.eval_shape)(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
+            jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
         return
-    dew = jax.jit(formed('accurate', functools.partial(chunk_on, 'mosaic_gpu', hooks)))
+    dew = jax.jit(functools.partial(chunk_on, 'mosaic_gpu', hooks))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
-                    f'the mosaic forward, {hooks} packed={packed} under the accurate forms',
-                    seeds=HOOK_SEEDS[hooks, packed])
+                    f'the mosaic forward, {hooks} packed={packed}', seeds=HOOK_SEEDS[hooks, packed])
 
 
 HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
