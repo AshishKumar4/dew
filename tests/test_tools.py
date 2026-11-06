@@ -1255,6 +1255,69 @@ run of two or more spaces between words is a spacing snapshot; its words and num
 one-space string, a column end measured and parsed data holding two spaces are not."""
 
 
+BANNED_ASSERTION_LINTS = {
+    "SLOP008": ({
+        "src/sparx/store.py": "class Store:\n    def _open(self):\n        pass\n",
+        "tests/test_store.py": (
+            "from unittest import mock\n"
+            "from sparx.store import Store\n"
+            "def test_spied(monkeypatch):\n"
+            "    store = Store()\n"
+            "    monkeypatch.setattr(store, '_open', lambda: None)\n"
+            "    with mock.patch.object(store, '_open', wraps=store._open):\n"
+            "        pass\n"
+            "def test_public_and_dunder(monkeypatch):\n"
+            "    store = Store()\n"
+            "    monkeypatch.setattr(store, 'path', 'x')\n"
+            "    monkeypatch.setattr(store, '__len__', lambda: 1)\n"),
+    }, "tests/test_store.py", (5, 6)),
+    "SLOP011": ({
+        "src/sparx/gate.py": "def main():\n    print('failed: quiet')\n",
+        "tests/test_gate.py": (
+            "from sparx import gate\n"
+            "def test_table(capsys):\n"
+            "    def judged():\n"
+            "        code = gate.main()\n"
+            "        return code, capsys.readouterr().out\n"
+            "    code, table = judged()\n"
+            "    assert code is None and 'failed: quiet' in table\n"
+            "    code, table = judged()\n"
+            "    table = table.split()\n"
+            "    assert 'quiet' in table\n"),
+    }, "tests/test_gate.py", (7,)),
+    "SLOP029": ({
+        "src/sparx/cli.py": "def main():\n    pass\n",
+        "tests/test_cli.py": (
+            "import subprocess\n"
+            "import json\n"
+            "def test_exit_alone():\n"
+            "    done = subprocess.run(['sparx'], capture_output=True)\n"
+            "    assert done.returncode == 0, done.stderr\n"
+            "def test_call_alone():\n"
+            "    assert subprocess.call(['sparx']) == 0\n"
+            "def test_with_its_state():\n"
+            "    done = subprocess.run(['sparx'], capture_output=True)\n"
+            "    assert done.returncode == 0\n"
+            "    assert json.loads(done.stdout) == {'rows': 1}\n"
+            "def test_no_assertions():\n"
+            "    subprocess.run(['sparx'], check=True)\n"),
+    }, "tests/test_cli.py", (3, 6)),
+}
+"""Bible §7's banned assertions the slop lint enforces (owner, 2026-11-06), a case each, by code: the files
+linted, the file the findings are in, their lines. SLOP008 (class 3): a private attribute of an object the
+test made, spied on or replaced; a public attribute or a dunder is not. SLOP011 (class 5): a sentence looked
+for in captured output that a helper returns, read through its unpacked name; a name rebound to its parse is
+not.
+SLOP029 (class 7): a test whose every assertion is a process's exit status; one that asserts the state the
+process reports as well, or asserts nothing, is not."""
+
+
+@pytest.mark.parametrize("code", sorted(BANNED_ASSERTION_LINTS))
+def test_the_banned_assertions_the_lint_reads_are_reported_and_the_rest_spared(code, tmp_path):
+    files, where, lines = BANNED_ASSERTION_LINTS[code]
+    assert _linted(tmp_path, files) == [(where, line, code) for line in lines]
+
+
 @pytest.mark.parametrize("code", sorted(ROW_1878_LINTS))
 def test_row_1878s_lints_report_their_cases_and_spare_the_rest(code, tmp_path):
     files, where, lines = ROW_1878_LINTS[code]

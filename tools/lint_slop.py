@@ -79,6 +79,11 @@ Scope is per rule, because the rules are not all about the same thing:
   name of exactly one test function of tests/test_contracts_*.py
   (`assert_contract`: every order finite against its float64 truth and an
   independent plain formula) (row 4411; `lint_derivatives`).
+- SLOP029 is about `tests`: no test's every assertion is a process's exit
+  status (a `returncode`, `subprocess.call` or `os.system` compared with a
+  constant or tested for truth), which a command that exits 0 having done
+  nothing passes; it asserts the state the command reports or leaves (bible
+  §7's class 7).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -682,11 +687,36 @@ def _seam(target: str) -> bool:
     return False
 
 
+def _spied(node: ast.Call, table: dict[str, str]) -> str:
+    """The private attribute (`_name`, not a dunder) a patching call replaces on an object the test holds
+    itself, an instance its own code made, as `monkeypatch.setattr(trainer, "_step", counting)` or
+    `patch.object(store, "_open", wraps=store._open)` spies on it: "<owner>.<attribute>", or "" where the
+    call patches none so, or patches a module's member (`_patched` reads those)."""
+    name = _named(node.func)
+    patching = name.endswith(("patch.object", "monkeypatch.setattr", "monkeypatch.delattr"))
+    if not patching or len(node.args) < 2:
+        return ""
+    owner, attribute = node.args[0], node.args[1]
+    if not (isinstance(attribute, ast.Constant) and isinstance(attribute.value, str)) or isinstance(
+            owner, ast.Constant):
+        return ""
+    private = attribute.value.startswith("_") and not (attribute.value.startswith("__")
+                                                       and attribute.value.endswith("__"))
+    return f"{_named(owner) or 'an object'}.{attribute.value}" if private and not scopes.resolved(
+        owner, table) else ""
+
+
 def mocks(module: Module) -> Iterator[Finding]:
     """SLOP008: a first-party module, or a table or registry it holds, replaced
-    instead of a seam taken."""
+    instead of a seam taken; or a private attribute of an object the test made spied on or replaced
+    (`_spied`), whose calls, counts or traces are the code under test's internals (bible §7's class 3:
+    observe the public outcome instead: transfers, reuse, release, results)."""
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if spied := _spied(node, dict(table)):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP008",
+                          f"spies on or replaces {spied}, a private attribute; assert the public outcome")
             continue
         target = _patched(node, dict(table))
         if not target.startswith(f"{module.package}."):
@@ -1025,12 +1055,61 @@ def _captured(node: ast.expr, names: Set[str]) -> bool:
             and isinstance(node.value, ast.Name) and node.value.id in ("capsys", "capfd", "caplog"))
 
 
+def _returned(tree: ast.Module) -> dict[str, frozenset[int] | None]:
+    """The functions `tree` defines, at any depth, that return captured output (`_captured`), by name: None
+    where one returns it whole, else the positions of a returned tuple that hold it (as a helper that runs a
+    command and returns `(code, capsys.readouterr().out)` does), so a test's sentence looked for in what it
+    returns is one looked for in captured output (bible §7's class 5)."""
+    found: dict[str, frozenset[int] | None] = {}
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        names: set[str] = set()
+        for node in scopes.own(function):
+            if isinstance(node, ast.Assign) and _captured(node.value, names):
+                names |= {name.id for target in node.targets for name in ast.walk(target)
+                          if isinstance(name, ast.Name)}
+        for node in scopes.own(function):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            if _captured(node.value, names):
+                found[function.name] = None
+            elif isinstance(node.value, ast.Tuple) and (positions := frozenset(
+                    index for index, element in enumerate(node.value.elts) if _captured(element, names))
+            ) and found.get(function.name, frozenset()) is not None:
+                found[function.name] = found.get(function.name, frozenset()) | positions
+    return found
+
+
+def _bound_captured(node: ast.Assign | ast.AnnAssign | ast.AugAssign, names: Set[str],
+                    returned: dict[str, frozenset[int] | None]) -> set[str]:
+    """The names an assignment binds to captured output: every name it binds where its value is captured
+    output, or a call of a function returning it whole (`_returned`); a tuple target's names at the
+    positions such a function's tuple holds it."""
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    bound = {name.id for target in targets for name in ast.walk(target)
+             if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)}
+    if node.value is None:
+        return set()
+    if _captured(node.value, names):
+        return bound
+    called = _named(node.value.func) if isinstance(node.value, ast.Call) else ""
+    if called not in returned:
+        return set()
+    positions = returned[called]
+    if positions is None:
+        return bound
+    return {target.elts[index].id for target in targets if isinstance(target, ast.Tuple)
+            for index in positions if index < len(target.elts) and isinstance(target.elts[index], ast.Name)}
+
+
 def _held(tree: ast.Module) -> dict[int, frozenset[str]]:
     """The names bound to captured output (`_captured`) where each node of a function's own scope is:
-    a name the function binds to it, or unpacks it into, until it binds that name again to anything
-    else (a parse of it, say); added to, it stays captured. An item or attribute assigned binds no
-    name."""
+    a name the function binds to it, or unpacks it into, or to what a helper returning it returns
+    (`_returned`), until it binds that name again to anything else (a parse of it, say); added to, it
+    stays captured. An item or attribute assigned binds no name."""
     held: dict[int, frozenset[str]] = {}
+    returned = _returned(tree)
     for function in ast.walk(tree):
         if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
@@ -1049,8 +1128,9 @@ def _held(tree: ast.Module) -> dict[int, frozenset[str]]:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             bound = {name.id for target in targets for name in ast.walk(target)
                      if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)}
-            if node.value is not None and _captured(node.value, names):
-                names |= bound
+            if captured := _bound_captured(node, names, returned):
+                names |= captured
+                names -= bound - captured
             elif not isinstance(node, ast.AugAssign):
                 names -= bound
     return held
@@ -1181,6 +1261,44 @@ def wording(module: Module) -> Iterator[Finding]:
               and node.value.startswith(f"src/{module.package}/") and node.value.endswith(".py")):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                           f"names {node.value}; test what the code does, not its source")
+
+
+EXITS = {"subprocess.call", "os.system"}
+"""The calls whose value is a process's exit status alone (SLOP029)."""
+
+
+def _status_only(test: ast.expr, table: dict[str, str]) -> bool:
+    """Is assertion `test` a process's exit status and nothing else: its `returncode` (or a call of
+    `EXITS`) compared with a constant, negated or tested for truth, or such checks joined by `and`?"""
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return all(_status_only(value, table) for value in test.values)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        test = test.operand
+
+    def status(expr: ast.expr) -> bool:
+        return (isinstance(expr, ast.Attribute) and expr.attr == "returncode") or (
+            isinstance(expr, ast.Call) and scopes.resolved(expr.func, table) in EXITS)
+
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        sides = (test.left, test.comparators[0])
+        return any(status(side) for side in sides) and all(
+            status(side) or isinstance(side, ast.Constant) for side in sides)
+    return status(test)
+
+
+def statuses(module: Module) -> Iterator[Finding]:
+    """SLOP029: a test whose every assertion is a process's exit status (`_status_only`), so a command
+    that exits 0 having done nothing passes (bible §7's class 7): assert the structured state it leaves
+    (its records, its output parsed, the files it writes) as well."""
+    named = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
+    for function in ast.walk(module.tree):
+        defined = isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
+        if not (defined and function.name.startswith("test")):
+            continue
+        asserts = [node for node in scopes.own(function) if isinstance(node, ast.Assert)]
+        if asserts and all(_status_only(node.test, dict(named.get(id(node), {}))) for node in asserts):
+            yield Finding(module.relative, function.lineno, function.col_offset + 1, "SLOP029",
+                          "asserts only a process's exit status; assert the state it reports or leaves")
 
 
 def skips(module: Module) -> Iterator[Finding]:
@@ -2329,7 +2447,8 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     """Every rule that applies to this file, in code order. SLOP010 reads
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
-    rules = (*rules, mocks, wording, skips) if module.relative.startswith("tests/") else (*rules, patches)
+    rules = (*rules, mocks, wording, skips, statuses) if module.relative.startswith("tests/") else (
+        *rules, patches)
     rules = (*rules, tolerances, divisions) if module.is_source else (*rules, tolerances, promotions)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
