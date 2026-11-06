@@ -264,6 +264,28 @@ def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
     assert_as_exact(jax.jit(through_template), jax.jit(through_xla), draw,
                     f"16-bit products into fp32 {depth}", seeds=SEEDS,
                     truth_fn=with_gradients(product(jnp.float64)))
+def the_template_takes_a_gpt_oss_width_as_exactly_as_xla():
+    """On this GPU the template named (`mosaic_gpu`) for a projection 2880 wide, gpt-oss-120b's (every tile
+    width dividing it an odd multiple of 64), its groups' rows odd, so each group's last tile stores a
+    one-row rung (an A100's in a row's layout, `mosaic.copied`: row 4474): its forward and both gradients
+    are as exact as XLA's ragged dot, from float64."""
+    group_sizes = jnp.asarray([67, 69], jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(jnp.asarray(rounded(values, jnp.bfloat16), jnp.bfloat16)
+                     for values in (rng.normal(size=(136, 256)), rng.normal(size=(2, 256, 2880)) / 16,
+                                    rng.normal(size=(136, 2880))))
+
+    def projection(implementation, dtype=jnp.bfloat16):
+        return with_gradients(lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None))
+
+    def through_template(x, w, dy):
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            return projection("pallas")(x, w, dy)
+
+    assert_as_exact(jax.jit(through_template), jax.jit(projection("xla")), draw, "template gpt-oss width",
+                    seeds=SEEDS, truth_fn=projection("xla", jnp.float64))
 
 
 def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):

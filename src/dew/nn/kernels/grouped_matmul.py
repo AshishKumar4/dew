@@ -717,23 +717,16 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).
         return mosaic_gpu.family_of(config, jnp.bfloat16).registers(config.warpgroups)
 
-    def _stored_rows(self, ba, config: mosaic_gpu.Tiles) -> int:
-        """The multiple a consumer's stored rows of an output tile come in: a grouped call's ragged to a
-        row, a dense call's whole `TMA_ROWS` (its rows padded to them, its tiles starting at whole ones)."""
-        del config
-        return mosaic_gpu.TMA_ROWS if ba.arguments.get('dense') else 1
-
     def _granular(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
         """Whether `config` is in `family`'s granularity (`candidate`): at most its consumers, at most the
         programs its registers hold, a ring of two stages at least, whole roles of rows for each consumer,
-        whole column units, rows it stores evenly, one of its depths, and each streamed block's rows in
-        its consumers' equal shares (`Family.shares_rows`)."""
+        whole column units, one of its depths, and each streamed block's rows in its consumers' equal
+        shares (`Family.shares_rows`)."""
         dtype = ba.arguments['tokens'].dtype
         return not (config.warpgroups > family.consumers
                     or config.programs > family.programs(config.warpgroups) or config.stages < 2
                     or config.block_m % (family.role_rows * config.warpgroups)
                     or config.block_n % family.column_unit(dtype)
-                    or not family.stores_columns(config.block_n, self._stored_rows(ba, config))
                     or config.block_k not in (self.STEPS or family.depths(dtype))
                     or not all(family.shares_rows(rows, config.warpgroups)
                                for rows in self._streamed_rows(ba, config)))
@@ -1189,11 +1182,6 @@ class MosaicTgmm(_Mosaic):
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
         rows, _, width = self._generated_extents(ba)
         return rows % config.block_m == 0 and width % config.block_n == 0
-
-    def _stored_rows(self, ba, config: mosaic_gpu.Tiles) -> int:
-        # Each consumer stores its depth half of a tile whole (`mosaic_gpu.tgmm`).
-        del ba
-        return config.block_m // config.warpgroups
 
     def _streamed_rows(self, ba, config: mosaic_gpu.Tiles) -> tuple[int, ...]:
         # Both operands stream a step's rows (the tokens): `block_k` of them each.

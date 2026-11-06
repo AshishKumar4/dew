@@ -575,9 +575,8 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
     none without a bundle, the exactly summed ones where its register model counts a running sum
     (`Family.counts_sums`), the hooked ones where it counts what they hold (`Family.counts_hooks`), the FP8
     ones where its products take FP8 (`Family.takes_fp8`);
-    at a projection `shape`, each whose output's width steps by the family's column unit, whose stores take
-    it (`Family.stores_columns`: a grouped product's rows ragged to one, a kernel gradient's whole role's)
-    and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
+    at a projection `shape`, each whose output's width steps by the family's column unit and whose
+    contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
     forms = {*PLAIN_FORMS, *(PAIRED_FORMS if family.counts_hooks or not family.feeds_itself else ()),
@@ -596,9 +595,7 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
         # An input gradient's output is the depth wide, contracting the width; every other form's output
         # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
         columns, contracted = (depth, width) if "input gradient" in form else (width, depth)
-        stored = family.role_rows if "kernel gradient" in form else 1
-        return (columns % unit == 0 and family.stores_columns(columns, stored)
-                and ("kernel gradient" in form or contracted % step == 0))
+        return columns % unit == 0 and ("kernel gradient" in form or contracted % step == 0)
 
     return {form for form in forms if takes(form)}
 
@@ -820,6 +817,37 @@ def test_a_routes_launches_run_per_shard_with_only_their_planned_collectives(loc
     found = compile_mosaic_kernels(cases, "sm90")
     failed = route_failures(cases, found)
     assert (failed == []) == local, failed
+
+
+def _gpt_oss_projected():
+    """gpt-oss-120b's expert projection (2880 wide and deep, four experts' rows) forward and backward through
+    the GEMM template, its launch named, the gradient in both operands."""
+    from dew.nn.kernels import gemm
+
+    def step(x, w, sizes):
+        def projected(x, w):
+            return gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            return jax.grad(projected, argnums=(0, 1))(x, w)
+
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    return step, (shaped((512, 2880)), shaped((4, 2880, 2880)), jax.ShapeDtypeStruct((4,), jnp.int32))
+
+
+def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
+    """gpt-oss-120b's 2880-wide expert projection, forward and backward, the template named, compiled for a
+    compile-only A100: its program launches the template's grouped product and kernel gradient, a product
+    reading the experts' matrices whole (`kernel_compile.Expected`, its route evidence). Every tile width
+    dividing 2880 is an odd multiple of 64, whose ragged store's one-row rung no warpgroup's strided layout
+    holds: the template refused each such tile, so the call it was named for (row 4474), until that rung was
+    copied in a row's layout (`mosaic.copied`)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None, None, None),
+                        launches=frozenset({"dew_gmm", "dew_tgmm"}), shards={"dew_gmm": (4, 2880, 2880)})
+    cases = [support.KernelCase("gpt-oss projection", _gpt_oss_projected, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 
 def test_each_triton_call_needs_a_launch_of_its_own():

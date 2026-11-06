@@ -4,6 +4,8 @@ one process (`gpu_flow`), each cell its own file's property:
 - A dense product's exact sums survive one row tile through Triton's MMA accumulation (test_gemm_template).
 - CUTLASS runs the grouped projection as exactly as XLA wherever it is chosen, over every grouping that
   routes a row (test_grouped_gemm).
+- The template takes gpt-oss's 2880-wide projection, its ragged stores' one-row rungs, as exactly as XLA's
+  (test_grouped_gemm; row 4474).
 - A ring streams tiles of their own trip counts, and consumers feeding their own ring split a step, on an
   H100 (test_mosaic_toolkit).
 - The Blackwell grouped matmul holds check 1 on a B200 or a B300, sm100 and sm103 alike
@@ -123,6 +125,8 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(grouped_gemm.the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla,
                                  depth))
           for depth in (128, 512)),
+        Cell("the template takes a gpt-oss width as exactly as XLA",
+             grouped_gemm.the_template_takes_a_gpt_oss_width_as_exactly_as_xla),
         *(Cell(f"CUTLASS runs a mapped projection as exactly as XLA where chosen: "
                f"{'shared' if shared else 'mapped'} matrices",
                functools.partial(grouped_gemm.cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen,
