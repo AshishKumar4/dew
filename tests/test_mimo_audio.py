@@ -20,16 +20,9 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import recorded_site
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_rounds_where_the_reference_does,
-    declared_seeds,
-    ieee_fixture,
-    indexed_recording,
-    recording,
-)
+from reference_error import as_given, assert_as_exact, assert_rounds_where_the_reference_does, ieee_fixture
 from tool_support import run_from
 
 from dew.nn.mimo_audio import (
@@ -76,14 +69,6 @@ def generator():
     """tools/mimo_reference.py, whose seeded draws the recorded sites' inputs are drawn again by."""
     with run_from("mimo_reference", "tools") as module:
         return module
-
-
-def recorded_site(site: str, inputs_of, truth_fn):
-    """`site`'s draw, recorded reference and truth over its declared seeds, Dew's float64 run `truth_fn`
-    its truth, held to the recording's sketch, and the count."""
-    seeds = declared_seeds(RECORDING)[site]
-    return (*indexed_recording(recording(RECORDING), site, seeds, inputs_of=inputs_of, truth_fn=truth_fn),
-            seeds)
 
 
 def segmented(config, mels, lengths):
@@ -145,7 +130,7 @@ def test_the_tokenizer_s_features_and_codes_are_the_reference_s(prefix, bound):
             return {"features": entries(features)}
 
     site = f"{'bounded ' if prefix else ''}tokenizer features"
-    draw, reference, truth, seeds = recorded_site(site, generator().mels_draw, wide)
+    draw, reference, truth, seeds = recorded_site(RECORDING, site, generator().mels_draw, wide)
     assert_as_exact(as_given(lambda index, inputs: ours(inputs)), reference, draw, site, seeds=seeds,
                     truth_fn=truth)
     mels, spans = segmented(config, refs["mels"], refs["lengths"])
@@ -186,7 +171,7 @@ def test_the_audio_encoder_is_as_exact_as_the_reference():
         with jax.enable_x64(new_val=True):
             return clips(wide_encoder.apply(wide_held, *codes_and_counts(inputs)))
 
-    draw, reference, truth, seeds = recorded_site("audio encoder", generator().codes_draw, wide)
+    draw, reference, truth, seeds = recorded_site(RECORDING, "audio encoder", generator().codes_draw, wide)
     assert_as_exact(as_given(lambda index, inputs: clips(encoder.apply(held, *codes_and_counts(inputs)))),
                     reference, draw, "audio encoder", seeds=seeds, truth_fn=truth)
 

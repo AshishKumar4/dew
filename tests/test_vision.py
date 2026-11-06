@@ -38,14 +38,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    declared_seeds,
-    ieee_fixture,
-    indexed_recording,
-    recording,
-)
+from model_support import recorded_site
+from reference_error import as_given, assert_as_exact, ieee_fixture
 from safetensors.numpy import load_file
 from tool_support import run_from
 
@@ -333,13 +327,6 @@ def mimo_generator():
     """tools/mimo_reference.py, whose seeded draws the recorded sites' inputs are drawn again by."""
     with run_from("mimo_reference", "tools") as module:
         return module
-
-
-def recorded_site(path, site: str, inputs_of, truth_fn):
-    """`site`'s draw, recorded reference and truth over its declared seeds in the summarized recording at
-    `path`, Dew's float64 run `truth_fn` its truth, held to the recording's sketch, and the count."""
-    seeds = declared_seeds(path)[site]
-    return (*indexed_recording(recording(path), site, seeds, inputs_of=inputs_of, truth_fn=truth_fn), seeds)
 
 
 def widened(build):

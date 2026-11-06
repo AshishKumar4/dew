@@ -174,7 +174,7 @@
    "lane": "Training"
   },
   "tests/test_deepseek_v41.py": {
-   "comparisons": 6,
+   "comparisons": 9,
    "lane": "Models, Serving & RL"
   },
   "tests/test_depthwise_conv.py": {

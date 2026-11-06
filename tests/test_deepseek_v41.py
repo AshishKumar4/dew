@@ -40,8 +40,9 @@ import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import decode_through
+from one_draw import assert_as_exact_as_the_reference
 from quantized_basis import dequantized_in_own_basis
-from reference_error import FACTOR, assert_as_exact, distance
+from reference_error import FACTOR, distance
 
 from dew.batch import coordinates
 from dew.interop import Pretrained
@@ -262,111 +263,60 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
     assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
 
 
-def held_rows(loaded, plain, reference, label):
-    """A check-1 site of the uncached forward over rows of the fixture's shape: each seed's drawn ids,
-    whose trunk's selections (its indexer's top-k and candidate pool, its routing) clear
-    `selection_margins.MARGIN` in the plain forward, so a variant of it chooses alike; the plain
-    forward's logits (one program), and its float64 twin's, the truth."""
-    import selection_margins
-    from model_support import float64_twin
-
-    shape = reference["input_ids"].shape
-    variables = jax.tree.map(jnp.asarray, loaded.variables)
-    selecting = jax.jit(functools.partial(selection_margins.capturing, plain))
-
-    def clears(inputs):
-        _, captured = selecting(*inputs)
-        return selection_margins.margin(loaded.model_config, captured, label) > selection_margins.MARGIN
-
-    def draw(seed):
-        ids = np.random.default_rng([0x4241, seed]).integers(0, plain.vocab_size, shape).astype(np.int32)
-        return variables, jnp.asarray(ids)
-
-    return (selection_margins.clearing(draw, clears), jax.jit(plain.apply),
-            jax.jit(float64_twin(plain).apply))
-
-
-GAP_SEEDS = 8
-"""The interior gap's declared check-1 seeds against the rows without it, sized by `seeds_for` paired."""
-
-
 def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source):
     """Uncached, three padding slots inside each row leave each real token's sliding window counting
     its row's real tokens (`counted_places`), as a cache's slots count them, and its compressed windows
-    and n-grams on them: over drawn rows, the real tokens' logits are on par with the rows' without the
-    gap from their float64 twin's (check 1, `held_rows`), where a window counted by index let the gap
-    crowd out the keys before it (audit NN-02)."""
+    and n-grams on them: the real tokens' logits are as exact as the reference's of the rows without the
+    gap (`assert_as_exact_as_the_reference`, the truth its float64 run), where a window counted by index
+    let the gap crowd out the keys before it (audit NN-02)."""
     loaded, plain, reference = source
-    at, gap = 5, 3
-    draw, plain_logits, truth = held_rows(loaded, plain, reference, "an interior gap")
-
-    @jax.jit
-    def gapped(variables, ids):
-        filler = jnp.zeros((ids.shape[0], gap), ids.dtype)
-        tokens = jnp.concatenate([ids[:, :at], filler, ids[:, at:]], axis=1)
-        slots = jnp.arange(tokens.shape[1])
-        real = (slots < at) | (slots >= at + gap)
-        logits = plain.apply(variables, tokens, attention_mask=jnp.broadcast_to(real, tokens.shape))
-        return jnp.concatenate([logits[:, :at], logits[:, at + gap:]], axis=1)
-
-    assert_as_exact(gapped, plain_logits, draw, "an interior gap", seeds=GAP_SEEDS, truth_fn=truth)
+    ids, at, gap = jnp.asarray(reference["input_ids"]), 5, 3
+    tokens = jnp.concatenate([ids[:, :at], jnp.zeros((ids.shape[0], gap), ids.dtype), ids[:, at:]], axis=1)
+    slots = jnp.arange(tokens.shape[1])
+    real = (slots < at) | (slots >= at + gap)
+    logits = plain.apply(loaded.variables, tokens, attention_mask=jnp.broadcast_to(real, tokens.shape))
+    assert_as_exact_as_the_reference(logits[:, real], reference["logits"], TRUTH["logits"], "an interior gap")
 
 
 SHIFT = 8
 """How far the shifted rows' given positions sit past their indices: a multiple of every compression
 rate, so a query that read entries by its given place would see SHIFT // rate windows of later tokens."""
-SHIFT_SEEDS = 8
-"""The shifted rows' declared check-1 seeds, uncached and cached, against the rows at their indices, sized
-by `seeds_for` paired."""
 
 
 def test_shifted_positions_compute_the_unshifted_rows_logits(source):
     """Uncached, positions given SHIFT past the tokens' indices: every rotation is relative, each
     compressed entry is visible by its window's tokens' ranks and rotates at its window's first given
-    place, where its queries rotate (`window_origins`), so over drawn rows the logits are on par with
-    the rows' at their indices from their float64 twin's (check 1, `held_rows`); entries visible by
-    the given places showed each query windows of later tokens, and entries rotated at zero-based
-    origins sat SHIFT away from their queries (audit NN-03)."""
+    place, where its queries rotate (`window_origins`), so the logits are as exact as the reference's
+    of the rows at their indices (`assert_as_exact_as_the_reference`, the truth its float64 run);
+    entries visible by the given places showed each query windows of later tokens, and entries rotated
+    at zero-based origins sat SHIFT away from their queries (audit NN-03)."""
     loaded, plain, reference = source
-    draw, plain_logits, truth = held_rows(loaded, plain, reference, "shifted positions")
-
-    @jax.jit
-    def shifted(variables, ids):
-        return plain.apply(variables, ids, positions=jnp.broadcast_to(jnp.arange(ids.shape[1]) + SHIFT,
-                                                                      ids.shape))
-
-    assert_as_exact(shifted, plain_logits, draw, "shifted positions", seeds=SHIFT_SEEDS, truth_fn=truth)
+    ids = jnp.asarray(reference["input_ids"])
+    positions = jnp.broadcast_to(jnp.arange(ids.shape[1]) + SHIFT, ids.shape)
+    logits = plain.apply(loaded.variables, ids, positions=positions)
+    assert_as_exact_as_the_reference(logits, reference["logits"], TRUTH["logits"], "shifted positions")
 
 
 def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source):
     """Cached, a prompt at positions SHIFT past its indices, then the rest of each row one token at a
     time: each compressed entry rotates at its window's first given place, which the cache carries
-    across the calls a window spans (`append_windows`), so over drawn rows every step's logits are on
-    par with the rows' at their indices from their float64 twin's (check 1, `held_rows`), where entries
-    rotated at their slots sat SHIFT away from their queries (audit NN-03)."""
+    across the calls a window spans (`append_windows`), so every step's logits are as exact as the
+    reference's of the rows at their indices (`assert_as_exact_as_the_reference`, the truth its float64
+    run), where entries rotated at their slots sat SHIFT away from their queries (audit NN-03)."""
     from dew.sampling.text import decode_ops, prefill_state
 
     loaded, plain, reference = source
-    prompt = int(reference["decode_prompt"])
-    draw, plain_logits, truth = held_rows(loaded, plain, reference, "a shifted cached walk")
-
-    def walked(variables, ids):
-        ops = decode_ops(plain, variables, 0, None)
-        positions = jnp.broadcast_to(jnp.arange(prompt) + SHIFT, (ids.shape[0], prompt))
-        prompted = ModelInputs(ids[:, :prompt], {"positions": positions})
-        state, _ = prefill_state(plain, variables, prompted, ops)
-
-        def step(state, column):
-            state = ops.advance(state, column, jnp.ones(ids.shape[0], bool))
-            return state, state.logits
-
-        # One step's program, scanned over the rest of each row.
-        _, steps = jax.lax.scan(step, state, ids[:, prompt:].T)
-        return jnp.concatenate([state.logits[:, None], jnp.moveaxis(steps, 0, 1)], axis=1)
-
-    assert_as_exact(jax.jit(walked), lambda variables, ids: plain_logits(variables, ids)[:, prompt - 1:],
-                    draw, "a shifted cached walk", seeds=SHIFT_SEEDS,
-                    truth_fn=lambda variables, ids: truth(variables, ids)[:, prompt - 1:])
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    ops = decode_ops(plain, loaded.variables, 0, None)
+    positions = jnp.broadcast_to(jnp.arange(prompt) + SHIFT, (ids.shape[0], prompt))
+    inputs = ModelInputs(ids[:, :prompt], {"positions": positions})
+    state, _ = prefill_state(plain, loaded.variables, inputs, ops)
+    steps = [np.asarray(state.logits)]
+    for column in range(prompt, ids.shape[1]):
+        state = ops.advance(state, ids[:, column], jnp.ones(ids.shape[0], bool))
+        steps.append(np.asarray(state.logits))
+    assert_as_exact_as_the_reference(np.stack(steps, axis=1), reference["logits"][:, prompt - 1:],
+                                     TRUTH["logits"][:, prompt - 1:], "a shifted cached walk")
 
 
 def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
@@ -472,6 +422,7 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
     run op by op they took two minutes of the test on armada (3820)."""
     import selection_margins
     from model_support import float64_twin
+    from reference_error import assert_as_exact
 
     from dew.sampling.text import decode_ops, prefill_state
 
