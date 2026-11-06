@@ -536,8 +536,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     Packed documents (`starts`, at most `max_segments` a row) each compute as they would alone. A conv
     runs before the op: it takes the conv's output. The operands the hooks read are checked as the
     decode step's (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction.
-    A call names a kernel through `generation.chosen` alone, the recurrence template's 'mosaic_gpu' among
-    them (row 959: the selectors decide every call)."""
+    A memory entering is read through its chunk's decays at their size while it lies within 2^96 of the
+    values: past it, a decay that leaves fp32's normals (a chunk's prefix under 2^-126) reads it as zero, as
+    fla's chunked form does (row 2344: on par at 2^96 through a token's decay of exp2(-124.8), a write gate's
+    output 150 times the recurrence's distance at 2^110). A call names a kernel through `generation.chosen`
+    alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
     given = recurrence.read(hooks, operands, optional=('state',))

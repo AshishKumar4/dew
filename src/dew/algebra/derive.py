@@ -675,16 +675,6 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         made = forms(shaped(tiles))
         value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)],
                           carried(made, state), product=product, **declared)
-        # The mainloop's own step where it gives one, once, over each reduction's parts as the rules state
-        # them (each value evaluated once), every reduction it leaves (None) by its form.
-        taken = (None,) * len(made.steps)
-        if stepped is not None:
-            parts = tuple(_parts_of(value, accumulated, added)
-                          for accumulated, added in zip(made.accumulated, made.added, strict=True))
-            taken = tuple(stepped(tuple(state), parts))
-        stepped = [value(form) if own is None else own for own, form in zip(taken, made.steps, strict=True)]
-        if not outputs:
-            return tuple(stepped)
         # The tile's outputs along the walked axis `outputs` names (by place), by the same evaluation: a
         # term both read, once.
         along = []
@@ -692,7 +682,19 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
             if not made.mapped[index] or (output := made.outputs[index]) is None:
                 raise Refused(f"output {index} is no output along the walked axis")
             along.append(value(output))
-        return tuple(stepped), tuple(along)
+        # The mainloop's own step where it gives one, once, over each reduction's parts as the rules state
+        # them (each value evaluated once), every reduction it leaves (None) by its form. Every value the
+        # step computes whatever the mainloop takes (each reduction of no parts, the outputs along the walk)
+        # before it: none written while its products run (a Hopper group's registers, which ptxas otherwise
+        # serializes, C7513).
+        parts = ((None,) * len(made.steps) if stepped is None else
+                 tuple(_parts_of(value, accumulated, added)
+                       for accumulated, added in zip(made.accumulated, made.added, strict=True)))
+        steps = [value(form) if part is None else None for part, form in zip(parts, made.steps, strict=True)]
+        taken = (None,) * len(made.steps) if stepped is None else tuple(stepped(tuple(state), parts))
+        stepped = [own if own is not None else made_step if made_step is not None else value(form)
+                   for own, made_step, form in zip(taken, steps, made.steps, strict=True)]
+        return tuple(stepped) if not outputs else (tuple(stepped), tuple(along))
 
     def merge(a, b, operands=None, *, shapes: Mapping, merged=None):
         made = forms(shapes)

@@ -542,6 +542,33 @@ def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_produc
         assert pairs in ratios and ratios <= {1.0, pairs}
 
 
+def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
+    """A bf16 Kimi delta attention forward with no bound on its inverse, lowered for an H100: its chunk
+    inverse's doubling merges in fp32 (`Call.ranged`), two bf16 parts on warpgroup products, which take no
+    transposed TF32 (`mainloop.FAST_PARTS`), so the intra solve, all doubling, states their three leading
+    pairs a model product, and no launch more; each stated the held bf16 operand's one (row 4032)."""
+    import re
+
+    from dew.nn.kernels.templates import product
+    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
+
+    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 64
+    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+
+    rule = functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), floor=FLOOR)
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        text = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
+    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+    models = [(float(_MODEL_FLOPS.search(line).group(1)), _stated_flops(line) or 0.0) for line in launches]
+    ratios = {hardware / model for model, hardware in models if model}
+    pairs = float(len(product.terms(mainloop.FAST_PARTS, mainloop.FAST_PARTS)))
+    assert pairs in ratios and max(ratios) == pairs
+
+
 def test_each_launch_lowers_once_however_many_layers_call_it():
     """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
     test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the
@@ -731,10 +758,11 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
 HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
 """The mainloop's hook cells, each hook combination over one sequence and packed documents."""
 
-LONG_HOOK_CELLS = {(FORMED[1], True), (FORMED[4], True)}
+LONG_HOOK_CELLS = {(FORMED[1], True), (FORMED[4], True), (FORMED[5], True)}
 """The hook cells past two minutes interpreted, each a check-1 site of its own in map tasks (`check1_shards`):
 the step write gate's packed documents (128 declared seeds, 384 s whole) and the rated scan's (64, 172 s),
-hooks-accurate at 136c07a5a."""
+hooks-accurate at 136c07a5a, and the rated scan's with its output norm (167.6 s in train 630's CI, main
+f424ab7d8)."""
 
 
 @pytest.mark.parametrize(('hooks', 'packed'), [cell for cell in HOOK_CELLS if cell not in LONG_HOOK_CELLS])
@@ -746,18 +774,21 @@ def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_inte
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed)
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=32)
+@pytest.mark.check1_shards(seeds=128, per_task=16)
 def test_the_step_gated_hook_over_packed_documents_is_as_exact_as_the_recurrence_interpreted():
     """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` at the step write
-    gate over packed documents (`LONG_HOOK_CELLS`)."""
+    gate over packed documents (`LONG_HOOK_CELLS`), sixteen draws a task: 32 took 77 to 122 s a task
+    (jsf-slow7 at 55dbf3627)."""
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(FORMED[1], packed=True)
 
 
-@pytest.mark.check1_shards(seeds=64, per_task=32)
-def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_interpreted():
-    """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` at the rated scan
-    over packed documents (`LONG_HOOK_CELLS`)."""
-    every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(FORMED[4], packed=True)
+@pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=['scan', 'with its output norm'])
+@pytest.mark.check1_shards(seeds=64, per_task=16)
+def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_interpreted(hooks):
+    """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` at the rated scan,
+    and with its output norm, over packed documents (`LONG_HOOK_CELLS`), sixteen draws a task: 32 took 192 to
+    235 s a task for the two (jsf-slow5 at c8f5a12e7)."""
+    every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed=True)
 
 
 RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
@@ -967,9 +998,13 @@ NEIGHBOURS = 3
 side of the derived one and its stages' other depth), the resource gate's variant groups (`GATE_GROUPS`)."""
 
 
+TWO_ROLES = 'two roles'
+"""A training group's variant: its walks at two consumer roles a program (`Tiles.walkers`), compiled apart
+from its derived tiles."""
+
 GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHAPES
                for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True)
-               for training in (False, True) for variant in (None, *range(NEIGHBOURS))
+               for training in (False, True) for variant in (None, TWO_ROLES, *range(NEIGHBOURS))
                if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
                and (name != 'a 192-wide value head' or (training and dtype == jnp.bfloat16 and not packed))
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
@@ -978,15 +1013,18 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                                                            ('kimi-linear-kda, no floor', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16),
                                                            ('a 192-wide value head', jnp.bfloat16)})
-               and not (variant is not None and (training or packed or dtype == jnp.float32))]
+               and not (variant == TWO_ROLES and not (training and not packed))
+               and not (isinstance(variant, int) and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
 geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the training pass of the
 gated delta rule in both and of Kimi delta attention and the SSD in 16 bits (Kimi's keys, 128 wide, past what
 an fp32 call takes under a decay a key dimension), and the 192-wide value head's 16-bit training pass alone;
 one row's 16-bit forward at its derived tiles apart from
-each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none). One test
+each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none), and one
+row's training pass at its derived tiles apart from its walks at two roles (`TWO_ROLES`). One test
 compiling them all took 674 seconds on sm90, a group with its variants 132 on sm80, and Kimi Linear's three
-variants 117 on sm80 at 9e65ee222's gate, each about the forward's 89 (armada)."""
+variants 117 on sm80 at 9e65ee222's gate, each about the forward's 89 (armada); the 27B's fp32 training pass
+with its two-role walks 130.2 s on sm90 (train 630's CI, main f424ab7d8)."""
 
 
 
@@ -1043,7 +1081,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind=kind) for tiles, kind in unheld]
             tiled = template.MOSAIC.variants(bound)
-            if variant is not None:
+            if isinstance(variant, int):
                 assert len(tiled) - 1 <= NEIGHBOURS, f"{name} has {len(tiled) - 1} variants, past NEIGHBOURS"
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind='') for tiles in tiled[1:][variant:variant + 1]]
@@ -1071,6 +1109,11 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                                        wide=derived.block_o or derived.block_v)
                if family.consumers >= 2 and not packed and value_width // derived.block_v % 2 == 0 else None)
         walked = [] if two is None else [(two, 'two roles ')]
+        if variant == TWO_ROLES:
+            return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
+                    for tiles, kind in walked]
+        # A training pass's two-role walks a group of their own (`TWO_ROLES`).
+        walked = [] if training else walked
         # A forward without a gradient at its own tiles (`Tiles.forward`), which no fast backward narrows.
         alone = [] if training or derived.forward is None else [(derived.forward, 'alone ')]
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)

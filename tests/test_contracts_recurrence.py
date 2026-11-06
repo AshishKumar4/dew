@@ -86,9 +86,19 @@ def precedent_chunked(query, key, value, g, beta, *, chunk_size: int, starts=Non
     return jnp.moveaxis(out, 1, 2)
 
 
+ORDER_SETS = {"first orders": ("primal", "jvp", "vjp"),
+              "second orders": ("jvp of grad", "second jvp", "grad of grad"),
+              "second orders, staged": ("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit",
+                                        "jvp of grad, scanned")}
+"""The contract's orders (`contract_support.orders`) a case of the chunked delta rule takes at once: all ten
+in one case took 127 to 156 s near float32's largest, each order's program compiled for itself (row
+4433)."""
+
+
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize(("packed", "edge"), list(itertools.product((False, True), DELTA_RULE_EDGES)),
                          ids=lambda value: {False: "one sequence", True: "packed"}.get(value, value))
-def test_the_chunked_delta_rule_holds_every_order(packed, edge):
+def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     """`recurrence_chunk.chunk_delta_rule` (the portable rule's custom derivative through
     `generation.linear_tangent`, rows 1861 and 1862): every order runs, its boolean document starts a
     residual with no tangent space, and each is finite wherever float64 is a normal float32 and JAX's own
@@ -127,8 +137,12 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     # A packed row's second orders through its gradient from 2^62: the owner's accuracy-for-speed acceptance
     # (ledger 2470, 10-30).
     accepted = packed and scale >= 2.0**62
-    assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}",
-                    truth_fn=recurrence, plain_fn=plain, held=PACKED_OVERFLOW_ORDERS if accepted else None)
+    # Each order one program (`jax.jit`): run op by op, an order's eager dispatch compiled 2,570 programs of
+    # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
+    others = tuple(name for orders in ORDER_SETS.values() for name in orders if name not in ORDER_SETS[taken])
+    assert_contract(jax.jit(rule), primals, direction, cotangent, f"the chunked delta rule {edge}",
+                    truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=others,
+                    held=PACKED_OVERFLOW_ORDERS if accepted else None)
 
 
 def plain_delta_rule(query, key, value, g, beta, state, scale):
