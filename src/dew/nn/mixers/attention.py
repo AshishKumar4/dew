@@ -50,7 +50,7 @@ from dew.nn.inputs import (
     counted_places,
     document_reach,
 )
-from dew.nn.kernels.selection import select
+from dew.nn.kernels.selection import select, selected
 from dew.nn.kernels.templates import attention as template
 from dew.nn.kv_cache import (
     PAGED,
@@ -1465,7 +1465,8 @@ class CausalSelfAttention(nn.Module):
                           arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
                                                     self.ctx.force_fp32_for_softmax),
                           named=self.ctx.attention_impl, windowed=windowed, sinks=sunk)
-        return select(PAGED, case).kernel != 'gathered'
+        # A read ahead of the store's dispatch (`KVStore.decode`), which reports the route it runs.
+        return selected(PAGED, case).name != 'gathered'
 
     def _decode_masks(self, positions, rows: int, key_length: int, valid,
                       history: dict[str, jax.Array]) -> tuple[jax.Array, jax.Array | None]:

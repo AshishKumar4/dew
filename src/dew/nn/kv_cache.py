@@ -49,7 +49,7 @@ from dew.mesh import LayoutRefused, logical_spec, mesh_axes
 from dew.nn.derivatives import KernelGlue
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
-from dew.nn.kernels.selection import Kernel, Op, Requirement, selected
+from dew.nn.kernels.selection import Kernel, Op, Requirement, select, selected
 from dew.nn.precision import float32_einsum
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import manual_map, sequence_shards
@@ -609,9 +609,10 @@ class KVStore:
         """
         case = self.case(query, value_dim=self.head_dim, softcap=softcap, arithmetic=False, named='auto',
                          windowed=starts is not None, sinks=sinks is not None)
-        # The selector's paged kernel: the layer reads this step through the pages where one takes it
-        # (`CausalSelfAttention._decode_attention`), the gathered rows elsewhere.
-        kernel = selected(PAGED, case).name
+        # The selector's paged kernel, reported as the step's route (the layer read it ahead, unreported,
+        # `CausalSelfAttention._decode_attention`): the layer reads this step through the pages where one
+        # takes it, the gathered rows elsewhere.
+        kernel = select(PAGED, case).kernel
         if kernel == 'gathered':
             # No paged kernel takes the step: the device's own raises its refusals.
             selected(PAGED, case, 'triton' if backend() == "gpu" else 'tpu')
