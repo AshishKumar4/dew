@@ -2430,73 +2430,30 @@ def bits_apart():
     return as_given(product)
 
 
-@pytest.mark.parametrize(("backend", "deterministic", "refused"), [
-    ("gpu", False, False), ("gpu", True, True), ("cpu", False, True)])
+@pytest.mark.parametrize(("backend", "deterministic", "declared", "refused"), [
+    ("gpu", False, False, False), ("gpu", True, False, True), ("cpu", False, False, True),
+    ("gpu", True, True, False), ("cpu", False, True, True)])
+@pytest.mark.parametrize("windowed", [False, True], ids=["one draw", "windowed"])
 def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
-        monkeypatch, request, backend, deterministic, refused):
+        monkeypatch, request, backend, deterministic, declared, refused, windowed):
     """Check 1 replays a site's arms on their first draw and requires their outputs again bit for bit only
     where the run promises a repeat (`_repeat_promised`, ledger 2842): on a GPU by default, whose reductions
     add with atomics in arrival order, an arm whose last bits move is not refused; on a GPU in deterministic
-    mode (`with_deterministic_ops`), and on a CPU, it is (`UnpairedDraw`)."""
-    from reference_error import UnpairedDraw
+    mode (`with_deterministic_ops`), and on a CPU, it is (`UnpairedDraw`). An arm declared to vary run to run
+    (`run_to_run`, row 4448) is judged by each draw's one run on a GPU in deterministic mode too, and held
+    to its repeat on a CPU, whose interpreted programs are functions of their inputs; through a window loop
+    (`over_windows`) and a null run's unrewritten reference alike."""
+    from reference_error import UnpairedDraw, over_windows, run_to_run, windows
 
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
     request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
     label = f"bits apart on a {backend}" + (", deterministic" if deterministic else "")
+    arm = run_to_run(bits_apart(), "atomic adds") if declared else bits_apart()
+    truth, draw = jnp.matmul, a_product_draw
+    if windowed:
+        arm, truth, draw = over_windows(arm), over_windows(jnp.matmul), windows(a_product_draw, 2)
     if refused:
         with pytest.raises(UnpairedDraw):
-            null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
+            null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
     else:
-        null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
-
-
-
-
-def test_an_arm_declared_to_vary_run_to_run_is_judged_by_its_one_run_and_held_to_its_inputs_on_a_cpu(
-        monkeypatch):
-    """An arm that sums its terms in another order on each run (an atomic accumulation's arrival order):
-    where a repeat is promised on a GPU (deterministic mode, the run's XLA_FLAGS), an undeclared one is
-    refused as no function of its inputs, and one declared `run_to_run` is judged by each draw's one run
-    and passes, as exact as the reference summing in one order; on a CPU, whose interpreted programs are
-    functions of their inputs, the declared one is held to its repeat as every arm is (row 4448)."""
-    from reference_error import UnpairedDraw, run_to_run
-
-    calls = [0]
-
-    def summed(terms):
-        total = np.float32(0)
-        for term in terms:
-            total = np.float32(total + term)
-        return total
-
-    @as_given
-    def arrival(x):
-        calls[0] += 1
-        terms = np.asarray(x, np.float32) * np.float32(1.1)
-        return {"y": summed(terms if calls[0] % 2 else terms[::-1])}
-
-    @as_given
-    def ordered(x):
-        return {"y": summed(np.asarray(x, np.float32) * np.float32(1.1))}
-
-    @as_given
-    def exact(x):
-        return {"y": np.sum(np.asarray(x, np.float64) * np.float64(np.float32(1.1)))}
-
-    def draw(seed):
-        return (np.random.default_rng([4448, seed]).standard_normal(64).astype(np.float32),)
-
-    with pytest.raises(UnpairedDraw):
-        assert_as_exact(run_to_run(arrival, "atomic adds"), ordered, draw, "on a CPU", seeds=16,
-                        truth_fn=exact)
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
-    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true")
-    with pytest.raises(UnpairedDraw):
-        assert_as_exact(arrival, ordered, draw, "undeclared", seeds=16, truth_fn=exact)
-    assert_as_exact(run_to_run(arrival, "atomic adds"), ordered, draw, "declared", seeds=16, truth_fn=exact)
-    # Through a window loop (`over_windows`), the declaration holds as it does alone.
-    from reference_error import over_windows, windows
-
-    windowed = windows(draw, 4)
-    assert_as_exact(over_windows(run_to_run(arrival, "atomic adds")), over_windows(ordered), windowed,
-                    "declared, windowed", seeds=4, truth_fn=over_windows(exact))
+        null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
