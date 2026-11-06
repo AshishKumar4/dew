@@ -121,3 +121,31 @@ def test_a_stack_in_host_memory_writes_what_its_caller_opens_as_a_resident_one_d
     for ours, theirs in zip(jax.tree.leaves(held["host"]), jax.tree.leaves(held["resident"]), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
     assert jax.tree.structure(held["host"]) == jax.tree.structure(held["resident"])
+
+
+TRUNK_SEEDS = 8
+"""Check 1's declared seeds for the trunk against transformers, sized by `seeds_for` paired on armada."""
+
+
+def test_the_trunk_is_transformers():
+    """V4-Flash-0731's trunk, sliding, compressed (CSA and HCA) and hash-routed layers among it, on par with
+    transformers' DeepseekV4ForCausalLM over the same checkpoint (its `mtp.*` stages unread) from its
+    float64 twin's (check 1, row 354), as released: no tie order forced on its selections; the rows drawn
+    clear its indexer's and routers' choices with no tie at a budget (`clearing_selections`,
+    `stable=False`, torch's `topk` stating no tie order)."""
+    from interop_support import clearing_selections, token_draw, transformers_arms
+    from reference_error import assert_as_exact
+
+    from tools.decoder_export_reference import Case, reference_model
+
+    source = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
+    model, variables = source.model, source.variables
+    reference, _ = reference_model(Case("deepseek_v4", "deepseek-v4-dspark-tiny"), TINY)
+    reference.eval()
+    reference.set_attn_implementation("eager")
+    run, truth = transformers_arms(reference,
+                                   lambda network, ids: network(input_ids=ids, use_cache=False).logits)
+    draw = clearing_selections(source, token_draw(0x354, model.vocab_size, REFERENCE["input_ids"].shape),
+                               "deepseek v4 dspark trunk", stable=False)
+    assert_as_exact(lambda ids: model.apply(variables, ids), run, draw, "deepseek v4 dspark trunk",
+                    seeds=TRUNK_SEEDS, truth_fn=truth)
