@@ -560,7 +560,8 @@ class Labels:
     its own, its span the whole line, and after the options the `cue`, whose last token the readout
     reads. Each label is read as the token id of each of `variants`, a template of its name (`{}`): a
     release's slot is one variant, its name after a space; a readout groups several as one. A variant
-    that spells as other than one token is refused.
+    that spells as other than one token is refused, and so are two labels spelled as one token (a
+    vocabulary that spells both as its unknown token), which no readout tells apart.
 
     `names` are the labels in slot order, a release's own list where it names its slots otherwise
     (one that leaves out the pairs its tokenizer spells as two tokens), or `label_names`' where unset;
@@ -581,32 +582,40 @@ class Labels:
 
     def capacity(self, encoder: Tokenizer) -> int:
         """How many options these labels letter under `encoder`: their own names, or every name of
-        `LABEL_NAMES` whose every variant it spells as one token (`spelled`)."""
+        `LABEL_NAMES` it spells apart (`spelled`)."""
         if self.names is not None:
             return len(self.names)
-        same = _same(encoder)
-        return sum(all(len(_piece(same, variant.format(name))) == 1 for variant in self.variants)
-                   for name in LABEL_NAMES)
+        return len(self._spelled_apart(encoder))
+
+    def _spelled_apart(self, encoder: Tokenizer) -> list[str]:
+        """The names of `LABEL_NAMES` whose every variant `encoder` spells as one token that no earlier such
+        name's holds."""
+        same, taken, named = _same(encoder), set[int](), list[str]()
+        for name in LABEL_NAMES:
+            pieces = [_piece(same, variant.format(name)) for variant in self.variants]
+            if all(len(piece) == 1 for piece in pieces) and not taken & {piece[0] for piece in pieces}:
+                taken.update(piece[0] for piece in pieces)
+                named.append(name)
+        return named
 
     def spelled(self, encoder: Tokenizer, count: int) -> "Labels":
         """These labels named for `encoder`: themselves where they name their own, else the first `count` of
-        `LABEL_NAMES` whose every variant `encoder` spells as one token, skipping those it spells as
-        two (Qwen3.5 spells " BQ" as two, and 570 of the 702 as one), so a run letters as many options
-        as its tokenizer can. Fewer than `count` such names is refused."""
+        `LABEL_NAMES` whose every variant `encoder` spells as one token of its own, skipping those it
+        spells as two (Qwen3.5 spells " BQ" as two, and 570 of the 702 as one) or as an earlier name's
+        (a vocabulary's unknown token), so a run letters as many options as its tokenizer tells apart.
+        Fewer than `count` such names is refused."""
         if self.names is not None:
             return self
-        same = _same(encoder)
-        named = [name for name in LABEL_NAMES
-                 if all(len(_piece(same, variant.format(name))) == 1 for variant in self.variants)]
+        named = self._spelled_apart(encoder)
         if count > len(named):
             raise ValueError(f"{count} options outnumber the {len(named)} labels this tokenizer spells as "
-                             f"one token each (of {len(LABEL_NAMES)})")
+                             f"one token each, apart (of {len(LABEL_NAMES)})")
         return dataclasses.replace(self, names=tuple(named[:count]))
 
     def ids(self, encoder: Tokenizer, count: int) -> tuple[tuple[int, ...], ...]:
-        """Each of the first `count` labels' ids, one a variant."""
+        """Each of the first `count` labels' ids, one a variant; two labels of one id are refused."""
         same = _same(encoder)
-        found = []
+        found, owners = [], dict[int, str]()
         for name in self.names_for(count):
             ids = []
             for variant in self.variants:
@@ -614,6 +623,9 @@ class Labels:
                 pieces = _piece(same, spelled)
                 if len(pieces) != 1:
                     raise ValueError(f"the label {spelled!r} spells as {len(pieces)} tokens, not one")
+                if owners.setdefault(pieces[0], name) != name:
+                    raise ValueError(f"the labels {owners[pieces[0]]!r} and {name!r} spell as one token "
+                                     f"({pieces[0]}), which no readout tells apart")
                 ids.append(pieces[0])
             found.append(tuple(ids))
         return tuple(found)
