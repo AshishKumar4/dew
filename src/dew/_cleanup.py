@@ -157,7 +157,9 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     # The descriptors this start holds, each closed once it is done with, or handed to `_LIFELINES` (the
     # owner pipe's write end): what is left here when it raises is closed then.
     owned: list[int] = []
-    line = process = None
+    # The lifeline, until `_LIFELINES` holds it beside its pipe.
+    unheld: subprocess.Popen | None = None
+    process = None
     try:
         owned.extend(os.pipe2(os.O_CLOEXEC))
         read, write = owned
@@ -166,6 +168,7 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
         line = subprocess.Popen([sys.executable, "-I", __file__, str(read)], pass_fds=(read,),
                                 start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
+        unheld = line
         _close(owned, read)
         owned.extend(os.pipe2(os.O_CLOEXEC))
         owned.extend(os.pipe2(os.O_CLOEXEC))
@@ -180,6 +183,7 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
         with _HELD:
             _LIFELINES[process.pid] = (write, line)
             owned.remove(write)
+            unheld = None
         os.write(release, b"1")
         # Closed by the command's execution, or written with its error.
         number = b"".join(iter(lambda: os.read(told, 64), b""))
@@ -192,12 +196,11 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is not None:
                     stream.close()
-        unheld = line is not None and write in owned
         for end in owned:
             os.close(end)
         owned.clear()
-        if unheld:
-            line.wait()
+        if unheld is not None:
+            unheld.wait()
         raise
     finally:
         for end in owned:
