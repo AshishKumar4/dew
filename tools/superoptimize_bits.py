@@ -423,9 +423,35 @@ def improved(form: BitForm, seconds: float = 60.0, window: int = 3, longest: int
             print(f"K round: {len(form.steps)} steps, price {form.price}", flush=True)
 
 
+def _halved(words, minifloat: bits.Minifloat, register: int):
+    """Register `register` of a word of four FP8 codes in their natural order (code `i` at bits `8 i`): codes
+    `2 register` and `2 register + 1` as its low and high bfloat16 halves, each the code's value times
+    2^(minifloat.bias - 127), its sign at the half's top and its other bits under the half's exponent and
+    mantissa (a finite code's placement, the free layout's `synthesized` decode in the stored order)."""
+    rest = minifloat.width - 1
+
+    def half(code):
+        return (code & jnp.uint32(1 << rest)) << jnp.uint32(15 - rest) | \
+            (code & jnp.uint32((1 << rest) - 1)) << jnp.uint32(7 - minifloat.mantissa)
+
+    first, second = (words >> jnp.uint32(16 * register + 8 * k) & jnp.uint32(0xFF) for k in (0, 1))
+    return half(first) | half(second) << jnp.uint32(16)
+
+
+def _e8m0(words):
+    """An MX block scale (OCP Microscaling Formats v1.0, 5.4.1: E8M0, its low byte) as fp32 bits: 2^(e-127),
+    0x00 the subnormal 2^-127, 0xFF a NaN."""
+    e = words & jnp.uint32(0xFF)
+    return jnp.where(e == 0, jnp.uint32(0x00400000), jnp.where(e == 0xFF, jnp.uint32(0x7FC00000),
+                                                                e << jnp.uint32(23)))
+
+
 REFERENCES = {"e4m3": lambda words: bits.encoded(words, bits.E4M3),
               "e5m2": lambda words: bits.encoded(words, bits.E5M2),
-              "e2m1": lambda words: bits.encoded(words, bits.E2M1)}
+              "e2m1": lambda words: bits.encoded(words, bits.E2M1),
+              **{f"{name}-decode-{register}": (lambda words, m=minifloat, r=register: _halved(words, m, r))
+                 for name, minifloat in (("e4m3", bits.E4M3), ("e5m2", bits.E5M2)) for register in (0, 1)},
+              "e8m0": _e8m0}
 
 
 def main() -> None:
