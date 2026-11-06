@@ -35,7 +35,8 @@ dependencies = [
     "numpy>=2.0",
     "pillow>=10.1",
     # dew.data.images decodes, resizes and jitters every image record with it.
-    "opencv-python-headless>=4.9.0.80",
+    # 4.10.0.84 is the first whose wheels are built against NumPy 2.
+    "opencv-python-headless>=4.10.0.84",
     "einops>=0.8",
     # dew.nn.engram draws its bucket primes with sympy.nextprime.
     "sympy>=1.12",
@@ -49,7 +50,8 @@ dependencies = [
     # on rich, so this names a package every install has; 13 has the
     # progress columns the display uses.
     "rich>=13",
-    "tyro>=0.9",
+    # dew._cli's tyro.conf markers (FlagCreatePairsOff, PositionalMetavarFromFieldName).
+    "tyro>=1.0.16",
     "typing_extensions>=4.14",
     "transformers>=5.16.1",
     "jinja2>=3.1",
@@ -108,6 +110,7 @@ Changelog = "https://github.com/AshishKumar4/dew/blob/main/CHANGELOG.md"
 dew = "dew._cli.main:main"
 
 [project.optional-dependencies]
+# An extra's requirements are bounded below by the release the suite runs (locks/), each at its minor version.
 # FlashAttention-2 (kernels/flash_attn), which attention_impl 'auto' runs on an
 # A100 or an Ada GPU; these extras install its wheels on Linux x86_64 and aarch64 (a GH200).
 # The CUDA plugin and its PJRT plugin (where Mosaic GPU compiles a kernel's PTX) are Dew's builds of the
@@ -120,7 +123,7 @@ cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda12-pjrt==0.1
 cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda13-pjrt==0.12.0.1.post45", "jaxlib==0.12.0.1",
           "dew-flash-attn-cu13~=0.3.7; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu13~=0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
-tpu = ["libtpu==0.0.50.*", "requests"]
+tpu = ["libtpu==0.0.50.*", "requests>=2.34"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
 # and 2.23.2. xprof 2.23.2 declares setuptools<70.0.0, which torch>=2.13's
 # setuptools>=77.0.3 cannot meet; the cap is the build lock's, read into the
@@ -136,9 +139,9 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 # float32, CUDA convolving int8 codes exactly in float32 chunks (post4).
 quantization = ["qwix==0.1.8.post4"]
 test = [
-    "pytest",
+    "pytest>=9.1",
     # tools/armada/ci.py's coverage report: branch coverage of src/dew over the suite on armada.
-    "coverage",
+    "coverage>=7.16",
     "moto[server,s3]>=5.1.15",
     # Delta source and publication scenarios use the optional table implementation.
     "dewml[delta]",
@@ -149,17 +152,17 @@ test = [
     # The legacy decoder graph test deserializes jax.export; JAX does not
     # declare flatbuffers. This version wrote the committed export fixture.
     "flatbuffers==25.12.19",
-    "pytest-xdist",
+    "pytest-xdist>=3.8",
     # Property, metamorphic and fuzz tests (docs/design/testing.md), under tests/conftest.py's
     # derandomized profile.
-    "hypothesis",
+    "hypothesis>=6.169",
     # The interop suite reads and writes safetensors with its native reader.
     "dewml[interop]",
     # Reference parity and PyTorch checkpoint imports run on the host.
     "dewml[torch]",
     # A published scheduler's beta sigma grid is an inverse incomplete beta,
     # which the source scheduler also takes from scipy and refuses without.
-    "scipy",
+    "scipy>=1.12",
     # tests/test_reporting.py exercises the WandbTracker adapter.
     "dewml[wandb]",
     # The Diffusers references the tests run live (Flux 2's and Z-Image's transformers among them),
@@ -169,7 +172,7 @@ test = [
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
     "dewml[wan]",
     # tests/test_tools.py imports FlaxDiff's reference, whose hilbert module imports matplotlib.
-    "matplotlib",
+    "matplotlib>=3.11",
     # tests/test_live_bridge.py runs the live bridge (site/live/container) over real sockets, on the
     # release its container installs (the live extra).
     "dewml[live]",
@@ -202,16 +205,16 @@ test = [
     "lm_eval[hf]==0.4.13",
 ]
 # The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
-av = ["moviepy"]
+av = ["moviepy>=2.2"]
 # FID's Inception weight download
-metrics = ["requests"]
+metrics = ["requests>=2.34"]
 wandb = ["wandb>=0.19.9"]
 # MLflowTracker: a run in a tracking store, local file store included.
-mlflow = ["mlflow"]
+mlflow = ["mlflow>=3.17"]
 # TensorBoardTracker: an event file, written with tensorboard's own writer.
-tensorboard = ["tensorboard"]
+tensorboard = ["tensorboard>=2.21"]
 # optuna_search: the sampler behind dew.config.sweep's Optuna backend.
-hpo = ["optuna"]
+hpo = ["optuna>=5.0"]
 # Online URL-streaming loader (HF datasets-backed). 5.0.1 is the release the suite passes on; 4.8.5,
 # Colab's, caps fsspec at 2026.2, below the 2026.6 the base needs, and unbounded pip backtracks from
 # it to datasets 1.6.2, whose metadata it can't read.
@@ -220,7 +223,7 @@ streaming = ["datasets>=5.0.1"]
 # extras: its bridge's WebSocket release, the kernel gateway and IPython kernel its contexts run, and
 # ipywidgets, without which tqdm warns in a kernel that it falls back to text bars. The test extra
 # holds it, so locks/cpu.txt, which the container installs under, pins every one.
-live = ["websockets==17.1", "jupyter-kernel-gateway==3.0.1", "ipykernel", "ipywidgets"]
+live = ["websockets==17.1", "jupyter-kernel-gateway==3.0.1", "ipykernel>=7.4", "ipywidgets>=8.1"]
 delta = ["deltalake>=1.0"]
 # dew.data.text's curation steps (Language, Quality, Classifier, Decontaminated): DataTrove's language,
 # quality, fastText and n-gram decontamination filters. DataTrove splits English into words with a blank
@@ -236,19 +239,19 @@ eval-harness = ["lm_eval>=0.4.10"]
 # (core/utils/resource_utils, through etils' lazy imports) but declares the
 # backport for Python < 3.9 only, so a 3.12 environment lacks it; it goes when
 # tfds declares it or reads importlib.resources.
-tfds = ["tensorflow-datasets>=4.9.10", "importlib_resources"]
+tfds = ["tensorflow-datasets>=4.9.10", "importlib_resources>=7.1"]
 # Flax <-> safetensors conversion (dew.interop)
-interop = ["safetensors"]
+interop = ["safetensors>=0.8"]
 # PyTorch on the host, never for a JAX computation: unpickling pytorch_model.bin
 # once into Dew's cache (dew.interop.pickles), and the tier-2 check that runs
 # transformers' own model for an unregistered decoder (dew.interop.verify).
-torch = ["torch"]
+torch = ["torch>=2.14"]
 # Original-format single-file diffusion checkpoints (Pretrained.load(..., single_file=)):
 # diffusers' own key maps, which are written in torch, convert them once.
-diffusers = ["diffusers>=0.34.0", "torch"]
+diffusers = ["diffusers>=0.34.0", "torch>=2.14"]
 # Wan 2.1's pipelines clean every prompt with ftfy before UMT5 reads it, and so
 # does dew.inputs.diffusion.WanConditioner.
-wan = ["ftfy"]
+wan = ["ftfy>=6.3"]
 # dew.rl.playground: MuJoCo Playground's MJX environments as Envs, its JAX implementation on any backend.
 playground = ["playground==0.2.0"]
 # dew.rl.hyperlux: HyperLux's batch ray tracer drawing the gate race's cameras (an NVIDIA GPU with OptiX).
@@ -289,16 +292,16 @@ kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post45; sys_platform == 'linux' a
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
 ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf,curation]",
-      "flake8",
+      "flake8>=7.4",
       # The compile gate's SASS rules disassemble the cubins it reads, wherever the suite runs: a CUDA 13 wheel,
       # laid out in nvidia/cu13, which post52's JAX takes as its CUDA root only where it holds ptxas too
       # (tests/test_cuda_root.py).
       "nvidia-cuda-nvdisasm==13.4.92; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 # The tutorial notebooks' environment outside Colab: the extras they import and a Jupyter kernel.
 # Tutorial 01, Diffusion from scratch, draws with matplotlib, which Colab installs.
-tutorials = ["dewml[streaming,interop,notebooks]", "matplotlib"]
+tutorials = ["dewml[streaming,interop,notebooks]", "matplotlib>=3.11"]
 # Execute notebooks through a Jupyter kernel of the selected interpreter.
-notebooks = ["nbclient", "nbformat", "ipykernel"]
+notebooks = ["nbclient>=0.11", "nbformat>=5.11", "ipykernel>=7.4"]
 
 # The least uv: 0.13.4 is the first whose own CA store leaves out emSign's (GHSA-hq85-5cpj-mr62). uv refuses
 # to run older in this project, setup-uv installs a release at least this, and site/scripts/gen_install.py

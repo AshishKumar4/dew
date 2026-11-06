@@ -26,11 +26,13 @@ artifact it then uploads; CI's package job runs it on every push.
 from __future__ import annotations
 
 import argparse
+import email.parser
 import runpy
 import subprocess
 import sys
 import tempfile
 import venv
+import zipfile
 from pathlib import Path
 
 INDEX = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/dew/_builds.py"))[
@@ -86,6 +88,15 @@ def run(*command: str | Path, cwd: Path) -> None:
     subprocess.run([str(part) for part in command], cwd=cwd, check=True)
 
 
+def requirements(wheel: Path) -> list[str]:
+    """The requirements `wheel` installs with no extra, as its metadata states them (Requires-Dist)."""
+    with zipfile.ZipFile(wheel) as archive:
+        [name] = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+        metadata = email.parser.BytesParser().parsebytes(archive.read(name))
+    return [requirement for requirement in metadata.get_all("Requires-Dist", [])
+            if "extra ==" not in requirement.partition(";")[2]]
+
+
 def smoke(wheel: Path, lowest: bool) -> None:
     """`wheel` installed into an empty environment, every requirement at its newest or, `lowest`, at the lower
     bound dewml declares, and used (the module's doc)."""
@@ -97,8 +108,14 @@ def smoke(wheel: Path, lowest: bool) -> None:
         run(python, "-m", "pip", "install", "--quiet", "-r", Path(__file__).with_name("pip.txt"), cwd=root)
         indexes = ("--index-url", "https://pypi.org/simple", "--extra-index-url", INDEX)
         if lowest:
+            # uv's lowest-direct lowers a project's own requirements, which a built wheel's are not to it:
+            # they are named here as direct ones, read from the wheel's metadata, and the wheel goes in after.
+            (root / "requirements.txt").write_text("\n".join(requirements(wheel)) + "\n")
             run("uv", "pip", "install", "--quiet", "--python", python, "--resolution", "lowest-direct",
-                *indexes, wheel, cwd=root)
+                *indexes, "-r", root / "requirements.txt", cwd=root)
+            run("uv", "pip", "install", "--quiet", "--python", python, "--no-deps", wheel, cwd=root)
+            # What the lower bounds resolved to, for the log.
+            run("uv", "pip", "freeze", "--python", python, cwd=root)
         else:
             run(python, "-m", "pip", "install", "--quiet", *indexes, wheel, cwd=root)
         # find_spec locates the package without importing it, so a module
