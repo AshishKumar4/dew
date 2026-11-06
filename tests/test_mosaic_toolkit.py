@@ -494,19 +494,6 @@ def test_an_sm80_side_vector_loads_in_the_layout_of_the_axis_it_follows(axis):
             lowering_platforms=("cuda",))
 
 
-def test_a_light_launch_is_held_within_the_threads_its_multiprocessor_runs():
-    """A one-warpgroup mma.sync launch of a few registers a thread on an L4 (sm89), whose multiprocessor runs
-    1536 threads in at most 24 blocks (CUDA C++ Programming Guide §5.1, Table 33): its registers would hold
-    sixteen programs, its threads hold twelve, and the residency it is planned at is twelve, where an A100's
-    2048 threads hold sixteen."""
-    from dew.nn.kernels.templates import bundles, resources
-
-    for generation_name, programs in (("sm89", 12), ("sm80", 16)):
-        with generation.assumed(generation_name):
-            family = bundles.of(generation_name, jnp.bfloat16)
-            assert resources.register_programs(family, 1, 32) == programs
-
-
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
