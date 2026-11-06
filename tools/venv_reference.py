@@ -57,6 +57,9 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                          "reference": "moonshotai/Kimi-Linear-48B-A3B-Instruct "
                                       "e1df551a447157d4658b573f9a695d57658590e9",
                          "license": "MIT", "distribution": ("fla-core", "0.4.0")},
+         **{f"uvit-{case}": {"test": "test_uvit_source", "arms": case, "worker": "uvit_worker.py",
+                             "reference": "baofff/U-ViT ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
+                             "license": "MIT"} for case in ("published", "variant")},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",
