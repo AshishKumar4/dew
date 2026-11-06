@@ -282,11 +282,15 @@ def _kernel_name(location: ir.Location) -> tuple[str, str | None] | None:
 
 def _named(location: ir.Location) -> str | None:
     """The name a location carries, as JAX lowers an equation's (`mlir._source_info_to_location`): a name
-    location's own (its name stack), a call site's callee's (a traceback without a name stack), or a fused
-    location's first part that carries one (a rewrite that merged operations); None where it carries
-    none."""
+    location's own (its name stack), its child's where it is an equation's primitive label (`<primitive>:`,
+    which JAX wraps the name stack in: a short conv's kernels under its marked call read 'marked_call:',
+    jsf-convloc), a call site's callee's (a traceback without a name stack), or a fused location's first part
+    that carries one (a rewrite that merged operations); None where it carries none."""
     if location.typeid == ir.NameLoc.static_typeid:
-        return ir.NameLoc(location).name_str
+        named = ir.NameLoc(location)
+        if named.name_str.endswith(":") and named.child_loc.typeid == ir.NameLoc.static_typeid:
+            return _named(named.child_loc)
+        return named.name_str
     if location.typeid == ir.CallSiteLoc.static_typeid:
         return _named(ir.CallSiteLoc(location).callee)
     if location.typeid == ir.FusedLoc.static_typeid:
