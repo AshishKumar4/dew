@@ -42,8 +42,9 @@ TEMPLATE = "mosaic_gpu"
 REFERENCE = "xla"
 """The selector's name for XLA's ragged dot, the reference path's route."""
 CHOICES = frozenset({"grouped_matmul"})
-"""The `generation.CHOICES` entries the cells run (the module's docstring): each cell asserts that the routes
-it records lie in them and that it reaches them."""
+"""The `generation.CHOICES` entries the cells run, the kernel under test the template's launches (the module's
+docstring): each cell asserts that its routes run them (`TEMPLATE`) and that any choice outside `CHOICES` runs
+at XLA, which none does."""
 
 
 def _matrices(case: dict[str, str]) -> tuple[int, ...]:
@@ -221,11 +222,13 @@ CASES = (
 def a_gemm_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The template route's training step of `case` on its GPU on par with the reference path's (check 1):
     the output and the gradients of the rows, the matrix and the hook's operands, from the plain formula in
-    float64; the routes it records are `CHOICES`, each one."""
+    float64; its routes run the template's launches (`CHOICES`)."""
     combination = dict(zip(AXES["gemm"], case, strict=True))
     route = route_of(combination)
     with generation.routes() as routes:
         assert_as_exact(jax.jit(with_gradients(_call(combination, route))),
                         jax.jit(with_gradients(_call(combination, REFERENCE))), _drawn(combination),
                         "-".join(case), seeds=SEEDS, truth_fn=with_gradients(_plain(combination)))
-    assert {found.choice for found in routes} == CHOICES, [found.choice for found in routes]
+    recorded = {(found.choice, found.kernel) for found in routes}
+    unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
+    assert ("grouped_matmul", TEMPLATE) in recorded and not unnamed, (sorted(recorded), unnamed)

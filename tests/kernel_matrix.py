@@ -47,9 +47,10 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "consumer": ("bias-cast", "silu-residual"),
         "dtype": ("bfloat16", "float16"),
     },
-    "gate_up": {
+    "join": {
         "generation": ("sm90", "sm80"),
-        "activation": ("swiglu", "geglu"),
+        "join": ("gate_up", "delta_gates"),
+        "activation": ("swiglu", "geglu", "none"),
         "bias": ("none", "bias"),
         "gate": ("plain", "scaled"),
         "dtype": ("bfloat16", "float16", "float32"),
@@ -67,9 +68,10 @@ a bias (a group's under a grouped call), a scale a row, or a paired gate and up 
 operands' dtype. The fused GEMM's (the choices `gemm_epilogue` and `gemm_prologue`): the GPU; the stage a
 region fuses, its consumers into the epilogue, its producer (an RMS norm) into the prologue (its consumers
 after the product in XLA), or both; the consumers, a bias then a cast, or a SiLU of twice the product plus a
-residual; the operands' dtype. The joined gate and up projections' (the choices `gate_up` and, where the
-activation is SwiGLU, `swiglu`): the GPU; a SwiGLU or a GeGLU gated MLP; projections with no bias or one;
-a gate times its multiplier or not; the operands' dtype."""
+residual; the operands' dtype. The joined projections' (the choices `gate_up` and `delta_gates`): the GPU; a
+gated MLP's gate and up projections joined, or a gated delta net's b and a; the MLP's activation, SwiGLU or
+GeGLU (`none` for the delta net, which has no gated product); projections with no bias or one; a gate times
+its multiplier or not (`plain` for the delta net); the operands' dtype."""
 
 SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (
@@ -84,7 +86,7 @@ CELLS: dict[str, tuple[str, str]] = {
     "decode": ("decode_matrix", "a_decode_step_is_on_par"),
     "gemm": ("gemm_matrix", "a_gemm_training_step_is_on_par"),
     "fused_gemm": ("fused_gemm_matrix", "a_fused_gemm_training_step_is_on_par"),
-    "gate_up": ("gate_up_matrix", "a_gated_mlps_training_step_is_on_par"),
+    "join": ("join_matrix", "a_joined_layers_training_step_is_on_par"),
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
 
@@ -93,7 +95,7 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_attention.py::test_the_decode_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_gate_up_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_join_matrix_holds_on_this_gpu",
 )
 """The flows that run the matrices' cells, by pytest node id."""
 
