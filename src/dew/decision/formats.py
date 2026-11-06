@@ -38,11 +38,11 @@ class DecisionFormat:
 
     name: str
     head: Callable[[PretrainedDecision], HeadFiles]
-    stated: Callable[[PretrainedDecision], tuple[Layout | None, int | None, Calibration | None]]
-    refuses: Callable[[PretrainedDecision], str | None] = lambda bundle: None
-    """Why its files hold no task of a bundle's, read off the bundle before any is written (the slot
-    release's engine reads no row of a tokenizer that spells no bare letter as one token); None where they
-    do."""
+    stated: Callable[[PretrainedDecision],
+                     tuple[Layout | None, int | None, Calibration | None] | Unwritable]
+    """The layout, max length and calibration its record states, or why its files hold no task of the
+    bundle's, read off the bundle before any is written (the slot release's engine reads no row of a
+    tokenizer that spells no bare letter as one token)."""
     folder: str = ""
     prefix: str = ""
     strip: str = ""
@@ -61,7 +61,7 @@ def _formats() -> dict[str, DecisionFormat]:
                                strip="model.", states={"architectures": ["ModernBertModel"]},
                                tokenizer_folder="tokenizer", generation=False, model_type="modernbert"),
         "joint": DecisionFormat("joint", joint_checkpoint.head_files, joint_checkpoint.stated),
-        "slots": DecisionFormat("slots", SlotSource.head_files, SlotSource.stated, SlotSource.refuses),
+        "slots": DecisionFormat("slots", SlotSource.head_files, SlotSource.stated),
     }
 
 
@@ -104,23 +104,23 @@ def decision_plan(bundle: PretrainedDecision) -> ReleasePlan | Unwritable:
     """A decision bundle's release in its head's format: its backbone's (`bundle_plan`) placed as the format
     places it, its head's files, its decision tokenizer in the format's folder and its record the
     backbone's with the facts the format's files cannot state; why none writes it where the format holds
-    another family than its backbone's, or refuses the bundle (`DecisionFormat.refuses`)."""
+    another family than its backbone's, or holds no task of the bundle's (`DecisionFormat.stated`)."""
     from dew.interop.layouts import Unwritable
 
     chosen = decision_format(bundle.head.release_format)
     refused = _holds(chosen, bundle.config)
     if refused is not None:
         return refused
-    why = chosen.refuses(bundle)
-    if why is not None:
-        return Unwritable(why)
+    stated = chosen.stated(bundle)
+    if isinstance(stated, Unwritable):
+        return stated
     backbone = bundle_plan(bundle.backbone())
     assert isinstance(backbone.model, Placed) and backbone.assets is not None
     placed = dataclasses.replace(backbone.model, folder=chosen.folder, prefix=chosen.prefix,
                                  strip=chosen.strip, stated=chosen.states)
     assets = Assets(tokenizer=bundle.decision_tokenizer, folder=chosen.tokenizer_folder,
                     generation_config=backbone.assets.generation_config if chosen.generation else None)
-    layout, max_length, calibration = chosen.stated(bundle)
+    layout, max_length, calibration = stated
     # A task's bundle states the dtype it computes in, and one read from a release whose record stated one
     # restates it, as the bundle computes, so a load of what it writes computes as it does; a source whose
     # record states none (an external release's) leaves its files' own.

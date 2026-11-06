@@ -18,6 +18,7 @@ from dew._files import write_atomically
 from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
+from dew.interop.layouts import Unwritable
 from dew.interop.pretrained import Pretrained, with_overrides
 from dew.interop.releases import HeadFiles
 from dew.interop.safetensors_io import LazyTensors
@@ -103,23 +104,21 @@ def _spelled(tokenizer: HFTokenizer) -> list[bool]:
     return valid
 
 
-def unspelled(tokenizer: HFTokenizer) -> str | None:
-    """Why the slot release's engine reads no row of `tokenizer`'s (`_verify_slots`): a bare A-Z label it
-    spells as more than one token, or as one that does not round-trip; None where it spells every one."""
-    if all(_spelled(tokenizer)[:len(LETTERS)]):
-        return None
-    return "the slot tokenizer must spell each bare A-Z label as one round-tripping token"
+def slot_names(tokenizer: HFTokenizer) -> tuple[str, ...] | Unwritable:
+    """The labels the slot release's engine admits for `tokenizer` (`_verify_slots`), read once: every
+    bare A-Z label as one round-tripping token, then all pairs together or none; why it reads no row of
+    `tokenizer`'s where it spells a bare letter otherwise."""
+    valid = _spelled(tokenizer)
+    if not all(valid[:len(LETTERS)]):
+        return Unwritable("the slot tokenizer must spell each bare A-Z label as one round-tripping token")
+    return SLOT_LABELS if all(valid) else LETTERS
 
 
-def _labels(tokenizer: HFTokenizer, count: int) -> tuple[Labels, tuple[tuple[int, ...], ...]]:
-    """The release requires every bare letter to round-trip as one token (`unspelled`), then admits all
-    pairs together or none, as its engine's `_verify_slots` does."""
-    refused = unspelled(tokenizer)
-    if refused is not None:
-        raise ValueError(refused)
-    names = (SLOT_LABELS if all(_spelled(tokenizer)) else LETTERS)[:count]
-    labels = Labels(variants=("{}",), names=names)
-    return labels, labels.ids(tokenizer, len(names))
+def _labels(tokenizer: HFTokenizer, names: tuple[str, ...], count: int
+            ) -> tuple[Labels, tuple[tuple[int, ...], ...]]:
+    """The first `count` of `names` (`slot_names`) as the release's labels, and their ids."""
+    labels = Labels(variants=("{}",), names=names[:count])
+    return labels, labels.ids(tokenizer, min(count, len(names)))
 
 
 
@@ -169,12 +168,6 @@ class SlotSource(SourceKind):
     """Readout metadata beside a native decoder, with the release's prompt as a layout value."""
 
     @staticmethod
-    def refuses(bundle: PretrainedDecision) -> str | None:
-        """Why the slot release holds no task of `bundle`'s: a tokenizer its engine reads no row of
-        (`unspelled`)."""
-        return unspelled(bundle.decision_tokenizer)
-
-    @staticmethod
     def head_files(bundle: PretrainedDecision) -> HeadFiles:
         """The slot readout in its release (`dew.decision.formats`): `readout.json`, its mode, slots and
         attention, and the slot-and-pointer head's tensors in `readout_head.pt` (none for the tied label
@@ -211,10 +204,12 @@ class SlotSource(SourceKind):
         return HeadFiles(tensors, files=files)
 
     @staticmethod
-    def stated(bundle: PretrainedDecision) -> tuple[QuestionLayout | None, int, Calibration | None]:
+    def stated(bundle: PretrainedDecision
+               ) -> tuple[QuestionLayout | None, int, Calibration | None] | Unwritable:
         """What the slot release states beside its files: its window, which the readout's prompt takes
         (`describe`), the layout whole where it is another than that prompt, and the calibration where the
-        task has one."""
+        task has one; why it holds no task of `bundle`'s where its engine reads no row of its tokenizer's
+        (`slot_names`)."""
         layout = bundle.layout
         assert isinstance(layout, QuestionLayout) and layout.labels is not None
         fields = _records.record(_records.record(bundle.head.record(), "head")["fields"], "head.fields")
@@ -222,7 +217,10 @@ class SlotSource(SourceKind):
                                     what="a list of label ids"))
         # The prompt an external release derives (its canonical bare labels), which the release states the
         # layout over where its labels are others.
-        canonical, _ = _labels(bundle.decision_tokenizer, count)
+        names = slot_names(bundle.decision_tokenizer)
+        if isinstance(names, Unwritable):
+            return names
+        canonical, _ = _labels(bundle.decision_tokenizer, names, count)
         prompt = SlotSource.layout(max_len=layout.max_len, labels=canonical, blocks=layout.blocks)
         return (None if layout == prompt else layout), layout.max_len, beyond_default(bundle.calibration)
 
@@ -301,7 +299,10 @@ class SlotSource(SourceKind):
         # the backbone the native loader builds under them reads blocks, of whatever kind.
         blocks = reads_blocks(config, overrides)
         tokenizer = HFTokenizer(str(directory), local_files_only=True)
-        labels, _ = _labels(tokenizer, count)
+        names = slot_names(tokenizer)
+        if isinstance(names, Unwritable):
+            raise ValueError(names.reason)
+        labels, _ = _labels(tokenizer, names, count)
         # The release's window, else an external release's default, over its prompt; and the layout and
         # calibration it states whole over that, whose labels the readout reads.
         layout, calibration = released_decision(
