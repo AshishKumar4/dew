@@ -1,5 +1,7 @@
 import inspect
 import importlib.metadata
+import os
+import textwrap
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +11,24 @@ import pytest
 
 from dew.checkpoints import Checkpoints, FROZEN_STORE, _digest
 from dew.checkpoints._state_trees import _item_metadata
+
+
+@pytest.fixture(autouse=True)
+def prototype_source_fix(monkeypatch):
+    """Apply the proposed source diff at runtime only; the product files stay untouched."""
+    if os.environ.get("DBG_REPACK_FROZEN") != "1":
+        return
+    source = textwrap.dedent(inspect.getsource(Checkpoints._frozen_values))
+    source = source.replace(
+        "jax.tree.structure(template) == jax.tree.structure(stored)",
+        "_paths(template) == _paths(stored)")
+    source = source.replace(
+        '_refuse_reshaped(template, stored, f"{path} ({name})")',
+        '_refuse_reshaped(template, stored, f"{path} ({name})")\n'
+        '                stored = ocp.tree.from_flat_dict(ocp.tree.to_flat_dict(stored), target=template)')
+    namespace = {}
+    exec(source, Checkpoints._frozen_values.__globals__, namespace)
+    monkeypatch.setattr(Checkpoints, "_frozen_values", namespace["_frozen_values"])
 
 
 @pytest.mark.parametrize("kind", ["decision", "supervised", "diffusion"])
