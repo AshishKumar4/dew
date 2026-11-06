@@ -44,7 +44,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
     "recurrence": {
         "generation": ("sm90", "sm80"),
         "form": ("gated delta net", "kimi delta attention", "write gate", "rated scan"),
-        "kernel": ("mosaic_gpu", "xla", "derived"),
+        "kernel": ("mosaic_gpu", "xla"),
         "dtype": ("bfloat16", "float32"),
         "documents": ("one", "packed"),
     },

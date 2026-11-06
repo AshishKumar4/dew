@@ -5,8 +5,10 @@ Its cells run generation.CHOICES' `gated_delta_rule` and `ssd`. Each takes the c
 (`recurrence_chunk.chunk`) of a form, forward and backward in one program as a layer's training step takes
 them, with the kernel the cell names (`generation.chosen`):
 - the recurrence template ('mosaic_gpu');
-- the portable math ('xla');
-- its derived forms ('derived', the delta rule's).
+- the portable math ('xla').
+The portable math's derived forms ('derived') join once they hold check 1: a call names them alone, and in
+fp32 a step write gate's key gradient sat 1.54 times the portable math's distance from float64 and its final
+memory 1.95 times (40 seeds, armada, recurrence matrix dry run 11-06, row 4466).
 
 Its output, final memory and every operand's gradient are held to its reference's (check 1): the form's
 port where it takes the call, fla's kernels for the delta rule's forms ('fla'), mamba_ssm's for the rated scan
