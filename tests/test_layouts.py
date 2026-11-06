@@ -14,12 +14,15 @@ from dew.interop import Pretrained, PretrainedDecoder, decoder_parts, hf_decoder
 from dew.interop.codecs import SIDECARS
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.layouts import (
+    Choice,
     ConfigField,
     ConfigLayout,
     ConfigPart,
     Copy,
+    Nested,
     Prefixed,
     Rebased,
+    Restated,
     Route,
     Spelled,
     Table,
@@ -30,15 +33,16 @@ from dew.interop.safetensors_io import header_specs
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 ROUTES = (Route, Copy, Table, Spelled, Prefixed, Rebased, When)
-CONFIGS = (ConfigLayout, ConfigPart, ConfigField)
+CONFIGS = (ConfigLayout, ConfigPart, ConfigField, Nested, Restated, Choice)
 
 
 def declared(node: object):
-    """Every node of a family's route table or config layout, the node first."""
+    """Every node of a family's route table or config layout, the node first: a nested record's, a
+    restated layout's and both of a choice's among them."""
     yield node
     for child in (*getattr(node, "entries", ()), *getattr(node, "parts", ())):
         yield from declared(child)
-    for attribute in ("routes", "route"):
+    for attribute in ("routes", "route", "layout", "routed", "plain"):
         if hasattr(node, attribute):
             yield from declared(getattr(node, attribute))
 

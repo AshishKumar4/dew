@@ -13,8 +13,7 @@ from dew.interop.hf_decoders import WRAPPER_LAYOUTS
 from dew.interop.layouts import source_layout
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
-WRITTEN = ("gemma3-tiny-mm", "gemma4-tiny-mm", "llama4-tiny-mm", "qwen35-tiny-mm", "qwen35-moe-native-tiny",
-           "lfm3-vl-tiny")
+WRITTEN = ("gemma3-tiny-mm", "gemma4-tiny-mm", "llama4-tiny-mm", "qwen35-tiny-mm", "qwen35-moe-native-tiny")
 """A release of each wrapper family whose layout writes it (`WRAPPER_LAYOUTS`), its media a vision tower
 and its projector."""
 
@@ -39,3 +38,12 @@ def test_a_wrapper_writes_its_release_from_its_own_fields_and_reads_back_as_itse
     assert written.keys() == read.keys()
     for path, leaf in written.items():
         assert np.array_equal(np.asarray(read[path]), np.asarray(leaf)), path
+
+
+def test_a_wrapper_whose_release_is_its_own_code_is_unwritable_with_its_reason():
+    """LFM3-VL's release is its own modeling code (LiquidAI/LFM3-VL-2B), which transformers has no class
+    for and no layout of Dew's writes (`WRAPPER_LAYOUTS`): its model is `Unwritable`, falsy and naming why,
+    before any file is written."""
+    loaded = Pretrained.load(str(FIXTURES / "lfm3-vl-tiny"), dtype="float32", attention_impl="reference")
+    layout = source_layout(loaded.model)
+    assert not layout and "lfm3_vl" in layout.reason
