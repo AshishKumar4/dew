@@ -420,13 +420,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         _most(self, consumers)
         return resources.entry_registers(consumers, programs)
 
-    def stores_columns(self, columns: int, rows: int) -> bool:
-        # Its store ladder reloads each rung's rows from shared memory through registers, whose strided
-        # layout wants a multiple of a role's threads in elements: its least rung, `rows` of `columns`, must
-        # hold one (BC-RAGGED-STORE: a grouped call's one-row rung at 64 columns finds no layout, a dense
-        # call's rungs of 8 rows do; UNIT64-2: a 192-column row, a thread and a half's, none either).
-        return rows * columns % resources.THREADS == 0
-
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
@@ -628,9 +621,9 @@ class Mma(MmaIssuer, CpAsync):
     consumers = 2
 
     def column_unit(self, dtype) -> int:
-        # Its stores move rows through registers, laid over the role's threads (`stores_columns`): a warp's
-        # threads at least, each holding an element, a tile's rows then whole multiples of the rest (the
-        # guarded attention walk's 32-column blocks, whose 64 held no tile's registers at width 128).
+        # Its stores move rows through registers, a row's columns over a warp's lanes at least
+        # (`mosaic.copied`), each lane holding an element (the guarded attention walk's 32-column blocks,
+        # whose 64 held no tile's registers at width 128).
         del dtype
         return resources.THREADS // 4
 

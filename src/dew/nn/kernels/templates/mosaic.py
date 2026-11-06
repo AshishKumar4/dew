@@ -31,7 +31,7 @@ from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
-from jax.experimental.mosaic.gpu import utils as mgpu_utils
+from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
@@ -625,8 +625,24 @@ def copied(source, destination) -> None:
     optimized-only (0.11 downgraded it), which a ladder rung of a row or two cannot be, so its layout
     inference searched every rung's layouts to exhaustion (ns-gate1: the sm80 forward failed after about
     1000 s; without the ladder, or with these transfers unoptimized, it lowers in seconds:
-    ns-noladder2, ns-abort1)."""
-    plgpu.store(destination, plgpu.load(source, optimized=False), optimized=False)
+    ns-noladder2, ns-abort1). A block whose elements no warpgroup's strided layout holds, a multiple of its
+    threads (a ragged store's one row of an odd multiple of 64 columns, as every tile of gpt-oss's 2880-wide
+    outputs: row 4474), is copied in a row's layout (`_row_layout`)."""
+    strided = math.prod(source.shape) % resources.THREADS == 0
+    layout = None if strided else _row_layout(source.shape, source.dtype)
+    plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False), optimized=False)
+
+
+def _row_layout(shape: tuple[int, ...], dtype) -> plgpu_core.SomeLayout:
+    """A `[rows, columns]` block's layout a row at a time (`copied`'s): each row's columns over a warp's
+    lanes, as many adjacent ones a lane as a whole number of them takes up to 16 bytes, and every warp of
+    the warpgroup holding the same; their stores race, writing the same values, which the CUDA memory model
+    allows (`fragmented_array`'s tiled store). `columns` a multiple of a warp's lanes."""
+    lanes = mgpu_fragments.WARP_SIZE
+    vector = math.gcd(shape[-1] // lanes, 16 // jnp.dtype(dtype).itemsize)
+    return plgpu.Layout.TILED(mgpu_fragments.Tiling(((1, lanes * vector), (vector,))),
+                              warp_dims=(mgpu_fragments.Replicated(mgpu_fragments.WARPS_IN_WARPGROUP),),
+                              lane_dims=(-2,), vector_dim=-1)
 
 
 def coalesced(source, destination) -> None:
@@ -1538,14 +1554,6 @@ class Transport[Allocated, Opened](abc.ABC):
     def registers(self, consumers: int, programs: int = 1) -> int:
         """The registers a thread of each of `consumers` consumer roles may hold, `programs` programs a
         multiprocessor at once."""
-
-    def stores_columns(self, columns: int, rows: int) -> bool:
-        """Whether its stores take an output tile `columns` wide (a multiple of `column_unit`) whose stored
-        rows come in multiples of `rows` (a grouped call's, ragged to a row: 1; a dense call's, whole
-        `TMA_ROWS`): any, unless its stores reload rows through registers laid over a role's threads
-        (`Mma`)."""
-        del columns, rows
-        return True
 
     def warpgroups(self, consumers: int) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
