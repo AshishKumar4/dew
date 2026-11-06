@@ -346,6 +346,19 @@ class Step:
         return [*collections, *(["qk"] if self.qk_stats else []),
                 *([INSPECTED] if self.watched is not None else [])]
 
+    def observed(self, sown: Variables, *within: str) -> tuple[Variables | None, Variables | None]:
+        """What a model call that opened `sown()` sowed for the step: the attention logit maxima where
+        the optimizer clips by them (`Aux.qk_stats`), nested under `within`, the call's module's path among
+        the objective's parameters (a decision model's `backbone`, which it applies apart), so a QK-Clip
+        finds each layer's maxima where it finds its weights; and the watched activations
+        (`Aux.inspected`). Each is None where the step asked for none: every objective that opens them
+        returns them, as a run whose optimizer clips by the maxima refuses a step returning none (row
+        1608: a decision, supervised or continuous diffusion run under 'muonclip' took no update)."""
+        qk = sown.get("qk", {}) if self.qk_stats else None
+        for name in reversed(within):
+            qk = None if qk is None else {name: qk}
+        return qk, sown.get(INSPECTED, {}) if self.watched is not None else None
+
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
         examples the update pools: what a draw stratified over the update's examples reads, or a role

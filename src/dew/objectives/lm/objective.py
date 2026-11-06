@@ -1437,13 +1437,12 @@ class LMObjective(TokenScorer):
                 progress=self.progress(step))
         statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
         reported = {"indexer_kl": kl}
-        qk = gathered.get("qk", {}) if step.qk_stats else None
+        qk, inspected = step.observed(gathered)
         if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return statistics, Aux(reported, qk_stats=qk, inspected=gathered.get(INSPECTED, {})
-                               if step.watched is not None else None)
+        return statistics, Aux(reported, qk_stats=qk, inspected=inspected)
 
     def _warmup_statistics(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[Ratio, jax.Array]:
         """The warm-up's loss, the indexer's weighted KL over the queries it
