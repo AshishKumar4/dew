@@ -112,15 +112,22 @@ class DataExport:
     provision: bool = False
     tokenizer: str | None = None
     eos: bool = False
+    plan_version: int | None = None
+    """The data plan version the chain is read by (`dew.data.plan.PLAN_VERSIONS`); this Dew's where None."""
 
     def run_command(self) -> int:
         from dew.data.compile import iterate
+        from dew.data.plan import PLAN_VERSIONS
         from dew.data.sinks import export
 
         format = self.format or ("array_record" if self.tokenizer is not None else "parquet")
         if self.tokenizer is not None and format != "array_record":
             raise ValueError("token exports must use --format array_record")
+        if self.tokenizer is not None and self.plan_version is not None:
+            raise ValueError("a token export reads its documents at this Dew's data plan version; give "
+                             "--plan-version to a record export")
         pipeline = chain_of(self.data, self.branch)
+        version = PLAN_VERSIONS[-1] if self.plan_version is None else self.plan_version
         if self.tokenizer is not None:
             from dew.data.text import export_tokens
 
@@ -128,8 +135,8 @@ class DataExport:
                                      rows_per_shard=self.rows_per_shard, read=self.read,
                                      provision=self.provision)
         else:
-            manifest = export(iterate(pipeline, read=self.read, provision=self.provision), self.destination,
-                              format=format, rows_per_shard=self.rows_per_shard)
+            rows = iterate(pipeline, read=self.read, provision=self.provision, plan_version=version)
+            manifest = export(rows, self.destination, format=format, rows_per_shard=self.rows_per_shard)
         emit(json.dumps(manifest, sort_keys=True))
         return 0
 
@@ -158,13 +165,19 @@ class DataPublish:
     branch: Literal["train", "validation"] = "train"
     read: Literal["memory", "indexed", "streamed"] = "streamed"
     provision: bool = False
+    plan_version: int | None = None
+    """The data plan version the run that reads the publication reads by (`dew.data.plan.PLAN_VERSIONS`),
+    whose shards a stream's fill numbers its rows by; this Dew's where None."""
 
     def run_command(self) -> int:
         from dew.data.cache import Cache
         from dew.data.compile import publish
+        from dew.data.plan import PLAN_VERSIONS
 
         pipeline = chain_of(self.data, self.branch)
-        generation = publish(pipeline, Cache(self.destination), read=self.read, provision=self.provision)
+        version = PLAN_VERSIONS[-1] if self.plan_version is None else self.plan_version
+        generation = publish(pipeline, Cache(self.destination), read=self.read, provision=self.provision,
+                             plan_version=version)
         emit(f"published {generation.url}")
         return 0
 

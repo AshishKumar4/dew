@@ -828,7 +828,7 @@ class _Lazy:
     def lengths(self):
         return None
 
-    def manifest(self):
+    def manifest(self, version):
         raise ValueError("a lazy source is indexed")
 
 

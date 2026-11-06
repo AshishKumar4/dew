@@ -3,7 +3,6 @@ reads the jaxpr, XLA compiles the program JAX lowers it to, and four terms the w
 Each test states one, with the rule that removes it, on a program small enough to read."""
 
 
-import re
 
 import jax
 import jax.numpy as jnp
@@ -268,11 +267,16 @@ def compiled_workspaces(gpu, function, *specs) -> list[int]:
     with XLA's Triton GEMMs off, as the planner compiles a step, so every product is a cuBLAS call."""
     sharding = NamedSharding(Mesh(np.asarray([gpu]), ("data",)), P())
     placed = [jax.ShapeDtypeStruct(spec.shape, spec.dtype, sharding=sharding) for spec in specs]
+    from dew.telemetry.instrumentation import hlo_instructions
+
     program = jax.jit(jax.grad(lambda *arguments: function(*arguments)[0])).lower(*placed).compile(
-        compiler_options={"xla_gpu_enable_triton_gemm": False}).as_text()
-    assert program, "the compile states no program"
-    return [int(size) for line in program.splitlines() if 'custom_call_target="__cublas' in line
-            for size in re.findall(r"s8\[(\d+)\]", line)]
+        compiler_options={"xla_gpu_enable_triton_gemm": False})
+    # Each cuBLAS call's result holds its product and, as an s8 array, its workspace.
+    calls = [instruction for instruction in hlo_instructions(program.as_text()).values()
+             if instruction.target.startswith("__cublas")]
+    assert calls, "the compile holds no cuBLAS call"
+    return [size for call in calls for element, size in zip(call.arrays, call.buffers, strict=True)
+            if element == "s8"]
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])

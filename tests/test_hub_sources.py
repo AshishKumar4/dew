@@ -13,7 +13,11 @@ import pytest
 from hub_support import native_builder, stated_shards
 
 from dew.data.dataset import DataPartition, Loading
+from dew.data.plan import PLAN_VERSIONS
 from dew.data.sources import Files, Memory
+
+LATEST = PLAN_VERSIONS[-1]
+"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monkeypatch):
@@ -558,7 +562,7 @@ def test_a_downloaded_hub_split_streams_offline_as_it_streamed_online(tmp_path, 
     def streamed(source):
         read = sorted((int(row["id"]), str(row["text"]), tuple(sorted(row)))
                       for row in iterate(Pipeline(source), read="streamed"))
-        return source.fingerprint(), [shard.id for shard in source.manifest().shards], read
+        return source.fingerprint(), [shard.id for shard in source.manifest(LATEST).shards], read
 
     online = streamed(split())
     assert online[2] == [(row["id"], row["text"], ("id", "text")) for row in rows[:6]]

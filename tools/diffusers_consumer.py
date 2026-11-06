@@ -14,7 +14,7 @@ and from the safetensors file beside it, with its PyTorch twin.
 transformers 5 ships no Flax CLIP, so a Flax text tower is read through its
 PyTorch twin alone, and the Flax pipelines themselves cannot be built here.
 
-`unet_prediction` runs the declared UNet (Flax or PyTorch) and
+`unet_predictor` runs the declared UNet (Flax or PyTorch) and
 `denoiser_prediction` a declared PyTorch denoiser, in float32 or in float64
 (`torch_precision.float64` for PyTorch, x64 for Flax), for a
 forward the caller holds Dew's trained one to by tests/reference_error.py's
@@ -33,6 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 
+from tools import flax_precision
 from tools.diffusers_reference_helpers import restore_transformers_names
 from tools.torch_precision import float64
 
@@ -137,29 +138,37 @@ def precision(wide: bool):
     return float64() if wide else contextlib.nullcontext()
 
 
-def unet_prediction(export: Path, sample: np.ndarray, timestep: float, context: np.ndarray,
-                    pooled: np.ndarray | None = None, time_ids: np.ndarray | None = None, *,
-                    wide: bool = False) -> np.ndarray:
-    """The declared UNet's prediction for a channels-last `sample` (noise and
-    any inpaint channels), in float32 or (`wide`) float64, channels last."""
+def unet_predictor(export: Path, *, wide: bool = False):
+    """The declared UNet (Flax or PyTorch), loaded once, as a function of a channels-last `sample` (noise
+    and any inpaint channels), the timestep, the prompt states and, for SDXL, the pooled embedding and
+    the time ids, in float32 or (`wide`) float64, its prediction channels last: a Flax UNet's float64 run
+    reads the float32 its modules name as float64 (`flax_precision.float64`)."""
     dtype = np.float64 if wide else np.float32
-    sample = np.ascontiguousarray(np.moveaxis(np.asarray(sample, dtype), -1, 1))
-    context = np.asarray(context, dtype)
-    added = None if pooled is None else {"text_embeds": np.asarray(pooled, dtype),
-                                         "time_ids": np.asarray(time_ids, dtype)}
     if flax_declared(export, "unet"):
         with jax.enable_x64(new_val=wide):
             model, params = load_flax(export, "unet", wide=wide)
-            output = model.apply({"params": params}, jnp.asarray(sample), jnp.asarray([timestep]),
-                                 jnp.asarray(context), added_cond_kwargs=added).sample
-            return np.moveaxis(np.asarray(output), 1, -1)
-    with precision(wide):
-        unet = load(export, "unet", torch.float64 if wide else torch.float32)
+    else:
+        with precision(wide):
+            unet = load(export, "unet", torch.float64 if wide else torch.float32)
+
+    def predict(sample, timestep, context, pooled=None, time_ids=None):
+        sample = np.ascontiguousarray(np.moveaxis(np.asarray(sample, dtype), -1, 1))
+        context = np.asarray(context, dtype)
+        added = None if pooled is None else {"text_embeds": np.asarray(pooled, dtype),
+                                             "time_ids": np.asarray(time_ids, dtype)}
+        times = np.full((len(sample),), timestep, dtype)
+        if flax_declared(export, "unet"):
+            with jax.enable_x64(new_val=wide), flax_precision.float64() if wide else contextlib.nullcontext():
+                output = model.apply({"params": params}, jnp.asarray(sample), jnp.asarray(times),
+                                     jnp.asarray(context), added_cond_kwargs=added).sample
+                return np.moveaxis(np.asarray(output), 1, -1)
         tensors = None if added is None else {key: torch.from_numpy(value) for key, value in added.items()}
-        with torch.no_grad():
-            output = unet(torch.from_numpy(sample), torch.tensor([timestep], dtype=unet.dtype),
+        with precision(wide), torch.no_grad():
+            output = unet(torch.from_numpy(sample), torch.from_numpy(times),
                           encoder_hidden_states=torch.from_numpy(context), added_cond_kwargs=tensors).sample
-    return np.moveaxis(output.numpy(), 1, -1)
+        return np.moveaxis(output.numpy(), 1, -1)
+
+    return predict
 
 
 def denoiser_prediction(export: Path, call, *, wide: bool = False) -> np.ndarray:

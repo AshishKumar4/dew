@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -47,9 +48,20 @@ def streamed(
     if places is not None:
         reader = _Taken(manifest.reader)
         return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described)
-    root = _dealt(_shards(manifest, partition=partition, loading=loading), seed=seed, epochs=epochs)
-    root = root[partition.cut()]
-    return _ShardPass(root, manifest.reader, cycle_length, loading, described, quota)
+    shards = _shards(manifest, partition=partition, loading=loading)
+    # Shards whose store counts their rows only where asked (a Parquet store's files) are counted once a read
+    # of them finds every one it reads empty (`_EmptyRun`), as a store of empty shards is refused above.
+    nothing = (functools.partial(_holds_nothing, manifest, loading.threads)
+               if epochs is None and manifest.counted is not None else None)
+    root = _dealt(shards, seed=seed, epochs=epochs)[partition.cut()]
+    return _ShardPass(root, manifest.reader, cycle_length, loading, described, quota,
+                      None if nothing is None else (nothing, 2 * len(shards)))
+
+
+def _holds_nothing(manifest: ShardManifest, reads: int) -> bool:
+    """Whether every shard of `manifest` holds no row, as its store counts them, `reads` at once
+    (`ShardManifest.sized`)."""
+    return all(shard.rows == 0 for shard in manifest.sized(reads).shards)
 
 
 def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | None, loading: Loading,
@@ -63,8 +75,9 @@ def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | No
     and none repeats one while another's go unread. Within that last pass, a share that interleaves its
     places reads its count's first rows in its own interleaved order, not the walk's, which an interleave
     defines on no process: the pool reads the bound's examples, each share's count exact, and no record
-    a pass more than another of the bound's. None where a shard states no rows."""
-    shards = _shards(manifest, partition=partition, loading=loading)
+    a pass more than another of the bound's. Its shards' rows are the ones they state or their store counts,
+    `Loading.threads` at once (`ShardManifest.sized`); None where a shard states none."""
+    shards = _shards(manifest.sized(loading.threads), partition=partition, loading=loading)
     if any(shard.rows is None for shard in shards):
         return None
     if not any(shard.rows for shard in shards):
@@ -84,9 +97,11 @@ def bounded_places(manifest: ShardManifest, *, partition: DataPartition, seed: i
                    epochs: int | None, examples: int) -> list[tuple[Shard, int]] | None:
     """This share's places among an endless stream's first `examples` rows, each with the rows it reads of
     it (`_reached`), in order: every row the bound deals this share and no other. None where the read is
-    no endless one, or a shard states no rows."""
-    shards = _shards(manifest, partition=partition, loading=loading)
-    if epochs is not None or any(shard.rows is None for shard in shards):
+    no endless one, or a shard states no rows and its store counts none (`ShardManifest.sized`)."""
+    if epochs is not None:
+        return None
+    shards = _shards(manifest.sized(loading.threads), partition=partition, loading=loading)
+    if any(shard.rows is None for shard in shards):
         return None
     if not any(shard.rows for shard in shards):
         return []
@@ -112,6 +127,16 @@ def _rows(shard: Shard | None) -> int:
     """The rows a dealt place's `shard` states, which every shard a bound walks does (`bounded`)."""
     assert shard is not None and shard.rows is not None, "every shard a bound walks states its rows"
     return shard.rows
+
+
+def cut(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) -> ShardManifest:
+    """`manifest` with the shards a stream deals its shares and their workers (`_shards`): its own, or its
+    parts where too few fill them, then no further part (`subdivide`) and their rows their own, so a read
+    that places its records (`dew.data.lowering._positioned`) places the shards it reads."""
+    shards = _shards(manifest, partition=partition, loading=loading)
+    if shards == manifest.shards:
+        return manifest
+    return dataclasses.replace(manifest, shards=shards, subdivide=None, counted=None)
 
 
 def _shards(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) -> tuple[Shard, ...]:
@@ -149,10 +174,11 @@ class _ShardPass[Place](grain.IterDataset):
     (`set_slice`) and its part of the quota, every worker's count-th."""
 
     def __init__(self, root: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
-                 loading: Loading, name: str, quota: int | None = None):
+                 loading: Loading, name: str, quota: int | None = None,
+                 nothing: tuple[Callable[[], bool], int] | None = None):
         super().__init__(root)
         self.root, self.reader = root, reader
-        self.cycle, self.loading, self.name, self.quota = cycle, loading, name, quota
+        self.cycle, self.loading, self.name, self.quota, self.nothing = cycle, loading, name, quota, nothing
 
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
         self.root = self.root[selection]
@@ -164,7 +190,7 @@ class _ShardPass[Place](grain.IterDataset):
             # A worker dealt no place or no row of the bound reads nothing (Grain's interleave of no dataset
             # raises).
             return _Passing(None)
-        reader = _Reader(self.reader, _EmptyRun(self.name), self.loading)
+        reader = _Reader(self.reader, _EmptyRun(self.name, self.nothing), self.loading)
         rows = (_Sequential(self.root, reader, self.loading) if self.cycle == 1
                 else interleaved(self.root, reader, self.cycle, self.loading))
         limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
@@ -289,16 +315,24 @@ class _Passing(grain.DatasetIterator):
 
 class _EmptyRun:
     """How many shards in a row one read found empty, which it logs at each doubling. Grain reads
-    each shard on a prefetch thread of its own, so the count is kept under a lock."""
+    each shard on a prefetch thread of its own, so the count is kept under a lock. Given `nothing`, whether
+    its store holds no row and a run long enough to hold every shard the read reads (twice the store's,
+    whatever pass it starts in), an endless read of shards that state no rows is refused once such a run
+    finds its store holds none, as one of shards that state none is (`streamed`), where it would read
+    nothing forever; the store is asked once."""
 
-    def __init__(self, name: str):
-        self.name, self.count = name, 0
+    def __init__(self, name: str, nothing: tuple[Callable[[], bool], int] | None = None):
+        self.name, self.count, self.nothing = name, 0, nothing
         self.lock = threading.Lock()
 
     def ended(self, yielded: bool) -> None:
         with self.lock:
             self.count = 0 if yielded else self.count + 1
-            count = self.count
+            count, nothing = self.count, self.nothing
+            if nothing is not None and count >= nothing[1]:
+                self.nothing = None
+        if nothing is not None and count >= nothing[1] and nothing[0]():
+            raise ValueError(f"{self.name} holds no rows, so reading it endlessly reads nothing forever")
         if logged_run(count, LONG_RUN):
             _log.warning("%s: its last %d shards held no row; the read goes on to the next", self.name, count)
 

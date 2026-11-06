@@ -51,44 +51,32 @@ def prefill(model, variables, prompt):
 
 
 CANVAS_SEEDS = 16
-"""Each canvas site's declared seeds, sized by `seeds_for` paired (armada, 11-06)."""
+"""Each canvas site's declared seeds, sized by `seeds_for` paired (armada, 11-06): 8 to 16, but the sliding
+window's 32 (`WINDOW_SEEDS`)."""
+WINDOW_SEEDS = 32
 SPECIAL = 3
-"""The fixtures' pad, end and start ids sit below it, and their image ids at 60 and above: a drawn prompt or
-canvas holds neither."""
+"""The fixtures' pad, end and start ids sit below it, and their image ids at 60 and above: a draw keeps
+each where the fixture's prompt holds it and draws every other position (`canvas_draw`)."""
 
 
 def transformers_model(directory: Path, canvas_length: int | None = None):
     """transformers' DiffusionGemmaForBlockDiffusion of `directory` in float32 with eager attention and
     experts (the grouped matmul has no float64 kernel): a whole checkpoint read by `from_pretrained`, or with
-    `canvas_length` a released-layout fixture (its text config and text weights alone, tools/hf_reference.py's
-    `diffusion_gemma_tiny`), built from its config with its weights, every tensor but the vision tower's
-    read."""
+    `canvas_length` a released-layout fixture (its text config and text weights alone), built as its
+    generator builds it (tools/diffusion_gemma_reference.py's `diffusion_gemma_model`) with its weights, every
+    tensor but the vision tower's read."""
     import torch
     from safetensors.torch import load_file as torch_load
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaConfig,
-        DiffusionGemmaTextConfig,
-    )
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
-    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+
+    from tools.diffusion_gemma_reference import diffusion_gemma_model
 
     if canvas_length is None:
         model = DiffusionGemmaForBlockDiffusion.from_pretrained(str(directory), dtype=torch.float32,
                                                                 local_files_only=True,
                                                                 experts_implementation="eager")
     else:
-        fields = json.loads((directory / "config.json").read_text())
-        # The layer types' rope parameters: the saved config also holds the flat keys transformers wrote
-        # beside them, which its constructor reads as a layer type.
-        fields["rope_parameters"] = {kind: value for kind, value in fields["rope_parameters"].items()
-                                     if isinstance(value, dict)}
-        text = DiffusionGemmaTextConfig(**{key: value for key, value in fields.items()
-                                           if key != "model_type"})
-        vision = Gemma4VisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=1,
-                                    num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
-                                    pooling_kernel_size=2, position_embedding_size=64)
-        model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
-            text_config=text, vision_config=vision, canvas_length=canvas_length, tie_word_embeddings=False))
+        model = diffusion_gemma_model(json.loads((directory / "config.json").read_text()), canvas_length)
         loaded = model.load_state_dict(torch_load(str(directory / "model.safetensors")), strict=False)
         assert not loaded.unexpected_keys and all("vision" in name for name in loaded.missing_keys), loaded
         for module in model.modules():
@@ -100,37 +88,34 @@ def transformers_model(directory: Path, canvas_length: int | None = None):
 
 def canvas_draw(prompt: np.ndarray, canvas: np.ndarray, vocab: int, *, previous: bool = False,
                 pixels: np.ndarray | None = None):
-    """A seed's prompt and canvas ids of the fixture's shapes, their previous logits normal where `previous`,
-    and pixels uniform in [0, 1) of `pixels`' shape where given, which keep `prompt` as it is (its image ids
-    where its images sit)."""
+    """A seed's prompt and canvas of the fixture's, each ordinary id drawn and each structural one (the
+    start id, an image's markers: below SPECIAL or from 60) kept where the fixture holds it; the previous
+    logits normal where `previous`, and pixels uniform in [0, 1) of `pixels`' shape where given."""
+    def ordinary(rng, ids):
+        drawn = rng.integers(SPECIAL, 60, ids.shape)
+        return np.where((ids < SPECIAL) | (ids >= 60), ids, drawn).astype(np.int32)
+
     def draw(seed):
         rng = np.random.default_rng([2219, prompt.size, canvas.size, seed])
-        drawn = {"prompt": prompt.astype(np.int32) if pixels is not None
-                 else rng.integers(SPECIAL, 60, prompt.shape).astype(np.int32),
-                 "canvas": rng.integers(SPECIAL, 60, canvas.shape).astype(np.int32)}
+        drawn = [ordinary(rng, prompt), ordinary(rng, canvas)]
         if previous:
-            drawn["previous"] = rng.standard_normal((*canvas.shape, vocab)).astype(np.float32)
+            drawn.append(rng.standard_normal((*canvas.shape, vocab)).astype(np.float32))
         if pixels is not None:
-            drawn["pixels"] = rng.uniform(size=pixels.shape).astype(np.float32)
-        return tuple(drawn.values())
+            drawn.append(rng.uniform(size=pixels.shape).astype(np.float32))
+        return tuple(drawn)
     return draw
 
 
 def transformers_canvas(network, prompt, canvas, *rest):
     """transformers' canvas logits after `prompt`, self-conditioned on the previous logits where given, or
     with the prompt's images where pixels are (the reference's patches and their positions)."""
-    import torch
-    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
+    from tools.diffusion_gemma_reference import media_inputs
 
     fields = {}
     if rest and rest[0].ndim == 3:
         fields["self_conditioning_logits"] = rest[0].to(next(network.parameters()).dtype)
     elif rest:
-        pixels = rest[0].to(next(network.parameters()).dtype)
-        patches = torch.stack([torch.as_tensor(convert_image_to_patches(image.numpy(), 2))
-                               for image in pixels[:, 0]])
-        positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(len(pixels), -1, -1)
-        fields = {"pixel_values": patches.to(pixels.dtype), "image_position_ids": positions}
+        fields = media_inputs(rest[0].to(next(network.parameters()).dtype))
     return {"logits": network(input_ids=prompt, decoder_input_ids=canvas, **fields).logits}
 
 
@@ -155,11 +140,11 @@ def dew_canvas(model, variables):
     return as_given(lambda *inputs: {"logits": canvas_of(*map(jnp.asarray, inputs))})
 
 
-def assert_canvas_logits(model, variables, network, draw, label: str) -> None:
+def assert_canvas_logits(model, variables, network, draw, label: str, seeds: int = CANVAS_SEEDS) -> None:
     """Dew's canvas logits (`dew_canvas`) as exact as transformers' float32 run of `network` against its
-    float64 run over the draws (check 1)."""
+    float64 run over `seeds` draws (check 1)."""
     reference, truth = transformers_arms(network, transformers_canvas)
-    assert_as_exact(dew_canvas(model, variables), reference, draw, label, seeds=CANVAS_SEEDS, truth_fn=truth)
+    assert_as_exact(dew_canvas(model, variables), reference, draw, label, seeds=seeds, truth_fn=truth)
 
 
 def test_diffusion_gemma_deferred_translation_materializes_the_same_model(system):
@@ -375,7 +360,8 @@ def test_a_sliding_denoiser_reads_its_whole_canvas_past_its_window():
     (`assert_canvas_logits`)."""
     directory, model, variables, network = released_fixture("diffusion-gemma-window-tiny", 6)
     assert_canvas_logits(model, variables, network, canvas_draw(
-        np.load(directory / "prompt.npy"), np.load(directory / "canvas.npy"), 64), "windowed canvas")
+        np.load(directory / "prompt.npy"), np.load(directory / "canvas.npy"), 64), "windowed canvas",
+        seeds=WINDOW_SEEDS)
 
 
 def test_media_prefill_and_canvas_generation_match_reference(system):
