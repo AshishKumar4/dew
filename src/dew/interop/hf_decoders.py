@@ -527,8 +527,8 @@ def _text_vlm_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrappe
 
 
 def _token(key: str, field: str, *aliases: str, default: int | None = None,
-           value: Callable[[MultimodalTransformer], object] | None = None
-           ) -> ConfigField[MultimodalTransformer]:
+           value: Callable[["MultimodalTransformer"], object] | None = None
+           ) -> "ConfigField[MultimodalTransformer]":
     """A placeholder id the wrapper states under `key` (or `aliases`), its config class's `default`
     where it has one (required where None), filling `field` of the wrapper's record, written from the
     model's (`value`, its own field where None)."""
@@ -537,7 +537,7 @@ def _token(key: str, field: str, *aliases: str, default: int | None = None,
     return ConfigField(key, field, default, parse=_records.integer, value=value, aliases=aliases)
 
 
-def _projected(field: str) -> Callable[[MultimodalTransformer], int]:
+def _projected(field: str) -> Callable[["MultimodalTransformer"], int]:
     """A wrapper's projector's `field`, which the wrapper states at its own scope."""
     return lambda model: getattr(model.projection, field)
 
