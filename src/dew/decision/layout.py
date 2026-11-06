@@ -704,8 +704,8 @@ class QuestionLayout(Layout):
     shared_state: int | None = dataclasses.field(default=None, metadata={_records.ADDED: True})
     """The most questions a row asks over one copy of their request's state (None: a row a question). Each
     reads what its own row writes before it, written once, and itself, at its own row's positions, so it
-    decides as its own row does (`_shared`); questions that outgrow a row take several, each repeating the
-    state, and one whose own row cuts the state is a row of its own."""
+    decides as its own row does (`dew.decision.shared_state`); questions that outgrow a row take several,
+    each repeating the state, and one whose own row cuts the state is a row of its own."""
     siblings: bool = dataclasses.field(default=False, metadata={_records.ADDED: True})
     """Whether a question of a row of several (`shared_state`) also reads the questions before it in its
     row, whole; off, each reads the shared part and itself alone."""
@@ -717,6 +717,12 @@ class QuestionLayout(Layout):
             if self.parallel or self.blocks or self.reads is not None or self.spans_in_context:
                 raise ValueError("a row of questions over one state sets what its tokens read, as parallel "
                                  "options, blocks, reads and a question in context do; a row takes one")
+            kinds = [type(segment) for segment in self.written]
+            asked = [at for at, kind in enumerate(kinds) if kind in (Instructions, OptionLines, AnswerCue)]
+            if max((at for at, kind in enumerate(kinds) if kind is State), default=-1) > min(asked) or (
+                    kinds.index(Instructions) != min(asked)):
+                raise ValueError("a row of questions over one state writes its state before its question, "
+                                 "and the question's instructions before its options and cue")
         elif self.siblings:
             raise ValueError("siblings are the questions a row over one state asks; give shared_state=")
         if self.head_max_len is not None:
@@ -823,28 +829,11 @@ class QuestionLayout(Layout):
                              tokens=tokens, conversation=_conversation(state),
                              request=questions if request is None else request)
                for name, question in questions.items()]
-        return own if self.shared_state is None else self._shared(own)
+        if self.shared_state is None:
+            return own
+        from dew.decision.shared_state import over_one_state
 
-    def _shared(self, own: Sequence[Encoded]) -> list[Encoded]:
-        """Each question's `own` row, in order, in the first row over one shared part that takes it
-        (`_takes`), or one of its own."""
-        rows: list[list[Encoded]] = []
-        for row in own:
-            taken = next((held for held in rows if self._takes(held, row)), None)
-            if taken is None:
-                rows.append([row])
-            else:
-                taken.append(row)
-        return [_over_state(held) for held in rows]
-
-    def _takes(self, held: Sequence[Encoded], row: Encoded) -> bool:
-        """Whether `held`'s row takes `row`'s question: both whole states written alike before their
-        questions, fewer than `shared_state` asked, and room for its part within `max_len`."""
-        shared = held[0].questions[0].span[0]
-        whole = all(each.state_kept == each.state_tokens for each in (held[0], row))
-        return (whole and len(held) < (self.shared_state or 1)
-                and held[0].tokens[:shared] == row.tokens[:row.questions[0].span[0]]
-                and shared + sum(len(each.tokens) - shared for each in (*held, row)) <= self.max_len)
+        return over_one_state(own, self.max_len, self.shared_state)
 
     def encode(self, encoder: Tokenizer, specials: Specials, question: Question,
                state: Sequence[int], *, conversation: bool = False,
@@ -2239,31 +2228,6 @@ def _compact(value: JSON) -> str:
 def _begin(specials: Specials) -> list[int]:
     return [] if specials.begin is None else [specials.begin]
 
-
-
-def _over_state(rows: Sequence[Encoded]) -> Encoded:
-    """`rows`, each one question's own, as one row: their shared part once (stream 0), then each one's own
-    part (streams 1...), each token at its own row's position; its cuts its questions', its state's once."""
-    shared = rows[0].questions[0].span[0]
-    tokens, positions, streams = list(rows[0].tokens[:shared]), list(range(shared)), [0] * shared
-    questions = []
-    for stream, row in enumerate(rows, start=1):
-        moved = len(tokens) - shared
-        [laid] = row.questions
-        questions.append(dataclasses.replace(
-            laid, span=(laid.span[0] + moved, laid.span[1] + moved),
-            options=tuple((start + moved, end + moved) for start, end in laid.options),
-            readout=None if laid.readout is None else laid.readout + moved))
-        tokens += row.tokens[shared:]
-        positions += range(shared, len(row.tokens))
-        streams += [stream] * (len(row.tokens) - shared)
-    first = rows[0]
-    return Encoded(tuple(tokens), tuple(questions), tuple(positions), None, first.state_tokens,
-                   first.state_kept,
-                   instructions_cut=sum(row.instructions_cut for row in rows),
-                   options_cut=sum(row.options_cut for row in rows), state_cut=first.state_cut,
-                   state_characters_cut=first.state_characters_cut,
-                   options_alike=any(row.options_alike for row in rows), streams=tuple(streams))
 
 
 def _parallel(spans: list[tuple[int, int]], length: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
