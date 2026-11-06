@@ -497,43 +497,56 @@ def spread_sums() -> optax.GradientTransformation:
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
 
 
+STAGE_LOCAL = {"adam": lambda: optax.adam(1e-3), "sgd-momentum": lambda: optax.sgd(1e-3, momentum=0.9),
+               "adamw-scheduled": lambda: optax.adamw(optax.cosine_decay_schedule(1e-3, 8), weight_decay=0.1),
+               "progress-scaled": lambda: optax.chain(scaled_by_progress(), optax.sgd(1e-3)),
+               "clipped-adamw": lambda: optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(1e-3))}
+"""Transformations whose update reads each stored layer of a stacked leaf by the same expression of that
+layer's entries as over the stored layers (`whole_reading`): each run stays stage-local."""
+WHOLE = {"lamb": lambda: optax.lamb(1e-3), "adafactor": lambda: optax.adafactor(1e-3),
+         # A decay masked by rank decides otherwise over a stacked leaf, whose bias is rank three.
+         "rank-masked": lambda: optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1,
+                                                                                     params)),
+         # An OptimConfig's transformation is built over the run's length, which fit gives.
+         "adafactor-config": lambda: OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3),
+         "doubled-gains": doubled_gains, "spread-sums": spread_sums}
+"""Transformations whose update reads a leaf whole, or whose build reads its tree's shapes: each keeps every
+layer whole on every stage."""
+
+
 @pytest.mark.mesh(devices=8)
-def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains():
+@pytest.mark.parametrize("name", [*STAGE_LOCAL, "uneven", *WHOLE])
+def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains(name):
     """Over two stages, a transformation given built whose update reads each stored layer of a stacked leaf
     by the same expression of that layer's entries as over the stored layers keeps each run stage-local
     (`whole_reading`): optax's Adam and SGD with momentum at a constant rate, AdamW's decay on a schedule,
     a scale by the run's progress, their moments, decay and scales a number at a time, and AdamW after a
-    clip by the global norm, its layers' sum (rows 3995, 4015, 4036). One whose update reads a leaf whole,
-    optax's LAMB, whose trust ratio would take one ratio over both stages, and Adafactor, whose factored
-    moments and block clip read the leaf, given built or named by its import path in an `OptimConfig`, one
-    whose build reads its tree's shapes (a decay masked by rank), one whose sums of squares differ by row
-    and are doubled 64 times (`doubled_gains`), and one through a primitive that takes an entrywise
-    operation's name and reads its operand whole (`spread_sums`), keep every layer whole on every stage,
-    and the run's plan names what kept them whole. No per-layer view of a transform whose reductions only
-    its own code knows is exact short of each layer a leaf of its own, so the run trains as
-    `Layout(stage_local=False)` trains it, and steps."""
-    model = decoder()
-    for local in (optax.adam(1e-3), optax.sgd(1e-3, momentum=0.9),
-                  optax.adamw(optax.cosine_decay_schedule(1e-3, 8), weight_decay=0.1),
-                  optax.chain(scaled_by_progress(), optax.sgd(1e-3)),
-                  optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(1e-3))):
-        assert saving(functools.partial(trainer, model, local, STAGED, 8, ema=None)) > 0
-        run = trainer(model, local, STAGED, 8, ema=None)
-        assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
+    clip by the global norm, its layers' sum (rows 3995, 4015, 4036), over two runs of unequal depth too.
+    One whose update reads a leaf whole, optax's LAMB, whose trust ratio would take one ratio over both
+    stages, and Adafactor, whose factored moments and block clip read the leaf, given built or named by its
+    import path in an `OptimConfig`, one whose build reads its tree's shapes (a decay masked by rank), one
+    whose sums of squares differ by row and are doubled 64 times (`doubled_gains`), and one through a
+    primitive that takes an entrywise operation's name and reads its operand whole (`spread_sums`), keep
+    every layer whole on every stage, and the run's plan names what kept them whole. No per-layer view of a
+    transform whose reductions only its own code knows is exact short of each layer a leaf of its own, so
+    the run trains as `Layout(stage_local=False)` trains it, and steps. Each transformation is its own case,
+    its own programs compiled (row 4343)."""
+    if name == "uneven":
+        # Two runs of unequal depth, four layers and two that share their keys and values, each output read
+        # against its own run's rows.
+        uneven = decoder(num_layers=6, kv_shared_layers=(4, 5))
+        assert saving(functools.partial(trainer, uneven, optax.adam(1e-3), STAGED, 8, ema=None)) > 0
+        return
+    model, local = decoder(), name in STAGE_LOCAL
+    given = (STAGE_LOCAL if local else WHOLE)[name]()
+    saved = saving(functools.partial(trainer, model, given, STAGED, 8, ema=None))
+    run = trainer(model, given, STAGED, 8, ema=None)
+    assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
+    if local:
+        assert saved > 0
         assert "layers_whole_for" not in run.plan
-    # Two runs of unequal depth, four layers and two that share their keys and values, each output read
-    # against its own run's rows.
-    uneven = decoder(num_layers=6, kv_shared_layers=(4, 5))
-    assert saving(functools.partial(trainer, uneven, optax.adam(1e-3), STAGED, 8, ema=None)) > 0
-    # A decay masked by rank decides otherwise over a stacked leaf, whose bias is rank three.
-    by_rank = optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1, params))
-    for given in (optax.lamb(1e-3), optax.adafactor(1e-3), by_rank,
-                  OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3), doubled_gains(),
-                  spread_sums()):
-        # An OptimConfig's transformation is built over the run's length, which fit gives.
-        assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0
-        run = trainer(model, given, STAGED, 8, ema=None)
-        assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
+    else:
+        assert saved == 0
         assert run.plan["layers_whole_for"]
 
 
