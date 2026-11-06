@@ -1715,8 +1715,9 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
                                     ("render", "InjectedValueError", 0), ("construct", "InjectedOSError", 1),
                                     ("next", "InjectedOSError", 1)):
             failed = report["results"][phase]
-            expected = (injected, True) if rank == at else ("RuntimeError", False)
-            assert (failed["error"], failed["own"]) in (expected, ("PeerFailure", False)), (phase, report)
+            # The injected failure itself on its own rank; the agreement's refusal, or a peer's, on the other.
+            allowed = {(injected, True)} if rank == at else {("RuntimeError", False), ("PeerFailure", False)}
+            assert (failed["error"], failed["own"]) in allowed, (phase, report)
             if phase != "construct":
                 assert phase in report["closed"]
         assert report["results"]["empty"] == {"scores": {}, "events": []}

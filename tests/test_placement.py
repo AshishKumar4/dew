@@ -40,11 +40,9 @@ def splits(name: str) -> list[tuple[str, ...]]:
 
 def assert_placed(name: str, tree, placement, mesh, table=None) -> None:
     """Each leaf of `tree`, as `placement` places it on `mesh`, holds the layout's invariants for the axes its
-    module declares (`declared`, read through `table` where the run's table names them), and a tree with a
-    leaf past the floor splits at least one."""
+    module declares (`declared`, read through `table` where the run's table names them)."""
     axes = declared(tree, table)
     leaves = jax.tree_util.tree_leaves_with_path(unboxed(tree))
-    sharded = 0
     for (path, leaf), sharding in zip(leaves, jax.tree.leaves(placement), strict=True):
         where = f"{name} {jax.tree_util.keystr(path)} {tuple(leaf.shape)}"
         assert isinstance(sharding, NamedSharding) and sharding.mesh == mesh, where
@@ -73,13 +71,29 @@ def assert_placed(name: str, tree, placement, mesh, table=None) -> None:
             else:
                 assert not used, (where, spec)
         else:
-            # A split over an axis other than fsdp's group is one its dimension's declared axis's rules
-            # name; fsdp's the rules' or the floor's fallback for a leaf they leave whole.
+            # Every split, fsdp's among them, is one its dimension's declared axis's rules name
+            # (`dew.mesh.logical_spec`: a declared leaf takes no shape fallback).
             for dim, entry in enumerate(per_dim):
                 ruled = {axis for split in splits(named[dim]) for axis in split} if named[dim] else set()
-                assert set(entry) - {FSDP_AXIS, SEQUENCE_AXIS} <= ruled, (where, named, spec)
-        sharded += bool(used)
-    assert sharded or not any(math.prod(leaf.shape) >= MIN_SHARD for _, leaf in leaves), name
+                assert set(entry) <= ruled, (where, named, spec)
+            # And a leaf one of whose dimensions its name's first rule splits, dividing it, is split.
+            wanted = [first_split(name, size, mesh) for name, size in zip(named, leaf.shape, strict=True)]
+            assert used or not any(wanted), (where, named, spec)
+
+
+def first_split(name: str | None, size: int, mesh) -> tuple[str, ...]:
+    """The live mesh axes the first rule of `name` that splits anything on `mesh` names, where they divide
+    `size`; empty for an undeclared dimension, a name whose first such rule keeps it whole, or one that does
+    not divide it (`dew.mesh.logical_spec` drops a rule whose axes are all of size one)."""
+    for rule, assignment in RULES if name is not None else ():
+        if rule != name:
+            continue
+        if assignment is None:
+            return ()
+        live = tuple(axis for axis in mesh_axes(assignment) if mesh.shape.get(axis, 1) > 1)
+        if live:
+            return live if size % math.prod(mesh.shape[axis] for axis in live) == 0 else ()
+    return ()
 
 
 def placed_case(name: str):

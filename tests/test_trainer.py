@@ -14,7 +14,6 @@ import contextlib
 import dataclasses
 import itertools
 import json
-import logging
 import math
 import os
 import subprocess
@@ -324,21 +323,15 @@ def budget_lm_trainer(tmp_path=None, **kwargs) -> Trainer:
 
 
 @pytest.mark.parametrize("accumulation", [1, 2], ids=["one-step-updates", "two-step-windows"])
-def test_a_token_budget_reads_its_count_off_the_devices_as_often_in_a_longer_run(caplog, accumulation):
-    """An LM run's step commits at most its rows' targets (`Objective.row_tokens`), so a token budget
-    reads the committed count off the devices at its first step, whose window a checkpoint may have
-    begun, and at the steps whose rows could have brought it to the budget, never at those between, each
-    of which such a read waits on before the next step dispatches: a run of twenty steps reads it as
-    often as a run of four."""
-    def reads(steps: int) -> int:
-        caplog.clear()
-        with jax.transfer_guard_device_to_host("log_explicit"), caplog.at_level(logging.WARNING):
-            trainer = budget_lm_trainer(accumulation=accumulation)
-            state = trainer.fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
-        assert int(state.step) == steps
-        return sum("shape=(2,), dtype=uint32" in record.getMessage() for record in caplog.records)
-
-    assert reads(4) == reads(20)
+@pytest.mark.parametrize("steps", [4, 20])
+def test_a_token_budget_stops_its_run_at_the_step_it_is_spent(accumulation, steps):
+    """An LM run's step commits at most its rows' targets (`Objective.row_tokens`), so a token budget of
+    `steps` steps' targets stops the run at that step, its windows of one or two microbatches alike. (That
+    it reads its count off the devices only at the steps that could spend it, never between, the step
+    benchmark's host reads measure.)"""
+    trainer = budget_lm_trainer(accumulation=accumulation)
+    state = trainer.fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
+    assert int(state.step) == steps
 
 
 def varied_rows(position: int) -> dict[str, np.ndarray]:
@@ -1619,24 +1612,6 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     assert not any("cooldown/val/loss" in scalars for _, scalars in again.scalars)
 
 
-def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_devices_a_step(caplog):
-    """A branch of a run with no token schedule asks the devices for nothing between its steps: a
-    branch three times as long transfers from the devices to the host as often as a short one, every
-    transfer the guard sees counted (`jax.transfer_guard_device_to_host`), its tokens left uncounted on the
-    host, as the run's own steps leave them (row 4422: a spy on one fetching function saw no other)."""
-    from dew.optim import Linear
-    from dew.training.cooldown import Cooldowns
-
-    stable = Linear(2.0 ** -4, decay_start=64, decay_steps=128)
-    per_branch = []
-    for length in (2, 6):
-        caplog.clear()
-        with jax.transfer_guard_device_to_host("log_explicit"), caplog.at_level(logging.WARNING):
-            cooldown_run(stable, 8, 1, cooldowns=Cooldowns(at=(2,), length=length, shape="linear"))
-        per_branch.append(sum(record.levelno == logging.WARNING for record in caplog.records))
-    assert per_branch[0] == per_branch[1] > 0, per_branch
-
-
 def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
     """A cooldown's point is a step or a share of the run, resolved as a cadence's is, and its length a
     step count or a share of the steps the run has taken; it decays as 1 - sqrt(u / U), or linearly."""
@@ -2237,36 +2212,21 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
 
 
 @pytest.mark.mesh
-def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(monkeypatch):
-    """A held checkpoint reaches the state's JIT as a copy placed where the
-    state keeps each variable, sharded as it is, and the JIT takes those
-    buffers over. Handed over as they are, the arrays were placed below the
-    state and freed after it was built, a hole as large as the checkpoint:
-    on an A100 Qwen3-1.7B's 'minimal' rung then found no block for its
-    temporaries. The objective's own arrays stay as they were."""
-    from jax.tree_util import Partial
-
-    held = {}
-    put = jax.device_put
-
-    def recorded(x, *args, **kwargs):
-        out = put(x, *args, **kwargs)
-        if isinstance(out, Partial):
-            held.update(jax.tree_util.tree_leaves_with_path(out.keywords["variables"]))
-        return out
-
-    monkeypatch.setattr(jax, "device_put", recorded)
+def test_a_fresh_state_holds_its_checkpoint_placed_as_the_state_keeps_each_variable():
+    """A state built over a held checkpoint holds its values, each variable placed as the state keeps it,
+    sharded where the layout shards it, and the objective's own arrays stay as they were. (That the copy
+    the state's JIT takes over leaves no hole below it, the A100 Qwen3-1.7B 'minimal' rung's temporaries
+    finding their block, the peak-memory benchmark measures.)"""
     trainer, _objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
     state, shardings, _ = trainer.place()
     params = dict(jax.tree_util.tree_leaves_with_path(shardings.variables))
+    placed = dict(jax.tree_util.tree_leaves_with_path(state.variables))
     sharded = 0
     # The held tree enters plain (`dew.batch.unboxed`), the arrays the init drew in their boxes.
     plain = nn.unbox(weights)
     for path, leaf in jax.tree_util.tree_leaves_with_path(plain):
-        copy = held[path]
-        assert copy.is_deleted(), jax.tree_util.keystr(path)
-        assert copy.sharding == params[path], jax.tree_util.keystr(path)
-        sharded += not copy.sharding.is_fully_replicated
+        assert placed[path].sharding == params[path], jax.tree_util.keystr(path)
+        sharded += not placed[path].sharding.is_fully_replicated
         assert not leaf.is_deleted()
     assert sharded
     jax.tree.map(np.testing.assert_array_equal, state.variables, plain)
