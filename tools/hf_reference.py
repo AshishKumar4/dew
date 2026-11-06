@@ -1344,27 +1344,12 @@ def save_diffusion_gemma(model, fields: dict, fixture: str) -> Path:
 
 def write_diffusion_denoiser_tiny() -> None:
     """One DiffusionGemma denoise step (`diffusion_gemma_tiny`): its weights
-    and text config, a fixed prompt, canvas and previous logits, and the fp32
-    reference logits with and without self-conditioning."""
+    and text config, and a prompt and canvas, whose shapes the test's drawn
+    ones take (tests/test_block_diffusion.py runs transformers on them)."""
     model = diffusion_gemma_tiny(DIFFUSION_DENOISER_TEXT, canvas_length=4)
     directory = save_diffusion_gemma(model, DIFFUSION_DENOISER_TEXT, "diffusion-gemma-denoise-tiny")
-    prompt = np.array([[2, 5, 7, 9]], np.int32)
-    canvas = np.array([[3, 4, 5, 6]], np.int32)
-    prev = np.random.RandomState(3).randn(1, 4, 64).astype(np.float32)
-    with torch.no_grad():
-        bare = model(input_ids=torch.from_numpy(prompt),
-                     decoder_input_ids=torch.from_numpy(canvas)
-                     ).logits.to(torch.float32).numpy()
-        conditioned = model(
-            input_ids=torch.from_numpy(prompt),
-            decoder_input_ids=torch.from_numpy(canvas),
-            self_conditioning_logits=torch.from_numpy(prev)
-            ).logits.to(torch.float32).numpy()
-    np.save(directory / "prompt.npy", prompt)
-    np.save(directory / "canvas.npy", canvas)
-    np.save(directory / "prev_logits.npy", prev)
-    np.save(directory / "ref_bare.npy", bare)
-    np.save(directory / "ref_conditioned.npy", conditioned)
+    np.save(directory / "prompt.npy", np.array([[2, 5, 7, 9]], np.int32))
+    np.save(directory / "canvas.npy", np.array([[3, 4, 5, 6]], np.int32))
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
@@ -1374,36 +1359,16 @@ def write_diffusion_window_tiny() -> None:
     a full layer at a window of 4, a prompt of 6 and a canvas of 6, so the
     decoder's sliding layer reads only the last 3 cached prompt keys while
     every canvas key reads every other (modeling_diffusion_gemma.py:1399-1401).
-    The fp32 and float64 reference logits, the latter for the float64 rule.
-    """
-    from torch_precision import float64, float64_twin
-
+    Its weights and text config, and a prompt and canvas, whose shapes the
+    test's drawn ones take (tests/test_block_diffusion.py runs transformers on
+    them)."""
     fields = {**DIFFUSION_DENOISER_TEXT, "sliding_window": 4,
               "layer_types": ["sliding_attention", "full_attention"]}
     torch.manual_seed(0)
     model = diffusion_gemma_tiny(fields, canvas_length=6)
-    # The experts' loop, since the grouped matmul has no float64 kernel.
-    for module in model.modules():
-        if hasattr(module, "experts") and hasattr(module.experts, "config"):
-            module.experts.config._experts_implementation = "eager"
     directory = save_diffusion_gemma(model, fields, "diffusion-gemma-window-tiny")
-    prompt = np.array([[2, 5, 7, 9, 11, 13]], np.int32)
-    canvas = np.array([[3, 4, 5, 6, 8, 10]], np.int32)
-
-    def logits(model):
-        with torch.no_grad():
-            return model(input_ids=torch.from_numpy(prompt).long(),
-                         decoder_input_ids=torch.from_numpy(canvas).long()).logits
-
-    np.save(directory / "prompt.npy", prompt)
-    np.save(directory / "canvas.npy", canvas)
-    np.save(directory / "logits.npy", logits(model).to(torch.float32).numpy())
-    with float64():
-        twin = float64_twin(model)
-        for module in twin.modules():
-            if hasattr(module, "experts") and hasattr(module.experts, "config"):
-                module.experts.config._experts_implementation = "eager"
-        np.save(directory / "logits_f64.npy", logits(twin).double().numpy())
+    np.save(directory / "prompt.npy", np.array([[2, 5, 7, 9, 11, 13]], np.int32))
+    np.save(directory / "canvas.npy", np.array([[3, 4, 5, 6, 8, 10]], np.int32))
 
 
 def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False,

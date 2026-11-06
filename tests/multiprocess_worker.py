@@ -1529,7 +1529,8 @@ def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -
             else:
                 rollout(state, broken, key)
         except (ValueError, RuntimeError) as error:
-            invalid_errors[fault] = str(error)
+            # The refusal's category, which the test reads, not its wording.
+            invalid_errors[fault] = type(error).__name__
         else:
             raise AssertionError("rank-local invalid input was accepted")
         reached = multihost_utils.process_allgather(np.asarray(rank, np.int32))
@@ -1552,7 +1553,7 @@ def _meshless_rollout(state, local, rollout, rank) -> dict:
     try:
         outcome["rows"] = len(rollout(state, broken, jax.random.key(29))["input_ids"])
     except (ValueError, RuntimeError) as error:
-        outcome["refused"] = str(error)
+        outcome["refused"] = type(error).__name__
     reached = multihost_utils.process_allgather(np.asarray(rank, np.int32))
     if reached.tolist() != [0, 1]:
         raise AssertionError("a rank did not return from its own rollout")

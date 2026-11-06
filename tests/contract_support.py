@@ -139,7 +139,8 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
         broken = []
         for index, (value, truth, plainly) in enumerate(zip(values, jax.tree.leaves(truths[name]), plains,
                                                             strict=True)):
-            if not np.issubdtype(value.dtype, np.inexact):
+            # JAX's dtype lattice, which holds bfloat16 (ml_dtypes' is no NumPy inexact type).
+            if not jnp.issubdtype(value.dtype, jnp.inexact):
                 continue
             kept = normal_float32(truth) & np.isfinite(truth)
             if plainly is not None:
