@@ -517,6 +517,50 @@ def test_a_products_operand_computed_from_a_held_value_frees_it():
     assert peak(from_logits) == peak(held_cotangent)
 
 
+def test_a_gemm_writes_in_its_bias_only_where_it_is_its_one_reader():
+    """A GEMM computing a sum writes in its bias only where it is the bias's one reader, whatever read the
+    bias before it (`FuseMatrixBiasAdd`'s `can_overwrite_bias`): a bias a reduction read first is held
+    beside the sum, one matrix more than where the GEMM reads it alone (review of row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    square = jax.ShapeDtypeStruct((512, 512), jnp.float32)
+
+    def alone(a, b, x, y):
+        return a @ b + x @ y
+
+    def read_before(a, b, x, y):
+        bias = x @ y
+        total = jnp.sum(bias)
+        return a @ b + bias, total
+
+    def peak(function):
+        return peak_bytes(simplified(jax.make_jaxpr(function)(square, square, square, square).jaxpr, "gpu"),
+                          "gpu", Workspace(0, 0))
+
+    matrix = 512 * 512 * 4
+    # The bias and the sum beside it, and the reduction's scalar the program returns.
+    assert (peak(alone), peak(read_before)) == (matrix, 2 * matrix + 4)
+
+
+def test_a_loops_slice_offset_computed_through_a_product_and_its_sum_is_evaluated():
+    """A loop's slice offset computed from its counter through a product and a sum, which the derivation
+    reads as one product with its bias (`biased`), is evaluated as the product plus its bias
+    (`compiled_program._evaluated`, as XLA's evaluator finds a slice's offset at each turn), where binding
+    the three operands to a product raised (review of row 4089)."""
+    from dew.training.footprint import peak_bytes, simplified
+
+    def program(x):
+        def turn(counter, total):
+            matrix = jnp.broadcast_to(counter.astype(jnp.float32), (16, 16))
+            offset = jnp.sum(matrix @ matrix + matrix).astype(jnp.int32)
+            return total + jnp.sum(jax.lax.dynamic_slice(x, (offset,), (64,)))
+        return jax.lax.fori_loop(jnp.int32(0), jnp.int32(4), turn, jnp.float32(0))
+
+    traced = jax.make_jaxpr(program)(jax.ShapeDtypeStruct((32768,), jnp.float32)).jaxpr
+    derived = peak_bytes(simplified(traced, "gpu"), "gpu", Workspace(0, 0))
+    assert derived >= 0
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
