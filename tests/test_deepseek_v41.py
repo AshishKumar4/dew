@@ -265,16 +265,12 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
 RELEASE = TINY / "release.npz"
 """The release as released (row 354): its inference/model.py at the pinned revision, nothing of it
 replaced, in bf16 over its own tilelang kernels and activation quantizers on an H100, its logits at every
-position (each prefix's prefill) and its cached step after each prompt that closes every ratio-2 group
-(`CLOSING`), and their float64 truth (the same code over the stand-ins kernels.npz holds to the kernels,
-widened), over drawn rows whose every selection the truth clears `selection_margins.MARGIN` by, summarized
-over check 1's seeds, beside the rows each seed drew (release_rows.npz; tools/deepseek_v41_reference.py
---release)."""
-CLOSING = (7, 9, 11, 13, 15)
-"""The prompts after which the release's cached step computes as the paper does (the tool's `CLOSING`): an
-odd prompt's step closes every ratio-2 group, so each Full layer publishes the index keys its Reindex
-layers read, where the release republishes them only then and Dew on every call (deepseek_v4.py's
-`_csa2`)."""
+position (each prefix's prefill, the paper's arithmetic: a cached step of the release that closes no
+ratio-2 group reads another layer's index keys, which Dew does not reproduce), from position zero and
+from a walk's prompt on, and their float64 truth (the same code over the stand-ins kernels.npz holds to
+the kernels, widened), over drawn rows whose every selection the truth clears `selection_margins.MARGIN`
+by, summarized over check 1's seeds, beside the rows each seed drew (release_rows.npz;
+tools/deepseek_v41_reference.py --release)."""
 
 
 @pytest.fixture(scope="module")
@@ -304,10 +300,9 @@ def recorded_rows(as_run):
     return rows
 
 
-def held_to_the_release(as_run, rows, site: str, picked=None):
+def held_to_the_release(as_run, rows, site: str, start: int = 0):
     """A recorded site's draw of `rows`, the release's evidence and truth over its declared seeds, Dew's
-    forward in float64 at the positions `picked` its truth, held to the release's (`recorded_site`), and
-    the count."""
+    forward in float64 past `start` its truth, held to the release's (`recorded_site`), and the count."""
     from model_support import float64_twin, recorded_site
 
     wide = jax.jit(float64_twin(as_run.model).apply)
@@ -317,8 +312,7 @@ def held_to_the_release(as_run, rows, site: str, picked=None):
             held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
                                 if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf,
                                 as_run.variables)
-            logits = wide(held, jnp.asarray(inputs["input_ids"]))
-            return {"logits": logits if picked is None else logits[:, picked]}
+            return {"logits": wide(held, jnp.asarray(inputs["input_ids"]))[:, start:]}
 
     return recorded_site(RELEASE, site, lambda seed: {"input_ids": rows[int(seed)]}, twin)
 
@@ -381,9 +375,9 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(as_run, recorded_row
     The walk is one compiled program, its steps scanned."""
     from dew.sampling.text import decode_ops, prefill_state
 
-    prompt = CLOSING[0]
-    draw, recorded, truth, seeds = held_to_the_release(as_run, recorded_rows,
-                                                       "deepseek v41 release walk", np.asarray(CLOSING))
+    prompt = int(np.load(TINY / "reference.npz")["decode_prompt"])
+    draw, recorded, truth, seeds = held_to_the_release(as_run, recorded_rows, "deepseek v41 release walk",
+                                                       prompt - 1)
 
     @jax.jit
     def walked(ids):
@@ -397,8 +391,7 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(as_run, recorded_row
             return state, state.logits
 
         _, steps = jax.lax.scan(step, state, ids[:, prompt:].T)
-        # Each step's logits at its own position, those of CLOSING the release's.
-        return jnp.moveaxis(steps, 0, 1)[:, np.asarray(CLOSING) - prompt]
+        return jnp.concatenate([state.logits[:, None], jnp.moveaxis(steps, 0, 1)], axis=1)
 
     assert_as_exact(as_given(lambda index, inputs: {"logits": walked(jnp.asarray(inputs["input_ids"]))}),
                     recorded, draw, "a shifted cached walk", seeds=seeds, truth_fn=truth)

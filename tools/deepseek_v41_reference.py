@@ -1043,13 +1043,6 @@ def write_recording(seed: int):
     print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
 
 
-CLOSING = tuple(range(PROMPT, LENGTH, 2))
-"""The prompt lengths after which the release's cached step computes as the paper does: odd, so the step at
-that position closes every ratio-2 group and each Full layer publishes the index keys its Reindex layers read
-(model.py:537-548). A step that closes none reads the keys the last layer to publish left, which Dew does
-not reproduce (src/dew/nn/deepseek_v4.py's `_csa2`), and every later step reads that step's window keys."""
-
-
 def release_model(name: str, kernels):
     """The pinned model.py as released, nothing of it replaced, loaded under `name` over `kernels` as its
     `kernel` module: the release's own tilelang kernels on a GPU (`official_kernels`), or the stand-ins
@@ -1082,7 +1075,11 @@ def release_net(model_module, engram_module, stored: dict, dtype: torch.dtype | 
 
 def release_rows(net, ids: torch.Tensor) -> np.ndarray:
     """The release's logits over `ids` `[2, LENGTH]` at every position as its own entry point computes them:
-    each prefix's prefill (`Transformer.forward` from position zero), its last position's logits."""
+    each prefix's prefill (`Transformer.forward` from position zero), its last position's logits. A cached
+    step is not taken: one that closes no ratio-2 group reads the index keys the last layer to publish left
+    (model.py:537-548), which Dew does not reproduce (src/dew/nn/deepseek_v4.py's `_csa2`), and every
+    later step reads that step's window keys; a prefill closes its groups, so each position's logits are
+    the paper's, which a cached walk's are too."""
     found = []
     with torch.no_grad():
         for length in range(1, LENGTH + 1):
@@ -1091,20 +1088,8 @@ def release_rows(net, ids: torch.Tensor) -> np.ndarray:
     return torch.stack(found, 1).double().cpu().numpy()
 
 
-def release_walk(net, ids: torch.Tensor) -> np.ndarray:
-    """The release's cached step after each prompt of CLOSING: that prompt's prefill, then one cached
-    `Transformer.forward` at its next position, its logits."""
-    found = []
-    with torch.no_grad():
-        for prompt in CLOSING:
-            reset(net)
-            forward(net, ids[:, :prompt])
-            found.append(forward(net, ids[:, prompt:prompt + 1], prompt)[1])
-    return torch.stack(found, 1).double().cpu().numpy()
-
-
 def write_release_recording():
-    """release.npz beside the fixture, on a CUDA GPU: the release's logits (`release_rows`, `release_walk`)
+    """release.npz beside the fixture, on a CUDA GPU: the release's logits at every position (`release_rows`)
     as released, bf16 over its own tilelang kernels and its activation quantizers, and their float64 truth
     (the same code over the stand-ins, widened), over drawn rows whose every selection the truth's forward
     clears by the gate's MARGIN (`clearing_rows`, on the twin), summarized over check 1's seeds
@@ -1132,17 +1117,23 @@ def write_release_recording():
                 rows[index] = clearing_rows(twin, TINY["vocab_size"], index)
         return {"input_ids": rows[index]}
 
-    def evaluated(outputs):
+    @functools.cache
+    def logits(row: bytes) -> tuple[np.ndarray, np.ndarray]:
+        ids = torch.from_numpy(np.frombuffer(row, np.int32).reshape(2, LENGTH).astype(np.int64)).cuda()
+        found = release_rows(net, ids)
+        with widened(twin_module):
+            return found, release_rows(twin, ids)
+
+    def evaluated(start: int):
+        """Each row's logits from position `start` on, the release's and their truth."""
         def evaluate(inputs):
-            ids = torch.from_numpy(inputs["input_ids"].astype(np.int64)).cuda()
-            found = outputs(net, ids)
-            with widened(twin_module):
-                truth = outputs(twin, ids)
-            return {"logits": found}, {"logits": truth}
+            found, truth = logits(inputs["input_ids"].tobytes())
+            return {"logits": found[:, start:]}, {"logits": truth[:, start:]}
         return evaluate
 
-    arrays = {**record_case("deepseek v41 release rows", draw, evaluated(release_rows), summary=True),
-              **record_case("deepseek v41 release walk", draw, evaluated(release_walk), summary=True)}
+    # Every position's, and those a cached walk computes after its prompt's prefill.
+    arrays = {**record_case("deepseek v41 release rows", draw, evaluated(0), summary=True),
+              **record_case("deepseek v41 release walk", draw, evaluated(PROMPT - 1), summary=True)}
     import tilelang
 
     written = save(FIXTURE / "release.npz", {**arrays, "provenance": provenance(
