@@ -57,7 +57,15 @@ from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
-from .precision import at_least_fp32, capped_logits, exact_products, float32_einsum
+from .precision import (
+    asks_default_precision,
+    at_least_fp32,
+    at_precision,
+    capped_logits,
+    configurable_precision,
+    exact_products,
+    float32_einsum,
+)
 from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
@@ -840,14 +848,22 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     if implementation not in ('decode', 'template'):
         mask = with_key_starts(mask, starts, key.shape[-3])
         starts = None
-    return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
-                            implementation, softcap=softcap, sinks=sinks,
-                            segment_ids=segment_ids, max_segments=max_segments,
-                            key_value_seq_lengths=lengths, key_value_seq_starts=starts,
-                            block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
-                            key_runs=key_runs,
-                            places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-                            dropout_places=dropout_places)
+
+    def fused(query, key, value, bias, sinks):
+        return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
+                                implementation, softcap=softcap, sinks=sinks,
+                                segment_ids=segment_ids, max_segments=max_segments,
+                                key_value_seq_lengths=lengths, key_value_seq_starts=starts,
+                                block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
+                                key_runs=key_runs,
+                                places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
+                                dropout_places=dropout_places)
+    # A kernel whose products take no precision of their own (jax.nn's xla attention, Pallas dots: the
+    # template's portable mainloop, splash and its flash fallback) multiplies at the call's stated
+    # precision, forward and backward (`at_precision`); a stated default is a floor the run's configured
+    # precision meets, and a kernel that states its own keeps it.
+    held = fused if asks_default_precision(precision) else at_precision(precision)(fused)
+    return held(query, key, value, bias, sinks)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits: bool = False) -> bool:
@@ -858,11 +874,13 @@ def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits:
     or the run's configured one, that whole products of the query's dtype
     with fp32 sums do not compute (`exact_products`: a dot algorithm that
     narrows the operands or widens them; any level, a 16-bit operand's
-    exact products at 'highest' among them), a
+    exact products at 'highest' among them) or that no config names (a
+    pair, a dot algorithm: `configurable_precision`), which a fused kernel
+    whose products take none of their own runs at (`at_precision`), a
     softmax outside fp32, a compute dtype other than the inputs', and logits
     formed from queries and keys widened to at least fp32 (`wide_logits`).
     """
-    return (not exact_products(precision, query.dtype)
+    return (not exact_products(precision, query.dtype) or not configurable_precision(precision)
             or not force_fp32_for_softmax
             or (dtype is not None and jnp.dtype(dtype) != query.dtype)
             or wide_logits)

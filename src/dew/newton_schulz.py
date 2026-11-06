@@ -170,8 +170,9 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
     platform that has not the algorithm refuses in JAX's own words, and a complex update, whose products no
     real algorithm holds, refuses by name); else the run's numerics' (`dew.nn.kernels.generation.numerics`),
     each product at its precision (`Numerics.matmul`), as `dew.nn.precision.iteration_dtype` declares it:
-    its compute dtype in its fast forms, bfloat16 under bf16-mixed, as Jordan's Muon (modded-nanogpt) and
-    Moonlight (arXiv 2502.16982) iterate; at least float32 of it in its accurate ones, TF32 products on a GPU
+    in its fast forms bfloat16 for a 16-bit compute dtype (16-mixed's float16 among them), as Jordan's Muon
+    (modded-nanogpt) and Moonlight (arXiv 2502.16982) iterate, and the compute dtype otherwise; at least
+    float32 of it in its accurate ones, TF32 products on a GPU
     at the default precision and IEEE float32 under the accurate preset (`precision="accurate"`);
     complex64 for a complex update; and at least float32 of the iteration's dtype for a spectral
     preconditioning, whose norm is an SVD of at least float32 operands (a float64 run's in float64).
