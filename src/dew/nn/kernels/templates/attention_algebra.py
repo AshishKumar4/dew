@@ -31,6 +31,7 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src.state.discharge import run_state_reference
 
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand, derived_on
@@ -574,9 +575,14 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
         else:
             return outputs
         if in_place:
-            held = jax.tree.map(jax.new_ref, outputs)
-            launch(form, live, into=held)
-            return jax.tree.map(jax.freeze, held)
+            # The refs one stateful scope's, discharged into array operations as it is traced
+            # (`run_state_reference`): a custom derivative around the call (a paged decode's linear tangent,
+            # kv_cache) holds no ref, which no rule discharges through it, and a vmap over it batches its
+            # launches, where `pl.run_state`'s primitive has no batching rule.
+            def rewalk(held) -> None:
+                launch(form, live, into=held)
+
+            return run_state_reference(rewalk)(outputs)
         return kept(live, launch(form, live)[0], outputs)
 
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
