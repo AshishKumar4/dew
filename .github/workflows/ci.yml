@@ -251,8 +251,10 @@ jobs:
         || 'armada' }}
       cancel-in-progress: false
       queue: max
-    timeout-minutes: ${{ (startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels'
-      || needs.scope.outputs.policy == 'off') && 110 || 60 }}
+    # Main's daily whole run, below every lane's, waits for capacity within its 6000 s deadlines: 130 minutes.
+    timeout-minutes: ${{ ((github.event_name == 'schedule' || inputs.whole) && 130)
+      || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels'
+      || needs.scope.outputs.policy == 'off') && 110) || 60 }}
     steps:
     - uses: actions/checkout@v4
       with:
