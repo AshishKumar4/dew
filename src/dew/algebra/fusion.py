@@ -21,6 +21,7 @@ from typing import NamedTuple
 import jax
 from jax.extend import core as jcore
 
+from dew.nn.kernels import generation
 from dew.nn.nested import nested
 from dew.nn.programs import ENTRYWISE, jax_name
 
@@ -51,17 +52,36 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     return _spliced(jaxpr, taken, fused_gemm) if taken else jaxpr
 
 
-def _product(equation: jcore.JaxprEqn) -> bool | None:
-    """Whether `equation` is a product the template's epilogue follows: a `dot_general` of a rows-by-depth
-    left operand and a depth-by-columns right one (False) or a columns-by-depth one (True, its transpose),
-    no batch axes; None for any other equation."""
-    if jax_name(equation.primitive) != "dot_general":
+class Product(NamedTuple):
+    """A product the template's epilogue follows (`_product`): its dot's equation, whether its right operand
+    is laid columns by depth (its transpose), and the dtype its result is rounded to."""
+
+    dot: jcore.JaxprEqn
+    transposed: bool
+    out_dtype: object
+
+
+def _product(equation: jcore.JaxprEqn) -> Product | None:
+    """`equation` as a product the template's epilogue follows: a `dot_general` of a rows-by-depth left
+    operand and a depth-by-columns right one (or columns by depth, its transpose), no batch axes, or a call
+    of one (`jnp.matmul`'s jit), its result cast once after it; None for any other equation."""
+    dot, out_dtype = equation, equation.outvars[0].aval.dtype if equation.outvars else None
+    if jax_name(equation.primitive) in ("pjit", "jit", "closed_call"):
+        body = equation.params.get("jaxpr") or equation.params.get("call_jaxpr")
+        inner = getattr(body, "jaxpr", body)
+        names = [jax_name(eqn.primitive) for eqn in inner.eqns]
+        if names not in (["dot_general"], ["dot_general", "convert_element_type"]):
+            return None
+        dot = inner.eqns[0]
+    if jax_name(dot.primitive) != "dot_general" or len(equation.invars) != 2:
         return None
-    (left, right), batch = equation.params["dimension_numbers"]
+    (left, right), batch = dot.params["dimension_numbers"]
     shapes = [tuple(var.aval.shape) for var in equation.invars]
-    if batch != ((), ()) or any(len(shape) != 2 for shape in shapes) or tuple(left) != (1,):
+    transposed = {(0,): False, (1,): True}.get(tuple(right))
+    if batch != ((), ()) or tuple(left) != (1,) or transposed is None or any(len(shape) != 2
+                                                                             for shape in shapes):
         return None
-    return {(0,): False, (1,): True}.get(tuple(right))
+    return Product(dot, transposed, out_dtype)
 
 
 def _regions(jaxpr: jcore.Jaxpr) -> list[Region]:
@@ -113,12 +133,12 @@ def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
         for place in region.places:
             equation = jaxpr.eqns[place]
             operands = [read(atom) for atom in equation.invars]
-            transposed = _product(equation)
-            if transposed is not None:
-                results = [fused_gemm.product(*operands, transpose_rhs=transposed,
-                                              precision=equation.params["precision"],
-                                              out_dtype=equation.outvars[0].aval.dtype,
-                                              interpret_on_cpu=True)]
+            product = _product(equation)
+            if product is not None:
+                results = [fused_gemm.product(*operands, transpose_rhs=product.transposed,
+                                              precision=product.dot.params["precision"],
+                                              out_dtype=product.out_dtype,
+                                              interpret_on_cpu=generation.assumption() is not None)]
             else:
                 made = equation.primitive.bind(*operands, **equation.params)
                 results = list(made) if equation.primitive.multiple_results else [made]
