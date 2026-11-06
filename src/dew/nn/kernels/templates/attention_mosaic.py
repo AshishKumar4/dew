@@ -630,6 +630,15 @@ def _anchor_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
     return -(-entries // 32) + pending + places
 
 
+def _mask_places(family: mosaic.Family, block_q: int, block_k: int) -> list:
+    """The int32 tiles a step's masks hold where its key tile's indices do not fold (`Family.folds_indices`):
+    the queries' and the keys' places and their difference, each entry's formed apart (an A100's 64 x 96 at
+    width 64 under a score hook: ptxas 255 registers and 16 to 56 bytes spilled where the two places priced
+    240; at 64 x 192 the mask's two subtractions and compares an entry, `folds_indices`); none where they
+    fold."""
+    return [] if family.folds_indices(block_k) else [(block_q, block_k, jnp.int32)] * 3
+
+
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = (), width: int | None = None,
                        deferred: bool = False, parts: int = 1) -> int:
@@ -650,12 +659,11 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     64 x 64 on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and
     196). Where its family reads operands from registers, its products' fragments beside their tiles
     (`_products`): the logits' product of `width`-deep queries and keys, and the values' product of the
-    weights. A key tile whose indices do not fold (`Family.folds_indices`) holds the places its masks
-    compare, the queries' and the keys', an int32 tile each. A walk that issues a tile's P·V a step late
-    (`deferred`, `values_deferred`) carries the tile's weights across the next step, its logits read while
-    that product runs. An fp32 call's `parts` (`MosaicForward.parts`) issue its logits' products' terms
-    into one accumulator and form its weights' parts one at a time, its remainder fp32 and the part
-    beside the weights (`attention_mosaic_forward._parted_products`)."""
+    weights. A key tile whose indices do not fold holds its masks' places (`_mask_places`). A walk that issues
+    a tile's P·V a step late (`deferred`, `values_deferred`) carries the tile's weights across the next step,
+    its logits read while that product runs. An fp32 call's `parts` (`MosaicForward.parts`) issue its logits'
+    products' terms into one accumulator and form its weights' parts one at a time, its remainder fp32 and the
+    part beside the weights (`attention_mosaic_forward._parted_products`)."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
@@ -666,9 +674,7 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         step += [weights]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
-    if not family.folds_indices(block_k):
-        # Its masks' query and key places, each entry's formed apart.
-        step += [bits, bits]
+    step += _mask_places(family, block_q, block_k)
     phases = [step]
     if natural:
         phases.append([logits] * 2 + [bits])
@@ -694,8 +700,8 @@ def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tupl
     238 where ptxas's least spill-free cap was 112)."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
-    logits, bits = (block_q, block_k, jnp.float32), (block_q, block_k, jnp.int32)
-    step = [logits, *([] if family.folds_indices(block_k) else [bits, bits])]
+    logits = (block_q, block_k, jnp.float32)
+    step = [logits, *_mask_places(family, block_q, block_k)]
     products = _products(family, dtype, (block_q, width, block_k, [logits], False, True), narrow=tiles.narrow,
                          lhs_swizzle=query_swizzle(family))
     carried = [(block_q, 1, jnp.float32)]
