@@ -200,6 +200,28 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
                     seeds=SEEDS[hooks, packed])
 
 
+def edge_draw(hooks, seed: int):
+    """`draw`'s operands over a chunk's 64 tokens entering a memory of about 2^96, the largest `chunk` reads
+    at its size through any decay, which each row's first token decays by exp2(-124.8), a normal fp32 whose
+    prefix leaves fp32's normals at the next token: every later token reads the memory near its values."""
+    (operands,) = draw(hooks, packed=False, seed=seed, length=64)
+    g = operands.log_decay.at[:, 0].set(-124.8 * np.log(2.0))
+    memory = jax.random.normal(jax.random.key(seed + 7), operands.state.shape) * 2.0 ** 96
+    return (dataclasses.replace(operands, log_decay=g, state=memory),)
+
+
+@pytest.mark.parametrize('hooks', [hooks for hooks in HOOKS if hooks.decay == 'scalar'], ids=str)
+def test_a_memory_read_through_a_decay_past_fp32s_normals_is_as_exact_as_the_recurrence(hooks):
+    """The portable math's output and final memory where a memory at `chunk`'s bound is read through a
+    chunk's decay prefix past fp32's normals (`edge_draw`), on par with the recurrence a token at a time from
+    float64, which decays the memory in place: a decay under 2^-126 reads it as zero, a term under fp32's
+    resolution of the output within the bound (row 2344)."""
+    dew = jax.jit(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK))
+    reference = jax.jit(functools.partial(token_by_token, hooks))
+    assert_as_exact(dew, reference, functools.partial(edge_draw, hooks), f'{hooks} past the normals',
+                    seeds=FEWEST_SEEDS)
+
+
 DERIVED = [hooks for hooks in HOOKS + FORMED if hooks.delta or not hooks.rated]
 """The hooks the delta rule's op runs (`GATED_DELTA`), which the derived forms take: every one but a rated
 scan without the delta rule (Mamba2's SSD, the scan's own op)."""
