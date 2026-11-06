@@ -10,6 +10,7 @@ programs, one a core. A program is one role: no producer runs beside it, and not
 
 import dataclasses
 from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -347,10 +348,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         # indexes it alike), its copies' DMA semaphores its `load_barriers`.
         return pltpu.VMEM(shape, dtype)
 
-    def meeting(self, consumers: int):
-        # One role: nothing to meet at (`meet` refuses), a program of two refused here first.
+    def meeting(self, consumers: int) -> Any:
+        # One role, which meets no other (`meet` refuses): a semaphore its scope allocates and never waits on.
         _one(consumers)
-        raise NotImplementedError("a TPU program is one role: it meets no other")
+        return pltpu.SemaphoreType.REGULAR
 
     def meet(self, halves) -> None:
         raise NotImplementedError("a TPU program is one role: it meets no other")
