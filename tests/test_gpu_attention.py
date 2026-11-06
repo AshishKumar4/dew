@@ -30,6 +30,7 @@ import functools
 import attention_inplace_operands as inplace
 import attention_matrix as matrix
 import attention_triton_stages as triton_stages
+import decode_matrix
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -219,6 +220,12 @@ def test_the_attention_matrix_holds_on_this_gpu():
     reference path at every pair of axis values the route serves, each cell on its own GPU, without XLA's
     deterministic ops (a deterministic run never derives the one launch its cells pin)."""
     run_cells(cells_of(matrix.a_routes_training_step_is_on_par))
+
+
+def test_the_decode_matrix_holds_on_this_gpu():
+    """Decode's check-1 matrix (tests/kernel_matrix.py): a serving step's decode, dense and paged, on par with
+    the reference path at every pair of axis values its selectors serve, each cell on its own GPU."""
+    run_cells(cells_of(decode_matrix.a_decode_step_is_on_par))
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
