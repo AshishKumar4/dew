@@ -253,13 +253,14 @@ def test_an_fp16_backward_keeps_a_gradient_whose_scores_are_large_but_cancel(key
                           (0.0, 0.25, 2.0 ** 30)],
                          ids=["small weight", "small scale", "large key", "large scaled key"])
 def test_an_extreme_fp32_backward_is_as_exact_as_the_reference(peak0, scale, key_size):
-    """fp32 at the range's edges, one query over one key resumed from a state holding a denominator of
-    2**25, under an output cotangent of 2**100: a weight exp(-87) / 2**25 below fp32's least subnormal,
-    a scale of 2**-126 over that denominator, or a key of 2**30 beside the cotangent. Both mainloops
-    form each score cotangent as the reference does, its weight over the denominator first, so every
-    intermediate stays within the reference's, and dQ is finite and on par with fp32's reference over the
-    case's draws (check 1, `_scaled_draw`): a weight the reference loses below fp32 they lose alike, and no
-    product overflows that the reference keeps."""
+    """fp32 at the range's edges, one query over one key resumed from a state holding a denominator of 2**25,
+    under an output cotangent of 2**100: a weight exp(-87) / 2**25 below fp32's least subnormal, a scale of
+    2**-126 over that denominator, or a key of 2**30 beside the cotangent. Both mainloops form each score
+    cotangent as the reference does, its cotangent term before the denominator (the weight exp(-87) / 2**25
+    alone would round to 0 where e times the cotangent over 2**25 is 1.9e-15), so every intermediate stays
+    within the reference's, and dQ is finite and on par with fp32's reference over the case's draws (check 1,
+    `_scaled_draw`): a weight the reference loses below fp32 they lose alike, and no product overflows that
+    the reference keeps."""
     spans = template.spans(1, 1, 1)
     query = jnp.zeros((1, 1, 1, 1), jnp.float32)
     key = jnp.full((1, 1, 1, 1), key_size, jnp.float32)

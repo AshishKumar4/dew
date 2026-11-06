@@ -765,8 +765,7 @@ otherwise the first of its kernels that takes the call, by what each takes (no t
 recurrence template at its derived tiles, else the port on any GPU Dew's Triton kernels run on, else the
 portable math (`chunk_delta_rule`). The portable math's forms derived from the token update
 (`derived_rule`) run where a call names them (`generation.chosen(gated_delta_rule='derived')`), until they
-match the hand forms in check 1 at the edges, in every derivative order and in time (the shared switch,
-`dew.algebra.forms.derived`, no longer reads here)."""
+match the hand forms in check 1 at the edges, in every derivative order and in time."""
 
 
 RESET = "first"

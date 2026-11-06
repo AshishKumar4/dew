@@ -13,7 +13,7 @@ import pytest
 from contract_support import EDGES, FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw
 from ssd_support import stepwise_scan
 
-from dew.algebra import SATURATION, forms as algebra_forms, scan
+from dew.algebra import SATURATION, scan
 from dew.nn.kernels import generation, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.mixers.mamba2 import chunk_ssd
 
@@ -317,12 +317,10 @@ def test_the_selective_scan_holds_its_orders(edge, taken):
                     without=outside(taken) + INTERPRETED_REMAT)
 
 
-@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_chunked_op_holds_every_order(edge, derived):
+def test_the_chunked_op_holds_every_order(edge):
     """The chunked op (`recurrence_chunk.chunk`: its kernel a product, `_per_product`, differentiated
-    through the portable math, its forms the hand-written ones or those derived from the token update behind
-    the switch, `dew.algebra.forms.derived`, and the skip `D v`, `recurrence.skipped`, each through
+    through the portable math, and the skip `D v`, `recurrence.skipped`, each through
     `generation.linear_tangent`), the gated delta rule with a decay a head, its queries scaled, and the skip,
     from a zero memory: every order of its output finite wherever float64 is a normal float32 and the rule a
     token at a time with its skip is (`plain_delta_rule`, in float64 the truth), at queries, keys and values
@@ -337,8 +335,7 @@ def test_the_chunked_op_holds_every_order(edge, derived):
 
     def chunked(query, key, value, g, beta, skip):
         operands = recurrence_chunk.Chunk(query, key, value, log_decay=g, beta=beta, skip=skip)
-        with algebra_forms.derived(derived):
-            return recurrence_chunk.chunk(hooks, operands, chunk_size=4)[0]
+        return recurrence_chunk.chunk(hooks, operands, chunk_size=4)[0]
 
     def recurrent(query, key, value, g, beta, skip):
         out, _ = plain_delta_rule(query, key, value, g, beta, jnp.zeros((1, 2, 8, 8), query.dtype),

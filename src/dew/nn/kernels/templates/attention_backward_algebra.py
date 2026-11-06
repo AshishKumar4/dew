@@ -1,5 +1,5 @@
 """The attention backward's declared algebra (theme A's declarations, docs/design/algebra.md §6.9) and its
-derived forms behind the switch (`dew.algebra.forms.derived`): a backward tile's softmax cotangents
+derived forms, which its mainloops compute by: a backward tile's softmax cotangents
 (`softmax_cotangents`, `derived_cotangents`), each mainloop's backward launch's, and the whole backward's
 gradients walked over key or query tiles (`softmax_gradients`, `backward_declaration`, `derived_backward`).
 The template's own forms are `attention_algebra`'s."""
@@ -34,7 +34,9 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     e = gradient.below(logits, per_query(peak if accurate else gradient.safe_peak(peak)), how,
                        safe=not accurate)
     over = per_query(1.0 / jnp.where(total == 0, 1.0, total))
-    dropped = products if keep is None else products * keep
+    # The dropped products rounded once before any centre reads them (`gradient.dropped_products`), as the
+    # mainloop's dropout centre takes them: where kept products agree its D is exactly their product.
+    dropped = gradient.dropped_products(products, keep)
     about = dropped - per_query(anchor)
     if at_anchor is not None:
         about = jnp.where(at_anchor, 0.0, about)
@@ -52,8 +54,8 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
 @functools.cache
 def derived_cotangents(keys_first: bool, dropped: bool, masked: bool, how: algebra.Recompute = algebra.PLAIN,
                        accurate: bool = False, anchored: bool = False) -> derive.Derived:
-    """The backward tile's derived softmax algebra (`softmax_cotangents`' forms, the fast class), the
-    template's behind the switch (`dew.algebra.forms.derived`): each mainloop's backward launch forms its
+    """The backward tile's derived softmax algebra (`softmax_cotangents`' forms, the fast class): each
+    mainloop's backward launch forms its
     tile's products and logits and takes its weights and score cotangents from these forms, its mask an
     operand where the tile has one (`masked`), in the recomputation's units (`how`) and the `accurate`
     form's, its anchor keys' mask an operand there and where a fast form's mainloop holds the anchor's own
@@ -96,21 +98,13 @@ def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, sl
 def derived_backward(scale: float, walked: str, hooked: bool = False, dropped: bool = False,
                      how: algebra.Recompute = algebra.PLAIN, accurate: bool = False,
                      anchored: bool = False) -> derive.Derived:
-    """The backward's derived forms (`backward_declaration`'s, of the fast class or `accurate`'s), the
-    template's behind the switch (`dew.algebra.forms.derived`): walked over the keys for dQ, over the queries
+    """The backward's derived forms (`backward_declaration`'s, of the fast class or `accurate`'s), walked over
+    the keys for dQ, over the queries
     for dK and dV, each walked sum's product the mainloop's to issue where it takes the step
     (`Derived.step`'s `stepped`, `Accumulated`: the accurate form's keyed sums and split products)."""
     return derive.derive(backward_declaration(scale=scale, walked=walked, hooked=hooked, dropped=dropped,
                                               how=how, accurate=accurate, anchored=anchored),
                          accurate=accurate, saturation=SATURATION)
-
-
-def backward_derived() -> bool:
-    """Whether the backward's derived forms walk a call (behind the switch, `dew.algebra.forms.derived`), in
-    every form: its recomputation's units (`how`) and its accurate form's anchor test are declared
-    (`softmax_cotangents`), and the accurate form's keyed sums and its cotangents' parts' products are each
-    mainloop's own, through the derived step's `stepped` (`attention_portable._accurate_sums`)."""
-    return algebra.derived_on()
 
 
 def backward_declaration(*, scale: float, walked: str, hooked: bool = False, dropped: bool = False,
