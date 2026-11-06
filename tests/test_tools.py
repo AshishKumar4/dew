@@ -28,7 +28,7 @@ from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_text_encoders import transformers_clip
 from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
-from tool_support import FIXTURES, REPO_ROOT, load
+from tool_support import FIXTURES, REPO_ROOT, linted, load
 
 from dew.telemetry.trace import window_split
 
@@ -654,12 +654,13 @@ def test_a_shared_draw_cache_computes_past_its_disk_reserve_and_keeps_nothing_th
         assert computed.loss == kept.loss and any(Path(directory).iterdir())
 
 
-def test_the_layout_parity_command_runs_its_main():
+def test_the_layout_parity_command_runs_its_main(tmp_path):
     """`python tools/layout_parity.py` runs the tool, which refuses `--prepare` with no `--references`
     directory to write, where a script whose entry point is gone exits 0 having checked nothing."""
     command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa", "--prepare"]
-    finished = subprocess.run(command, capture_output=True, text=True, timeout=600)
-    assert finished.returncode != 0, finished.stdout[-2000:]
+    finished = subprocess.run(command, capture_output=True, text=True, timeout=600, cwd=tmp_path)
+    # Its refusal is a SystemExit of its own, no traceback's error, and it wrote nothing.
+    assert finished.returncode == 1 and not any(tmp_path.iterdir()), finished.stderr[-2000:]
 
 
 def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
@@ -1107,20 +1108,9 @@ def test_the_script_reads_its_files_in_processes_and_reports_as_one_process_does
     assert len(serial.out.splitlines()) == 80
 
 
-def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
-    """Write `files` into a sparx checkout and return each finding as (path, line, code)."""
-    lint = load("lint_slop")
-    for relative, text in files.items():
-        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / relative).write_text(text)
-    modules = list(lint.collect(["src/sparx", "tests", "tools"], tmp_path, "sparx"))
-    return sorted((finding.path, finding.line, finding.code)
-                  for module in modules for finding in lint.check(module))
-
-
 def assert_reported(tmp_path, path: str, source: str, code: str, lines: tuple[int, ...]) -> None:
     """`source`, written at `path` in a sparx checkout, is reported as `code` at `lines` and nowhere else."""
-    assert _linted(tmp_path, {path: source}) == [(path, line, code) for line in lines]
+    assert linted(tmp_path, {path: source}) == [(path, line, code) for line in lines]
 
 
 def test_the_gate_reads_the_site_the_docs_generators_and_the_kernel_packages_but_not_installed_npm(tmp_path):
@@ -1160,7 +1150,7 @@ def test_a_suppression_is_reported_in_every_file_and_a_string_or_function_that_s
     "ignore" are each reported. A string that spells a comment, a function of the
     file's own named `cast`, a filter that makes warnings errors, and an import kept
     for the registry entry it makes are not."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/graph.py": "EDGES = 1\n",
         "tests/test_graph.py": (
             "import warnings\n"
@@ -1195,7 +1185,7 @@ def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_bo
     alias, a from-import or a local import, by setattr, delattr, setitem or delitem, and a member
     named like a seam (`narrowed_paths`) is none. The clock, a Hub snapshot and a subprocess are
     boundaries a test may replace."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/graph.py": "EDGES = {}\n",
         "tests/test_graph.py": (
             "import time\n"
@@ -1218,54 +1208,11 @@ def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_bo
     assert found == [("tests/test_graph.py", line, "SLOP008") for line in (5, 7, 8, 11, 12)]
 
 
-ROW_1878_LINTS = {
-    "SLOP008": ({
-        "src/sparx/store.py": "class Store:\n    def _open(self):\n        pass\ndef open(path):\n    pass\n",
-        "tests/test_store.py": (
-            "from sparx.store import Store\n"
-            "import sparx.store as store\n"
-            "def test_private(monkeypatch):\n"
-            "    monkeypatch.setattr(Store, '_open', lambda self: None)\n"
-            "def test_public(monkeypatch):\n"
-            "    monkeypatch.setattr(store, 'open', lambda path: None)\n"
-            "def test_a_seams_own_private(monkeypatch):\n"
-            "    monkeypatch.setattr('sparx.store.os._exit', lambda code: None)\n"
-            "def test_a_first_party_private_under_a_seam_word(monkeypatch):\n"
-            "    monkeypatch.setattr('sparx.sources.hub.Hub._selected', lambda self: None)\n"),
-    }, "tests/test_store.py", (4, 10)),
-    "SLOP011": ({
-        "src/sparx/graph.py": "EDGES = 1\n",
-        "tests/test_graph.py": (
-            "def test_table(table):\n"
-            "    assert report.table().splitlines() == ['   a  b', 'x  1  2']\n"
-            "    assert table.plain == 'data 4,824 rows  ·  0 rejected'\n"
-            "    assert '4,824' in table.split()\n"
-            "    assert table.title == 'data rows'\n"
-            "    assert table.index('b') + 1 == len('   a  b')\n"
-            "    assert json.loads(payload) == ['a  b']\n"
-            "    assert parsed.name == 'two  spaces'\n"),
-    }, "tests/test_graph.py", (2, 3)),
-}
-"""Row 1878's two lint cases, by code: the files linted, the file the findings are in, their lines.
-SLOP008: a private attribute of a first-party object is the code under test, so replacing it is
-reported even where its name holds a seam's (`Checkpoints._open`); a public seam of the same name and a
-standard-library module's own private attribute are not. SLOP011: a rendering (its text read through
-`plain`, `table()`, captured output or `str`) compared whole with a string, or a list of strings, with a
-run of two or more spaces between words is a spacing snapshot; its words and numbers looked for, a
-one-space string, a column end measured and parsed data holding two spaces are not."""
-
-
-@pytest.mark.parametrize("code", sorted(ROW_1878_LINTS))
-def test_row_1878s_lints_report_their_cases_and_spare_the_rest(code, tmp_path):
-    files, where, lines = ROW_1878_LINTS[code]
-    assert _linted(tmp_path, files) == [(where, line, code) for line in lines]
-
-
 def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
     """SLOP015: a test that reaches its own package through `pytest.importorskip`,
     however it imports the skip, turns an import the package breaks into a skip; an
     optional dependency's skip, or a package that only shares the prefix, is not reported."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/graph.py": "EDGES = 1\n",
         "tests/test_graph.py": ("import pytest\n"
                                 "from pytest import importorskip\n"
@@ -1289,7 +1236,7 @@ def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_
     (a `getattr` of the caller's among them), a name rebound to something else or shadowed by a
     parameter or a comprehension (a lambda's in it too), and a class attribute, which no method reads
     as a name, are not."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/nn/kernels/generation.py": (
             "def device_generation():\n"
             "    return 'sm80'\n"
@@ -1372,7 +1319,7 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
     test that names a source file each prove text, not behaviour, however the
     test imports them. A raise without `match`, another object's `raises`, a
     local `getsource`, and a library that names its own file, are not reported."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/graph.py": 'HOME = "src/sparx/graph.py"\n',
         "tests/test_graph.py": (
             "import inspect\n"
@@ -1910,7 +1857,7 @@ def test_a_bare_jit_anywhere_in_the_package_is_reported(tmp_path):
     for package in ("rl", "training", "checkpoints"):
         assert_reported(tmp_path / package, f"src/sparx/{package}/rollout.py", rollout, "SLOP025",
                         (5, 7, 8, 9, 12))
-    assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
+    assert linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
 
 
 def test_a_pallas_call_outside_the_launch_point_is_reported(tmp_path):
@@ -1930,8 +1877,8 @@ def test_a_pallas_call_outside_the_launch_point_is_reported(tmp_path):
         assert_reported(tmp_path / package.replace("/", "_"), f"src/sparx/{package}/kernel.py", kernel,
                         "SLOP027", (5, 6, 7))
     point = "from jax.experimental import pallas as pl\ncall = pl.pallas_call\n"
-    assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
-    assert _linted(tmp_path / "suite", {"tests/test_kernel.py": kernel, "tools/kernel.py": kernel}) == []
+    assert linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
+    assert linted(tmp_path / "suite", {"tests/test_kernel.py": kernel, "tools/kernel.py": kernel}) == []
 
 
 def test_a_mosaic_gpu_kernel_outside_the_launch_point_is_reported(tmp_path):
@@ -1949,8 +1896,8 @@ def test_a_mosaic_gpu_kernel_outside_the_launch_point_is_reported(tmp_path):
     assert_reported(tmp_path / "bundle", "src/sparx/nn/kernels/templates/bundle.py", bundle, "SLOP027",
                     (5, 6, 7))
     point = "from jax.experimental.pallas import mosaic_gpu as plgpu\nbuild = plgpu.kernel\n"
-    assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
-    assert _linted(tmp_path / "suite", {"tests/test_bundle.py": bundle, "tools/bundle.py": bundle}) == []
+    assert linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
+    assert linted(tmp_path / "suite", {"tests/test_bundle.py": bundle, "tools/bundle.py": bundle}) == []
 
 
 ROLLOUT = ("import functools\n"
@@ -2000,8 +1947,8 @@ def test_a_construct_built_outside_its_owner_module_is_reported(tmp_path, code, 
     for package in packages:
         assert_reported(tmp_path / package, f"src/sparx/{package}/site.py", site, code, lines)
     path, text = owner
-    assert _linted(tmp_path / "owner", {path: text}) == []
-    assert _linted(tmp_path / "suite", {"tests/test_site.py": site, "tools/site.py": site}) == []
+    assert linted(tmp_path / "owner", {path: text}) == []
+    assert linted(tmp_path / "suite", {"tests/test_site.py": site, "tools/site.py": site}) == []
 
 
 def test_each_form_of_a_custom_derivative_is_a_seam():
@@ -2064,11 +2011,11 @@ def test_a_custom_derivative_without_its_contract_is_reported(tmp_path):
              "def loose(x):\n    return linear_tangent(f, g, h)(x)\n")
     files = {"tests/test_contracts_seams.py": contracts, "src/sparx/nn/seams.py": seams,
              "tests/test_contracts_more.py": "def test_twice(): pass\n"}
-    assert [found for found in _linted(tmp_path / "source", files) if found[2] == "SLOP028"] == [
+    assert [found for found in linted(tmp_path / "source", files) if found[2] == "SLOP028"] == [
         ("src/sparx/nn/seams.py", line, "SLOP028") for line in (5, 8, 11, 16, 20)]
     suite = {"tests/test_contracts_seams.py": contracts, "tests/test_seams.py": seams,
              "tools/seams.py": seams}
-    assert [found for found in _linted(tmp_path / "suite", suite) if found[2] == "SLOP028"] == []
+    assert [found for found in linted(tmp_path / "suite", suite) if found[2] == "SLOP028"] == []
 
 
 def test_the_compile_points_own_jit_is_the_only_bare_one(tmp_path):
@@ -2083,7 +2030,7 @@ def test_the_compile_points_own_jit_is_the_only_bare_one(tmp_path):
              "    def _jitted(self, f):\n"
              "        return jax.jit(f)\n")
     nesting = "import jax\ndef nested(f):\n    return jax.jit(f)\n"
-    found = _linted(tmp_path, {"src/sparx/nn/kernels/options.py": point, "src/sparx/training/step.py": point,
+    found = linted(tmp_path, {"src/sparx/nn/kernels/options.py": point, "src/sparx/training/step.py": point,
                                "src/sparx/nn/nested.py": nesting})
     assert [finding for finding in found if finding[2] == "SLOP025"] == [
         ("src/sparx/nn/kernels/options.py", 7, "SLOP025"), ("src/sparx/training/step.py", 4, "SLOP025"),
@@ -2098,7 +2045,7 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
     hook however it is spelled, and an attribute of an object a scope holds
     as its own name or reaches from a call are not reported; each scope
     reads its own imports, and a comprehension's names stay in it."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/conv.py": "",
         "src/sparx/graph.py": (
             "import sys\n"

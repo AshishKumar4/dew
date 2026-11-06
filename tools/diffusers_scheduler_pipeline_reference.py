@@ -80,10 +80,9 @@ def build(base, destination):
 
 def truth(base, destination):
     """Each walk's float64 latents (see the module docstring)."""
-    from unittest.mock import patch
-
+    import flax_precision
     from diffusers import FlaxDDIMScheduler
-    from diffusers_pipeline_reference import Float64Numpy, widened_modules
+    from diffusers_pipeline_reference import WIDENED
     from diffusers_wan_reference import float64_scheduler
 
     require("diffusers-pipelines")
@@ -91,10 +90,7 @@ def truth(base, destination):
     torch.set_num_threads(2)
     with np.load(destination) as stored:
         arrays = dict(stored)
-    patches = [patch.object(module, "jnp", Float64Numpy()) for module in widened_modules()]
-    for item in patches:
-        item.start()
-    try:
+    with flax_precision.float64(WIDENED):
         pipe, params = FlaxStableDiffusionPipeline.from_pretrained(
             base, local_files_only=True, safety_checker=None, feature_extractor=None, dtype=jnp.float64)
         pipe.text_encoder = type(pipe.text_encoder).from_pretrained(f"{base}/text_encoder", dtype=jnp.float64)
@@ -115,9 +111,6 @@ def truth(base, destination):
             arrays[name + ".latents.fp64"] = value.permute(0, 2, 3, 1).numpy()
             gap = float(np.max(np.abs(arrays[name + ".latents.fp64"] - arrays[name + ".latents"])))
             print(json.dumps({"scheduler": name, "dtype": str(value.dtype), "float32_from_float64": gap}))
-    finally:
-        for item in patches:
-            item.stop()
     np.savez_compressed(destination, **arrays)
 
 
