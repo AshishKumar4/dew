@@ -481,13 +481,15 @@ def reached(maxima: jax.Array, *, unseen: bool) -> jax.Array:
 
 
 type Launch[O] = Callable[..., tuple[O, jax.Array, jax.Array]]
-"""A whole launch of a call in a form (`walked_launches`), `launch(form, live, again=False)`: its outputs,
-each row's running maximum and whether its weighted values overflowed; `again` a plain launch run once more
-inside the guard's rare branch, a recomputation (its kernel named apart, its products counted once)."""
+"""A whole launch of a call in a form (`walked_launches`), `launch(form, live, again=False, into=None)`: its
+outputs, each row's running maximum and whether its weighted values overflowed; `again` a plain launch run
+once more inside the guard's rare branch, a recomputation (its kernel named apart, its products counted
+once); `into` refs holding the plain launch's outputs, which it writes its rows `live` into in place
+(`walked_launches`' `in_place`)."""
 
 
 def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O], *,
-                       masked: bool = False) -> O:
+                       masked: bool = False, in_place: bool = False) -> O:
     """`walked`'s guards over whole launches, for a mainloop whose program walks its keys once (a producer
     streams them, so no program walks again): `launch(form, live)` runs the call in `form`, plain where
     `live` is None, else with its rows `live` shifting (`guarded`), and returns its outputs, each row's
@@ -507,14 +509,28 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     (its rows' finished maxima and denominators too) at those rows: the fold's plain launch costs its
     exponential's two instructions an element where the natural form's costs about sixty
     (ET-DECSASS-h100, ET-FOLDED-h100: Qwen3-8B's decode at 32 rows of 32768 keys, 1.35 ms folded against
-    2.11 natural, the H100's bandwidth floor 1.28)."""
-    if masked:
+    2.11 natural, the H100's bandwidth floor 1.28).
+
+    `in_place` walks so, masked, every call, its rewalk written into the plain launch's outputs held in refs
+    (`launch(form, live, into=refs)`: the launch writes its rows `live` and leaves every other row's bits),
+    no branch and no `kept` over them: the branch's common side copied the plain launch's outputs into its
+    result every call (ET-MEMCPY-h100: the output and its rows, 45 us of Qwen3-8B's causal forward on an
+    H100), and the masked launch's `kept` selected over them every call; its empty launch costs its
+    prologue."""
+    if masked or in_place:
         outputs, maxima, over = launch(spec, None)
         if spec.reaches:
             # A padded query's maximum is -inf, a row that reads nothing, as is a slice's row of no keys.
-            live = (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over
-            return kept(live, launch(unfolded(spec), live)[0], outputs)
-        return kept(over, launch(spec, over)[0], outputs) if spec.headroom else outputs
+            live, form = (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over, unfolded(spec)
+        elif spec.headroom:
+            live, form = over, spec
+        else:
+            return outputs
+        if in_place:
+            held = jax.tree.map(jax.new_ref, outputs)
+            launch(form, live, into=held)
+            return jax.tree.map(jax.freeze, held)
+        return kept(live, launch(form, live)[0], outputs)
 
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
         if not form.headroom:
