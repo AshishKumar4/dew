@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from certified import assert_certified
 from jax.sharding import Mesh, PartitionSpec as P
+from port_support import row_names_port
 from reference_error import (
     FEWEST_SEEDS,
     assert_as_exact,
@@ -468,7 +469,8 @@ def test_a_kernel_named_for_the_rule_takes_forward_mode_however_a_caller_stages_
 
     def tangent(kernel):
         def tangents(*given):
-            with generation.chosen(gated_delta_rule=kernel):
+            # The port at the default product precision its fp32 products are declared at (`port_support`).
+            with row_names_port('gated_delta_rule', 'fla', port=kernel == 'fla'):
                 found = jax.jvp(stage(recurrence_chunk.chunk_gated_delta_rule), given[:6], given[6:])[1]
             return dict(zip(('output', 'memory'), jax.tree.leaves(found), strict=True))
         return tangents

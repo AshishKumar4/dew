@@ -606,7 +606,9 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
     keeps more for a tiny decoder's backward than a policy saving nothing. A recurrence's output is
     both its 'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are
     its port's (`row_names_port`, interpreted off a GPU), named within its rule's declared span
-    (`derivatives.declared_derivative`), whose saved residuals JAX reports as the span's outputs."""
+    (`derivatives.declared_derivative`), whose saved residuals JAX reports as the span's outputs; the
+    port runs at the default product precision its fp32 products are declared at
+    (`recurrence_chunk._port_precision`; the suite's lanes configure 'highest')."""
     from jax.ad_checkpoint import print_saved_residuals
 
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -626,8 +628,9 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
         print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
         return capsys.readouterr().out
 
-    nothing = saved(())
-    assert [name for name in value.marks() or () if saved((name,)) == nothing] == []
+    with jax.default_matmul_precision("default"):
+        nothing = saved(())
+        assert [name for name in value.marks() or () if saved((name,)) == nothing] == []
 
 
 def one_tap(kind):
