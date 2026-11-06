@@ -220,7 +220,8 @@ draws of windows of 1,024 tokens beside 2,048 of contexts, 1,004 s on a CI core,
 them eight a task (`check1_shards`, row 3907)."""
 
 
-@pytest.mark.check1_shards(seeds=PACKED_SCHEMA_SEEDS, per_task=8)
+# PACKED_SCHEMA_SEEDS, as literal counts, which the plan reads from the source (tools/armada/ci.py `sites`).
+@pytest.mark.check1_shards(seeds=128, per_task=8)
 def test_packed_rows_decide_each_schema_in_context_as_each_row_alone():
     """Rows whose schemas are their contexts, packed several a window, decide each row's options as the
     row does in a window of its own, through the unmodified objective, its cross-attention open (every
