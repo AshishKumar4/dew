@@ -34,12 +34,13 @@ from dew.interop.safetensors_io import MAX_SHARD_SIZE, flatten, read_weights, sa
 from dew.nn.precision import Numerics
 
 if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
 
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
-    from dew.objectives.base import Objective
+    from dew.objectives.base import Objective, SavedTask
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -144,8 +145,8 @@ class ReleasesModel:
     run as the native release. Mixed in before `Objective`: `class JepaObjective(ReleasesModel,
     Objective[Ratio])`."""
 
-    saved_task: ClassVar[type[SavedModel]] = SavedModel
-    settings: ClassVar[type[ModelSettings]] = ModelSettings
+    saved_task: ClassVar[type[SavedTask] | None] = SavedModel
+    settings: ClassVar[type[DataclassInstance] | None] = ModelSettings
 
     def task_settings(self) -> ModelSettings:
         """The facts a loader cannot read off the model: none, unless the objective states some."""

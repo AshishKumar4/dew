@@ -39,7 +39,7 @@ from dew.decision.calibration import (
     Temperatures,
 )
 from dew.decision.data import Example
-from dew.decision.head import DecisionHead, Head
+from dew.decision.head import Head
 from dew.decision.images import Images
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
@@ -460,17 +460,17 @@ class Decide(SavedRunTask, InItsForm):
     def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
 
-        The files are those of the format its head is read from: Laya's layout for a `DecisionHead`
-        (`LayaCheckpoint.save`, the files llama.cpp's converter and `/v1/systemone` server read too), the
-        joint head's for a `JointSchemaHead`, the slot readout's for a `LabelReadout` or a `SlotReadout`
-        (`PretrainedDecision.of`). What a format's files cannot state, the task's own layout and a
-        calibration beyond temperatures, goes beside them in the release (`dew.config.Release`), which
-        the one decision loader reads back over them (`dew.decision.release`), so a task of any layout it
-        was trained with exports and loads as the task it is. The calibration's temperatures go into
-        Laya's file held within their bounds as this task applies them, so that a reader which does not
-        hold them answers as this task does.
+        The files are those of the format its head is released in (`Head.release_format`): Laya's layout
+        for a `DecisionHead` (`LayaCheckpoint.save`, the files llama.cpp's converter and `/v1/systemone`
+        server read too), the joint head's for a `JointSchemaHead`, the slot readout's for a
+        `LabelReadout` or a `SlotReadout` (`PretrainedDecision.of`). What a format's files cannot state,
+        the task's own layout and a calibration beyond temperatures, goes beside them in the release
+        (`dew.config.Release`), which the one decision loader reads back over them
+        (`dew.decision.release`), so a task of any layout it was trained with exports and loads as the
+        task it is. The calibration's temperatures go into Laya's file held within their bounds as this
+        task applies them, so that a reader which does not hold them answers as this task does.
         """
-        if not isinstance(self.model.head, DecisionHead):
+        if self.model.head.release_format != "laya":
             from dew.decision.sources import PretrainedDecision
 
             PretrainedDecision.of(self).save(directory, max_shard_size=max_shard_size)

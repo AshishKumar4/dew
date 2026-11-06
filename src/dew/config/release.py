@@ -53,7 +53,7 @@ class Release:
         if self.max_length is not None and (type(self.max_length) is not int or self.max_length < 1):
             raise ValueError(f"a release's max_length is a positive count of tokens, not {self.max_length!r}")
 
-    def to_record(self) -> dict[str, object]:
+    def to_record(self) -> Mapping[str, object]:
         """The record `read` rebuilds this release from: each field it states."""
         return {name: value for name in _FIELDS if (value := getattr(self, name)) is not None}
 

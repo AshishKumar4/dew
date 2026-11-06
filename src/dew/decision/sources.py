@@ -24,7 +24,7 @@ from dew.registry import dtype_name, import_path
 
 from . import joint_checkpoint
 from .calibration import Calibration, Temperatures
-from .head import DecisionHead, Head, JointSchemaHead, LabelReadout, SlotReadout
+from .head import DecisionHead, Head, JointSchemaHead
 from .joint_checkpoint import HEAD_CONFIG, HEAD_WEIGHTS, _path, _shaped
 from .laya import CONFIG_FILE, IN_PROJ, _head_path, _token, laya_tensors
 from .layout import JointLayout, Layout, MarkerLayout, QuestionLayout, Specials
@@ -110,20 +110,18 @@ class PretrainedDecision(Pretrained):
         if not isinstance(task.tokenizer, HFTokenizer):
             raise ValueError("a released checkpoint holds the files of a Hugging Face tokenizer, and this "
                              f"task's is a {type(task.tokenizer).__name__}")
-        formats = {JointSchemaHead: (joint_checkpoint.save, joint_checkpoint.export),
-                   LabelReadout: (SlotSource.save, SlotSource.export),
-                   SlotReadout: (SlotSource.save, SlotSource.export)}
+        formats = {"joint": (joint_checkpoint.save, joint_checkpoint.export),
+                   "slots": (SlotSource.save, SlotSource.export)}
         head = task.model.head
-        if type(head) not in formats:
-            raise ValueError(f"a {type(head).__name__} is read by no release format: Laya's holds a "
-                             f"DecisionHead, the joint head's a JointSchemaHead and the slot readout's a "
-                             f"LabelReadout or a SlotReadout")
+        if head.release_format not in formats:
+            raise ValueError(f"a {type(head).__name__} is released in {head.release_format!r}, no format a "
+                             f"decoder bundle writes: the joint head's or the slot readout's")
         from dew.interop.pretrained import PretrainedDecoder
 
         encoder, backbone = task.model.backbone, thaw(part(task.variables, "backbone"))
         decoder = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
         held = {field.name: getattr(decoder, field.name) for field in dataclasses.fields(Pretrained)}
-        writer, exporter = formats[type(head)]
+        writer, exporter = formats[head.release_format]
         return cls(**held, head=head, head_variables=thaw(part(task.variables, "head")), layout=task.layout,
                    specials=task.specials, calibration=task.calibration, decision_tokenizer=task.tokenizer,
                    writer=writer, exporter=exporter)
