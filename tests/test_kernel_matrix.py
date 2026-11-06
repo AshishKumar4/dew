@@ -62,3 +62,20 @@ def test_every_kernel_choice_is_run_under_test_by_a_familys_matrix():
     assert declared == generation.CHOICES, (
         f"choices no family's matrix runs: {sorted(generation.CHOICES - declared)}; "
         f"declared, not choices: {sorted(declared - generation.CHOICES)}")
+
+
+def test_every_kernel_an_op_serves_is_run_under_test_by_a_familys_matrix():
+    """Every kernel a dispatch may select for an op (`selection.Op`'s kernels, the generic path that takes
+    what the others turn down left as the reference) is one some family's cells run under test, by the
+    families' KERNELS, each cell module's own, which its cells assert their routes against (row 4513): a
+    kernel added to an op without a cell fails here."""
+    modules = [importlib.import_module(module) for module, _ in kernel_matrix.CELLS.values()]
+    tested: dict[str, set[str]] = {}
+    for module in modules:
+        for choice, kernels in module.KERNELS.items():
+            tested.setdefault(choice, set()).update(kernels)
+    served = {choice: {kernel.name for op in found for kernel in op.kernels if not kernel.generic}
+              for choice, found in kernel_matrix.ops().items()}
+    untested = {choice: sorted(kernels - tested.get(choice, set())) for choice, kernels in served.items()
+                if kernels - tested.get(choice, set())}
+    assert not untested, f"kernels no family's matrix runs under test: {untested}"

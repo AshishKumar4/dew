@@ -150,6 +150,22 @@ FLOWS: tuple[str, ...] = (
 """The flows that run the matrices' cells, by pytest node id."""
 
 
+def ops() -> dict[str, list]:
+    """Every kernel op Dew's dispatches serve (`selection.Op`), by its choice, read from the production
+    modules under `dew.nn` as they define them: none is listed here."""
+    import pkgutil
+
+    import dew.nn
+    from dew.nn.kernels import selection
+
+    found: dict[str, list] = {}
+    for module in pkgutil.walk_packages(dew.nn.__path__, "dew.nn."):
+        for value in vars(importlib.import_module(module.name)).values():
+            if isinstance(value, selection.Op) and all(value is not op for op in found.get(value.choice, [])):
+                found.setdefault(value.choice, []).append(value)
+    return found
+
+
 def check(family: str):
     """`family`'s matrix cell function (`CELLS`)."""
     module, name = CELLS[family]
