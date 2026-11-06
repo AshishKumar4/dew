@@ -264,8 +264,8 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
 
 RECORDING = TINY / "recording.npz"
 """The release's plain logits over drawn rows whose every selection clears `selection_margins.MARGIN`,
-every position's and a cached walk's past its prompt, summarized over seeds (tools/deepseek_v41_reference.py
---record)."""
+every position's and a cached walk's past its prompt, summarized over seeds, beside the rows each seed drew
+(recording_rows.npz; tools/deepseek_v41_reference.py --record)."""
 
 
 def held_to_the_release(plain, variables, site: str, start: int = 0):
@@ -281,7 +281,9 @@ def held_to_the_release(plain, variables, site: str, start: int = 0):
                                 if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
             return {"logits": wide(held, jnp.asarray(inputs["input_ids"]))[:, start:]}
 
-    return recorded_site(RECORDING, site, None, twin)
+    with np.load(TINY / "recording_rows.npz") as stored:
+        rows = stored["rows"]
+    return recorded_site(RECORDING, site, lambda seed: {"input_ids": rows[int(seed)]}, twin)
 
 
 def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source):

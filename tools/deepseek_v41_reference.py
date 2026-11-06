@@ -997,8 +997,8 @@ def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
 
 def write_recording(seed: int):
     """recording.npz beside the fixture: the release's plain logits in fp32 and fp64 over drawn rows its
-    selections clear (`clearing_rows`), every position's and a cached walk's past its prompt, the rows
-    stored, summarized over seeds for check 1
+    selections clear (`clearing_rows`), every position's and a cached walk's past its prompt, summarized
+    over seeds for check 1, and the rows each seed drew (recording_rows.npz)
     (`recorded_references.record_case`), the reference the suite's variants of a row (an interior gap,
     shifted positions, a shifted cached walk) are held to (tests/test_deepseek_v41.py)."""
     from recorded_references import provenance, record_case, save
@@ -1011,8 +1011,12 @@ def write_recording(seed: int):
     with widened(model_module):
         wide = build(model_module, engram_module, args, seed, widen=True)
 
+    rows: dict[int, np.ndarray] = {}
+
     def draw(index: int) -> dict[str, np.ndarray]:
-        return {"input_ids": clearing_rows(net, args.vocab_size, index)}
+        if index not in rows:
+            rows[index] = clearing_rows(net, args.vocab_size, index)
+        return {"input_ids": rows[index]}
 
     def evaluated(start: int):
         """Each row's logits from position `start` on, in fp32 and in fp64."""
@@ -1035,7 +1039,10 @@ def write_recording(seed: int):
         "PYTHONPATH=.:tests:tools <release python> tools/deepseek_v41_reference.py --record",
         torch=torch.__version__)}, reference=f"deepseek-ai/DeepSeek-V4.1-Flash@{DEEPSEEK_V41_REVISION}",
         license="mit")
-    print(f"{written}: {sorted(arrays)}")
+    # The rows each seed drew, which the test reads its inputs from (`recorded_rows`): its own draw would
+    # rerun the release's selections to clear them.
+    np.savez(FIXTURE / "recording_rows.npz", rows=np.stack([rows[index] for index in range(len(rows))]))
+    print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
 
 
 def main():
