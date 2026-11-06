@@ -894,7 +894,7 @@ class FitSearch[LossT, EffectsT]:
             return under
         return under * temporaries // missed
 
-    def learned(self, foreseen: int | None, measured: int | None, fit: bool, split: int,
+    def learned(self, foreseen: int | None, measured: int | None, *, fit: bool, split: int,
                 temporaries: int | None) -> None:
         """What a compile at the objective's remat at `split` teaches the derivation's next judgments there:
         the headroom it `measured` short of the one `foreseen` corrects them (`under`), in proportion to the
@@ -1016,8 +1016,8 @@ class FitSearch[LossT, EffectsT]:
         foreseen = pooled_headroom(None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
-        self.learned(foreseen, pooled_headroom(headroom), fit, split,
-                     None if candidate.footprint is None else candidate.footprint.temporaries)
+        self.learned(foreseen, pooled_headroom(headroom), fit=fit, split=split,
+                     temporaries=None if candidate.footprint is None else candidate.footprint.temporaries)
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.
