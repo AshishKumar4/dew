@@ -196,9 +196,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     128 and 256 wide (ptxas, sm90a). None where none fits: the plain launch is then illegal at `tiles`
     (`MosaicForward.legal`); unless `held_only`, its least candidate then, which a launch pinned at `tiles`
     walks whatever its legality (a resource witness lowers as pinned). An fp32 call's `parts`
-    (`MosaicForward.parts`) form its weights' parts beside them, sum each product's terms beside a fresh
-    accumulator (the consumer's `dot`), and read its keys' magnitudes from each part's tile, summed fp32
-    (et-fp32e: uncounted, 64 x 64 at width 64 spilled 1,820 bytes on an H100)."""
+    (`MosaicForward.parts`) form its weights' parts one at a time beside them, its remainder and the part
+    (`_parted_products`), and bound its keys' magnitudes from their first parts (et-fp32e: the parts formed
+    at once and their magnitudes summed, 64 x 64 at width 64 spilled 1,820 bytes on an H100)."""
     def held(candidate: Tiles) -> bool:
         rows, block = candidate.block_q, candidate.block_k
         # Priced in the layout the guarded launch takes at its share (`bundle_of`).
@@ -214,8 +214,8 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         # 64 still spills 40 bytes counted apart, its decode path the Triton mainloop's until it does not).
         magnitudes = [logits[0], (columns, block, jnp.float32)]
         if parts > 1:
-            logits = [*logits, (rows, block, jnp.float32), *[(rows, block, dtype)] * parts]
-            magnitudes += [(columns, block, dtype)] * parts
+            # Its weights' remainder and the part taken from it (`_parted_products`).
+            logits = [*logits, (rows, block, jnp.float32), (rows, block, dtype)]
         live = resources.live_registers(arranged, carried, logits + sums, magnitudes, *fragments)
         if arranged.operands_in_registers:
             # Its products' fragments loaded beside the step's tiles, which they read (mma.sync: priced
@@ -938,11 +938,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     def dot(lhs, rhs):
         if isinstance(rhs, operands.Parts):
-            # An fp32 call's product of a register operand with a tile's parts: their terms' products, each
-            # its own accumulator, summed smallest first (`Family.apart`'s).
-            formed = product.formed(lhs, len(rhs.refs))
-            return functools.reduce(jnp.add, (family.registers_product(formed[i], rhs.refs[j], interpret)
-                                              for i, j in product.terms(len(formed), len(rhs.refs))))
+            fresh = family.zeros((lhs.shape[0], rhs.shape[1]))
+            return _parted_products(family, fresh, None, lhs, rhs, interpret)
         return family.registers_product(lhs, rhs, interpret)
 
     def step(index, slots, carry, accumulators):
@@ -952,7 +949,12 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             # Its keys' largest value magnitudes from the value tile it holds (`Family.key_magnitudes`).
             def largest():
                 tile = program.parted(slots["values"], tiles.block_k)
-                return family.key_magnitudes(*tile.refs) if program.parts > 1 else family.key_magnitudes(tile)
+                if program.parts == 1:
+                    return family.key_magnitudes(tile)
+                # An fp32 tile's bound from its first part, its value rounded to bf16's 8 bits (or its
+                # largest): within 2^-8 of it, so `1 + 2^-7` past it, fp32's largest at most.
+                bound = family.key_magnitudes(tile.refs[0]) * (1 + 2.0 ** -7)
+                return jnp.minimum(bound, jnp.finfo(jnp.float32).max)
 
             keys = algebra.Keys(coords, logits, tile, dot, products=products, largest=largest)
             return algebra.plain_step(spec, carry, keys), accumulators
@@ -1286,20 +1288,28 @@ def _started(program: _Program, spec: algebra.Forward, guard: _Guard | None, hoo
     return start, live, merged
 
 
+def _parted_products(family: mosaic.Family, acc, scale, weights: jax.Array, values: operands.Parts,
+                     interpret: bool):
+    """`acc` with an fp32 call's P·V issued into it in place, its factor `scale` first where given: the fp32
+    `weights`' bf16 parts (`product.bf16_parts`), each formed as it is taken, the largest first, each
+    product with the values' parts (`values`) the pair's orders under their count (`product.terms`'), so a
+    consumer holds one part and its remainder beside the sums, not the three."""
+    count = len(values.refs)
+    for i, part in enumerate(product.bf16_parts(weights, count, saturating=count)):
+        for j in range(count - i):
+            acc = (family.rescaled_products(acc, scale, (part,), values.refs[j], interpret)
+                   if i == j == 0 and scale is not None
+                   else issued_into(family, acc, (part,), values.refs[j], interpret))
+    return acc
+
+
 def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
     """`algebra.Keys.accumulate` on the family's accumulator: the tile's products issued into it in place,
     after its factor where the step gives one (`Family.rescaled_products`)."""
     def accumulate(acc, scale, parts, value):
         if isinstance(value, operands.Parts):
-            # An fp32 call's P·V its weights' parts' products with the values' (`product.terms`, smallest
-            # first), each into the sums in place, the sums' factor before the first.
             (weights,) = parts
-            formed = product.formed(weights, len(value.refs))
-            for count, (i, j) in enumerate(product.terms(len(formed), len(value.refs))):
-                acc = (family.rescaled_products(acc, scale, (formed[i],), value.refs[j], interpret)
-                       if count == 0 and scale is not None
-                       else issued_into(family, acc, (formed[i],), value.refs[j], interpret))
-            return acc
+            return _parted_products(family, acc, scale, weights, value, interpret)
         if scale is None:
             return issued_into(family, acc, parts, value, interpret)
         return family.rescaled_products(acc, scale, parts, value, interpret)

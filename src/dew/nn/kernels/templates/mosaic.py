@@ -1465,17 +1465,13 @@ class Issuer[Accumulator](abc.ABC):
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
         return plgpu.load(ref, layout=self.layout, optimized=False)
 
-    def key_magnitudes(self, tile, *parts) -> jax.Array:
+    def key_magnitudes(self, tile) -> jax.Array:
         """Each key's largest value magnitude, fp32, from a values tile `tile` `[keys, columns]` in shared
         memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,
         so the vector is in a column's layout (`column`, a logits tile's keys'), as `algebra.room` reads
         it; no pass over the values outside the launch. In the values' own dtype until the reduction is
-        done (a magnitude's maximum is exact in any), so the tile holds half an fp32 tile's registers. With
-        `parts`, the tile an fp32 one's first part and they its others (`product.formed`), summed in fp32
-        before the reduction."""
-        loads = [plgpu.load(each.transpose((1, 0)), layout=self.layout, optimized=False)
-                 for each in (tile, *parts)]
-        values = loads[0] if not parts else functools.reduce(jnp.add, (x.astype(jnp.float32) for x in loads))
+        done (a magnitude's maximum is exact in any), so the tile holds half an fp32 tile's registers."""
+        values = plgpu.load(tile.transpose((1, 0)), layout=self.layout, optimized=False)
         return jnp.max(jnp.abs(values), axis=0).astype(jnp.float32)
 
     column_scratch: int

@@ -600,16 +600,17 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     weights. A key tile whose indices do not fold (`Family.folds_indices`) holds the places its masks
     compare, the queries' and the keys', an int32 tile each. A walk that issues a tile's P·V a step late
     (`deferred`, `values_deferred`) carries the tile's weights across the next step, its logits read while
-    that product runs. An fp32 call's `parts` (`MosaicForward.parts`) sum its logits' products apart
-    (`Family.apart`: the running sum beside each term's fresh accumulator, two fp32 tiles) and form the
-    weights' parts at once, `parts` tiles in the operands' dtype beside the fp32 weights."""
+    that product runs. An fp32 call's `parts` (`MosaicForward.parts`) issue its logits' products' terms
+    into one accumulator and form its weights' parts one at a time, its remainder fp32 and the part
+    beside the weights (`attention_mosaic_forward._parted_products`)."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
     step = [logits, weights, *([weights] if residuals else [])]
     if parts > 1:
-        step += [logits, logits, *[weights] * (parts - 1)]
+        # Its weights' remainder and the part taken from it (`_parted_products`).
+        step += [logits, weights]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
     if not family.folds_indices(block_k):
