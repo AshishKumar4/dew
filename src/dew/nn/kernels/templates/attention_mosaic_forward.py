@@ -41,8 +41,6 @@ from dew.nn.kernels.templates import (
     resources,
 )
 from dew.nn.kernels.templates.attention import (
-    Draw,
-    Dropout,
     Hooks,
     KeySpans,
     Param,
@@ -670,7 +668,8 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                       + anchors)
             value_rows = jnp.take(jnp.swapaxes(v, 1, 2).reshape(-1, v.shape[-1]), places, axis=0)
             # Under dropout the anchor's own weight takes its draw's multiplier, as `algebra.joined` does.
-            own = split.own if hooks.drop is None else split.own * _anchor_multipliers(hooks.drop, anchors)
+            own = (split.own if hooks.drop is None
+                   else split.own * algebra.anchor_multipliers(hooks.drop, anchors))
             acc = algebra.split_output(split.others, own, value_rows)
             out = algebra.output_of(acc, rows[1], guarded=form.guarded or hooks.initial is not None)
             out = _output_hooked(out, hooks, hooked)
@@ -713,15 +712,6 @@ def _whole(array: jax.Array, parts: int) -> jax.Array:
     if parts == 1:
         return array
     return jnp.sum(array.astype(jnp.float32).reshape(parts, -1, *array.shape[1:]), axis=0)
-
-
-def _anchor_multipliers(drop: Dropout, anchors: jax.Array) -> jax.Array:
-    """Each row's anchor's dropout multiplier (`Draw`) at its query and its anchor key `anchors`
-    `[B, H, Qp]`, every batch row and query head its draw's."""
-    batch, heads, queries = anchors.shape
-    draw = Draw((drop.seed[0], drop.seed[1]), drop.rows.reshape(batch, 1, 1), drop.heads.reshape(1, heads, 1),
-                drop.rate)
-    return draw(jnp.arange(queries, dtype=jnp.int32), anchors)
 
 
 def _widened(array: jax.Array, width: int) -> jax.Array:

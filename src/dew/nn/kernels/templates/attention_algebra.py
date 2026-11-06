@@ -35,7 +35,7 @@ import numpy as np
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.kernels.templates import layout, product
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, Initial, within
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, Dropout, Initial, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
 
 
@@ -1459,6 +1459,16 @@ def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
         lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows)[0],
         (compensated(spec, start), no_argmax(start.total.shape[0], dropping), nothing, nothing))
     return settled(state), arg, own, others_total
+
+
+def anchor_multipliers(drop: Dropout, anchors: jax.Array) -> jax.Array:
+    """Each row's anchor's dropout multiplier (`Draw`) at its query and its anchor key `anchors`
+    `[B, H, Qp]`, every batch row and query head its draw's: the factor its own weight takes in the output
+    (`joined`) and its value in D (a dropping backward's `gradient.split_delta`)."""
+    batch, heads, queries = anchors.shape
+    draw = Draw((drop.seed[0], drop.seed[1]), drop.rows.reshape(batch, 1, 1), drop.heads.reshape(1, heads, 1),
+                drop.rate)
+    return draw(jnp.arange(queries, dtype=jnp.int32), anchors)
 
 
 def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array]) -> Partial:
