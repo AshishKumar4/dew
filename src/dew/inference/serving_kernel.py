@@ -736,16 +736,19 @@ def _captured(states: Variables, resident: Slots, carried: Slots, slots: jax.Arr
     return jax.tree_util.tree_map_with_path(captured, states, cache, is_leaf=lambda x: x is None)
 
 
-def _pooled(cache: Variables) -> Variables:
-    """The paged pool's leaves of `cache` (`POOLED`), `[heads, pages, page_size, ...]`, None elsewhere."""
-    return jax.tree_util.tree_map_with_path(lambda path, leaf: leaf if leaf_name(path) in POOLED else None,
-                                            cache)
+def _pages_axis(path: tuple[jax.tree_util.KeyEntry, ...]) -> int:
+    """The axis a paged pool's leaf at `path` (`POOLED`) holds its pages on: `[heads, pages, page_size,
+    ...]`, its run's layers first under a bank (`row_axis`)."""
+    return row_axis(path) + 1
 
 
 def _read_pages(resident: Slots, carried: Slots, pages: jax.Array) -> Variables:
-    """The pool's `pages`, each leaf's `[heads, len(pages), page_size, ...]`, None off the pool."""
-    return jax.tree.map(lambda leaf: None if leaf is None else jnp.take(leaf, pages, axis=1),
-                        _pooled(joined(resident, carried).decoder.cache), is_leaf=lambda x: x is None)
+    """The pool's `pages`, each leaf's `[len(pages), ...]`, a page's every other axis after it, its heads
+    and under a bank its run's layers (`_pages_axis`), so the host keeps each page alike; None off the
+    pool."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.moveaxis(jnp.take(leaf, pages, axis=_pages_axis(path)), _pages_axis(path), 0)
+        if leaf_name(path) in POOLED else None, joined(resident, carried).decoder.cache)
 
 
 def page_shapes(resident: Slots, carried: Slots, count: int) -> Variables:
@@ -755,16 +758,18 @@ def page_shapes(resident: Slots, carried: Slots, count: int) -> Variables:
 
 def _written_pages(resident: Slots, carried: Slots, pages: jax.Array, held: Variables) -> tuple[Slots, Slots]:
     """The state with the pool's `pages`, `[groups, count]`, each group's own, set to `held`'s, each leaf
-    `[groups, heads, count, ...]`, a group's pages in its row; a page past the pool is dropped."""
+    `[groups, count, ...]`, a group's pages in its row, each as `_read_pages` reads it; a page past the pool
+    is dropped."""
     state = joined(resident, carried)
 
-    def written(leaf, values):
+    def written(path, leaf, values):
         if values is None:
             return leaf
-        flat = jnp.moveaxis(values, 0, 1).reshape(values.shape[1], -1, *values.shape[3:])
-        return leaf.at[:, pages.reshape(-1)].set(flat.astype(leaf.dtype), mode="drop")
+        axis = _pages_axis(path)
+        flat = jnp.moveaxis(values.reshape(-1, *values.shape[2:]), 0, axis)
+        return leaf.at[(*(slice(None),) * axis, pages.reshape(-1))].set(flat.astype(leaf.dtype), mode="drop")
 
-    cache = jax.tree.map(written, state.decoder.cache, held, is_leaf=lambda x: x is None)
+    cache = jax.tree_util.tree_map_with_path(written, state.decoder.cache, held, is_leaf=lambda x: x is None)
     return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
 
 

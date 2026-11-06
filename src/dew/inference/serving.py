@@ -1163,7 +1163,7 @@ class Server:
                       if self.pooled else pinned_get(jax.tree.leaves(read)))
             for index, (_, slot) in enumerate(batch):
                 if slot // host in self._local:
-                    self._host[slot] = [np.asarray(leaf)[:, index].copy() for leaf in leaves]
+                    self._host[slot] = [np.asarray(leaf)[index].copy() for leaf in leaves]
         share = width // self.groups
         by_group = [[pair for pair in uploads if pair[0] // host == group] for group in range(self.groups)]
         shapes = page_shapes(self._resident, self._carried, share)
@@ -1175,7 +1175,7 @@ class Server:
                     pages[group, index] = page
                     if group in self._local:
                         for rows, held_page in zip(held, self._host[slot], strict=True):
-                            rows[self._local.index(group), :, index] = held_page
+                            rows[self._local.index(group), index] = held_page
             self._resident, self._carried = self._written_pages(
                 self._resident, self._carried, pages,
                 jax.tree.unflatten(jax.tree.structure(shapes), self._placed(held)))
