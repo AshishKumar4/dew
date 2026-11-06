@@ -26,6 +26,14 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "dtype": ("bfloat16", "float16", "float32"),
         "form": ("fast", "accurate"),
     },
+    "attention_kernels": {
+        "generation": ("sm90", "sm80", "v5e"),
+        "kernel": ("flash", "triton", "cudnn", "template", "tpu"),
+        "width": ("64", "128", "256"),
+        "heads": ("mha", "gqa-8-2"),
+        "mask": ("causal", "full", "documents"),
+        "dtype": ("bfloat16", "float16", "float32"),
+    },
     "decode": {
         "generation": ("sm90", "sm80"),
         "layout": ("dense", "paged"),
@@ -134,6 +142,7 @@ whatever the covering takes besides (`covering`), so the row's own case proves i
 
 CELLS: dict[str, tuple[str, str]] = {
     "attention": ("attention_matrix", "a_routes_training_step_is_on_par"),
+    "attention_kernels": ("attention_kernels_matrix", "a_kernels_training_step_is_on_par"),
     "decode": ("decode_matrix", "a_decode_step_is_on_par"),
     "gemm": ("gemm_matrix", "a_gemm_training_step_is_on_par"),
     "fused_gemm": ("fused_gemm_matrix", "a_fused_gemm_training_step_is_on_par"),
@@ -149,6 +158,7 @@ CELLS: dict[str, tuple[str, str]] = {
 
 FLOWS: tuple[str, ...] = (
     "tests/test_gpu_attention.py::test_the_attention_matrix_holds_on_this_gpu",
+    "tests/test_gpu_attention.py::test_the_attention_kernels_matrix_holds_on_this_gpu",
     "tests/test_gpu_attention.py::test_the_decode_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
@@ -160,7 +170,12 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_recurrence.py::test_the_recurrent_decode_matrix_holds_on_this_gpu",
     "tests/test_gpu_numerics.py::test_the_norm_swiglu_matrix_holds_on_this_gpu",
 )
-"""The flows that run the matrices' cells, by pytest node id."""
+"""The flows that run the matrices' cells on the GPU tier, by pytest node id."""
+
+TPU_FLOWS: tuple[str, ...] = (
+    "tests/test_attention_splash.py::test_the_attention_kernels_matrix_holds_on_this_tpu",
+)
+"""The flows that run the matrices' TPU cells on the TPU tier (`-m tpu`), by pytest node id."""
 
 
 def check(family: str):
