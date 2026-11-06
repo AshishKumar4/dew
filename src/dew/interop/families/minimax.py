@@ -31,19 +31,17 @@ from dew.interop.decoder_parts import (
     MOE_NAMES,
     DecoderFamily,
     DecoderFields,
-    ExportRefused,
     RopeSpelling,
     base_config,
     kind_mixers,
     kinds_of,
+    read_only,
     read_partial_rope,
-    reads,
     refuse,
     softmax_top_k,
     specified_layer_types,
     spelled,
 )
-from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -172,17 +170,13 @@ def _lightning(model: CausalTransformer) -> list[LightningAttentionMixer]:
     return [mixer for mixer in kind_mixers(model) if isinstance(mixer, LightningAttentionMixer)]
 
 
-def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
-    """No config: no runtime outside Dew computes this family as its release does (the module docstring),
-    so a Hugging Face checkpoint of it would open as another model."""
-    raise ExportRefused("MiniMax-Text-01 and M1 write no Hugging Face checkpoint: transformers' MiniMax "
-                        "turns every dimension of a head and scales its lightning rates otherwise, and the "
-                        "release's own code does not import under transformers 5 (ledgers 2534, 2535)")
-
-
 MINIMAX = DecoderFamily(
     ('minimax', *_OWN),
-    ConfigLayout(ConfigPart(reads(_minimax_config), _minimax_export)),
+    # No runtime outside Dew computes this family as its release does (the module docstring), so a Hugging
+    # Face checkpoint of it would open as another model.
+    read_only(_minimax_config, "MiniMax-Text-01 and M1 write no Hugging Face checkpoint: transformers' "
+              "MiniMax turns every dimension of a head and scales its lightning rates otherwise, and the "
+              "release's own code does not import under transformers 5 (ledgers 2534, 2535)"),
     lambda fields: bool(_lightning(fields) or fields.normed_residual or fields.stream_multiplier != 1.0),
     'minimax',
     'MiniMaxForCausalLM',
