@@ -259,6 +259,7 @@ def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monke
     assert publisher["processes"] == 2 and publisher["release"] == reader["release"]
     assert publisher["release_files"] == reader["release_files"] and publisher["release_files"]
     whole = sum(path.stat().st_size for path in Path(publisher["release"]).glob("*.safetensors"))
+    print("POOL_MEMORY", whole, [(r["rank"], r["read"], r["held"], r["exported"]) for r in (publisher, reader)], flush=True)
     assert [scope["writes"] for scope in publisher["read"]] == [True]
     assert [scope["writes"] for scope in reader["read"]] == [False]
     for report in (publisher, reader):
