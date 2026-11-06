@@ -94,16 +94,30 @@ def _initialize(head: nn.Module, backbone: Pretrained) -> Variables:
         jax.random.key(0), backbone.variables, jnp.zeros((1, 1), jnp.int32))
 
 
-def _labels(tokenizer: HFTokenizer, count: int) -> tuple[Labels, tuple[tuple[int, ...], ...]]:
-    """The release requires every bare letter to round-trip as one token, then admits all pairs
-    together or none, as its engine's `_verify_slots` does."""
+def _spelled(tokenizer: HFTokenizer) -> list[bool]:
+    """Whether `tokenizer` spells each of `SLOT_LABELS` bare as one token that round-trips."""
     valid = []
     for label in SLOT_LABELS:
         ids = tokenizer.encode(label, add_special_tokens=False)
         valid.append(len(ids) == 1 and tokenizer.decode(ids) == label)
-    if not all(valid[:len(LETTERS)]):
-        raise ValueError("the slot tokenizer must spell each bare A-Z label as one round-tripping token")
-    names = (SLOT_LABELS if all(valid) else LETTERS)[:count]
+    return valid
+
+
+def unspelled(tokenizer: HFTokenizer) -> str | None:
+    """Why the slot release's engine reads no row of `tokenizer`'s (`_verify_slots`): a bare A-Z label it
+    spells as more than one token, or as one that does not round-trip; None where it spells every one."""
+    if all(_spelled(tokenizer)[:len(LETTERS)]):
+        return None
+    return "the slot tokenizer must spell each bare A-Z label as one round-tripping token"
+
+
+def _labels(tokenizer: HFTokenizer, count: int) -> tuple[Labels, tuple[tuple[int, ...], ...]]:
+    """The release requires every bare letter to round-trip as one token (`unspelled`), then admits all
+    pairs together or none, as its engine's `_verify_slots` does."""
+    refused = unspelled(tokenizer)
+    if refused is not None:
+        raise ValueError(refused)
+    names = (SLOT_LABELS if all(_spelled(tokenizer)) else LETTERS)[:count]
     labels = Labels(variants=("{}",), names=names)
     return labels, labels.ids(tokenizer, len(names))
 
@@ -153,6 +167,12 @@ def _torch_readout(tensors: Mapping[str, np.ndarray], path: Path) -> None:
 
 class SlotSource(SourceKind):
     """Readout metadata beside a native decoder, with the release's prompt as a layout value."""
+
+    @staticmethod
+    def refuses(bundle: PretrainedDecision) -> str | None:
+        """Why the slot release holds no task of `bundle`'s: a tokenizer its engine reads no row of
+        (`unspelled`)."""
+        return unspelled(bundle.decision_tokenizer)
 
     @staticmethod
     def head_files(bundle: PretrainedDecision) -> HeadFiles:
