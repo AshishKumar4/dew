@@ -1052,12 +1052,27 @@ about it is an estimate.
   of the challenge's price, a rotation by 6, shifts by 2 and 6 and the rotation's by 2 and four masked XORs,
   in 27 seconds (left shifts to 6 places: 2.3 seconds, the test's). No form without a right-moving shift
   exists within three left shifts.
-- **Not in the vocabulary yet** (row 4050): PRMT's byte permutes, LOP3's other linear tables (a three-way
-  XOR, a bit select), and transforms that are not linear (a rounding pack, an integer decode through fp16
-  arithmetic), whose search over LOP3's truth tables, IADD3 and HFMA2 is a bit-vector synthesis (Z3) and whose
-  proof over a 32-bit word is Z3's equivalence. Each joins when a consumer's transform needs it: sm80's FP8
-  and FP4 epilogue packing (row 3733) is the first. No target varies the vocabulary: the pipes and rates above
-  hold from sm75 to sm120, so the search takes no target.
+- **Transforms that are not linear** (row 4050): an encode's rounding and saturation is no GF(2)-linear map,
+  so its form takes the integer pipes' arithmetic beside the linear instructions (`BitOp`'s others: LOP3 of
+  any table, IADD3, IMAD, minima and maxima, an arithmetic shift, shifts by a value, a compare and a select,
+  PRMT's literal byte selection), each with its PTX (`_written`). Its reference is a jax.numpy function of
+  uint32 words (`encoded`: fp32 to e4m3, e5m2 or e2m1, round to nearest even, saturated finite, a NaN as
+  its NaN code), proven exhaustively over every fp32 word against ml_dtypes' cast. Its form is found at
+  development time by `tools/superoptimize_bits.py` (Z3 its dependency, not Dew's): the reference's jaxpr
+  traced into the vocabulary, then each window of up to three steps that only its last step leaves replaced
+  by a cheaper program of one or two, its operations, operands, immediates and tables unknowns, by
+  counterexample-guided synthesis, a replacement taken only where Z3 proves it equal on every value of the
+  window's inputs. For the three encodes it finds the same program, 41 issues to 37 (`x != 0` as
+  `min(x, 1)`, two adds as one IADD3, a select and a mask as one), its constants the minifloat's:
+  `encode_form`, proven against `encoded` on every fp32 word by its test, and its PTX run on the GPU against
+  its own evaluation. Windows of four steps into three found nothing further (2026-11-06, one round within
+  its bounds). Whether its PTX beats the compiler's lowering of `encoded` is its consumer's measurement
+  (sm80's FP8 and FP4 epilogue, row 3733).
+- **Not in the linear search**: PRMT and LOP3's other tables as a register's combiner. A register's LOP3
+  must zero its other bits, and a three-way XOR with a mask takes four operands, which LOP3 does not; a
+  byte selection adds nothing a free layout's encoder does not, and a fixed layout's byte moves are the
+  non-linear vocabulary's (the e4m3 and e5m2 decodes in their natural byte order need three classes of bits
+  in a half, which one LOP3 under one mask does not separate).
 
 ### 7.4 Interface with the GEMM template (its first consumer, row 3733)
 
