@@ -998,6 +998,12 @@ def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: D
 
         drafts = tuple(kept(fresh, held) for fresh, held in zip(carried[1:], following.drafts, strict=True))
         following = dataclasses.replace(replayed, hidden=kept(carried[0], following.hidden), drafts=drafts)
+    elif seen is not None:
+        # The target's own state at each row's last emitted token, its last slot's past a short block; a
+        # row that emitted nothing keeps what it had.
+        at_last = jnp.take_along_axis(seen, last[:, None, None], axis=1)[:, 0]
+        hidden = jnp.where((count > 0)[:, None], at_last, state.hidden)
+        following = dataclasses.replace(following, hidden=hidden)
     following = dataclasses.replace(
         following, logits=jnp.where((count > 0)[:, None],
                                     jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
