@@ -38,12 +38,18 @@ from dew.nn.kernels.recurrence_chunk import Chunk, chunk, recomputing
 from dew.telemetry.benchmark import device_time
 
 DELTA = ('qwen3.5-27b-gdn', 'qwen3-next-gdn', 'kimi-linear-kda')
+SCANS = ('nemotron-h-4b-ssd', 'nemotron-h-30b-ssd')
+"""The scoreboard's rated scans (Mamba-2's SSD), which Mamba-2's chunked scan takes (`mamba2.chunk_ssd`)."""
 """The delta-rule shapes the template's forward takes: a decay a head (Qwen3.5-27B's and Qwen3-Next's
 gated delta nets) and a key dimension's (Kimi Linear's)."""
 
 NAMED = {'mosaic': 'mosaic_gpu', 'mosaic-recompute': 'mosaic_gpu', 'port': 'fla', 'xla': 'xla'}
 """The kernel each arm names to the delta rule's selector (`generation.chosen(gated_delta_rule=...)`), the
 chunked op's one route."""
+
+SCANNED = {'mosaic': 'mosaic_gpu', 'port': 'pallas', 'xla': 'xla'}
+"""The kernel each arm names to the rated scan's selector (`generation.chosen(ssd=...)`): the port mamba_ssm's
+kernels'."""
 
 
 KERNELS = 40
@@ -74,6 +80,8 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
     """`(compiled, args)`: the arm's forward, or forward and gradient, at the shape, compiled, its program
     named for the arm (`forward_mosaic`, `trained_port`, ...) and its operands."""
     shape = SHAPES[name]
+    if shape.kind == 'ssd':
+        return _compiled_scan(name, arm, dtype, training)
     given = {key: jnp.asarray(value) for key, value in operands(shape).items()
              if key in ('q', 'k', 'v', 'g', 'beta')}
     # Kimi delta attention's declared floor (its layer's `lower_bound`), which the draws' decays lie above,
@@ -98,6 +106,31 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
     timed = trained if training else forward
     timed.__name__ = f"{'trained' if training else 'forward'}_{arm}"
     with generation.chosen(gated_delta_rule=NAMED[arm]):
+        return program(timed).executable(*args), args
+
+
+def _compiled_scan(name: str, arm: str, dtype, training: bool):
+    """`compiled_arm` of a rated scan: Mamba-2's chunked scan (`mamba2.chunk_ssd`) over the shape's `x`,
+    step, `A`, `B`, `C` and `D`, `x`, `B` and `C` in `dtype` as the mixer hands them, on the arm's kernel
+    named to the scan's selector (`SCANNED`)."""
+    from dew.nn.mixers.mamba2 import chunk_ssd
+
+    shape = SHAPES[name]
+    given = operands(shape)
+    args = tuple(jnp.asarray(given[key], dtype if key in ('x', 'B', 'C') else None)
+                 for key in ('x', 'dt', 'A', 'B', 'C', 'D'))
+
+    def forward(*args):
+        return chunk_ssd(*args, chunk_size=shape.chunk)
+
+    def trained(*args):
+        # The forward's results returned with the gradients (`compiled_arm`'s `trained`).
+        out, pull = jax.vjp(forward, *args)
+        return out, pull(jax.tree.map(jnp.ones_like, out))
+
+    timed = trained if training else forward
+    timed.__name__ = f"{'trained' if training else 'forward'}_{arm}"
+    with generation.chosen(ssd=SCANNED[arm]):
         return program(timed).executable(*args), args
 
 
@@ -162,7 +195,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument('--arm', required=True, help=f"one of {tuple(NAMED)}, or several comma-separated "
                                                      "with --profile")
     parser.add_argument('--profile', help="capture the arms' kernels under this directory (kernel_stats)")
-    parser.add_argument('--shape', default='all', help=f"one of {DELTA} or 'all'")
+    parser.add_argument('--shape', default='all',
+                        help=f"one of {DELTA + SCANS}, 'all' (the delta rule's) or 'scans' (the rated "
+                             "scans')")
     parser.add_argument('--dtype', default='bfloat16', help="bfloat16, float32, or both comma-separated")
     parser.add_argument('--pass', dest='training', default='forward',
                         help="forward, training, or both comma-separated (in that order: the device's peak "
@@ -180,7 +215,7 @@ def main(argv: list[str] | None = None) -> None:
     if not set(passes) <= {'forward', 'training'} or passes != sorted(passes):
         parser.error("--pass takes forward, training, or forward,training")
     failed = []
-    for name in DELTA if args.shape == 'all' else (args.shape,):
+    for name in {'all': DELTA, 'scans': SCANS}.get(args.shape, (args.shape,)):
         for dtype, passed in itertools.product(args.dtype.split(','), passes):
             training = passed == 'training'
             kind, timing = jnp.dtype(dtype), (args.warmup, args.repeats, training)
