@@ -81,6 +81,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.inference import pipeline
     from dew.inputs import Condition, Field, InputSpec
     from dew.nn.kernels.generation import GpuFacts, gpu_facts
+    from dew.nn.kernels.options import jit
     from dew.objectives import Objective
     from dew.objectives.base import Aux, EMASpec, Step
     from dew.objectives.supervised import Supervised
@@ -125,7 +126,7 @@ _EXPORTS = {
     "pipeline": "dew.inference",
     "Profiler": "dew.telemetry.profile",
     "gpu_facts": "dew.nn.kernels.generation", "GpuFacts": "dew.nn.kernels.generation",
-    "kernels": "dew.kernels",
+    "kernels": "dew.kernels", "jit": "dew.nn.kernels.options",
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
@@ -180,6 +181,7 @@ __all__ = [
     "WandbTracker",
     "__version__",
     "gpu_facts",
+    "jit",
     "kernels",
     "pipeline",
     "sample",
