@@ -942,7 +942,7 @@ def filled_version(fill: Mapping[str, object]) -> int:
     return FILE_SHARDS if fill.get("shards") == "files" else FILE_SHARDS - 1
 
 
-def streams_parquet(source: object) -> bool:
+def streams_parquet(source: JSON) -> bool:
     """Whether `source`, a store's fingerprint as a plan records it (`Manifest.semantic`'s `source`), names
     a Parquet store at any depth (a selection's, a concatenation's part, a mixture's corpus): the stores
     whose streamed shards a plan version decides (`FILE_SHARDS`)."""

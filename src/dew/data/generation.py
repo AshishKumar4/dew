@@ -134,9 +134,8 @@ def _publish(
     completions, shards = _sealed(root, pins)
     if current is not None:
         _retain_committed(root, current, completions, shards, pins)
-    streamed = any(row.startswith("[") for row in completions)
     # A stream's fill numbers its rows by the shards its key says it read (`filled_version`).
-    version = filled_version(key.fill)
+    streamed, version = any(row.startswith("[") for row in completions), filled_version(key.fill)
     if of_several and streamed:
         stored = {shard.id for shard in source.manifest(version).shards}
         if any(json.loads(row)[0] not in stored for row in completions):

@@ -318,12 +318,13 @@ def fetched_generation(chain, directory):
     manifest publication records, filled once through the cache."""
     from dew.data.analysis import _cache_manifest
     from dew.data.compile import _prepared
+    from dew.data.plan import PLAN_VERSIONS
 
     (prepared,) = _prepared((chain,), "indexed", provision=False)
     source = prepared.source
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
-    manifest = _cache_manifest(source, prepared.stages, "indexed")
+    manifest = _cache_manifest(source, prepared.stages, "indexed", PLAN_VERSIONS[-1])
     stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:

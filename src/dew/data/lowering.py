@@ -439,9 +439,7 @@ class _PlacedShards:
 
 
 def _positioned(manifest: ShardManifest, reads: int) -> ShardManifest:
-    """`manifest` read with each record's place in the stream, its shards' rows stated or counted, `reads`
-    at once (`ShardManifest.sized`), so each shard's reader numbers its records from its start."""
-    manifest = manifest.sized(reads)
+    manifest = manifest.sized(reads)  # Its shards' rows stated or counted, `reads` at once.
     rows = [shard.rows for shard in manifest.shards if shard.rows is not None]
     if len(rows) != len(manifest.shards):
         raise ValueError("map_with_index over a streamed read needs every shard to state its rows")
@@ -812,9 +810,8 @@ def _filled(stage: Artifact) -> Cache:
 
 def _fill(pipeline: Pipeline, source: Source, at: int, read: Read,
           version: int) -> tuple[Cache, Manifest, _Prefix]:
-    """The cache stage at `at`, the manifest its fill is keyed by, read by data plan `version`, and the
-    record steps before it that fill it, from which memory, indexed and streamed reads all open the
-    cache."""
+    """The cache stage at `at`, the manifest its fill is keyed by at data plan `version`, and the record
+    steps before it that fill it, from which memory, indexed and streamed reads all open the cache."""
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
@@ -1659,14 +1656,13 @@ class _Build:
         start = 0 if cache is None else cache + 1
         transparent = cache is not None and _transparent(pipeline, cache)
         shards = source.manifest(self.version)
-        threads = self.stream_loading.threads
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read, self.version)
-            shards = _positioned(shards, threads) if 0 <= last < cache else shards
+            shards = _positioned(shards, self.stream_loading.threads) if 0 <= last < cache else shards
             reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads,
                                      source=source, transparent=transparent)
             shards = dataclasses.replace(shards, reader=reader)
-        shards = _positioned(shards, threads) if last >= start else shards
+        shards = _positioned(shards, self.stream_loading.threads) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
         steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline),
