@@ -263,7 +263,7 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
         # The blocks every query of the block sees whole, below its diagonal and before padding.
         whole = jnp.maximum(jnp.minimum(lax.div(block.first, block_k), blocks - padded), 0)
     # Its layouts inferred from the row reductions the walk's carry meets.
-    start = (jnp.full((rows,), -jnp.inf, jnp.float32), jnp.zeros((rows,), jnp.float32))
+    start = (jnp.full((rows,), algebra.LEAST, jnp.float32), jnp.zeros((rows,), jnp.float32))
     def walked(index, carry):
         # A block the query block walks, masked from its first that some query sees in part.
         return lax.cond(index < block.steps, lambda carry: step(index, carry, masked=index >= whole),

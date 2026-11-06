@@ -586,7 +586,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     initial = hooks.initial
     m0 = total0 = acc0 = None
     if initial is not None:
-        m0, total0 = call.rows(initial.m, -jnp.inf), call.rows(initial.total)
+        m0, total0 = call.rows(initial.m, algebra.LEAST), call.rows(initial.total)
         acc0 = jnp.pad(call.rows(initial.acc),
                        ((0, 0),) * 3 + ((0, call.value.shape[-1] - value.shape[-1]),))
     op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
