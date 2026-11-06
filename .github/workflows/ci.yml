@@ -113,11 +113,14 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+        # Main's whole run (the schedule's, the land queue's whole dispatch), background work (`WHOLE`).
+        WHOLE: ${{ (github.event_name == 'schedule' || inputs.whole) && '1' || '' }}
       run: |
         base=$(git merge-base HEAD origin/main)
         # A train's gates start before lanes' runs, a push to main's and a staged train's after a train's, as their
-        # suites do.
+        # suites do; main's whole run's after every lane's, as its suite's.
         case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; ci/stage-*|main) priority=--priority=5 ;; *) priority= ;; esac
+        if [ -n "$WHOLE" ]; then priority=--priority=-15; fi
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
           $priority --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
@@ -291,7 +294,10 @@ jobs:
       # A train staged on the testing train's tip (ci/stage-*) runs beside it, at 5, on the pool its branch
       # names (its lease's suite share, the land queue's promote.sh); a push to main the queue did not grade
       # (a direct push) is its tip's only test, at 5 too, in a concurrency group of its own (the maintainer,
-      # 2026-10-29, 2026-10-31).
+      # 2026-10-29, 2026-10-31). Main's whole run (the schedule's, the queue's whole dispatch) is background
+      # work: it runs at -15, below every lane's run at a head (verdict.sh's -10, a targeted run's 0), so a head's
+      # run never queues behind it (Main, 2026-11-06: a whole run and the gates' shadow held the fleet while
+      # lanes waited at 0).
       run: |
         case "$GITHUB_REF_NAME" in ci/base-*|base/kernels) gangless=1 ;; *) gangless= ;; esac
         case "$GITHUB_REF_NAME" in
@@ -300,6 +306,7 @@ jobs:
           ci/base-*|base/kernels) priority=-10 ;;
           *) priority= ;;
         esac
+        if [ -n "$DEW_WHOLE_SUITE" ]; then priority=-15; fi
         pool=$BACKGROUND_POOL
         case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) pool=${GITHUB_REF_NAME##*-p} ;; esac
         ARMADA=armada LABEL="$GITHUB_REF_NAME" PRIORITY="$priority" GANGLESS="$gangless" POOL="$pool" \
