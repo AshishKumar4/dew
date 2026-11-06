@@ -123,6 +123,29 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
 
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
+def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run(tmp_path, recorded, kind):
+    """A kind's run saved at an earlier main, exported by `dew export` where its checkpoint declared its task,
+    loads back through `dew.pipeline` as the task its run loads (`from_run`) and answers one request as that
+    task does, leaf for leaf (MF01). A run that declared none (the corpus's JEPA runs, saved before a JEPA
+    encoder had a release) is refused by the export, as `SavedRun.pinned` refuses it."""
+    from option_witness import answered_alike, answers
+
+    from dew._cli.main import main
+    from dew.inference.loading import pipeline
+
+    run = extracted(tmp_path, recorded, kind)
+    task = objectives[RunConfig.load(str(run)).objective.name].saved_task
+    with Checkpoints(str(run)) as checkpoints:
+        declared = checkpoints.artifact(checkpoints.latest) is not None
+    release = tmp_path / "release"
+    if not declared:
+        with pytest.raises(ValueError):
+            main(["export", str(run), str(release)])
+        return
+    assert main(["export", str(run), str(release)]) == 0
+    assert answered_alike(answers(pipeline(str(release))), answers(task.from_run(str(run))))
+
+@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monkeypatch, recorded, kind):
     """A kind's run saved at an earlier main resumes from its last checkpoint for one step more, in the
     compute it trained in (a main that recorded no evidence: every corpus run's model draws fresh or loads
