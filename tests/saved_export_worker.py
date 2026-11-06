@@ -22,6 +22,9 @@ import ctypes
 import functools
 import gc
 import hashlib
+import os
+import sys
+import tracemalloc
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +51,19 @@ RELEASE_SHARD = "1MB"
 """A saved run's release's shard size (`released`), so its 17 MB are written in shards each a fraction of
 it: the writer holds one shard at a time, and at the 5 GB default the release is one shard, which held
 the whole release on each host (19 to 22 MB of resident growth on armada) while tracemalloc read 0.25 MB."""
+
+TRACE = []
+COMPILES = []
+
+
+def memory_detail():
+    from dew.telemetry.benchmark import resident_memory
+
+    result = resident_memory()
+    for line in Path("/proc/self/smaps_rollup").read_text().splitlines()[1:]:
+        name, value = line.split(":", 1)
+        result["rollup_" + name] = int(value.split()[0]) * 1024
+    return result
 
 
 def digests(directory: Path) -> dict[str, str]:
@@ -80,8 +96,23 @@ def resident_growth(into: list[int]) -> Iterator[None]:
     ctypes.CDLL(None).malloc_trim(0)
     Path("/proc/self/clear_refs").write_text("5")
     before = resident_memory()["VmRSS"]
+    detail_before = memory_detail()
+    modules_before = set(sys.modules)
+    compiles_before = len(COMPILES)
+    tracing = os.environ.get("DBG_TRACE_ALLOC") == "1"
+    if tracing:
+        tracemalloc.start()
     yield
     into.append(resident_memory()["VmHWM"] - before)
+    detail_after = memory_detail()
+    record = {"before": detail_before, "after": detail_after,
+              "new_modules": sorted(set(sys.modules) - modules_before),
+              "compiles": COMPILES[compiles_before:]}
+    if tracing:
+        record["traced"] = tracemalloc.get_traced_memory()
+        record["top"] = [str(s) for s in tracemalloc.take_snapshot().statistics("lineno")[:12]]
+        tracemalloc.stop()
+    TRACE.append(record)
 
 
 def exported(args) -> dict:
@@ -193,11 +224,19 @@ def released(args) -> dict:
     shards (`RELEASE_SHARD`), after an export of the run outside the cache, so the measured one finds its
     programs compiled and its modules imported, and the same measure over the release held home."""
     import jax
+    import logging
     from safetensors.numpy import load_file
 
     from dew._cli.main import main
     from dew.interop import saved_sources
     from dew.interop.pretrained import PretrainedDecoder
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            COMPILES.append(record.getMessage())
+
+    logging.getLogger("jax").addHandler(Capture())
+    jax.config.update("jax_log_compiles", True)
 
     PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=RELEASE_SHARD)
     rank = jax.process_index()
@@ -217,7 +256,7 @@ def released(args) -> dict:
     return {"processes": jax.process_count(), "rank": rank, "release": str(release),
             "export_code": code,
             "release_files": digests(Path(release)), "read": read, "held": held[0], "exported": list(scopes),
-            "export_files": digests(destination)}
+            "export_files": digests(destination), "trace": TRACE}
 
 
 MODES = {"exported": exported, "released": released}
