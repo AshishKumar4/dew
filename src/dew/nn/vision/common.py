@@ -31,7 +31,7 @@ type Reader = Callable[[Mapping[str, Stored], Callable[[str], tuple[str, ...] | 
 `dew.interop.weights.placed`, or a patch-folding ViT's `translate_vit_weights`."""
 
 
-type StoredShapes = Callable[[nn.Module], Mapping[str, tuple[int, ...]]]
+type StoredShapes = Callable[[TowerBase], Mapping[str, tuple[int, ...]]]
 """The shapes a release stores some of a component's tensors in, by their names, from the component's
 fields (a tower's, a projector's), where the tensor folds or unfolds its leaf's axes as well as
 transposing them: a patch convolution `[out, in, time, h, w]` its Dense map `[in * time * h * w, out]`
@@ -45,6 +45,8 @@ def written(routes: Routes, variables: Mapping[str, Mapping[str, object]], kept:
     `[out, in, ...]` as `[..., in, out]`, `stored_shape`), but a `kept` name as its leaf is, and a name
     `shapes` folds stored in its shape; refused (`ExportRefused`) where a leaf has no name, which a model
     of that layout cannot write."""
+    import jax
+    import numpy as np
     from flax.traverse_util import flatten_dict
 
     from dew.interop.decoder_parts import refuse_export
@@ -59,6 +61,8 @@ def written(routes: Routes, variables: Mapping[str, Mapping[str, object]], kept:
             if name is None:
                 missing.append("/".join(rooted))
                 continue
+            if not isinstance(leaf, jax.Array | jax.ShapeDtypeStruct | np.ndarray):
+                raise TypeError(f"{'/'.join(rooted)} is a {type(leaf).__name__}, not a leaf")
             rank = len(leaf.shape)
             order = None if name in kept else orders(rooted, rank)[1]
             shape = (shapes or {}).get(name) or (tuple(leaf.shape) if name in kept
@@ -114,7 +118,7 @@ class TowerLayout:
         SigLIP's pooling head, has none."""
         return self.read(hf_tensors, self.path, param_dtype)
 
-    def tensors(self, tower: nn.Module,
+    def tensors(self, tower: TowerBase,
                 variables: Mapping[str, Mapping[str, object]]) -> tuple[WeightLayout, ...]:
         """The layouts that write `tower`'s leaves (`variables`, its collections) under its names
         past `prefix` (`written`), each folded as a read one is (`shapes`)."""

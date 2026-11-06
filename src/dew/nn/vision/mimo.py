@@ -102,7 +102,7 @@ _MIMO_ROUTES = Table(
 """A MiMo ViT's tensor names past `visual.`, both ways; the merger maps with the projector."""
 
 
-def _patch_convolution(tower: nn.Module) -> Mapping[str, tuple[int, ...]]:
+def _patch_convolution(tower: TowerBase) -> Mapping[str, tuple[int, ...]]:
     """The patch map as the release stores it, a `[width, channels, time, patch, patch]` convolution."""
     assert isinstance(tower, MiMoVision)
     return {PATCH_CONVOLUTION: (tower.hidden_size, tower.in_channels, tower.temporal_patch_size,

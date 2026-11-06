@@ -29,6 +29,7 @@ from dew.registry import Configured, configured
 
 if TYPE_CHECKING:
     import numpy as np
+    from flax import linen as nn
 
     from dew.interop.decoder_parts import SourceCode
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -514,13 +515,9 @@ class ConfigField[Model]:
         keys = (self.key, *self.aliases)
         used.update(keys)
         key = next((key for key in keys if key in hf_config), None)
-        default = self.default
-        if key is not None:
-            stated = configured(hf_config[key])
-        elif isinstance(default, Required):
+        if key is None and self.default is REQUIRED:
             raise KeyError(self.key)
-        else:
-            stated = default
+        stated = configured(self.default if key is None else hf_config[key])
         record[self.field] = stated if self.parse is None else self.parse(stated, key or self.key)
         return record
 
@@ -712,7 +709,7 @@ class SourceLayout:
             written.write_bytes(module.read_bytes())
 
 
-def source_layout(model: Configured, *,
+def source_layout(model: nn.Module, *,
                   config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
     """The layout `model` is written in as its family's release, or what it cannot write (`Unwritable`):
     the one answer every writer asks (a run's export, a bundle's save, a decision's release). A decoder's

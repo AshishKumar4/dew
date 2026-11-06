@@ -146,7 +146,7 @@ _MOONVIT_ROUTES = Table(
 table read and write folded (`_read_moonvit`, `_folded`)."""
 
 
-def _folded(tower: nn.Module) -> Mapping[str, tuple[int, ...]]:
+def _folded(tower: TowerBase) -> Mapping[str, tuple[int, ...]]:
     """The patch convolution `[width, 3, patch, patch]` and the position table `[height, width, features]`
     as the release stores them."""
     assert isinstance(tower, MoonViT)

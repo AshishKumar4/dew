@@ -105,7 +105,7 @@ _QWEN35_ROUTES = Table(unplaced(r"merger\..+"), *tensor_routes(_QWEN35_VISION_TE
 rotary table is a buffer the checkpoint leaves out."""
 
 
-def _patch_convolution(tower: nn.Module) -> Mapping[str, tuple[int, ...]]:
+def _patch_convolution(tower: TowerBase) -> Mapping[str, tuple[int, ...]]:
     """The patch map as the release stores it, a `[width, channels, time, patch, patch]` convolution."""
     assert isinstance(tower, Qwen35Vision)
     return {PATCH_CONVOLUTION: (tower.hidden_size, tower.in_channels, tower.temporal_patch_size,

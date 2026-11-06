@@ -4,7 +4,7 @@ release projects it in and out, and two reserved learned-position rows."""
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.decoder_config import expect, flag, inert, integer, ungated
+from dew.interop.decoder_config import biases, expect, flag, inert, integer, ungated
 from dew.interop.decoder_parts import DecoderFamily, DecoderFields, Renames, context_lengths, spelled
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, constant, unread
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -52,20 +52,13 @@ def _opt_heads(hf_config: Mapping[str, object], used: set[str], record: DecoderF
     return record
 
 
-def _opt_bias(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    used.add('enable_bias')
-    biased = bool(hf_config.get('enable_bias', True))
-    record.update(mlp_bias=biased, attention_bias=biased)
-    return record
-
-
 OPT_CONFIG = ConfigLayout(
     integer('vocab_size', 'vocab_size', 50272), integer('hidden_size', 'emb_features', 768),
     integer('num_hidden_layers', 'num_layers', 12),
     ConfigPart(_opt_heads, lambda model: {'num_attention_heads': model.num_heads}),
     integer('ffn_dim', 'mlp_features', 3072),
     ungated('activation_function', ('relu', 'gelu', 'gelu_new'), 'OPT', default='relu'),
-    ConfigPart(_opt_bias, lambda model: {'enable_bias': model.attention_bias}),
+    biases('enable_bias', default=True),
     ConfigPart(_opt_norms, _opt_norms_written),
     ConfigPart(_opt_embedding, lambda model: {'word_embed_proj_dim': model.embedding_features
                                               or model.emb_features}),

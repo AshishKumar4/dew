@@ -17,6 +17,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import jax.numpy as jnp
+
 from dew import _records
 from dew.interop.decoder_parts import ExportRefused
 from dew.interop.layouts import ConfigLayout, SourceLayout, Unwritable
@@ -120,13 +122,14 @@ def uncorrected(layout: WrapperLayout, language_model: CausalTransformer
         for name in correction.kinds or tuple(dict.fromkeys(language_model.per_layer_types)):
             kind = kinds.get(name, LayerKind())
             mixer = kind.mixer or base
+            assert dataclasses.is_dataclass(mixer) and not isinstance(mixer, type), "a mixer is a dataclass"
             # The fields it holds off their defaults (`record_fields` leaves a default out).
             stated = {field: value for field, value in record_fields(mixer, type(mixer)).items()
                       if field in correction.fields}
             if not stated:
                 continue
             fields.update(stated)
-            plain = mixer.clone(**{field: getattr(type(mixer)(), field) for field in stated})
+            plain = dataclasses.replace(mixer, **{field: getattr(type(mixer)(), field) for field in stated})
             kinds[name] = dataclasses.replace(kind, mixer=None if plain == base else plain)
         if fields:
             held.append((correction, fields))
@@ -208,7 +211,7 @@ def _refuse_lossy(wrapper: MultimodalTransformer, config: Mapping[str, object]) 
         record = hf_decoders.translate_wrapper_config(config)
         language = from_record(CausalTransformer, {**_wrapper_text_fields(config, record, None),
                                                    "dtype": wrapper.language_model.dtype})
-        rebuilt = _wrapper_model(config, record, language, dtype=wrapper.dtype or "float32")
+        rebuilt = _wrapper_model(config, record, language, dtype=jnp.dtype(wrapper.dtype or jnp.float32).name)
     except (KeyError, ValueError) as error:
         raise ExportRefused(f"the {wrapper.family} config written for this model does not read back: "
                             f"{error}") from error
@@ -249,11 +252,13 @@ def _tensors(layout: WrapperLayout, wrapper: MultimodalTransformer, language: Ca
         if hf_decoders.wrapper_route(stored, record) != ("language_model", name):
             raise ExportRefused(f"{name} would be stored as {stored}, which a {wrapper.family} wrapper "
                                 "reads elsewhere")
+    vision = wrapper.vision
+    assert vision is not None, "a wrapper's layout writes its vision tower (`wrapper_layout`)"
     towers = {collection: tree["tower"] for collection, tree in variables.items()
               if isinstance(tree, Mapping) and "tower" in tree}
     prefix = projector.prefix if isinstance(projector.prefix, str) else projector.prefix[0]
     media = (*(dataclasses.replace(held, name=layout.root + tower.prefix + held.name)
-               for held in nested(tower.tensors(wrapper.vision, towers), 1, "tower")),
+               for held in nested(tower.tensors(vision, towers), 1, "tower")),
              *(dataclasses.replace(held, name=layout.root + prefix + held.name)
                for held in nested(projector.written(_tree(_tree(variables, "params"), "projector")), 1,
                                   "projector")))

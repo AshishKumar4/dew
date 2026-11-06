@@ -3,7 +3,15 @@
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.decoder_config import DecoderSpelling, decoder_layout, expect, inert, ungated
+from dew.interop.decoder_config import (
+    DecoderSpelling,
+    biases,
+    decoder_layout,
+    expect,
+    four_wide,
+    inert,
+    ungated,
+)
 from dew.interop.decoder_parts import MEGATRON_NAMES, DecoderFamily, DecoderFields, grouped_qkv, spelled
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, constant, unread
 
@@ -16,30 +24,15 @@ def _multi_query(hf_config: Mapping[str, object], used: set[str], record: Decode
     return record
 
 
-def _falcon_width(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    used.add('ffn_hidden_size')
-    record['mlp_features'] = _records.integer(
-        hf_config.get('ffn_hidden_size') or 4 * _records.integer(record['emb_features'], 'hidden_size'),
-        'ffn_hidden_size')
-    return record
-
-
-def _falcon_bias(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    used.add('bias')
-    biased = bool(hf_config.get('bias', False))
-    record.update(mlp_bias=biased, attention_bias=biased)
-    return record
-
-
 FALCON_CONFIG = ConfigLayout(
     decoder_layout(DecoderSpelling(
         reads=frozenset(), tie_embeddings=True, scale_after_cast=False, activation=None,
         defaults={'hidden_size': 4544, 'num_attention_heads': 71},
         undeclared=frozenset({'num_key_value_heads', 'head_dim', 'intermediate_size', 'rms_norm_eps'}))),
     ConfigPart(_multi_query, lambda model: {'multi_query': model.kv_heads == 1}),
-    ConfigPart(_falcon_width, lambda model: {'ffn_hidden_size': model.hidden_features}),
+    four_wide('ffn_hidden_size'),
     ungated('activation', ('gelu', 'gelu_new', 'relu'), 'Falcon', default='gelu'),
-    ConfigPart(_falcon_bias, lambda model: {'bias': model.attention_bias}),
+    biases('bias', default=False),
     ConfigField('layer_norm_epsilon', 'norm_eps', 1e-5,
                 parse=lambda value, key: _records.number(value or 1e-5, key)),
     ConfigField('attention_dropout', 'attention_dropout_rate', 0.0,

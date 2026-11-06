@@ -1510,7 +1510,7 @@ def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
         order = stored_order(path, 2 if fold else len(shape), len(shape))
         stored: tuple[int, ...] = shape if order is None else tuple(shape[axis] for axis in order)
         if fold:
-            stored = (math.prod(stored[:-1]), stored[-1])
+            stored = (math.prod(stored[:-1]), *stored[-1:])
         for target, expert in slices:
             if target in layouts:
                 raise ValueError(f"{'.'.join(path)} and {layouts[target].paths[0]} both write {target}")

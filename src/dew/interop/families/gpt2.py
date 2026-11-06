@@ -8,7 +8,7 @@ import numpy as np
 
 from dew import _records
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_config import flag, inert, integer, ungated
+from dew.interop.decoder_config import flag, four_wide, inert, integer, ungated
 from dew.interop.decoder_parts import (
     GPT_MLP,
     GPT_TRUNK,
@@ -51,13 +51,6 @@ def _heads(hf_config: Mapping[str, object], used: set[str], record: DecoderField
     return record
 
 
-def _inner(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    used.add('n_inner')
-    record['mlp_features'] = _records.integer(hf_config.get('n_inner') or 4 * _records.integer(
-        record['emb_features'], 'n_embd'), 'n_inner')
-    return record
-
-
 def _positions(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
     used.add('n_positions')
     positions = _records.integer(hf_config.get('n_positions', 1024), 'n_positions')
@@ -75,7 +68,7 @@ def gpt2_layout(activation: ConfigPart[CausalTransformer]) -> ConfigLayout[Causa
     return ConfigLayout(
         integer('vocab_size', 'vocab_size', 50257), integer('n_embd', 'emb_features', 768),
         integer('n_layer', 'num_layers', 12), ConfigPart(_heads, lambda model: {'n_head': model.num_heads}),
-        ConfigPart(_inner, lambda model: {'n_inner': model.hidden_features}), activation,
+        four_wide('n_inner'), activation,
         ConfigPart(_positions, lambda model: {'n_positions': model.position_embedding_size
                                               or model.max_seq_len}),
         ConfigField('layer_norm_epsilon', 'norm_eps', 1e-5, parse=_records.number),
@@ -138,7 +131,7 @@ def _neo_pattern_written(model: CausalTransformer) -> Mapping[str, object]:
 
 
 GPT_NEO_CONFIG = ConfigLayout(
-    Restated(GPT2_CONFIG, keys={'n_embd': 'hidden_size', 'n_layer': 'num_layers', 'n_head': 'num_heads',
+    Restated(GPT2_CONFIG, own={'n_embd': 'hidden_size', 'n_layer': 'num_layers', 'n_head': 'num_heads',
                                 'n_positions': 'max_position_embeddings', 'n_inner': 'intermediate_size',
                                 'resid_pdrop': 'resid_dropout', 'embd_pdrop': 'embed_dropout',
                                 'attn_pdrop': 'attention_dropout'},

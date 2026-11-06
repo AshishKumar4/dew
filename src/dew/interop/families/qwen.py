@@ -202,7 +202,7 @@ DELTA_NET_FIELDS: ConfigLayout[GatedDeltaNetMixer] = ConfigLayout(
 """The hybrid Qwen block's delta net's geometry, both ways."""
 
 
-def qwen_hybrid(*, fixed: Mapping[str, object] | None = None, spelling: DecoderSpelling | None = None,
+def qwen_hybrid(*, fixed: Mapping[str, Configured] | None = None, spelling: DecoderSpelling | None = None,
                 delta_net: ConfigLayout[GatedDeltaNetMixer] = DELTA_NET_FIELDS
                 ) -> ConfigLayout[CausalTransformer]:
     """The hybrid Qwen block qwen3_5_text, qwen3_next and qwen4_exp share, both ways: gated delta net layers

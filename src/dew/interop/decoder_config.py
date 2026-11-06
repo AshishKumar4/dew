@@ -407,8 +407,30 @@ def plain_rope_part(spelling: RopeSpelling | None = PLAIN_SPELLING, *, default_f
                                            factor_field: model.partial_rotary_factor or 1.0})
 
 
+def biases(key: str, *, default: bool) -> ConfigPart[CausalTransformer]:
+    """One flag biasing every projection, the attention's and the MLP's, both ways: `key` (Falcon's `bias`,
+    OPT's `enable_bias`, StarCoder2's `use_bias`), its class's `default` where unstated (`config_flag`)."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        used.add(key)
+        biased = config_flag(hf_config, key, default=default)
+        record.update(mlp_bias=biased, attention_bias=biased)
+        return record
+    return ConfigPart(read, lambda model: {key: model.attention_bias})
+
+
+def four_wide(key: str) -> ConfigPart[CausalTransformer]:
+    """The MLP's width under `key`, four times the model's where the config states none (GPT-2's `n_inner`,
+    Falcon's `ffn_hidden_size`), both ways."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+        used.add(key)
+        record['mlp_features'] = _records.integer(
+            hf_config.get(key) or 4 * _records.integer(record['emb_features'], 'hidden_size'), key)
+        return record
+    return ConfigPart(read, lambda model: {key: model.hidden_features})
+
+
 def kind_mixer[Mixer](kind: str, name: str, mixer: type[Mixer], layout: ConfigLayout[Mixer], *,
-                      fixed: Mapping[str, object] | None = None) -> ConfigPart[CausalTransformer]:
+                      fixed: Mapping[str, Configured] | None = None) -> ConfigPart[CausalTransformer]:
     """The mixer the layers of `kind` hold (a hybrid's delta net, SSD or lightning attention), its keys
     `layout`'s, both ways: read into the kind's record as the `mixers` registry's `name` beside what the
     family's reference fixes of it (`fixed`), its keys read as nothing where no layer is of the kind;

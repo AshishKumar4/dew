@@ -2,21 +2,12 @@
 rotate-half rotary, a sliding window on every layer when it states one, and
 an ungated feed-forward, every map biased under `use_bias`."""
 
-from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.decoder_config import DecoderSpelling, decoder_layout, ungated
-from dew.interop.decoder_parts import GPT_MLP, DecoderFamily, DecoderFields, spelled
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, constant, unread
+from dew.interop.decoder_config import DecoderSpelling, biases, decoder_layout, ungated
+from dew.interop.decoder_parts import GPT_MLP, DecoderFamily, spelled
+from dew.interop.layouts import ConfigField, ConfigLayout, constant, unread
 from dew.nn.backbones.causal_transformer import CausalTransformer
-
-
-def _use_bias(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    used.add('use_bias')
-    biased = bool(hf_config.get('use_bias', True))
-    record.update(mlp_bias=biased, attention_bias=biased)
-    return record
-
 
 STARCODER2_CONFIG = ConfigLayout(
     # Starcoder2Model masks every layer by the window when one is set.
@@ -25,7 +16,7 @@ STARCODER2_CONFIG = ConfigLayout(
                                    defaults={'norm_epsilon': 1e-5})),
     ungated('hidden_act', ('gelu_pytorch_tanh', 'gelu_new', 'gelu', 'relu'), 'Starcoder2',
             default='gelu_pytorch_tanh', tanh='gelu_pytorch_tanh'),
-    ConfigPart(_use_bias, lambda model: {'use_bias': model.attention_bias}),
+    biases('use_bias', default=True),
     ConfigField('residual_dropout', 'dropout_rate', 0.0, parse=_records.number),
     ConfigField('embedding_dropout', 'embedding_dropout_rate', 0.0, parse=_records.number),
     ConfigField('attention_dropout', 'attention_dropout_rate', 0.0, parse=_records.number),
