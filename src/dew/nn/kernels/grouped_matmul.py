@@ -750,11 +750,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """The bundle the launch runs on `target`: its instruction family's (`bundles.of`), none where the
         family has none (a TPU's launches are their own; a CPU interprets a GPU's only where
         `generation.assumed` names it)."""
-        return bundles.of(target.generation, ba.arguments['tokens'].dtype)
+        return bundles.of(target.generation, ba.arguments['tokens'].dtype, stated=True)
 
     def _families(self, ba, target) -> tuple[mosaic.Family, ...]:
         """The bundles the launch may run on `target`, in preference order (`bundles.layouts`)."""
-        return bundles.layouts(target.generation, ba.arguments['tokens'].dtype)
+        return bundles.layouts(target.generation, ba.arguments['tokens'].dtype, stated=True)
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
@@ -1651,7 +1651,7 @@ def _takes_pair(name: str, case: GroupedCase) -> bool:
     its only hook is the epilogue over its two accumulators (`_pair_alone`: mma.sync's SwiGLU, 254 to 255
     registers and no spill at Qwen3-30B-A3B's and Qwen3.5-4B's gate|up on sm80, row 2100); every other
     hands it on (`APART`)."""
-    family = bundles.of(case.call.target.generation, jnp.bfloat16)
+    family = bundles.of(case.call.target.generation, jnp.bfloat16, stated=True)
     if name != MosaicGmm.name or family is None:
         return False
     bound = case.call.bound.get(name)

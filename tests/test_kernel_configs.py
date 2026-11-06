@@ -588,7 +588,7 @@ def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     the compile gate fewer cases. A GPU whose family has no bundle (`bundles.of`: a B200's tcgen05, consumer
     Blackwell's TMA-fed mma.sync) emits none."""
     cases = _gemm_mainloop_cases(generation_name, shape)
-    forms = _emitted_forms(bundles.of(generation_name, jnp.bfloat16), shape)
+    forms = _emitted_forms(bundles.of(generation_name, jnp.bfloat16, stated=True), shape)
     assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
 
 
