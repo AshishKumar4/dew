@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tests"))
-sys.path.insert(0, str(ROOT / "tools"))
+# The tests' own path (pyproject's `pythonpath`: the repository root), their directory and this one.
+sys.path[:0] = [str(ROOT / "tools"), str(ROOT / "tests"), str(ROOT)]
 
 _WORKER = importlib.import_module("native_diffusion_worker")
 NATIVE = {**{f"{task}-{group}": (task, group) for task in _WORKER.TASKS for group in _WORKER.groups(task)},
