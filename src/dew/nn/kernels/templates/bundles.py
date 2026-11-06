@@ -3,12 +3,11 @@ registry keyed by the device's instruction family (`generation.family`), each bu
 an execution policy: Hopper's warpgroup MMA's (`mosaic_sm90.WGMMA`, and its layout without a producer,
 `mosaic_sm90.FED`), Ampere's mma.sync's on cp.async (`mosaic_sm80.Mma`) and consumer Blackwell's mma.sync on
 TMA rings (`MmaFed`); a launch names its bundle by the bundle's `name` (`named`). Blackwell's tcgen05, whose
-products accumulate in tensor memory, composes its issuer with the TMA rings (`mosaic_sm100.RINGS`), which a
-launch names; `of` gives it to sm100 and sm103 once the templates' persistent launches state their
-accumulators (`Transport.persist`'s `accumulators`). A TPU core's bundle composes the MXU's issuer with VMEM
-rings (`mosaic_tpu.MXU`), which runs the toolkit's persistent walk; `of` gives it to a TPU once the templates'
-launches run on it. Until then a TPU runs no shared mainloop: every template's Mosaic launch is ineligible
-there, and its call takes the next route by legality."""
+products accumulate in tensor memory, composes its issuer with the TMA rings (`mosaic_sm100.RINGS`), sm100's
+and sm103's for a launch that states its accumulators (`of`). A TPU core's bundle composes the MXU's issuer
+with VMEM rings (`mosaic_tpu.MXU`), which runs the toolkit's persistent walk; `of` gives it to a TPU once the
+templates' launches run on it. Until then a TPU runs no shared mainloop: every template's Mosaic launch is
+ineligible there, and its call takes the next route by legality."""
 
 import dataclasses
 
@@ -35,12 +34,14 @@ class MmaFed(mosaic_sm80.MmaIssuer, mosaic.ConsumerFed):
     consumers = 1
 
 
-def of(generation_name: str, dtype) -> mosaic.Family | None:
+def of(generation_name: str, dtype, *, stated: bool = False) -> mosaic.Family | None:
     """The bundle a template's Mosaic GPU mainloop runs on a device of `generation_name` (`'sm80'`, the
     assumed or a real one's) for operands of `dtype`, by its instruction family (`generation.family`); None
     where its family has none. mma.sync's bundle stages its blocks by cp.async (`mosaic_sm80.Mma`), or on a
     device whose blocks move by TMA (`generation.Architecture.tma`, consumer Blackwell's) through TMA rings
-    (`MmaFed`)."""
+    (`MmaFed`). tcgen05's (`mosaic_sm100.RINGS`) is a launch's where it states its tiles' accumulators
+    (`stated`, `Transport.persist`'s `accumulators`), which that bundle allocates in tensor memory: the GEMM
+    template's; a launch that does not runs none there."""
     architecture = generation.architecture(generation_name)
     if architecture is None or generation.capability(generation_name) is None:
         return None
@@ -48,6 +49,8 @@ def of(generation_name: str, dtype) -> mosaic.Family | None:
         return mosaic_sm90.WGMMA
     if architecture.family == mosaic_sm80.Mma.name:
         return _mma(architecture, dtype)
+    if architecture.family == mosaic_sm100.RINGS.name and stated:
+        return mosaic_sm100.RINGS
     return None
 
 
@@ -64,7 +67,8 @@ def useful_rows(family: mosaic.Family, rows: int) -> float:
     return rows / (-(-rows // family.rows) * family.rows)
 
 
-def layouts(generation_name: str, dtype, rows: int | None = None) -> tuple[mosaic.Family, ...]:
+def layouts(generation_name: str, dtype, rows: int | None = None, *, stated: bool = False
+            ) -> tuple[mosaic.Family, ...]:
     """The bundles a launch on a device of `generation_name` may take for operands of `dtype`, in preference
     order: its instruction family's (`of`) first, a producer's layout, whose loads overlap no consumer's
     issue; then, on warpgroup MMA, its layout without a producer (`mosaic_sm90.FED`), whose consumers hold
@@ -72,8 +76,9 @@ def layouts(generation_name: str, dtype, rows: int | None = None) -> tuple[mosai
     launch's `rows`, also mma.sync's where the device issues it beside its own family
     (`generation.issuers`), every bundle ordered by the share of its padded rows the launch fills
     (`useful_rows`), that order on a tie: a decode step's 8 rows take mma.sync's 16 before wgmma's 64 (row
-    4042), where a launch's tile pads its rows to the bundle's least. None where its family has no bundle."""
-    first, architecture = of(generation_name, dtype), generation.architecture(generation_name)
+    4042), where a launch's tile pads its rows to the bundle's least. None where its family has no bundle;
+    `stated` as `of`'s."""
+    first, architecture = of(generation_name, dtype, stated=stated), generation.architecture(generation_name)
     if first is None or architecture is None:
         return ()
     found = (first, mosaic_sm90.FED) if first is mosaic_sm90.WGMMA else (first,)

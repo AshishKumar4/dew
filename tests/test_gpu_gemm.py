@@ -8,8 +8,8 @@ one process (`gpu_flow`), each cell its own file's property:
   (test_grouped_gemm; row 4474).
 - A ring streams tiles of their own trip counts, and consumers feeding their own ring split a step, on an
   H100 (test_mosaic_toolkit).
-- The Blackwell grouped matmul holds check 1 on a B200 or a B300, sm100 and sm103 alike
-  (test_gemm_blackwell).
+- The shared GEMM mainloop runs on Blackwell's tcgen05, exactly, on a B200 or a B300, sm100 and sm103 alike
+  (test_gemm_tcgen05).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
   H100 and an A100 (test_contracts_gemm).
 - The template's grouped product of 16-bit operands sums into fp32 as exactly as XLA's at depths 128 and
@@ -37,7 +37,7 @@ import numpy as np
 import nvfp4_matrix
 import pytest
 import test_contracts_gemm as contracts_gemm
-import test_gemm_blackwell as gemm_blackwell
+import test_gemm_tcgen05 as gemm_tcgen05
 import test_gemm_template as gemm_template
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
@@ -140,7 +140,8 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
                                  consumers, lo), "sm90")
           for consumers, lo in ((1, 0), (2, 0), (2, 3))),
-        *cells_of(gemm_blackwell.the_blackwell_gmm_holds_check_1_on_blackwell),
+        Cell("the shared GEMM mainloop runs on Blackwell's tcgen05",
+             gemm_tcgen05.the_shared_mainloop_runs_exactly_on_blackwell, "sm100"),
         *(Cell(f"the NVFP4 product's packed kernel holds every order: {name} {edge}",
                functools.partial(contracts_gemm.test_an_nvfp4_products_kernels_hold_every_order, edge,
                                  "packed"), name)

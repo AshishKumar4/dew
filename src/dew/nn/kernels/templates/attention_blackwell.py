@@ -1,6 +1,6 @@
 """The attention template's Blackwell mainloop (Mosaic GPU, sm100), the design's first sm100 rung
 (docs/design/kernel-templates.md §6), on the tcgen05 bundle (`mosaic_sm100`, the GEMM template's
-`gemm.mosaic_blackwell` beside it): tcgen05's products with their accumulators in tensor memory, as
+mainloop on tcgen05 beside it): tcgen05's products with their accumulators in tensor memory, as
 FlashAttention-4 and Tokamax's sm100 kernel hold them, and the template's algebra (`attention_algebra`)
 between the products.
 
