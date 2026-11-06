@@ -346,3 +346,21 @@ def test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_it
     rounded = np.clip(quotient, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)
     decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32) * np.float32(bits.NVFP4_OWED)
     np.testing.assert_array_equal(decoded, rounded * np.repeat(least, 16, axis=0))
+
+
+def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():
+    """A truth table over one value and the immediate (`BitOp.LOGIC` with one operand) runs as PTX writes it
+    and the synthesizer proves it, `lop3.b32 d, a, imm, imm`, under every table (row 4647): each result
+    bit the table's bit at the minterm of the value's bit and the immediate's twice, the PTX ISA's
+    definition."""
+    words = np.random.default_rng(4647).integers(0, 1 << 32, 4096, dtype=np.uint64).astype(np.uint32)
+    immediate = 0x0F0F_A5C3
+    lanes = np.arange(32, dtype=np.uint32)
+    held = (words[:, None] >> lanes) & 1
+    other = (np.uint32(immediate) >> lanes) & 1
+    for table in range(256):
+        form = bits.BitForm((bits.BitStep(bits.BitOp.LOGIC, (0,), immediate, bits.Unit.ALU, table),), (1,),
+                            tuple(1 << bit for bit in range(32)))
+        minterms = (held << 2) | (other << 1) | other
+        expected = np.sum(((np.uint32(table) >> minterms) & 1) << lanes, axis=-1, dtype=np.uint64)
+        np.testing.assert_array_equal(form.decoded(words)[0], expected, err_msg=f"table {table:#04x}")

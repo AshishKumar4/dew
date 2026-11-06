@@ -456,13 +456,14 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     blockwise FP8 product (1 x 128 activation tiles, 128 x 128 weight blocks; row 4518). Its forward alone:
     a recipe's gradients are their own FP8 products of requantized operands (row 2513). Its selector
     (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's."""
-    launch = grouped_matmul.MosaicGmm()
+    launch = grouped_matmul.MosaicStepScaledGmm()
     abstract = jax.ShapeDtypeStruct
     bound = launch.bind(abstract(lhs.shape, lhs.dtype), abstract(kernel.shape, kernel.dtype),
                         abstract(group_sizes.shape, jnp.int32), out_dtype='float32', trans_rhs=True,
                         interpret=interpret_on_cpu, exact_sums=True)
-    target = generation.gpu_target()
-    tile = _step_scaled_tile(launch, bound, target, kernel.shape[1], column_scales.shape[-1])
+    per = kernel.shape[1] // column_scales.shape[-1]
+    # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
+    tile = _planned(launch, bound) if per == 1 or per % mosaic_gpu.STEP_SCALE_DEPTH == 0 else None
     if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic_gpu':
         assert tile is not None, "the selector names the template where it plans a tile"
         summed = mosaic_gpu.gmm(lhs, kernel, group_sizes.astype(jnp.int32), tiles=tile, transpose_rhs=True,
@@ -491,10 +492,17 @@ def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_bloc
     contiguous layout), so no block straddles groups. Its selector (`BLOCKWISE_FP8`) runs the template's
     rows-contiguous kernel gradient where named (`mosaic_gpu.tgmm`'s `k_major`), else XLA's."""
     sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
-    tile = _gradient_tile(lhs_t, rhs_t, sizes, interpret_on_cpu)
+    launch = grouped_matmul.MosaicStepScaledTgmm()
+    rows = lhs_t.shape[1]
+    # Bound as the call it is, its operands' rows first as a kernel gradient states them (`k_major` lays
+    # them out rows-contiguous).
+    tile = _planned(launch, launch.bind(jax.ShapeDtypeStruct((rows, lhs_t.shape[0]), lhs_t.dtype),
+                                        jax.ShapeDtypeStruct((rows, rhs_t.shape[0]), rhs_t.dtype),
+                                        jax.ShapeDtypeStruct(sizes.shape, jnp.int32), out_dtype='float32',
+                                        interpret=interpret_on_cpu, exact_sums=True))
     if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic_gpu':
         assert tile is not None, "the selector names the template where it plans a tile"
-        launched = grouped_matmul.MosaicTgmm()._launched(tile, interpret_on_cpu)
+        launched = launch._launched(tile, interpret_on_cpu)
         summed = mosaic_gpu.tgmm(lhs_t, rhs_t, sizes, tiles=tile, out_dtype=jnp.float32,
                                  multiprocessors=launched,
                                  interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
@@ -621,24 +629,11 @@ _blockwise_projection = contracted("test_a_blockwise_fp8_projection_holds_every_
                         nondiff_argnums=(3, 4)))
 
 
-def _gradient_tile(lhs_t, rhs_t, sizes, interpret: bool) -> mosaic_gpu.Tiles | None:
-    """The template's tile for a blockwise kernel gradient (`blockwise_fp8_kernel_gradient`): the exactly
-    summed kernel gradient's derived tile for 16-bit operands of its shapes, at a 128-row step, where the
-    16-bit tile is legal at a 64-row one (an FP8 128-row step's bytes, the shared memory and registers it
-    holds: the launch takes no FP8 kernel gradient to plan, and a 16-bit step is at most a swizzled row's 64
-    elements); None where it plans none."""
-    launch = grouped_matmul.MosaicTgmm()
-    rows = lhs_t.shape[1]
-    bound = launch.bind(jax.ShapeDtypeStruct((rows, lhs_t.shape[0]), jnp.bfloat16),
-                        jax.ShapeDtypeStruct((rows, rhs_t.shape[0]), jnp.bfloat16),
-                        jax.ShapeDtypeStruct(sizes.shape, jnp.int32), out_dtype='float32',
-                        interpret=interpret, exact_sums=True)
+def _planned(launch, bound) -> mosaic_gpu.Tiles | None:
+    """The tile `launch` plans for the call it is `bound` to on the target (its derived tile, its allocations
+    its kernel's), None where it takes none."""
     target = generation.gpu_target()
-    if not launch.eligible(bound, target) or (tile := launch.derived(bound, target)) is None:
-        return None
-    if not launch.legal(bound, dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH // 2), target):
-        return None
-    return dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH)
+    return launch.derived(bound, target) if launch.eligible(bound, target) else None
 
 
 def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax.Array:
@@ -659,27 +654,6 @@ def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax
         return total.at[owner[index]].add(scaled)
 
     return jax.lax.fori_loop(0, blocks, block, jnp.zeros((groups, depth, width), jnp.float32))
-
-
-def _step_scaled_tile(launch, bound, target, width: int, scaled: int) -> mosaic_gpu.Tiles | None:
-    """The tile the template's launch plans for a blockwise-scaled product (`blockwise_fp8_product`): its
-    derived FP8 tile at a 128-deep step, its columns the derived tile's, else the columns one column scale
-    covers (`width / scaled`, where each column has none of its own), the first legal of them whose columns
-    divide a scale's; None where it plans none (a 192-column FP8 tile at Qwen3-30B-A3B's 768-wide experts
-    plans 128, a whole scale's)."""
-    if not launch.eligible(bound, target) or (tile := launch.derived(bound, target)) is None:
-        return None
-    per = width // scaled
-    widths = (tile.block_n,) if per == 1 else tuple(each for each in dict.fromkeys((tile.block_n, per))
-                                                    if per % each == 0)
-    # A stage fewer than the derived ring's: its rows' scales stream beside it (`mosaic_gpu.gmm`'s
-    # `row_scales`, 4 bytes a row a stage, at most 4 KB), which the launch's planner does not count and a
-    # derived ring fills the block without (Qwen3-30B-A3B's projection asked past the H100's); one FP8
-    # stage (at least 32 KB at a 128-deep step) holds them.
-    stages = max(2, tile.stages - 1)
-    planned = (dataclasses.replace(tile, block_k=mosaic_gpu.STEP_SCALE_DEPTH, block_n=each, stages=stages)
-               for each in widths)
-    return next((each for each in planned if launch.legal(bound, each, target)), None)
 
 
 def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scale, *, out_dtype,

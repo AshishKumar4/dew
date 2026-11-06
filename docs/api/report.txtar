@@ -330,6 +330,10 @@ class WandbTracker(project: str, name: str | None = None, *, entity: str | None 
   .run: property
 __version__: str
 def gpu_facts(part: str | None = None) -> GpuFacts  [dew.nn.kernels.generation]
+module kernels  [dew.kernels]
+  class KernelRefused(choice: str, kernel: str, refusals: list[Refusal]) -> None  [dew.nn.kernels.selection]
+  choices = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'low_rank', 'narrow_copies', 'nvfp4', 'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
+  def use(**kernels: str) -> Iterator[None]  [dew.nn.kernels.generation]
 def pipeline(source: str, *, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, dtype: DTypeLike | None = None, param_dtype: DTypeLike | Literal['auto'] | None = None, ema: bool | None = None, step: int | str | None = None, revision: str | None = None, trust: Sequence[str] = (), options: SourceOptions | None = None, precision: Numerics | str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask  [dew.inference.loading]
 def sample(denoise: dew.diffusion.process.Denoiser | dew.diffusion.discrete.DiscreteDenoiser, x_T: jax.Array, steps: int | None = None, *, solver: dew.sampling.solvers.common.Solver[StateT], guidance: dew.sampling.guidance.Guidance | None = None, key: int | jax.Array | dew.sampling.solvers.common.RowKeys, times: jax.Array | numpy.ndarray | numpy.bool | numpy.number | bool | int | float | complex | collections.abc.Sequence[float] | None = None, initial: StateT | None = None, final_denoise: bool = True, record: collections.abc.Callable[[jax.Array, StateT, jax.Array], RecordT] | None = None) -> jax.Array | tuple[jax.Array, RecordT]  [dew.sampling.walks]
 -- config --
@@ -843,10 +847,14 @@ dew.nn.precision.Dtypes
   params: str = 'float32'
   compute: str = 'bfloat16'
   output: str = 'float32'
+dew.nn.precision.LowPrecision
+  recipe: str = 'blockwise_fp8'
+  roles: tuple[str, ...] = ('mixer', 'mlp', 'experts')
 dew.nn.precision.Numerics
   dtypes: Dtypes = dew.nn.precision.Dtypes()
   matmul: str | jax.lax.DotAlgorithmPreset = 'default'
   forms: Literal['fast', 'accurate'] = 'fast'
+  low_precision: LowPrecision | None = None
 dew.nn.sharding.Link
   bytes_per_second: float | None
   flops_per_second: float | None

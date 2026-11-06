@@ -787,6 +787,34 @@ def _gemm_on_a_tpu_core():
     }
 
 
+def test_a_tpu_launch_plans_one_program_within_its_cores_scoped_vmem():
+    """`resources.plan` on a TPU v5e for a launch on its core's bundle (`mosaic_tpu.MXU`, which budgets no
+    registers): one program at a ring its scoped VMEM holds, its DMA semaphores no VMEM byte of it (a scope
+    holding a semaphore a stage plans as one without them); one whose floor of two stages the scoped VMEM
+    does not hold plans nothing."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu, resources
+
+    family = mosaic_tpu.MXU
+
+    def launch(stage_bytes: int, *, signalled: bool) -> resources.Launch:
+        def scope(stages: int) -> resources.Scope:
+            semaphores = (pltpu.SemaphoreType.DMA((stages,)),) if signalled else ()
+            return resources.Scope(program=(pltpu.VMEM((stages * stage_bytes,), jnp.uint8), *semaphores))
+
+        return resources.Launch(scope, consumers=1, registers=0)
+
+    with generation.assumed("v5e"):
+        target = generation.gpu_target()
+        plain, signalled = (resources.plan([launch(2 ** 20, signalled=held)], family, target)
+                            for held in (False, True))
+        assert plain is not None and plain == signalled
+        (found,) = plain
+        assert found.programs == 1 and found.stages >= 2 and found.shared <= target.scoped_vmem
+        assert resources.plan([launch(target.scoped_vmem, signalled=True)], family, target) is None
+
+
 @pytest.mark.parametrize("case", ["dense bias", "grouped", "grouped transposed", "kernel gradient"])
 def test_the_gemms_kernel_bodies_run_on_a_tpu_core(case):
     """Interpreted on any host, each of the GEMM template's kernel bodies on a TPU core's bundle gives its

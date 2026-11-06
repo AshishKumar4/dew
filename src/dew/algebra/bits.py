@@ -56,7 +56,7 @@ class BitOp(enum.Enum):
     SHRV = "shf.r.u32.v"   # its first value shifted right by its second, 0 past 31 places (PTX clamps at 32)
     SHLV = "shf.l.u32.v"   # its first value shifted left by its second, 0 past 31 places
     CMP = "isetp"          # 1 where its first value compares to its second (or the immediate) as `table`
-                           # names (`_COMPARED`), else 0: ISETP and a SEL of it, two issues
+                           # names (`COMPARISONS`), else 0: ISETP and a SEL of it, two issues
     SEL = "sel"            # its second value where its first is not 0, else its third: ISETP and SEL, two
     PRMT = "prmt"          # each byte one of its two values' eight, the immediate's nibbles naming them
                            # (0-7: literal selection; a nibble's sign-replicating bit is not taken)
@@ -77,8 +77,21 @@ class BitOp(enum.Enum):
         return 2 if self in (BitOp.CMP, BitOp.SEL) else 1
 
 
-_COMPARED = ("lt", "le", "gt", "ge", "eq", "ne")
-"""A compare's predicates (`BitOp.CMP`), its `table`'s value; plus 8 signed."""
+COMPARISONS = ("lt", "le", "gt", "ge", "eq", "ne")
+"""A compare's predicates (`BitOp.CMP`), its `table`'s low three bits each's index (no other code is one);
+plus 8 signed."""
+
+_FILLED = {BitOp.LOGIC: 3, BitOp.MINMAX: 2, BitOp.CMP: 2}
+"""The operands an instruction reads whatever values it is given, the immediate filling the rest."""
+
+
+def operands(op: BitOp, values: Sequence, immediate) -> list:
+    """The operands `op` reads given `values` and its `immediate`: LOP3 three, a min, max or compare two, the
+    immediate each one past the values (PTX's `lop3.b32 d, a, imm, imm`); every other its values. The one
+    declaration execution (`_run`), emission (`_written`) and the synthesizer's proof
+    (tools/superoptimize_bits.py) read, whatever their values are (arrays, registers' names, bit-vectors)."""
+    filled = _FILLED.get(op)
+    return list(values) if filled is None else [*values, *[immediate] * (filled - len(values))]
 
 
 class BitStep(NamedTuple):
@@ -98,11 +111,13 @@ def _run[Words: (np.ndarray, jax.Array)](steps: Sequence[BitStep], outputs: Sequ
     """Each output (`outputs`, 0 the stored word, `i + 1` step `i`'s) of `steps` over `words`, uint32 arrays
     of `xp` (NumPy, or `jax.numpy` for a kernel's portable path): the one evaluation of a form's steps, as
     each instruction computes it, its shifts in 32 bits."""
-    values = [words]
+    # Each value the type of `words`, which `xp`'s operations keep and no checker follows through them.
+    values: list = [words]
     for step in steps:
         first = values[step.args[0]] if step.args else xp.zeros_like(words)
         amount = xp.uint32(step.immediate)
-        operands = [values[arg] for arg in step.args]
+        given = [values[arg] for arg in step.args]
+        read = operands(step.op, given, xp.full_like(first, amount))
         if step.op is BitOp.SHR:
             value = first >> amount
         elif step.op is BitOp.ROTR:
@@ -112,43 +127,43 @@ def _run[Words: (np.ndarray, jax.Array)](steps: Sequence[BitStep], outputs: Sequ
         elif step.op is BitOp.LOP3:
             value = (first if len(step.args) == 1 else first ^ values[step.args[1]]) & amount
         elif step.op is BitOp.LOGIC:
-            value = _looked_up(step.table, [*operands, xp.full_like(first, amount)][:3], xp)
+            value = _looked_up(step.table, read, xp)
         elif step.op is BitOp.IADD3:
             value = amount + sum((xp.uint32(0) - operand if step.table >> index & 1 else operand)
-                                 for index, operand in enumerate(operands))
+                                 for index, operand in enumerate(given))
         elif step.op is BitOp.IMAD:
-            value = first * amount + (operands[1] if len(operands) > 1 else xp.uint32(0))
+            value = first * amount + (given[1] if len(given) > 1 else xp.uint32(0))
         elif step.op is BitOp.MINMAX:
-            pair = [*operands, xp.full_like(first, amount)][:2]
+            pair = read
             if step.table & 1:
                 pair = [value.astype(xp.int32) for value in pair]
             value = (xp.maximum if step.table & 2 else xp.minimum)(*pair)
         elif step.op is BitOp.SAR:
             value = first.astype(xp.int32) >> xp.int32(step.immediate)
         elif step.op in (BitOp.SHRV, BitOp.SHLV):
-            places = operands[1]
+            places = given[1]
             shifted = first >> xp.minimum(places, xp.uint32(WORD - 1)) if step.op is BitOp.SHRV \
                 else first << xp.minimum(places, xp.uint32(WORD - 1))
             value = xp.where(places < xp.uint32(WORD), shifted, xp.uint32(0))
         elif step.op is BitOp.CMP:
-            left, right = [*operands, xp.full_like(first, amount)][:2]
+            left, right = read
             if step.table & 8:
                 left, right = left.astype(xp.int32), right.astype(xp.int32)
             compared = {"lt": left < right, "le": left <= right, "gt": left > right, "ge": left >= right,
-                        "eq": left == right, "ne": left != right}[_COMPARED[step.table & 7]]
+                        "eq": left == right, "ne": left != right}[COMPARISONS[step.table & 7]]
             value = compared.astype(xp.uint32)
         elif step.op is BitOp.SEL:
-            value = xp.where(first != xp.uint32(0), operands[1], operands[2])
+            value = xp.where(first != xp.uint32(0), given[1], given[2])
         else:
-            value = _permuted(operands, step.immediate, xp)
+            value = _permuted(given, step.immediate, xp)
         values.append(value.astype(xp.uint32))
     return tuple(values[index] for index in outputs)
 
 
 def _looked_up[Words: (np.ndarray, jax.Array)](table: int, operands: Sequence[Words], xp) -> Words:
-    """LOP3's `table` over `operands` (its first operand's truth table 0xF0, the second's 0xCC, the third's
+    """LOP3's `table` over its three `operands` (the first's truth table 0xF0, the second's 0xCC, the third's
     0xAA), as the sum of its minterms: each set bit of the table the AND of each operand or its complement."""
-    a, b, c = (*operands, *[xp.zeros_like(operands[0])] * (3 - len(operands)))
+    a, b, c = operands
     value = xp.zeros_like(a)
     for minterm in range(8):
         if table >> minterm & 1:
@@ -369,8 +384,7 @@ def _written(step: BitStep, out: str, ins: Sequence[str]) -> str:
     if step.op.linear:
         return _PTX[step.op, step.unit](out, ins, step.immediate)
     if step.op is BitOp.LOGIC:
-        operands = [*ins, imm, imm][:3]
-        return f"lop3.b32 {out}, {', '.join(operands)}, {step.table:#04x};"
+        return f"lop3.b32 {out}, {', '.join(operands(step.op, ins, imm))}, {step.table:#04x};"
     if step.op is BitOp.IADD3:
         lines = [f"mov.b32 {out}, {imm};"]
         lines += [f"{'sub' if step.table >> index & 1 else 'add'}.u32 {out}, {out}, {value};"
@@ -380,14 +394,15 @@ def _written(step: BitStep, out: str, ins: Sequence[str]) -> str:
         return f"mad.lo.u32 {out}, {ins[0]}, {imm}, {ins[1] if len(ins) > 1 else 0};"
     if step.op is BitOp.MINMAX:
         kind = f"{'max' if step.table & 2 else 'min'}.{'s32' if step.table & 1 else 'u32'}"
-        return f"{kind} {out}, {ins[0]}, {ins[1] if len(ins) > 1 else imm};"
+        return f"{kind} {out}, {', '.join(operands(step.op, ins, imm))};"
     if step.op is BitOp.SAR:
         return f"shr.s32 {out}, {ins[0]}, {step.immediate};"
     if step.op in (BitOp.SHRV, BitOp.SHLV):
         return f"{'shr' if step.op is BitOp.SHRV else 'shl'}.b32 {out}, {ins[0]}, {ins[1]};"
     if step.op is BitOp.CMP:
-        kind = f"{_COMPARED[step.table & 7]}.{'s32' if step.table & 8 else 'u32'}"
-        return (f"{{ .reg .pred p; setp.{kind} p, {ins[0]}, {ins[1] if len(ins) > 1 else imm}; "
+        kind = f"{COMPARISONS[step.table & 7]}.{'s32' if step.table & 8 else 'u32'}"
+        left, right = operands(step.op, ins, imm)
+        return (f"{{ .reg .pred p; setp.{kind} p, {left}, {right}; "
                 f"selp.b32 {out}, 1, 0, p; }}")
     if step.op is BitOp.SEL:
         return f"{{ .reg .pred p; setp.ne.u32 p, {ins[0]}, 0; selp.b32 {out}, {ins[1]}, {ins[2]}, p; }}"

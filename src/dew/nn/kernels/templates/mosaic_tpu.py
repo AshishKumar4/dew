@@ -187,6 +187,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     walks_scoped = False
 
+    budgets_registers = False
+
     def registers(self, consumers: int, programs: int = 1) -> int:
         raise NotImplementedError("a TPU core budgets no registers: its values spill to VMEM")
 
