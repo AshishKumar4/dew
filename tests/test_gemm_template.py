@@ -1142,6 +1142,38 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
                         seeds=SEEDS, truth_fn=truth)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_a_fused_regions_consumer_reads_its_product_as_the_dot_rounds_it(generation_name):
+    """A region fused through `fused_gemm.fused`, its dot written as `fused_gemm.product` declaring a bf16
+    result: its consumer, run in the epilogue, reads the accumulator rounded once to bf16, the dot's own
+    rounding, before its first operation, so the region's value is the program's bitwise. Over integers
+    whose sums pass bf16's 256 (the rounding matters; every product and fp32 sum exact): a bias added to the
+    bf16 product, as XLA's program adds it; and `fused_gemm.analysis` reports the epilogue fused, run on
+    nothing."""
+    sizes = jnp.asarray([96, 40], jnp.int32)
+    keys = jax.random.split(jax.random.key(7), 3)
+    x = jax.random.randint(keys[0], (136, 128), -7, 8).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (2, 128, 256), -7, 8).astype(jnp.bfloat16)
+    bias = jax.random.randint(keys[2], (256,), -3, 4).astype(jnp.bfloat16)
+
+    def region(x, w, bias):
+        return fused_gemm.product(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True) + bias
+
+    def program(x, w, bias):
+        return jax.lax.ragged_dot(x, w, sizes, preferred_element_type=jnp.float32).astype(jnp.bfloat16) + bias
+
+    with generation.assumed(generation_name):
+        found = fused_gemm.analysis(region, x, w, bias)
+        assert found.epilogue is not None and found.epilogue.kernel == "fused", found
+        got = jax.jit(functools.partial(fused_gemm.fused, region))(x, w, bias)
+    expected = np.asarray(program(x, w, bias), np.float32)
+    np.testing.assert_array_equal(np.asarray(got, np.float32), expected)
+    # The draw tells the two roundings apart: the fp32 sum plus the bias, rounded once, differs.
+    once = jax.lax.ragged_dot(x, w, sizes, preferred_element_type=jnp.float32) + bias.astype(jnp.float32)
+    assert np.any(np.asarray(once.astype(jnp.bfloat16), np.float32) != expected)
+
+
 def _moved_columns(columns: int, block: int):
     """A consumer adding to the product a residual's column block `c * c - c` at the product's column block
     `c` (blocks of `block` columns), as a custom fusion whose pull rule says so: block 1 reads block 0, while
