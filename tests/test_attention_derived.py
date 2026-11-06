@@ -562,8 +562,6 @@ def test_a_split_decodes_states_merge_and_finish_by_the_derived_forms():
     """A split decode's slices' states (`[rows, splits, queries, heads]`, `decode_attention._combined`) of an
     fp16 call under the run's fast forms, merged and finished by the derived forms over every row whatever
     the states' leading axes: on par with XLA's merge in one sum against float64's (check 1)."""
-    from dew.nn.kernels import decode_attention
-
     spec = decode_attention._spec(0.25, 1.0, None, natural=False, dtype=jnp.float16, sinks=False)
 
     def states(seed):

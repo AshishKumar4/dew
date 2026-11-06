@@ -33,8 +33,8 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         UniPC,
     )
     from dew.sampling.strategies import Beam, Sample, Speculative, Strategy, TreeSpeculative
-    from dew.sampling.trees import TreeShape
     from dew.sampling.text import Generation, Sampling, generate, with_ids_of
+    from dew.sampling.trees import TreeShape
     from dew.sampling.walks import sample
 
 _EXPORTS = {
