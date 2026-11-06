@@ -563,12 +563,13 @@ class Pretrained:
             sources.SourceReference(str(name_or_dir), revision, subfolder, remote_code=trust_remote_code),
             selected, fallback,
             modeling_overrides)
-        loading = load_settings(reference.directory(directory), numerics, dtype, param_dtype)
+        loading = load_settings(reference.directory(directory), numerics, dtype, param_dtype, max_seq_len)
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file, single_file=single_file,
             dduf_file=dduf_file, placed=placed, streaming=streaming or not weights, weights=weights,
             dtype=loading.dtype, param_dtype=loading.param_dtype, attention_impl=attention_impl,
-            max_seq_len=max_seq_len, overrides=modeling_overrides, trust_remote_code=trust_remote_code,
+            max_seq_len=loading.max_seq_len, overrides=modeling_overrides,
+            trust_remote_code=trust_remote_code,
             text_only=text_only, prediction_depths=prediction_depths)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "

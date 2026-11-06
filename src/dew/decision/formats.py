@@ -125,7 +125,7 @@ def decision_plan(bundle: PretrainedDecision) -> ReleasePlan | Unwritable:
     # restates it, as the bundle computes, so a load of what it writes computes as it does; a source whose
     # record states none (an external release's) leaves its files' own.
     stated = (bundle.source is None or bundle.numerics is not None
-              or released(bundle.source)[2] is not None)
+              or released(bundle.source).compute is not None)
     compute = computed_in(bundle.numerics, bundle.model, bundle.variables) if stated else None
     envelope = decision_envelope(backbone.envelope, layout, calibration, max_length=max_length,
                                  numerics=bundle.numerics, compute=compute)
