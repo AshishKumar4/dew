@@ -416,12 +416,14 @@ def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, parts=None, 
 
 def call_tree(metadata) -> tuple[int, ...] | None:
     """A recurrent mixer's call's tree (`dew.nn.inputs.AttentionMetadata.tree_parents`), None for none: its
-    key runs are the tree's attention mask, which a recurrence reads as the tree, and refused without
-    one, which it would run as if unset."""
+    key runs and key positions are the tree's attention mask and the places a windowed attention layer
+    windows it over, which a recurrence following the parents has no use for; either without a tree is
+    refused, which it would run as if unset."""
     tree = None if metadata is None else metadata.tree_parents
-    if tree is None and metadata is not None and metadata.key_runs is not None:
-        raise ValueError("a recurrent mixer reads key runs only as a tree call's attention mask, and would "
-                         "run them as if unset")
+    if tree is None and metadata is not None and (metadata.key_runs is not None
+                                                  or metadata.key_positions is not None):
+        raise ValueError("a recurrent mixer reads key runs and key positions only beside a tree call's "
+                         "tree, and would run them as if unset")
     return tree
 
 
@@ -818,11 +820,10 @@ class GatedDeltaNet(nn.Module):
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's alone, and the key runs that
-    mask its attention beside it: a recurrence reads every earlier token of its document, with no mask
-    or bias to narrow it, and on a tree its path's (`tree_conv`, `tree_rule`). Key runs without a tree
-    are refused."""
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
+    of its attention beside it (`call_tree`): a recurrence reads every earlier token of its document,
+    with no mask or bias to narrow it, and on a tree its path's (`tree_scan`)."""
 
     emb_features: int
     num_k_heads: int

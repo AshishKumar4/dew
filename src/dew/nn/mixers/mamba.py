@@ -111,9 +111,9 @@ class Mamba(nn.Module):
     (`segment_ids`) run as if alone.
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs that mask its
-    attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
+    of its attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
 
     emb_features: int
     intermediate_size: int

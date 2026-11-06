@@ -36,9 +36,9 @@ class GatedShortConv(nn.Module):
     bias product, its code zeroing a padded slot's input before them alone. Parameter names are the
     checkpoint's (`conv/weight` the `[D, 1, K]` taps)."""
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs that mask its
-    attention beside it (`dew.nn.linear.call_tree`): a convolution reads the K-1 tokens before each of
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
+    of its attention beside it (`dew.nn.linear.call_tree`): a convolution reads the K-1 tokens before each of
     its document, on a tree the K-1 on its path (`tree_conv`)."""
 
     emb_features: int

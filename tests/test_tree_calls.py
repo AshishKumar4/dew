@@ -143,11 +143,11 @@ def tree_runs(rows: int, prompt: int, tree: tuple[int, ...]) -> jax.Array:
 @pytest.mark.parametrize("tree", [TREE, (-1,)], ids=["branching", "one-token"])
 def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone(tree, mixer):
     """A recurrent mixer's tree call (`dew.nn.linear.tree_scan`, a convolution's `tree_conv`) beside
-    attention's, each
-    token at its depth's position: each token's logits are on par with its root-to-token path decoded as
-    a plain cached call from the same cache, from the float64 run's (check 1), its conv over its
-    ancestors and past the root the cache's history, its recurrence from its parent's state; a one-token
-    tree too, which takes the tree's path where a step would take a single token's."""
+    attention's, each token at its depth's position and its attention's keys at theirs: each token's
+    logits are on par with its root-to-token path decoded as a plain cached call from the same cache,
+    from the float64 run's (check 1), its conv over its ancestors and past the root the cache's history,
+    its recurrence from its parent's state; a one-token tree too, which takes the tree's path where a
+    step would take a single token's."""
     model = hybrid_model(mixer)
     wide = float64_twin(model)
     rows = 2
@@ -162,9 +162,14 @@ def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone(tree, mi
     def tree_logits(params, prompt, block):
         cache = cached(model, params, prompt)
         placed = jnp.broadcast_to(PROMPT + jnp.asarray(depths(tree)), (rows, len(tree)))
+        # The keys' places as a tree verify states them, each cache slot's: the prompt's, then each tree
+        # token's its depth's.
+        slots = jnp.arange(model.max_seq_len).at[PROMPT:PROMPT + len(tree)].set(
+            PROMPT + jnp.asarray(depths(tree)))
+        keys = jnp.broadcast_to(slots, (rows, model.max_seq_len))
         logits, _ = model.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
                                 attention_tree=tree, attention_key_runs=tree_runs(rows, PROMPT, tree),
-                                rotary_positions=placed)
+                                attention_key_positions=keys, rotary_positions=placed)
         return logits
 
     def decoded(decoder):

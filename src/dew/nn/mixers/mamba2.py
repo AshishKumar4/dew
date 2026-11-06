@@ -229,9 +229,9 @@ class Mamba2(nn.Module):
     (`recurrence_algebra.entering`); decoding and padded rows are refused there.
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs that mask its
-    attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
+    of its attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
     """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
     of its document, with no mask or bias to narrow it."""
 
