@@ -66,20 +66,24 @@ def stored(layout, keys, values=None, dtype=jnp.float32):
 def test_a_head_that_serves_as_keys_and_values_is_kept_once_where_its_layout_stores_it_as_given(layout, once):
     """A store whose values are its keys (DeepSeek V4's window head and its drafter's context,
     `keys_as_values`) reads back what a store holding the head twice reads, keys and values alike, and
-    holds fewer bytes where its layout stores keys as given, full precision or float8, where both were
-    allocated and written (ledger 1921); int8's keys are rotated, not the values' layout, so it keeps
-    both (`KVCache.key_rotation`)."""
+    holds the twice-held store's leaves but its values' where its layout stores keys as given, full
+    precision or float8 (ledger 1921): each the same shape and dtype. int8's keys are rotated, not the
+    values' layout, so it keeps every leaf (`KVCache.key_rotation`)."""
     keys = jax.random.normal(jax.random.key(0), (2, 8, 1, 16))
 
     def kept(holder):
         cache = holder.init(jax.random.key(0), keys, keys)["cache"]
         read, written = holder.apply({"cache": cache}, keys, keys, mutable=["cache"])
-        return read, sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(written))
+        leaves = jax.tree_util.tree_flatten_with_path(written)[0]
+        return read, {jax.tree_util.keystr(path): (leaf.shape, leaf.dtype) for path, leaf in leaves}
 
-    (shared, shared_bytes), (separate, separate_bytes) = (kept(Holder(layout, keys_as_values=flag))
-                                                         for flag in (True, False))
+    (shared, shared_leaves), (separate, separate_leaves) = (kept(Holder(layout, keys_as_values=flag))
+                                                           for flag in (True, False))
     jax.tree.map(np.testing.assert_array_equal, shared, separate)
-    assert (shared_bytes < separate_bytes) == once and shared_bytes <= separate_bytes
+    values = ("cached_value", "value_scale")
+    assert shared_leaves == {path: held for path, held in separate_leaves.items()
+                             if not (once and path.endswith(tuple(f"['{name}']" for name in values)))}
+    assert any(path.endswith("['cached_value']") for path in separate_leaves)
 
 
 def outlier_keys(seed=0):
