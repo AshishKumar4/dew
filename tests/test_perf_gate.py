@@ -600,7 +600,8 @@ def test_a_step_is_planned_and_compiled_ahead_for_an_absent_gpu_with_the_gates_a
     substituted, and every selected field of its plan with its own value. A compile that substituted a
     kernel is the gate's unsupported row (`compile`'s test, at its process boundary)."""
     script = gate._script(tmp_path / "compiled.json", gate.COMPILED)
-    argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), gate.AHEAD_ATTENTION, ",".join(gate.SELECTED)]
+    selected = ",".join(gate.SELECTED)
+    argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), gate.AHEAD_ATTENTION, selected]
     done = gate._run(ROOT, Path(sys.executable), "", argv, ROOT / "tools", 900, tmp_path / "compiles")
     assert done.returncode == 0, done.stderr[-3000:]
     ahead = json.loads(done.stdout.strip().splitlines()[-1])
