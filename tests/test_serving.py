@@ -939,6 +939,57 @@ def test_a_hybrid_servers_host_states_fit_the_bytes_of_its_host_pages(host_pages
     assert part.states.host.slots * entry <= budget < (part.states.host.slots + 1) * entry
 
 
+def thin_hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
+    """`hybrid_model` with a delta net of one 4-by-4 value head and a two-tap convolution: a row state of
+    224 bytes, under half a page of four tokens' keys (512 bytes), so a host tier holds more states than
+    pages."""
+    return CausalTransformer(
+        vocab_size=vocab_size, emb_features=width, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
+        mlp_features=2 * width, max_seq_len=128, dtype="float32",
+        layer_types=("linear_attention",) * 2 + ("full_attention",),
+        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
+            "linear_num_key_heads": 1, "linear_num_value_heads": 1, "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2}}}})
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
+    """A hybrid stack whose row state is smaller than a page keeps more states on the host than pages
+    (`thin_hybrid_model`: four states in two pages' bytes), each in its own slot: three prompts send
+    their states there as a store of one entry gives way, the third to the slot past the pages' count,
+    and their repeats read each back with its own prefix (ledger 4602's review), each request drawing
+    what it draws alone and scoring it as a full forward does (check 1)."""
+    model = thin_hybrid_model(256)
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    task = TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+    requests = (Served(9), Served(9, flipped=(0,)), Served(9, flipped=(0, 1)), Served(9, flipped=(0, 2)),
+                Served(9, flipped=(0, 1)), Served(9, flipped=(0,)))
+    serving = {**HYBRID_SHARED, "slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8),
+               "host_pages": 2, "prefix_states": 1}
+    server = Server.from_task(task, **serving)
+    assert server.rows.pages[0].states.host.slots == 4
+    assert_served_as_exact(task, requests, "thin hybrid host states", serving=serving,
+                           rounds=(1,) * len(requests), budget=8, seeds=(256, 256))
+
+
+def test_a_one_tap_convolutions_empty_state_fits_any_host_tier():
+    """A one-tap short convolution keeps an empty conv tail beside paged attention, a row state of no
+    bytes: a server of it builds, its state host tier as many slots as the pages' (ledger 4602's review),
+    with no host tier and with one."""
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2, head_dim=8,
+        mlp_features=32, max_seq_len=128, dtype="float32", layer_types=("conv", "full_attention"),
+        kinds={"conv": {"mixer": {"class": "short_conv", "fields": {"conv_L_cache": 1}}}})
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    task = TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+    for host_pages in (0, 3):
+        server = Server.from_task(task, **{**HYBRID_SHARED, "host_pages": host_pages})
+        part = server.rows.pages[0]
+        assert part.states is not None and part.states.host.slots == part.host == host_pages
+
+
 def test_a_shared_segment_is_refused_where_no_server_keeps_it_or_it_splits_its_prompt():
     """A declared shared segment (`Server.submit`'s `shared`) is kept by a paged server with a prefix cache
     alone and holds some of the prompt's tokens but not its last: a dense server's, an empty one and a

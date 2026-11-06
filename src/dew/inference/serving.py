@@ -436,7 +436,8 @@ class PagedRows:
             state = sum(_nbytes(leaf) // leaf.shape[row_axis(path)] for path, leaf in leaves
                         if row_state(path))
             for part in self.pages:
-                part.states = States(self.states, host=part.host * page // state)
+                # A state of no bytes (a one-tap convolution's empty tail) fits wherever a page does.
+                part.states = States(self.states, host=part.host * page // state if state else part.host)
 
     @property
     def stateful(self) -> bool:
@@ -741,7 +742,9 @@ class Server:
         self._host_states: dict[int, list[np.ndarray]] | None = None
         """The row state store's host tier: each of this process's host slots, by the slot's global index,
         its entry of each state leaf (`dew.inference.pages.States`); None without one."""
-        if self._states is not None and isinstance(rows, PagedRows) and rows.pages[0].host:
+        states_host = (rows.pages[0].states.host.slots if isinstance(rows, PagedRows)
+                       and rows.pages[0].states is not None else 0)
+        if self._states is not None and states_host:
             self._host_states = {}
             self._read_entries, self._written_entries = map(Fetched, entry_programs(self._states,
                                                                                     self._admitted))
@@ -1206,8 +1209,9 @@ class Server:
             return {"copies": [], "spills": [], "uploads": [], "state_spills": [], "state_uploads": []}
         per, host = self.rows.pages[0].count, self.rows.pages[0].host
         owed = [(group, self.rows.pages[group].drained()) for group in self._local]
-        # The row states' moves, by the store's global entry and the host tier's global slot.
+        # The row states' moves, by the store's global entry and its own host tier's global slot.
         entries = self.rows.states
+        state_host = 0 if self.rows.pages[0].states is None else self.rows.pages[0].states.host.slots
         moved = [(group, (([], []) if part.states is None else part.states.drained()))
                  for group, part in ((group, self.rows.pages[group]) for group in self._local)]
         return {"copies": [[group * per + source, group * per + page] for group, held in owed
@@ -1216,9 +1220,9 @@ class Server:
                            for page, slot in held.spills],
                 "uploads": [[group * host + slot, group * per + page] for group, held in owed
                             for slot, page in held.uploads],
-                "state_spills": [[group * entries + entry, group * host + slot]
+                "state_spills": [[group * entries + entry, group * state_host + slot]
                                  for group, (spills, _) in moved for entry, slot in spills],
-                "state_uploads": [[group * host + slot, group * entries + entry]
+                "state_uploads": [[group * state_host + slot, group * entries + entry]
                                   for group, (_, uploads) in moved for slot, entry in uploads]}
 
     def _copied(self, copies: Sequence[tuple[int, int]]) -> None:
@@ -1246,7 +1250,9 @@ class Server:
         def write(pages: np.ndarray, held: Variables) -> None:
             self._resident, self._carried = self._written_pages(self._resident, self._carried, pages, held)
 
-        self._host_moves(spills, uploads, self._host, phase="the prefix cache's spilled pages",
+        assert isinstance(self.rows, PagedRows)
+        self._host_moves(spills, uploads, self._host, self.rows.pages[0].host,
+                         phase="the prefix cache's spilled pages",
                          read=lambda pages: self._read_pages(self._resident, self._carried, pages),
                          write=write, shapes=lambda count: page_shapes(self._resident, self._carried, count))
 
@@ -1261,22 +1267,24 @@ class Server:
         def write(entries: np.ndarray, held: Variables) -> None:
             self._states = self._written_entries(self._states, entries, held)
 
-        self._host_moves(spills, uploads, self._host_states, phase="the prefix cache's spilled row states",
+        assert isinstance(self.rows, PagedRows) and self.rows.pages[0].states is not None
+        self._host_moves(spills, uploads, self._host_states, self.rows.pages[0].states.host.slots,
+                         phase="the prefix cache's spilled row states",
                          read=lambda entries: self._read_entries(self._states, entries), write=write,
                          shapes=lambda count: entry_shapes(states, count))
 
     def _host_moves(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]],
-                    tier: dict[int, list[np.ndarray]], *, read: Callable[[np.ndarray], Variables],
+                    tier: dict[int, list[np.ndarray]], host: int, *, read: Callable[[np.ndarray], Variables],
                     write: Callable[[np.ndarray, Variables], None], shapes: Callable[[int], Variables],
                     phase: str) -> None:
         """Move a device store's places (a pool's pages, a row state store's entries) to and from the host
-        `tier`: each spilled place out to its slot, `read` a fixed number a call, then each uploaded slot
-        back into its place, `write` a fixed number a call, so one program of each serves every step. A
-        process keeps the slots of its own groups, and hands the places written in a row per group, its
-        groups' rows its own (`_placed`), each group's at most as many as its share of an admission
-        reads."""
+        `tier` of `host` slots a group: each spilled place out to its slot, `read` a fixed number a call,
+        then each uploaded slot back into its place, `write` a fixed number a call, so one program of each
+        serves every step. A process keeps the slots of its own groups, and hands the places written in a
+        row per group, its groups' rows its own (`_placed`), each group's at most as many as its share of
+        an admission reads."""
         assert isinstance(self.rows, PagedRows)
-        host, width = self.rows.pages[0].host, self.admission * self.rows.width
+        width = self.admission * self.rows.width
         for start in range(0, len(spills), width):
             batch = spills[start:start + width]
             places, _ = _padded(batch, width, 1)
