@@ -225,6 +225,11 @@ def _cyclic(classes: Mapping[Hashable, Sequence[Node]]) -> dict[Hashable, int]:
             if sizes[labels[number]] > 1 or (number, number) in edges}
 
 
+FEASIBLE = 1e-6
+"""The relative slack a solved level's bound keeps for the next (`_Program.level`): above HiGHS's primal
+feasibility tolerance (1e-7), below any price difference a level resolves (a millionth of its unit)."""
+
+
 class _Program:
     """The integer program over `nodes` (`solved`): its variables each node's choice, then each cyclic
     class's order, then each level's bound; its rows the DAG's constraints, a level's held optimum added as
@@ -285,7 +290,11 @@ class _Program:
         objective = {number: level.added * scale for number, level in enumerate(levels)
                      if level.added and math.isfinite(level.added)}
         objective[bound] = 1.0
-        self.rows.append((objective, -np.inf, self._least(objective)))
+        # Held at its least within the solver's feasibility tolerance: the least it reports is met only
+        # within it, so a bound of exactly it may leave the next level no feasible point (the paged decode's
+        # forms, HiGHS status 8); a choice the slack lets past is refused by `_dearer_before`.
+        least = self._least(objective)
+        self.rows.append((objective, -np.inf, least + FEASIBLE * max(1.0, abs(least))))
 
     def solution(self) -> list[bool]:
         """Each node's choice at the last level solved."""
