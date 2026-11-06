@@ -1422,10 +1422,22 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     return {name: np.stack(held) for name, held in found.items()}
 
 
+CARRIED_GRADIENT_SHARES = {"dv": 0.5, "entering": 0.5}
+"""The least share of the reverse walk's records at which a backward reading another output's and final
+memory's gradients (another seed's) is refused."""
+
+
 def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
     """The step witness of the delta rule's fast backward (`back_enclosures`): a bf16 call of three chunks,
-    every record each launch keeps inside its step's enclosure."""
-    back = recorded_backward(draw(0, "mild", heads=heads))
+    every record each launch keeps inside its step's enclosure; and a backward that read another output's
+    and final memory's gradients refused (`CARRIED_GRADIENT_SHARES`): its records, claimed for those given."""
+    operands = draw(0, "mild", heads=heads)
+    back = recorded_backward(operands)
     held = back_witnessed(back, lane)
     for name in BACK_RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
+    other = recorded_backward(operands, seed=1)
+    claimed = back._replace(dh=other.dh, dh0=other.dh0, records=other.records)
+    refused = back_witnessed(claimed, lane)
+    for name, share in CARRIED_GRADIENT_SHARES.items():
+        assert np.mean(~refused[name]) >= share, (name, np.mean(~refused[name]))
