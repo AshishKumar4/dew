@@ -37,7 +37,6 @@ from flax.typing import Dtype
 
 from dew import _records
 from dew.batch import Variables
-from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 from dew.nn.kernels.options import program
 
@@ -47,7 +46,7 @@ from ..blocks import Upsample
 from ..conv import Conv
 from ..norms import l2_normalized
 from ..precision import at_least_fp32
-from .api import AutoEncoder, LatentNormalization, published_source
+from .api import AutoEncoder, LatentNormalization, bound_autoencoder, published_source
 from .kl import posterior_latent
 
 if TYPE_CHECKING:
@@ -510,9 +509,8 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
     video = jax.ShapeDtypeStruct(
         (1, 1 + model.temporal_factor, model.downscale_factor, model.downscale_factor, 3), jnp.float32
     )
-    return bind_component(
-        directory, "vae", config, model, wan_vae_path,
+    return bound_autoencoder(
+        directory, config, model, wan_vae_path,
         lambda bound: WanAutoencoder(model=model, params=bound, latents_mean=config["latents_mean"],
                                      latents_std=config["latents_std"]),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(video,),
-        shapes=shapes)
+        params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes, inputs=(video,))
