@@ -355,6 +355,7 @@ dew.config.DecoderRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -391,6 +392,7 @@ dew.config.RunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -459,6 +461,7 @@ dew.config.diffusion.DiffusionRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -492,6 +495,7 @@ dew.config.env.EnvRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -524,6 +528,7 @@ dew.config.jepa.JepaRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.001))()
@@ -544,6 +549,7 @@ dew.config.lm.LMRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.0006, weight_decay=0.1, clip_grads=1.0))()
@@ -594,6 +600,7 @@ dew.config.world_model.WorldModelRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -613,6 +620,7 @@ dew.decision.config.DecisionRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
+  kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
   source: dew.config.SourceOptions = dew.config.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=2.5e-05))()
