@@ -231,14 +231,34 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 _GRID_NAMES.reset(token)
 
         def launched(*operands):
-            # A table its programs read an element at a time in scalar memory, every other operand in HBM.
-            spaces = [pltpu.SMEM if at < scalars else pl.ANY for at in range(len(operands))]
-            return launches.pallas_call(
-                named, name=name or self.name, out_shape=out_type, grid=grid,
+            # A table its programs read an element at a time in scalar memory, every other operand in HBM. A
+            # ref the launch adds into in place (`jax.new_ref`, `mosaic.stacked_zeros`) goes in as its value
+            # aliased to an output of its own (`input_output_aliases`), which the program reads and writes as
+            # the ref, and which is written back into the ref after the call. Its programs run in turn
+            # ("arbitrary"), so one's read-modify-write of a shared view (`added`) races no other's.
+            places = [at for at, operand in enumerate(operands)
+                      if isinstance(jax.typeof(operand), state_types.AbstractRef)]
+            values = [operand[...] if at in places else operand for at, operand in enumerate(operands)]
+            outputs, structure = jax.tree.flatten(out_type)
+            aliased = [jax.ShapeDtypeStruct(values[at].shape, values[at].dtype) for at in places]
+
+            def program(*refs):
+                given, made = list(refs[:len(values)]), refs[len(values):]
+                for at, ref in zip(places, made[len(outputs):], strict=True):
+                    given[at] = ref
+                return named(*given, *made[:len(outputs)])
+
+            spaces = [pltpu.SMEM if at < scalars else pl.ANY for at in range(len(values))]
+            results = launches.pallas_call(
+                program, name=name or self.name, out_shape=(*outputs, *aliased), grid=grid,
                 in_specs=[pl.BlockSpec(memory_space=space) for space in spaces],
-                out_specs=jax.tree.map(lambda _: pl.BlockSpec(memory_space=pl.ANY), out_type),
-                compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",) * len(grid)),
-                interpret=pltpu.InterpretParams() if interpret else False, cost_estimate=cost)(*operands)
+                out_specs=[pl.BlockSpec(memory_space=pl.ANY)] * (len(outputs) + len(aliased)),
+                input_output_aliases={at: len(outputs) + k for k, at in enumerate(places)},
+                compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",) * len(grid)),
+                interpret=pltpu.InterpretParams() if interpret else False, cost_estimate=cost)(*values)
+            for at, result in zip(places, results[len(outputs):], strict=True):
+                operands[at][...] = result
+            return jax.tree.unflatten(structure, results[:len(outputs)])
 
         return launched
 
@@ -402,9 +422,16 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             pltpu.sync_copy(smem, view)
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
-        del pending
-        raise NotImplementedError("a TPU core adds into HBM by no atomic: a split contraction's partial "
-                                  "sums take a place each")
+        # No atomic into HBM: the view read into VMEM, added to and written back, the launch's programs in
+        # turn (`kernel`'s "arbitrary" grid), so no other program's add falls between.
+        del interpret, smem, pending
+
+        def add(held):
+            pltpu.sync_copy(view, held)
+            held[...] = held[...] + value.astype(held.dtype)
+            pltpu.sync_copy(held, view)
+
+        pl.run_scoped(add, pltpu.VMEM(view.shape, view.dtype))
 
 
 @dataclasses.dataclass(frozen=True)
