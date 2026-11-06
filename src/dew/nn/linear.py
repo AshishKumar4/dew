@@ -413,6 +413,40 @@ def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, parts=None, 
     return tuple(piece[:, -1].reshape(batch, length, -1) for piece in convolved)
 
 
+def call_tree(metadata) -> tuple[int, ...] | None:
+    """A recurrent mixer's call's tree (`dew.nn.inputs.AttentionMetadata.tree_parents`), None for none: its
+    key runs are the tree's attention mask, which a recurrence reads as the tree, and refused without
+    one, which it would run as if unset."""
+    tree = None if metadata is None else metadata.tree_parents
+    if tree is None and metadata is not None and metadata.key_runs is not None:
+        raise ValueError("a recurrent mixer reads key runs only as a tree call's attention mask, and would "
+                         "run them as if unset")
+    return tree
+
+
+def tree_scan(module: nn.Module, mixed, taps, bias, tree: tuple[int, ...], rule,
+              sequence: Sequence[jax.Array], *, state: str = 'ssm_state', state_dtype=None, parts=None,
+              dtype=None):
+    """`held_scan`'s conv and scan over a tree call (`tree_conv`, `tree_rule`): each token convolved over
+    its path from the row's held `conv_state`, and advanced by `rule(convolved, *sequence, held)` (each
+    `[B, 1, ...]`, the convolved `parts` where given) from its parent's state, the held `state` past the
+    root, in `state_dtype`; the cache left as it was, which a verify replays its accepted path into."""
+    if not module.has_variable('cache', state):
+        raise ValueError("a tree call reads a row's cache, which a decode call allocates first")
+    held = module.get_variable('cache', state)
+    convolved = tree_conv(mixed, taps, bias, module.get_variable('cache', 'conv_state'), tree, parts=parts,
+                          dtype=dtype)
+    pieces = tuple(convolved) if parts is not None else (convolved,)
+    count = len(pieces)
+
+    def step(*operands):
+        pieced, rest, prior = operands[:count], operands[count:-1], operands[-1]
+        return rule(pieced if parts is not None else pieced[0], *rest, prior)
+
+    out = tree_rule(step, tree, (*pieces, *sequence), held.astype(state_dtype or held.dtype))
+    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+
+
 def tree_rule(rule, tree: tuple[int, ...], operands: Sequence[jax.Array], held: jax.Array):
     """A tree call's recurrence: each token advanced by `rule(*its operands [B, 1, ...], state)` from its
     parent's state, the held `held` past the root, in tree order: its outputs `[B, S, ...]`. The tokens'
@@ -984,17 +1018,16 @@ class GatedDeltaNet(nn.Module):
         return token
 
     def _tree(self, mixed, g, beta, tree: tuple[int, ...], heads, widths, wide):
-        """A tree call's convolved tokens and recurrence (`tree_conv`, `tree_rule`): each token on its path,
-        from the row's held history and state past the root, the cache left as it was."""
-        if not self.has_variable('cache', 'recurrent_state'):
-            raise ValueError("a tree call reads a row's cache, which a decode call allocates first")
-        history = self.get_variable('cache', 'conv_state')
-        held = self.get_variable('cache', 'recurrent_state').astype(wide)
-        convolved = tree_conv(mixed, self.conv1d()[0], None, history, tree, parts=heads, dtype=wide)
-        query, key, value = (self._split_heads(part, width)
-                             for part, width in zip(convolved, widths, strict=True))
-        query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
-        return tree_rule(recurrent_gated_delta_rule, tree, (query, key, value, g, beta), held)
+        """A tree call's convolved tokens and recurrence (`tree_scan`): each token on its path, from the
+        row's held history and state past the root, the cache left as it was."""
+        def rule(convolved, g, beta, held):
+            query, key, value = (self._split_heads(part, width)
+                                 for part, width in zip(convolved, widths, strict=True))
+            query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
+            return recurrent_gated_delta_rule(query, key, value, g, beta, held)
+
+        return tree_scan(self, mixed, self.conv1d()[0], None, tree, rule, (g, beta), state='recurrent_state',
+                         state_dtype=wide, parts=heads, dtype=wide)
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
@@ -1006,7 +1039,7 @@ class GatedDeltaNet(nn.Module):
         key_dim = self.key_features
         operand = mixed.dtype
         token, stepped = None, False
-        tree = None if attention_metadata is None else attention_metadata.tree_parents
+        tree = call_tree(attention_metadata)
         # A one-token tree takes the tree's path (`_tree`), whose output the common norm reads.
         if decode and S == 1 and tree is None:
             kernel = self._decode_kernel(x, operand)
@@ -1064,9 +1097,6 @@ class GatedDeltaNet(nn.Module):
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
-        if tree is None and attention_metadata is not None and attention_metadata.key_runs is not None:
-            raise ValueError("a gated delta net reads key runs only as a tree call's attention mask, and "
-                             "would run them as if unset")
         if tree is not None:
             out = self._tree(mixed, g, beta, tree, heads, widths, wide)
         elif shards > 1:
