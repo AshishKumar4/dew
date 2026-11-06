@@ -1921,6 +1921,37 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+@pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
+def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name, width):
+    """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
+    of a causal call `width` wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
+    launch within its shared memory, spilling nothing, its register model's decision ptxas's."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.float32)
+    key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.float32)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    with generation.assumed(generation_name):
+        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
+        op, args = attention_mosaic._forward_call(*zeros, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        config = op.derived(ba, generation.gpu_target())
+        assert config is not None, f"the Mosaic forward derives no fp32 config {width} wide"
+        found = compile_mosaic_kernels(
+            [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
+            generation_name)
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "accurate", "hooks"), BACKWARD_GATE)
 def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, width, accurate, hooks):
     """The backward at its derived tiles of a causal call `width` wide in the form `accurate` names under the
