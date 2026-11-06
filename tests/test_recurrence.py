@@ -1,6 +1,5 @@
-"""The linear recurrence's decode step (`dew.nn.kernels.recurrence.step`): every combination of its
-hooks against its XLA form in float64, at its launch's config (`recurrence.COLUMNS`' column blocks, or a
-whole head where a hook reads one), and the continuation contract a
+"""The linear recurrence's decode step (`dew.nn.kernels.recurrence.step`, the recurrence template's step on
+Mosaic GPU): every combination of its hooks against its XLA form in float64, and the continuation contract a
 decode token keeps (an idle row untouched, a bf16 state rounded as it is held)."""
 
 import dataclasses
@@ -11,17 +10,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tokamax
 from reference_error import assert_as_exact
-from tuned import each_config, taken
 
-from dew.nn.kernels import recurrence, tuning
+from dew.nn.kernels import recurrence
 from dew.nn.precision import FP32_SUMS
 
-ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 16, 2, 4, 16, 64, 4
-"""The draws' shape: values two of the step launch's column blocks wide (`recurrence.COLUMNS`), so check 1
-reaches a head's later blocks' programs, as a gated delta net's 128-wide values take four (template numerics
-review 2026-10-26, P3-6)."""
+ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 3, 2, 4, 128, 128, 4
+"""The draws' shape: a model's 128 keys and values a head (Qwen3.5's, Kimi Linear's, Mamba2's state), the
+template step's warpgroup a value column a thread; three rows, the second idle (an interpreted call of 16
+rows took 6.2 s, armada jsf-steptime)."""
 """A decode token with grouped heads, idle rows and a four-tap history."""
 
 NORMS = (None, recurrence.OutputNorm(1e-6, 'silu'), recurrence.OutputNorm(1e-6, 'sigmoid'))
@@ -186,111 +183,25 @@ def summed(hooks: recurrence.Hooks):
     return run
 
 
-def test_a_decode_step_is_tuned_as_its_launch_is_described():
-    """A decode token's launch, keyed as tokamax describes it in a lowering made to read it
-    (`tuning.launches`), is the launch its own lowering records for tuning (`tuning.seen`): a decode
-    step's picks are found and stored by what it was called with."""
-    hooks = HOOKS[0]
-
-    def keyed(op, ba):
-        return type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items()))
-
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(jax.jit(functools.partial(recurrence.step, hooks)),
-                                                  operands(hooks))
-    described = sorted(keyed(ba.op, ba) for ba in found)
-    with tuning.seen() as seen:
-        jax.jit(functools.partial(recurrence.step, hooks)).lower(operands(hooks))
-    assert described and sorted(keyed(op, ba) for op, ba in seen) == described
-
-
 @pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
 def test_every_hook_combination_steps_as_its_float64_form(hooks):
-    """A decode token through the launch, at its config, within tests/reference_error.py's
-    rule of the XLA form's fp32 run against its float64 run: its output, its state and, under a conv,
-    its moved history, which is the history's own bits (`summed`'s fp32 run). The idle row's output is
-    zeros and its state and history are its inputs' bits."""
+    """A decode token through the launch, the recurrence template's step on Mosaic GPU
+    (`templates.recurrence.step`, interpreted off a GPU), within tests/reference_error.py's rule of the XLA
+    form's fp32 run against its float64 run: its output, its state and, under a conv, its moved history,
+    which is the history's own bits. The idle row's output is zeros and its state and history are its
+    inputs' bits."""
     given = operands(hooks)
-    reference_fn = jax.jit(functools.partial(recurrence.step_reference, hooks))
-    reference = reference_fn(given)
-
-    configs = each_config(recurrence.StepLaunch, functools.partial(recurrence.step, hooks), given)
-    # A column-split launch runs more than one block a head, its later programs' columns among them; a decay
-    # a key dimension's blocks are as wide as the draws' heads (`recurrence.KEYED_COLUMNS`), its later
-    # blocks checked at 80 columns (`test_a_head_wider_than_its_column_blocks_steps_every_column`).
-    assert all(config.block == 0 or VALUE_WIDTH // config.block > 1
-               or config.block == recurrence.KEYED_COLUMNS for config in configs), configs
-    for config in configs:
-        with tuning.pinned({recurrence.StepLaunch: config}):
-            step = jax.jit(functools.partial(recurrence.step, hooks))
-            assert_as_exact(step, summed(hooks), functools.partial(draw, hooks), f'{hooks} {config}',
-                            seeds={**SEEDS, **FORMED_SEEDS}[hooks], truth_fn=reference_fn)
-            out, history, state = step(given)
-        np.testing.assert_array_equal(np.asarray(out)[1], 0.0)
-        np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
-        if hooks.conv is not None:
-            np.testing.assert_array_equal(np.asarray(history), np.asarray(reference[1]))
-            np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
-
-
-@pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
-def test_every_hook_steps_on_the_template_as_its_float64_form(hooks):
-    """A decode token through the recurrence template's step on Mosaic GPU (`templates.recurrence.step`,
-    interpreted off a GPU) at a model's widths, 128 keys and values a head (Qwen3.5's, Kimi Linear's,
-    Mamba2's state): its output and state within tests/reference_error.py's rule of the XLA form's fp32 run
-    against its float64 run, and under a conv its moved history the history's own bits; an idle row's output
-    zeros and its state and history its own bits."""
-    from dew.nn.kernels.templates import bundles
-    from dew.nn.kernels.templates.recurrence import step as template
-
-    # Three rows, the second idle: an interpreted call of 16 rows took 6.2 s (armada, jsf-steptime).
-    widths = {"key_width": 128, "value_width": 128, "rows": 3}
-    stepped = jax.jit(functools.partial(template.step, hooks, dtype=None, family=bundles.INTERPRETED,
-                                        interpret=True))
-    assert_as_exact(stepped, summed(hooks), functools.partial(draw, hooks, **widths),
-                    f'{hooks} on the template', seeds={**SEEDS, **FORMED_SEEDS}[hooks],
+    step = jax.jit(functools.partial(recurrence.step, hooks))
+    assert_as_exact(step, summed(hooks), functools.partial(draw, hooks), f'{hooks}',
+                    seeds={**SEEDS, **FORMED_SEEDS}[hooks],
                     truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
-    given = operands(hooks, **widths)
-    assert template.serves(hooks, given)
-    out, history, state = stepped(given)
+    out, history, state = step(given)
     np.testing.assert_array_equal(np.asarray(out)[1], 0.0)
     np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
     if hooks.conv is not None:
         moved = recurrence.step_reference(hooks, given)[1]
         np.testing.assert_array_equal(np.asarray(history), np.asarray(moved))
         np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
-
-
-UNEVEN = {recurrence.Hooks(decay='scalar'): 8,
-          recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8,
-          recurrence.Hooks(decay='vector'): 8}
-"""The hooks an 80-wide head steps under (the gated delta rule's, Mamba-2's rated scan with its skip, Kimi
-delta attention's decay a key dimension, five blocks a head) and their declared seeds."""
-
-
-@pytest.mark.parametrize('hooks', UNEVEN, ids=str)
-def test_a_head_wider_than_its_column_blocks_steps_every_column(hooks):
-    """A decode token over 80 value columns a head, at the launch's own config (unpinned): its output and
-    state within tests/reference_error.py's rule of the XLA form's fp32 run against its float64 run, every
-    column among them, so a head whose width no column block divides as many times as it launched them (80
-    of 32 took two programs, 64 columns) leaves none of its outputs unwritten or its state stale."""
-    width = 80
-    reference_fn = jax.jit(functools.partial(recurrence.step_reference, hooks))
-    assert_as_exact(jax.jit(functools.partial(recurrence.step, hooks)), summed(hooks),
-                    functools.partial(draw, hooks, value_width=width), f'{hooks} {width} wide',
-                    seeds=UNEVEN[hooks], truth_fn=reference_fn)
-
-
-def test_a_column_block_pin_is_refused_where_a_hook_reads_a_whole_head():
-    """A hook reading a head's whole state (a conv, the epilogue's norm) takes a whole-head launch: a pin
-    of a block of value columns is refused as the step traces, a whole-head pin taken."""
-    hooks = next(form for form in HOOKS + FORMED if form.conv is not None or form.output is not None)
-    given = operands(hooks)
-    step = functools.partial(recurrence.step, hooks)
-    with tuning.pinned({recurrence.StepLaunch: recurrence.Launch(8, 4)}), pytest.raises(tuning.Unpinnable):
-        jax.jit(step).trace(given)
-    with tuning.pinned({recurrence.StepLaunch: recurrence.Launch(0, 4)}):
-        assert taken(recurrence.StepLaunch, step, given) == [recurrence.Launch(0, 4)]
 
 
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=str)

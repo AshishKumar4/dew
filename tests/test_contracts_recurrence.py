@@ -356,9 +356,10 @@ def test_the_decode_step_holds_every_order(edge):
     `generation.linear_tangent`; interpreted off a GPU), the gated delta rule with a decay a head and the
     skip: every order of its output and updated memory finite wherever float64 is a normal float32 and the
     token's update as the rule states it is (`plain_delta_rule` over one token), at queries, keys, values
-    and memory whose products near float32's ends."""
+    and memory whose products near float32's ends, at a model's 128 keys and values a head (the launch's
+    warpgroup takes a value column a thread)."""
     (query, key, value, g, beta, state), direction, cotangent = delta_rule_draw(
-        2669, EDGES[edge], key_heads=1, value_heads=2, width=8, length=1, per_key=False)
+        2669, EDGES[edge], key_heads=1, value_heads=2, width=128, length=1, per_key=False)
     (skip,) = normal_draw(2672, (2,))
     (skip_direction,) = normal_draw(2673, (2,))
     hooks = recurrence.Hooks(decay="scalar", skip=True)
