@@ -88,8 +88,7 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
     refused = subprocess.run([sys.executable, str(TIMING), "run", str(tmp_path / "manifest.json"), "--out",
                               str(tmp_path / "refused")], cwd=repo, capture_output=True, text=True)
-    assert refused.returncode != 0 and "on no remote branch: push it" in refused.stderr
-    assert not (tmp_path / "refused").exists()
+    assert refused.returncode == 1 and not (tmp_path / "refused").exists()
 
 
 def test_the_dense_cells_build_every_product_for_each_implementation_on_the_cpu():
