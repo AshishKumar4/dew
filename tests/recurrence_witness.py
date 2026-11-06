@@ -1469,9 +1469,12 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     return {name: np.stack(held) for name, held in found.items()}
 
 
-CARRIED_GRADIENT_SHARES = {"dv": 0.5, "entering": 0.5}
-"""The least share of the reverse walk's records at which a backward reading another output's and final
-memory's gradients (another seed's) is refused."""
+CARRIED_GRADIENT_SHARES = {"local": 0.9, "entering": 0.9}
+"""The least share of the records reading the output's gradient at which a backward that read another
+output's and final memory's gradients (another seed's) is refused: 99.9% of the local and memory gradients
+interpreted at 1e3091f19. The records each launch forms from the claimed records alone (`dv` from the
+claimed local gradient and memory's, its last chunk's alone from the final memory's) refuse only where
+the given gradients enter them."""
 
 
 def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
