@@ -5,10 +5,8 @@ Its cells run generation.CHOICES' `gated_delta_rule` and `ssd`. Each takes the c
 (`recurrence_chunk.chunk`) of a form, forward and backward in one program as a layer's training step takes
 them, with the kernel the cell names (`generation.chosen`):
 - the recurrence template ('mosaic_gpu');
-- the portable math ('xla').
-The portable math's derived forms ('derived') join once they hold check 1: a call names them alone, and in
-fp32 a step write gate's key gradient sat 1.54 times the portable math's distance from float64 and its final
-memory 1.95 times (40 seeds, armada, recurrence matrix dry run 11-06, row 4466).
+- the portable math ('xla');
+- its derived forms ('derived', the delta rule's).
 
 Its output, final memory and every operand's gradient are held to its reference's (check 1): the form's
 port where it takes the call, fla's kernels for the delta rule's forms ('fla'), mamba_ssm's for the rated scan
@@ -133,14 +131,16 @@ def supported(case: dict[str, str]) -> bool:
 CASES = (
     ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'),
     ('sm90', 'kimi delta attention', 'xla', 'float32', 'packed'),
-    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'packed'),
-    ('sm80', 'gated delta net', 'xla', 'float32', 'one'),
+    ('sm80', 'write gate', 'derived', 'bfloat16', 'packed'),
+    ('sm80', 'rated scan', 'xla', 'float32', 'one'),
+    ('sm90', 'write gate', 'derived', 'float32', 'one'),
+    ('sm90', 'rated scan', 'mosaic_gpu', 'bfloat16', 'packed'),
+    ('sm80', 'gated delta net', 'xla', 'bfloat16', 'packed'),
+    ('sm80', 'kimi delta attention', 'derived', 'bfloat16', 'one'),
+    ('sm90', 'gated delta net', 'mosaic_gpu', 'float32', 'one'),
+    ('sm90', 'gated delta net', 'derived', 'bfloat16', 'one'),
     ('sm90', 'write gate', 'mosaic_gpu', 'float32', 'one'),
-    ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'),
-    ('sm80', 'kimi delta attention', 'xla', 'bfloat16', 'one'),
-    ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'packed'),
-    ('sm90', 'write gate', 'mosaic_gpu', 'float32', 'packed'),
-    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'one'),
+    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change)."""

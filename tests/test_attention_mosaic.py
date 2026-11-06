@@ -1599,22 +1599,20 @@ def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
 
 def _counted(fn, *arrays) -> tuple[float, float]:
     """The model's share of the Mosaic launches' work `fn` lowers for an H100 each declares
-    (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (`_stated_flops`: none unsized)."""
-    import re
-
-    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
+    (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (its cost estimate), as the lowered
+    program's structured reader reads them (`lowered.kernel_launches`, each launch times the calls a call
+    of the program makes)."""
+    from dew.nn.kernels.lowered import kernel_launches
 
     # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
     # of its own.
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
-    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
-    assert launches and all(_stated_flops(line) is not None for line in launches)
-    declared = [_MODEL_FLOPS.search(line) for line in launches]
-    assert all(declared)
-    return (sum(float(found.group(1)) for found in declared if found),
-            sum(_stated_flops(line) or 0.0 for line in launches))
+        lowered = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",))
+    launches = [(call, times) for call, times in kernel_launches(lowered) if call.kind == "mosaic_gpu"]
+    assert launches and all(call.flops is not None and call.model_flops is not None for call, _ in launches)
+    return (sum((call.model_flops or 0.0) * times for call, times in launches),
+            sum((call.flops or 0.0) * times for call, times in launches))
 
 
 @pytest.mark.parametrize("causal, queries, keys, pairs", [
@@ -1811,6 +1809,41 @@ FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for gener
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
 split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set
 beside the walk's), and a softcap's inference forward 256 wide (Gemma's)."""
+
+
+@COMPILES_ON_CPU
+def test_the_public_template_route_runs_each_shards_rows_and_heads_with_no_collective():
+    """The public call on the template (`scaled_dot_product_attention`), causal, forward and backward, its
+    batch split over a compile-only H100 mesh's data axis and its heads over its tensor axis, compiled for
+    them: the forward and the fused backward launch, each reading its shard's rows and heads (four query heads
+    of eight, two key heads of four, two rows of four), and the program moves and sums nothing
+    (`kernel_compile.Expected`, its route evidence): a head's softmax and its gradients are its own."""
+    import fla_gdn_support as support
+    from jax.sharding import PartitionSpec
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    from dew.nn.attention import scaled_dot_product_attention
+
+    rows, tokens, heads, kv_heads, width = 4, 256, 8, 4, 64
+
+    def call():
+        def step(query, key, value):
+            def loss(query, key, value):
+                out = scaled_dot_product_attention(query, key, value, implementation="template", causal=True)
+                return out.astype(jnp.float32).sum()
+            return jax.grad(loss, argnums=(0, 1, 2))(query, key, value)
+
+        def shaped(kv):
+            return jax.ShapeDtypeStruct((rows, tokens, kv, width), jnp.bfloat16)
+        return step, (shaped(heads), shaped(kv_heads), shaped(kv_heads))
+
+    spec = PartitionSpec("data", None, "tensor", None)
+    expected = Expected(axes=(("data", 2), ("tensor", 2)), specs=(spec, spec, spec),
+                        launches=frozenset({"attention_forward", "attention_dkv_fused"}),
+                        shards={"attention_forward": (rows // 2, tokens, heads // 2, width),
+                                "attention_dkv_fused": (rows // 2, tokens, kv_heads // 2, width)})
+    cases = [support.KernelCase("template route", call, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
 
 
 @COMPILES_ON_CPU

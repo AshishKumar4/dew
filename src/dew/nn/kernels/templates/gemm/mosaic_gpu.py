@@ -291,11 +291,15 @@ class GroupInfo:
     actual_end: jax.Array
     start_within_block: jax.Array
     actual_size: jax.Array
+    matrix: jax.Array | None = None
+    """Dew: the matrix of a stack the group reads, where a table's fifth column states it (`gmm`'s
+    `first`); None where the group reads its own."""
 
     @classmethod
     def create(cls, table, tile, tid):
         """Dew: the group info of row tile `tid`, read from `tile_groups`' table (its group, its first row,
-        its group's first and past-last row) rather than walked over every group's length in each tile."""
+        its group's first and past-last row, and where `gmm` states one, its matrix of a stack) rather than
+        walked over every group's length in each tile."""
         tile = jnp.int32(tile)
         group, block_start, group_start, group_end = (table[tid, column] for column in range(4))
         # Mosaic's copies and stores read a slice's start as a multiple of the rows its tiling takes.
@@ -305,7 +309,8 @@ class GroupInfo:
         start_within_block = actual_start - block_start
         actual_size = actual_end - actual_start
         return cls(group_id=group, block_start=block_start, actual_start=actual_start,
-                   actual_end=actual_end, start_within_block=start_within_block, actual_size=actual_size)
+                   actual_end=actual_end, start_within_block=start_within_block, actual_size=actual_size,
+                   matrix=table[tid, 4] if table.shape[1] > 4 else None)
 
     @classmethod
     def dense(cls, tile: int, tid, rows: int):
@@ -452,7 +457,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         epilogue_operands: tuple = (), epilogue_axes: tuple = (),
         out_dtypes: tuple | None = None, dense: bool = False,
         paired: jax.Array | None = None, exact_sums: bool = False,
-        transpose_lhs: bool = False) -> jax.Array | tuple[jax.Array, ...]:
+        transpose_lhs: bool = False, first: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
     routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`.
@@ -461,7 +466,9 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     accumulators, which the epilogue takes together (`epilogue(acc, paired_acc, *side_tiles)`: a gate and
     an up projection with their SwiGLU) or the outputs are, both (`out_dtypes`). With `transpose_lhs` (a
     dense call without a prologue), `lhs` is `[depth, rows]`, its blocks read transposed by the products: a
-    product whose rows are the call's weight (its swapped orientation, `Tiles.swapped`).
+    product whose rows are the call's weight (its swapped orientation, `Tiles.swapped`). With `first`, an
+    int32 scalar, `rhs` is a stack of more matrices than `group_sizes` has groups, group `g` reading matrix
+    `first + g` where it lies (a banked layer's experts); the grid and the tile table are the groups'.
 
 Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` (a cooperative
     tile's consumer, half its rows) in its shared memory stage before the warpgroup MMA reads it;
@@ -473,23 +480,29 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     if transpose_lhs and (not dense or prologue is not None):
         raise ValueError("a transposed lhs is a dense call's without a prologue")
     k, rows = lhs.shape if transpose_lhs else lhs.shape[::-1]
-    g, k2, n = rhs.shape
+    matrices, k2, n = rhs.shape
+    g = group_sizes.shape[0]
     if transpose_rhs:
         k2, n = n, k2
-    if dense and g != 1:
+    if dense and matrices != 1:
         raise ValueError("a dense product takes one matrix")
+    if first is not None and (dense or paired is not None):
+        raise ValueError("a stack read from its first matrix is a grouped product's of one matrix")
     if paired is not None and paired.shape != rhs.shape:
         raise ValueError(f"a paired matrix {paired.shape} is not its product's {rhs.shape}")
     accumulators = 1 if paired is None else 2
     if k != k2 or k % block_k or n % block_n:
-        raise ValueError(f"a [{rows}, {k}] x [{g}, {k2}, {n}] product does not take {tiles}")
+        raise ValueError(f"a [{rows}, {k}] x [{matrices}, {k2}, {n}] product does not take {tiles}")
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     if k == 0:
         # Dew: a product of no depth sums nothing, its rows zeros through the epilogue on whole arrays (its
         # hooks are a tile's elementwise arithmetic), with no launch: a walk of no steps has no block of the
         # matrix to view (JAX 0.12 refuses a zero-extent slice).
+        # Its side operands by group read at each row as XLA's program reads them (`axes.at_rows`, row 4489).
         zeros = (jnp.zeros((rows, n), jnp.float32),) * accumulators
-        values = zeros if epilogue is None else epilogue(*zeros, *epilogue_operands)
+        by_row = tuple(axes.at_rows(side, side_axes, group_sizes, rows) if axes.GROUPS in side_axes else side
+                       for side, side_axes in zip(epilogue_operands, epilogue_axes, strict=True))
+        values = zeros if epilogue is None else epilogue(*zeros, *by_row)
         values = values if isinstance(values, tuple) else (values,)
         outs = tuple(value.astype(dtype) for value, dtype in zip(values, dtypes, strict=True))
         return outs if out_dtypes else outs[0]
@@ -519,6 +532,10 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                    jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
         table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
+        if first is not None:
+            # Each tile's matrix, its group's of the stack from `first` (`GroupInfo.matrix`): the group itself
+            # stays the call's, which its validity and its side operands read.
+            table = jnp.concatenate([table, jnp.minimum(table[:, :1], g - 1) + first], axis=1)
     extent = (m if family_of(tiles, lhs.dtype).bounded_loads and not interpret
               else -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile))
     lhs = rows_extended(lhs, row_axis, extent)
@@ -798,7 +815,8 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
     lhs_view = ((lhs_gmem.at[:, rows], lambda j: (first + j, 0)) if transpose_lhs
                 else (lhs_gmem.at[rows], lambda j: (0, first + j)))
     rhs_index = _rhs_index(transpose_rhs)
-    matrices = {name: (_matrix_columns(gmem.at[jnp.minimum(group.group_id, groups - 1)], column_tile,
+    matrix = jnp.minimum(group.group_id, groups - 1) if group.matrix is None else group.matrix
+    matrices = {name: (_matrix_columns(gmem.at[matrix], column_tile,
                                        block_n=tiles.block_n, transpose_rhs=transpose_rhs),
                        lambda j: rhs_index(first + j)) for name, gmem in matrix_gmems.items()}
     return {'rows': lhs_view, **matrices,

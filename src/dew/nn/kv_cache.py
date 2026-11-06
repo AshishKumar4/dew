@@ -485,8 +485,10 @@ class KVStore:
         held = self._get(name)
         return (held if self.layout.page_size is None else self._gathered(held))[..., 0]
 
-    def write_tokens(self, key: jax.Array, value: jax.Array, rows: jax.Array, positions: jax.Array) -> None:
-        """Write keys and values `[tokens, kv_heads, head_dim]`, each at its own row and slot.
+    def write_tokens(self, key: jax.Array, value: jax.Array, rows: jax.Array, positions: jax.Array,
+                     groups: Mapping[str, jax.Array] | None = None) -> None:
+        """Write keys and values `[tokens, kv_heads, head_dim]`, each at its own row and slot, and the
+        tokens' `groups` `[tokens]` of each field named (`GROUPS`) beside them.
 
         This is the write of a serving step's mixed call
         (`dew.nn.inputs.Admitted`). A token whose row is past the cache's rows,
@@ -494,7 +496,9 @@ class KVStore:
         unrotated, and a paged pool must have one group, as the mixed call
         requires.
         """
-        for (name, _), incoming in zip(self.payloads, (key, value), strict=False):
+        leaves = [(name, incoming) for (name, _), incoming in zip(self.payloads, (key, value), strict=False)]
+        leaves += [(GROUPS[field], held[:, None].astype(jnp.int32)) for field, held in (groups or {}).items()]
+        for name, incoming in leaves:
             pool = self._get(name)
             size = self.layout.page_size
             self._put(name, write_tokens(pool, incoming, rows, positions) if size is None
