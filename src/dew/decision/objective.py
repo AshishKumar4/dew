@@ -56,6 +56,7 @@ from dew.objectives.base import (
     joined,
     model_rngs,
 )
+from dew.objectives.routing import refuse_fixed_router
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -278,6 +279,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             variables is OMITTED and isinstance(backbone, Pretrained)) else ()
         if variables is not OMITTED:
             held = variables
+        # Its backbone's routers train by the decision loss alone (`dew.objectives.routing`).
+        refuse_fixed_router(module, None, held)
         if tokenizer is None:
             raise ValueError("a decision model lays its rows out with a tokenizer; pass tokenizer=")
         if not 0.0 <= label_smoothing < 1.0:

@@ -118,6 +118,7 @@ __all__ = [
     "Recomputing",
     "RematChoosing",
     "RequiresText",
+    "Routed",
     "Selective",
     "Serving",
     "StagedStacks",
@@ -570,6 +571,15 @@ class HiddenStates(Protocol):
 
     def hidden_states(self, tokens: jax.Array, *, train: bool = False,
                       **fields: ModelKwarg) -> jax.Array: ...
+
+
+@runtime_checkable
+class Routed(Protocol):
+    """A model that may route tokens to experts: the routers among its own whose expert weights are fixed
+    whatever they score (`dew.nn.backbones.decoder_block.Mixture.fixed_weights`), by name, which no term
+    of a plain loss reaches (`dew.objectives.routing.refuse_fixed_router`)."""
+
+    def fixed_routers(self) -> tuple[str, ...]: ...
 
 
 @runtime_checkable
