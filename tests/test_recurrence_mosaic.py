@@ -542,6 +542,33 @@ def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_produc
         assert pairs in ratios and ratios <= {1.0, pairs}
 
 
+def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
+    """A bf16 Kimi delta attention forward with no bound on its inverse, lowered for an H100: its chunk
+    inverse's doubling merges in fp32 (`Call.ranged`), two bf16 parts on warpgroup products, which take no
+    transposed TF32 (`mainloop.FAST_PARTS`), so the intra solve, all doubling, states their three leading
+    pairs a model product, and no launch more; each stated the held bf16 operand's one (row 4032)."""
+    import re
+
+    from dew.nn.kernels.templates import product
+    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
+
+    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 64
+    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+
+    rule = functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), floor=FLOOR)
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        text = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
+    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+    models = [(float(_MODEL_FLOPS.search(line).group(1)), _stated_flops(line) or 0.0) for line in launches]
+    ratios = {hardware / model for model, hardware in models if model}
+    pairs = float(len(product.terms(mainloop.FAST_PARTS, mainloop.FAST_PARTS)))
+    assert pairs in ratios and max(ratios) == pairs
+
+
 def test_each_launch_lowers_once_however_many_layers_call_it():
     """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
     test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the
