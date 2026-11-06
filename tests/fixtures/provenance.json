@@ -123,14 +123,6 @@
    "tool": "tools/laya_reference.py",
    "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/diffusion-gemma-window-tiny/logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/diffusion-gemma-window-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -977,38 +969,6 @@
     }
    ],
    "note": "The release's own inference/kernel.py (tilelang 0.1.8, torch 2.10.0+cu128) run on an RTX 4080 by --kernels: act_quant and fp4_act_quant in place on bf16 rows, sparse_attn and hc_split_sinkhorn; inputs and outputs as bits."
-  },
-  "hf/diffusion-gemma-denoise-tiny/numerics.npz": {
-   "tool": "tools/numerics_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ]
-  },
-  "hf/diffusion-gemma-denoise-tiny/ref_bare.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "transformers 5.16.1 recomputes it bit for bit from the committed weights and inputs."
-  },
-  "hf/diffusion-gemma-denoise-tiny/ref_conditioned.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "transformers 5.16.1 recomputes it bit for bit from the committed weights and inputs."
   },
   "hf/diffusion-gemma-sc-tiny/ref.npy": {
    "tool": "tools/hf_reference.py",
@@ -3960,7 +3920,6 @@
     "hf/deepseek-v32-tiny/model.safetensors",
     "hf/diffusion-gemma-denoise-tiny/canvas.npy",
     "hf/diffusion-gemma-denoise-tiny/model.safetensors",
-    "hf/diffusion-gemma-denoise-tiny/prev_logits.npy",
     "hf/diffusion-gemma-denoise-tiny/prompt.npy",
     "hf/diffusion-gemma-sc-tiny/inputs.npy",
     "hf/diffusion-gemma-sc-tiny/model.safetensors",

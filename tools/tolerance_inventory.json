@@ -78,7 +78,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_block_diffusion.py": {
-   "comparisons": 7,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_block_sft.py": {
@@ -184,10 +184,6 @@
   "tests/test_device_image_augmentation.py": {
    "comparisons": 6,
    "lane": "Training"
-  },
-  "tests/test_diffusion_gemma_workflow.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_diffusion_objective.py": {
    "comparisons": 7,
