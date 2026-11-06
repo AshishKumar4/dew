@@ -8,31 +8,34 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
   (test_recurrence_template_stability).
 - The portable backward as a GPU compiles it, and the SSD port's forward and gradient, finite and on par
   under every regime (test_recurrence_stability).
-- The short conv's kernels as exact as XLA's conv at the training shapes (test_short_conv).
-- Mamba's selective scan on the template under the fast forms as exact as recorded mamba_ssm in each
-  recorded case, and a Mamba layer under the template's choice, packed and from a held state, as exact as
-  under the portable scan, on an H100 (test_selective_template; an A100's after post42).
+- A Mamba layer under the template's selective scan, packed and from a held state, as exact as under the
+  portable scan, on an H100 (test_selective_template).
 - Each recurrence layer trained on its port's kernels, natively (`PORT_KERNELS`): a gated delta net on the
   FLA GDN kernels and a Kimi delta attention layer on FLA KDA's chunk_kda, packed rows, forward and every
   gradient on par from float64 with the portable rule's; their training step the same bit for bit each
-  run, on the port and on the template; a gated delta net's decode tokens on its decode kernels (the fused
-  step and the step alone), its state held in fp32 and in bf16, on par with the portable step's; and the
-  port on par with fla's own in fp32 and mixed dtypes (test_fla_gdn), fla run in the reference interpreter
-  DEW_FLA_PYTHON names, which a GPU job provides to a file naming it.
+  run, on the port and on the template; and the port on par with fla's own in fp32 and mixed dtypes
+  (test_fla_gdn), fla run in the reference interpreter DEW_FLA_PYTHON names, which a GPU job provides to a
+  file naming it.
 - The decode launches as a server runs them (test_linear_attention): the step kernel leaving an idle row's
   state and output alone, bit for bit; the fused step's bits the same however its launches are timed; and
   a layer choosing the fused step decoding over two GPUs, its rows or its heads split, as on one device.
+- The check-1 matrices of the recurrence's choices (tests/kernel_matrix.py): the chunked op on each kernel
+  against its form's port (recurrence_matrix), the short conv against XLA's (short_conv_matrix), the
+  selective scan against recorded mamba_ssm (selective_matrix), and the decode tokens on each decode kernel
+  against the portable step (delta_decode_matrix).
 """
 
 import functools
 
+import delta_decode_matrix
 import gpu_flow
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import recurrence_matrix as matrix
-import selective_support
+import recurrence_matrix
+import selective_matrix
+import short_conv_matrix
 import test_fla_gdn as fla_gdn
 import test_mamba_ssd as mamba_ssd
 import test_recurrence_mosaic as forward
@@ -40,7 +43,6 @@ import test_recurrence_mosaic_gradient as gradient
 import test_recurrence_stability as stability
 import test_recurrence_template_stability as template_stability
 import test_selective_template as selective_template
-import test_short_conv as short_conv
 from delta_rule_support import fused_step
 from gpu_flow import Cell, cells_of, run_cells, when
 from jax.sharding import NamedSharding, PartitionSpec
@@ -130,41 +132,6 @@ def repeats_bit_for_bit(make, kernel: str):
     step = jax.jit(named(jax.grad(lambda params, x: jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2),
                                   argnums=(0, 1)), gated_delta_rule=kernel))
     gpu_flow.repeats_bit_for_bit(step, params, x)
-
-
-DECODED = 4
-"""The tokens a decode cell decodes in turn after its prefill."""
-
-
-def decodes_on_its_kernel(kernel: str, held):
-    """A gated delta net's decode tokens on `kernel` (`linear.DELTA_DECODE`: 'fused' or 'step'), `DECODED`
-    in turn after a prefill, its recurrent state held in `held`: each token's output, and the conv history
-    and recurrent state it leaves, on par with the portable step's (check 1) from the layer in float64 (the
-    truth: a bf16 layer on widened arguments fixes its projections and norm in bf16 and casts its state
-    back, so only the stored state's rounding is the contract's)."""
-    layer = fused_case(4, 128, 3, jnp.bfloat16, held)[0]
-
-    def decoded(module):
-        def decode(variables, cache, tokens):
-            outs = []
-            for at in range(DECODED):
-                out, after = module.apply({**variables, "cache": cache}, tokens[:, at:at + 1],
-                                          MixerCall(decode=True), mutable=["cache"])
-                outs.append(out)
-                cache = after["cache"]
-            return jnp.concatenate(outs, axis=1), cache["conv_state"], cache["recurrent_state"]
-        return decode
-
-    def draw(seed):
-        _, variables, cache, token = fused_case(4, 128, 3, jnp.bfloat16, held, seed)
-        later = jax.random.normal(jax.random.key(3000 + seed), (token.shape[0], DECODED - 1, token.shape[-1]))
-        return variables, cache, jnp.concatenate([token, later.astype(token.dtype)], axis=1)
-
-    assert_as_exact(named(decoded(layer), delta_decode=kernel), named(decoded(layer), delta_decode="xla"),
-                    draw,
-                    f"a gated delta net decoding {DECODED} tokens on its {kernel} kernel, its state held in "
-                    f"{jnp.dtype(held).name}", seeds=FEWEST_SEEDS,
-                    truth_fn=named(decoded(layer.clone(dtype=jnp.float64)), delta_decode="xla"))
 
 
 def the_decode_kernel_leaves_an_idle_row_alone():
@@ -288,27 +255,14 @@ def portable_and_ssd_port_cells() -> list[Cell]:
 
 
 def selective_cells() -> list[Cell]:
-    """Mamba's selective scan on the template against recorded mamba_ssm, and a Mamba layer under it."""
+    """A Mamba layer under the template's selective scan."""
     return [
-        *(Cell(f"the selective scan on the template under the fast forms is as exact as mamba_ssm: {case}",
-               functools.partial(selective_template.the_template_is_as_exact_as_mamba_ssm, case), "sm90")
-          for case in selective_support.SEEDED_CASES),
         *(Cell(f"a Mamba layer is as exact under the template: packed {packed}"
                f"{f', a held state {held}' if held else ''}",
                functools.partial(selective_template.the_layer_is_as_exact_under_the_template, packed, held),
                "sm90")
           for packed, held in ((False, None), (True, None), (False, "through the template"))),
     ]
-
-
-def short_conv_cells() -> list[Cell]:
-    """The short conv's kernels against XLA's conv at the training shapes."""
-    return [Cell(f"the short conv's kernels are as exact as XLA's at the training shapes: {model} "
-                 f"{dtype.__name__}{' packed' if packed else ''}",
-                 functools.partial(short_conv.the_kernels_are_as_exact_as_xla_at_the_training_shapes,
-                                   model, dtype, packed))
-            for model in sorted(short_conv.CONV_SHAPES) for dtype in (jnp.bfloat16, jnp.float32)
-            for packed in (False, True)]
 
 
 def port_training_cells() -> list[Cell]:
@@ -334,9 +288,6 @@ def port_training_cells() -> list[Cell]:
 def decode_cells() -> list[Cell]:
     """The decode launches as a server runs them."""
     return [
-        *(Cell(f"a gated delta net decodes on its {kernel} kernel on par with the portable step, its state "
-               f"held in {jnp.dtype(held).name}", functools.partial(decodes_on_its_kernel, kernel, held))
-          for kernel in ("fused", "step") for held in (jnp.float32, jnp.bfloat16)),
         Cell("the decode kernel leaves an idle row alone", the_decode_kernel_leaves_an_idle_row_alone),
         Cell("the fused decode step gives the same bits however its launches are timed",
              the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed),
@@ -350,7 +301,7 @@ def decode_cells() -> list[Cell]:
 FAMILIES = {"mainloop forward": mainloop_forward_cells, "mainloop gradient": mainloop_gradient_cells,
             "template stability": template_stability_cells,
             "portable and SSD port": portable_and_ssd_port_cells, "selective scan": selective_cells,
-            "short conv": short_conv_cells, "port training": port_training_cells, "decode": decode_cells}
+            "port training": port_training_cells, "decode": decode_cells}
 """The recurrence cells by family, each family a test of its own: the planner times and packs each, and one
 family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes)."""
 
@@ -364,6 +315,24 @@ def test_the_recurrences_run_on_this_gpu(family):
 
 def test_the_recurrence_matrix_holds_on_this_gpu():
     """The recurrence's check-1 matrix (tests/kernel_matrix.py): the chunked op's training step, its kernel
-    named, on par with the recurrence a token at a time at every pair of axis values the route serves, each
-    cell on its own GPU."""
-    run_cells(cells_of(matrix.a_recurrences_training_step_is_on_par))
+    named, on par with its form's port's, or the portable math's where no port takes it, at every pair of
+    axis values the route serves, each cell on its own GPU."""
+    run_cells(cells_of(recurrence_matrix.a_recurrences_training_step_is_on_par))
+
+
+def test_the_short_conv_matrix_holds_on_this_gpu():
+    """The short conv's check-1 matrix: a delta net's conv at its training shapes on the kernels, on par with
+    XLA's conv, each cell on its own GPU."""
+    run_cells(cells_of(short_conv_matrix.a_short_convs_training_step_is_on_par))
+
+
+def test_the_selective_scan_matrix_holds_on_this_gpu():
+    """The selective scan's check-1 matrix: each recorded case on the template, on par with recorded
+    mamba_ssm, each cell on its own GPU."""
+    run_cells(cells_of(selective_matrix.a_selective_scan_is_as_exact_as_mamba_ssm))
+
+
+def test_the_recurrent_decode_matrix_holds_on_this_gpu():
+    """The recurrent decode's check-1 matrix: a gated delta net's decode tokens on each decode kernel, on par
+    with the portable step's, each cell on its own GPU."""
+    run_cells(cells_of(delta_decode_matrix.a_decode_token_is_on_par))
