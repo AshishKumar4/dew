@@ -43,7 +43,7 @@ from dew import _cache
 from dew.algebra import bits
 from dew.nn.derivatives import KernelGlue, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import rows_padded
 from dew.nn.kernels.templates.product import declared
@@ -52,7 +52,7 @@ from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 """The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
-reads at its tile's group (`axes.GROUPS`) and XLA's program at each row (`_by_row`)."""
+reads at its tile's group (`axes.GROUPS`) and XLA's program at each row (`axes.at_rows`)."""
 
 
 def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *, transpose_rhs: bool = False,
@@ -755,17 +755,9 @@ def _split(operands: tuple, hook: str, group_sizes: jax.Array | None) -> tuple[t
 
 def _rows(arrays: tuple, axes_of: tuple, group_sizes: jax.Array, rows: int) -> tuple:
     """The side operands as XLA's program reads them: a `groups` axis as `rows` rows, each its group's
-    value (`_by_row`), every other operand as it is."""
-    return tuple(_by_row(array, axes, group_sizes, rows) if GROUPS in axes else array
+    value (`axes.at_rows`), every other operand as it is."""
+    return tuple(side_axes_of.at_rows(array, axes, group_sizes, rows) if GROUPS in axes else array
                  for array, axes in zip(arrays, axes_of, strict=True))
-
-
-def _by_row(array: jax.Array, axes: tuple, group_sizes: jax.Array, rows: int) -> jax.Array:
-    """A side operand of one value a group (its `groups` axis, `[G, ...]`) at each of `rows` rows: each
-    group's value at each of its rows, a row past the groups' the last's (its output unrouted, `_routed`).
-    Its derivative, the repetition's transpose, sums each group's rows' cotangents: the group-aware
-    reduction its gradient is."""
-    return jnp.repeat(array, group_sizes.astype(jnp.int32), axis=axes.index(GROUPS), total_repeat_length=rows)
 
 
 def _launchable(arrays: tuple, axes_of: tuple) -> tuple[tuple, tuple, tuple]:

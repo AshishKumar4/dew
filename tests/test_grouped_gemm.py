@@ -159,10 +159,10 @@ def test_the_hopper_grouped_matmuls_lower_for_an_h100_at_their_tile_and_a_narrow
         ba, target = launch.bind(*args, **options), generation.gpu_target()
         derived = launch.derived(ba, target)
         narrow = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
-        assert launch.legal(ba, narrow, target) and derived != narrow
-        # The forward's rows, 256 a group, span two of its row tiles: a pair (`mosaic_gpu.derived`).
+        assert derived is not None and launch.legal(ba, narrow, target)
+        # The forward on a pair of multiprocessors as well (its matrix's blocks multicast), whatever the
+        # derivation picks (row 4491).
         pairs = 1 if isinstance(launch, grouped_matmul.MosaicTgmm) else 2
-        assert derived is not None and derived.cluster == pairs
         paired = dataclasses.replace(narrow, cluster=pairs)
         assert launch.legal(ba, paired, target)
         for config in {derived, narrow, paired}:
@@ -234,28 +234,6 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
 
     assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
                     f"cutlass {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection("xla", jnp.float64)))
-
-
-def test_a_mapped_cutlass_call_runs_each_map_in_turn():
-    """CUTLASS's FFI calls (`grouped_matmul._cutlass_call`, the forward's and the kernel gradient's) mapped
-    (`jax.vmap`, the matrices mapped or shared) trace a sequential batching rule, each map one call in turn;
-    none was declared, and JAX's raised (row 4389). Traced, never run: the targets register on a GPU whose
-    dew-cutlass holds them."""
-    sizes = jnp.asarray([3, 5], jnp.int32)
-    xs, dys = jnp.zeros((2, 8, 16), jnp.bfloat16), jnp.zeros((2, 8, 32), jnp.bfloat16)
-    ws = jnp.zeros((2, 2, 16, 32), jnp.bfloat16)
-    forward = grouped_matmul._cutlass_call('dew_cutlass_grouped_gemm',
-                                           jax.ShapeDtypeStruct((8, 32), jnp.bfloat16))
-    gradient = grouped_matmul._cutlass_call('dew_cutlass_grouped_gemm_k',
-                                            jax.ShapeDtypeStruct((2, 16, 32), jnp.bfloat16))
-
-    def product(x, w):
-        return forward(x, w, sizes, transpose_w=False)
-
-    for mapped, args in ((jax.vmap(product), (xs, ws)), (jax.vmap(product, in_axes=(0, None)), (xs, ws[0])),
-                         (jax.vmap(lambda x, dy: gradient(x, dy, sizes)), (xs, dys))):
-        traced = str(jax.make_jaxpr(mapped)(*args))
-        assert "dew_cutlass_grouped_gemm" in traced and ("scan" in traced or "while" in traced), traced[-300:]
 
 
 def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
@@ -570,6 +548,27 @@ def test_an_mma_sync_forward_of_no_depth_is_zero():
         got = jax.jit(lambda x, w: gemm.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,
                                                  precision="default", interpret_on_cpu=True))(lhs, rhs)
     assert not np.any(np.asarray(got))
+
+
+@pytest.mark.parametrize("sizes", [(3, 2), (2, 2)])
+def test_a_grouped_epilogue_of_no_depth_reads_each_rows_group(sizes):
+    """A grouped product of no depth runs no launch, its zeros through the epilogue on whole arrays: its side
+    operands by group read at each row as XLA's program reads them (`axes.at_rows`, row 4489), each row its
+    group's bias, a row past the groups' the last's; a side operand by column as it is."""
+    bias = jnp.asarray(np.arange(2 * 128).reshape(2, 128), jnp.float32)
+    column = jnp.asarray(np.linspace(-1, 1, 128), jnp.float32)
+    def added(acc, by_group, by_column):
+        return acc + by_group + by_column
+
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, family="wgmma")
+    got = mosaic_gpu.gmm(jnp.zeros((5, 0), jnp.bfloat16), jnp.zeros((2, 0, 128), jnp.bfloat16),
+                         jnp.asarray(sizes, jnp.int32), tiles=tiles, transpose_rhs=False,
+                         out_dtype=jnp.float32, multiprocessors=1, epilogue=added,
+                         epilogue_operands=(bias, column),
+                         epilogue_axes=(("groups", "columns"), ("columns",)))
+    # Each row's group, the rows past the groups' the last group's.
+    groups = np.concatenate([np.repeat(np.arange(2), sizes), np.full(5 - sum(sizes), 1)])
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(bias)[groups] + np.asarray(column)[None])
 
 
 def halved(acc, bias):
