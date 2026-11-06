@@ -14,9 +14,18 @@ Each array file stores fp32 and float64 references, IEEE products.
   batch and once with its batches bounded at 30 frames, its own grouping run under that bound.
 - `mimo-audio-tiny/mel.npz` (`--mel`): torchaudio stops at torch 2.11, so this part runs in an
   environment of torch 2.11 and torchaudio 2.11, the transform built in the dtype it computes in.
+- `mimo-vision-tiny/recording.npz` (`--record-vision`): the fixture's tower and merger over drawn pixels
+  (`vision_draw`) and drawn trunk features (`merger_draw`), their evidence and float64 truths' sketches
+  recorded over seeds for check 1 (`recorded_references.record_case`, summarized).
 
     python tools/mimo_reference.py
     <torch 2.11 + torchaudio python> tools/mimo_reference.py --mel
+    PYTHONPATH=src:tests python tools/mimo_reference.py --record-vision
+    PYTHONPATH=src:tests python tools/mimo_reference.py --record-audio
+
+`--record-audio` writes `mimo-audio-tiny/recording.npz`: the fixture's tokenizer encoder's pooled features
+of drawn mels (`mels_draw`), its batches whole and bounded at 30 frames, and its audio encoder over drawn
+codes (`codes_draw`), summarized over seeds for check 1.
 """
 
 import argparse
@@ -167,6 +176,156 @@ def write_mimo_vision_tiny() -> None:
            "projector": merged, "projector_f64": merged_f64})
 
 
+VISION_WIDTH = 3 * MIMO_VISION["temporal_patch_size"] * MIMO_VISION["patch_size"] ** 2
+"""Each packed patch's pixels: its channels, frames and rows of pixels."""
+
+
+def vision_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's packed pixels of MIMO_GRIDS' two rows, padded into one batch (`packed_rows`), drawn apart
+    from the fixture's own (seed 11)."""
+    return {"pixels": packed_rows(MIMO_GRIDS, VISION_WIDTH, 1_000 + seed)[0]}
+
+
+def merger_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's trunk features of MIMO_GRIDS' two rows, the merger's input, padded into one batch."""
+    rng = np.random.default_rng([0x3e9, seed])
+    rows = [rng.standard_normal((int(np.prod(grid)), MIMO_VISION["hidden_size"])).astype(np.float32)
+            for grid in MIMO_GRIDS]
+    return {"trunk": padded(rows).astype(np.float32)}
+
+
+def record_mimo_vision() -> None:
+    """The fixture's tower and merger (mimo-vision-tiny's tensors, loaded into the release's modules) over
+    seeds: the trunk of drawn pixels and the merger of drawn trunk features, each row's real entries in
+    float32 and float64, recorded for check 1 (`record_case`)."""
+    from recorded_references import provenance, record_case, save
+    from safetensors.torch import load_file
+    from torch_precision import float64
+
+    modeling = mimo_module()
+    config = SimpleNamespace(**MIMO_VISION)
+    directory = FIXTURES / "mimo-vision-tiny"
+    held = {name: tensor for file in ("model.safetensors", "projector.safetensors")
+            for name, tensor in load_file(str(directory / file)).items()}
+    narrow = modeling.MiMoVisionTransformer(config).float().eval()
+    # The merger's biases zero, as the release stores none and the fixture holds none.
+    with torch.no_grad():
+        for name, tensor in narrow.merger.named_parameters():
+            if name.endswith("bias"):
+                tensor.zero_()
+    narrow.load_state_dict({**narrow.state_dict(), **held})
+    with float64():
+        wide = modeling.MiMoVisionTransformer(config).eval()
+        wide.load_state_dict({name: tensor.double() for name, tensor in narrow.state_dict().items()})
+
+    def trunks(model, pixels, dtype):
+        caught, out = {}, []
+        hook = model.merger.register_forward_hook(lambda module, inputs, output: caught.update(x=inputs[0]))
+        with torch.no_grad():
+            for row, grid in zip(pixels, MIMO_GRIDS, strict=True):
+                model(torch.from_numpy(row[:int(np.prod(grid))]).to(dtype), torch.tensor([grid]))
+                out.append(caught["x"].double().numpy())
+        hook.remove()
+        return {"tower": np.concatenate(out)}
+
+    def merged(model, trunk, dtype):
+        with torch.no_grad():
+            return {"merger": np.concatenate([
+                model.merger(torch.from_numpy(row[:int(np.prod(grid))]).to(dtype)).double().numpy()
+                for row, grid in zip(trunk, MIMO_GRIDS, strict=True)])}
+
+    def case(run, name):
+        """A site's float32 run and float64 twin over a seed's `name` input."""
+        def evaluate(inputs):
+            narrow_out = run(narrow, inputs[name], torch.float32)
+            with float64():
+                return narrow_out, run(wide, inputs[name], torch.float64)
+        return evaluate
+
+    # Summarized: the test's float64 run is held to the truth's sketch (`indexed_recording`'s `truth_fn`).
+    arrays = {**record_case("mimo tower", vision_draw, case(trunks, "pixels"), store_inputs=False,
+                            summary=True),
+              **record_case("mimo merger", merger_draw, case(merged, "trunk"), store_inputs=False,
+                            summary=True)}
+    written = save(directory / "recording.npz", {**arrays, "provenance": provenance(
+        MIMO_REPO, MIMO_REVISION, "cpu",
+        "PYTHONPATH=src:tests python tools/mimo_reference.py --record-vision",
+        torch=torch.__version__)}, reference=f"{MIMO_REPO}@{MIMO_REVISION}", license="mit")
+    print(f"{written}: {sorted(arrays)}")
+
+
+CODE_LENGTHS = (11, 4)
+"""Each drawn clip's code frames, its last group partial."""
+
+
+def mels_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's mel frames of the two clips of LENGTHS."""
+    rng = np.random.default_rng([0x3ea, seed])
+    return {f"mel_{clip}": rng.standard_normal((length, TOKENIZER["n_mels"])).astype(np.float32)
+            for clip, length in enumerate(LENGTHS)}
+
+
+def codes_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's codes of two clips of CODE_LENGTHS, each channel within its codebook."""
+    rng = np.random.default_rng([0x3eb, seed])
+    sizes = TOKENIZER["codebook_size"]
+    return {f"codes_{clip}": np.stack([rng.integers(0, size, length) for size in sizes],
+                                      axis=-1).astype(np.int64)
+            for clip, length in enumerate(CODE_LENGTHS)}
+
+
+def record_mimo_audio() -> None:
+    """The fixture's tokenizer encoder and audio encoder (mimo-audio-tiny's tensors in the release's
+    modules) over seeds: the pooled features of drawn mels, the reference's batches whole and bounded at
+    30 frames, and each drawn clip's encoded groups, in float32 and float64 (`record_case`, summarized:
+    the test's float64 runs are held to the truths' sketches)."""
+    from recorded_references import provenance, record_case, save
+    from torch_precision import float64
+
+    modeling = mimo_module()
+    with np.load(AUDIO_FIXTURE / "model.npz") as stored:
+        held = {name: torch.from_numpy(np.asarray(stored[name])) for name in stored.files
+                if name.startswith(("tokenizer/", "encoder/"))}
+
+    def build(dtype):
+        modules = audio_modules(modeling)
+        prefixes = ("tokenizer/", "encoder/audio_encoder.", "encoder/speech_embeddings.")
+        for module, prefix in zip(modules, prefixes, strict=True):
+            module.load_state_dict({name.removeprefix(prefix): tensor for name, tensor in held.items()
+                                    if name.startswith(prefix)}, strict=False)
+        return tuple(module.to(dtype) for module in modules)
+
+    narrow = build(torch.float32)
+    with float64():
+        wide = build(torch.float64)
+
+    def features(modules, inputs, dtype, bound):
+        mels = [inputs[f"mel_{clip}"] for clip in range(len(LENGTHS))]
+        return {"features": audio_tokenized(modeling, modules, mels, dtype, bound)[0].astype(np.float64)}
+
+    def encoded(modules, inputs, dtype):
+        codes = [inputs[f"codes_{clip}"] for clip in range(len(CODE_LENGTHS))]
+        return {"encoded": np.concatenate(audio_encoded(modeling, modules, codes)).astype(np.float64)}
+
+    def both(run, **options):
+        def evaluate(inputs):
+            reference = run(narrow, inputs, torch.float32, **options)
+            with float64():
+                return reference, run(wide, inputs, torch.float64, **options)
+        return evaluate
+
+    arrays = {**record_case("tokenizer features", mels_draw, both(features, bound=256000),
+                            store_inputs=False, summary=True),
+              **record_case("bounded tokenizer features", mels_draw, both(features, bound=30),
+                            store_inputs=False, summary=True),
+              **record_case("audio encoder", codes_draw, both(encoded), store_inputs=False, summary=True)}
+    written = save(AUDIO_FIXTURE / "recording.npz", {**arrays, "provenance": provenance(
+        MIMO_REPO, MIMO_REVISION, "cpu",
+        "PYTHONPATH=src:tests python tools/mimo_reference.py --record-audio", torch=torch.__version__)},
+        reference=f"{MIMO_REPO}@{MIMO_REVISION}", license="mit")
+    print(f"{written}: {sorted(arrays)}")
+
+
 def write_mel() -> None:
     """torchaudio's mel frames of a fixed half second at MiMo's settings, fp32 and float64."""
     from torchaudio.transforms import MelSpectrogram
@@ -188,50 +347,57 @@ def write_mel() -> None:
              mel_f64=mel(torch.float64))
 
 
+def audio_modules(modeling):
+    """The release's tokenizer encoder, audio encoder and speech embeddings at the fixture's sizes."""
+    tokenizer = modeling.AudioTokenizerEncoder(modeling.MiMoAudioTokenizerConfig(**TOKENIZER)).eval()
+    config = SimpleNamespace(**AUDIO)
+    return tokenizer, modeling.MiMoAudioEncoder(config).eval(), modeling._build_speech_embeddings(config)
+
+
+def audio_encoded(modeling, modules, codes):
+    """The audio encoder over each clip's codes, a clip's groups apart."""
+    _, encode, embed = modules
+    with torch.no_grad():
+        grouped = [modeling._pad_and_group_audio_codes(torch.as_tensor(c), AUDIO["audio_channels"],
+                                                       AUDIO["group_size"]) for c in codes]
+        hidden = encode._apply_input_local_transformer(encode._apply_speech_embeddings(torch.cat(grouped),
+                                                                                        embed))
+        out = encode.projection(hidden.reshape(hidden.shape[0], -1)).numpy()
+    return np.split(out, np.cumsum([len(g) for g in grouped])[:-1])
+
+
+def audio_tokenized(modeling, modules, mels, dtype, bound):
+    """The pooled features of every segment in order and each clip's codes, the reference's batches
+    bounded at `bound` frames (its `_at_group_by_length`, run under that bound)."""
+    grouping = modeling._at_group_by_length
+    caught = []
+    hook = modules[0].down_sample_norm.register_forward_hook(lambda module, args, out: caught.append(out))
+    modeling._at_group_by_length = lambda features, lengths, _: grouping(features, lengths, bound)
+    try:
+        codes = modeling.tokenize_audio_batch([torch.from_numpy(m).to(dtype) for m in mels], modules[0],
+                                              segment_size=AUDIO["audio_segment_size"])
+    finally:
+        modeling._at_group_by_length = grouping
+        hook.remove()
+    return torch.cat(caught).numpy(), [c.numpy() for c in codes]
+
+
 def write_mimo_audio_tiny() -> None:
     from torch_precision import float64
 
     modeling = mimo_module()
-    grouping = modeling._at_group_by_length
-
-    def build():
-        tokenizer = modeling.AudioTokenizerEncoder(modeling.MiMoAudioTokenizerConfig(**TOKENIZER)).eval()
-        config = SimpleNamespace(**AUDIO)
-        encoder = modeling.MiMoAudioEncoder(config).eval()
-        embeddings = modeling._build_speech_embeddings(config)
-        return tokenizer, encoder, embeddings
-
     torch.manual_seed(1234)
-    tokenizer, encoder, embeddings = build()
+    tokenizer, encoder, embeddings = audio_modules(modeling)
     for index, module in enumerate((tokenizer, encoder, embeddings)):
         scatter(module, 1234 + index)
     mels = [np.random.RandomState(7 + i).randn(length, TOKENIZER["n_mels"]).astype(np.float32)
             for i, length in enumerate(LENGTHS)]
 
     def encoded(modules, codes):
-        """The audio encoder over each clip's codes, a clip's groups apart."""
-        _, encode, embed = modules
-        with torch.no_grad():
-            grouped = [modeling._pad_and_group_audio_codes(torch.as_tensor(c), AUDIO["audio_channels"],
-                                                           AUDIO["group_size"]) for c in codes]
-            hidden = encode._apply_input_local_transformer(encode._apply_speech_embeddings(torch.cat(grouped),
-                                                                                            embed))
-            out = encode.projection(hidden.reshape(hidden.shape[0], -1)).numpy()
-        return np.split(out, np.cumsum([len(g) for g in grouped])[:-1])
+        return audio_encoded(modeling, modules, codes)
 
     def tokenized(modules, dtype, bound):
-        """The pooled features of every segment in order and each clip's codes, the reference's batches
-        bounded at `bound` frames (its `_at_group_by_length`, run under that bound)."""
-        caught = []
-        hook = modules[0].down_sample_norm.register_forward_hook(lambda module, args, out: caught.append(out))
-        modeling._at_group_by_length = lambda features, lengths, _: grouping(features, lengths, bound)
-        try:
-            codes = modeling.tokenize_audio_batch([torch.from_numpy(m).to(dtype) for m in mels], modules[0],
-                                                  segment_size=AUDIO["audio_segment_size"])
-        finally:
-            modeling._at_group_by_length = grouping
-            hook.remove()
-        return torch.cat(caught).numpy(), [c.numpy() for c in codes]
+        return audio_tokenized(modeling, modules, mels, dtype, bound)
 
     modules = (tokenizer, encoder, embeddings)
     arrays = {}
@@ -240,7 +406,7 @@ def write_mimo_audio_tiny() -> None:
         arrays.update({f"{prefix}features": features, **{f"{prefix}codes_{i}": c for i, c in enumerate(codes)},
                        **{f"{prefix}embedded_{i}": e for i, e in enumerate(encoded(modules, codes))}})
     with float64():
-        wide = build()
+        wide = audio_modules(modeling)
         for source, target in zip(modules, wide, strict=True):
             target.load_state_dict({name: tensor.double() if tensor.is_floating_point() else tensor
                                     for name, tensor in source.state_dict().items()})
@@ -269,8 +435,19 @@ def write_mimo_audio_tiny() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mel", action="store_true", help="write mimo-audio-tiny/mel.npz, under torchaudio")
-    if parser.parse_args().mel:
+    parser.add_argument("--record-vision", action="store_true",
+                        help="record mimo-vision-tiny's tower and merger over seeds")
+    parser.add_argument("--record-audio", action="store_true",
+                        help="record mimo-audio-tiny's tokenizer and audio encoder over seeds")
+    arguments = parser.parse_args()
+    if arguments.record_audio:
+        record_mimo_audio()
+        return
+    if arguments.mel:
         write_mel()
+        return
+    if arguments.record_vision:
+        record_mimo_vision()
         return
     write_mimo_vision_tiny()
     write_mimo_audio_tiny()

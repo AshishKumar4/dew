@@ -6,6 +6,11 @@ scale-free norm's output, fp32 and float64, IEEE products. The first row is an N
 the image processor's own patchify, which the test feeds Dew as the image.
 
     python tools/muse_glimmer_reference.py
+    PYTHONPATH=src:tests python tools/muse_glimmer_reference.py --record
+
+`--record` writes `recording.npz` beside the fixture: its trunk over drawn pixels (`pixels_draw`) and over
+drawn NCHW images its processor packs (`image_draw`), and its projector over drawn trunk features
+(`trunk_draw`), each in float32 and float64 over seeds for check 1 (`recorded_references.record_case`).
 """
 
 from types import SimpleNamespace
@@ -105,7 +110,123 @@ def write_muse_glimmer_vision_tiny() -> None:
            "tower_f64": trunk_f64, "projector": merged, "projector_f64": merged_f64})
 
 
+WIDTH = 3 * MUSE_VISION["patch_temporal"] * MUSE_VISION["patch_size"] ** 2
+"""Each packed patch's pixels: its channels, frames and rows of pixels."""
+
+
+def pixels_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's packed pixels of MUSE_GRIDS' rows, padded into one batch, apart from the fixture's (13)."""
+    return {"pixels": packed_rows(MUSE_GRIDS, WIDTH, 2_000 + seed)[0]}
+
+
+def image_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's NCHW image of MUSE_GRIDS' first grid, which the processor packs."""
+    _, height, wide = MUSE_GRIDS[0]
+    patch = MUSE_VISION["patch_size"]
+    rng = np.random.default_rng([0x6c1, seed])
+    return {"image": rng.random((1, 3, height * patch, wide * patch)).astype(np.float32)}
+
+
+def trunk_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's trunk features of MUSE_GRIDS' rows in merge-block order, the projector's input, padded."""
+    rng = np.random.default_rng([0x6c2, seed])
+    return {"trunk": padded([rng.standard_normal((int(np.prod(grid)), MUSE_VISION["hidden_size"]))
+                             for grid in MUSE_GRIDS]).astype(np.float32)}
+
+
+def record_muse_glimmer_vision() -> None:
+    """The fixture's trunk and projector (muse-glimmer-vision-tiny's tensors in transformers' modules) over
+    seeds: each row's trunk of drawn pixels, the first grid's trunk of a drawn image the processor packs,
+    and the projector of drawn trunk features, each row's real entries in float32 and float64."""
+    import transformers
+    from recorded_references import provenance, record_case, save
+    from safetensors.torch import load_file
+
+    directory = FIXTURES / "muse-glimmer-vision-tiny"
+    vconf = MuseGlimmerVisionConfig(**MUSE_VISION)
+    vconf._attn_implementation = "eager"
+    wrapper = SimpleNamespace(**MUSE_WRAPPER)
+    tower_state = load_file(str(directory / "model.safetensors"))
+    projector_state = load_file(str(directory / "projector.safetensors"))
+
+    def build(dtype):
+        tower, adapter = MuseGlimmerVisionModel(vconf).eval(), MuseGlimmerVisionAdapter(wrapper).eval()
+        projection = torch.nn.Linear(MUSE_WRAPPER["projector_hidden_size"], MUSE_TEXT["hidden_size"],
+                                     bias=False)
+        tower.load_state_dict(tower_state)
+        adapter.load_state_dict({name.removeprefix("vision_adapter."): tensor
+                                 for name, tensor in projector_state.items()
+                                 if name.startswith("vision_adapter.")})
+        projection.load_state_dict({"weight": projector_state["vision_projection.weight"]})
+        norm = MuseGlimmerRMSNorm(eps=MUSE_TEXT["rms_norm_eps"], with_scale=False)
+        return tuple(module.to(dtype) for module in (tower, adapter, projection, norm))
+
+    narrow = build(torch.float32)
+    with float64():
+        wide = build(torch.float64)
+
+    def trunks(modules, rows, grids, dtype):
+        captured, out = {}, []
+        hook = modules[0].ln_post.register_forward_hook(
+            lambda module, inputs, output: captured.update(x=output))
+        with torch.no_grad():
+            for row, grid in zip(rows, grids, strict=True):
+                modules[0](torch.from_numpy(np.asarray(row)).to(dtype), torch.tensor([grid]))
+                order = get_vision_pixel_shuffle_index(torch.tensor([grid]), MUSE_VISION["merge_size"])
+                out.append(captured["x"][order].double().numpy())
+        hook.remove()
+        return np.concatenate(out)
+
+    def projected(modules, trunk, dtype):
+        _, adapt, linear, rms = modules
+        block = MUSE_VISION["merge_size"] ** 2
+        out = []
+        with torch.no_grad():
+            for row, grid in zip(trunk, MUSE_GRIDS, strict=True):
+                features = torch.from_numpy(row[:int(np.prod(grid))]).to(dtype)
+                shuffled = features.view(-1, block, features.shape[-1]).permute(0, 2, 1).reshape(
+                    -1, block * features.shape[-1])
+                out.append(rms(linear(adapt(shuffled))).double().numpy())
+        return np.concatenate(out)
+
+    def both(run):
+        def evaluate(inputs):
+            reference = run(narrow, inputs, torch.float32)
+            with float64():
+                return reference, run(wide, inputs, torch.float64)
+        return evaluate
+
+    def pixels_case(modules, inputs, dtype):
+        rows = [inputs["pixels"][index, :int(np.prod(grid))] for index, grid in enumerate(MUSE_GRIDS)]
+        return {"tower": trunks(modules, rows, MUSE_GRIDS, dtype)}
+
+    def image_case(modules, inputs, dtype):
+        packed, _, _ = MuseGlimmerImageProcessor.patchify(
+            None, torch.from_numpy(inputs["image"]), MUSE_VISION["patch_size"], MUSE_VISION["patch_temporal"])
+        return {"tower": trunks(modules, [packed[0].numpy()], MUSE_GRIDS[:1], dtype)}
+
+    def trunk_case(modules, inputs, dtype):
+        return {"projector": projected(modules, inputs["trunk"], dtype)}
+
+    arrays = {**record_case("muse glimmer tower", pixels_draw, both(pixels_case), store_inputs=False,
+                               summary=True),
+              **record_case("muse glimmer image", image_draw, both(image_case), store_inputs=False,
+                               summary=True),
+              **record_case("muse glimmer projector", trunk_draw, both(trunk_case), store_inputs=False,
+                               summary=True)}
+    written = save(directory / "recording.npz", {**arrays, "provenance": provenance(
+        "huggingface/transformers", transformers.__version__, "cpu",
+        "PYTHONPATH=src:tests python tools/muse_glimmer_reference.py --record", torch=torch.__version__)},
+        reference=f"transformers {transformers.__version__}", license="Apache-2.0")
+    print(f"{written}: {sorted(arrays)}")
+
+
 def main() -> None:
+    import sys
+
+    if sys.argv[1:] == ["--record"]:
+        record_muse_glimmer_vision()
+        return
     write_muse_glimmer_vision_tiny()
 
 

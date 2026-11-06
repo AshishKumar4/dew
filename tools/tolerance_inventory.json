@@ -158,7 +158,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoder_export.py": {
-   "comparisons": 18,
+   "comparisons": 17,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoding_components.py": {
@@ -434,7 +434,7 @@
    "lane": "Training"
   },
   "tests/test_mimo_audio.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_mimo_v2.py": {
@@ -466,7 +466,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe_exchange.py": {
-   "comparisons": 7,
+   "comparisons": 6,
    "lane": "Training"
   },
   "tests/test_moe_precision.py": {
@@ -706,7 +706,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_vision.py": {
-   "comparisons": 21,
+   "comparisons": 15,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_source.py": {
