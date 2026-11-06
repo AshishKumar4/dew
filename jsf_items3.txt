@@ -1,0 +1,4 @@
+16|8|2|70|formed|0|given32
+16|8|2|70|formed|0|heldonly32
+16|8|2|70|formed|0|exact-all
+16|8|2|70|formed|0|exact-write,corrected,apply_u,apply_w
