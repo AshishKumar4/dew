@@ -12,7 +12,7 @@ onto `DecisionHead`.
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
@@ -20,9 +20,11 @@ import numpy as np
 
 from dew.batch import Variables, part, thaw
 from dew.data.text import HFTokenizer
+from dew.decision.calibration import Calibration
 from dew.decision.head import DecisionHead
-from dew.decision.layout import MarkerLayout, Specials
+from dew.decision.layout import QuestionLayout, Specials
 from dew.decision.model import DecisionModel
+from dew.decision.release import stated_release
 from dew.interop.decoder_parts import Packed, layout_tensors, packed_layouts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, save_sharded, tensor_specs
 from dew.lora import FACTORS
@@ -75,22 +77,16 @@ LAYA = "convaiinnovations/laya"
 
 @dataclass(frozen=True)
 class LayaCheckpoint:
-    """One released Laya checkpoint: its model, variables, layout and tokenizer, and its agent's temperatures.
-
-    `temperatures` is `rl_agent_config.json`'s per-type list (choice, score,
-    noul), and `bucket_temperatures` its per-(type, option count) map, as the file
-    states them.
-    """
+    """One released Laya checkpoint: its model, variables, layout and tokenizer, and its calibration, whose
+    temperatures Laya's agent reads (`rl_agent_config.json`'s per-type list, choice, score, noul, and its
+    per-(type, option count) map, as the file states them)."""
 
     model: DecisionModel
     variables: Variables
-    layout: MarkerLayout
+    layout: QuestionLayout
     tokenizer: HFTokenizer
     specials: Specials
-    temperatures: tuple[float, float, float]
-    bucket_temperatures: dict[str, float]
-
-
+    calibration: Calibration = field(default_factory=Calibration)
 
     def save(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write this checkpoint in Laya's layout, which `Pretrained.load` and llama.cpp's converter read.
@@ -98,20 +94,15 @@ class LayaCheckpoint:
         That is `model.safetensors` (the encoder's ModernBertModel tensors under
         `encoder.` and the head's under Laya's names), `encoder/config.json`, the
         tokenizer under `tokenizer/`, and `rl_agent_config.json` with the head's
-        depth, the layout's budgets and the temperatures. The backbone must be a
-        ModernBERT encoder and the head Laya's. A backbone under LoRA is written
-        with its factors merged into their kernels (`Pretrained.bound`). Laya's config states a layout's
-        window, question budgets and option layout alone, so a layout that chooses more (an order, labels,
-        segments, blocks) is refused before anything is written; a run saved by `Decide.save` keeps it.
+        depth, the layout's window, question budgets and option layout, and the calibration's
+        temperatures held within their bounds as the task applies them, so that a reader which
+        does not hold them answers as it does. A backbone under LoRA is written with its factors merged
+        into their kernels (`Pretrained.bound`). Laya's config states no more of a layout than
+        that, nor of a calibration than its temperatures: the layout itself (an order, labels, segments,
+        blocks, a framing) and a binning map or abstention thresholds are the release's own
+        (`dew.config.Release`, `dew_release.json`), which `DecisionSource.describe` reads back over Laya's
+        file. A Laya reader that reads `rl_agent_config.json` alone lays rows out by that part of it.
         """
-        layout = self.layout
-        # Laya's own order is the question first, however the layout names it.
-        stated = MarkerLayout(max_len=layout.max_len, head_max_len=layout.head_max_len,
-                              option_tokens=layout.option_tokens, parallel=layout.parallel,
-                              order="question_first" if layout.order == "question_first" else None)
-        if layout != stated:
-            raise ValueError(f"Laya's config states a layout's window, budgets and option layout alone, not "
-                             f"this one's other choices ({layout}); save the task into a run with `save`")
         head = from_record(DecisionHead, self.model.head)
         tensors, config = laya_tensors(self.model, self.variables)
         root = Path(directory)
@@ -120,12 +111,17 @@ class LayaCheckpoint:
         config = {**config, "architectures": ["ModernBertModel"]}
         (root / "encoder" / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         self.tokenizer.save_pretrained(root / "tokenizer")
+        applied = self.calibration.temperatures.applied()
         (root / CONFIG_FILE).write_text(json.dumps({
             "head_layers": head.layers, "max_len": self.layout.max_len,
             "head_max_len": self.layout.head_max_len, "option_tokens": self.layout.option_tokens,
             "option_layout": "parallel" if self.layout.parallel else "sequential",
-            "temperature": list(self.temperatures), "temperature_by_options": self.bucket_temperatures,
+            "temperature": [applied.types.get(kind, 1.0) for kind in ("choice", "score", "noul")],
+            "temperature_by_options": dict(applied.buckets),
         }, indent=2) + "\n")
+        # Laya's file holds the temperatures and no more of a calibration (its own, binning and abstention).
+        beyond = self.calibration.binning is not None or self.calibration.abstention is not None
+        stated_release(root, self.layout, self.calibration if beyond else None)
 
 
 def laya_tensors(model: DecisionModel, variables: Variables
