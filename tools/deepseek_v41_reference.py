@@ -681,13 +681,7 @@ def orders(drawn: Path, seed: int):
     """
     from safetensors.torch import load_file
 
-    model_module, engram_module = import_reference()
-    install_selection_probe()
-    set_quantizers(model_module, enabled=False)
-    args = model_args(model_module, engram_module)
-    net = build(model_module, engram_module, args, seed)
-    with widened(model_module):
-        twin = build(model_module, engram_module, args, seed, widen=True)
+    model_module, _, net, twin = released(seed)
     stored = np.load(FIXTURE / "reference.npz")
     truth = np.load(FIXTURE / "reference_f64.npz")["updated_logits"]
     ids = torch.from_numpy(stored["input_ids"].astype(np.int64))
@@ -720,6 +714,19 @@ def orders(drawn: Path, seed: int):
     np.savez(FIXTURE / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
              updated_logits=np.asarray(distances))
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
+
+
+def released(seed: int):
+    """The release's model at `seed`, quantizers off and its selections probed, and its float64 twin, with
+    the release's module and arguments."""
+    model_module, engram_module = import_reference()
+    install_selection_probe()
+    set_quantizers(model_module, enabled=False)
+    args = model_args(model_module, engram_module)
+    net = build(model_module, engram_module, args, seed)
+    with widened(model_module):
+        twin = build(model_module, engram_module, args, seed, widen=True)
+    return model_module, args, net, twin
 
 
 def official_kernels():
@@ -972,6 +979,70 @@ def write_padding() -> None:
                    json.loads((FIXTURE / "config.json").read_text()), FIXTURE)
 
 
+def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
+    """The `seed`-th drawn rows `[2, LENGTH]` (from the seed's stream, redrawn until it does) whose every
+    top-k of the release's plain forward clears the gate's `MARGIN` (tests/selection_margins.py): rows a
+    float32 port selects over as the release does."""
+    from selection_margins import MARGIN
+
+    generator = torch.Generator().manual_seed(0x4241 + seed)
+    while True:
+        ids = torch.randint(3, vocabulary - 1, (2, LENGTH), generator=generator)
+        recorded = Record()
+        RECORDS[:] = [recorded]
+        with torch.no_grad():
+            reset(net)
+            forward(net, ids)
+        RECORDS.clear()
+        margins = [call["margin"] for call in recorded.calls.get("selection", [])]
+        if all(bool((margin > MARGIN).all()) for margin in margins):
+            return ids.numpy().astype(np.int32)
+
+
+def write_recording(seed: int):
+    """recording.npz beside the fixture: the release's plain logits in fp32 and fp64 over drawn rows its
+    selections clear (`clearing_rows`), every position's and a cached walk's past its prompt, summarized
+    over seeds for check 1, and the rows each seed drew (recording_rows.npz)
+    (`recorded_references.record_case`), the reference the suite's variants of a row (an interior gap,
+    shifted positions, a shifted cached walk) are held to (tests/test_deepseek_v41.py)."""
+    from recorded_references import provenance, record_case, save
+
+    model_module, args, net, wide = released(seed)
+
+    rows: dict[int, np.ndarray] = {}
+
+    def draw(index: int) -> dict[str, np.ndarray]:
+        if index not in rows:
+            rows[index] = clearing_rows(net, args.vocab_size, index)
+        return {"input_ids": rows[index]}
+
+    def evaluated(start: int):
+        """Each row's logits from position `start` on, in fp32 and in fp64."""
+        def evaluate(inputs):
+            ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
+            with torch.no_grad():
+                reset(net)
+                narrow = forward(net, ids)[1][:, start:].double().numpy()
+                with widened(model_module):
+                    reset(wide)
+                    truth = forward(wide, ids)[1][:, start:].numpy()
+            return {"logits": narrow}, {"logits": truth}
+        return evaluate
+
+    # Every position's, and those a cached walk computes after its prompt's prefill.
+    arrays = {**record_case("deepseek v41 plain rows", draw, evaluated(0), summary=True),
+              **record_case("deepseek v41 plain walk", draw, evaluated(PROMPT - 1), summary=True)}
+    written = save(FIXTURE / "recording.npz", {**arrays, "provenance": provenance(
+        "deepseek-ai/DeepSeek-V4.1-Flash", DEEPSEEK_V41_REVISION, "cpu",
+        "PYTHONPATH=.:tests:tools <release python> tools/deepseek_v41_reference.py --record",
+        torch=torch.__version__)}, reference=f"deepseek-ai/DeepSeek-V4.1-Flash@{DEEPSEEK_V41_REVISION}",
+        license="mit")
+    # The rows each seed drew, which the test reads its inputs from (`recorded_rows`): its own draw would
+    # rerun the release's selections to clear them.
+    np.savez(FIXTURE / "recording_rows.npz", rows=np.stack([rows[index] for index in range(len(rows))]))
+    print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", nargs="?", choices=("orders",))
@@ -983,6 +1054,8 @@ def main():
     parser.add_argument("--fp64", action="store_true", help="write the fixture's float64 truth")
     parser.add_argument("--vision", action="store_true", help="write the vision half beside the fixture")
     parser.add_argument("--padding", action="store_true", help="record the rows the lookup leaves untrained")
+    parser.add_argument("--record", action="store_true",
+                        help="record the plain logits over drawn rows its selections clear, over seeds")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
     # One thread keeps every reduction in one order, so a rerun writes the
@@ -1000,6 +1073,8 @@ def main():
         write_vision(options.seed)
     elif options.padding:
         write_padding()
+    elif options.record:
+        write_recording(options.seed)
     elif options.search:
         search(options.seed, options.search)
     else:

@@ -2,9 +2,10 @@
 seeds in the environment its code runs under (tools/remote_code_reference.py --record, the draws
 tests/remote_code_draws.py's): Liquid's LFM3 (LiquidAI/LFM3-1.7B@40ebe0a, transformers 5.18.0),
 MiMo-V2.6 (XiaomiMiMo/MiMo-V2.6-Pro-MOPD@6a7f202, 5.1.0, the last whose masks its code calls), its decoder
-alone and whole with its ViT, its audio encoder over its folder's tokenizer and the prediction layer vLLM
-composes of its modules, Dream (Dream-org/Dream-v0-Base-7B@6572adb, 4.46.3) and LLaDA
-(GSAI-ML/LLaDA-8B-Base@0f2787f, 4.46.3), each over a tiny random-weight checkpoint."""
+alone, with sliding layers of their own heads and width, and whole with its ViT, its audio encoder over
+its folder's tokenizer and the prediction layer vLLM composes of its modules, Dream
+(Dream-org/Dream-v0-Base-7B@6572adb, 4.46.3) and LLaDA (GSAI-ML/LLaDA-8B-Base@0f2787f, 4.46.3), each over
+a tiny random-weight checkpoint."""
 
 import json
 from pathlib import Path
@@ -28,7 +29,8 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
     tied head) over a packed row whose first documents are shorter than a convolution's history, through
     the decode cache in chunks, its parameter gradients under a drawn cotangent, its logits after one SGD
     step on the rows' next-token cross-entropy (a real update, the tied embedding and head stepped once)
-    and, with its convolutions' bias, over left-padded rows (ledgers 2039, 2040); MiMo-V2.6's whole over
+    and, with its convolutions' bias, over left-padded rows (ledgers 2039, 2040); MiMo-V2.6's decoder whose
+    sliding layers attend in their own geometry (ledger 4290); MiMo-V2.6's whole over
     rows a drawn image, a drawn video's frames or drawn audio clips fill, and its prediction layer's logits
     (row 357)."""
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
@@ -44,7 +46,8 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
 
 
 OPENED = {"lfm3-tiny": "transformers==5.18.0", "lfm3-biased-tiny": "transformers==5.18.0",
-          "lfm3-vl-tiny": "transformers==5.18.0", "mimo-v2-tiny": "transformers==5.1.0"}
+          "lfm3-vl-tiny": "transformers==5.18.0", "mimo-v2-tiny": "transformers==5.1.0",
+          "mimo-v2-sliding-tiny": "transformers==5.1.0"}
 """Each fixture whose export opens through its release's code, by the transformers that code runs under,
 which the whole suite's run overlays on the suite's own for its check alone (`release_env`): LFM3's
 native export carries it (`DecoderFamily.release_code`); MiMo-V2's and LFM3-VL's, which transformers

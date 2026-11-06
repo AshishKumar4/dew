@@ -59,6 +59,7 @@ from dew.nn.kv_cache import (
     Append,
     KVCache,
     KVStore,
+    cache_leaf,
     cached_validity,
     filled_slots,
     open_kv_cache,
@@ -1131,8 +1132,8 @@ class CausalSelfAttention(nn.Module):
             # Every canvas query reads the same retained encoder keys and all
             # canvas keys (modeling_diffusion_gemma.py:1399-1401). A local
             # layer retains the last window-1 prefix keys.
-            cached_key = self.get_variable("cache", "cached_key")
-            cached_value = self.get_variable("cache", "cached_value")
+            cached_key = cache_leaf(self, "cached_key")
+            cached_value = cache_leaf(self, "cached_value")
             alloc = cached_key.shape[-3]
             prefix_slots = jnp.arange(alloc)[None, :]
             valid_prefix = cached_validity(self, alloc)
@@ -1146,7 +1147,7 @@ class CausalSelfAttention(nn.Module):
             value = jnp.concatenate([cached_value, value], axis=-3)
             causal, window = False, None
             # The encoder's dense cache keeps a place a slot, `[rows, alloc, 1]`.
-            key_places = (jnp.concatenate([self.get_variable("cache", PLACES)[..., 0],
+            key_places = (jnp.concatenate([cache_leaf(self, PLACES)[..., 0],
                                            jnp.broadcast_to(places, (B, S))], axis=-1)
                           if self._reads_places else jnp.arange(alloc + S))
         elif self.ctx.kv_shared and decode:

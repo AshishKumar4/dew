@@ -106,7 +106,7 @@ def main() -> None:
         try:
             rollout(initial, local, jax.random.key(71))
         except ValueError as error:
-            refusal = str(error)
+            refusal = type(error).__name__
     device, host = split_fields(local)
     rolled = rollout(initial, with_host(shard_batch(trainer.device_mesh, device), host), jax.random.key(71))
     reassembled = shard_batch(trainer.device_mesh, rolled)

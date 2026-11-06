@@ -23,8 +23,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from interop_support import PROMPT_WORDS
 from model_support import streamed_export
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 
 from dew.interop.pretrained import Pretrained, load_diffusion_source
 from dew.training import Layout, MeshSpec
@@ -76,6 +77,19 @@ def test_a_streamed_pipeline_samples_what_the_eager_one_does(extracted, family):
 
 ENCODED = {"z_image": "HiddenStatesConditioner", "wan": "WanConditioner"}
 PROMPTS = ["a red bird", "two cats on a mat"]
+CONDITIONER_SEEDS = 8
+"""The conditioner-alone site's declared seeds, sized by `seeds_for` paired (armada, 11-06)."""
+
+
+def drawn_words(salt: int, seed, count: int) -> np.ndarray:
+    """`count` prompts of one to eight `PROMPT_WORDS` drawn from `seed` under `salt`, as each word's index,
+    -1 past a prompt's end: a draw the gate widens is arrays."""
+    rng = np.random.default_rng([salt, int(seed)])
+    indices = np.full((count, 8), -1, np.int32)
+    for row in indices:
+        row[:rng.integers(1, 9)] = -2
+        row[row == -2] = rng.integers(0, len(PROMPT_WORDS), (row == -2).sum())
+    return indices
 
 
 def encoded(directory: Path, conditioner: str, rows: list, placement: dict, *, widened: bool = False) -> dict:
@@ -157,12 +171,9 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
     call draws the prompted call's noise bit for bit, and given the
     encodings the prompted call made it walks to its images bit for bit.
     The conditioner alone encodes two rows where the task encodes them
-    padded and sharded, so XLA sums its contractions in another order: those
-    encodings are held to tests/reference_error.py's rule against the same
-    conditioner's float64 encoding, no further from it than twice the
-    task's own, and their masks equal. Observed (RMS distance from float64,
-    the conditioner alone's over the task's): Wan 1.008, Z-Image 1.053; the
-    two float32 encodings lie at most 8.9e-7 apart."""
+    padded and sharded, so XLA sums its contractions in another order: over
+    drawn prompts, its encodings are as exact as the task's against the same
+    conditioner's float64 encoding (check 1), and their masks equal."""
     directory = extracted[family]
     placement = {"mesh": MeshSpec(fsdp=jax.device_count()), "layout": LAYOUT}
     whole = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", **placement)
@@ -177,18 +188,36 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
     assert_same_bits(own.noise, prompted.noise)
     walked = lean_task(own, key=3).host().images
     assert_same_bits(walked, task(prompted, key=3).host().images)
-    alone = encoded(directory, ENCODED[family], PROMPTS, placement)["conditioning"]
-    with jax.enable_x64(new_val=True):
-        truth = encoded(directory, ENCODED[family], PROMPTS, {}, widened=True)["conditioning"]
-        truth = [np.asarray(leaf) for leaf in jax.tree.leaves(truth)]
-    task_own = [np.asarray(leaf)[:rows] for leaf in jax.tree.leaves(prompted.conditions["conditioning"])]
-    for got, want, wide in zip(jax.tree.leaves(alone), task_own, truth, strict=True):
-        if want.dtype == bool:
-            np.testing.assert_array_equal(np.asarray(got), want)
-            np.testing.assert_array_equal(wide, want)
-        else:
-            assert wide.dtype == np.float64
-            assert_as_exact_as_the_reference(np.asarray(got), want, wide, f"{family} conditioner alone")
+    def leaves(tree, kind) -> dict[str, np.ndarray]:
+        """An encoding's leaves of `kind`, the masks (bool) or the values (float), by their place."""
+        held = [np.asarray(leaf)[:rows] for leaf in jax.tree.leaves(tree)]
+        return {str(index): leaf for index, leaf in enumerate(held)
+                if (leaf.dtype == bool) == (kind == "masks")}
+
+    def alone(prompts, kind="values"):
+        return leaves(encoded(directory, ENCODED[family], list(prompts), placement)["conditioning"], kind)
+
+    def task_own(prompts, kind="values"):
+        return leaves(task.prepare(list(prompts), key=3, steps=2).conditions["conditioning"], kind)
+
+    def truth(prompts):
+        with jax.enable_x64(new_val=True):
+            wide = encoded(directory, ENCODED[family], list(prompts), {}, widened=True)["conditioning"]
+            wide = leaves(wide, "values")
+        assert all(leaf.dtype == np.float64 for leaf in wide.values())
+        return wide
+
+    masks = zip(alone(PROMPTS, "masks").values(), task_own(PROMPTS, "masks").values(), strict=True)
+    for got, want in masks:
+        np.testing.assert_array_equal(got, want)
+    def worded(indices):
+        """The prompts a draw's word indices spell (`drawn_words`)."""
+        return [" ".join(PROMPT_WORDS[index] for index in row if index >= 0) for row in np.asarray(indices)]
+
+    assert_as_exact(as_given(lambda indices: alone(worded(indices))),
+                    as_given(lambda indices: task_own(worded(indices))),
+                    lambda seed: (drawn_words(2190, seed, rows),), f"{family} conditioner alone",
+                    seeds=CONDITIONER_SEEDS, truth_fn=as_given(lambda indices: truth(worded(indices))))
 
 
 WIDER_FLUX = """

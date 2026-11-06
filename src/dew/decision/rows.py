@@ -93,7 +93,7 @@ class Encoding:
             else None
         )
         return self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
-                                tokens=None if tokens is None else tokens.tolist())
+                                tokens=None if tokens is None else tokens.tolist(), request=example.questions)
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
                  tokens: np.ndarray | None = None, group_of: "GroupOf | None" = None,
@@ -405,7 +405,8 @@ class Fit(pygrain.MapTransform):
     def _rows(self, example: Example, asked: Mapping[str, Question]) -> tuple[FittedRow, ...] | Rejected:
         """`example`'s rows of the questions `asked`, as the layout lays them out, or why none fit."""
         state = self.layout.state(self.tokenizer, self.specials, example.state)
-        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state,
+                                request=example.questions)
         # Counted under its reason, as a server counts the request it refuses (`Layout.refusal`); a
         # scored row whose options a declared cut left alike is answered as a server answers it.
         refusals = [self.layout.refusal(row, self.context_length) for row in laid]
@@ -447,7 +448,8 @@ class Fit(pygrain.MapTransform):
             asked[laid.name] = question
         if all(asked[laid.name].options == example.questions[laid.name].options for laid in row.questions):
             return None
-        [augmented] = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
+        [augmented] = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state,
+                                       request=example.questions)
         return drawn_refusal(self.layout, augmented, self.context_length, row.cuts)
 
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
@@ -499,7 +501,7 @@ class Fit(pygrain.MapTransform):
                             if name in example.answers and draws_none(question, fewest) else question)
                      for name in row.names for question in (example.questions[name],)}
             laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked,
-                                    tokens=row.tokens.tolist())
+                                    tokens=row.tokens.tolist(), request=example.questions)
             schemas = sum(len(each.context or ()) for each in laid if each.spans_in_context)
             return sum(len(each.tokens) for each in laid), schemas or row.context
 
