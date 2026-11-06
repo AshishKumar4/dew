@@ -844,6 +844,9 @@ the later ones wait for the first to write it."""
     ((Served(9), Served(12, flipped=(0,)), Served(12, flipped=(0, 1)), Served(9)),
      {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
       "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
+    ((Served(9), Served(9, flipped=(0,)), Served(9)),
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 2,
+      "prefix_states": 1}, (0, 0, 8), None, NARROW_HYBRID),
     (SEGMENT, {}, (0, 6, 12), None, NARROW_HYBRID),
     (SEGMENT, {}, (12,), (3,), NARROW_HYBRID),
     ((Served(7, shared=6), Served(7, flipped=(0,)), Served(7, flipped=(0, 1)),
@@ -853,7 +856,7 @@ the later ones wait for the first to write it."""
       Served(7, flipped=(6,), shared=6), Served(9, flipped=(0,))),
      {**SEGMENT_HOST, "kv_cache": KVCache(page_size=4, pages=8)}, (0, 0, 6, 14), (1, 1, 2, 1), SHORT_HYBRID)],
     ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host",
-         "from-one-host-slot", "a-shared-segment", "a-shared-segment-asked-at-once",
+         "from-one-host-slot", "a-state-from-the-host", "a-shared-segment", "a-shared-segment-asked-at-once",
          "a-segment-uploaded-and-copied-at-once", "a-segment-copied-into-a-spilled-page"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
@@ -894,16 +897,16 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     while another prompt runs, its state kept in a store of four entries, and its repeat reads its pages
     back (a pool without the tier reads none: its other prompt takes the pages); in a pool of eight pages
     two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
-    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back.
-    A segment three prompts declare shared, ending inside a page (`SEGMENT`), is read by each later one
-    from the state kept at its end, its last page copied into the prompt's own, one a round or all asked
-    at once. With a host tier (`SEGMENT_HOST`): a segment two other prompts spill to the host, its page
-    named by the segment alone, comes back for two prompts seated together, the first uploading it and the
-    second copying it from there after the upload lands; and a prompt copying a segment into a page the
-    pool reclaims from a cached prefix spills that prefix first, which its repeat reads back. Each
-    request
-    draws what it draws alone and scores it as a full
-    forward does (check 1)."""
+    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back;
+    a store of one entry sends a prompt's state to the host tier when another prompt's takes the entry,
+    and its repeat reads it back with its pages (`dew.inference.pages.States`). A segment three prompts
+    declare shared, ending inside a page (`SEGMENT`), is read by each later one from the state kept at
+    its end, its last page copied into the prompt's own, one a round or all asked at once. With a host
+    tier (`SEGMENT_HOST`): a segment two other prompts spill to the host, its page named by the segment
+    alone, comes back for two prompts seated together, the first uploading it and the second copying it
+    from there after the upload lands; and a prompt copying a segment into a page the pool reclaims from
+    a cached prefix spills that prefix first, which its repeat reads back. Each request draws what it
+    draws alone and scores it as a full forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
     # measure: at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
     model = hybrid_model(vocab_size=site.vocab, width=site.width)
