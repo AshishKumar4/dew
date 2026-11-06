@@ -264,12 +264,13 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
 
 RELEASE = TINY / "release.npz"
 """The release as released (row 354): its inference/model.py at the pinned revision, nothing of it
-replaced, over the weights it holds (release.safetensors), in bf16 over its own tilelang kernels and activation quantizers on an H100, its logits at every
-position (each prefix's prefill, the paper's arithmetic: a cached step of the release that closes no
-ratio-2 group reads another layer's index keys, which Dew does not reproduce), from position zero and
-from a walk's prompt on, and their float64 truth (the same code over the stand-ins kernels.npz holds to
-the kernels, widened), over drawn rows whose every selection the truth clears `selection_margins.MARGIN`
-by, summarized over check 1's seeds, beside the rows each seed drew (release_rows.npz;
+replaced, over the weights it holds (release.safetensors), in bf16 over its own tilelang kernels and
+activation quantizers on an H100, its logits at every position (each prefix's prefill, the paper's
+arithmetic: a cached step of the release that closes no ratio-2 group reads another layer's index keys,
+which Dew does not reproduce), from position zero and from a walk's prompt on, and an image prompt's,
+and their float64 truth (the same code over the stand-ins kernels.npz holds to the kernels, widened),
+over drawn rows whose every selection both float64 runs clear `selection_margins.MARGIN` by, summarized
+over check 1's seeds, beside the rows and prompts each seed drew (release_rows.npz;
 tools/deepseek_v41_reference.py --release)."""
 
 
