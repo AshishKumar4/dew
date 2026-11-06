@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from jax.typing import DTypeLike
 
 from dew.batch import Batch, Variables, unboxed
 from dew.inference.models import ModelSettings, ReleasesModel
@@ -46,28 +47,32 @@ _MIN_STD = 1e-3
 class _MLP(nn.Module):
     layers: Sequence[int]
     out: int
+    dtype: DTypeLike | None = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         for width in self.layers:
-            x = nn.swish(nn.Dense(width, kernel_init=nn.initializers.lecun_uniform())(x))
-        return nn.Dense(self.out, kernel_init=nn.initializers.lecun_uniform())(x)
+            x = nn.swish(nn.Dense(width, kernel_init=nn.initializers.lecun_uniform(), dtype=self.dtype)(x))
+        return nn.Dense(self.out, kernel_init=nn.initializers.lecun_uniform(), dtype=self.dtype)(x)
 
 
 class ActorCritic(nn.Module):
     """Brax PPO's networks over a flat observation: the policy MLP's location and raw scale of each
     of `action_size` action dimensions, and the value MLP's one value. Brax's DM Control widths:
     four layers of 32 for the policy, five of 256 for the value. `spread` multiplies the policy's scale:
-    below 1, a policy explores less from the start (a drone's first rollouts fly rather than tumble)."""
+    below 1, a policy explores less from the start (a drone's first rollouts fly rather than tumble).
+    `dtype` is the networks' compute dtype (None for their weights'), which a release loaded in another
+    computes in (`dew.inference.models.SavedModel`)."""
 
     action_size: int
     policy_layers: Sequence[int] = (32, 32, 32, 32)
     value_layers: Sequence[int] = (256, 256, 256, 256, 256)
     spread: float = 1.0
+    dtype: DTypeLike | None = None
 
     def setup(self) -> None:
-        self.policy_net = _MLP(tuple(self.policy_layers), 2 * self.action_size)
-        self.value_net = _MLP(tuple(self.value_layers), 1)
+        self.policy_net = _MLP(tuple(self.policy_layers), 2 * self.action_size, self.dtype)
+        self.value_net = _MLP(tuple(self.value_layers), 1, self.dtype)
 
     def __call__(self, observation: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         location, scale = self.policy(observation)
