@@ -64,6 +64,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
+import fractions
 import functools
 import hashlib
 import itertools
@@ -629,8 +630,11 @@ def assert_within_rounding(computed, exact, magnitudes, roundings: int, dtype, l
     `dtype`'s unit roundoff; half `reduction_bound`'s two-sided bound): a bound derived from the arithmetic
     alone, for a claim no float64 reference can hold, a float64 computation's own accuracy. `exact` is the
     exact value (each a `fractions.Fraction`, or a float64 that holds it exactly)."""
-    error = np.abs(np.asarray(computed, np.float64) - np.asarray([float(value) for value in np.ravel(exact)],
-                                                                   np.float64).reshape(np.shape(exact)))
+    # The error taken exactly, the exact value never rounded on the way: its float64 rounding alone would
+    # add half its ulp to the error, past the bound of a result rounded once.
+    error = np.asarray([float(abs(fractions.Fraction(float(found)) - fractions.Fraction(value)))
+                        for found, value in zip(np.ravel(np.asarray(computed, np.float64)), np.ravel(exact),
+                                                strict=True)]).reshape(np.shape(exact))
     bound = reduction_bound(magnitudes, roundings, dtype) / 2
     worst = float(np.broadcast_to(bound, error.shape).max())
     assert within(error, bound), (f"{label}: {int(np.sum(error > bound))} values past gamma_{roundings} of "

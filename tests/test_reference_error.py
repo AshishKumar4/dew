@@ -2446,3 +2446,9 @@ def test_a_float64_computation_is_held_within_its_own_roundings():
     assert_within_rounding(computed, exact, magnitudes, 1000, np.float64, "a float64 sum")
     with pytest.raises(AssertionError):
         assert_within_rounding(computed.astype(np.float32), exact, magnitudes, 1000, np.float64, "float32")
+    # The error is the exact one: a value just past the midpoint above 1 rounds up to 1 + 2^-52, and a result
+    # four roundings below it (1 - 3 2^-53, 4 2^-53 + 2^-120 from it) is within gamma_4, though five of
+    # 2^-53 from the exact value's float64 rounding.
+    exact = Fraction(1) + Fraction(1, 2**53) + Fraction(1, 2**120)
+    assert_within_rounding(np.asarray([1 - 3 * 2.0**-53]), np.asarray([exact], object), np.asarray([1.0]), 4,
+                           np.float64, "below the midpoint's rounding")
