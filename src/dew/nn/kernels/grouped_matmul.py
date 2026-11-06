@@ -972,7 +972,19 @@ class MosaicGmm(_Mosaic):
         if swapped is None:
             return super().derived(ba, target)
         tile = self._derived(swapped, target, admits=lambda tile: self._left_fits(ba, tile))
-        return None if tile is None else dataclasses.replace(tile, swapped=True)
+        if tile is None:
+            return None
+        # Its few output tiles leave a wave's programs idle: its depth splits where the busiest program then
+        # walks shorter, its fp32 partials' passes and their sum's launch counted (`mosaic_gpu.split_count`,
+        # the kernel gradient's rule; rows 1762 and 483), every run in the one launch (`mosaic_gpu.gmm`).
+        weight, padded = swapped.arguments['tokens'].shape, swapped.arguments['kernel'].shape
+        splits = 1 if ba.arguments['exact_sums'] else mosaic_gpu.split_count(
+            tile, groups=1, rows=weight[1], depth=weight[0], width=padded[1],
+            multiprocessors=_multiprocessors(target), step_seconds=mosaic_gpu.step_seconds(tile, target),
+            bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
+        swapped_tile = dataclasses.replace(tile, swapped=True)
+        split = dataclasses.replace(swapped_tile, splits=splits)
+        return split if splits > 1 and self.legal(ba, split, target) else swapped_tile
 
     def _left_fits(self, ba, config: mosaic_gpu.Tiles) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
@@ -1009,10 +1021,18 @@ class MosaicGmm(_Mosaic):
             return ba, config
         swapped = self._swapped(ba, generation.gpu_target())
         assert swapped is not None, "a swapped tile is a swappable call's (`legal`)"
-        return swapped, dataclasses.replace(config, swapped=False)
+        if config.splits > 1:
+            # A split's runs write fp32 partials (`mosaic_gpu.gmm`), each at the tile unsplit.
+            swapped = self.bind(*swapped.args, **{**swapped.kwargs, 'out_dtype': 'float32'})
+        return swapped, dataclasses.replace(config, swapped=False, splits=1)
 
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         if config.swapped and (self._swapped(ba, target) is None or not self._left_fits(ba, config)):
+            return False
+        # A split is a swapped call's (a decode step's), of no exact sums, each run some steps.
+        depth = ba.arguments['tokens'].shape[1]
+        if config.splits > 1 and (not config.swapped or ba.arguments['exact_sums']
+                                  or not mosaic_gpu.split_runs(depth // config.block_k, config.splits)):
             return False
         return super().legal(ba, config, target)
 

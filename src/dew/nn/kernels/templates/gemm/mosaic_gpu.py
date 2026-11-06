@@ -493,6 +493,10 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         values = values if isinstance(values, tuple) else (values,)
         outs = tuple(value.astype(dtype) for value, dtype in zip(values, dtypes, strict=True))
         return outs if out_dtypes else outs[0]
+    if tiles.splits > 1 and (not dense or paired is not None or exact_sums or prologue is not None
+                             or epilogue is not None or not split_runs(k // block_k, tiles.splits)):
+        raise ValueError(f"a depth split is a dense product's of no hooks, pair or exact sums, each run some "
+                         f"steps, not {tiles} of a {k}-deep one")
     # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
     # the routed ones, the padding among them, are a last group, whose tiles store zeros. A group's tiles
     # start at its first row (`tile_groups`), so a tile reads up to a tile's rows past the last group's
@@ -528,15 +532,26 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
             and not exact_sums):
         tail = tail_of.balanced(-(-m // tiles.block_m) * (n // block_n), k // block_k, multiprocessors,
                                 handoff_steps=handoff_steps(tiles, generation.gpu_target()))
-    walked = (-(-m // row_tile) + (0 if dense else g)) * (n // block_n) * tiles.cluster
+    walked = (-(-m // row_tile) + (0 if dense else g)) * (n // block_n) * tiles.cluster * tiles.splits
     programs = launched(family_of(tiles, lhs.dtype), multiprocessors, walked, tail)
     outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
-                         dtypes=dtypes, multiprocessors=programs, interpret=interpret,
+                         dtypes=dtypes if tiles.splits == 1 else (jnp.dtype(jnp.float32),),
+                         multiprocessors=programs, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
                          sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired, tail=tail,
                          exact_sums=exact_sums, transpose_lhs=transpose_lhs)
+    if tiles.splits > 1:
+        # Each run's fp32 partial, summed in its order (the same sums every call) and rounded once.
+        total = functools.reduce(jnp.add, tuple(outs[0]))
+        outs = tuple(total.astype(dtype) for dtype in dtypes)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
+
+
+def split_runs(steps: int, splits: int) -> bool:
+    """Dew: whether `steps` split into `splits` runs of a share each (the last's the rest, `_gmm_scheduled`)
+    leaves every run some steps."""
+    return (splits - 1) * -(-steps // splits) < steps
 
 
 def launched(family: mosaic.Family, multiprocessors: int, walked: int, tail: tail_of.Tail | None) -> int:
@@ -607,7 +622,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         blocks = allocations.blocks
 
         schedule = functools.partial(
-            _gmm_scheduled, table_gmem=table_gmem, lhs_gmem=lhs_gmem,
+            _gmm_scheduled, table_gmem=table_gmem, lhs_gmem=lhs_gmem, splits=tiles.splits,
             matrix_gmems=dict(zip(matrices, matrix_gmems, strict=True)), prologue_gmems=prologue_gmems,
             shape=(m, steps, g), grid=grid, tiles=tiles, dense=dense, tail=tail, programs=multiprocessors,
             transpose_rhs=transpose_rhs, axes_of={i: prologue_axes[i] for i in stepped},
@@ -641,7 +656,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                               strict=True)),
                               partials=None if tail is None else (workspace, ready))
 
-            walks = (grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
+            walks = (tiles.splits * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
             # Its step is its products and its waits (the prologue's rewrite apart), small enough that a
             # rotation of its ring unrolled takes fewer instructions an HGMMA (`mosaic.stepping`); an exactly
             # summed step is not (its product apart and its IEEE add of the tile beside the running sum), and
@@ -656,7 +671,9 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                       streams=family.streams(blocks, tiles.stages, consumers,
                                              multicast=matrices if pair > 1 else ()))
 
-    out_type = tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes)
+    # A depth split's outputs: each run's partial, a `[m, n]` slice of its own.
+    out_type = tuple(jax.ShapeDtypeStruct((m, n) if tiles.splits == 1 else (tiles.splits, m, n), dtype)
+                     for dtype in dtypes)
     # A balanced tail's partials: each program's, a consumer's share of a tile each.
     workspace = () if tail is None else (
         jax.ShapeDtypeStruct((multiprocessors, consumers, *part), jnp.float32),)
@@ -676,7 +693,9 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
     """Dew: a consumer's share of a `gmm` tile stored (`_finished`) from its accumulators: at once, or,
     a balanced tail's tile (`partials`: its workspace and readiness flags), once its program's partial and
     the other programs' are added (`mosaic.Family.fixed_up`)."""
-    group, row_start, ni, start, gathered, program = tile
+    group, row_start, ni, start, gathered, program, split = tile
+    # A depth split's run stores its partial in its own slice of each output.
+    o_gmems = o_gmems if split is None else tuple(o_gmem.at[split] for o_gmem in o_gmems)
     # This consumer's share of the tile: its first row, and its group's rows there.
     part_row, column = row_start + wg * part[0], ni * part[1]
     first, stored = _stored_rows(group, part_row, part[0], m, dense=dense, row_tile=row_tile)
@@ -733,17 +752,27 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
 def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_gmems, shape: tuple,
                    grid: tuple, tiles: Tiles, dense: bool, tail: tail_of.Tail | None, programs: int,
                    transpose_rhs: bool, axes_of: dict, interpreted: bool,
-                   transpose_lhs: bool = False) -> tuple:
+                   transpose_lhs: bool = False, splits: int = 1) -> tuple:
     """Dew: `gmm`'s tile at the persistent walk's `index` (`mosaic.Family.persist`'s schedule): whether it
     multiplies any row, its steps, its streams' views (`_gmm_views`) and its group, row block and column
     tile: its pair's but for this multiprocessor's row block; in a balanced tail, the first of the tile's
-    steps its program walks and how many, its partials' gatherer and its program (`tail.Tail.segment`).
+    steps its program walks and how many, its partials' gatherer and its program (`tail.Tail.segment`);
+    with `splits`, its depth's run: the walk every tile's first run, then every tile's second (as many
+    launches of a run each would walk them), each run a share of the steps, the last's the rest.
     `shape` is the padded rows, the steps and the groups."""
     m, steps, groups = shape
     pair = tiles.cluster
     index = tail_of.ordered(tail, index, programs, interpreted)
-    snaked, start, count, gathered = ((index[0], 0, steps, None) if tail is None
-                                      else tail.segment(index, programs, grid[0] * grid[1]))
+    split = None
+    if tail is not None:
+        snaked, start, count, gathered = tail.segment(index, programs, grid[0] * grid[1])
+    elif splits == 1:
+        snaked, start, count, gathered = index[0], 0, steps, None
+    else:
+        share = -(-steps // splits)
+        split, snaked = index[0] // (grid[0] * grid[1]), index[0] % (grid[0] * grid[1])
+        start, gathered = split * share, None
+        count = jnp.minimum(share, steps - start)
     mi, ni = tail_of.planar_snake(snaked, grid, 1, tiles.grid_block_n)
     group = (GroupInfo.dense(tiles.block_m * pair, mi, m) if dense
              else GroupInfo.create(table_gmem, tiles.block_m * pair, mi))
@@ -755,7 +784,7 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
                        transpose_lhs=transpose_lhs)
     active = (count > 0 if tail is not None else jnp.ones((), jnp.bool_) if dense
               else (group.group_id < groups) & (group.actual_size > 0))
-    return active, count, views, (group, row_start, ni, start, gathered, index[-1])
+    return active, count, views, (group, row_start, ni, start, gathered, index[-1], split)
 
 
 def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, column_tile, *, tiles: Tiles,
