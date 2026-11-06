@@ -35,15 +35,17 @@ def logits(directory):
 
 
 def fused(tensors, config):
-    """The split q, k and v projections fused as the Pro release stores them."""
-    runs, heads = config['num_key_value_heads'], config['num_attention_heads']
-    widths = (heads // runs * config['head_dim'], config['num_key_value_heads'] // runs * config['head_dim'],
-              config['num_key_value_heads'] // runs * config['v_head_dim'])
+    """The split q, k and v projections fused as the Pro release stores them, in runs over each layer's key
+    heads: a sliding layer's of its `swa_*` geometry, a full layer's of the model's."""
     out = dict(tensors)
-    for layer in range(config['num_hidden_layers']):
+    for layer, slides in enumerate(config['hybrid_layer_pattern']):
+        prefix = 'swa_' if slides else ''
+        runs, heads = config[f'{prefix}num_key_value_heads'], config[f'{prefix}num_attention_heads']
+        width = config[f'{prefix}head_dim']
+        widths = (heads // runs * width, width, config['v_head_dim'])
         stem = f'model.layers.{layer}.self_attn.'
-        parts = [out.pop(f'{stem}{part}_proj.weight').reshape(runs, width, -1)
-                 for part, width in zip('qkv', widths, strict=True)]
+        parts = [out.pop(f'{stem}{part}_proj.weight').reshape(runs, part_width, -1)
+                 for part, part_width in zip('qkv', widths, strict=True)]
         out[f'{stem}qkv_proj.weight'] = np.concatenate(parts, axis=1).reshape(-1, parts[0].shape[-1])
     return out
 
@@ -283,6 +285,63 @@ def test_a_fused_prediction_layer_of_its_own_geometry_loads_and_saves_back_as_it
     assert sorted(written) == sorted(tensors)
     for name, tensor in tensors.items():
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+
+
+SLIDING = {'swa_num_attention_heads': 2, 'swa_num_key_value_heads': 1, 'swa_head_dim': 24}
+"""Sliding layers' geometry other than the tiny trunk's full layers': half their query heads, one key
+head, twice their width; their values the model's (ledger 4290)."""
+
+
+def sliding_source(directory: Path, layout: str) -> dict:
+    """The tiny trunk whose sliding layers (1 and 2) attend in `SLIDING`'s geometry, their q, k, v and o
+    projections and sinks drawn at its shapes, stored `layout` ('split' or fused in each layer's own runs,
+    'fused_qkv') at `directory`: the tensors it holds."""
+    config = {**json.loads((TINY / 'config.json').read_text()), **SLIDING,
+              'attention_projection_layout': layout}
+    rng = np.random.default_rng(4290)
+    tensors = dict(load_file(TINY / 'model.safetensors'))
+    heads, kv, width, value = 2, 1, 24, config['v_head_dim']
+    for layer in (1, 2):
+        stem = f'model.layers.{layer}.self_attn.'
+        for name, shape in (('q_proj.weight', (heads * width, 32)), ('k_proj.weight', (kv * width, 32)),
+                            ('v_proj.weight', (kv * value, 32)), ('o_proj.weight', (32, heads * value)),
+                            ('attention_sink_bias', (heads,))):
+            tensors[stem + name] = (0.3 * rng.normal(size=shape)).astype(np.float32)
+    if layout == 'fused_qkv':
+        tensors = fused(tensors, config)
+    directory.mkdir()
+    (directory / 'config.json').write_text(json.dumps(config))
+    save_file(tensors, directory / 'model.safetensors')
+    return tensors
+
+
+def test_sliding_layers_of_their_own_geometry_load_split_or_fused_and_save_back_as_they_came(tmp_path):
+    """A trunk whose sliding layers state query heads, key heads and a width of their own (`SLIDING`,
+    MiMoV2Attention's `swa_*`) builds them in a kind of that geometry, the full layers in the model's;
+    stored fused, each layer's runs split by its own kind (`Packed.owner`), it computes the split source's
+    logits bit for bit; each saves back every tensor as it came and the `swa_*` geometry it was read with.
+    Values of another width than the model's, which no kind sets apart, are refused by name (ledger 4290)."""
+    from dew.interop.hf_decoders import translate_config
+
+    split = sliding_source(tmp_path / 'split', 'split')
+    fused_tensors = sliding_source(tmp_path / 'fused', 'fused_qkv')
+    config = json.loads((tmp_path / 'split' / 'config.json').read_text())
+    sliding = translate_config(config)['kinds']['sliding_attention']
+    assert (sliding['num_heads'], sliding['num_kv_heads'], sliding['head_dim']) == (2, 1, 24)
+    with pytest.raises(ValueError):
+        translate_config({**config, 'swa_v_head_dim': 12})
+    loaded, expected = logits(tmp_path / 'split')
+    reread, actual = logits(tmp_path / 'fused')
+    np.testing.assert_array_equal(actual, expected)
+    for source, tensors in ((loaded, split), (reread, fused_tensors)):
+        saved = tmp_path / f'saved-{len(tensors)}'
+        source.save(saved)
+        written = load_file(saved / 'model.safetensors')
+        assert sorted(written) == sorted(tensors)
+        for name, tensor in tensors.items():
+            np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+        stated = json.loads((saved / 'config.json').read_text())
+        assert {key: stated[key] for key in SLIDING} == SLIDING
 
 
 def test_a_release_without_a_processor_of_its_own_refuses_raw_media_and_reads_its_fields():
