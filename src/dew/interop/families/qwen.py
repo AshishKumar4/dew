@@ -29,6 +29,7 @@ from dew.interop.decoder_parts import (
     constant,
     declared_depths,
     decoder_layout,
+    experts,
     flag,
     inert,
     integer,
@@ -161,16 +162,16 @@ def _schedule() -> ConfigPart[CausalTransformer]:
     return ConfigPart(read, write)
 
 
-def qwen_experts(*, experts: int, top_k: int, width: int, shared: int | None = None,
+def qwen_experts(*, count: int, top_k: int, width: int, shared: int | None = None,
                  normalized: bool | None = False, scheduled: bool = True) -> ConfigLayout[CausalTransformer]:
-    """A Qwen MoE's routed experts, both ways, at its class's defaults (`experts`, `top_k`, `width`): their
+    """A Qwen MoE's routed experts, both ways, at its class's defaults (`count`, `top_k`, `width`): their
     count (`num_experts`, `num_local_experts` its alias, the name transformers 5.16.1 writes it back
     under), softmax top-k and width, renormalized where `norm_topk_prob` says, whose default is
     `normalized` (None for a router that always renormalizes and reads no such key), a sigmoid-gated
     shared expert of width `shared` where the family has one, and, where `scheduled`, the layers they route
     (`_schedule`), none where the config routes none (`_routes_some`)."""
     return ConfigLayout(
-        experts(integer('num_experts', 'experts', experts, 'num_local_experts'),
+        experts(integer('num_experts', 'experts', count, 'num_local_experts'),
                 integer('num_experts_per_tok', 'top_k', top_k),
                 integer('moe_intermediate_size', 'expert_features', width),
                 *(() if normalized is None
@@ -178,7 +179,7 @@ def qwen_experts(*, experts: int, top_k: int, width: int, shared: int | None = N
                 *(() if shared is None
                   else (integer('shared_expert_intermediate_size', 'shared_features', shared),
                         constant('shared_gate', value=True))),
-                present=_routes_some(experts) if scheduled else None),
+                present=_routes_some(count) if scheduled else None),
         TRAINING_ROUTER, *((_schedule(),) if scheduled else ()))
 
 
@@ -283,7 +284,7 @@ QWEN3_NEXT = DecoderFamily(
     # release spells its rope flat: rope_theta beside a null rope_scaling, a ramp there the YaRN its model
     # card suggests past 256K.
     ConfigLayout(qwen_hybrid(fixed={'fused_in_proj': True}), single_depth('num_nextn_predict_layers'),
-                 qwen_experts(experts=512, top_k=10, width=512, shared=512, normalized=True)),
+                 qwen_experts(count=512, top_k=10, width=512, shared=512, normalized=True)),
     lambda fields: any(
         isinstance(mixer, GatedDeltaNetMixer) and mixer.fused_in_proj for mixer in kind_mixers(fields)
     ),
@@ -309,7 +310,7 @@ QWEN3_5_MOE_TEXT = DecoderFamily(
         inert('output_gate_type', 'Qwen3.5 DeltaNet uses the swish gate', neutral='swish'),
         inert('mtp_use_dedicated_embeddings', 'the released prediction layer shares embeddings and head',
               neutral=False),
-        qwen_experts(experts=256, top_k=8, width=512, shared=512, normalized=None, scheduled=False)),
+        qwen_experts(count=256, top_k=8, width=512, shared=512, normalized=None, scheduled=False)),
     lambda fields: bool(fields.output_gate and fields.mixture is not None),
     'qwen3_5_moe_text',
     'Qwen3_5MoeForCausalLM',
@@ -341,7 +342,7 @@ QWEN3_MOE = DecoderFamily(
     # The Qwen3 block with a routed feed-forward on the layers decoder_sparse_step and mlp_only_layers pick
     # (the others dense at intermediate_size), and every layer windowed under use_sliding_window.
     ConfigLayout(_every_layer_window(), decoder_layout(DecoderSpelling(qk_norm=True)),
-                 qwen_experts(experts=128, top_k=8, width=768)),
+                 qwen_experts(count=128, top_k=8, width=768)),
     lambda fields: bool(fields.qk_norm and fields.mixture is not None),
     'qwen3_moe',
     'Qwen3MoeForCausalLM',
@@ -357,7 +358,7 @@ QWEN3_VL_MOE_TEXT = DecoderFamily(
     # Qwen3VLMoeTextTopKRouter always divides them by their sum (modeling_qwen3_vl_moe.py, transformers
     # 5.17), and its config reads no such field.
     ConfigLayout(_every_layer_window(), decoder_layout(DecoderSpelling(qk_norm=True)),
-                 qwen_experts(experts=128, top_k=8, width=768, normalized=None),
+                 qwen_experts(count=128, top_k=8, width=768, normalized=None),
                  unread('norm_topk_prob')),
     # A text decoder read from a Qwen3-VL-MoE release (`hf_decoders.TEXT_FAMILIES`), never the family a
     # model exports as: it exports as Qwen3-MoE.
@@ -395,7 +396,7 @@ QWEN2_MOE = DecoderFamily(
     # norms; softmax experts beside a sigmoid-gated shared MLP on its sparse-step schedule.
     ConfigLayout(_even_layer_window(), decoder_layout(DecoderSpelling(reads=_QWEN_READS)),
                  flag('qkv_bias', 'attention_bias', default=True), constant('o_proj_bias', value=False),
-                 qwen_experts(experts=60, top_k=4, width=1408, shared=5632)),
+                 qwen_experts(count=60, top_k=4, width=1408, shared=5632)),
     lambda fields: bool(not fields.qk_norm and fields.mixture is not None
                         and fields.mixture.shared_gate),
     'qwen2_moe',

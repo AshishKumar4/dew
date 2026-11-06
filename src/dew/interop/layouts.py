@@ -452,6 +452,19 @@ type ConfigWrite[Model] = Callable[[Model], Mapping[str, object]]
 (`decoder_parts.ExportRefused`)."""
 
 
+class ConfigEntry[Model](Protocol):
+    """One entry of a family's config layout (`ConfigLayout`), both ways: its keys read into the model's
+    record (`read`), the record's fields written back as keys (`write`), and the keys it states by name
+    (`keys`), which a layout that reads none of them marks read (`Nested.present`, a kind no layer holds)."""
+
+    def read(self, hf_config: Mapping[str, object], used: set[str], record: NativeFields[Model], /
+             ) -> NativeFields[Model]: ...
+
+    def write(self, model: Model, /) -> Mapping[str, object]: ...
+
+    def names(self) -> tuple[str, ...]: ...
+
+
 @dataclass(frozen=True, eq=False)
 class ConfigPart[Model]:
     """Config keys a family reads and writes together (`read`, `write`), declared side by side so neither
@@ -461,6 +474,10 @@ class ConfigPart[Model]:
 
     read: ConfigRead[Model]
     write: ConfigWrite[Model]
+
+    def names(self) -> tuple[str, ...]:
+        """None by name: a part's keys are its read's own, which it marks read (`used`)."""
+        return ()
 
 
 _MISSING = object()
@@ -498,6 +515,9 @@ class ConfigField[Model]:
     def write(self, model: Model) -> Mapping[str, object]:
         held = getattr(model, self.field) if self.value is None else self.value(model)
         return {self.key: held if self.spell is None else self.spell(held)}
+
+    def names(self) -> tuple[str, ...]:
+        return (self.key, *self.aliases)
 
 
 def constant[Model](field: str, *, value: Configured) -> ConfigPart[Model]:
@@ -539,7 +559,7 @@ class Nested[Model, Part]:
     def read(self, hf_config: Mapping[str, object], used: set[str],
              record: NativeFields[Model]) -> NativeFields[Model]:
         if self.present is not None and not self.present(hf_config):
-            used.update(self.layout.keys())
+            used.update(self.layout.names())
             record[self.field] = None
             return record
         part = self.layout.read(hf_config, used, NativeFields(self.kind, {}))
@@ -550,15 +570,18 @@ class Nested[Model, Part]:
         part = self.held(model)
         return {} if part is None else self.layout.write(part)
 
+    def names(self) -> tuple[str, ...]:
+        return self.layout.names()
+
 
 @dataclass(frozen=True, eq=False)
 class Restated[Model]:
     """`layout` under a family's own keys: each shared key read from and written to the family's
-    (`keys`, shared to own), and the keys a family's class fixes (`fixed`, shared to value) read at their
+    (`own`, shared to own), and the keys a family's class fixes (`fixed`, shared to value) read at their
     value and written as nothing (DeepSeek's one key/value head of its latent attention)."""
 
     layout: ConfigLayout[Model]
-    keys: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    own: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     fixed: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
     defaults: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
     """Shared keys at the class's own default where the config states none."""
@@ -569,18 +592,21 @@ class Restated[Model]:
     def read(self, hf_config: Mapping[str, object], used: set[str],
              record: NativeFields[Model]) -> NativeFields[Model]:
         view = {**self.defaults, **hf_config}
-        for shared, own in self.keys.items():
+        for shared, own in self.own.items():
             if own in view:
                 view[shared] = view[own]
         view.update(self.fixed)
         read: set[str] = set()
         record = self.layout.read(view, read, record)
-        used.update(self.keys.get(key, key) for key in read if key not in self.fixed)
+        used.update(self.own.get(key, key) for key in read if key not in self.fixed)
         return record
 
     def write(self, model: Model) -> Mapping[str, object]:
-        return {self.keys.get(key, key): value for key, value in self.layout.write(model).items()
+        return {self.own.get(key, key): value for key, value in self.layout.write(model).items()
                 if key not in self.fixed and key not in self.undeclared}
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(self.own.get(key, key) for key in self.layout.names() if key not in self.fixed)
 
 
 @dataclass(frozen=True, eq=False)
@@ -601,18 +627,19 @@ class Choice[Model]:
     def write(self, model: Model) -> Mapping[str, object]:
         return (self.routed if self.writes(model) else self.plain).write(model)
 
+    def names(self) -> tuple[str, ...]:
+        return (*self.routed.names(), *self.plain.names())
+
 
 @dataclass(frozen=True, eq=False)
 class ConfigLayout[Model]:
-    """A family's config, its parts in order (`ConfigPart`, `ConfigField`, or another layout): read, each
-    filling the record (`read`), and written, each stating its keys (`write`, a later part's keys over an
-    earlier's)."""
+    """A family's config, its entries in order (`ConfigEntry`: a `ConfigPart`, a `ConfigField`, another
+    layout): read, each filling the record (`read`), and written, each stating its keys (`write`, a later
+    entry's keys over an earlier's)."""
 
-    parts: tuple[ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model] | Nested[Model, object]
-                 | Restated[Model] | Choice[Model], ...]
+    parts: tuple[ConfigEntry[Model], ...]
 
-    def __init__(self, *parts: ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model]
-                 | Nested[Model, object] | Restated[Model] | Choice[Model]) -> None:
+    def __init__(self, *parts: ConfigEntry[Model]) -> None:
         object.__setattr__(self, 'parts', parts)
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
@@ -621,11 +648,9 @@ class ConfigLayout[Model]:
             record = part.read(hf_config, used, record)
         return record
 
-    def keys(self) -> tuple[str, ...]:
-        """The config keys its fields state, each under every spelling it reads."""
-        return tuple(key for part in self.parts
-                     for key in ((part.key, *part.aliases) if isinstance(part, ConfigField)
-                                 else part.keys() if isinstance(part, ConfigLayout) else ()))
+    def names(self) -> tuple[str, ...]:
+        """The config keys its entries state by name, each under every spelling it reads."""
+        return tuple(key for part in self.parts for key in part.names())
 
     def write(self, model: Model) -> Mapping[str, object]:
         written: dict[str, object] = {}
@@ -742,8 +767,41 @@ def _decoder_layout(decoder: object) -> Mapping[str, object] | Unwritable:
     return written
 
 
-__all__ = ["INDEX", "REQUIRED", "Choice", "Condition", "Config", "ConfigField", "ConfigLayout",
-           "ConfigPart", "ConfigRead", "ConfigWrite", "Copy", "Leaf", "Nested", "Path", "Prefixed",
-           "Rebased", "Renames", "Restated", "Route", "Routes", "Slot", "SourceLayout", "Spelled", "Table",
-           "Unwritable", "Unwritten", "When", "after", "constant", "mapped", "nested", "one_of", "renamed",
-           "source_layout", "unread"]
+__all__ = [
+    "INDEX",
+    "REQUIRED",
+    "Choice",
+    "Condition",
+    "Config",
+    "ConfigEntry",
+    "ConfigField",
+    "ConfigLayout",
+    "ConfigPart",
+    "ConfigRead",
+    "ConfigWrite",
+    "Copy",
+    "Leaf",
+    "Nested",
+    "Path",
+    "Prefixed",
+    "Rebased",
+    "Renames",
+    "Restated",
+    "Route",
+    "Routes",
+    "Slot",
+    "SourceLayout",
+    "Spelled",
+    "Table",
+    "Unwritable",
+    "Unwritten",
+    "When",
+    "after",
+    "constant",
+    "mapped",
+    "nested",
+    "one_of",
+    "renamed",
+    "source_layout",
+    "unread",
+]

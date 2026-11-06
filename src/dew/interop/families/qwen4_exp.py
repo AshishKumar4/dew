@@ -162,7 +162,7 @@ QWEN4_EXP_CONFIG = ConfigLayout(
            ConfigLayout(integer('hc_count', 'hc_mult', 4), integer('hc_lowrank', 'hc_lowrank', 320),
                         constant('head', value='gated')),
            lambda model: model.hyper_connections),
-    qwen_experts(experts=512, top_k=10, width=512, shared=512, normalized=True, scheduled=False),
+    qwen_experts(count=512, top_k=10, width=512, shared=512, normalized=True, scheduled=False),
     ConfigPart(_engram, _engram_written),
     # The prediction layer's fields, which transformers reads nowhere (the module doc), the cache's slot
     # count it derives from the PLE (configuration_qwen4_exp.py:172), and the delta net's state dtype,

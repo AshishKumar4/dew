@@ -182,7 +182,8 @@ def _inverse_root(value: object, key: str) -> float | None:
 
 
 _QUERY_SCALE = ConfigField('query_pre_attn_scalar', 'attention_scale', None, parse=_inverse_root,
-                           spell=lambda scale: None if scale is None else round(1.0 / scale ** 2))
+                           spell=lambda scale: None if scale is None
+                           else round(1.0 / _records.number(scale, 'attention_scale') ** 2))
 """The query's scale, spelled as the scalar whose inverse square root it is."""
 
 _SANDWICH = (constant('scale_offset', value=True), constant('embedding_scale', value=True),

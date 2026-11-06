@@ -30,6 +30,7 @@ from dew.interop.layouts import (
     REQUIRED,
     Condition,
     Config,
+    ConfigEntry,
     ConfigField,
     ConfigLayout,
     ConfigPart,
@@ -1182,7 +1183,7 @@ def kind_mixer[Mixer](kind: str, name: str, mixer: type[Mixer], layout: ConfigLa
     written from the mixer the kind holds."""
     def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
         if kind not in _records.strings(record['layer_types'], 'layer_types'):
-            used.update(layout.keys())
+            used.update(layout.names())
             return record
         fields = layout.read(hf_config, used, NativeFields(mixer, {}))
         fields.update(fixed or {})
@@ -1236,7 +1237,8 @@ def decoder_layout(spelling: DecoderSpelling = PLAIN_DECODER, *,
         *(flag(name, name, default=False) if name in reads else constant(name, value=False)
           for name in ('attention_bias', 'mlp_bias')),
         flag('tie_word_embeddings', 'tie_embeddings', default=spelling.tie_embeddings),
-        constant('qk_norm', spelling.qk_norm), constant('scale_after_cast', spelling.scale_after_cast))
+        constant('qk_norm', value=spelling.qk_norm),
+        constant('scale_after_cast', value=spelling.scale_after_cast))
 
 
 def nested_ramp(ramp: Ramp | None) -> Ramp | None:
@@ -1277,10 +1279,15 @@ TRAINING_ROUTER = unread('output_router_logits', 'router_aux_loss_coef')
 """A router's training controls, which a forward reads to no effect."""
 
 
-def experts(*fields: ConfigField | ConfigPart, present=None) -> Nested:
+def _mixture(model: CausalTransformer) -> Mixture | None:
+    return model.mixture
+
+
+def experts(*fields: ConfigEntry[Mixture], present: Callable[[Mapping[str, object]], bool] | None = None
+            ) -> Nested[CausalTransformer, Mixture]:
     """A model's routed experts (`Mixture`), their keys `fields`, under its `mixture` (none where
     `present`, of the source config, says the config routes no layer)."""
-    return Nested('mixture', Mixture, ConfigLayout(*fields), lambda model: model.mixture, present=present)
+    return Nested('mixture', Mixture, ConfigLayout(*fields), _mixture, present=present)
 
 
 LOCAL_EXPERTS = ConfigLayout(experts(integer('num_local_experts', 'experts'),

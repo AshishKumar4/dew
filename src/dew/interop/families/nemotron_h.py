@@ -200,7 +200,9 @@ def _kinds(hf_config: Mapping[str, object], used: set[str], record: DecoderField
                                          "time_step_min"), float("inf")))
     mlp = MLPMixer(intermediate_size=count("intermediate_size", 21504),
                    activation=activation, use_bias=boolean("mlp_bias", default=False))
-    step = {record.get('mtp_layer_type'), record.get('mtp_feedforward_type')} - {None}
+    step = {_records.text(kind, 'mtp_layer_type') for kind in (record.get('mtp_layer_type'),
+                                                                record.get('mtp_feedforward_type'))
+            if kind is not None}
     built = set(_records.strings(record['layer_types'], 'layer_types')) | step
     # Records, as every family's kinds are, which a release's modeling overrides then read
     # (`modeling_overrides`).

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop.config_records import native_fields
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     MOE_SHARED,
     TRAINING_ROUTER,
@@ -122,8 +122,8 @@ def _moe_layers(hf_config: Mapping[str, object], used: set[str], record: Decoder
         if step < 1:
             refuse(f"interleave_moe_layer_step {step}", "the routed layers are every step-th one")
         moe_layers = list(range(step - 1, _records.integer(record['num_layers'], 'num_layers'), step))
-    mixture = _records.record(record['mixture'], 'mixture')
-    record['mixture'] = native_fields(Mixture)(**mixture, layers=_records.integers(moe_layers, 'moe_layers'))
+    record['mixture'] = NativeFields(Mixture, {**_records.record(record['mixture'], 'mixture'),
+                                               'layers': _records.integers(moe_layers, 'moe_layers')})
     return record
 
 
