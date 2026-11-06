@@ -221,8 +221,8 @@ class Launch:
         process = "a process" if place.process_id is None else f"process {place.process_id}"
         of = "" if place.process_count is None else f" of {place.process_count}"
         emit(f"{cluster.name}: {process}{of}, placed by the cluster; running {shlex.join(self.command)}")
-        if cluster.name == "tpu" and place.process_id == 0 and (place.process_count or 0) > 1:
-            emit(f"every worker has to run it; `dew launch --tpu NAME` starts all {place.process_count}")
+        if cluster.name == "tpu":
+            emit("every worker of a Cloud TPU runs it; `dew launch --tpu NAME` starts them all")
         return self.execute(self.command)
 
     def srun(self) -> int:

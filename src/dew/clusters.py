@@ -37,9 +37,6 @@ import functools
 import glob
 import importlib.util
 import os
-import time
-import urllib.error
-import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -217,22 +214,6 @@ def _in_cloud_tpu_vm(environ: Mapping[str, str]) -> bool:
     return (installed or importlib.util.find_spec("libtpu") is not None) and _tpu_chips() > 0
 
 
-def _metadata(key: str, environ: Mapping[str, str]) -> str | None:
-    """The TPU VM's GCE metadata attribute `key`, or None where its server answers no success, asked as
-    JAX asks it: up to six tries half a second apart, each waiting at most 60 s
-    (`get_metadata`, jax/_src/clusters/cloud_tpu_cluster.py, Apache-2.0, jax-ml/jax 19a48d1de)."""
-    host = environ.get("GCE_METADATA_IP", "metadata.google.internal")
-    asked = urllib.request.Request(f"http://{host}/computeMetadata/v1/instance/attributes/{key}",
-                                   headers={"Metadata-Flavor": "Google"})
-    for _ in range(6):
-        try:
-            with urllib.request.urlopen(asked, timeout=60) as answer:
-                return answer.read().decode()
-        except urllib.error.HTTPError:
-            time.sleep(0.5)
-    return None
-
-
 def _gke_workers(environ: Mapping[str, str]) -> str | None:
     """A GKE TPU slice's workers, comma-separated, in JAX's order of sources: the file
     TPU_PROCESS_ADDRESSES_PATH names, then TPU_PROCESS_ADDRESSES, then TPU_WORKER_HOSTNAMES
@@ -246,9 +227,10 @@ def _gke_workers(environ: Mapping[str, str]) -> str | None:
 @dataclasses.dataclass(frozen=True)
 class CloudTPU:
     """A Cloud TPU's workers, which JAX's detection places whole, multislice ranks among them: on GKE a TPU
-    VM whose worker list the environment states (`GkeTpuCluster`), on GCE one whose metadata server names
-    its worker number, TPU_SKIP_MDS_QUERY unset (`GceTpuCluster`). Its place, for Dew's own decisions, is
-    its slice's workers times MEGASCALE_NUM_SLICES, and its rank in its slice."""
+    VM whose worker list the environment states (`GkeTpuCluster`), else on GCE one whose metadata server JAX
+    asks, TPU_SKIP_MDS_QUERY unset (`GceTpuCluster`). Its place is JAX's to read as it joins (its metadata,
+    its slices): Dew decides nothing by it before, so it states none, and `dew launch` runs every worker's
+    program in place."""
 
     environ: Mapping[str, str] | None = None
     name = "tpu"
@@ -261,9 +243,7 @@ class CloudTPU:
             return None
         if _gke_workers(environ) is not None:
             return "gketpu"
-        if "TPU_SKIP_MDS_QUERY" not in environ and _metadata("agent-worker-number", environ) is not None:
-            return "gcetpu"
-        return None
+        return None if "TPU_SKIP_MDS_QUERY" in environ else "gcetpu"
 
     def detected(self) -> bool:
         return self._kind is not None
@@ -272,31 +252,7 @@ class CloudTPU:
         return Joining(detection=self._kind)
 
     def place(self) -> Joining:
-        environ = _environ(self.environ)
-        if self._kind == "gketpu":
-            workers, rank = _gke_workers(environ), environ.get("TPU_WORKER_ID")
-        elif self._kind == "gcetpu":
-            workers = _metadata("worker-network-endpoints", environ)
-            rank = _metadata("agent-worker-number", environ)
-        else:
-            return Joining()
-        per_slice = None if not workers else len(workers.split(","))
-        slices, slice_id = (int(self._tpu_env(variable) or default)
-                            for variable, default in (("MEGASCALE_NUM_SLICES", 1), ("MEGASCALE_SLICE_ID", 0)))
-        return Joining(None, None if per_slice is None else per_slice * slices,
-                       None if rank is None or per_slice is None else int(rank) + slice_id * per_slice)
-
-    def _tpu_env(self, variable: str) -> str | None:
-        """A TPU runtime variable: the environment's, or the metadata's `tpu-env` line naming it, on GKE as
-        on GCE (`get_tpu_env_value`, jax/_src/clusters/cloud_tpu_cluster.py, jax-ml/jax 19a48d1de)."""
-        environ = _environ(self.environ)
-        if variable in environ:
-            return environ[variable]
-        for line in (_metadata("tpu-env", environ) or "").split("\n"):
-            key, _, value = line.partition(":")
-            if value and key.strip() == variable:
-                return value.strip().strip("'")
-        return None
+        return Joining()
 
 
 @dataclasses.dataclass(frozen=True)
