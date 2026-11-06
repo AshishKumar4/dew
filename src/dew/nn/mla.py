@@ -798,8 +798,8 @@ class MultiHeadLatentAttention(LinearProducts):
         if own is None and not (groups or window is not None or self.attention_chunk is not None):
             return None, False
         if own is not None:
-            mask, runs, window, key_places = own
-            causal, segment_ids, groups, valid = False, None, {}, None
+            mask, runs, window, key_places = own.mask, own.runs, own.window, own.key_places
+            causal, segment_ids, groups, valid, places = False, None, {}, None, key_places
         else:
             mask = runs = None
             key_places = places
