@@ -201,16 +201,19 @@ def forwards(query, key, value, spans, hooks=None, *, residuals=False, scale=Non
     return triton, portable
 
 
+@pytest.mark.parametrize("peak", [0.0, float(np.finfo(np.float32).min)], ids=["zero", "fp32-least"])
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_a_plain_call_of_no_keys_reads_its_initial_state_or_zero_in_both_mainloops(causal):
+def test_a_plain_call_of_no_keys_reads_its_initial_state_or_zero_in_both_mainloops(causal, peak):
     """A full or causal call of no keys walks no padding as keys: zero output from no state, and a resumed
-    partial's own `acc / total` (1.5), in both mainloops."""
+    partial's own `acc / total` (1.5), in both mainloops, its maximum 0 or fp32's least, a real state's (a
+    hook's mask by fp32's least, as transformers' are) and not one of no keys (row 4486)."""
     spans = template.spans(3, 0, 1, causal=causal)
     query = jnp.ones((1, 3, 2, 32), jnp.float32)
     empty = jnp.zeros((1, 0, 1, 32), jnp.float32)
     for out in forwards(query, empty, empty, spans):
         np.testing.assert_array_equal(np.asarray(out), 0)
-    state = template.Initial(jnp.zeros((1, 2, 3)), jnp.full((1, 2, 3), 2.0), jnp.full((1, 2, 3, 32), 3.0))
+    state = template.Initial(jnp.full((1, 2, 3), peak), jnp.full((1, 2, 3), 2.0),
+                             jnp.full((1, 2, 3, 32), 3.0))
     for out in forwards(query, empty, empty, spans, template.Hooks(initial=state)):
         np.testing.assert_array_equal(np.asarray(out), 1.5)
 
@@ -221,7 +224,7 @@ def test_merging_partials_of_no_keys_is_the_identity_whatever_the_form(form):
     tile loop takes no guard), stays a state of no key, finite, and leaves the state as it was."""
     spec = algebra.Forward(form, 64, ids=False, scale=0.125)
     nothing = algebra.merge(spec, algebra.empty(4, 8), algebra.empty(4, 8))
-    assert np.asarray(algebra.unseen(nothing.m)).all()
+    assert np.asarray(algebra.no_keys(nothing.total)).all()
     np.testing.assert_array_equal(np.asarray(nothing.acc), 0)
     np.testing.assert_array_equal(np.asarray(nothing.total), 0)
     filled = algebra.Partial(jnp.ones((4, 8)), jnp.full((4,), 2.0), jnp.full((4,), 3.0))

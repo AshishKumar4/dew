@@ -350,14 +350,16 @@ def imported(parts: tuple[jax.Array, ...]) -> Partial:
 
 LEAST = float(jnp.finfo(jnp.float32).min)
 """A walk's running maximum before any key: fp32's least finite value, the derived forms' floor of it
-(`dew.algebra.forms`' init), which every state a step or a merge meets is at or above. A row still at it
-saw no key (`unseen`); its factor onto a key's maximum underflows to 0 as -inf's did, onto another unseen
-state's is 1 over zero sums, so every row's bits are what -inf gave."""
+(`dew.algebra.forms`' init), which every state a step or a merge meets is at or above, so no factor between
+two states is a NaN. A real logit may be it too (a hook's mask by fp32's least, as transformers' are), so a
+row that saw no key is one of no denominator (`no_keys`), never one at `LEAST`: its factor onto a key's
+maximum underflows to 0 as -inf's did, onto another such state's is 1 over zero sums."""
 
 
-def unseen(m: jax.Array) -> jax.Array:
-    """Whether each row of a running maximum `m` saw no key: at the walk's start (`LEAST`), or below it."""
-    return m <= LEAST
+def no_keys(total: jax.Array) -> jax.Array:
+    """Whether each row of a state's denominator `total` saw no key: none of its sums, as any key's weight
+    at the row's maximum is 1 (a guarded walk's shifted by its room, never to 0)."""
+    return total == 0
 
 
 def empty(rows: int, width: int) -> Partial:
@@ -477,7 +479,7 @@ def reached(maxima: jax.Array, *, unseen: bool) -> jax.Array:
     sees a key, so it is a row whose products all passed fp32 below zero, past every reach
     (`attention_mosaic_forward._prepared`'s raw products)."""
     reach = jnp.where(jnp.isnan(maxima), jnp.inf, jnp.abs(maxima))
-    return jnp.where(maxima <= LEAST, 0.0, reach) if unseen else reach
+    return jnp.where(maxima == -jnp.inf, 0.0, reach) if unseen else reach
 
 
 type Launch[O] = Callable[..., tuple[O, jax.Array, jax.Array]]
@@ -1019,11 +1021,6 @@ def places_read(spec: Forward, *, masked: bool, hooked: tuple[bool, bool], dropp
     return queries, keys
 
 
-def _safe(spec: Forward, m: jax.Array) -> jax.Array:
-    """`m`, with 0 for a query that has seen nothing where one can (`Forward.guarded`)."""
-    return jnp.where(unseen(m), 0.0, m) if spec.guarded else m
-
-
 def peak(spec: Forward, m: jax.Array, s: jax.Array, products: jax.Array | None = None, *, axis: int = -1
          ) -> tuple[jax.Array, jax.Array]:
     """The running maximum after a tile's logits `s`, and `alpha`, the factor the state before it
@@ -1046,7 +1043,7 @@ def peaked(spec: Forward, m: jax.Array, new: jax.Array) -> tuple[jax.Array, jax.
     """`peak`'s running maximum `new` (at least `m`) and the factor the state before it takes from `m` to
     it: a mainloop that takes a tile's maximum a part of the tile at a time (`peak` of each) states the
     tile's whole by it."""
-    return new, carried(spec, m, _safe(spec, new))
+    return new, carried(spec, m, new)
 
 
 def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
@@ -1089,8 +1086,7 @@ def weights(spec: Forward, s: jax.Array, m: jax.Array, coords: Coords | None = N
     form (`Forward.natural`) the largest logit weighs 1 exactly: raw logits subtract before they scale
     (`Forward.raw`), and scaled ones (under a hook or an initial state) hold it to 1 by a select. The
     maximum a query's broadcast over its keys as `coords` hold them (its rows by default)."""
-    safe = _safe(spec, m)
-    peak = expand(safe, s) if coords is None else coords.queries(safe, s)
+    peak = expand(m, s) if coords is None else coords.queries(m, s)
     if spec.natural and not spec.raw:
         # The accurate form's scaled logits: the largest's weight held to 1 against the contraction.
         return spec.power(jnp.where(s < peak, s - peak, 0.0))
@@ -1341,7 +1337,7 @@ def anchored(spec: Forward, start: Partial, arg: Argmax) -> Carry:
     the walk's final maximum, the larger of its own and the keys', which no tile moves, and no key's weight
     yet."""
     m = jnp.maximum(start.m, arg.peak)
-    factor = carried(spec, start.m, jnp.where(unseen(m), 0.0, m))
+    factor = carried(spec, start.m, m)
     nothing = jnp.zeros_like(start.total)
     return Partial(expand(factor, start.acc) * start.acc, m, factor * start.total), arg, nothing, nothing
 
@@ -1407,7 +1403,7 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
         # The initial state's factor to the walk's maximum, in the walk's own units, at most 1: folded, its
         # maximum taken to base 2 as the walk resumed from it (`resumed`), whose own may round back below it.
         m0 = initial[0].astype(jnp.float32)
-        carried = jnp.where(unseen(m0), 0.0,
+        carried = jnp.where(m0 == -jnp.inf, 0.0,
                             jnp.exp2(jnp.minimum(base2_maximum(m0) - state.m, 0.0)) if spec.base2
                             else jnp.exp(jnp.minimum(m0 - maximum, 0.0)))
         share = carried, initial[1]
@@ -1598,8 +1594,7 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     if derived_on():
         return _derived_merge(spec, first, second)
     m = jnp.maximum(first.m, second.m)
-    safe = jnp.where(unseen(m), 0.0, m)
-    factors = carried(spec, first.m, safe), carried(spec, second.m, safe)
+    factors = carried(spec, first.m, m), carried(spec, second.m, m)
     if first.guard is None and second.guard is None:
         a, b = factors
         acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
@@ -1651,7 +1646,7 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     if derived_on():
         return _derived_merged(spec, stacked, axis)
     m = jnp.max(stacked.m, axis=axis)
-    factors = carried(spec, stacked.m, jnp.expand_dims(jnp.where(unseen(m), 0.0, m), axis))
+    factors = carried(spec, stacked.m, jnp.expand_dims(m, axis))
     if stacked.guard is None:
         acc = jnp.sum(expand(factors, stacked.acc) * stacked.acc, axis=axis)
         return Partial(acc, m, jnp.sum(factors * stacked.total, axis=axis))
@@ -1691,7 +1686,7 @@ def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.
     products where the forward's are (`Forward.raw`), the products of the query its call's power of two took
     (`Forward.prescale`), and the denominator, unshifted (`room`)."""
     m = state.m if spec.raw else spec.naturalized(state.m)
-    m = jnp.where(unseen(state.m), 0.0 if spec.guarded or initial else -jnp.inf, m)
+    m = jnp.where(no_keys(state.total), 0.0 if spec.guarded or initial else -jnp.inf, m)
     fields = state.guard
     if fields is None:
         return m, state.total
