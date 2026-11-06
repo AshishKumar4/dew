@@ -16,10 +16,16 @@ import numpy as np
 
 import test_chunk_adaptation as t
 from dew.nn.categorical import label_terms
+from dew.nn.precision import compensated_sum
 from reference_error import with_gradients, widened
 
 
 def direct_loss(logits, targets, variant):
+    if variant == "batch-compensated":
+        peak = jax.lax.stop_gradient(jnp.max(logits, axis=-1))
+        mass = compensated_sum(jnp.exp(logits - peak[:, None]), (logits.ndim - 1,))
+        own = jnp.take_along_axis(logits, targets[:, None], axis=-1)[:, 0]
+        return jnp.log(mass) - (own - peak)
     if variant == "batch-wide":
         with jax.enable_x64(True):
             return label_terms(logits.astype(jnp.float64), targets)[0].astype(logits.dtype)
@@ -72,7 +78,7 @@ def make(kind, variant):
 kind = sys.argv[1] if len(sys.argv) > 1 else "documents"
 count = int(sys.argv[2]) if len(sys.argv) > 2 else 256
 variants = ("literal", "token-categorical", "batch-categorical", "batch-logsoftmax", "batch-wide",
-            "batch-log1p", "actual", "equation")
+            "batch-log1p", "batch-compensated", "actual", "equation")
 programs = {(variant, mode): jax.jit(make(kind, variant), compiler_options=(
     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))
     for variant in variants for mode in ("on", "off")}
