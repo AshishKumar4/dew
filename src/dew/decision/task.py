@@ -407,6 +407,18 @@ class Decide(SavedRunTask, InItsForm):
         return step_calibrations(directory, step)
 
     @classmethod
+    def publishes(cls, run: SavedRun) -> bool:
+        """Whether the format its head is released in states `run`'s backbone: one with cross-attention
+        layers (a decision context's encoder read through them) none states, so its export is its run's
+        native release (`dew.inference.models.write_run_release`)."""
+        from dew.inference.tasks import saved_model
+        from dew.interop.pretrained import source_states
+
+        model = saved_model(run.record, None).build()
+        assert isinstance(model, DecisionModel)
+        return source_states(model.backbone)
+
+    @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
                    layout: "Placement | None" = None, dtype: DTypeLike | None = None,
                    param_dtype: DTypeLike | None = None) -> Self:

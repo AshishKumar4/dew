@@ -208,6 +208,14 @@ def _extension_drawn(model: nn.Module, selected: Callable[[tuple[str, ...]], boo
     return jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
 
 
+def source_states(model: nn.Module) -> bool:
+    """Whether a source's format states `model`'s layers: none holds cross-attention layers, which a run's
+    own checkpoint and its native release keep (`dew.inference.models.write_run_release`)."""
+    from dew.nn.protocols import CrossAttending
+
+    return not (isinstance(model, CrossAttending) and model.cross_attention is not None)
+
+
 @dataclass(frozen=True)
 class Pretrained:
     """A native model with explicit variables and its checkpoint's host processor.
@@ -381,7 +389,7 @@ class Pretrained:
         model_config = saved_model(run.record, None)
         trained = models[model_config.name]
         if trained is CausalTransformer:
-            return True
+            return source_states(model_config.build())
         if trained is models["diffusion_gemma"]:
             from dew.interop import diffusion_gemma
 
@@ -710,9 +718,9 @@ class Pretrained:
         from dew.batch import thaw
         from dew.inference.projections import unpacked
         from dew.nn.backbones.layer_names import stored_layers
-        from dew.nn.protocols import CrossAttending, Differential
+        from dew.nn.protocols import Differential
 
-        if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
+        if not source_states(self.model):
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local

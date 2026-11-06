@@ -85,6 +85,11 @@ class SavedModel(SavedRunTask):
         return cls(model, variables, saved_settings(run.record, settings), objective, run.precision)
 
     @classmethod
+    def publishes(cls, run: SavedRun) -> bool:
+        """Its own release states every model: it is its run's native release."""
+        return True
+
+    @classmethod
     def from_pretrained(cls, directory: str | Path, *, mesh: MeshSpec | Mesh | None = None,
                         layout: Layout | None = None, dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> Self:

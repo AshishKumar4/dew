@@ -67,11 +67,12 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
     from dew.objectives.base import ReleasedTask
 
     task = run.objective.saved_task
-    if task is not None and issubclass(task, ReleasedTask):
+    released_task = task is not None and issubclass(task, ReleasedTask)
+    if task is not None and issubclass(task, ReleasedTask) and task.publishes(run):
         released = task.from_saved(run, ema=ema, mesh=mesh, layout=layout)
         with reading_home("saved run export", writes=publishes):
             released.save_pretrained(str(destination))
-    elif Pretrained.publishes(run):
+    elif not released_task and Pretrained.publishes(run):
         bundle = Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout)
         with reading_home("saved run export", writes=publishes):
             bundle.save(destination)
