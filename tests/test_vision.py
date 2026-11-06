@@ -480,86 +480,76 @@ def test_a_moonvit_pools_frames_finitely_beside_a_padded_item():
 
 
 def exact_bicubic_weights(size_in: int, size_out: int, antialias: bool
-                          ) -> tuple[list[list[fractions.Fraction]], list[fractions.Fraction]]:
+                          ) -> tuple[list[list[fractions.Fraction]], list[list[float]], int]:
     """The `[size_out][size_in]` weights of torch's bicubic resize along one axis (`align_corners=False`),
-    exactly, and each row's total before its normalization: without antialiasing the cubic of a = -3/4
-    on the four taps about each half-pixel source position, clamped at the border (each total 1); with
-    it the cubic of a = -1/2 over the support widened by the shrink, normalized
-    (`dew.nn.blocks.torch_bicubic_resize`, torch's upsample_bicubic2d)."""
+    exactly, the magnitudes of the terms each one's arithmetic sums (each argument's terms, as `|x|`,
+    through the cubic's terms), and the most roundings any one takes: without antialiasing the cubic of
+    a = -3/4 on the four taps about each half-pixel source position, clamped at the border (the scale, its
+    product, the half and the floor subtracted, a tap's offset, Horner's six steps, and up to three sums
+    at the border); with it the cubic of a = -1/2 over the support widened by the shrink, normalized by
+    its total (the scale, the center, the tap's offset, its half and stretch, Horner's six steps, the
+    total's sums and the division) (`dew.nn.blocks.torch_bicubic_resize`, torch's upsample_bicubic2d)."""
+    half = fractions.Fraction(1, 2)
     scale = fractions.Fraction(size_in, size_out)
     weights = [[fractions.Fraction(0)] * size_in for _ in range(size_out)]
-    totals = [fractions.Fraction(1)] * size_out
+    magnitudes = [[0.0] * size_in for _ in range(size_out)]
+    roundings = 14
     for row in range(size_out):
         if antialias:
-            stretch, center = max(scale, 1), scale * (row + fractions.Fraction(1, 2))
-            low = max(math.floor(center - 2 * stretch + fractions.Fraction(1, 2)), 0)
-            high = min(math.floor(center + 2 * stretch + fractions.Fraction(1, 2)), size_in)
-            taps = {}
+            stretch, center = max(scale, 1), scale * (row + half)
+            low = max(math.floor(center - 2 * stretch + half), 0)
+            high = min(math.floor(center + 2 * stretch + half), size_in)
+            taps, terms = {}, {}
             for tap in range(low, high):
-                x = abs((tap - center + fractions.Fraction(1, 2)) / stretch)
-                half = fractions.Fraction(1, 2)
+                x, size = abs((tap - center + half) / stretch), (tap + center + half) / stretch
                 taps[tap] = ((3 * half * x - 5 * half) * x * x + 1 if x < 1 else
                              ((-x * half + 5 * half) * x - 4) * x + 2 if x < 2 else 0)
-            totals[row] = sum(taps.values())
+                # Either branch's terms, the one the computed argument takes beside the exact one's.
+                terms[tap] = max(3 * half * size ** 3 + 5 * half * size ** 2 + 1,
+                                 half * size ** 3 + 5 * half * size ** 2 + 4 * size + 2)
+            total, summed = sum(taps.values()), sum(terms.values())
             for tap, weight in taps.items():
-                weights[row][tap] = weight / totals[row]
+                weights[row][tap] = weight / total
+                magnitudes[row][tap] = float((terms[tap] + abs(weight / total) * summed) / total)
+            roundings = max(roundings, 11 + len(taps))
             continue
         a = fractions.Fraction(-3, 4)
-        source = scale * (row + fractions.Fraction(1, 2)) - fractions.Fraction(1, 2)
+        source = scale * (row + half) - half
         index = math.floor(source)
         t = source - index
+        size = scale * (row + half) + half + abs(index) + 1
         for tap, x in zip(range(index - 1, index + 3), (t + 1, t, 1 - t, 2 - t), strict=True):
             near = ((a + 2) * x - (a + 3)) * x * x + 1
             far = ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
-            weights[row][min(max(tap, 0), size_in - 1)] += near if x <= 1 else far
-    return weights, totals
+            place = min(max(tap, 0), size_in - 1)
+            weights[row][place] += near if x <= 1 else far
+            magnitudes[row][place] += float(max(abs(a + 2) * size ** 3 + abs(a + 3) * size ** 2 + 1,
+                                                abs(a) * size ** 3 + 5 * abs(a) * size ** 2
+                                                + 8 * abs(a) * size + 4 * abs(a)))
+    return weights, magnitudes, roundings
 
 
 @pytest.mark.parametrize("antialias", [False, True], ids=["plain", "antialiased"])
 @pytest.mark.parametrize("size_out", [5, 11], ids=["shrinking", "growing"])
 def test_a_float64_bicubic_resize_weighs_each_pixel_in_float64(antialias, size_out):
     """A float64 bicubic resize (`torch_bicubic_resize`, REPA's and RAE's preprocessing, a vision tower's
-    position table) weighs each source pixel in float64, as torch's resize of a float64 input does: each
-    unit image of seven rows (three columns wide, which a resize to three columns weighs by one, exactly)
-    resized to five or eleven rows reads out every weight of its row, each within the bound float64's
-    own roundings of its arithmetic leave of its exact value (`exact_bicubic_weights`). Weights built in
-    float32 sit near 1e-8 from it, some hundred thousand times the bound."""
-    from op_certificates import Format, gamma
+    position table) weighs each source pixel in float64, as torch's resize of a float64 input does (row
+    4445): each unit image of seven rows (three columns wide, which a resize to three columns weighs by
+    one, exactly) resized to five or eleven rows reads out every weight of its row, each within float64's
+    own roundings of its arithmetic of its exact value (`exact_bicubic_weights`,
+    `assert_within_rounding`). Weights built in float32 sit near 1e-8 from it, far past the bound."""
+    from reference_error import assert_within_rounding
 
     from dew.nn.blocks import torch_bicubic_resize
 
-    float64 = Format("float64", 53, -1022, 1023)
-
-    def rounded(terms: int) -> float:
-        return gamma(terms, float64)
-
     size_in = 7
-    exact, totals = exact_bicubic_weights(size_in, size_out, antialias)
+    exact, magnitudes, roundings = exact_bicubic_weights(size_in, size_out, antialias)
     units = np.eye(size_in)[:, :, None, None].repeat(3, axis=2)
     with jax.enable_x64(new_val=True):
         ours = np.asarray(torch_bicubic_resize(jnp.asarray(units), size_out, 3, antialias=antialias))
     assert ours.dtype == np.float64
-    if antialias:
-        # The center scale * (i + 1/2) rounded twice; each tap's argument (j - center + 1/2) / stretch
-        # three times more over terms at most 2 * size_in + 1, and by stretch's own rounding over an
-        # argument at most 3; the cubic of a = -1/2 Lipschitz 25/18 on [0, 2] and its Horner form's six
-        # roundings over terms at most 24; the total of at most `taps` of them, each at most 1, and the
-        # division by it.
-        taps = math.ceil(4 * max(size_in / size_out, 1)) + 2
-        argument = rounded(2) * size_in + rounded(3) * (2 * size_in + 1) + rounded(2) * 3
-        cubic = 25 / 18 * argument + rounded(6) * 24
-        total = float(min(totals))
-        drift = taps * cubic + rounded(taps) * taps
-        bound = (cubic + drift / total) / (total - drift) + rounded(1) / total
-    else:
-        # The source scale * (i + 1/2) - 1/2 rounded three times over terms at most size_in + 1, each tap's
-        # argument once more (at most 2); the cubic of a = -3/4 Lipschitz 27/20 on [0, 2] and its Horner
-        # form's six roundings over terms at most 36; a border entry the sum of up to four taps, their
-        # weights' magnitudes at most 2.
-        argument = rounded(3) * (size_in + 1) + rounded(1) * 2
-        bound = 4 * (27 / 20 * argument + rounded(6) * 36) + rounded(3) * 2
-    for pixel in range(size_in):
-        for row in range(size_out):
-            for column in range(3):
-                difference = abs(fractions.Fraction(float(ours[pixel, row, column, 0])) - exact[row][pixel])
-                assert difference <= bound, (pixel, row, float(difference), bound)
+    # Pixel by row, each column the same weight.
+    read = ours[..., 0].transpose(1, 0, 2)
+    assert_within_rounding(read, np.asarray(exact, dtype=object)[..., None].repeat(3, axis=2),
+                           np.asarray(magnitudes)[..., None].repeat(3, axis=2), roundings, np.float64,
+                           f"bicubic weights, {size_in} to {size_out} rows")
