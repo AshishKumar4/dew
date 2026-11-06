@@ -55,6 +55,7 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
     without the key runs that mask its attention, of another length than the call's tokens, with a parent
     not before its child, or branching without its tokens' positions is refused."""
     from dew.nn.engram import Engram
+    from dew.nn.hyper_connections import HyperConnections
 
     mamba = CausalTransformer(
         vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8, mlp_features=32,
@@ -63,7 +64,7 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
             "num_heads": 4, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4}}}})
     engram = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32"}, engram=Engram(
         layer_ids=(0,), num_embeddings=(168,), max_ngram_size=3, vocab_size=VOCAB, n_heads=2, head_dim=4,
-        compressed_vocab_size=VOCAB))
+        compressed_vocab_size=VOCAB), hyper_connections=HyperConnections(hc_mult=2, head="weighted"))
     decoder = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32"})
     ids = jax.random.randint(jax.random.key(0), (2, PROMPT + BLOCK), 0, VOCAB)
     block, runs = ids[:, PROMPT:], chain_runs(2, PROMPT, BLOCK)
