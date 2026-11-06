@@ -337,3 +337,13 @@ def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, 
                                           without_state["output"][row, prefix:])
             np.testing.assert_array_equal(actual["final"][row], without_state["final"][row])
             np.testing.assert_array_equal(final_only["state"][row], np.zeros_like(final_only["state"][row]))
+
+
+@pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")
+def test_the_recurrence_matrix_holds_on_this_tpu():
+    """The recurrence's check-1 matrix (tests/kernel_matrix.py) on a TPU: the rated scan's TPU kernel's
+    training step on par with the portable math's, each cell on its own TPU (a v6e or a v5e)."""
+    import recurrence_matrix
+    from gpu_flow import cells_of, run_cells
+
+    run_cells(cells_of(recurrence_matrix.a_recurrences_training_step_on_a_tpu_is_on_par))

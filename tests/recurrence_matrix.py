@@ -43,6 +43,12 @@ PORTS = {"gated_delta_rule": "fla", "ssd": "pallas"}
 CHOICES = frozenset({"gated_delta_rule", "ssd"})
 """The generation.CHOICES entries the family's cells run (row 184): the chunked op's selectors'."""
 
+KERNELS = {"gated_delta_rule": frozenset({"mosaic_gpu", "xla", "derived", "fla"}),
+           "ssd": frozenset({"mosaic_gpu", "xla", "pallas", "tpu"})}
+"""The kernels each choice's cells run under test (row 4513), each taken by its route (the cell asserts it):
+the template, the portable math and its derived forms, each port held to the portable math, and the rated
+scan's TPU kernel on the TPU tier (a v6e or a v5e, as the tier's Colab TPU is)."""
+
 
 def _op(hooks) -> str:
     """The choice a form's call takes its kernel from: the rated scan's (`ssd`) or the delta rule's."""
@@ -113,8 +119,11 @@ def _routed(case: tuple[tuple[str, str], ...], kernel: str) -> frozenset | None:
 def _reference(case: dict[str, str]) -> str:
     """The kernel `case`'s cell is held to: its form's port where the port takes the call (`PORTS`, the
     upstream's numbers, which a 16-bit call and the fast forms round as), else the portable math ('xla'), as
-    the cell's GPU computes it at the run's precision (a step write gate's form, which no port runs)."""
+    the cell's GPU computes it at the run's precision (a step write gate's form, which no port runs); the
+    port itself held to the portable math."""
     port = _port(case)
+    if case["kernel"] == port:
+        return "xla"
     taken = _routed(tuple(case.items()), port) or frozenset()
     return port if any(kernel == port for _, kernel in taken) else "xla"
 
@@ -122,7 +131,9 @@ def _reference(case: dict[str, str]) -> str:
 def supported(case: dict[str, str]) -> bool:
     """Whether the route serves `case` (tests/kernel_matrix.py): its kernel takes the case's training call
     (`_routed`, the route's own selectors: not refused, nor handed to another kernel) and is not its own
-    reference (`_reference`)."""
+    reference (`_reference`); a kernel of another op's (`KERNELS`) is none of its form's."""
+    if case["kernel"] not in KERNELS[_op(FORMS[case["form"]])]:
+        return False
     taken = _routed(tuple(case.items()), case["kernel"])
     return (taken is not None and any(kernel == case["kernel"] for _, kernel in taken)
             and _reference(case) != case["kernel"])
@@ -132,29 +143,36 @@ CASES = (
     ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'),
     ('sm90', 'kimi delta attention', 'xla', 'float32', 'packed'),
     ('sm80', 'write gate', 'derived', 'bfloat16', 'packed'),
-    ('sm80', 'rated scan', 'xla', 'float32', 'one'),
+    ('sm80', 'rated scan', 'pallas', 'float32', 'one'),
+    ('sm80', 'gated delta net', 'fla', 'float32', 'packed'),
+    ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'),
     ('sm90', 'write gate', 'derived', 'float32', 'one'),
-    ('sm90', 'rated scan', 'mosaic_gpu', 'bfloat16', 'packed'),
-    ('sm80', 'gated delta net', 'xla', 'bfloat16', 'packed'),
+    ('sm90', 'rated scan', 'pallas', 'bfloat16', 'packed'),
+    ('sm80', 'gated delta net', 'xla', 'bfloat16', 'one'),
+    ('sm90', 'write gate', 'mosaic_gpu', 'float32', 'packed'),
     ('sm80', 'kimi delta attention', 'derived', 'bfloat16', 'one'),
-    ('sm90', 'gated delta net', 'mosaic_gpu', 'float32', 'one'),
-    ('sm90', 'gated delta net', 'derived', 'bfloat16', 'one'),
-    ('sm90', 'write gate', 'mosaic_gpu', 'float32', 'one'),
     ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'),
+    ('sm90', 'gated delta net', 'derived', 'bfloat16', 'one'),
+    ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'),
 )
+
+TPU_CASES = (
+    ('v6e', 'rated scan', 'tpu', 'bfloat16', 'one'),
+    ('v5e', 'rated scan', 'tpu', 'float32', 'packed'),
+    ('v6e', 'rated scan', 'tpu', 'bfloat16', 'packed'),
+    ('v6e', 'rated scan', 'tpu', 'float32', 'one'),
+    ('v5e', 'rated scan', 'tpu', 'bfloat16', 'one'),
+)
+"""The TPU cells' cases (`kernel_matrix.covering("recurrence_tpu")`)."""
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change)."""
 
 
-@cell("recurrence", covers=lambda case: dict(zip(AXES["recurrence"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
-    for case in CASES], ids="-".join)
-def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
+def _on_par(family: str, case: tuple[str, ...]) -> None:
     """The chunked op's training step of `case` on its GPU, its kernel named, on par with its reference's
     (`_reference`; check 1, the recurrence a token at a time in float64 the truth): the output, the final
     memory and every operand's gradient. Its routes are its family's (`CHOICES`)."""
-    named = dict(zip(AXES["recurrence"], case, strict=True))
+    named = dict(zip(AXES[family], case, strict=True))
     hooks, starts = FORMS[named["form"]], _starts(named)
 
     def truth(operands):
@@ -165,3 +183,22 @@ def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
                         functools.partial(_drawn, named), "-".join(case), seeds=FEWEST_SEEDS,
                         truth_fn=with_gradients(truth))
     assert {route.choice for route in found} <= CHOICES
+    assert any(route.kernel == named["kernel"] for route in found)
+
+
+@cell("recurrence", covers=lambda case: dict(zip(AXES["recurrence"], case, strict=True)))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
+    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+    for case in CASES], ids="-".join)
+def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
+    """`_on_par` of a GPU's case."""
+    _on_par("recurrence", case)
+
+
+@cell("recurrence_tpu", covers=lambda case: dict(zip(AXES["recurrence_tpu"], case, strict=True)))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
+    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+    for case in TPU_CASES], ids="-".join)
+def a_recurrences_training_step_on_a_tpu_is_on_par(case: tuple[str, ...]) -> None:
+    """`_on_par` of a TPU's case (the TPU tier's flow, tests/test_ssd_kernel.py)."""
+    _on_par("recurrence_tpu", case)

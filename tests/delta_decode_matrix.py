@@ -28,6 +28,9 @@ from dew.nn.linear import decode_kernel
 CHOICES = frozenset({"delta_decode"})
 """The generation.CHOICES entries the family's cells run (row 184)."""
 
+KERNELS = {"delta_decode": frozenset({"fused", "step"})}
+"""The kernels each choice's cells run under test (row 4513): the fused step and the step."""
+
 REFERENCES = {"grouped_matmul": "xla", "rms_norm": "xla", "short_conv": "xla", "delta_gates": "apart"}
 """The other choices a gated delta net's decode token reaches, each at its generic kernel: its projections,
 its gated norm, its conv and its gates' join."""

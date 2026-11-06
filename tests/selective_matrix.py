@@ -26,6 +26,9 @@ from dew.nn.mixers.mamba import selective_scan as portable
 CHOICES = frozenset({"selective_scan"})
 """The generation.CHOICES entries the family's cells run (row 184)."""
 
+KERNELS = {"selective_scan": frozenset({"mosaic_gpu"})}
+"""The kernels each choice's cells run under test (row 4513): the template."""
+
 
 @functools.cache
 def _taken(case: tuple[tuple[str, str], ...]) -> bool:
