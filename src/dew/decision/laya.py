@@ -19,10 +19,11 @@ import jax
 import numpy as np
 
 from dew.batch import Variables, part, thaw
+from dew.config.release import RELEASE_FILE
 from dew.data.text import HFTokenizer
 from dew.decision.calibration import Calibration
 from dew.decision.head import DecisionHead
-from dew.decision.layout import QuestionLayout, Specials
+from dew.decision.layout import MarkerLayout, QuestionLayout, Specials
 from dew.decision.model import DecisionModel
 from dew.decision.release import stated_release
 from dew.interop.decoder_parts import Packed, layout_tensors, packed_layouts
@@ -41,6 +42,13 @@ _LAYER = {
     "linear1": ("mlp", "up_proj"), "linear2": ("mlp", "down_proj")}
 _SCORER = {"scorer.0": ("scorer_norm",), "scorer.1": ("scorer_hidden",), "scorer.3": ("scorer_out",)}
 CONFIG_FILE = "rl_agent_config.json"
+
+LAYA_OPTION_LAYOUTS = ("sequential", "parallel")
+"""The option layouts Laya's readers lay rows out by (`laya.common.OPTION_LAYOUTS` at LAYA_COMMIT), each
+refusing any other value of `option_layout` (`uses_parallel_layout`)."""
+
+LAYA_REQUIRED = ("encoder", "head_layers")
+"""The keys Laya's agent refuses a config without (`_verify_compatibility`'s `required_cfg`)."""
 
 # The action head and the unused temperature buffer: Laya's card reports
 # that the action head carries no signal, and the agent reads its
@@ -106,9 +114,20 @@ class LayaCheckpoint:
         that, nor of a calibration than its temperatures: the layout itself (an order, labels, segments,
         blocks, a framing) and a binning map or abstention thresholds are the release's own
         (`dew.config.Release`, `dew_release.json`), which `DecisionSource.describe` reads back over Laya's
-        file. A Laya reader that reads `rl_agent_config.json` alone lays rows out by that part of it.
+        file; where the task holds either, Laya's `option_layout` names that file, a value Laya's readers
+        refuse, so none of them lays rows out or answers unlike the task with nothing saying so.
         """
         head = from_record(DecisionHead, self.model.head)
+        # What Laya's file states of a layout and a calibration: where the task's hold more, its readers
+        # would lay rows out or answer unlike the task, so its option layout names the release that
+        # states them, which Laya's readers refuse (`LAYA_OPTION_LAYOUTS`) and Dew's reads.
+        layout = self.layout
+        stated = MarkerLayout(max_len=layout.max_len, head_max_len=layout.head_max_len,
+                              option_tokens=layout.option_tokens, parallel=layout.parallel,
+                              order="question_first" if layout.order == "question_first" else None)
+        beyond = self.calibration.binning is not None or self.calibration.abstention is not None
+        option_layout = (RELEASE_FILE if layout != stated or beyond
+                         else "parallel" if layout.parallel else "sequential")
         tensors, config = laya_tensors(self.model, self.variables)
         root = Path(directory)
         (root / "encoder").mkdir(parents=True, exist_ok=True)
@@ -118,14 +137,13 @@ class LayaCheckpoint:
         self.tokenizer.save_pretrained(root / "tokenizer")
         applied = self.calibration.temperatures.applied()
         (root / CONFIG_FILE).write_text(json.dumps({
-            "head_layers": head.layers, "max_len": self.layout.max_len,
+            # The encoder Laya's agent names (its tokenizer's, which the release holds under tokenizer/).
+            "encoder": self.tokenizer.name, "head_layers": head.layers, "max_len": self.layout.max_len,
             "head_max_len": self.layout.head_max_len, "option_tokens": self.layout.option_tokens,
-            "option_layout": "parallel" if self.layout.parallel else "sequential",
+            "option_layout": option_layout,
             "temperature": [applied.types.get(kind, applied.default) for kind in ("choice", "score", "noul")],
             "temperature_by_options": dict(applied.buckets),
         }, indent=2) + "\n")
-        # Laya's file holds the temperatures and no more of a calibration (its own, binning and abstention).
-        beyond = self.calibration.binning is not None or self.calibration.abstention is not None
         compute = computed_in(self.numerics, self.model.backbone, part(self.variables, "backbone"))
         stated_release(root, self.layout, self.calibration if beyond else None, numerics=self.numerics,
                        compute=compute)
