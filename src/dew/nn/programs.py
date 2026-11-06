@@ -55,15 +55,16 @@ REDUCTIONS = frozenset({"argmax", "argmin", "reduce_and", "reduce_max", "reduce_
 CUMULATIVE = frozenset({"cumlogsumexp", "cummax", "cummin", "cumprod", "cumsum"})
 """The operations that scan along the axis their `axis` parameter names."""
 
-def holes(tree, selected: Callable[[object], bool], is_leaf: Callable[[object], bool] | None = None
-          ) -> tuple[list, Callable[[Sequence], object]]:
+def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool],
+                      is_leaf: Callable[[Leaf], bool] | None = None
+                      ) -> tuple[list[Leaf], Callable[[Sequence[Leaf]], Tree]]:
     """The leaves of `tree` (a call's arguments, `(args, kwargs)`) that `selected` keeps, in order, and
     `fill(values)`, `tree` with those leaves replaced by `values` in their order and every other as it is:
     what a trace of a function of some of its arguments (its arrays) binds and what it rebuilds."""
     leaves, structure = jax.tree.flatten(tree, is_leaf=is_leaf)
     places = [index for index, leaf in enumerate(leaves) if selected(leaf)]
 
-    def fill(values: Sequence):
+    def fill(values: Sequence[Leaf]) -> Tree:
         filled = list(leaves)
         for index, value in zip(places, values, strict=True):
             filled[index] = value
