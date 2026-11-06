@@ -497,6 +497,33 @@ def test_a_resume_inside_an_accumulation_window_keeps_the_ema_clock(tmp_path):
                                    rtol=1e-6, atol=1e-7)
 
 
+def test_a_run_saved_between_updates_keeps_no_window_and_resumes_as_the_whole_run(tmp_path):
+    """A checkpoint at an update's boundary holds no accumulation window (row 4309): the window a commit
+    leaves holds nothing a step reads, its gradient sum a trainable-size float32 tree the next window's
+    first microbatch replaces, so the window a resume allocates continues the run as it stood, bit for
+    bit. A checkpoint inside a window keeps its window, which the resume reads on."""
+    accum, updates = 2, 3
+    total = accum * updates * 2
+
+    def stream():
+        return Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None)
+
+    whole = make_accumulating(tmp_path / "whole", accum).fit(stream(), steps=total)
+    between = make_accumulating(tmp_path / "between", accum)
+    between.fit(stream(), steps=accum * updates)
+    assert between.checkpoints.stored()["accumulation"] is None
+    inside = make_accumulating(tmp_path / "inside", accum)
+    inside.fit(stream(), steps=accum * updates + 1)
+    assert inside.checkpoints.stored()["accumulation"] is not None
+
+    resumed = make_accumulating(tmp_path / "between", accum).fit(stream(), steps=total)
+    assert int(resumed.step) == int(whole.step) == total
+    for expected, actual in zip(jax.tree.leaves((whole.variables, whole.opt_state, whole.ema)),
+                                jax.tree.leaves((resumed.variables, resumed.opt_state, resumed.ema)),
+                                strict=True):
+        np.testing.assert_array_equal(np.asarray(expected), np.asarray(actual))
+
+
 # --------------------------------------------------------------------------
 # Resuming a grain loader mid-epoch
 # --------------------------------------------------------------------------
