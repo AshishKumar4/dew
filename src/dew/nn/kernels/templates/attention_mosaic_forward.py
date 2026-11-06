@@ -849,9 +849,11 @@ def _deferred_walk(spec: algebra.Forward, family: mosaic.Family, tiles: Tiles, q
     (`Tiles.deferred`, `values_deferred`), from `start`: FlashAttention 3's step, the tile's `Q Kᵀ` issued
     fresh into the walk's own accumulator, then the step before's P·V, its weights carried and its value
     slot held past it (`Family.walk`'s `held_past`); the tensor cores the partner's once both are issued
-    (`turn`); the logits read once their product is done (`scored`'s `product`), the P·V running on under
-    the softmax; the sums taken to the tile's maximum once it is done. The sums' operations and their order
-    are the plain step's: the step before's product added, then the factor. Its first step issues no P·V
+    (`turn`); the logits read once their product is done (`scored`'s `product`), the P·V running on beside
+    that wait; the step before's P·V settled before the step's softmax, whose weights take registers the
+    running P·V reads (written under it, ptxas serialized the products, C7513), so the softmax is not yet
+    under it. The sums' operations and their order are the plain step's: the step before's product added,
+    then the factor. Its first step issues no P·V
     before it; `finish` issues the last one's. Returns the walk's state and no residuals (`_consumer`'s
     `walked`)."""
     lo, hi = bounds
@@ -870,6 +872,8 @@ def _deferred_walk(spec: algebra.Forward, family: mosaic.Family, tiles: Tiles, q
             return family.read(logits_acc, pending=1 if issues_before else 0)
 
         _, coords, logits, products = scored(index, slots, product)
+        # The step before's P·V done before the softmax, in either form's order of its arithmetic.
+        family.settled()
         taken = {}
 
         def accumulate(sums, scale, parts, value):
@@ -879,14 +883,7 @@ def _deferred_walk(spec: algebra.Forward, family: mosaic.Family, tiles: Tiles, q
             (taken["weights"],) = parts
             return family.rescaled_products(sums, scale, (), None, interpret)
 
-        def value_slot():
-            # The step before's P·V done where the step first reads its values, past its softmax and before
-            # its weights are narrowed (FlashAttention 3's `warpgroup_wait<0>` before `convert_type_out`): a
-            # register the P·V reads is never written while it runs, which ptxas would serialize.
-            family.settled()
-            return slots["values"]
-
-        tile = algebra.Operand((tiles.block_k, value_width), dtype, value_slot)
+        tile = algebra.Operand((tiles.block_k, value_width), dtype, lambda: slots["values"])
         keys = algebra.Keys(coords, logits, tile, dot, accumulate, products)
         state = algebra.plain_step(spec, algebra.Partial(acc, m, total), keys)
         return (state.m, state.total, taken["weights"]), (state.acc, logits_acc)
