@@ -438,7 +438,10 @@ class _PlacedShards:
         return self.reader(shard, options).map_with_index(_Placed(self.starts[shard.id]))
 
 
-def _positioned(manifest: ShardManifest) -> ShardManifest:
+def _positioned(manifest: ShardManifest, reads: int) -> ShardManifest:
+    """`manifest` read with each record's place in the stream, its shards' rows stated or counted, `reads`
+    at once (`ShardManifest.sized`), so each shard's reader numbers its records from its start."""
+    manifest = manifest.sized(reads)
     rows = [shard.rows for shard in manifest.shards if shard.rows is not None]
     if len(rows) != len(manifest.shards):
         raise ValueError("map_with_index over a streamed read needs every shard to state its rows")
@@ -807,14 +810,15 @@ def _filled(stage: Artifact) -> Cache:
     return stage.cache
 
 
-def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cache, Manifest, _Prefix]:
-    """The cache stage at `at`, the manifest its fill is keyed by and the
-    record steps before it that fill it, from which memory, indexed and
-    streamed reads all open the cache."""
+def _fill(pipeline: Pipeline, source: Source, at: int, read: Read,
+          version: int) -> tuple[Cache, Manifest, _Prefix]:
+    """The cache stage at `at`, the manifest its fill is keyed by, read by data plan `version`, and the
+    record steps before it that fill it, from which memory, indexed and streamed reads all open the
+    cache."""
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(_cache_steps(prefix))
+    return _filled(artifact), _cache_manifest(source, prefix, read, version), _Prefix(_cache_steps(prefix))
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
@@ -1605,7 +1609,7 @@ class _Build:
             present = _Present.of(records) if _in_memory(keyed) else None
             positions = None if present is None else present.positions
         stored = _cache_inputs(keyed, records)
-        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
+        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read, self.version)
         # Read by input, as the source's own rows are: its missing inputs skipped, as the uncached
         # root skips them, and written by the fill; one record for each input reads by index and in
         # the uncached chain's order, the rest as a stream of each input's outputs.
@@ -1654,14 +1658,15 @@ class _Build:
         cache, interleave = self.lowering.cache, self.lowering.interleave
         start = 0 if cache is None else cache + 1
         transparent = cache is not None and _transparent(pipeline, cache)
-        shards = source.manifest()
+        shards = source.manifest(self.version)
+        threads = self.stream_loading.threads
         if cache is not None:
-            filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-            shards = _positioned(shards) if 0 <= last < cache else shards
+            filled, manifest, prefix = _fill(pipeline, source, cache, self.read, self.version)
+            shards = _positioned(shards, threads) if 0 <= last < cache else shards
             reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads,
                                      source=source, transparent=transparent)
             shards = dataclasses.replace(shards, reader=reader)
-        shards = _positioned(shards) if last >= start else shards
+        shards = _positioned(shards, threads) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
         steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline),
@@ -1965,7 +1970,7 @@ class _Build:
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
             prefix = pipeline.stages[: pipeline.stages.index(stage)]
-            manifest = _cache_manifest(pipeline.source, prefix, self.read)
+            manifest = _cache_manifest(pipeline.source, prefix, self.read, self.version)
             rows = _filled(stage).mapped(rows, manifest)
         elif not isinstance(stage, Interleave):
             raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} has no lowering here")

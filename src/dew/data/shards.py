@@ -63,8 +63,9 @@ def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | No
     and none repeats one while another's go unread. Within that last pass, a share that interleaves its
     places reads its count's first rows in its own interleaved order, not the walk's, which an interleave
     defines on no process: the pool reads the bound's examples, each share's count exact, and no record
-    a pass more than another of the bound's. None where a shard states no rows."""
-    shards = _shards(manifest, partition=partition, loading=loading)
+    a pass more than another of the bound's. Its shards' rows are the ones they state or their store counts,
+    `Loading.threads` at once (`ShardManifest.sized`); None where a shard states none."""
+    shards = _shards(manifest.sized(loading.threads), partition=partition, loading=loading)
     if any(shard.rows is None for shard in shards):
         return None
     if not any(shard.rows for shard in shards):
@@ -84,9 +85,11 @@ def bounded_places(manifest: ShardManifest, *, partition: DataPartition, seed: i
                    epochs: int | None, examples: int) -> list[tuple[Shard, int]] | None:
     """This share's places among an endless stream's first `examples` rows, each with the rows it reads of
     it (`_reached`), in order: every row the bound deals this share and no other. None where the read is
-    no endless one, or a shard states no rows."""
-    shards = _shards(manifest, partition=partition, loading=loading)
-    if epochs is not None or any(shard.rows is None for shard in shards):
+    no endless one, or a shard states no rows and its store counts none (`ShardManifest.sized`)."""
+    if epochs is not None:
+        return None
+    shards = _shards(manifest.sized(loading.threads), partition=partition, loading=loading)
+    if any(shard.rows is None for shard in shards):
         return None
     if not any(shard.rows for shard in shards):
         return []

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Mapping, Sequence
-from functools import cached_property
 
 import grain.python as grain
 import numpy as np
@@ -98,23 +98,32 @@ class Concatenate(Dataset):
         measured = [length for length in lengths if length is not None]
         return np.concatenate(measured) if len(measured) == len(lengths) else None
 
-    @cached_property
-    def _manifests(self) -> tuple[ShardManifest, ...]:
-        return tuple(source.manifest() for source in self.sources)
-
-    @cached_property
-    def _shards(self) -> Mapping[str, tuple[ShardManifest, Shard]]:
-        return {f"{index}/{shard.id}": (manifest, shard)
-                for index, manifest in enumerate(self._manifests) for shard in manifest.shards}
-
-    def manifest(self) -> ShardManifest:
-        """Each store's shards, one store after another: their index order where each store's is,
-        as `records` joins them."""
-        ordered = all(manifest.index_ordered for manifest in self._manifests)
+    def manifest(self, version: int) -> ShardManifest:
+        """Each store's shards at `version`, one store after another: their index order where each
+        store's is, as `records` joins them; their rows counted (`ShardManifest.sized`) where every
+        store's are stated or counted."""
+        manifests = tuple(source.manifest(version) for source in self.sources)
+        shards = {f"{index}/{shard.id}": (manifest, shard)
+                  for index, manifest in enumerate(manifests) for shard in manifest.shards}
+        ordered = all(manifest.index_ordered for manifest in manifests)
+        countable = any(manifest.counted is not None for manifest in manifests) and all(
+            manifest.counted is not None or all(shard.rows is not None for shard in manifest.shards)
+            for manifest in manifests)
         return ShardManifest(tuple(dataclasses.replace(shard, id=identifier)
-                                   for identifier, (_, shard) in self._shards.items()), self._reader,
-                             index_ordered=ordered)
+                                   for identifier, (_, shard) in shards.items()),
+                             functools.partial(_read_joined, shards), index_ordered=ordered,
+                             counted=functools.partial(_counted, manifests) if countable else None)
 
-    def _reader(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
-        manifest, original = self._shards[shard.id]
-        return manifest.reader(original, options)
+
+def _read_joined(shards: Mapping[str, tuple[ShardManifest, Shard]], shard: Shard,
+                 options: grain.ReadOptions | None = None) -> grain.IterDataset:
+    """Shard `shard` of a concatenation, its store's own (`shards`, by the concatenation's ids) read by
+    its store's reader."""
+    manifest, original = shards[shard.id]
+    return manifest.reader(original, options)
+
+
+def _counted(manifests: Sequence[ShardManifest], reads: int) -> tuple[int, ...]:
+    """The rows of each shard of the stores `manifests` name, one store after another, each store's as it
+    counts them, `reads` at once (`ShardManifest.sized`)."""
+    return tuple(int(shard.rows or 0) for manifest in manifests for shard in manifest.sized(reads).shards)
