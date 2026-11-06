@@ -16,7 +16,7 @@ import pytest
 from fla_gdn_support import CONV_SHAPES
 from gpu_flow import cell
 from kernel_matrix import AXES
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 from test_short_conv import TRAINING_SEEDS, cotangents, documents, operands, row_truth, run
 
 from dew.nn.kernels import generation
@@ -105,7 +105,9 @@ def a_short_convs_training_step_is_on_par(case: tuple[str, ...]) -> None:
     (_, _), parts = CONV_SHAPES[named["model"]]
     segments = documents(2, CONV_SHAPES[named["model"]][0][1]) if named["documents"] == "packed" else None
 
+    @as_given
     def exact(x, weights, grads):
+        # A row at a time on the host (`row_truth`), which the gate runs as it is (`as_given`).
         pieces, gradients = row_truth(x, weights, parts, grads, segments)
         return pieces, gradients[:2]
 
