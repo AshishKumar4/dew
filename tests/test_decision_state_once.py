@@ -101,7 +101,8 @@ def test_each_question_reads_the_shared_part_and_itself_and_with_siblings_those_
         inputs = DecisionInputs.collate([row], SPECIALS.pad, attention=layout.attention)
         runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
         length = inputs.tokens.shape[1]
-        seen = np.asarray(visibility_mask(length, length, causal=False, sliding_window=None, key_runs=runs))[0, 0]
+        seen = np.asarray(visibility_mask(length, length, causal=False, sliding_window=None,
+                                          key_runs=runs))[0, 0]
         streams = np.asarray(row.streams)
         index = np.arange(len(streams))
         for query, stream in enumerate(streams):
