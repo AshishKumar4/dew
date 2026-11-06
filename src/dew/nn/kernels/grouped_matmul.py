@@ -1227,14 +1227,18 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     TILE: ClassVar[mosaic_gpu.Tiles]
 
     def eligible(self, ba, target) -> bool:
+        return target.generation in cutlass_architectures() and self.takes(ba)
+
+    @staticmethod
+    def takes(ba) -> bool:
+        """Whether its kernels take the call wherever dew_cutlass holds them (`eligible` adds the installed
+        library's generations): bf16 operands, bf16 or fp32 out, int32 sizes, every extent a multiple of 8
+        elements (16-byte aligned rows of every operand and output, as its TMA copies and each group's
+        pointers need), no hooks or exact sums, compiled (no interpreter), its stack read whole."""
         operands = [value for name, value in ba.arguments.items()
                     if name in ('tokens', 'kernel', 'cotangent')]
-        # 16-byte aligned rows of every operand and output, as its TMA copies and each group's pointers
-        # need: every extent a multiple of 8 elements.
         extents = {extent for operand in operands for extent in operand.shape[1:]}
-        built = target.generation
-        return (built in cutlass_architectures()
-                and all(operand.dtype == jnp.bfloat16 for operand in operands)
+        return (all(operand.dtype == jnp.bfloat16 for operand in operands)
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
                 and ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('exact_sums')

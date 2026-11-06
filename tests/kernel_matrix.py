@@ -26,6 +26,14 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "dtype": ("bfloat16", "float16", "float32"),
         "form": ("fast", "accurate"),
     },
+    "attention_kernels": {
+        "generation": ("sm90", "sm80", "v5e"),
+        "kernel": ("flash", "triton", "cudnn", "template", "tpu"),
+        "width": ("64", "128", "256"),
+        "heads": ("mha", "gqa-8-2"),
+        "mask": ("causal", "full", "documents"),
+        "dtype": ("bfloat16", "float16", "float32"),
+    },
     "decode": {
         "generation": ("sm90", "sm80"),
         "layout": ("dense", "paged"),
@@ -33,9 +41,11 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "hook": ("plain", "sinks", "softcap"),
         "dtype": ("bfloat16", "float16", "float32"),
         "width": ("64", "128"),
+        "kernel": ("decode", "cudnn", "triton", "template"),
     },
     "gemm": {
-        "generation": ("sm90", "sm80"),
+        "generation": ("sm90", "sm80", "v5e"),
+        "kernel": ("mosaic_gpu", "triton", "cutlass", "mosaic_tpu"),
         "form": ("dense", "grouped"),
         "matrix": ("n-major", "k-major"),
         "hook": ("plain", "bias", "row-scale", "paired"),
@@ -98,11 +108,12 @@ parameters of one shape added to the logits (two in-place gradients of one shape
 the backward in one launch, two, or one whose consumers share a key block; the operands' dtype; the fast or
 the accurate form. Decode's (the choices `decode` and `paged_decode`): the GPU; a dense cache's step or a
 paged pool's; 16 query heads over 8 key heads, or 8 over 8; no hook, attention sinks, or a softcap; the
-operands' dtype; the head width. GEMM's: the GPU; a dense product or one over three groups (one of them
-empty); the matrix stored N-major (`[depth, width]`) or K-major (`transpose_rhs`, `[width, depth]`); no hook,
-a bias (a group's under a grouped call), a scale a row, or a paired gate and up product under SwiGLU; the
-operands' dtype. The fused GEMM's (the choices `gemm_epilogue` and `gemm_prologue`): the GPU; the stage a
-region fuses, its consumers into the epilogue, its producer (an RMS norm) into the prologue (its consumers
+operands' dtype; the head width. GEMM's: the GPU or TPU; the grouped matmul's kernel; a dense product or one
+over three groups (one of them empty); the matrix stored N-major (`[depth, width]`) or K-major
+(`transpose_rhs`, `[width, depth]`); no hook, a bias (a group's under a grouped call), a scale a row, or a
+paired gate and up product under SwiGLU; the operands' dtype. The fused GEMM's (the choices `gemm_epilogue`
+and `gemm_prologue`): the GPU; the stage a region fuses, its consumers into the epilogue, its producer (an RMS
+norm) into the prologue (its consumers
 after the product in XLA), or both; the consumers, a bias then a cast, or a SiLU of twice the product plus a
 residual; the operands' dtype. The joined projections' (the choices `gate_up` and `delta_gates`): the GPU; a
 gated MLP's gate and up projections joined, or a gated delta net's b and a; the MLP's activation, SwiGLU or
@@ -131,6 +142,7 @@ whatever the covering takes besides (`covering`), so the row's own case proves i
 
 CELLS: dict[str, tuple[str, str]] = {
     "attention": ("attention_matrix", "a_routes_training_step_is_on_par"),
+    "attention_kernels": ("attention_kernels_matrix", "a_kernels_training_step_is_on_par"),
     "decode": ("decode_matrix", "a_decode_step_is_on_par"),
     "gemm": ("gemm_matrix", "a_gemm_training_step_is_on_par"),
     "fused_gemm": ("fused_gemm_matrix", "a_fused_gemm_training_step_is_on_par"),
@@ -146,6 +158,7 @@ CELLS: dict[str, tuple[str, str]] = {
 
 FLOWS: tuple[str, ...] = (
     "tests/test_gpu_attention.py::test_the_attention_matrix_holds_on_this_gpu",
+    "tests/test_gpu_attention.py::test_the_attention_kernels_matrix_holds_on_this_gpu",
     "tests/test_gpu_attention.py::test_the_decode_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
@@ -157,7 +170,12 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_recurrence.py::test_the_recurrent_decode_matrix_holds_on_this_gpu",
     "tests/test_gpu_numerics.py::test_the_norm_swiglu_matrix_holds_on_this_gpu",
 )
-"""The flows that run the matrices' cells, by pytest node id."""
+"""The flows that run the matrices' cells on the GPU tier, by pytest node id."""
+
+TPU_FLOWS: tuple[str, ...] = (
+    "tests/test_attention_splash.py::test_the_attention_kernels_matrix_holds_on_this_tpu",
+)
+"""The flows that run the matrices' TPU cells on the TPU tier (`-m tpu`), by pytest node id."""
 
 
 def check(family: str):

@@ -50,13 +50,14 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from dew.nn.decode_geometry import grouped_query
 from dew.nn.kernels import launches
 
 from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import Capped, grouped_rows, kernel_dot, prescaled, ungrouped_rows
+from .templates.attention import Capped, kernel_dot, prescaled
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -491,20 +492,6 @@ def _spans(lengths: jax.Array, starts: jax.Array | None) -> jax.Array:
     lengths = jnp.asarray(lengths, jnp.int32)
     starts = jnp.zeros_like(lengths) if starts is None else jnp.asarray(starts, jnp.int32)
     return jnp.stack([starts, lengths], axis=1)
-
-
-def grouped_query(attend, query, key, value):
-    """`attend` over `query` `[B, T, N, D]` with each key head's `N // K` query heads as its query
-    positions, `[B, T * N // K, K, D]` over the `K` key heads, and its output back in the query's
-    layout: a decode step's lone query, whose heads read the same keys (key lengths alone end a
-    row's), reads its key head's keys once a group. cuDNN otherwise padded the lone query to two
-    positions and ran each query head on its own, 4.7% slower a layer at 64 rows for the same bits
-    (docs/performance.md), and the decode kernel takes as many query heads as key heads
-    (`decode_attention.SUPPORTS`)."""
-    heads, kv_heads = query.shape[2], key.shape[-2]
-    if heads == kv_heads:
-        return attend(query, key, value)
-    return ungrouped_rows(attend(grouped_rows(query, kv_heads), key, value), heads)
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array, starts=None, *,
