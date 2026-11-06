@@ -11,7 +11,7 @@ from dew.data import Loading
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
-from dew.data.sources import Files
+from dew.data.sources import Concatenate, Files
 from dew.data.storage import Store
 
 READ = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
@@ -115,3 +115,85 @@ def test_a_parquet_streams_position_saved_under_plan_version_9_resumes_by_9_alon
                 assert ids(resumed) == expected
             finally:
                 resumed.close()
+
+
+def test_a_streamed_parquet_file_read_by_more_shares_than_files_places_each_record():
+    """A stream of a Parquet store of one file, read by two shares, reads its row groups as its shards, each
+    record numbered by its place in the store (`map_with_index`) whatever share reads it, as a read of row
+    groups numbered them (review of row 4131)."""
+    root = Store("memory://parquet-files-placed")
+    sink = pa.BufferOutputStream()
+    pq.write_table(pa.Table.from_pylist([{"id": row} for row in range(GROUPS * ROWS)]), sink,
+                   row_group_size=ROWS)
+    root.child("part-00.parquet").write(sink.getvalue().to_pybytes())
+    chain = Pipeline(Files(root.url, format="parquet")).map_with_index(
+        lambda index, row: {**row, "place": index}, identity="place@1").batch(2)
+    read = compile(chain, read="streamed", loading=READ, epochs=1)
+    placed = []
+    for share in range(2):
+        stream = read.train(DataPartition(share, 2))
+        try:
+            placed += [(int(batch["id"][at]), int(batch["place"][at])) for batch in stream for at in range(2)]
+        finally:
+            stream.close()
+    assert sorted(placed) == [(row, row) for row in range(GROUPS * ROWS)]
+
+
+def test_a_concatenation_of_parquet_files_reads_through_more_shares_than_files():
+    """A concatenation of two Parquet stores of one file each, read by four shares, reads their row groups as
+    its shards, each record once, as each store alone would (review of row 4131)."""
+    stores = []
+    for number in range(2):
+        root = Store(f"memory://parquet-files-joined-{number}")
+        sink = pa.BufferOutputStream()
+        rows = [{"id": number * 100 + row} for row in range(GROUPS * ROWS)]
+        pq.write_table(pa.Table.from_pylist(rows), sink, row_group_size=ROWS)
+        root.child("part-00.parquet").write(sink.getvalue().to_pybytes())
+        stores.append(Files(root.url, format="parquet"))
+    read = compile(Pipeline(Concatenate(tuple(stores))).batch(2), read="streamed", loading=READ, epochs=1)
+    seen = []
+    for share in range(4):
+        stream = read.train(DataPartition(share, 4))
+        try:
+            seen += ids(stream)
+        finally:
+            stream.close()
+    assert sorted(seen) == [number * 100 + row for number in range(2) for row in range(GROUPS * ROWS)]
+
+
+def test_an_endless_stream_of_parquet_files_that_hold_no_row_is_refused():
+    """An endless stream of a Parquet store whose files hold no row is refused as it reads, as a store whose
+    shards state they hold none is, where it would read nothing forever (review of row 4131)."""
+    root = Store("memory://parquet-files-empty")
+    for number in range(3):
+        sink = pa.BufferOutputStream()
+        pq.write_table(pa.Table.from_pylist([], schema=pa.schema([("id", pa.int64())])), sink)
+        root.child(f"part-{number:02d}.parquet").write(sink.getvalue().to_pybytes())
+    with pytest.raises(ValueError, match="holds no rows"):
+        stream = compile(Pipeline(Files(root.url, format="parquet")).repeat().batch(2), read="streamed",
+                         loading=READ).train(DataPartition())
+        try:
+            next(stream)
+        finally:
+            stream.close()
+
+
+def test_a_published_parquet_stream_names_its_rows_by_its_files_counts(monkeypatch):
+    """A cache filled from a stream of a Parquet store publishes its rows named by its files and their counts
+    read off their footers, reading no file's rows again to name them (review of row 4131)."""
+    from dew.data import generation
+    from dew.data.cache import Cache
+    from dew.data.compile import iterate, publish
+
+    url = written("published")
+
+    def reread(*args, **kwargs):
+        raise AssertionError("publication read a file's rows again to name them")
+
+    monkeypatch.setattr(generation, "_shard_inputs", reread)
+    tagged = Pipeline(Files(url, format="parquet")).map(lambda row: {**row, "tag": row["id"] * 10},
+                                                        identity="tag@1")
+    published = publish(tagged, Cache("memory://parquet-files-published-cache"), read="streamed")
+    rows = sorted((int(row["id"]), int(row["tag"])) for row in iterate(Pipeline(published.source()),
+                                                                       read="indexed"))
+    assert rows == [(row, row * 10) for row in range(FILES * GROUPS * ROWS)]
