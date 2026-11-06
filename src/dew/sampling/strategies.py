@@ -127,7 +127,8 @@ class DecodeOps:
     `crosses` says which rows a call taking them from `lengths` tokens to
     `following` carries past the position where the model's cached keys go
     stale (`text.rebuild_position`), each such row rebuilding every cache in
-    `verify`; None where none goes stale.
+    `verify`; None where none goes stale. `capacity` is the cache slots a row
+    holds, None where unbounded.
     """
 
     advance: Advance
@@ -140,6 +141,7 @@ class DecodeOps:
     draft: DraftBlock | None = None
     draft_tree: DraftTree | None = None
     crosses: Callable[[jax.Array, jax.Array], jax.Array] | None = None
+    capacity: int | None = None
 
 
 class Strategy(Protocol):
@@ -772,6 +774,22 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
     return _Drafted(drafting, candidates, scores, states, offered, ending)
 
 
+def _taken(key: jax.Array, log_ratio: jax.Array) -> jax.Array:
+    """Whether each row accepts a candidate whose target-over-draft log ratio is `log_ratio` `[rows]`: with
+    probability `min(1, exp(log_ratio))`, each row its own key's uniform `key` `[rows]` whatever rows it is
+    drawn beside (`counted`)."""
+    uniform = jax.vmap(jax.random.uniform)(counted(key))
+    return jnp.log(uniform) <= log_ratio
+
+
+def _positive_part(p: jax.Array, q: jax.Array) -> jax.Array:
+    """The normalized positive part of `p - q` over the last axis, the distribution a rejection draws from
+    (arXiv 2211.17192, algorithm 1); a row with none left keeps its unnormalized zeros."""
+    residual = jnp.maximum(p - q, 0.0)
+    weight = jnp.sum(residual, axis=-1, keepdims=True)
+    return residual / jnp.where(weight > 0, weight, 1.0)
+
+
 def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafted: _Drafted,
               step: StepState, active: jax.Array, budget: int | jax.Array, walking: jax.Array
               ) -> tuple[jax.Array, jax.Array]:
@@ -789,9 +807,7 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
     for at in range(1, block_size):
         ratio = (categorical.token_log_probs(targets[at], candidates[at])
                  - categorical.token_log_probs(drafts[at], candidates[at]))
-        # Each row its own key's uniform, whatever rows it is drawn beside (`counted`).
-        uniform = jax.vmap(jax.random.uniform)(counted(keys[:, block_size + at]))
-        accepted.append((jnp.log(uniform) <= ratio) & offered[at])
+        accepted.append(_taken(keys[:, block_size + at], ratio) & offered[at])
     available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
     matched = jnp.where(walking, 0, 1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1),
                                                 axis=1)).astype(jnp.int32)
@@ -799,9 +815,7 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
     target = jnp.take_along_axis(jnp.stack(targets, axis=1), matched[:, None, None], axis=1)[:, 0]
     draft = jnp.take_along_axis(jnp.stack(drafts, axis=1),
                                 jnp.minimum(matched, block_size - 1)[:, None, None], axis=1)[:, 0]
-    residual = jnp.maximum(categorical.probabilities(target) - categorical.probabilities(draft), 0.0)
-    weight = jnp.sum(residual, axis=-1, keepdims=True)
-    rest = jnp.log(residual / jnp.where(weight > 0, weight, 1.0))
+    rest = jnp.log(_positive_part(categorical.probabilities(target), categorical.probabilities(draft)))
     stopped = jnp.any(jnp.stack(ending, axis=1)
                       & (jnp.arange(block_size)[None, :] < matched[:, None]), axis=1)
     replacement = select(keys[:, 2 * block_size], jnp.where(turned_down[:, None], rest, target),
@@ -1059,13 +1073,16 @@ def tree_step(state: DecoderState, step: StepState, terminated: jax.Array, plan:
         jax.random.fold_in(key, count), 3 + deepest * width))(step.keys, step.step)
     walking = (jnp.zeros(rows, bool) if ops.crosses is None or state.lengths is None else
                ops.crosses(state.lengths, state.lengths + shape.nodes + 1))
+    cursor = step.total()
+    if ops.capacity is not None:
+        # A row whose cache cannot hold the whole tree walks too: a node past it would score without its key.
+        walking = walking | (cursor + shape.nodes + 1 > ops.capacity)
 
     opening = dataclasses.replace(step, active=active & (step.step < budget))
     first = transform(opening, state.logits.astype(jnp.float32))
     root = select(keys[:, 0], first, opening.active)
     drafted = draft_tree(state, root, shape, keys[:, 1])
     fed = jnp.concatenate([root[:, None], drafted.tokens], axis=1)
-    cursor = step.total()
     block = TreeBlock(shape, cursor, _coordinates(state, step, jnp.zeros((1, 1), jnp.int32))[:, 0])
     _, verified, _ = verify(state, fed, jnp.broadcast_to((active & ~walking)[:, None], fed.shape),
                             rebuilds=False, tree=block)
@@ -1102,12 +1119,9 @@ def tree_step(state: DecoderState, step: StepState, terminated: jax.Array, plan:
                  else jnp.exp(row_of(drafted.log_q, held - 1)))
             seen = jnp.take_along_axis(p, token[:, None], axis=1)[:, 0]
             offered = jnp.take_along_axis(q, token[:, None], axis=1)[:, 0]
-            # Each row its own key's uniform, whatever rows it is drawn beside (`counted`).
-            uniform = jax.vmap(jax.random.uniform)(counted(keys[:, 3 + (depth - 1) * width + index]))
-            accepted = tested & (uniform * offered <= seen)
-            residual = jnp.maximum(p - q, 0.0)
-            weight = jnp.sum(residual, axis=-1, keepdims=True)
-            p = jnp.where((tested & ~accepted)[:, None], residual / jnp.where(weight > 0, weight, 1.0), p)
+            ratio = jnp.log(seen) - jnp.log(offered)
+            accepted = tested & _taken(keys[:, 3 + (depth - 1) * width + index], ratio)
+            p = jnp.where((tested & ~accepted)[:, None], _positive_part(p, q), p)
             found, chosen = found | accepted, jnp.where(accepted, kid, chosen)
         path.append(jnp.where(found, chosen, -1))
         at = chosen
