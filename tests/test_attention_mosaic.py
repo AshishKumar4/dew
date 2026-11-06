@@ -1295,6 +1295,15 @@ def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks
 
 
 @INTERPRETS
+def test_a_softcapped_backward_in_one_launch_holds_check_1_interpreted(without_deterministic_ops):
+    """The fast form's one launch queries first under a softcap, a score hook of no parameters: its score
+    cotangents taken back through the cap's slope (`gradient.pulled`) before dQ's and dK's products, every
+    gradient the reference's (check 1) over causal packed documents under a window, under the
+    interpreter."""
+    _check_hooked_backward("softcap", form="fused", interpret=True)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
 def test_a_width_split_backward_writes_its_score_parameters_gradients_once_interpreted(hooks):
     """The accurate backward 128 wide, its sums in two column halves (`BackwardTiles.columns`), under a hook

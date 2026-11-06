@@ -943,7 +943,8 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
                               (block_k, block_q, value_width, [logits], False, False),
                               (block_k, block_q, width, [logits], False, False),
                               (block_q, block_k, width, dq_tile, False, False))
-        return resources.live_registers(family, carried, products, dq_tile, *fragments) + statistics
+        # A score hook's pullback (its slopes, `gradient.pulled`) beside the output cotangents' product.
+        return resources.live_registers(family, carried, products, pullback, dq_tile, *fragments) + statistics
     queries = block_q // config.consumers if split else block_q
     held, vectors = _hook_live(family, queries, block_k, params, grads="keys", keys_first=True)
     step = [(queries, block_k, jnp.float32)] * 2 + held
@@ -988,7 +989,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     them): its queries, keys, values and output cotangent, its spans' arrays, its score hook's parameters, its
     initial state (`Initial`, or None) and a training forward's residuals (`forward`'s). Returns its
     gradients (`Gradients`). Its config comes from the family's facts and the call's extents (`derived`: one
-    launch for a hookless fast-form call, two for the accurate form, a hooked call and deterministic mode),
+    launch for a fast-form call whose score hook takes no parameters, deterministic mode's a full or causal
+    one's, two for the accurate form and a call whose hook does),
     legal within the device's block and a consumer's registers (`legal`)."""
 
     HOOKS = ("score_mod",)
@@ -1027,13 +1029,18 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                          block=_block(config), scale=self.scale, rounded=self.rounded), None
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
-        # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless
-        # and undropped call's of equal head widths, its dK/dV program queries first on the dQ launch's
+        # The one launch adds each tile's dQ under the first pass's D: the fast form's, an undropped call's
+        # of equal head widths with no initial state, its dK/dV program queries first on the dQ launch's
         # layout or keys first on one whose consumers share a key block (`split_queries`), each consumer's
         # share of a slot's queries a warpgroup MMA's rows (dQ's product's M), or keys first each consumer
-        # its own keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`).
-        hooked = (self.score_mod is not None or ba.arguments["initial"] is not None
+        # its own keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`). A score hook's
+        # only queries first, each consumer its own keys, and one of no parameters, whose gradients no
+        # launch writes (Gemma 2's softcap, FlashAttention 3's).
+        hooked = (bool(self.score_kinds) or ba.arguments["initial"] is not None
                   or ba.arguments["drop"] is not None)
+        if (config.fused and self.score_mod is not None
+                and not (config.queries_first and not config.shared_keys)):
+            return False
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         dkv_family = found.get(config.dkv.family)
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
@@ -1089,10 +1096,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
         launches walk the largest their registers and the block hold, two stages, one consumer, whose step
         issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
-        at 64 x 64 with two consumers and one). The fast form of a hookless call takes one launch where one
-        holds the whole width, its dK/dV program queries first adding each tile's dQ atomically
-        (FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and 128 over 1k to 8k tokens; ET-A05AB3-h100:
-        5.20 against 6.19 ms the two keys-first launches at Qwen3-8B causal, 1.19 against 1.53 at width 64;
+        at 64 x 64 with two consumers and one). The fast form of a hookless call (or one whose hook takes no
+        parameters: a softcap) takes one launch where one holds the whole width, its dK/dV program queries
+        first adding each tile's dQ atomically (FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and
+        128 over 1k to 8k tokens; ET-A05AB3-h100: 5.20 against 6.19 ms the two keys-first launches at
+        Qwen3-8B causal, 1.19 against 1.53 at width 64;
         check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
         temporaries against 258 at llama-d128 2 x 4096, its dQ fp32), a call over key spans, windows,
         documents or runs as a plain one (ET-CROSS-h100 and ET-SPAN4-h100, the attention launches a training
@@ -1255,7 +1263,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     `residuals` (its maxima, denominators, anchor keys and split sums): D about each query's anchor from the
     split sums (`gradient.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between
     them, in the form `accurate` names; or the fast form's one launch (`BackwardTiles.fused`,
-    `_launch_backward`), a hookless call's derived default outside deterministic mode
+    `_launch_backward`), the derived default of a call whose score hook takes no parameters
     (`MosaicBackward.derived`). Every
     call form of bf16 operands, under every score hook and the initial state. The output hook is no part of
     it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
