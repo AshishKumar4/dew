@@ -1052,6 +1052,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         if (config.fused and (self.accurate or hooked or sixteen)) or not super().legal(ba, config, target):
             return False
         family = bundle_of(config, dtype)
+        # Deterministic mode's one launch orders its adds by turns (`Family.ticketed`): each query tile's dQ
+        # adds come from its key tiles counted from the first, which a full or causal call's walk keeps (a
+        # program's consumers walk their first key tile's readers, which every earlier key tile reads too);
+        # queries first, each consumer its own keys, on a family that waits across programs.
+        if config.fused and deterministic_ops_requested() and not (
+                self.form in ("full", "causal") and family is not None and family.fixes_up
+                and config.queries_first and not (config.shared_keys or config.shared_dq)):
+            return False
         if config.producer_dq and not config.shared_dq:
             # The producer adds a shared dQ's staged shares alone (`mosaic.Outbox`).
             return False
@@ -1092,9 +1100,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         8192, under a causal window of 4096 at 8192 0.65; width 64's 8 heads over 2 0.56 to 0.88, 16 over
         16 under the window 0.54; check 1 over documents and a window at 1 x 2048; of every call measured,
         row 3171's toy one alone the slower, 1 x 1024 over three short documents and a window of 256,
-        1.38 times: 20 us a step); otherwise (the accurate form, a hooked or dropping call, deterministic
-        mode, `deterministic_ops_requested`, a width no fused launch holds) two launches, the dQ launch then
-        the keys-first dK/dV one, in a fixed order."""
+        1.38 times: 20 us a step); in deterministic mode (`deterministic_ops_requested`) only a full or
+        causal call's, queries first on a layout whose consumers feed their rings, every add across programs
+        in a fixed order (`Family.ticketed`); otherwise (the accurate form, a hooked or dropping call, a
+        width no fused launch holds) two launches, the dQ launch then the keys-first dK/dV one, in a fixed
+        order."""
         family = self._family(ba, target)
         if family is None:
             return None
@@ -1107,10 +1117,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
         dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
-        if not deterministic_ops_requested():
+        deterministic = deterministic_ops_requested()
+        found = []
+        if not deterministic:
             # Legal where the form, the hooks, the widths and the registers allow (`legal`): of the one
             # launch keys first and queries first, the larger query tile (`_derived`'s order).
-            found = []
             for shared in [*({**dkv, "staged_logits": staged} for staged in (False, True) if dkv), {}]:
                 def fused(rows: int, walked: int, consumers: int, shared=shared) -> BackwardTiles:
                     return BackwardTiles(walked, rows, 2, consumers, fused=True, family=family.name, **shared)
@@ -1118,35 +1129,38 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 if config := _derived(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
                                       overlapped=False):
                     found.append(config)
-            # Queries first on the layout whose consumers feed their rings, each consumer its own keys over
-            # the query stream it feeds (FlashAttention 3's CTA), at the layout's consumers, whom no
-            # producer's warpgroup shares the registers with (ET-FFED3-h100, the fused launch: 2.40 against
-            # 2.71 ms causal and 4.32 against 5.54 full at Qwen3-8B's widths, 0.47 against 0.59 at width 64).
-            for layout in fed:
-                def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
-                    return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
+        # Queries first on the layout whose consumers feed their rings, each consumer its own keys over
+        # the query stream it feeds (FlashAttention 3's CTA), at the layout's consumers, whom no
+        # producer's warpgroup shares the registers with (ET-FFED3-h100, the fused launch: 2.40 against
+        # 2.71 ms causal and 4.32 against 5.54 full at Qwen3-8B's widths, 0.47 against 0.59 at width 64).
+        # Deterministic mode's one launch, every add across programs in its turn (`Family.ticketed`,
+        # FlashAttention 3's deterministic backward); else the two launches below, each program's sums its
+        # own.
+        for layout in fed:
+            def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
+                return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
 
-                if config := _derived(layout, query.dtype, key.shape[1], query.shape[1], fed_fused, fits,
-                                      overlapped=True):
-                    found.append(config)
-            if found:
-                # The most keys and queries a program's step takes, its consumers' keys over its query tile;
-                # on a tie the more consumers, one's softmax under the other's products (ET-FFED3-h100 at
-                # width 64: 64 x 64 on two consumers 0.47 ms against 128 x 64 on one, 0.59).
-                return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers,
-                                                      config.consumers))
-            # Where no consumer's registers hold its own keys' whole dK and dV sums, the consumers share
-            # one key block, each its share of the columns (FlashAttention 3's width 256: ET-COOP1-h100,
-            # 0.68 ms against the two launches' 1.30 at Qwen3-8B's heads 256 wide, causal; where the sums
-            # fit, sharing cost 9% at width 128 and 46% at 64, ET-COOP2-h100).
-            for layout in fed:
-                def sharing(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
-                    return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name,
-                                         shared_keys=True)
+            if config := _derived(layout, query.dtype, key.shape[1], query.shape[1], fed_fused, fits,
+                                  overlapped=True):
+                found.append(config)
+        if found:
+            # The most keys and queries a program's step takes, its consumers' keys over its query tile;
+            # on a tie the more consumers, one's softmax under the other's products (ET-FFED3-h100 at
+            # width 64: 64 x 64 on two consumers 0.47 ms against 128 x 64 on one, 0.59).
+            return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers,
+                                                  config.consumers))
+        # Where no consumer's registers hold its own keys' whole dK and dV sums, the consumers share
+        # one key block, each its share of the columns (FlashAttention 3's width 256: ET-COOP1-h100,
+        # 0.68 ms against the two launches' 1.30 at Qwen3-8B's heads 256 wide, causal; where the sums
+        # fit, sharing cost 9% at width 128 and 46% at 64, ET-COOP2-h100).
+        for layout in fed if not deterministic else ():
+            def sharing(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
+                return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name,
+                                     shared_keys=True)
 
-                if config := _derived(layout, query.dtype, key.shape[1], query.shape[1], sharing, fits,
-                                      overlapped=True):
-                    return config
+            if config := _derived(layout, query.dtype, key.shape[1], query.shape[1], sharing, fits,
+                                  overlapped=True):
+                return config
         # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
         # Its logits' queries a stream of their own, else where that passes the block staged a step

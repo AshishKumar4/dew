@@ -1958,6 +1958,25 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+@INTERPRETS
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_a_deterministic_backward_in_one_launch_holds_check_1_interpreted(call, with_deterministic_ops):
+    """The backward under --xla_gpu_deterministic_ops on a full or causal call, its one launch's adds each
+    in its turn (`Family.ticketed`: dQ's in its key tiles' order, grouped dK's and dV's in their query
+    heads'), its gradients the reference's (check 1), under the interpreter, whose programs run in turn."""
+    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+def test_a_deterministic_backward_compiles_spill_free_as_its_model_decides(width, with_deterministic_ops):
+    """The backward under --xla_gpu_deterministic_ops at its derived tiles of a causal call `width` wide,
+    its adds ordered across programs by semaphores (`Family.ticketed`), lowered and compiled by ptxas for an
+    H100 on this CPU: within its shared memory, spilling nothing, its register model's decision ptxas's."""
+    test_the_backward_compiles_spill_free_as_its_model_decides(generation_name="sm90", width=width,
+                                                               accurate=False, hooks="none")
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "accurate", "hooks"), BACKWARD_GATE)
 def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, width, accurate, hooks):
