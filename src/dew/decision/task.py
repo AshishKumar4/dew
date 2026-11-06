@@ -414,9 +414,8 @@ class Decide(SavedRunTask, InItsForm):
         from dew.inference.tasks import saved_model
         from dew.interop.pretrained import source_states
 
-        model = saved_model(run.record, None).build()
-        assert isinstance(model, DecisionModel)
-        return source_states(model.backbone)
+        # The record's model is the backbone the head reads (`from_saved`).
+        return source_states(saved_model(run.record, None).build())
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
