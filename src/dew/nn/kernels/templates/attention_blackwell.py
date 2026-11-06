@@ -270,6 +270,8 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
                         lambda carry: carry, carry)
 
     m, total = lax.fori_loop(0, blocks, walked, start)
+    # A row that saw no key, by its denominator in the walk's row layout (its maximum's).
+    no_keys = algebra.no_keys(total)
     scratch.o_done.wait(scratch.o_done.turn(block.steps - 1))
     acc = TCGEN05.load_columns(scratch.acc_tmem, 0, value_width)
     TCGEN05.loaded()
@@ -282,7 +284,7 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     # The rows' maxima, and the overflows of their sums, through the denominator's stage.
     over = algebra.overflowed(acc).astype(jnp.float32)
     # A row that saw no key -inf (`algebra.reached`'s convention).
-    m = jnp.where(algebra.no_keys(total), -jnp.inf, m)
+    m = jnp.where(no_keys, -jnp.inf, m)
     mosaic.stored((m, over), (maxima_ref.at[places], over_ref.at[places]), smem=scratch.l_smem)
 
 
