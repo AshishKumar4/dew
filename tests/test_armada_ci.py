@@ -921,6 +921,46 @@ def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tm
     assert stored == kept
 
 
+def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci, tmp_path, monkeypatch,
+                                                                             cache_worker):
+    """A task keeps each test it passed in its artifacts as it ends (tools/armada/progress.py), and an attempt
+    armada starts after recalling one (ARMADA_RESUME, the artifacts the recalled attempt kept, #4544) sets
+    those aside and runs the rest: its row green with every test's seconds, the earlier attempt's among them,
+    its progress carrying them for a later recall, and no record written, as no record holds the earlier
+    attempt's opens."""
+    (tmp_path / "tests/test_resumed.py").write_text(
+        "from pathlib import Path\n"
+        "def test_first():\n"
+        "    with Path('ran').open('a') as ran: ran.write('first ')\n"
+        "def test_second():\n"
+        "    with Path('ran').open('a') as ran: ran.write('second ')\n")
+    interpreter(tmp_path, "3.12")
+    url, stored, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    # An attempt that ran whole kept both tests as it went.
+    [row] = armada_task(ci, monkeypatch, out, policy="off")
+    assert row["exitCode"] == 0, row["output"]
+    progress = tmp_path / "artifacts" / "progress.jsonl"
+    kept = [json.loads(line)["node"] for line in progress.read_text().splitlines()]
+    assert kept == ["tests/test_resumed.py::test_first", "tests/test_resumed.py::test_second"]
+    # The next, recalled after its first test: that one set aside, the second run, both in its row.
+    (tmp_path / "resume").mkdir()
+    (tmp_path / "resume" / "progress.jsonl").write_text(progress.read_text().splitlines()[0] + "\n")
+    progress.unlink()
+    (tmp_path / "ran").unlink()
+    monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
+    stored.clear()
+    [row] = armada_task(ci, monkeypatch, out, policy="off")
+    assert row["exitCode"] == 0, row["output"]
+    assert (tmp_path / "ran").read_text() == "second "
+    assert set(row["tests"]) == {"tests/test_resumed.py::test_first", "tests/test_resumed.py::test_second"}
+    assert [json.loads(line)["node"] for line in progress.read_text().splitlines()] == kept
+    assert stored == {}
+
+
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,
                                                                                   cache_worker):
     """A file that ran green is reused by a later task on the same CPU class while its inputs are

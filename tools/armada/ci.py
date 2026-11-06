@@ -150,6 +150,7 @@ coverage_report = _loaded(HERE / "coverage_report.py")
 r2 = _loaded(HERE / "r2.py")
 watched = _loaded(HERE / "watched.py")
 followed = _loaded(HERE / "followed.py")
+progress = _loaded(HERE / "progress.py")
 digests = _loaded(HERE / "digests.py")
 code_of, unit, units = digests.code_of, digests.unit, digests.units
 SETTLE = 30.0
@@ -1578,7 +1579,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
-    command = pytest_command(run, tests, split, release)
+    # The tests an attempt the fleet recalled passed (`resumed`): set aside, their seconds kept for the rows.
+    done_before = {} if site is not None or release or coverage is not None else resumed(tests)
+    command = [*pytest_command(run, tests, split, release), "-p", "progress",
+               *(word for node in done_before for word in ("--deselect", node))]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
@@ -1661,19 +1665,47 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
-                     "tests": {node_of(case): float(case.get("time") or 0) for case in own},
+                     "tests": {**{node: seconds for node, seconds in done_before.items()
+                                  if node.split("::", 1)[0] == name},
+                               **{node_of(case): float(case.get("time") or 0) for case in own}},
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
                      "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
-    if coverage is None and not release and not (environ and check1_wire().CENSUS in environ):
+    if (coverage is None and not release and not (environ and check1_wire().CENSUS in environ)
+            and not done_before):
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
-        # under its requirement's overlay and on the whole suite's run alone, nor the census's.
+        # under its requirement's overlay and on the whole suite's run alone, nor the census's, nor a resumed
+        # one's, whose earlier attempt's opens no record holds.
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set())
     return 0
+
+
+def resumed(tests: list[str]) -> dict[str, float]:
+    """The tests of `tests` an earlier attempt of this task passed before the fleet recalled it (armada keeps
+    a recalled attempt's artifacts and hands them to the next as ARMADA_RESUME, #4544), each with its seconds,
+    as tools/armada/progress.py kept them; copied into this attempt's progress, so a second recall keeps them
+    too. None outside a resumed task."""
+    kept = Path(os.environ.get("ARMADA_RESUME", "/nonexistent")) / progress.PROGRESS
+    if not kept.is_file():
+        return {}
+    passed = {}
+    for line in kept.read_text().splitlines():
+        found = json.loads(line)
+        if found["node"].split("::", 1)[0] in tests:
+            passed[found["node"]] = float(found["seconds"])
+    artifacts = os.environ.get("ARMADA_ARTIFACTS")
+    if artifacts and passed:
+        Path(artifacts).mkdir(parents=True, exist_ok=True)
+        with (Path(artifacts) / progress.PROGRESS).open("a") as carried:
+            carried.writelines(json.dumps({"node": node, "seconds": seconds}) + "\n"
+                               for node, seconds in passed.items())
+    if passed:
+        print(f"resumed: {len(passed)} tests an earlier attempt passed set aside", flush=True)
+    return passed
 
 
 def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
