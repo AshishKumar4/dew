@@ -240,10 +240,11 @@ CI runs on CPUs. Two diagnostics read a new JAX release on a GPU when you want t
 
 ## XLA:CPU open items
 
-Two quirks of XLA's CPU backend that Dew records rather than works around (CONTRIBUTING.md's one exception): the same computation in float64 shows Dew's own arithmetic right in both.
+Quirks of XLA's CPU backend that Dew records rather than works around (CONTRIBUTING.md's one exception): the same computation in float64 shows Dew's own arithmetic right in each.
 
 - A reduction split across CPU devices, a bias gradient summed over the positions a layout splits among them, takes none of the YNNPACK fusion the same reduction takes on one device: each shard sums with XLA's own reduction, so the split result is the unfused one's, 1.57 times one device's error from float64 for a `[8192, 3]` float32 sum and 5.7 times for a split `Dense` bias gradient. With `xla_cpu_experimental_ynn_fusion_type=""` the two agree (ledger row 4520).
 - A float32 dot whose output is narrower than 16 runs through YNNPACK's generic `dot_1x1x1`, which rounds each product before it adds it; from width 16, and in XLA's own dot, each product is fused into its sum (ledger row 4522).
+- An attention's weighted sum over many keys is one plain float32 dot (`dot_f32_f32_f32`), where PyTorch's CPU kernel sums in blocks: over the 1,296 keys of a decision head's evidence cross-attention, Dew's CPU error at that sum is 2.4 to 2.9 times PyTorch's, and the same products summed in float64 are 0.55 times (ledger row 4610).
 
 ## Compilation cache
 
