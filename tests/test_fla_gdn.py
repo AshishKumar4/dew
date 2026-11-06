@@ -16,6 +16,7 @@ import pytest
 from delta_rule_support import NAMES, checkpointed, fla_side, math as portable, recurrence, rule_math, through
 from flax import linen as nn
 from gdn_cases import CASES
+from port_support import row_names_port
 from reference_error import (
     FEWEST_SEEDS,
     as_given,
@@ -555,16 +556,6 @@ def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs(kind):
     assert np.isfinite(np.asarray(got)).all()
 
 
-@contextlib.contextmanager
-def row_names_port(*, port: bool = True):
-    """Choose the port for the rule where `port`, else XLA; off a GPU the port's kernels interpret. The
-    port runs at the default product precision its fp32 products are declared at (TF32,
-    `recurrence_chunk._port_precision`), which the suite's lanes' 'highest' hands to XLA."""
-    with (generation.chosen(gated_delta_rule="fla" if port else "xla"),
-          jax.default_matmul_precision("default") if port else contextlib.nullcontext()):
-        yield
-
-
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
 def test_a_gated_delta_net_on_fla_matches_it_on_xla(dtype, bound):
     """The layer where a GPU runs the port hands it its projections' dtype and its keys on their own
@@ -573,11 +564,11 @@ def test_a_gated_delta_net_on_fla_matches_it_on_xla(dtype, bound):
     x = jax.random.normal(jax.random.key(23), (2, 72, 64)).astype(dtype)
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
                           dtype=dtype)
-    with row_names_port(port=False):
+    with row_names_port("gated_delta_rule", "fla", port=False):
         params = nn.unbox(layer.init(jax.random.key(29), x))
 
     def loss(params, *, port):
-        with row_names_port(port=port):
+        with row_names_port("gated_delta_rule", "fla", port=port):
             out = layer.apply(params, x)
         return jnp.sum(out.astype(jnp.float32) ** 2), out
 
@@ -680,7 +671,7 @@ def test_the_rule_runs_at_every_geometry(label):
         with generation.chosen(gated_delta_rule=routed):
             found = run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
     else:
-        with row_names_port(port=names_port):
+        with row_names_port("gated_delta_rule", "fla", port=names_port):
             found = run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
     assert all(np.all(np.isfinite(np.asarray(x, np.float32))) for x in jax.tree.leaves(found))
 

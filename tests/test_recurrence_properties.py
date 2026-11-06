@@ -108,13 +108,17 @@ def test_the_portable_math_carried_across_a_split_is_the_whole_recurrence(hooks,
 
 def the_template_carried_across_a_split_is_the_whole_recurrence(hooks):
     """The template's 16-bit call over packed documents split at `TEMPLATE_SPLIT` into two, the second
-    entering the first's final memory, interpreted: its output and final memory on par with the call whole."""
+    entering the first's final memory, interpreted: its output and final memory on par with the call whole.
+    Its numbers are the run's fast forms', at the default product precision they round at
+    (`recurrence_chunk.fast_rounding`; the suite's lanes configure 'highest'): an l2 norm hands the rule
+    fp32 queries and keys, whose products the template rounds there."""
     length, at = 70, TEMPLATE_SPLIT
     whole = functools.partial(chunk_on, "mosaic_gpu", hooks)
-    assert_as_exact(jax.jit(split("mosaic_gpu", hooks, at, length)), jax.jit(whole),
-                    _drawn(hooks, packed=True, length=length, narrow=True),
-                    f"the template, {hooks}, packed, split at {at}", seeds=SEEDS,
-                    truth_fn=functools.partial(token_by_token, hooks))
+    with jax.default_matmul_precision("default"):
+        assert_as_exact(jax.jit(split("mosaic_gpu", hooks, at, length)), jax.jit(whole),
+                        _drawn(hooks, packed=True, length=length, narrow=True),
+                        f"the template, {hooks}, packed, split at {at}", seeds=SEEDS,
+                        truth_fn=functools.partial(token_by_token, hooks))
 
 
 # The template's split interpreted, a form a check-1 site of its own over map tasks of two draws: at two
