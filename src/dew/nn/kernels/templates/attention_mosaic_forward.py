@@ -786,6 +786,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks, residuals=residuals,
                  out=(out_view, out_smem), rows=(finished, row_smem))
 
+
 def _deferred_walk(spec: algebra.Forward, family: mosaic.Family, tiles: Tiles, q, start: algebra.Partial,
                    scored: Callable, dot: Callable, turn: Callable, streams, bounds: tuple, counted, *,
                    value_width: int, dtype, interpret: bool) -> tuple:

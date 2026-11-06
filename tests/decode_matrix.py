@@ -1,12 +1,13 @@
 """Decode's check-1 matrix (tests/kernel_matrix.py): a serving step's decode on par with the reference.
 
 Its cells run the kernel choices `decode` (`attention_kernels.DECODE`: a step over a dense cache's key
-lengths, as `scaled_dot_product_attention` takes it) and `paged_decode` (`kv_cache.PAGED`: a step over a
-paged pool, as `KVStore.decode` takes it) as a serving step calls them, on the cell's GPU. A dense cell holds the output and
-its query, key and value gradients under a cotangent to the reference path's (check 1), a paged cell its
-output, each with their float64 terms (`attention_oracle.attention_terms`). What each choice serves is read
-from its selector: the decode selector's own test (`attention_kernels.decodes`), and the paged selector taking
-a paged kernel (`select(PAGED, case)`, as the layer asks it, `CausalSelfAttention._decode_attention`).
+lengths, as `scaled_dot_product_attention` takes it) and `paged_decode` (`kv_cache.PAGED`: a step over a paged
+pool, as `KVStore.decode` takes it) as a serving step calls them, on the cell's GPU. A dense cell holds the
+output and its query, key and value gradients under a cotangent to the reference path's (check 1), a paged
+cell its output, each with their float64 terms (`attention_oracle.attention_terms`). What each choice serves
+is read from its selector: the decode selector's own test (`attention_kernels.decodes`), and the paged
+selector taking a paged kernel (`select(PAGED, case)`, as the layer asks it,
+`CausalSelfAttention._decode_attention`).
 """
 
 import flax.linen as nn
