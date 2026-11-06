@@ -1189,8 +1189,8 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """The state after a tile `keys`: its softmax and the product of its weights with its values, the
     mainloop's own running sums taking it where it holds them (`Keys.accumulate`, the state's `acc` in its
     form). A tile held keys first (`Coords.keys_first`, a decode program's `K Qᵀ`) takes its sums so: the
-    mainloop's, `[Dv, bq]`, its queries their columns, on the plain walk. Behind the switch, the derived
-    forms' (`dew.algebra.forms.derived`, `_derived_step`), but for a dropping call's: the derivation narrows a
+    mainloop's, `[Dv, bq]`, its queries their columns, on the plain walk. The derived forms'
+    (`_derived_step`), but for a dropping call's: the derivation narrows a
     dropped weight unnormalized, past fp16's largest at a rate near 1 (a multiplier of 2^16), where this
     step's scaled parts (`weights_parts`) keep it, a representation the declaration states none of."""
     # A compensated or guarded walk's step takes its dropped roundings and its shifts through the derived
@@ -1615,9 +1615,8 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
            output_params: tuple[jax.Array, ...] = ()) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
-    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves. Behind the switch, that
-    ratio the derived forms' (`dew.algebra.forms.derived`, `_derived_output`), a guarded state's live rows
-    taken from its unshifted sums as ever."""
+    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves, the derived forms'
+    (`_derived_output`), a guarded state's live rows taken from its unshifted sums as ever."""
     m, denominator = finished_rows(spec, state, initial=initial)
     out = _derived_output(spec, state)
     fields = state.guard
@@ -1833,10 +1832,9 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
     tile's raw products times `factor` where the mainloop gives them (`Keys.products`, `logits_of`), so the
     derivation may take their maximum and scale it once (`rules`' positive scale out of a maximum), the
     hand step's 62 fewer multiplies a step at Qwen3's tile, its exponent's argument one fused multiply-add a
-    logit (`rules._contracted`). Its derived forms stand beside this module's (`plain_step`, `merge`,
-    `finish`), behind the one switch (`dew.algebra.forms.derived`, `derived_forms`), which they replace
-    only on par with them against float64 and no slower in the kernel (docs/design/algebra.md). The accurate
-    form's (`natural`, `Forward.natural`) declares its exponential (`natural_exp`) and its rescale
+    logit (`rules._contracted`). Its derived forms (`derived_forms`) are what this module's walk computes
+    by (`plain_step`, `merge`, `finish`), on par with XLA's against float64 (docs/design/algebra.md). The
+    accurate form's (`natural`, `Forward.natural`) declares its exponential (`natural_exp`) and its rescale
     (`natural_carried`, its exponent compensated), which the derivation evaluates as they are and rewrites
     none: over scaled logits its largest weight held to 1 (`softmax_of`'s `held`), over raw products
     (`Forward.raw`) each difference scaled by their `raw` scale, which the exponential carries and the
@@ -1865,8 +1863,7 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
 @functools.cache
 def derived_forms(base2: bool, keys_first: bool = False, factor: float | None = None, natural: bool = False,
                   raw: float | None = None, guarded: bool = True) -> derive.Derived:
-    """The forward's derived forms (`declaration`'s), the template's behind the switch
-    (`dew.algebra.forms.derived`): `plain_step`, `merge` and `finish` take them in place of their own; a
+    """The forward's derived forms (`declaration`'s), which `plain_step`, `merge` and `finish` compute by; a
     step over raw products, their `factor` (`declaration`). The fast form's are the fast class's; the
     accurate form's (`natural`) the accurate class's, which admits no reordering past the error-free rules."""
     from dew.algebra import SATURATION

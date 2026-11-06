@@ -270,11 +270,6 @@ ALGEBRA = jax.make_user_context(default_value=Passes())
 """The algebra pass's switch (`Passes`), keyed on as `KERNEL_TUNES` is: a program a switch traced is never run
 under another, and the accuracy gate opens it per arm (docs/design/algebra.md §6.7)."""
 
-DERIVED = jax.make_user_context(default_value=False)
-"""Whether the templates take their algebra's derived forms (`dew.algebra.forms.derived`) in place of their
-hand-written ones, keyed on as `ALGEBRA` is: a program traced under one set of forms is never run under the
-other, and check 1 drives both (docs/design/algebra.md §6.9)."""
-
 KERNEL_LAUNCHES = jax.make_user_context(default_value=False)
 """Whether a traced kernel launch carries tokamax's description of itself
 (`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only a
