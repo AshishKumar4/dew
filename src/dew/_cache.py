@@ -18,7 +18,7 @@ from pathlib import Path
 
 import jax
 
-from dew._devices import deterministic_ops_requested, xla_flag
+from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
 
 
 def dew_cache_dir() -> str:
@@ -156,8 +156,8 @@ def enable_compilation_cache(path: str):
     recompiles the same step function from scratch.
 
     XLA's GPU compile measures each fusion's candidate kernels on the device.
-    The picks go to `<path>/autotune/jaxlib-<version>`, one file a fusion keyed
-    by the fusion and the GPU model, for this XLA alone, so a later compile of
+    The picks go to `autotune_dir(path)`, one file a fusion keyed by the
+    fusion and the GPU model, for this XLA alone, so a later compile of
     the same fusions takes them without measuring. A process beside other work
     on its GPU would measure unfairly, so it reads them and adds none
     (`gpu-run -n 0.5` sets XLA's AUTOTUNE_CACHE_MODE_READ). Neither the
@@ -231,10 +231,14 @@ def uncached() -> Iterator[None]:
 
 def autotune_dir(path: str) -> str:
     """Where the GPU picks of the executables cached under `path` go, for this
-    jaxlib alone: XLA's per fusion, and Dew's kernels' beside them
-    (`kernel_picks_path`). jaxlib pins XLA, Triton and Mosaic, which each
-    pick's speed depends on."""
-    return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}")
+    jaxlib and the build of each CUDA PJRT plugin installed beside it: XLA's
+    per fusion, and Dew's kernels' beside them (`kernel_picks_path`). The GPU
+    compile each pick's speed depends on, XLA's, Triton's and Mosaic GPU's,
+    runs in the plugin, and Dew builds its plugins again under one jaxlib, a
+    version each (row 3560)."""
+    plugins = "".join(f"-{build}-{importlib.metadata.version(f'jax-{build}-pjrt')}"
+                      for build in cuda_builds())
+    return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}{plugins}")
 
 
 def kernel_picks_path(device_kind: str) -> str:
