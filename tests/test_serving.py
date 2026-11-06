@@ -845,7 +845,7 @@ the later ones wait for the first to write it."""
      {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
       "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
     ((Served(9), Served(9, flipped=(0,)), Served(9)),
-     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 2,
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 6,
       "prefix_states": 1}, (0, 0, 8), None, NARROW_HYBRID),
     (SEGMENT, {}, (0, 6, 12), None, NARROW_HYBRID),
     (SEGMENT, {}, (12,), (3,), NARROW_HYBRID),
@@ -899,7 +899,8 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
     alone, where the store holds the state after the deepest page only, so the repeat reads nothing back;
     a store of one entry sends a prompt's state to the host tier when another prompt's takes the entry,
-    and its repeat reads it back with its pages (`dew.inference.pages.States`). A segment three prompts
+    and its repeat reads it back with its pages (`dew.inference.pages.States`; a tier holds as many states
+    as its host pages' bytes, one in six pages' here). A segment three prompts
     declare shared, ending inside a page (`SEGMENT`), is read by each later one from the state kept at
     its end, its last page copied into the prompt's own, one a round or all asked at once. With a host
     tier (`SEGMENT_HOST`): a segment two other prompts spill to the host, its page named by the segment
