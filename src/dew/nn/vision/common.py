@@ -9,14 +9,14 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable, Collection, Mapping
 from types import MappingProxyType
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from flax import linen as nn
 
 from dew import _records
 from dew.batch import Variables
 from dew.interop.decoder_parts import read_rope_theta
-from dew.interop.layouts import Route, Routes, Table
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Routes, Table
 from dew.interop.unread import Stored
 from dew.interop.weights import placed
 from dew.registry import Record, projectors, towers
@@ -86,6 +86,22 @@ class TowerLayout:
     """The leading names of a tower stored under several roots, an empty `prefix` beside them, whose
     names `routes` read whole: MiMo-V2.6's audio tower, its encoder's and its tokenizer folder's."""
     shapes: StoredShapes | None = None
+    config: ConfigLayout | None = None
+    """The tower's vision_config, both ways (`dew.interop.layouts.ConfigLayout`): read into its fields
+    (`fields`), written from its value (`vision_config`); None for a tower whose config is read apart."""
+    model_type: str | None = None
+    """The vision_config's own model_type, which a written config states."""
+
+    def fields(self, vision: Mapping[str, object]) -> dict[str, object]:
+        """The tower's fields `vision`, its vision_config, states (`config`)."""
+        assert self.config is not None, "the tower reads its config apart"
+        return self.config.read(vision, set(), {})
+
+    def vision_config(self, tower: object) -> dict[str, object]:
+        """The vision_config `tower` is written with, which `fields` reads back as it (`config`)."""
+        assert self.config is not None, "the tower reads its config apart"
+        return {**({} if self.model_type is None else {"model_type": self.model_type}),
+                **self.config.write(tower)}
 
     def path(self, name: str) -> tuple[str, ...] | None:
         """The leaf of tensor `name`, rooted at its collection; None for one the tower does not compute
@@ -386,3 +402,54 @@ def rope_base(vision: Mapping[str, object], default: float, *, axial: bool = Fal
         entry = {**{name: value for name, value in entry.items() if name != "type"}, "rope_type": "default"}
     theta = read_rope_theta(entry, "rope_parameters")
     return _records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta
+def integer_field(key: str, field: str | None = None, default: object = None, *,
+                  required: bool = False) -> ConfigField:
+    """A config key holding an integer field (`field`, the key's name where None), its config class's
+    `default` where the config omits it (none where `required`)."""
+    return (ConfigField(key, field or key, parse=_records.integer) if required
+            else ConfigField(key, field or key, default, parse=_records.integer))
+
+
+def number_field(key: str, field: str | None = None, default: object = None) -> ConfigField:
+    """A config key holding a float field, its config class's `default` where the config omits it."""
+    return ConfigField(key, field or key, default, parse=_records.number)
+
+
+def side_field(key: str, default: int) -> ConfigField:
+    """A square image or patch size, an int or an equal pair (`_side`), written as its side."""
+    return ConfigField(key, key, default, parse=_side)
+
+
+def activation_field(runs: Collection[str], default: str, *keys: str) -> ConfigField:
+    """The trunk's activation under the first of `keys` a config states (`activation_name`), refused
+    outside `runs`, written under the first."""
+    def parse(value: object, key: str) -> str:
+        return activation_name({key: value}, runs, default, (key,))
+    return ConfigField(keys[0], "hidden_act", default, parse=parse, aliases=keys[1:])
+
+
+class Rotary(Protocol):
+    """A tower that rotates by a plain base."""
+
+    rope_theta: float
+
+
+def rope_part(default: float, *, axial: bool = False) -> ConfigPart:
+    """A trunk's plain rotary base (`rope_base`), written as its `rope_parameters`."""
+    def read(vision: Mapping[str, object], used: set[str], record: dict[str, object]) -> dict[str, object]:
+        used.update(("rope_parameters", "rope_theta"))
+        record["rope_theta"] = rope_base(vision, default, axial=axial)
+        return record
+
+    def write(tower: Rotary) -> Mapping[str, object]:
+        return {"rope_parameters": {"rope_type": "default", "rope_theta": tower.rope_theta}}
+    return ConfigPart(read, write)
+
+
+TRUNK_FIELDS = (integer_field("hidden_size", required=True),
+                integer_field("intermediate_size", required=True),
+                integer_field("num_hidden_layers", "num_layers", required=True),
+                integer_field("num_attention_heads", "num_heads", required=True))
+"""The width, MLP width, depth and head count a ViT config states (`trunk_geometry`), both ways."""
+
+

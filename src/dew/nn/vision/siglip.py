@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew.batch import Variables
-from dew.interop.layouts import Table
+from dew.interop.layouts import ConfigLayout, Table
 from dew.interop.unread import Stored, held
 from dew.interop.weights import checkpoint_array
 from dew.nn.dense import Dense
@@ -25,17 +25,19 @@ from dew.nn.text_encoders import TOWER_ACTIVATIONS, encoder_layer_routes, tower_
 from dew.registry import Record
 
 from .common import (
+    TRUNK_FIELDS,
     ProjectorBase,
     ProjectorLayout,
     TowerBase,
     TowerGeometry,
     TowerLayout,
-    _side,
     _vision_section,
-    activation_name,
+    activation_field,
     head_width,
+    integer_field,
+    number_field,
+    side_field,
     tensor_routes,
-    trunk_geometry,
     unplaced,
 )
 from .vit import LearnedPositions, VisionTransformer, ViTLayout
@@ -174,17 +176,15 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:
     (`TOWER_ACTIVATIONS`) refuses with its name. Dropout, which the eval trunk
     never applies, is left unread.
     """
-    vision = _vision_section(hf_config)
-    return {
-        "class": "siglip", "fields": {
-        **trunk_geometry(vision),
-        "image_size": _side(vision.get("image_size", 224), "image_size"),
-        "patch_size": _side(vision.get("patch_size", 16), "patch_size"),
-        "num_channels": _records.integer(vision.get("num_channels", 3), "num_channels"),
-        "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu_pytorch_tanh",
-                                      ("hidden_act", "hidden_activation")),
-        "layer_norm_eps": _records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
-    }}
+    return {"class": "siglip", "fields": _SIGLIP_CONFIG.read(_vision_section(hf_config), set(), {})}
+
+
+_SIGLIP_CONFIG = ConfigLayout(
+    *TRUNK_FIELDS, side_field("image_size", 224), side_field("patch_size", 16),
+    integer_field("num_channels", default=3),
+    activation_field(TOWER_ACTIVATIONS, "gelu_pytorch_tanh", "hidden_act", "hidden_activation"),
+    number_field("layer_norm_eps", default=1e-6))
+"""A SiglipVisionConfig's fields, both ways."""
 
 
 def translate_gemma_projector_config(vision: Mapping[str, object], text_width: int,
@@ -214,7 +214,8 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
     }}
 
 
-SiglipVision.checkpoint = TowerLayout("vision_tower.", _SIGLIP_ROUTES)
+SiglipVision.checkpoint = TowerLayout("vision_tower.", _SIGLIP_ROUTES, config=_SIGLIP_CONFIG,
+                                      model_type="siglip_vision_model")
 GemmaProjector.checkpoint = ProjectorLayout("multi_modal_projector.", GEMMA_PROJECTOR_TENSORS,
                                             kept=frozenset({"mm_input_projection_weight"}),
                                             read=translate_gemma_projector_weights)

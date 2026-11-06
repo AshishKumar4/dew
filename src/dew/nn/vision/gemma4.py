@@ -18,7 +18,7 @@ from flax.typing import Dtype, Initializer, PrecisionLike
 from dew import _records
 from dew._model_types import SANDWICH_NORMS
 from dew.batch import Variables, coordinates
-from dew.interop.layouts import Route, Table, mapped, one_of
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Table, mapped, one_of
 from dew.interop.unread import Stored
 from dew.interop.weights import placed
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
@@ -34,16 +34,18 @@ from dew.nn.scan_orders import patchify
 from dew.registry import Record
 
 from .common import (
+    TRUNK_FIELDS,
     ProjectorBase,
     ProjectorLayout,
     TowerBase,
     TowerGeometry,
     TowerLayout,
     _vision_section,
-    activation_name,
+    activation_field,
     head_width,
-    rope_base,
-    trunk_geometry,
+    integer_field,
+    number_field,
+    rope_part,
     written,
 )
 
@@ -376,56 +378,48 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
     their reference buffers outside the trainable parameter collection.
     """
     vision = _vision_section(hf_config)
-    geometry = trunk_geometry(vision)
     if vision.get("attention_bias", False):
         raise ValueError("attention_bias=True needs biased maps this trunk lacks")
     if "output_proj_dims" in vision:
         raise ValueError(
             f"output_proj_dims ({vision['output_proj_dims']!r}) changes the "
             "projector width this record leaves to the text width")
-    heads = geometry["num_heads"]
-    return {
-        "class": "gemma4", "fields": {
-        **geometry,
-        "num_key_value_heads": _records.integer(
-            vision.get("num_key_value_heads", heads), "num_key_value_heads"
-        ),
-        "head_dim": _records.integer(vision.get("head_dim", geometry["hidden_size"] // heads), "head_dim"),
-        "patch_size": _records.integer(vision.get("patch_size", 16), "patch_size"),
-        "pooling_kernel_size": _records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
-        "position_embedding_size": _records.integer(
-            vision.get("position_embedding_size", 10240), "position_embedding_size"
-        ),
-        "hidden_act": activation_name(vision, ("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh",
-                                      ("hidden_activation", "hidden_act")),
-        "rms_norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "rope_theta": rope_base(vision, 100.0, axial=True),
-        "standardize": bool(vision.get("standardize", False)),
-        "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
-    }}
+    return {"class": "gemma4", "fields": _GEMMA4_CONFIG.read(vision, set(), {})}
 
 
-def export_gemma4_vision_config(tower: Gemma4Vision) -> Mapping[str, object]:
-    """A Gemma4Vision value as the Gemma4VisionConfig that
-    `translate_gemma4_vision_config` reads back to it. An unset head_dim is
-    written as the width it stands for."""
-    return {
-        "model_type": "gemma4_vision",
-        "hidden_size": tower.hidden_size,
-        "intermediate_size": tower.intermediate_size,
-        "num_hidden_layers": tower.num_layers,
-        "num_attention_heads": tower.num_heads,
-        "num_key_value_heads": tower.num_key_value_heads,
-        "head_dim": tower.hidden_size // tower.num_heads if tower.head_dim is None else tower.head_dim,
-        "patch_size": tower.patch_size,
-        "pooling_kernel_size": tower.pooling_kernel_size,
-        "position_embedding_size": tower.position_embedding_size,
-        "hidden_activation": tower.hidden_act,
-        "rms_norm_eps": tower.rms_norm_eps,
-        "rope_parameters": {"rope_type": "default", "rope_theta": tower.rope_theta},
-        "standardize": tower.standardize,
-        "use_clipped_linears": tower.use_clipped_linears,
-    }
+def _read_heads(vision: Mapping[str, object], used: set[str],
+                record: dict[str, object]) -> dict[str, object]:
+    """The key/value heads, the query heads' count where unstated, and each head's width, the trunk's
+    over its heads where unstated."""
+    used.update(("num_key_value_heads", "head_dim"))
+    heads = int(record["num_heads"])
+    record["num_key_value_heads"] = _records.integer(vision.get("num_key_value_heads", heads),
+                                                     "num_key_value_heads")
+    record["head_dim"] = _records.integer(vision.get("head_dim", int(record["hidden_size"]) // heads),
+                                          "head_dim")
+    return record
+
+
+def _write_heads(tower: Gemma4Vision) -> Mapping[str, object]:
+    """The heads `_read_heads` reads back: an unset head width as the width it stands for."""
+    return {"num_key_value_heads": tower.num_key_value_heads,
+            "head_dim": tower.hidden_size // tower.num_heads if tower.head_dim is None else tower.head_dim}
+
+
+def _flag(key: str) -> ConfigField:
+    """A switch the config states as a boolean, false where omitted."""
+    return ConfigField(key, key, default=False, parse=lambda value, key: bool(value))
+
+
+_GEMMA4_CONFIG = ConfigLayout(
+    *TRUNK_FIELDS, ConfigPart(_read_heads, _write_heads),
+    integer_field("patch_size", default=16), integer_field("pooling_kernel_size", default=3),
+    integer_field("position_embedding_size", default=10240),
+    activation_field(("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh", "hidden_activation",
+                     "hidden_act"),
+    number_field("rms_norm_eps", default=1e-6), rope_part(100.0, axial=True),
+    _flag("standardize"), _flag("use_clipped_linears"))
+"""A Gemma4VisionConfig's fields, both ways."""
 
 
 def translate_gemma4_projector_config(vision: Mapping[str, object], text_width: int,
@@ -440,6 +434,7 @@ def translate_gemma4_projector_config(vision: Mapping[str, object], text_width: 
     return {"class": "gemma4", "fields": fields}
 
 
-Gemma4Vision.checkpoint = TowerLayout("vision_tower.", _GEMMA4_ROUTES)
+Gemma4Vision.checkpoint = TowerLayout("vision_tower.", _GEMMA4_ROUTES, config=_GEMMA4_CONFIG,
+                                      model_type="gemma4_vision")
 Gemma4Projector.checkpoint = ProjectorLayout("embed_vision.", GEMMA4_PROJECTOR_TENSORS,
                                              read=translate_gemma4_projector_weights)

@@ -9,7 +9,7 @@ from flax import linen as nn
 
 from dew import _records
 from dew._model_types import _QWEN35_VISION_TYPES
-from dew.interop.layouts import Table
+from dew.interop.layouts import ConfigLayout, Table
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 
@@ -20,9 +20,10 @@ from .common import (
     TowerGeometry,
     TowerLayout,
     _vision_section,
-    activation_name,
+    activation_field,
     block_routes,
     head_width,
+    integer_field,
     merger_projector,
     tensor_routes,
     unplaced,
@@ -127,19 +128,17 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:
         raise ValueError(
             f"num_position_embeddings ({table}) is not a square, this trunk "
             "resamples a square table")
-    return {
-        "class": "qwen3_5", "fields": {
-        "depth": _records.integer(vision["depth"], "depth"),
-        "hidden_size": _records.integer(vision["hidden_size"], "hidden_size"),
-        "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu_pytorch_tanh"),
-        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_heads": _records.integer(vision["num_heads"], "num_heads"),
-        "in_channels": _records.integer(vision.get("in_channels", 3), "in_channels"),
-        "patch_size": _records.integer(vision["patch_size"], "patch_size"),
-        "spatial_merge_size": _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "temporal_patch_size": _records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
-        "num_position_embeddings": table,
-    }}
+    return {"class": "qwen3_5", "fields": _QWEN35_CONFIG.read(vision, set(), {})}
+
+
+_QWEN35_CONFIG = ConfigLayout(
+    integer_field("depth", required=True), integer_field("hidden_size", required=True),
+    activation_field(TOWER_ACTIVATIONS, "gelu_pytorch_tanh", "hidden_act"),
+    integer_field("intermediate_size", required=True), integer_field("num_heads", required=True),
+    integer_field("in_channels", default=3), integer_field("patch_size", required=True),
+    integer_field("spatial_merge_size", default=2), integer_field("temporal_patch_size", required=True),
+    integer_field("num_position_embeddings", required=True))
+"""A Qwen3_5VisionConfig's fields, both ways: the trunk's geometry under the reference's names."""
 
 
 def translate_qwen35_projector_config(hf_config: Mapping[str, object],
@@ -149,7 +148,8 @@ def translate_qwen35_projector_config(hf_config: Mapping[str, object],
 
 
 Qwen35Vision.checkpoint = TowerLayout("visual.", _QWEN35_ROUTES, read=translate_vit_weights,
-                                      shapes=_patch_convolution)
+                                      shapes=_patch_convolution, config=_QWEN35_CONFIG,
+                                      model_type="qwen3_5_vision")
 Qwen35Projector.checkpoint = ProjectorLayout("visual.merger.", {
     "norm.weight": ("norm", "scale"), "norm.bias": ("norm", "bias"),
     "linear_fc1.weight": ("fc1", "kernel"), "linear_fc1.bias": ("fc1", "bias"),
