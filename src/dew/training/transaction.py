@@ -44,6 +44,7 @@ from dew.nn.inspection import (
     unscaled,
 )
 from dew.nn.kernels.options import owned_program
+from dew.nn.moe import fixed_routers
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import auto_part, rows_spec
 from dew.objectives.base import (
@@ -57,6 +58,7 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
+from dew.objectives.routing import Balanced, refuse_fixed_routers
 from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
 from dew.training.compiled_program import gradients_read
@@ -1014,8 +1016,12 @@ class Transaction:
             step_info = self.attempt(state, state.variables, batch, attempt, part, slot)
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             # A watched cotangent is read unscaled by the factor its backward is seeded with.
-            with unscaled(factor):
-                realized = realize(self.read(state.variables, state.compute), batch, step_info)
+            read = self.read(state.variables, state.compute)
+            # Every router the loss weighs by a fixed weight, which no term of it trains.
+            with unscaled(factor), fixed_routers() as fixed:
+                realized = realize(read, batch, step_info)
+            refuse_fixed_routers(fixed, read["params"],
+                                 self.objective.balance if isinstance(self.objective, Balanced) else None)
             loss, cotangent = reduce(realized.stats, factor)
             # A step that summarizes its cotangents takes its probes' gradient from the same backward where
             # the microbatch is its update's whole window; otherwise from the pooled loss's, below.

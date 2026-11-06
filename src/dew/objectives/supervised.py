@@ -33,7 +33,6 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.progress import progressed
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Aux, Objective, Ratio, Source, Step, model_rngs
-from dew.objectives.routing import refuse_fixed_router
 
 type Outputs = jax.Array | tuple[Outputs, ...] | list[Outputs] | Mapping[str, Outputs]
 """What a model returns: an array, or a tree of them."""
@@ -83,7 +82,6 @@ class Supervised(Objective[Ratio]):
             raise ValueError(f"the metrics' names {sorted(named)} repeat or include loss; each reports under "
                              "its own name")
         self.model = self.bind_model(model)
-        refuse_fixed_router(self.model, None, self.variables)
         self.criterion = loss
         self.metrics: Mapping[str, Criterion] = named
         self.field = inputs if isinstance(inputs, str) else inputs.sample.key
