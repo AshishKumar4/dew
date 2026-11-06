@@ -35,6 +35,7 @@ from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
 from compressed_tensors.quantization.lifecycle.forward import dequantize, set_forward_quantized
 from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
+from recorded_references import token_ids
 from safetensors.torch import save_file
 from torch_precision import float64, float64_twin
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
@@ -66,6 +67,9 @@ def compress(weight: torch.Tensor, scheme: QuantizationScheme, kind: str) -> dic
         state["weight_global_scale"] = overall
     return COMPRESSORS[kind].compress(state, scheme)
 
+
+draw = token_ids(2037, 48, (2, 6))
+"""A seed's two rows of six token ids below the tiny model's 48 (the test draws them again)."""
 
 def checkpoint(kind: str) -> None:
     """Read the same files through transformers before recording logits or decoded weights."""
@@ -108,10 +112,9 @@ def checkpoint(kind: str) -> None:
         np.testing.assert_array_equal(after, published)
     for module in loaded.modules():
         module.quantization_enabled = False
-    with torch.no_grad():
-        # PreTrainedModel.float refuses quantized models even after their
-        # weights are decoded. Module.float promotes that decoded tree.
-        reference = torch.nn.Module.float(loaded)(ids, use_cache=False).logits.numpy()
+    # PreTrainedModel.float refuses quantized models even after their weights are decoded. Module.float
+    # promotes that decoded tree.
+    float32_read = torch.nn.Module.float(loaded)
     if kind == "nvfp4":
         for name in tuple(decoded):
             stem = name.removesuffix(".weight")
@@ -129,11 +132,19 @@ def checkpoint(kind: str) -> None:
         directory, dtype=torch.float64, attn_implementation="eager"))
     for module in exact.modules():
         module.quantization_enabled = False
-    with float64(), torch.no_grad():
-        truth = exact(ids, use_cache=False).logits.numpy()
-    np.savez(directory / "reference.npz", ids=ids.numpy(), logits=reference, logits_f64=truth,
-             published_logits=published, **decoded)
-    print(kind, "reference RMS from float64", float(np.sqrt(np.mean((reference - truth) ** 2))))
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs["ids"]).long()
+        with torch.no_grad():
+            narrow = float32_read(ids, use_cache=False).logits.numpy()
+        with float64(), torch.no_grad():
+            return {"logits": narrow}, {"logits": exact(ids, use_cache=False).logits.numpy()}
+
+    from recorded_references import record_case
+
+    recorded = record_case("logits", draw, evaluate, store_inputs=False)
+    np.savez(directory / "reference.npz", published_ids=ids.numpy(), published_logits=published, **decoded,
+             **recorded)
+    print(kind, "recorded the reference's logits over", int(recorded["logits.seeds"]), "seeds")
 
 
 def activation_forwards() -> None:

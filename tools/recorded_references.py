@@ -88,6 +88,14 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
     return written
 
 
+def token_ids(salt: int, vocab: int, shape: tuple[int, ...]):
+    """A recording's `draw(seed)` of token ids below `vocab` in `shape` (`{"ids": ...}`), its stream `salt`'s,
+    which the test draws again (`indexed_recording`'s `inputs_of`)."""
+    def draw(seed: int) -> dict[str, np.ndarray]:
+        return {"ids": np.random.default_rng([salt, seed]).integers(0, vocab, shape).astype(np.int32)}
+    return draw
+
+
 def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
                 summary: bool = False, dew=None, start: int = FEWEST_SEEDS) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the

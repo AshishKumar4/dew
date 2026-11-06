@@ -40,6 +40,7 @@ from unittest.mock import patch
 import numpy as np
 import requests
 import torch
+from recorded_references import token_ids
 
 # CUDA torch must load before the pinned transformers environment's CPU
 # torch can appear on sys.path. The same kernel then serves both references.
@@ -135,8 +136,27 @@ def author_weight(stored: dict[str, torch.Tensor], stem: str) -> torch.Tensor:
                                double_scale=stored[stem + ".weight_scale_2"], block_sizes={-1: 16})
 
 
+draw = token_ids(2049, 96, (2, 8))
+"""A seed's two rows of eight token ids below the tiny model's 96 (the test draws them again)."""
+
+def recorded_logits(reference, wide) -> dict[str, np.ndarray]:
+    """The reference's logits and its float64 twin's (`wide`) over check 1's seeds of `draw`
+    (`recorded_references.record_case`), each input quantizer hooked on both."""
+    from recorded_references import record_case
+    from torch_precision import float64
+
+    def evaluate(inputs):
+        drawn = torch.from_numpy(inputs["ids"]).long().to("cuda")
+        with torch.no_grad():
+            narrow = reference(drawn, use_cache=False).logits.cpu().numpy()
+        with float64(), torch.no_grad():
+            return {"logits": narrow}, {"logits": wide(drawn, use_cache=False).logits.cpu().numpy()}
+
+    return record_case("logits", draw, evaluate, store_inputs=False)
+
+
 def tiny(*, mixed: bool = False) -> None:
-    from torch_precision import float64, float64_twin
+    from torch_precision import float64_twin
 
     torch.manual_seed(2049)
     config = Qwen3Config(vocab_size=96, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
@@ -168,7 +188,8 @@ def tiny(*, mixed: bool = False) -> None:
     suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
     parts = {stem + suffix for stem in quantized for suffix in suffixes}
     state = {name: value.float() for name, value in stored.items() if name not in parts}
-    arrays = {"ids": ids.cpu().numpy()}
+    # The calibration ids' forward records each quantizer's inputs and outputs; the draws record nothing.
+    arrays, capturing = {"calibration_ids": ids.cpu().numpy()}, [True]
     for stem in quantized:
         state[stem + ".weight"] = author_weight(stored, stem).float()
         arrays[stem + "/weight"] = state[stem + ".weight"].cpu().numpy()
@@ -198,18 +219,20 @@ def tiny(*, mixed: bool = False) -> None:
             if value.dtype == torch.float64:
                 return (quantize(direct_float(value)).double(),)
             output = quantize(value)
-            arrays[stem + "/forward_inputs"] = value.detach().cpu().numpy()
-            arrays[stem + "/forward_qdq"] = output.detach().cpu().numpy()
-            if not is_fp8:
-                arrays[stem + "/forward_sm89_qdq"] = author_qdq(value, overall, corrected=False).cpu().numpy()
+            if capturing[0]:
+                arrays[stem + "/forward_inputs"] = value.detach().cpu().numpy()
+                arrays[stem + "/forward_qdq"] = output.detach().cpu().numpy()
+                if not is_fp8:
+                    arrays[stem + "/forward_sm89_qdq"] = author_qdq(value, overall,
+                                                                    corrected=False).cpu().numpy()
             return (output,)
 
         hooks += [model.get_submodule(stem).register_forward_pre_hook(input_hook)
                   for model in (reference, wide)]
     with torch.no_grad():
-        arrays["logits"] = reference(ids, use_cache=False).logits.cpu().numpy()
-    with float64(), torch.no_grad():
-        arrays["logits_f64"] = wide(ids, use_cache=False).logits.cpu().numpy()
+        reference(ids, use_cache=False)
+        capturing[0] = False
+    arrays.update(recorded_logits(reference, wide))
     for hook in hooks:
         hook.remove()
     generator = torch.Generator(device="cuda").manual_seed(2050)
@@ -231,8 +254,7 @@ def tiny(*, mixed: bool = False) -> None:
             arrays[stem + "/sm89_qdq"] = author_qdq(probe, overall, corrected=False).cpu().numpy()
     np.savez(directory / "reference.npz", **arrays)
     assert torch.Tensor.to is original_to
-    print("tiny", directory, "reference RMS", float(np.sqrt(np.mean(
-        (arrays["logits"] - arrays["logits_f64"]) ** 2))))
+    print("tiny", directory, "recorded the reference's logits over", int(arrays["logits.seeds"]), "seeds")
     differences = {stem: int(np.count_nonzero(
         arrays[stem + "/forward_qdq"].view(np.uint32)
         != arrays[stem + "/forward_sm89_qdq"].view(np.uint32))) for stem in quantized

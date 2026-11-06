@@ -30,11 +30,54 @@ from compressed_tensors.quantization.lifecycle.forward import forward_quantize
 from compressed_tensors.quantization.utils.helpers import generate_gparam
 from compressed_tensors_mxfp4_reference import TIES
 from nvfp4_storage_reference import ARGS, compress
+from recorded_references import token_ids
 from safetensors.torch import save_file
 from torch_precision import float64, float64_twin
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "nvfp4_qdq"
+
+
+draw = token_ids(2038, 96, (1, 8))
+"""A seed's row of eight token ids below the tiny model's 96 (the test draws them again): a recording small
+enough to keep in git."""
+
+def recorded_logits(model, exact, directory: Path) -> dict[str, np.ndarray]:
+    """The float32 read's logits (`model`) and its float64 twin's (`exact`) over check 1's seeds of `draw`
+    (`recorded_references.record_case`), the twin's quantizer defining its discrete function in fp32. The
+    count confirmed paired with Dew's own read of `directory` (`dew`): the activations' QDQ makes both
+    arms' errors heavy-tailed across draws alike, where the reference compared with itself never
+    resolves."""
+    import jax
+    from recorded_references import record_case
+
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    forward = jax.jit(loaded.model.apply)
+
+    direct_float = torch.Tensor.float
+
+    def quantize_wide(module, value, base_name, args):
+        # The quantizer defines the discrete function in fp32. Its stored
+        # globals must stay fp32 even though the surrounding model widens.
+        overall = module.input_global_scale
+        module.input_global_scale = torch.nn.Parameter(direct_float(overall), requires_grad=False)
+        try:
+            return forward_quantize(module, direct_float(value), base_name, args).double()
+        finally:
+            module.input_global_scale = overall
+
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs["ids"]).long()
+        with torch.no_grad():
+            narrow = model(ids, use_cache=False).logits.numpy()
+        with float64(), torch.no_grad(), patch(
+                "compressed_tensors.quantization.lifecycle.forward.forward_quantize", quantize_wide):
+            return {"logits": narrow}, {"logits": exact(ids, use_cache=False).logits.numpy()}
+
+    return record_case("logits", draw, evaluate, store_inputs=False,
+                       dew=lambda inputs: {"logits": np.asarray(forward(loaded.variables, inputs["ids"]))})
 
 
 def checkpoint(e4m3: bool) -> None:
@@ -86,7 +129,7 @@ def checkpoint(e4m3: bool) -> None:
             module.quantization_status = QuantizationStatus.COMPRESSED
     with torch.no_grad():
         np.testing.assert_array_equal(model(ids, use_cache=False).logits.numpy(), reference)
-    arrays = {"ids": ids.numpy(), "logits": reference}
+    arrays = {"ids": ids.numpy()}
     for name, module in model.named_modules():
         if name not in calibration:
             continue
@@ -118,29 +161,14 @@ def checkpoint(e4m3: bool) -> None:
     for module in exact.modules():
         if hasattr(module, "quantization_status"):
             module.quantization_status = QuantizationStatus.COMPRESSED
-    direct_float = torch.Tensor.float
-
-    def quantize_wide(module, value, base_name, args):
-        # The quantizer defines the discrete function in fp32. Its stored
-        # globals must stay fp32 even though the surrounding model widens.
-        overall = module.input_global_scale
-        module.input_global_scale = torch.nn.Parameter(direct_float(overall), requires_grad=False)
-        try:
-            return forward_quantize(module, direct_float(value), base_name, args).double()
-        finally:
-            module.input_global_scale = overall
-
-    with float64(), torch.no_grad(), patch(
-            "compressed_tensors.quantization.lifecycle.forward.forward_quantize", quantize_wide):
-        arrays["logits_f64"] = exact(ids, use_cache=False).logits.numpy()
+    arrays.update(recorded_logits(model, exact, directory))
     for module in model.modules():
         module.quantization_enabled = False
     with torch.no_grad():
         arrays["weight_only_logits"] = model(ids, use_cache=False).logits.numpy()
     np.savez(directory / "reference.npz", **arrays)
-    rms = float(np.sqrt(np.mean((reference - arrays["logits_f64"]) ** 2)))
     apart = float(np.sqrt(np.mean((reference - arrays["weight_only_logits"]) ** 2)))
-    print(directory.name, "reference RMS from float64", rms,
+    print(directory.name, "recorded the reference's logits over", int(arrays["logits.seeds"]), "seeds;",
           "QDQ RMS from weight-only", apart)
 
 
