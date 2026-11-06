@@ -489,7 +489,8 @@ def gradients(run, laid_do, dht, tiles) -> tuple:
     gated = held.split(algebra.key_gated(query, (run.hi, run.lo), run.scale))
     d_scores, local = _key_scores_back(run.scores, laid_do, run.corrected, run.taken, call)
     dh, dv2, dh0, decayed = _reverse(gated, run.keys, run.w, laid_do, local, run.hi, run.lo, dht,
-                                     run.sequences, None, None, call, tiles, scale=run.scale, memory=run.h)
+                                     run.sequences, None, None, call, tiles, scale=run.scale, memory=run.h,
+                                     every=run.every)
     dq_m, dk_m, dg_m, d_weights, dbeta_m = _key_memory_back(
         run.q, run.k, run.hi, run.lo, laid_do, run.corrected, dv2, run.h, dh, run.a, run.beta, run.taken,
         call, scale=run.scale)

@@ -162,7 +162,7 @@ def ranged(dtype, delta: bool, bound: float | None) -> bool:
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
                 wide: bool = False, family=None, floor: float | None = None, bound: float | None = None,
-                firsts=None, rounded: bool = False, skip=None, recomputed: bool = False):
+                firsts=None, rounded: bool = False, skip=None, recomputed: bool = False, every: bool = False):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop (`mainloop.forward`): the
     port's operands and results (`recurrence_chunk.fla_rule`'s), the operands in their common dtype and beta
@@ -180,7 +180,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     (`ranged`); a `rounded` call takes the run's fast forms' numbers (`recurrence_chunk.fast_rounding`,
     `mainloop.forward`). Where `recomputed`, its fast backward forms the forward's memories again rather than
     keeping them (a remat rung recomputing 'delta_memory', `recurrence_chunk.RECOMPUTED`, resolved at its
-    route)."""
+    route). Where `every` packed document (`starts`) enters the row's `state`, not its first alone
+    (`recurrence_chunk.Chunk.entered`), the state's gradient sums every document's."""
 
     dtype = jnp.result_type(query, key, value)
     device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
@@ -215,7 +216,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         alone = {**run, "tiles": tiles.forward or tiles}
         return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
                                 max_segments=max_segments, scale=scale, delta=delta, wide=wide,
-                                rounded=rounded, skip=skip, **alone)
+                                rounded=rounded, skip=skip, every=every, **alone)
 
     def forward(*operands):
         if not fast:
@@ -227,7 +228,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         out, final, (inverse, kept) = mainloop.kept_forward(*operands[:6], starts=operands[6],
                                                             firsts=operands[7], max_segments=max_segments,
                                                             scale=scale, delta=delta, wide=wide,
-                                                            rounded=rounded, skip=operands[8], **run)
+                                                            rounded=rounded, skip=operands[8], every=every,
+                                                            **run)
         kept = None if recomputed else checkpoint_name(kept, 'delta_memory')
         return (out, final), (operands, (checkpoint_name(inverse, 'delta_inverse'), kept))
 
@@ -246,7 +248,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
             *grads, dh0, dskip = mainloop_backward.gradients(
                 query, key, value, g, beta, state, out_grad, final_grad, starts=starts, firsts=firsts,
                 max_segments=max_segments, scale=scale, inverse=inverse, kept=kept, delta=delta,
-                rounded=rounded, skip=skip, **run)
+                rounded=rounded, skip=skip, every=every, **run)
         return (*grads, None if state is None else dh0, None, None,
                 None if dskip is None else dskip.astype(skip.dtype))
 

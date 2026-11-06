@@ -76,7 +76,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
               max_segments: int | None = None, scale: float | None = None,
               family: mosaic.Family | None = None, interpret: bool = False,
               inverse=None, kept=None, delta: bool = True, floor: float | None = None, rounded: bool = False,
-              ranged: bool = False, skip=None):
+              ranged: bool = False, skip=None, every: bool = False):
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
     call, or of a `rounded` call without it (the SSD's under the run's fast forms, `fast_backward_form`):
     `(dq, dk, dv, dg, dbeta, dh0, dskip)` for the output's and final memory's gradients `do`, `dfinal`, fla's
@@ -95,7 +95,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
                                   "under the run's fast forms, an fp32 call's under them alone")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                   firsts=firsts, floor=floor, rounded=rounded, ranged=ranged)
+                   firsts=firsts, floor=floor, rounded=rounded, ranged=ranged, every=every)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
@@ -112,7 +112,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     gates = not delta and run.value_width == columns
     dh, dv2, dh0, *gated = _reverse(run.q, run.k, run.w, laid_do, local, run.hi, run.lo, dht, run.sequences,
                                     run.v if gates else None, run.beta if gates else None, call, tiles,
-                                    scale=run.scale, skip=skip if gates else None)
+                                    scale=run.scale, skip=skip if gates else None, every=run.every)
     ds, decay_pairs = _scores_back(run.q, run.k, run.corrected, laid_do, run.hi, run.lo, run.taken, run.beta,
                                    call,
                                    scale=run.scale)
@@ -164,7 +164,8 @@ def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_d
     """The backward's gradients laid back as the call's operands (`operands`, `(q, k, v, g, beta)`) and in
     their dtypes: the queries' and keys' `[R, H * Dk]` a key head's, `extra_dk` `[B, T, H, Dk]` added to the
     keys', the values' `[R, HV * Dv]`, the log decay's and write gates' as the call's (laid back already), and
-    the initial memory's `[B * HV * Dk, Dv]`, zero for a row a document starts."""
+    the initial memory's `[B * HV * Dk, Dv]`, zero for a row a document starts (but where every document
+    enters its row's, whose sequences' gradients it sums, `entered_gradient`)."""
     call = run.call
     q, k, v, g, beta = operands
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
@@ -175,8 +176,10 @@ def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_d
         return laid[..., :run.key_width]
 
     dv = run.unlaid(dv.reshape(rows, heads, columns))[..., :run.value_width]
+    if run.every:
+        dh0 = entered_gradient(dh0, run.sequences, run.batch)
     dh0 = dh0.reshape(run.batch, heads, width, columns)[:, :, :run.key_width, :run.value_width]
-    if starts is not None:
+    if starts is not None and not run.every:
         dh0 = jnp.where(jnp.asarray(starts, bool)[:, 0, None, None, None], 0.0, dh0)
     return (key_headed(dq).astype(q.dtype), (key_headed(dk) + extra_dk).astype(k.dtype), dv.astype(v.dtype),
             dg.astype(g.dtype), dbeta.astype(beta.dtype), dh0)
@@ -344,6 +347,15 @@ def _reverse_keyed(call: Call, h) -> tuple[Operand, object]:
     return call.given, h // call.group * call.width
 
 
+def entered_gradient(dh0, sequences, batch: int) -> jax.Array:
+    """Each sequence's initial memory's gradient `dh0` `[N * HV * Dk, Dv]` summed to its row's `[B * HV * Dk,
+    Dv]` (`sequences`' third column), as every packed document entering its row's memory reads it; a sequence
+    of no chunks (a row's unused slot, which no program walks) adds none."""
+    per = dh0.reshape(sequences.shape[0], -1, dh0.shape[-1])
+    per = jnp.where((sequences[:, 1] > 0)[:, None, None], per, 0.0)
+    return jax.ops.segment_sum(per, sequences[:, 2], num_segments=batch).reshape(-1, dh0.shape[-1])
+
+
 def _reverse_launched(call: Call, batch: int, bv: int, walked_width: int, *, gates: bool,
                       skips: bool = False) -> tuple:
     """`_reverse`'s outputs' types, its walked streams and its final memories' streams, a program walking
@@ -372,7 +384,7 @@ def _reverse_launched(call: Call, batch: int, bv: int, walked_width: int, *, gat
 
 @lowered_once
 def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, tiles: Tiles, *, scale: float,
-             skip=None, memory=None):
+             skip=None, memory=None, every: bool = False):
     """`(dh [chunks * HV * Dk, Dv], dv [R, HV * Dv], dh0 [B * HV * Dk, Dv])`: the gradient of the memory each
     chunk leaves as `call.memories`, the corrected values' gradient in `_reverse_values`' form (their own
     output's, `local`, `_local_back`'s, and the memory's, `algebra.reverse_carried`) and each row's initial
@@ -389,14 +401,17 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     `dD`. Under a decay a key dimension `memory` is the memories each chunk enters (`call.memories`), and a
     fourth output `[Dv / BV, chunks * HV * Dk]` fp32 each value block's part of the memory decay's gradient
     `sum(h dh)` (`algebra.key_memory_decay`) from the memory's gradient the walk holds, its key rows a
-    tile's (kda-lower5-sm90 at 6e03eb57e: where the keys' columns met them, no layout held)."""
+    tile's (kda-lower5-sm90 at 6e03eb57e: where the keys' columns met them, no layout held). Where `every`
+    packed document enters its row's memory (`mainloop._layout`), `dh0` is each sequence's, `[N * HV * Dk,
+    Dv]`, which `entered_gradient` sums to its row's."""
     gates, skips = v is not None, skip is not None
     width, value_width, family = call.width, call.value_width, call.family
     grads = _reverse_values(call, gates=gates)
     bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
     walked_width = bv * walkers
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
-    batch = dht.shape[0] // (call.heads * width)
+    # The initial memories' gradients a row's, or a sequence's where every document enters its row's.
+    batch = sequences.shape[0] if every else dht.shape[0] // (call.heads * width)
     final = Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
     chunks = call.chunks
     assert gates or not skips, "the walk adds a skip where it gates the values"
@@ -462,7 +477,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
 
         sequence_walk(call, final, "final", (leaving, final_views), (walked_streams, views), step,
                       chunks - first - count, count, ends, begins,
-                      lambda role, i: dh0_ref.at[pl.ds(memory(row, i), call.block),
+                      lambda role, i: dh0_ref.at[pl.ds(memory(s if every else row, i), call.block),
                                                  pl.ds(walked + role * bv, bv)], bv,
                       landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 

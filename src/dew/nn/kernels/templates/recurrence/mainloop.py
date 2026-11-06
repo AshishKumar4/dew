@@ -2162,11 +2162,12 @@ def zero_padded(x, axis: int, size: int):
     return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
 
 
-def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None):
+def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, every: bool = False):
     """A call's tokens a chunk at a time: `(chunks, taken [chunks], sequences [N, 5], laid, unlaid)`, each
-    chunk's tokens, each sequence's first chunk, chunks, row and whether it begins and ends its row
-    (`_states`), and the maps from `[B, T, ...]` to the chunks' rows `[chunks * C, ...]` (a chunk's rows past
-    its tokens zero) and back. An aligned call's chunks are its rows' own, unmoved."""
+    chunk's tokens, each sequence's first chunk, chunks, row and whether it enters its row's initial memory
+    (it begins its row, or `every` packed document does) and ends its row (`_states`), and the maps from
+    `[B, T, ...]` to the chunks' rows `[chunks * C, ...]` (a chunk's rows past its tokens zero) and back. An
+    aligned call's chunks are its rows' own, unmoved."""
     tokens = batch * length
     if starts is None and length % CHUNK == 0:
         chunks = tokens // CHUNK
@@ -2186,7 +2187,8 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
     first, count = seqs[:, 0], seqs[:, 1]
     sizes = -(-count // CHUNK)
     live = count > 0
-    sequences = jnp.stack([jnp.cumsum(sizes) - sizes, sizes, first // length, live & (first % length == 0),
+    enters = live if every else live & (first % length == 0)
+    sequences = jnp.stack([jnp.cumsum(sizes) - sizes, sizes, first // length, enters,
                            live & ((first + count) % length == 0)], 1).astype(jnp.int32)
     place = jnp.arange(CHUNK)
     real = (place[None, :] < taken[:, None]).reshape(-1)
@@ -2209,7 +2211,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False, floor: float | None = None,
-            rounded: bool = False, ranged: bool = False, skip=None):
+            rounded: bool = False, ranged: bool = False, skip=None, every: bool = False):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
     rule) or a key dimension's `[B, T, HV, Dk]` (Kimi delta attention), the write gate `beta` `[B, T, HV]` and
@@ -2235,7 +2237,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, floor=floor, keeps=False,
-                                 rounded=rounded, ranged=ranged, skip=skip)
+                                 rounded=rounded, ranged=ranged, skip=skip, every=every)
     return out, final
 
 
@@ -2245,7 +2247,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  family: mosaic.Family | None = None, interpret: bool = False,
                  floor: float | None = None, keeps: bool = True,
                  rounded: bool = False, ranged: bool = False,
-                 skip=None) -> tuple[jax.Array, jax.Array, tuple]:
+                 skip=None, every: bool = False) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
@@ -2264,7 +2266,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
              and not reads.operands_in_registers)
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps, firsts=firsts,
-                   rounded=rounded, ranged=ranged, states=not scans)
+                   rounded=rounded, ranged=ranged, states=not scans, every=every)
     call, tiles = run.call, run.tiles
     out_dtype = jnp.float32 if wide else run.dtype
     if scans:
@@ -2315,6 +2317,8 @@ class _Run:
     """The states launch's values: the weighted values under the delta rule, else the values laid."""
     h0: jax.Array | None = None
     """Each row's initial memory `[B * HV * Dk, Dv]` fp32, as the states launch takes it."""
+    every: bool = False
+    """Whether every packed document enters its row's initial memory (`_layout`), not its first alone."""
 
     def final_of(self, final: jax.Array) -> jax.Array:
         """A states walk's final memories `[B * HV * Dk, Dv]` as the call's `[B, HV, Dk, Dv]`."""
@@ -2326,7 +2330,7 @@ class _Run:
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None,
              inverse=None, kept=None, floor: float | None = None, keeps: bool = True,
-             rounded: bool = False, ranged: bool = False, states: bool = True) -> _Run:
+             rounded: bool = False, ranged: bool = False, states: bool = True, every: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None), or but the
@@ -2363,8 +2367,10 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
           else zero_padded(zero_padded(h0.astype(jnp.float32), 2, width), 3, columns))
     if starts is not None:
         starts = jnp.asarray(starts, bool)
-        h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
-    chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
+        # A row's first document entering zero where it begins at the row's start, but where `every`
+        # document enters the row's memory.
+        h0 = h0 if every else jnp.where(starts[:, 0, None, None, None], 0.0, h0)
+    chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts, every)
     rows = chunks * CHUNK
     given = Operand(rows, _parts(dtype, family, rounded), dtype)
     # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
@@ -2424,7 +2430,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
             w, u = _weighted(k, v, a, hi, lo, beta, taken, call)
     h0 = h0.reshape(-1, columns)
     run = _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta, a, w, keys,
-               scores, None, None, None, taken, sequences, laid, unlaid, u=u, h0=h0)
+               scores, None, None, None, taken, sequences, laid, unlaid, u=u, h0=h0, every=every)
     if kept is not None:
         # The forward's saved states, with the delta rule's weights or without them (`w` None).
         (w, h, corrected) = kept
