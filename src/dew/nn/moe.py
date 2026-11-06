@@ -942,11 +942,12 @@ def _exchange_shard[Parameters](
     in one `ragged_all_to_all`, the shard projects what every device sent it,
     grouped by its experts, and a second one brings each row back where it was
     sent from: XLA's own collective, each row moved once, whatever the routing's
-    skew. Every device learns the whole exchange's sizes, each device's slots for
-    each shard, from one gather of its own (`all_gather`), and so where its rows
-    land on each shard and where theirs come back. A shard receives at most every
-    device's slots dropless, or what a capacity lets each device's sequences keep
-    for it, the receiving buffer's static size.
+    skew. Every device learns the whole exchange's counts, each device's slots for
+    each expert, from one gather of its own (`all_gather`), and so where its rows
+    land on each shard, where theirs come back, and each received row's expert,
+    as a device sends a shard its rows expert by expert. A shard receives at most
+    every device's slots dropless, or what a capacity lets each device's sequences
+    keep for it, the receiving buffer's static size.
     """
     top_k = indices.shape[-1]
     tokens = x.reshape(-1, x.shape[-1])
@@ -959,23 +960,25 @@ def _exchange_shard[Parameters](
     send = tokens[rows]
     if input_weights is not None:
         send = send * input_weights.ravel()[order][:, None].astype(send.dtype)
-    # A dropped slot's sentinel expert sorts last and is sent to no shard.
-    sizes = jnp.bincount(experts // per_shard, length=shards + 1)[:shards].astype(jnp.int32)
-    # Every device's slots for every shard, `[sender, receiver]`, and where each run starts on its sender and
-    # lands on its receiver: after the runs every earlier device sends the same receiver.
-    table = jax.lax.all_gather(sizes, EXPERT_AXIS, tiled=False)
+    # Every device's slots for every expert, `[sender, expert]` (a dropped slot's sentinel expert sorts last
+    # and is sent to no shard), its slots for every shard, `[sender, receiver]`, and where each run starts on
+    # its sender and lands on its receiver: after the runs every earlier device sends the same receiver.
+    counts = jax.lax.all_gather(jnp.bincount(experts, length=num_experts + 1)[:num_experts].astype(jnp.int32),
+                                EXPERT_AXIS, tiled=False)
+    table = counts.reshape(shards, shards, per_shard).sum(-1)
     me = jax.lax.axis_index(EXPERT_AXIS)
     sent_from = jnp.cumsum(table, axis=1) - table
     landed_at = jnp.cumsum(table, axis=0) - table
     received_from = table[:, me]
-
-    def exchanged(operand: jax.Array, empty: jax.Array) -> jax.Array:
-        return jax.lax.ragged_all_to_all(operand, empty, sent_from[me], sizes, landed_at[me], received_from,
-                                         axis_name=EXPERT_AXIS)
-
-    received = exchanged(send, jnp.zeros((shards * most, tokens.shape[-1]), send.dtype))
-    # A received row's expert on this shard; the buffer past what arrived holds the sentinel.
-    received_ids = exchanged(experts % per_shard, jnp.full((shards * most,), per_shard, experts.dtype))
+    received = jax.lax.ragged_all_to_all(
+        send, jnp.zeros((shards * most, tokens.shape[-1]), send.dtype), sent_from[me], table[me],
+        landed_at[me], received_from, axis_name=EXPERT_AXIS)
+    # A received row's expert on this shard, each sender's run its experts' counts in order; the buffer past
+    # what arrived holds the sentinel.
+    mine = jax.lax.dynamic_slice_in_dim(counts, me * per_shard, per_shard, axis=1)
+    received_ids = jnp.repeat(jnp.tile(jnp.arange(per_shard, dtype=experts.dtype), shards), mine.ravel(),
+                              total_repeat_length=shards * most)
+    received_ids = jnp.where(jnp.arange(shards * most) < received_from.sum(), received_ids, per_shard)
     permutation = jnp.argsort(received_ids)
     groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
     computed = project(received[permutation], groups, received_ids[permutation], parameters)[
