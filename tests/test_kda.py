@@ -15,7 +15,6 @@ and inputs (check 1, tests/reference_error.py); a per-head scalar decay in
 place of the per-dimension one moves the layer by 1.06.
 """
 
-import functools
 from functools import partial
 
 import jax
@@ -344,47 +343,13 @@ def test_documents_that_enter_another_read_its_memory_and_history_as_their_own_r
     assert_entered_as_own_rows(module, variables, E, layout, "Kimi delta attention")
 
 
-FUSED_SEEDS = 8
-"""The fused decode token's declared draws against the unfused one (check 1): sized by `seeds_for` paired
-with the fused step."""
-
-
 def test_a_decode_token_on_the_fused_step_is_the_layers_own():
-    """A Kimi delta attention layer's decode token through the recurrence's fused step (the decode kernel
-    named 'fused', interpreted on a CPU: its conv over the held history, l2 norm, decay a key dimension,
-    update and sigmoid-gated norm in one launch, `KimiDeltaAttention._fused_token`), at a model's 128-wide
-    heads after a 3-token prefill, its state held in fp32 as the layer holds it: its output and state on par
-    (check 1) with the layer's own unfused token, from the float64 layer's; its conv history bit for bit the
-    unfused token's."""
-    from dew.nn.kernels.generation import chosen
+    """A Kimi delta attention layer's decode tokens through the recurrence's fused step (the decode kernel
+    named 'fused', interpreted on a CPU, its conv, gates and update in one launch), on par (check 1) with the
+    layer's own unfused tokens, from the float64 layer's: the decode matrix's cell on a CPU
+    (`delta_decode_matrix.on_par`)."""
+    import delta_decode_matrix
 
-    module, _, variables = layer_and_params(-5.0, E=64, H=2, D=128)
-    wide = module.clone(dtype=jnp.float64)
-    step = MixerCall(decode=True)
+    delta_decode_matrix.on_par(('sm90', 'kimi delta attention', 'fused', 'float32'))
 
-    def cached(seed):
-        x = jnp.asarray(np.random.RandomState(seed).randn(3, 4, 64).astype(np.float32))
-        allocated = module.apply(variables, x[:, :1], step, mutable=["cache"])[1]
-        cache = module.apply({**variables, **allocated}, x[:, :3], step, mutable=["cache"])[1]["cache"]
-        return cache, x[:, 3:4]
 
-    def token(layer, cache, x, kernel):
-        with chosen(delta_decode=kernel):
-            out, written = layer.apply({**variables, "cache": cache}, x, step, mutable=["cache"])
-        return out, written["cache"]
-
-    def unfused(layer, cache, x):
-        out, written = token(layer, cache, x, "xla")
-        return out, written["recurrent_state"]
-
-    def fused(cache, x):
-        out, written = token(module, cache, x, "fused")
-        return out, written["recurrent_state"]
-
-    assert_as_exact(fused, functools.partial(unfused, module), cached,
-                    "Kimi delta attention's fused decode token", seeds=FUSED_SEEDS,
-                    truth_fn=functools.partial(unfused, wide))
-    cache, x = cached(0)
-    after = token(module, cache, x, "fused")[1]
-    np.testing.assert_array_equal(np.asarray(after["conv_state"]),
-                                  np.asarray(token(module, cache, x, "xla")[1]["conv_state"]))

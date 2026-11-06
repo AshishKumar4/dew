@@ -27,7 +27,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn import derivatives
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import base, bundles, mosaic, report, resources
-from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
+from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
 
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
@@ -60,21 +60,21 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.
             floor: float | None = None, target: generation.GpuTarget | None = None,
             rounded: bool = False, wide: bool = False, ranged: bool = False,
             skip=None) -> tuple[mainloop.Launch, ...]:
-    """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `mainloop.forward`'s) runs
-    at `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
-    planned (`mainloop.Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
-    (`mainloop.launch_kernel`): a forward without a gradient's (`mainloop.forward`'s); with `backward`, the
-    forward a fast backward takes (`mainloop.kept_forward`'s) and that backward's
-    (`mainloop_backward.gradients`). A `wide` call's output lands in fp32
-    (`mainloop.forward`'s): planned in the operands' dtype, the SSD's output launch asked 16 KB past its plan
-    (204800 bytes against 188544 on an H100's compile, the resource gate's). A `skip` (`[HV]`, its shape)
-    fused into the output and reverse walk is planned with them: its reverse walk holds a tile more."""
+    """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `chunk_forward.forward`'s)
+    runs at `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in
+    order, as planned (`mainloop.Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and
+    not built (`mainloop.launch_kernel`): a forward without a gradient's (`chunk_forward.forward`'s); with
+    `backward`, the forward a fast backward takes (`chunk_forward.kept_forward`'s) and that backward's
+    (`mainloop_backward.gradients`). A `wide` call's output lands in fp32 (`chunk_forward.forward`'s): planned
+    in the operands' dtype, the SSD's output launch asked 16 KB past its plan (204800 bytes against 188544 on
+    an H100's compile, the resource gate's). A `skip` (`[HV]`, its shape) fused into the output and reverse
+    walk is planned with them: its reverse walk holds a tile more."""
     found: list[mainloop.Launch] = []
 
     def run(q, k, v, g, beta, h0, starts, skip):
         token = mainloop.PLANNED.set(found)
         try:
-            out, final, (inverse, held) = mainloop.kept_forward(
+            out, final, (inverse, held) = chunk_forward.kept_forward(
                 q, k, v, g, beta, h0, tiles=tiles, starts=starts, max_segments=max_segments, delta=delta,
                 family=family, floor=floor, rounded=rounded, wide=wide, ranged=ranged, skip=skip,
                 keeps=backward)
@@ -106,12 +106,12 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
                    delta: bool = True, floor: float | None = None, rounded: bool = False,
                    ranged: bool = False, skip=None) -> bool:
     """Whether the launches a fast backward runs (`mainloop_backward.gradients`'s and the forward it takes,
-    `mainloop.kept_forward`'s) hold on `family`'s bundle at `tiles` on `target`, planned there and within its
-    block's shared memory (`holds`); where they do not, the rule's gradient is the portable math's. Planned on
-    the device's own target off a GPU, an interpreted call's states launch held no program at the interpreted
-    target's shared budget (`Launch.resident`). Each plan is the call's cached one (`_planned`): planned
-    afresh at each of a Qwen3.5-4B-width step's 168 traces of its GDN layers, it took 11.37 s of its 182.9 s
-    compile_ahead on sm90, its 425 plans 13.34 s (cProfile, armada job 20261105140541-69454bb5 at
+    `chunk_forward.kept_forward`'s) hold on `family`'s bundle at `tiles` on `target`, planned there and within
+    its block's shared memory (`holds`); where they do not, the rule's gradient is the portable math's.
+    Planned on the device's own target off a GPU, an interpreted call's states launch held no program at the
+    interpreted target's shared budget (`Launch.resident`). Each plan is the call's cached one (`_planned`):
+    planned afresh at each of a Qwen3.5-4B-width step's 168 traces of its GDN layers, it took 11.37 s of its
+    182.9 s compile_ahead on sm90, its 425 plans 13.34 s (cProfile, armada job 20261105140541-69454bb5 at
     base/kernels 384436fbe8, row 4260)."""
     *shapes, skip = (None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype)
                      for x in (q, k, v, g, beta, h0, starts, skip))
@@ -164,7 +164,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 wide: bool = False, family=None, floor: float | None = None, bound: float | None = None,
                 firsts=None, rounded: bool = False, skip=None, recomputed: bool = False):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
-    without the `delta` rule, on the recurrence template's Mosaic GPU mainloop (`mainloop.forward`): the
+    without the `delta` rule, on the recurrence template's Mosaic GPU mainloop (`chunk_forward.forward`): the
     port's operands and results (`recurrence_chunk.fla_rule`'s), the operands in their common dtype and beta
     with them, the decay and the memory fp32, on one device, by the bundle of its instruction family
     (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's interpreter,
@@ -173,13 +173,13 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     (`backward_holds`); it takes no other call's, which raises NotImplementedError as the gradient is traced:
     the delta rule's selector gives a training call it refuses another kernel (`Mosaic.trains`), and a call
     that names the mainloop insists on it (ledger 1926: no kernel falls back inside itself). Its states and
-    output launches take `tiles` (`mainloop.Tiles`, the template's config); a `family` given is the bundle
-    it issues by, interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's
-    declared `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit
-    delta rule the chunk inverse's `bound` its form proves, its solve at fp32's range where it proves none
+    output launches take `tiles` (`mainloop.Tiles`, the template's config); a `family` given is the bundle it
+    issues by, interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's
+    declared `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit delta
+    rule the chunk inverse's `bound` its form proves, its solve at fp32's range where it proves none
     (`ranged`); a `rounded` call takes the run's fast forms' numbers (`recurrence_chunk.fast_rounding`,
-    `mainloop.forward`). Where `recomputed`, its fast backward forms the forward's memories again rather than
-    keeping them (a remat rung recomputing 'delta_memory', `recurrence_chunk.RECOMPUTED`, resolved at its
+    `chunk_forward.forward`). Where `recomputed`, its fast backward forms the forward's memories again rather
+    than keeping them (a remat rung recomputing 'delta_memory', `recurrence_chunk.RECOMPUTED`, resolved at its
     route)."""
 
     dtype = jnp.result_type(query, key, value)
@@ -213,7 +213,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     def primal(query, key, value, g, beta, state, starts, firsts, skip):
         # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
         alone = {**run, "tiles": tiles.forward or tiles}
-        return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
+        return chunk_forward.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
                                 max_segments=max_segments, scale=scale, delta=delta, wide=wide,
                                 rounded=rounded, skip=skip, **alone)
 
@@ -224,7 +224,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # weighted keys and corrected values, as the port keeps its memory, but where the block's remat rung
         # recomputes them (`recomputed`). Each is named as the port names its own, so a rung that saves names
         # keeps them rather than replaying the forward's launches for them (`mixer_base.DELTA_RESIDUALS`).
-        out, final, (inverse, kept) = mainloop.kept_forward(*operands[:6], starts=operands[6],
+        out, final, (inverse, kept) = chunk_forward.kept_forward(*operands[:6], starts=operands[6],
                                                             firsts=operands[7], max_segments=max_segments,
                                                             scale=scale, delta=delta, wide=wide,
                                                             rounded=rounded, skip=operands[8], **run)
@@ -543,7 +543,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 training: bool = False) -> mainloop.Launch:
         """The forward's walk over each sequence's chunks: a forward without a gradient's scan, forming the
         output in the walk (`mainloop._scan`), or where `training` the states launch of the forward its fast
-        backward takes (`mainloop.kept_forward`), a call without one its scan."""
+        backward takes (`chunk_forward.kept_forward`), a call without one its scan."""
         return next(launch for launch in self._launches(ba, tiles, target, backward=training)
                     if launch.name.startswith(("recurrence_states", "recurrence_scan")))
 

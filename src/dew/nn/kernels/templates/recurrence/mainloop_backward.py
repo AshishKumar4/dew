@@ -18,6 +18,7 @@ from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
+from dew.nn.kernels.templates.recurrence.chunk_forward import prepared, zero_padded
 from dew.nn.kernels.templates.recurrence.mainloop import (
     CHUNK,
     Call,
@@ -38,7 +39,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     masks,
     memory_landing,
     prefix_reader,
-    prepared,
     role_tiles,
     sequence_walk,
     staging_tiles,
@@ -50,7 +50,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     vector_blocks,
     vector_views,
     walk_stores,
-    zero_padded,
 )
 from dew.nn.precision import compensated_sum
 
@@ -77,8 +76,8 @@ class Kept(NamedTuple):
     rule the system's, values' and keys' launches take none (their fields None)."""
 
     run: object
-    """The prepared call (`mainloop.prepared`): its laid operands, decay halves, inverse, corrected values
-    and stored memories, which the launches read."""
+    """The prepared call (`chunk_forward.prepared`): its laid operands, decay halves, inverse, corrected
+    values and stored memories, which the launches read."""
     local: jax.Array
     """`_local_back`'s corrected values' gradient from each chunk's own output."""
     dh: jax.Array
@@ -132,10 +131,10 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     not. Its rounding is fla's (mamba_ssm's without the delta rule); the accurate backward is the portable
     math's token adjoint. Without the delta rule there is no system: the corrected values are the values
     gated, `u = v beta`, whose gradient `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v
-    du)`, and the memory walks back with no `w^T dv`; a `skip` `[HV]` (Mamba2's `D`, `mainloop.forward`'s)
-    adds `D do` to `dv`, its own gradient `sum(v do)` (`dskip`, None without a skip). Returns them with each
-    launch's outputs as stored (`Kept`; a decay a key dimension's, `key_backward.KeyKept`), the forward's
-    `kept_forward` beside it."""
+    du)`, and the memory walks back with no `w^T dv`; a `skip` `[HV]` (Mamba2's `D`,
+    `chunk_forward.forward`'s) adds `D do` to `dv`, its own gradient `sum(v do)` (`dskip`, None without a
+    skip). Returns them with each launch's outputs as stored (`Kept`; a decay a key dimension's,
+    `key_backward.KeyKept`), the forward's `kept_forward` beside it."""
     if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
                                   "under the run's fast forms, an fp32 call's under them alone")

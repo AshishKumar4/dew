@@ -170,10 +170,16 @@ CASES = (
     generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
     for case in CASES], ids="-".join)
 def a_decode_token_is_on_par(case: tuple[str, ...]) -> None:
-    """A layer's `DECODED` decode tokens of `case` on its GPU on its kernel, on par with the portable step's
-    (check 1, the layer in float64 the truth: a bf16 layer on widened arguments fixes its projections and
-    norm in bf16 and casts its state back, so only the stored state's rounding is the contract's). Its
-    routes are its family's (`CHOICES`), every other choice's at its reference (`REFERENCES`)."""
+    """`on_par` of a GPU's case."""
+    on_par(case)
+
+
+def on_par(case: tuple[str, ...]) -> None:
+    """A layer's `DECODED` decode tokens of `case` on its kernel (interpreted off a GPU), on par with the
+    portable step's (check 1, the layer in float64 the truth: a bf16 layer on widened arguments fixes its
+    projections and norm in bf16 and casts its state back, so only the stored state's rounding is the
+    contract's). Its routes are its family's (`CHOICES`), every other choice's at its reference
+    (`REFERENCES`)."""
     named = dict(zip(AXES["delta_decode"], case, strict=True))
     layer = LAYERS[named["layer"]]
     held = jnp.dtype(named["state"])
