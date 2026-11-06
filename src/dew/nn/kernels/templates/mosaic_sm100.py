@@ -2,9 +2,9 @@
 accumulators in tensor memory, and the warpgroups a mainloop runs them in, which the GEMM template's
 (the GEMM template's, on `RINGS`) and the attention template's Blackwell mainloops share.
 
-A program runs two warpgroups (`roles`). The first issues: one warp's TMA loads fill the TMA rings'
-operand stages (`RINGS`, `CommittedRing`), one warp issues each step's products once its stage is there,
-the products releasing the stage when they have read it (a tensor-core-ordered barrier, `tcgen05_mma`'s). The second reads
+A program runs two warpgroups (`roles`). The first issues: one warp's TMA loads fill the TMA rings' operand
+stages (`RINGS`, `CommittedRing`), one warp issues each step's products once its stage is there, the products
+releasing the stage when they have read it (a tensor-core-ordered barrier, `tcgen05_mma`'s). The second reads
 finished accumulators out of tensor memory (`read`, in column chunks of tcgen05's register layout) and
 releases them for the products after next (`Accumulators`, two or more in tensor memory's columns). A
 barrier's completions no later turn waited for are observed before the program ends (`drain`).
