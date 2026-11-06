@@ -139,6 +139,10 @@ class Encoding:
             golds = {name: example.distribution(name) for name in names if name in labels}
             dropped = {}
             rows = self._rows(example, asked, rng, tokens)
+        if len(rows) != 1:
+            # A row over one state that its options' drawn order splits, their lines read as other tokens
+            # (`QuestionLayout.shared_state`), is laid out in their own order, as Fit admitted it.
+            rows = self._rows(example, asked, None, tokens)
         # A run over a backbone that reads no context leaves an example's own context unread.
         rows = with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
                             self.context_length)
@@ -449,9 +453,12 @@ class Fit(pygrain.MapTransform):
             asked[laid.name] = question
         if all(asked[laid.name].options == example.questions[laid.name].options for laid in row.questions):
             return None
-        [augmented] = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state,
-                                       request=example.questions)
-        return drawn_refusal(self.layout, augmented, self.context_length, row.cuts)
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state,
+                                request=example.questions)
+        if len(laid) != 1:
+            # A row over one state its added options leave no room in (`QuestionLayout.shared_state`).
+            return "unfit"
+        return drawn_refusal(self.layout, laid[0], self.context_length, row.cuts)
 
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
         """Grouped examples' labelled rows, each as an example of its own lays it out (`QuestionRows`
