@@ -1077,9 +1077,9 @@ class Trainer(Generic[Loss, Effects]):
 
         def lower(split: int, narrow: bool, footprint: Footprint | None = None, lowering=True) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
-            return self._candidate(state, batch, schedule, placement, replicated, split, narrow,
-                                   recorded_launches(recorded, rung), lowering=lowering, capacity=capacity,
-                                   footprint=footprint)
+            launches = recorded_launches(recorded, rung)
+            return self._candidate(state, batch, schedule, placement, replicated, split, narrow, launches,
+                                   lowering=lowering, capacity=capacity, footprint=footprint)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1172,20 +1172,18 @@ class Trainer(Generic[Loss, Effects]):
                             and bool(set(COMMIT_FIELDS) & set(self.layout.host)))
         with staging.measured() as cuts:
             if self.tune_kernels and lowering and platforms is None:
-                # The configs it measures are not the ones a derivation traced: its footprint is traced again.
-                lowered, launches, footprint = *tuning.tune(lower, measure=True), None
+                lowered, launches, footprint = *tuning.tune(lower, measure=True), None  # The tuner's configs.
             else:
                 # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
                 lowered, launches = lower() if lowering else None, launches or "[]"
             if staging_measured and not lowering:
                 jitted.trace(*apart(prepared), given, part)
         window = split * self.accumulation
-        if footprint is None and shapes is not None and mesh is None:
-            footprint = candidate_footprint(
-                self.objective, self._model_shapes(micro), window, prepared, held,
-                (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
-                functools.partial(self._consumes_where_made, prepared, micro, window, shapes),
-                max(cuts, default=0), capacity)
+        footprint = footprint or (None if shapes is None or mesh is not None else candidate_footprint(
+            self.objective, self._model_shapes(micro), window, prepared, held,
+            (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
+            functools.partial(self._consumes_where_made, prepared, micro, window, shapes),
+            max(cuts, default=0), capacity))
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)
@@ -1211,15 +1209,14 @@ class Trainer(Generic[Loss, Effects]):
         `narrow` is off."""
         window = split * self.accumulation
         with group_of(state, batch) as (view, rows):
-            traced, shapes = (None, None) if self.step is not None else self._loss_shape(
-                view, rows, window, split)
+            loss, shapes = self._loss_shape(view, rows, window, split) if self.step is None else (None, None)
         if shapes is not None:
             self._staging.refuse_unpipelined(schedule, self.objective)
         prepared = windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
             state, rows, shapes, window=window, shape_only=shape_only), state, batch)
         # DiLoCo's groups read their own parameters, which no narrow copy shadows.
         copies = (narrow_copies(self.objective, state, batch, self._model_batch, window=window, split=split,
-                                composed=self.step is None and not self.dynamic_scale, traced=traced)
+                                composed=self.step is None and not self.dynamic_scale, traced=loss)
                   if (self._narrow if narrow is None else narrow) and self.diloco is None else {})
         prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
             lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)

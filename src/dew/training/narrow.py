@@ -130,7 +130,7 @@ def narrowed_paths(loss, params: Variables, *rest) -> dict[tuple[str, ...], jnp.
     return cast_paths(jax.make_jaxpr(loss)(params, *rest), params)
 
 
-def cast_paths(closed: core.ClosedJaxpr, tree: Variables, within: tuple[str, ...] = ()
+def cast_paths(closed: core.Jaxpr, tree: Variables, within: tuple[str, ...] = ()
                ) -> dict[tuple[str, ...], jnp.dtype]:
     """The paths of `tree`'s leaves under `within` (relative to it) whose one use in `closed`, a program
     whose first inputs are `tree`'s leaves, is a cast to a narrower float dtype, with that dtype: those
@@ -163,7 +163,7 @@ def forward_variables(variables: Variables, compute: Variables | None) -> Variab
 
 
 def narrow_copies(objective, state, batch, model_batch, *, composed: bool, window: int = 1,
-                  split: int = 1, traced: core.ClosedJaxpr | None = None) -> dict:
+                  split: int = 1, traced: core.Jaxpr | None = None) -> dict:
     """The parameters a step reads through narrow copies, by path under `params` (`narrowed_paths`):
     on every GPU but one whose row measured them off, for a step the trainer composes (`composed`),
     without a loss scale, whose state holds no frozen collection. `model_batch` is the trainer's
