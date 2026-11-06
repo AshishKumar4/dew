@@ -24,12 +24,9 @@ def test_each_scheduler_reads_its_own_place_and_leaves_the_rest_to_jax():
     and leave the coordinator to JAX's detection of the same scheduler; `dew launch`'s pool is stated whole,
     JAX's detection off; a GKE TPU worker states its pool's size and rank alone."""
     assert Slurm(SLURM_TASK).detected() and Slurm(SLURM_TASK).joining() == Joining(None, 4, 3, (1,))
-    assert OpenMPI(MPI_RANK).joining().arguments() == {"num_processes": 8, "process_id": 5,
-                                                        "local_device_ids": [1]}
+    assert OpenMPI(MPI_RANK).joining() == Joining(None, 8, 5, (1,))
     launched = Launched.environ_of("host-0:8476", 2, 1, (2, 3))
-    assert Launched(launched).joining().arguments() == {
-        "coordinator_address": "host-0:8476", "num_processes": 2, "process_id": 1, "local_device_ids": [2, 3],
-        "cluster_detection_method": "deactivate"}
+    assert Launched(launched).joining() == Joining("host-0:8476", 2, 1, (2, 3), fills=False)
     tpu = CloudTPU({"TPU_WORKER_HOSTNAMES": "w-0,w-1,w-2,w-3", "TPU_WORKER_ID": "2"})
     assert tpu.detected() and tpu.joining() == Joining(None, 4, 2)
     quiet = {"TPU_SKIP_MDS_QUERY": "1"}
