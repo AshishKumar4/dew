@@ -256,8 +256,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         their elements themselves."""
         return self.dtype.itemsize <= 2
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
-        out = self.products(self.zeros(shape), lhs, rhs, interpret=False)
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+        out = self.products(self.zeros(shape), lhs, rhs, interpret=interpret)
         if then is not None:
             then()
         return out
@@ -560,10 +560,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
-    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+    def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         # Element-wise atomic adds into global memory (`red.global`; no TMA reduction before Hopper), so
-        # every other role's and program's adds into the view stay whole.
-        del smem
+        # every other role's and program's adds into the view stay whole, no buffer between them.
+        del smem, pending
         if interpret:
             view[...] = view[...] + value
         else:

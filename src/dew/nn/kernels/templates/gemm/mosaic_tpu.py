@@ -65,14 +65,16 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         out_dtype, interpret: bool | pltpu.InterpretParams = False, prologue=None,
         prologue_operands: tuple = (), prologue_axes: tuple = (), epilogue=None,
         epilogue_operands: tuple = (), epilogue_axes: tuple = (),
-        out_dtypes: tuple | None = None) -> jax.Array | tuple[jax.Array, ...]:
+        out_dtypes: tuple | None = None, first: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype` (or a tuple in
     `out_dtypes`), each row past the routed ones the epilogue of a zero accumulator. The depth must divide
-    by `blocks.block_k` and the width by `blocks.block_n`."""
+    by `blocks.block_k` and the width by `blocks.block_n`. With `first`, an int32 scalar, `rhs` is a stack
+    of more matrices than `group_sizes` has groups, group `g` reading matrix `first + g` where it lies (a
+    banked layer's experts); the schedule is the groups'."""
     block_m, block_n, block_k = blocks.block_m, blocks.block_n, blocks.block_k
     rows, depth = lhs.shape
-    groups = rhs.shape[0]
+    groups = group_sizes.shape[0]
     rhs_depth, width = (rhs.shape[2], rhs.shape[1]) if transpose_rhs else rhs.shape[1:]
     if depth != rhs_depth or depth % block_k or width % block_n:
         raise ValueError(f"a [{rows}, {depth}] x {list(rhs.shape)} product does not take {blocks}")
@@ -87,8 +89,11 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     steps = depth // block_k
     sides = len(prologue_operands) + len(epilogue_operands)
+    # Dew: the stack's matrix group 0 reads, prefetched beside the schedule.
+    offset = jnp.zeros((1,), jnp.int32) if first is None else jnp.reshape(first, (1,)).astype(jnp.int32)
 
-    def kernel(group_offsets, group_ids, m_tile_ids, lhs_ref, rhs_ref, *refs):
+    def kernel(group_offsets, group_ids, m_tile_ids, offset, lhs_ref, rhs_ref, *refs):
+        del offset
         prologue_refs, epilogue_refs = refs[:len(prologue_operands)], refs[len(prologue_operands):sides]
         out_refs, acc_ref = refs[sides:-1], refs[-1]
         slot, step = pl.program_id(1), pl.program_id(2)
@@ -118,14 +123,14 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             for out_ref, out in zip(out_refs, outs, strict=True):
                 out_ref[...] = jnp.where(mine, out.astype(out_ref.dtype), out_ref[...])
 
-    def lhs_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
+    def lhs_index(column, slot, step, group_offsets, group_ids, m_tile_ids, offset):
         return m_tile_ids[slot], step
 
-    def rhs_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
-        group = jnp.minimum(group_ids[slot], groups - 1)
-        return (group, column, step) if transpose_rhs else (group, step, column)
+    def rhs_index(column, slot, step, group_offsets, group_ids, m_tile_ids, offset):
+        matrix = jnp.minimum(group_ids[slot], groups - 1) + offset[0]
+        return (matrix, column, step) if transpose_rhs else (matrix, step, column)
 
-    def origin(column, slot, step, group_offsets, group_ids, m_tile_ids):
+    def origin(column, slot, step, group_offsets, group_ids, m_tile_ids, offset):
         # The unrouted rows' slot reads the last group's, as XLA's program repeats it there.
         return {'rows': m_tile_ids[slot], 'depth': step, 'columns': column,
                 GROUPS: jnp.minimum(group_ids[slot], groups - 1)}
@@ -134,7 +139,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             for side, axes in zip((*prologue_operands, *epilogue_operands), (*prologue_axes, *epilogue_axes),
                                   strict=True)]
 
-    def out_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
+    def out_index(column, slot, step, group_offsets, group_ids, m_tile_ids, offset):
         return m_tile_ids[slot], column
 
     out_shape = tuple(jax.ShapeDtypeStruct((m, width), dtype) for dtype in dtypes)
@@ -142,7 +147,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         kernel,
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=4,
             in_specs=[pl.BlockSpec((block_m, block_k), lhs_index),
                       pl.BlockSpec((None, block_n, block_k) if transpose_rhs else (None, block_k, block_n),
                                    rhs_index),
@@ -155,7 +160,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         cost_estimate=estimate(2 * rows * depth * width, lhs, rhs, *prologue_operands, *epilogue_operands,
                            *out_shape),
         name="dew_gmm",
-    )(*metadata, lhs, rhs, *(side for side, _ in laid))
+    )(*metadata, offset, lhs, rhs, *(side for side, _ in laid))
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
 

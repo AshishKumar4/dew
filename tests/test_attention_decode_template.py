@@ -284,8 +284,19 @@ def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     rows, row_spans, _ = attention_decode.packed(query, spans, 2)
     assert rows.shape == (2, 12, 2, 16)
     np.testing.assert_array_equal(template.ungrouped_rows(rows, 8), query)
-    np.testing.assert_array_equal(row_spans.start, np.repeat(np.asarray(spans.start), 4, axis=1))
+    np.testing.assert_array_equal(row_spans.per_query().start, np.repeat(np.asarray(spans.start), 4, axis=1))
 
+
+
+def test_a_packed_steps_spans_mean_its_rows_own_to_every_reader():
+    """A decode step's packed rows keep one interval a position (`KeySpans.per_span`); every mainloop and the
+    reference read them as each row's own: the reference over the packed rows and spans is the reference over
+    the same rows with an interval a row, bit for bit (row 4487)."""
+    query, key, value, _ = _drawn(4, 8, 2, jnp.float32)(0)
+    rows, packed_spans, _ = attention_decode.packed(query, _spans(4), 2)
+    assert packed_spans.per_span == 4
+    np.testing.assert_array_equal(template.reference(rows, key, value, packed_spans),
+                                  template.reference(rows, key, value, packed_spans.per_query()))
 
 def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each slice's softmax state over its keys `cuts[s]` to `cuts[s + 1]`, and one more of no key: its output
@@ -317,7 +328,7 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
         initial = template.Initial(sink, jnp.ones_like(sink), jnp.zeros((*sink.shape, values.shape[-1])))
         spec = algebra.Forward("spans", 40, ids=False, scale=1.0, natural=True, initial=True)
         out, maximum, total = _states(logits, values, cuts)
-        return attention_decode.merged(spec, out, maximum, total, initial)
+        return algebra.merged_slices(spec, out, maximum, total, initial)
 
     def whole(logits, values, sink):
         scores = jnp.concatenate([logits, jnp.transpose(sink, (0, 2, 1))[..., None]], axis=-1)

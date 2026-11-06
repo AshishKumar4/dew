@@ -80,7 +80,9 @@ class WgmmaIssuer(mosaic.Issuer):
         # rows (DQROWPROOF64: 260 against ptxas's 255 and 512 bytes spilled; DQROWPROOF128: 184 at 64 rows).
         return -(-rows * jnp.dtype(dtype).itemsize // 128)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+        del interpret  # wgmma lowers interpreted
+
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             mosaic.committed()
