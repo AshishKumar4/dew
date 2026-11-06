@@ -12,6 +12,11 @@ mode=sys.argv[1]
 target=int(sys.argv[2]) if len(sys.argv)>2 else 16
 original=scan._issued
 def product(left,right):
+    if mode=="split":
+        high=right.astype(j.bfloat16).astype(right.dtype)
+        low=right-high
+        return (float32_matmul(left,high,jax.lax.Precision.HIGHEST)
+                +float32_matmul(left,low,jax.lax.Precision.HIGHEST))
     if mode=="inner":
         return j.sum(left[:,None,:]*right.T[None,:,:],axis=-1)
     if mode=="rows":
