@@ -269,6 +269,8 @@ def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, par
     def read(tap):
         """The token `K - 1 - tap` before each, of its own document, else of the history it enters."""
         inside = padded[:, tap:tap + length]
+        if tap == taps_count - 1:
+            return inside
         behind = history[rows, jnp.maximum(slot, 0), jnp.clip(tap + rank, 0, taps_count - 2)]
         behind = jnp.where((slot >= 0)[..., None], behind, 0)
         return jnp.where((rank >= taps_count - 1 - tap)[..., None], inside, behind)

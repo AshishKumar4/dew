@@ -1661,7 +1661,7 @@ class QSASelfAttention(CausalSelfAttention):
     """`CausalSelfAttention` under QSA (`qsa`), which reads no pairwise mask or key runs: either may hide a
     key from one query that sees it from another, where QSA pools each key once (`qsa_selection`)."""
 
-    reads: ClassVar[frozenset[str]] = CausalSelfAttention.reads - {"pairwise_mask", "key_runs"}
+    reads: ClassVar[frozenset[str]] = CausalSelfAttention.reads - {"pairwise_mask", "key_runs", "entered"}
 
 
 @dataclasses.dataclass(frozen=True)
