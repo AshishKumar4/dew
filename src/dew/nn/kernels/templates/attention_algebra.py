@@ -491,14 +491,14 @@ once); `into` refs holding the plain launch's outputs, which it writes its rows 
 
 
 def finished_form(spec: Forward) -> Forward:
-    """The form a walk's finished states merge in (`slice_state`, `merge`, `merged_slices`): the walk's own
-    where `finish` leaves its maxima in its units (natural, or a raw fold's products), else its fold's
+    """The form a walk's finished states merge in (`slice_state`, `finished_merged`, `merged_slices`): its
+    own where `finish` leaves its maxima in its units (natural, or a raw fold's products), else its fold's
     natural form (`unfolded`), whose units a folded walk's finished maxima are in (`finished_rows`)."""
     return spec if spec.natural or spec.raw else unfolded(spec)
 
 
 def slice_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array) -> Partial:
-    """A finished slice of a row's keys as a state of their merge (`merge`, `merged`): its output `out`
+    """A finished slice of a row's keys as a state of their merge (`finished_merged`): its output `out`
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
     keeps them) and its denominator folded into its maximum (`m + log(total)`, in those units) and its mass
     1 where it saw a key, so no output multiplied back by its denominator passes fp32's largest; a slice of
@@ -532,7 +532,35 @@ def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.
                                           jnp.swapaxes(initial.total, 1, 2)))
         state = Partial(*(jnp.concatenate([mine, theirs[:, None]], axis=1)
                           for mine, theirs in zip(state[:3], own[:3], strict=True)))
-    return finish(spec, merged(spec, state, axis=1), initial=True)[0]
+    return finish(spec, finished_merged(spec, state, axis=1), initial=True, normalized=True)[0]
+
+
+def finished_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
+    """Two finished states over disjoint keys (`slice_state`'s, or merges of them) as one merge of them,
+    `first`'s keys before `second`'s: `finished_merged`'s convex combination of two, elementwise, as a
+    program's registers hold them (the in-launch merge's, `attention_mosaic_forward._Merge`)."""
+    m = jnp.maximum(first.m, second.m)
+    a, b = carried(spec, first.m, m) * first.total, carried(spec, second.m, m) * second.total
+    total = a + b
+    over = 1.0 / jnp.where(total > 0, total, 1.0)
+    out = expand(a * over, first.acc) * first.acc + expand(b * over, second.acc) * second.acc
+    return Partial(out, m, total)
+
+
+def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
+    """Finished states over disjoint keys (`slice_state`'s, their outputs normalized, or merges of them)
+    stacked on `axis` as one merge of them: their outputs' convex combination, each weighed by its mass at
+    the largest of their maxima (`merge`'s factors) over those weights' sum before its product, so the merged
+    output is bounded by its states' (their factors' products summed first passed fp32's largest where 8
+    slices' outputs near 3e38 merged, row 4526), its denominator those weights' sum, never folded into its
+    maximum again (a fold a merge rounds away at a large maximum loses the mass). Its output is its sums
+    (`finish`'s `normalized`); a state of no key adds nothing."""
+    m = jnp.max(stacked.m, axis=axis)
+    weights = carried(spec, stacked.m, jnp.expand_dims(m, axis)) * stacked.total
+    total = jnp.sum(weights, axis=axis)
+    shares = weights * jnp.expand_dims(1.0 / jnp.where(total > 0, total, 1.0), axis)
+    out = jnp.sum(expand(shares, stacked.acc) * stacked.acc, axis=axis)
+    return Partial(out, m, total)
 
 
 def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O], *,
@@ -1669,13 +1697,17 @@ def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
-           output_params: tuple[jax.Array, ...] = ()) -> tuple[jax.Array, jax.Array, jax.Array]:
+           output_params: tuple[jax.Array, ...] = (), normalized: bool = False
+           ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
     (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves, the derived forms'
-    (`_derived_output`), a guarded state's live rows taken from its unshifted sums as ever."""
+    (`_derived_output`), a guarded state's live rows taken from its unshifted sums as ever. A `normalized`
+    state's sums are its output already (a merge of finished states, `finished_merged`): zero where it holds
+    no mass."""
     m, denominator = finished_rows(spec, state, initial=initial)
-    out = _derived_output(spec, state)
+    out = (jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0) if normalized
+           else _derived_output(spec, state))
     fields = state.guard
     if fields is not None:
         bounded = finite(fields.plain_total)
