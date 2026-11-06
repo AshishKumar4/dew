@@ -368,9 +368,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def load_barriers(self, count: int):
         return pltpu.SemaphoreType.DMA((count,))
 
-    def staged_memory(self, shape: tuple[int, ...], dtype):
+    def staged_memory(self, shape: tuple[int, ...], dtype, swizzle: int | None = None):
         # Its one role's staging in VMEM (`staging` keeps the GPU's up to two roles' shape, so a template
-        # indexes it alike), its copies' DMA semaphores its `load_barriers`.
+        # indexes it alike), its copies' DMA semaphores its `load_barriers`; its compiler lays the tile
+        # out, no swizzle.
+        del swizzle
         return pltpu.VMEM(shape, dtype)
 
     def meet(self, halves) -> None:
