@@ -238,6 +238,16 @@ PLAIN_PRODUCT = (((1,), (0,)), ((), ()))
 """A matrix product's dimension numbers, `a @ b`: the left's last axis with the right's first, no batch."""
 
 
+def _oriented(numbers, ranks: tuple[int, int]) -> tuple[bool, bool] | None:
+    """Whether each operand of a contraction of one axis of each of two matrices (`ranks` 2), no batch axis,
+    is taken transposed to make it `[m, k] @ [k, n]` (`PLAIN_PRODUCT`'s): the left's where it contracts its
+    first axis, the right's where it contracts its second; None for any other contraction."""
+    (left, right), batch = numbers
+    if batch != ((), ()) or len(left) != 1 or ranks != (2, 2):
+        return None
+    return left[0] == 0, right[0] == 1
+
+
 class Operand(NamedTuple):
     """A leaf's value given by its type and the call that acquires it (`load`), which an evaluation calls
     where a form first reads the leaf (`evaluator`): a mainloop's operand whose acquisition waits on its
@@ -303,11 +313,16 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
             left, right, index = args
             _, params = region.params[terms.integer(index)]
             numbers = jax.tree.map(int, params["dimension_numbers"])
-            if product is not None and numbers == PLAIN_PRODUCT:
-                made = (product(value(left), value(right)) if named is None
-                        else product(named(left, right), value(left), value(right)))
+            a, b = value(left), value(right)
+            oriented = _oriented(numbers, (a.ndim, b.ndim)) if product is not None else None
+            if oriented is not None:
+                # Any one-axis contraction of two matrices is the mainloop's product of them oriented as it
+                # takes them, `[m, k] @ [k, n]`: a transposed operand's product its own, never Dew's.
+                a, b = (operand.T if flip else operand
+                        for operand, flip in zip((a, b), oriented, strict=True))
+                made = product(a, b) if named is None else product(named(left, right), a, b)
             else:
-                made = float32_dot_general(value(left), value(right), params["dimension_numbers"],
+                made = float32_dot_general(a, b, params["dimension_numbers"],
                                            precision=params.get("precision"),
                                            preferred_element_type=params.get("preferred_element_type"))
         elif (exponential is not None and (args := get_callable_args(term, terms.Term.unary)) is not None
