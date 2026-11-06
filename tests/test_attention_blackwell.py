@@ -49,12 +49,6 @@ def _attended(causal: bool, tokens: int, rows: int, *, reference: bool = False, 
     return run
 
 
-INTERPRETED_CASES = ("full",)
-"""The call forms the interpreter runs: a causal call's per-block walk fails Mosaic GPU's interpreter at the
-pinned JAX (an XLA RET_CHECK compiling a role's thread, a tuple of 8 leaves given 9 shardings), which its
-compile for a B200 does not (row 2422)."""
-
-
 
 @pytest.fixture(autouse=True)
 def _on_a_b200():
@@ -66,7 +60,7 @@ def _on_a_b200():
 @INTERPRETS
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("width", list(SHAPES))
-@pytest.mark.parametrize("case", INTERPRETED_CASES)
+@pytest.mark.parametrize("case", CASES)
 def test_the_blackwell_forward_holds_check_1_interpreted(case, width, natural):
     """The forward of a `case` call of heads `width` wide, interpreted: as exact as the template's reference
     from float64 truth, its padded tokens (masked past the keys) and its grouped heads included."""
