@@ -433,3 +433,22 @@ def test_a_slot_release_states_the_window_and_the_prompt_its_layout_accepted(tmp
     assert Pretrained.load(tmp_path / "other", dtype="float32", attention_impl="xla").layout == other
     (tmp_path / "narrow" / "dew_release.json").unlink()
     assert Pretrained.load(tmp_path / "narrow", dtype="float32", attention_impl="xla").layout.max_len == 32768
+
+
+def test_a_slot_release_reads_the_labels_its_layout_states_in_their_order(tmp_path):
+    """A slot release whose layout writes its labels in another order than its source's canonical one (B, A,
+    C, D) reads them in that order: exported, its readout and its layout reload with those labels, the rows
+    a question asks under them, and the task answers it as the release it was exported from (row 4484)."""
+    source, _ = slot_release(tmp_path, "slot_lm", n_slots=4)
+    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    labels = replace(bundle.layout.labels, names=("B", "A", "C", "D"))
+    head = bundle.head.clone(label_ids=labels.ids(bundle.decision_tokenizer, 4))
+    chosen = replace(bundle, layout=replace(bundle.layout, labels=labels), head=head)
+    chosen.save(tmp_path / "saved")
+    restored = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    assert restored.layout.labels == labels and restored.head.label_ids == head.label_ids
+    asked = {"team": Choice("Which team?", ["billing", "technical", "fraud"])}
+    answers = [Decide.of(each, name="release")("Refund requested.", asked)["team"]
+               for each in (chosen, restored)]
+    assert answers[0].options == answers[1].options
+    assert answers[0].probabilities.tolist() == answers[1].probabilities.tolist()
