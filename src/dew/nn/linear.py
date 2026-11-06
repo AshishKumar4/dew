@@ -702,34 +702,37 @@ def stepped_per_shard(hooks: recurrence.Hooks, state: jax.Array, query: jax.Arra
     return manual_map(local, (memory, P(rows), specs), (three, memory))(state, active, given)
 
 
-def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, fuses: bool) -> str:
+def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, fuses: bool, normed: bool = True) -> str:
     """The kernel a decode token over `state` `[B, Hv, Dk, Dv]` runs on the target, as the decode selector
-    reports it (`DELTA_DECODE`): a caller that has a conv, gates and a gated norm for the fused step to
-    take (`fuses`)."""
-    return select(DELTA_DECODE, DecodeCase(state.shape, jnp.dtype(state.dtype), fuses)).kernel
+    reports it (`DELTA_DECODE`): a caller that has its conv and gates for the fused step to take (`fuses`),
+    and a gated norm over a head with them (`normed`; Mamba2's norms its groups after the step)."""
+    return select(DELTA_DECODE, DecodeCase(state.shape, jnp.dtype(state.dtype), fuses, normed)).kernel
 
 
 def fused_token(hooks: recurrence.Hooks, taps, *, heads: tuple[int, int, int], widths: tuple[int, int, int],
-                per_row: dict, per_head: dict, weight: Callable[[], jax.Array], valid, dtype=None,
-                starts=None):
+                per_row: dict, per_head: dict, weight: Callable[[], jax.Array] | None, valid, dtype=None,
+                starts=None, conv_bias=None):
     """A delta rule layer's decode token whole in one launch (`recurrence.step` under `hooks`: its conv over
     the held history, gates, update and gated norm), `held_scan`'s `token`, each shard's rows and heads on
     their own (`manual_map`), as `decode_gated_delta_rule` places them. The conv's channels are the
-    queries', keys' and values' (`heads` and `widths` each); a mesh splitting the heads holds them by shard,
-    so they are reordered so each shard's slice is its heads' queries, keys and values in turn, and back
-    after. `per_row` are the step's operands of a row and value head (`[B, Hv, ...]`), `per_head` a value
-    head's (`[Hv]`), `weight()` the gated norm's; `dtype` the output's, at least fp32 of the projections'
-    where None. A row `starts` marks enters a zero memory and history: a new document's token."""
+    queries', keys' and values' (`heads` and `widths` each) in the conv's order (`recurrence.Conv.order`); a
+    mesh splitting the heads holds them by shard, so they are reordered so each shard's slice is its heads'
+    pieces in turn, and back after. `per_row` are the step's operands of a row and value head (`[B, Hv,
+    ...]`), `per_head` a value head's (`[Hv]`), `weight()` the gated norm's (None without one), `conv_bias`
+    the conv's bias `[C]` where it has one; `dtype` the output's, at least fp32 of the projections' where
+    None. A row `starts` marks enters a zero memory and history: a new document's token."""
     batch, value_heads = next(iter(per_row.values())).shape[:2]
     P = jax.sharding.PartitionSpec
     rows, split = grouped_heads((batch, 1, value_heads, widths[2]), heads[0])
     mesh = jax.sharding.get_abstract_mesh()
     shards = math.prod(mesh.shape[axis] for axis in mesh_axes(split))
-    # Each channel's place in the shards' order: by shard, then piece, then the piece's heads there.
-    first = np.cumsum([0, *(h * w for h, w in zip(heads, widths, strict=True))])
+    # Each channel's place in the shards' order: by shard, then piece in the conv's order, then the
+    # piece's heads there.
+    shapes = dict(zip('qkv', zip(heads, widths, strict=True), strict=True))
+    pieces = [shapes[name] for name in hooks.conv.order]
+    first = np.cumsum([0, *(h * w for h, w in pieces)])
     order = np.concatenate([first[i] + np.arange(shard * h * w // shards, (shard + 1) * h * w // shards)
-                            for shard in range(shards)
-                            for i, (h, w) in enumerate(zip(heads, widths, strict=True))])
+                            for shard in range(shards) for i, (h, w) in enumerate(pieces)])
     inverse = np.argsort(order)
     active = jnp.ones((batch,), bool) if valid is None else jnp.asarray(valid, bool)[:, 0]
     names = (*per_row, *per_head)
@@ -744,19 +747,23 @@ def fused_token(hooks: recurrence.Hooks, taps, *, heads: tuple[int, int, int], w
             held = jnp.where(fresh[:, None, None, None], jnp.zeros((), held.dtype), held)
             history = jnp.where(fresh[:, None, None], jnp.zeros((), history.dtype), history)
 
-        def local(token, history, taps, weight, state, active, *values):
+        extras = {**({} if weight is None else {'weight': (weight(), P())}),
+                  **({} if conv_bias is None else {'conv_bias': (ordered(conv_bias, 0), P(split))})}
+
+        def local(token, history, taps, state, active, *values):
+            given = dict(zip((*extras, *names), values, strict=True))
             out, moved, state = recurrence.step(hooks, recurrence.Step(
-                state, token=token, held=history, taps=taps, weight=weight, active=active,
-                **dict(zip(names, values, strict=True))), dtype=out_dtype)
+                state, token=token, held=history, taps=taps, active=active, **given), dtype=out_dtype)
             assert moved is not None, 'a step with a conv moves its history'
             return out, moved, state
 
-        specs = (P(rows, split), P(rows, None, split), P(split, None), P(), P(rows, split, None, None),
-                 P(rows), *(P(rows, split, *(None,) * (x.ndim - 2)) for x in per_row.values()),
+        specs = (P(rows, split), P(rows, None, split), P(split, None), P(rows, split, None, None), P(rows),
+                 *(spec for _, spec in extras.values()),
+                 *(P(rows, split, *(None,) * (x.ndim - 2)) for x in per_row.values()),
                  *(P(split) for _ in per_head))
-        out, history, state = manual_map(local, specs, (P(rows, split, None), specs[1], specs[4]))(
-            ordered(mixed[:, 0], 1), ordered(history, 2), ordered(taps, 0), weight(), held, active,
-            *per_row.values(), *per_head.values())
+        out, history, state = manual_map(local, specs, (P(rows, split, None), specs[1], specs[3]))(
+            ordered(mixed[:, 0], 1), ordered(history, 2), ordered(taps, 0), held, active,
+            *(value for value, _ in extras.values()), *per_row.values(), *per_head.values())
         history = history if shards == 1 else jnp.take(history, inverse, axis=2)
         return out.reshape(batch, 1, -1), history, state
 
@@ -816,13 +823,14 @@ class DecodeCase:
     shape: tuple[int, ...]
     dtype: np.dtype
     fuses: bool
+    normed: bool = True
 
 
 def _step_fits(case: DecodeCase) -> bool:
     """Whether the template's step takes `case`'s state (`templates.recurrence.step.fits`)."""
     from dew.nn.kernels.templates.recurrence import step
 
-    return step.fits(case.shape, case.fuses)
+    return step.fits(case.shape, case.fuses and case.normed)
 
 
 def _template_runs() -> bool:

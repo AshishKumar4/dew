@@ -49,8 +49,7 @@ def fits(shape: tuple[int, ...], whole: bool) -> bool:
     """Whether a state of `shape` `[rows, Hv, Dk, Dv]` steps here: its key dimension the key vectors' (a
     whole number of a warpgroup's), its value heads a whole number of programs' blocks (`_block`: a power of
     two narrower than a warpgroup, as many heads as fill one dividing the heads, or a whole number of
-    warpgroups); a head a warpgroup wide where a hook reads it `whole` (a conv in the prologue, the fused
-    step's, or a gated norm)."""
+    warpgroups); a head a warpgroup wide where a hook reads it `whole` (a gated norm over a head)."""
     _, value_heads, key_width, value_width = shape
     block = _block(value_width)
     tiles = (value_width % block.columns == 0 and value_heads % block.heads == 0
@@ -63,7 +62,7 @@ def serves(hooks: recurrence.Hooks, operands: recurrence.Step) -> bool:
     launch (`recurrence.step`)."""
     if hooks.conv is not None and (operands.held is None or operands.held.shape[1] == 0):
         return False
-    return fits(operands.state.shape, hooks.output is not None or hooks.conv is not None)
+    return fits(operands.state.shape, hooks.output is not None)
 
 
 def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: mosaic.Family,
@@ -165,7 +164,7 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
                    pl.ds(lax.axis_index("columns") * block.columns, block.columns), block)
     state_ref = inputs['state']
     key_width = state_ref.shape[2]
-    conv = (_Conv(inputs, moved, token, key_heads, key_width, state_ref.shape[3], group)
+    conv = (_Conv(inputs, moved, token, hooks.conv, key_heads, key_width, state_ref.shape[3], group)
             if hooks.conv is not None else None)
 
     @pl.when(active_ref[token.row] != 0)
@@ -176,12 +175,12 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
             value = token.tile(inputs['value'])
         else:
             windows = conv.windows()
-            query, key, flat = conv.convolved(windows, hooks.conv)
+            convolved = conv.convolved(windows)
             conv.write([window[1:] for window in windows])
-            # The conv's values a head's vector, laid as a block of one head through shared memory.
-            plgpu.store(values.at[0], flat, optimized=False)
+            # The conv's values the block's heads' vector, laid as the block through shared memory.
+            plgpu.store(values.reshape(block.heads * block.columns), convolved[0], optimized=False)
             mosaic.synced(interpret)
-            keyed = [(query, key)]
+            keyed = [convolved[1 + 2 * p:3 + 2 * p] for p in range(block.heads)]
             value = plgpu.load(values, layout=block.layout, optimized=False)
         writes = [_staged(hooks, inputs, token, p, *keyed[p], vectors, exchanged, interpret=interpret)
                   for p in range(block.heads)]
@@ -216,13 +215,16 @@ def _key_entry(vectors, token: _Token, which: int, k: int):
 
 @dataclasses.dataclass(frozen=True)
 class _Conv:
-    """A program's view of the prologue's conv (`recurrence._ConvRefs`' channels): the row's token `[C]`,
-    history `[rows, K - 1, C]` and taps `[K, C]`, its key head's queries and keys and its own values, and
-    the moved history it writes, the queries' and keys' by its key head's first value head."""
+    """A program's view of the prologue's conv (`recurrence.Conv`): the row's token `[C]`, history
+    `[rows, K - 1, C]`, taps `[K, C]` and bias `[C]`, in the conv's order of queries, keys and values
+    (`recurrence.conv_pieces`); its streams the block's heads' values, contiguous, then each block head's key
+    head's queries and keys; the moved history it writes, the queries' and keys' by their key head's first
+    value head."""
 
     inputs: dict
     moved: object
     token: _Token
+    conv: recurrence.Conv
     key_heads: int
     key_width: int
     value_width: int
@@ -230,11 +232,17 @@ class _Conv:
 
     @property
     def pieces(self):
-        """Each stream's first channel and width: its key head's queries and keys, its own values."""
-        keyed = self.token.keyed[0]
-        return ((keyed * self.key_width, self.key_width),
-                ((self.key_heads + keyed) * self.key_width, self.key_width),
-                (2 * self.key_heads * self.key_width + self.token.head * self.value_width, self.value_width))
+        """Each stream's first channel and width: the block's values, then each head's queries and keys."""
+        block = self.token.block
+        whole = recurrence.conv_pieces(self.conv, self.key_heads, self.value_heads, self.key_width,
+                                       self.value_width)
+        values = (whole['v'][0] + self.token.first * self.value_width, block.heads * self.value_width)
+        return (values, *((whole[name][0] + keyed * self.key_width, self.key_width)
+                          for keyed in self.token.keyed for name in 'qk'))
+
+    @property
+    def value_heads(self) -> int:
+        return self.group * self.key_heads
 
     def _load(self, ref, first, width):
         return plgpu.load(ref.at[pl.ds(first, width)], layout=scan.blocked(width), optimized=False)
@@ -249,9 +257,9 @@ class _Conv:
                  self._load(token.at[self.token.row], first, width).astype(jnp.float32)]
                 for first, width in self.pieces]
 
-    def convolved(self, windows, conv: recurrence.Conv):
-        """The queries, keys and values: each stream's taps over its window, oldest first
-        (`short_conv.preactivation`'s order), then the activation."""
+    def convolved(self, windows):
+        """Each stream's taps over its window, oldest first (`short_conv.preactivation`'s order), then its
+        bias, then the activation: the block's values, then each head's queries and keys."""
         taps = self.inputs['taps']
         streams = []
         for window, (first, width) in zip(windows, self.pieces, strict=True):
@@ -259,8 +267,10 @@ class _Conv:
             pre = window[0] * weights[0]
             for inputs, weight in zip(window[1:], weights[1:], strict=True):
                 pre = pre + inputs * weight
+            if self.conv.bias:
+                pre = pre + self._load(self.inputs['conv_bias'], first, width).astype(jnp.float32)
             # SiLU as the reference's, the input times its sigmoid.
-            streams.append(pre if conv.activation is None else pre * _sigmoid(pre))
+            streams.append(pre if self.conv.activation is None else pre * _sigmoid(pre))
         return tuple(streams)
 
     def held(self):
@@ -270,19 +280,20 @@ class _Conv:
                 for first, width in self.pieces]
 
     def write(self, rows):
-        """Each stream's moved history: the values', and the queries' and keys' where the program is its key
-        head's first."""
+        """Each stream's moved history: the block's values', and each head's queries' and keys' where the
+        head is its key head's first."""
         def store(piece, history):
             for j, row in enumerate(history):
                 plgpu.store(self.moved.at[self.token.row, j, pl.ds(*piece)], row.astype(self.moved.dtype),
                             optimized=False)
 
-        store(self.pieces[2], rows[2])
-
-        @pl.when(self.token.head % self.group == 0)
-        def _():
-            store(self.pieces[0], rows[0])
-            store(self.pieces[1], rows[1])
+        pieces = self.pieces
+        store(pieces[0], rows[0])
+        for p, head in enumerate(self.token.heads):
+            @pl.when(head % self.group == 0)
+            def _(p=p):
+                store(pieces[1 + 2 * p], rows[1 + 2 * p])
+                store(pieces[2 + 2 * p], rows[2 + 2 * p])
 
 
 def _staged(hooks, inputs, token: _Token, index: int, query, key, vectors, exchanged, *, interpret: bool):
