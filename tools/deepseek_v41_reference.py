@@ -1144,7 +1144,8 @@ def write_release_recording():
     as released, bf16 over its own tilelang kernels and its activation quantizers, and their float64 truth
     (the same code over the stand-ins, widened), over drawn rows whose every selection the truth's forward
     clears by the gate's MARGIN (`clearing_rows`, on the twin), summarized over check 1's seeds
-    (`recorded_references.record_case`), and the rows each seed drew (release_rows.npz): the reference
+    (`recorded_references.record_case`), and the rows and image prompts each seed drew (release_rows.npz,
+    which the test reads its inputs from: its own draw would run the release's processor): the reference
     tests/test_deepseek_v41.py holds Dew's forward, its variants and its cached walk to (row 354)."""
     from recorded_references import provenance, record_case, save
     from safetensors.torch import load_file
@@ -1188,6 +1189,12 @@ def write_release_recording():
             return {"logits": found[:, start:]}, {"logits": truth[:, start:]}
         return evaluate
 
+    prompts: dict[int, dict[str, np.ndarray]] = {}
+
+    def image_prompt(index: int) -> dict[str, np.ndarray]:
+        prompts.setdefault(index, vision_draw(index))
+        return prompts[index]
+
     def seen(inputs):
         found = release_vision(seeing, inputs)
         with widened(twin_module):
@@ -1196,7 +1203,7 @@ def write_release_recording():
     # Every position's, those a cached walk computes after its prompt's prefill, and an image prompt's.
     arrays = {**record_case("deepseek v41 release rows", draw, evaluated(0), summary=True),
               **record_case("deepseek v41 release walk", draw, evaluated(PROMPT - 1), summary=True),
-              **record_case("deepseek v41 release vision", vision_draw, seen, summary=True)}
+              **record_case("deepseek v41 release vision", image_prompt, seen, summary=True)}
     import tilelang
 
     written = save(FIXTURE / "release.npz", {**arrays, "provenance": provenance(
@@ -1204,7 +1211,9 @@ def write_release_recording():
         "PYTHONPATH=.:tests:tools <release python> tools/deepseek_v41_reference.py --release",
         torch=torch.__version__, tilelang=tilelang.__version__)}, reference=f"{REPO}@{DEEPSEEK_V41_REVISION}",
         license="mit")
-    np.savez(FIXTURE / "release_rows.npz", rows=np.stack([rows[index] for index in range(len(rows))]))
+    np.savez(FIXTURE / "release_rows.npz", rows=np.stack([rows[index] for index in range(len(rows))]),
+             **{f"vision_{name}": np.stack([prompts[index][name] for index in range(len(prompts))])
+                for name in prompts[0]})
     print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
 
 

@@ -283,17 +283,24 @@ def as_run():
 @pytest.fixture(scope="module")
 def recorded_rows(as_run):
     """The rows the recording drew (release_rows.npz), each of whose selections, the release's float64 run
-    cleared when it was recorded, Dew's forward clears `selection_margins.MARGIN` by too: so Dew's runs
-    over them, its float64 one and the release's select alike, whichever positions a variant of the
-    forward computes them at (a gap, shifted positions, a cached walk), each of whose selections is one
-    of the forward's."""
+    cleared when it was recorded, Dew's float64 forward clears `selection_margins.MARGIN` by too: so
+    Dew's truth and the release's select alike, whichever positions a variant of the forward computes
+    them at (a gap, shifted positions, a cached walk), each of whose selections is one of the forward's.
+    The bf16 runs select as their own rounding takes them, the release's and Dew's alike, which check 1
+    weighs."""
     import selection_margins
+    from model_support import float64_twin
 
     with np.load(TINY / "release_rows.npz") as stored:
         rows = stored["rows"]
-    selecting = jax.jit(functools.partial(selection_margins.capturing, as_run.model))
+    selecting = jax.jit(functools.partial(selection_margins.capturing, float64_twin(as_run.model)))
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf,
+                            as_run.variables)
     for index, row in enumerate(rows):
-        _, captured = selecting(as_run.variables, jnp.asarray(row))
+        with jax.enable_x64(new_val=True):
+            _, captured = selecting(wide, jnp.asarray(row))
         smallest = selection_margins.margin(as_run.model_config, captured, f"recorded row {index}")
         assert smallest > selection_margins.MARGIN, (
             f"Dew's selections over recorded row {index} clear {smallest:.3g}, not MARGIN")
@@ -424,9 +431,13 @@ def test_an_image_prompt_computes_the_releases_logits(tmp_path):
                                 if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
             return logits(wide, held, inputs)
 
+    with np.load(TINY / "release_rows.npz") as stored:
+        prompts = {name: stored[f"vision_{name}"] for name in ("pixels", "input_ids", "token_types")}
     site = "deepseek v41 release vision"
     seeds = declared_seeds(RELEASE)[site]
-    draw, reference, truth = indexed_recording(recording(RELEASE), site, seeds, truth_fn=truth)
+    draw, reference, truth = indexed_recording(
+        recording(RELEASE), site, seeds, truth_fn=truth,
+        inputs_of=lambda seed: {name: value[int(seed)] for name, value in prompts.items()})
     assert_as_exact(as_given(lambda index, inputs: logits(model, variables, inputs)), reference, draw,
                     "an image prompt", seeds=seeds, truth_fn=truth)
 
