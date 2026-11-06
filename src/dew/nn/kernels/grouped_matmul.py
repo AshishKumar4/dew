@@ -715,6 +715,27 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         del config
         return mosaic_gpu.TMA_ROWS if ba.arguments.get('dense') else 1
 
+    def _granular(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
+        """Whether `config` is in `family`'s granularity (`candidate`): at most its consumers, at most the
+        programs its registers hold, a ring of two stages at least, whole roles of rows for each consumer,
+        whole column units, rows it stores evenly, one of its depths, and each streamed block's rows in
+        its consumers' equal shares (`Family.shares_rows`)."""
+        dtype = ba.arguments['tokens'].dtype
+        return not (config.warpgroups > family.consumers
+                    or config.programs > family.programs(config.warpgroups) or config.stages < 2
+                    or config.block_m % (family.role_rows * config.warpgroups)
+                    or config.block_n % family.column_unit(dtype)
+                    or not family.stores_columns(config.block_n, self._stored_rows(ba, config))
+                    or config.block_k not in family.depths(dtype)
+                    or not all(family.shares_rows(rows, config.warpgroups)
+                               for rows in self._streamed_rows(ba, config)))
+
+    def _streamed_rows(self, ba, config: mosaic_gpu.Tiles) -> tuple[int, ...]:
+        """The rows of each block a step streams, each its leading axis as it lies (its consumers' shares
+        of them, `Family.shares_rows`): the rows' tile's (`block_m`, or `block_k` read transposed) and the
+        matrix's (`block_k`, or `block_n` read transposed)."""
+        return config.block_m, config.block_k, *((config.block_n,) if ba.arguments.get('trans_rhs') else ())
+
     def _fp8(self, ba, dtype, family: mosaic.Family | None) -> bool:
         """Whether an FP8 call (`product.EIGHT`) runs here: a forward product on warpgroup MMA, its matrix
         K-major (`trans_rhs`, as Hopper's FP8 tensor cores read both operands; an N-major FP8 matrix is
@@ -831,13 +852,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if (family is None or config.cluster > family.cluster or not self._divides(ba, config)
                 or report.refused(self, ba, config)):
             return False
-        dtype = ba.arguments['tokens'].dtype
-        if (config.warpgroups > family.consumers or config.programs > family.programs(config.warpgroups)
-                or config.stages < 2
-                or config.block_m % (family.role_rows * config.warpgroups)
-                or config.block_n % family.column_unit(dtype)
-                or not family.stores_columns(config.block_n, self._stored_rows(ba, config))
-                or config.block_k not in family.depths(dtype)):
+        if not self._granular(ba, config, family):
             return False
         hooks = ba.arguments['hooks']
         axes = {axis for name, axes_of in (('prologue_operands', hooks.prologue_axes),
@@ -1113,6 +1128,11 @@ class MosaicTgmm(_Mosaic):
         # Each consumer stores its depth half of a tile whole (`mosaic_gpu.tgmm`).
         del ba
         return config.block_m // config.warpgroups
+
+    def _streamed_rows(self, ba, config: mosaic_gpu.Tiles) -> tuple[int, ...]:
+        # Both operands stream a step's rows (the tokens): `block_k` of them each.
+        del ba
+        return (config.block_k,)
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """`_Mosaic.candidate` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family

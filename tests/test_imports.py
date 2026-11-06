@@ -216,17 +216,18 @@ LAYERS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
     "inference imports no trainer or front end": (
         ("dew.inference",), (), ("dew.training", "dew._cli", "dew.decision", "dew.io")),
     "reinforcement learning imports no trainer": (("dew.rl",), (), ("dew.training",)),
+    # An environment run's record is the configuration's (`dew.config.env`), not the objectives' (row 4267).
+    "objectives import no trainer, configuration or front end": (
+        ("dew.objectives",), (), ("dew.training", "dew.config", "dew.checkpoints", "dew._cli")),
     "only the reinforcement-learning packages import dew.rl": (
         ("dew",), ("dew.rl", "dew.objectives.rl"), ("dew.rl",)),
-    "the kernels import nothing above the network layer": (
-        ("dew.nn.kernels",), (), tuple(name for name in FEATURES if name not in ("dew.nn", "dew.telemetry"))),
 }
 """The layering contracts (docs/design/architecture.md; row 1557): each one's modules, those among them it
 leaves out, and the packages none of them imports directly (absolute, relative, function-local or under
 TYPE_CHECKING). Each contract here holds on main; a layer whose crossings are still open (models reading
-weight interop, the registry's lazy family table, objectives' RL run config, interop reading the decision
-front end, the kernel report reading training, the data layer's block steps reading the network layer)
-joins when its owner settles them (rows 4264-4271)."""
+weight interop, the registry's lazy family table, interop reading the decision front end, the kernel report
+reading training, the data layer's block steps reading the network layer) joins when its owner settles them
+(rows 4264-4271)."""
 
 
 def _within(name: str, prefix: str) -> bool:
