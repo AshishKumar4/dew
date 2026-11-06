@@ -25,6 +25,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from dew.interop.decoder_parts import SourceCode
 
 type Config = Mapping[str, object]
@@ -537,11 +539,11 @@ class SourceLayout:
 
     config: Mapping[str, object]
     folders: Mapping[str, Mapping[str, object]]
-    writer: Callable[[Mapping[str, object]], Mapping[str, object]]
+    writer: Callable[[Mapping[str, object]], Mapping[str, np.ndarray]]
     code: SourceCode | None = None
     """The family's `SourceCode`, whose modules `assets` writes; None for a family transformers implements."""
 
-    def tensors(self, variables: Mapping[str, object]) -> Mapping[str, object]:
+    def tensors(self, variables: Mapping[str, object]) -> Mapping[str, np.ndarray]:
         """`variables` (the model's, every collection) as the release's tensors, by their names, each built
         when it is read (`safetensors_io.LazyTensors`)."""
         return self.writer(variables)
@@ -569,8 +571,13 @@ def source_layout(model: object, *, config: Mapping[str, object] | None = None) 
     from dew.interop import hf_decoders
     from dew.lora import unadapted
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
     from dew.registry import from_record
 
+    if isinstance(model, MultimodalTransformer):
+        from dew.interop.wrappers import wrapper_layout
+
+        return wrapper_layout(model, config=config)
     if not isinstance(model, CausalTransformer):
         return Unwritable(f"no family writes a {type(model).__name__}")
     decoder = from_record(CausalTransformer, unadapted(model))
@@ -584,7 +591,7 @@ def source_layout(model: object, *, config: Mapping[str, object] | None = None) 
     if isinstance(held, Unwritable):
         return held
 
-    def tensors(variables: Mapping[str, object]) -> Mapping[str, object]:
+    def tensors(variables: Mapping[str, object]) -> Mapping[str, np.ndarray]:
         # The bundle's own export: its storage read as layers, the extension folded, the factors merged,
         # the family's writer.
         from dew.interop.pretrained import PretrainedDecoder

@@ -33,7 +33,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
@@ -66,10 +66,12 @@ from dew.interop.decoder_parts import (
     refuse_drafter,
     translated,
 )
+from dew.interop.layouts import ConfigField, ConfigLayout
 from dew.interop.release import RELEASE_FILE
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
 from dew.interop.unread import Stored, equal, held
 from dew.interop.weights import checkpoint_dtype, insert, nested
+from dew.interop.wrappers import TextCorrection, WrapperLayout
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -86,6 +88,9 @@ from dew.nn.vision.muse_glimmer import (
 from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
 from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.registry import from_record, towers
+
+if TYPE_CHECKING:
+    from dew.nn.multimodal import MultimodalTransformer
 
 GENERATION_CONFIG_FILE = "generation_config.json"
 
@@ -301,11 +306,11 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     """Read a Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
     text = _wrapper_text(hf_config, used)
     tower = translate_siglip_vision_config(hf_config)
-    used.add("mm_tokens_per_image")
+    keys = WRAPPER_LAYOUTS["gemma3"].keys.read(hf_config, used, {})
     projector = translate_gemma_projector_config(
         tower["fields"], _records.integer(text.get("emb_features"), "emb_features"),
-        hf_config.get("mm_tokens_per_image"))
-    image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
+        keys["mm_tokens_per_image"])
+    image = _records.integer(keys["image_token_id"], "image_token_id")
     return _wrapper_fields("gemma3", used, text, tower, projector, image,
                            record_int(projector["fields"], "tokens_per_side") ** 2)
 
@@ -316,7 +321,8 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = translate_llama4_vision_config(hf_config)
     projector = translate_llama4_projector_config(
         _records.integer(text.get("emb_features"), "emb_features"))
-    image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
+    image = _records.integer(WRAPPER_LAYOUTS["llama4"].keys.read(hf_config, used, {})["image_token_id"],
+                             "image_token_id")
     vision = tower["fields"]
     grid = record_int(vision, "image_size") // record_int(vision, "patch_size")
     ratio = record_float(vision, "pixel_shuffle_ratio")
@@ -377,9 +383,10 @@ def _gemma4_placeholders(hf_config: Mapping[str, object], used: set[str]) -> tup
     default as Gemma4Config's and Gemma4UnifiedConfig's do, which agree (transformers 5.17.0,
     configuration_gemma4.py:349,352 and configuration_gemma4_unified.py:309,312), and both stay
     placeholders to the decoder whether or not a tower reads them."""
-    image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
-    return (image, _defaulted_token_id(hf_config, used, "video_token_id", 258884),
-            _defaulted_token_id(hf_config, used, "audio_token_id", 258881))
+    keys = ConfigLayout(*_GEMMA4_TOKENS).read(hf_config, used, {})
+    return (_records.integer(keys["image_token_id"], "image_token_id"),
+            _records.integer(keys["video_token_id"], "video_token_id"),
+            _records.integer(keys["audio_token_id"], "audio_token_id"))
 
 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
@@ -417,15 +424,15 @@ def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> 
 
 def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Qwen 3.5 wrapper: NaViT-style tower, merger, decoder."""
-    if hf_config.get('language_model_only', False) is not False:
+    keys = _QWEN35_KEYS.read(hf_config, used, {})
+    if keys['language_model_only'] is not False:
         refuse('language_model_only', 'the multimodal wrapper requires its vision component')
-    used.add('language_model_only')
     family = _records.text(hf_config['model_type'], 'model_type')
     text = _wrapper_text(hf_config, used)
     tower = translate_qwen35_vision_config(hf_config)
     projector = translate_qwen35_projector_config(
         hf_config, _records.integer(text.get("emb_features"), "emb_features"))
-    image = _wrapper_token_id(hf_config, used, "image_token_id")
+    image = _records.integer(keys["image_token_id"], "image_token_id")
     # One resolution per call, so the soft-token count varies with the image
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
@@ -473,7 +480,8 @@ def _lfm3_vl_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
                  "projector_layer_norm_eps", "video_token_id", "vision_start_token_id", "vision_end_token_id",
                  "auto_map", "bos_token_id", "eos_token_id", "pad_token_id", "dtype"))
     # Lfm3VlConfig's placeholders where a config leaves them out (configuration_lfm3_vl.py).
-    image = _defaulted_token_id(hf_config, used, "image_token_id", 125030)
+    image = _records.integer(WRAPPER_LAYOUTS["lfm3_vl"].keys.read(hf_config, used, {})["image_token_id"],
+                             "image_token_id")
     video = _defaulted_token_id(hf_config, used, "video_token_id", 125029)
     fields = _wrapper_fields("lfm3_vl", used, text, tower, projector, image, None, video=video)
     fields["text_model_type"] = _records.text(_text_config(hf_config)["model_type"], "text_config.model_type")
@@ -516,6 +524,126 @@ def _text_vlm_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrappe
     fields["unported"] = {"visual.": f"{model_type}'s vision tower has no Dew port"}
     fields["text_unprefixed"] = ("embed_tokens.", "layers.", "norm.")
     return fields
+
+
+def _token(key: str, field: str, *aliases: str, default: int | None = None,
+           value: Callable[[MultimodalTransformer], object] | None = None
+           ) -> ConfigField[MultimodalTransformer]:
+    """A placeholder id the wrapper states under `key` (or `aliases`), its config class's `default`
+    where it has one (required where None), filling `field` of the wrapper's record, written from the
+    model's (`value`, its own field where None)."""
+    if default is None:
+        return ConfigField(key, field, parse=_records.integer, value=value, aliases=aliases)
+    return ConfigField(key, field, default, parse=_records.integer, value=value, aliases=aliases)
+
+
+def _projected(field: str) -> Callable[[MultimodalTransformer], int]:
+    """A wrapper's projector's `field`, which the wrapper states at its own scope."""
+    return lambda model: getattr(model.projection, field)
+
+
+def _qwen35_mrope(text: Mapping[str, object]) -> Mapping[str, object]:
+    """Qwen3.5's full-attention layers rotate by the three mrope sections of its text_config's
+    rope_parameters (modeling_qwen3_5.py, Qwen3_5TextRotaryEmbedding)."""
+    rope = _records.record(text.get("rope_parameters") or {}, "rope_parameters")
+    sections = rope.get("mrope_section", [11, 11, 10])
+    if (not isinstance(sections, (list, tuple)) or len(sections) != 3
+            or any(type(value) is not int or value < 0 for value in sections)):
+        raise ValueError("mrope_section must contain three nonnegative integer widths")
+    return {"mrope_section": list(sections)}
+
+
+def _qwen35_rope(held: Mapping[str, object], text: Mapping[str, object]) -> Mapping[str, object]:
+    """The text_config's rope_parameters with the mrope sections, interleaved as the reference always
+    reads them, beside the base, the rotated fraction and any scaling its text family writes."""
+    text = dict(text)
+    scaling = text.pop("rope_scaling", None) or {"rope_type": "default"}
+    text["rope_parameters"] = {**_records.record(scaling, "rope_scaling"),
+                               "rope_theta": text.pop("rope_theta"),
+                               "partial_rotary_factor": text.pop("partial_rotary_factor", 1.0),
+                               "mrope_section": list(_records.integers(held["mrope_section"],
+                                                                       "mrope_section")),
+                               "mrope_interleaved": True}
+    return text
+
+
+def _bidirectional(fields: Mapping[str, object], *, default: str | None = None
+                   ) -> Callable[[Mapping[str, object]], Mapping[str, object] | None]:
+    """A correction read where the text_config attends its vision spans both ways
+    (`use_bidirectional_attention` 'vision', `default` where unstated)."""
+    def read(text: Mapping[str, object]) -> Mapping[str, object] | None:
+        return fields if text.get("use_bidirectional_attention", default) == "vision" else None
+    return read
+
+
+def _states_vision(held: Mapping[str, object], text: Mapping[str, object]) -> Mapping[str, object]:
+    return {**text, "use_bidirectional_attention": "vision"}
+
+
+_GEMMA4_TOKENS = (_token("image_token_id", "image_token_id", "image_token_index"),
+                  _token("video_token_id", "video_token_id", default=258884,
+                         value=lambda model: model.extra_placeholder_ids[0]),
+                  _token("audio_token_id", "audio_token_id", default=258881,
+                         value=lambda model: model.extra_placeholder_ids[1]))
+"""Gemma 4's placeholder ids, the video's and audio's at Gemma4Config's defaults
+(configuration_gemma4.py:349,352, and Gemma4UnifiedConfig's alike), held among the decoder's extra
+placeholders."""
+
+_QWEN35_KEYS = ConfigLayout(
+    _token("image_token_id", "image_token_id"),
+    # Qwen 3.5's language-model-only checkpoint drops the tower this wrapper reads.
+    ConfigField("language_model_only", "language_model_only", default=False,
+                value=lambda model: False))
+
+WRAPPER_LAYOUTS: Mapping[str, WrapperLayout] = {
+    "gemma3": WrapperLayout(
+        "Gemma3ForConditionalGeneration", ConfigLayout(
+            _token("image_token_index", "image_token_id", "image_token_id"),
+            ConfigField("mm_tokens_per_image", "mm_tokens_per_image", None,
+                        value=lambda model: _projected("tokens_per_side")(model) ** 2)),
+        vision_type="siglip_vision_model",
+        corrections=(TextCorrection(None, ("bidirectional_images",),
+                                    lambda text: {"bidirectional_images": True}, lambda held, text: text),)),
+    "llama4": WrapperLayout(
+        "Llama4ForConditionalGeneration",
+        ConfigLayout(_token("image_token_index", "image_token_id", "image_token_id")),
+        root="", nests_head=True, vision_type="llama4_vision_model"),
+    "gemma4": WrapperLayout(
+        "Gemma4ForConditionalGeneration", ConfigLayout(*_GEMMA4_TOKENS),
+        corrections=(TextCorrection(("sliding_attention",), ("bidirectional_images",),
+                                    _bidirectional({"bidirectional_images": True}), _states_vision),)),
+    "gemma4_unified": WrapperLayout(
+        "Gemma4UnifiedForConditionalGeneration", ConfigLayout(*_GEMMA4_TOKENS),
+        corrections=(TextCorrection(None, ("bidirectional_blocks",),
+                                    _bidirectional({"bidirectional_blocks": True}, default="vision"),
+                                    _states_vision),)),
+    **{family: WrapperLayout(
+        architecture, _QWEN35_KEYS, tied_default=False,
+        corrections=(TextCorrection(("full_attention",), ("mrope_section",), _qwen35_mrope, _qwen35_rope),))
+       for family, architecture in (("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+                                    ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+                                    ("qwen4_exp", "Qwen4ExpForConditionalGeneration"))},
+    "lfm3_vl": WrapperLayout(
+        "Lfm3VlForConditionalGeneration", ConfigLayout(
+            _token("image_token_id", "image_token_id", default=125030),
+            # The projector's geometry, at Lfm3VlConfig's defaults (`translate_lfm3_vl_projector_config`).
+            ConfigField("downsample_factor", "downsample_factor", 2,
+                        value=_projected("spatial_merge_size")),
+            ConfigField("projector_hidden_size", "projector_hidden_size", 4096,
+                        value=_projected("width")),
+            ConfigField("projector_bias", "projector_bias", default=True,
+                        value=_projected("bias")),
+            ConfigField("projector_layer_norm_eps", "projector_layer_norm_eps", 1e-6,
+                        value=_projected("norm_eps")),
+            ConfigField("projector_hidden_act", "projector_hidden_act", "gelu",
+                        value=_projected("activation"))),
+        text_type="lfm3"),
+}
+"""Each wrapper's release layout (`dew.interop.wrappers.WrapperLayout`), by its model_type: the writer of
+a wrapper built in Dew (`wrappers.wrapper_layout`) and its reader's text corrections and placeholder keys
+(`_wrapper_text_fields`, the readers above) read the same declaration. A wrapper absent here (Muse
+Glimmer's, whose language model holds its placeholders; Gemma 3n's MobileNet; the audio towers) is read
+and not yet written."""
 
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
@@ -1462,6 +1590,12 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
     except ValueError as error:
         raise ExportRefused(f"the {config['model_type']} config written for this model does not read back: "
                             f"{error}") from error
+    refuse_rebuilt(model, rebuilt, str(config['model_type']))
+
+
+def refuse_rebuilt(model: CausalTransformer, rebuilt: CausalTransformer, model_type: str) -> None:
+    """Refuse a decoder whose written config reads back as `rebuilt`, another computation than `model`,
+    naming the fields that differ."""
     lost: dict[str, tuple[str, str]] = {}
     for declared in dataclasses.fields(model):
         if declared.name in _RUNTIME_FIELDS:
@@ -1472,7 +1606,7 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
             lost[declared.name] = (repr(theirs), repr(ours))
     if lost:
         raise ExportRefused(
-            f"{sorted(lost)} would not survive an export as {config['model_type']}: its config reads back "
+            f"{sorted(lost)} would not survive an export as {model_type}: its config reads back "
             f"{', '.join(f'{name}={read}' for name, (read, _) in lost.items())} where this model has "
             f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, "
             "so transformers would compute "
