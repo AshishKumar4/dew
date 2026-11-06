@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -37,10 +37,12 @@ if TYPE_CHECKING:
     from dew.training.trainer import Trainer
 
 
-def candidate_for(trainer: Trainer[Any, Any], state: TrainState, batch: Batch, schedule: Schedule, placement,
-                  replicated, split: int, narrow: bool | None, launches: str | None, lowering: bool = True, *,
-                  mesh: Mesh | AbstractMesh | None = None, platforms: tuple[str, ...] | None = None,
-                  capacity: int | None = None, footprint: Footprint | None = None) -> Candidate:
+def candidate_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
+                                   schedule: Schedule, placement, replicated, split: int, narrow: bool | None,
+                                   launches: str | None, lowering: bool = True, *,
+                                   mesh: Mesh | AbstractMesh | None = None,
+                                   platforms: tuple[str, ...] | None = None, capacity: int | None = None,
+                                   footprint: Footprint | None = None) -> Candidate:
     """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
     alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
     `launches` are its kernel launches where a record holds them, which settle their configs before it
@@ -105,8 +107,8 @@ def candidate_for(trainer: Trainer[Any, Any], state: TrainState, batch: Batch, s
                      lower.report() if lowering else KernelReport((), ()), footprint, sampled)
 
 
-def consumes_where_made(trainer: Trainer[Any, Any], prepared: TrainState, micro: Batch, window: int,
-                        shapes) -> bool:
+def consumes_where_made[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], prepared: TrainState,
+                                         micro: Batch, window: int, shapes) -> bool:
     """Whether the step over `prepared` consumes each gradient where it is made
     (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
     (`group_of`), not the outer optimizer's."""
@@ -115,8 +117,8 @@ def consumes_where_made(trainer: Trainer[Any, Any], prepared: TrainState, micro:
                                    progressed=trainer._examples is not None)
 
 
-def prepared_for(trainer: Trainer[Any, Any], state: TrainState, batch: Batch, schedule: Schedule, split: int,
-                 narrow: bool | None = None):
+def prepared_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
+                                  schedule: Schedule, split: int, narrow: bool | None = None):
     """The loss's shapes (None under a custom step), the narrow copies and the state's shapes with the
     accumulation of an update's window, `split` microbatches a step (DiLoCo's groups' `windowed`), and
     the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
@@ -138,8 +140,9 @@ def prepared_for(trainer: Trainer[Any, Any], state: TrainState, batch: Batch, sc
     return shapes, copies, prepared
 
 
-def step_program(trainer: Trainer[Any, Any], shapes, copies: dict, shardings: Placement[TrainState],
-                 placement, replicated: NamedSharding, split: int, sampled: bool = False):
+def step_program[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], shapes, copies: dict,
+                                  shardings: Placement[TrainState], placement, replicated: NamedSharding,
+                                  split: int, sampled: bool = False):
     """The step over one of the `split` microbatches of a batch
     (`microbatch`), which counts the step at its last microbatch. It takes the state apart
     (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
@@ -172,8 +175,8 @@ def step_program(trainer: Trainer[Any, Any], shapes, copies: dict, shardings: Pl
                          out_shardings=returned, donate_argnums=0)
 
 
-def lowered_for(trainer: Trainer[Any, Any], state: TrainState, batch: Batch,
-                generation: str) -> jax.stages.Lowered:
+def lowered_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
+                                 generation: str) -> jax.stages.Lowered:
     """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
     (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of that GPU's
     devices, from which JAX's Pallas lowering reads the GPU, at the base rung and the plan's first split:
