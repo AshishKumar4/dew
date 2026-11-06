@@ -1812,6 +1812,41 @@ beside the walk's), and a softcap's inference forward 256 wide (Gemma's)."""
 
 
 @COMPILES_ON_CPU
+def test_the_public_template_route_runs_each_shards_rows_and_heads_with_no_collective():
+    """The public call on the template (`scaled_dot_product_attention`), causal, forward and backward, its
+    batch split over a compile-only H100 mesh's data axis and its heads over its tensor axis, compiled for
+    them: the forward launches, reading its shard's rows and heads (four query heads of eight, two key heads
+    of four, two rows of four), and the program moves and sums nothing, its backward's launches whichever
+    the derivation takes (`kernel_compile.Expected`, its route evidence): a head's softmax and its gradients
+    are its own."""
+    import fla_gdn_support as support
+    from jax.sharding import PartitionSpec
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    from dew.nn.attention import scaled_dot_product_attention
+
+    rows, tokens, heads, kv_heads, width = 4, 256, 8, 4, 64
+
+    def call():
+        def step(query, key, value):
+            def loss(query, key, value):
+                out = scaled_dot_product_attention(query, key, value, implementation="template", causal=True)
+                return out.astype(jnp.float32).sum()
+            return jax.grad(loss, argnums=(0, 1, 2))(query, key, value)
+
+        def shaped(kv):
+            return jax.ShapeDtypeStruct((rows, tokens, kv, width), jnp.bfloat16)
+        return step, (shaped(heads), shaped(kv_heads), shaped(kv_heads))
+
+    spec = PartitionSpec("data", None, "tensor", None)
+    expected = Expected(axes=(("data", 2), ("tensor", 2)), specs=(spec, spec, spec),
+                        launches=frozenset({"attention_forward"}),
+                        shards={"attention_forward": (rows // 2, tokens, heads // 2, width)})
+    cases = [support.KernelCase("template route", call, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
+
+
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT], ids=["inference", "training"])
 def test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for(dtype, kept):

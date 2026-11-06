@@ -10,7 +10,8 @@ product warp issues each step's `S = Q Kᵀ` into tensor memory and, a step behi
 accumulator there, so a step's `S` is computed while the last step's weights multiply their values. The
 softmax warpgroup reads `S` out of tensor memory, hands it to the algebra (`logits_of`, `peak`, `weights`,
 `denominator_after`), hands each step's rescale of the state before it to the correction warpgroup through
-shared memory, and writes the narrowed weights back for the next `P V` once the last one has read its own.
+shared memory, and writes the narrowed weights into one of two buffers in tensor memory, the other the last
+step's, which its `P V` reads meanwhile (FlashAttention-4's), once the `P V` two steps back has read it.
 The correction warpgroup, FlashAttention-4's, rescales the output's accumulator in place once the last
 `P V` is in it (`rescale`, `CHUNK` columns at a time), which the next `P V` waits for, and runs the
 epilogue from the softmax's final rows: the rescale is off the softmax's path, its exponentials beside the
@@ -120,8 +121,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 class _Scratch(NamedTuple):
     """A program's opened scratch: its query block and its load's signal, the key and value rings
     (`mosaic_sm100.Ring`), `S`'s accumulator (`mosaic_sm100.Tensor`: the products commit it, the softmax
-    releases it once read), the weights in tensor memory and the signal publishing them, the output's
-    accumulator and the signal each `P V` commits (`mosaic_sm100.Signal`, a turn a step), each step's
+    releases it once read), the weights' two buffers in tensor memory (a step's the turn's slot of the
+    signal publishing them), the output's accumulator and the signal each `P V` commits
+    (`mosaic_sm100.Signal`, a turn a step, two slots: a step's weights wait for the one two back), each step's
     rescale in shared memory (two slots) and the signal the softmax gives it by, the signal the correction
     publishes the rescaled accumulator by, the softmax's final rows in shared memory and their signal, and
     the epilogue's stages, which it writes by item (`ref[...] = `, which no static type of JAX's refs
@@ -132,7 +134,7 @@ class _Scratch(NamedTuple):
     keys: mosaic_sm100.Ring
     values: mosaic_sm100.Ring
     scores: mosaic_sm100.Tensor
-    p_tmem: mosaic.Ref
+    p_tmems: tuple[mosaic.Ref, mosaic.Ref]
     p_full: mosaic_sm100.Signal
     acc_tmem: mosaic.Ref
     o_done: mosaic_sm100.Signal
@@ -202,7 +204,9 @@ def _products(block: _Block, scratch: _Scratch) -> None:
         (v_smem,), consumed = scratch.values.acquire(scratch.values.turn(index))
         scratch.p_full.wait(scratch.p_full.turn(index))
         pl.when(index > 0)(lambda: scratch.corrected.wait(scratch.corrected.turn(index - 1)))
-        TCGEN05.product(scratch.acc_tmem, scratch.p_tmem, v_smem, consumed, accumulate=index > 0)
+        for slot, p_tmem in enumerate(scratch.p_tmems):
+            pl.when(lax.rem(index, 2) == slot)(functools.partial(
+                TCGEN05.product, scratch.acc_tmem, p_tmem, v_smem, consumed, accumulate=index > 0))
         scratch.o_done.committed(scratch.o_done.turn(index))
 
     @pl.loop(0, block.blocks)
@@ -249,12 +253,14 @@ def _softmax(block: _Block, scratch: _Scratch, *, spec: algebra.Forward, tiles: 
         @pl.when(index > 0)
         def _():
             # The factor to the correction, in the slot two steps back's: the correction read that one
-            # before the `P V` this step's weights wait for (`_correction`). Then the last step's `P V`,
-            # done reading its weights, before this step's overwrite them.
+            # before the `P V` this step's weights wait for (`_correction`).
             turn = scratch.scaled.turn(index - 1)
             scratch.scales.at[turn.slot][...] = alpha
             scratch.scaled.published(turn)
-            scratch.o_done.wait(scratch.o_done.turn(index - 1))
+
+        # The `P V` two steps back done reading the buffer this step's weights overwrite; the last step's
+        # reads the other meanwhile.
+        pl.when(index > 1)(lambda: scratch.o_done.wait(scratch.o_done.turn(index - 2)))
 
         for part in range(parts):
             # The weights complete before their two readers, the sum below and the narrowed copy `P V` takes:
@@ -265,7 +271,10 @@ def _softmax(block: _Block, scratch: _Scratch, *, spec: algebra.Forward, tiles: 
             weights = lax.optimization_barrier(algebra.weights(spec, logits(read, index, part, masked)[0], m))
             total = (algebra.denominator_after(total, alpha, weights) if part == 0
                      else total + weights.sum(axis=-1))
-            TCGEN05.store_columns(scratch.p_tmem, part * PART, algebra.narrow(weights, dtype))
+            narrowed = algebra.narrow(weights, dtype)
+            for slot, p_tmem in enumerate(scratch.p_tmems):
+                pl.when(lax.rem(index, 2) == slot)(functools.partial(
+                    TCGEN05.store_columns, p_tmem, part * PART, narrowed))
         # The next S may overwrite this one once it is read out (`Tensor.release`).
         scratch.scores.release(scratch.scores.turn(index))
         scratch.p_full.published(scratch.p_full.turn(index))
@@ -347,11 +356,11 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     scores = mosaic_sm100.Accumulators(1, rows, block_k)
 
     def kernel(q_ref, k_ref, v_ref, out_ref, maxima_ref, over_ref, *refs):
-        (q_smem, q_loaded, key_refs, value_refs, score_refs, p_tmem, p_full, acc_tmem, o_done, scales,
+        (q_smem, q_loaded, key_refs, value_refs, score_refs, p_even, p_odd, p_full, acc_tmem, o_done, scales,
          scaled, corrected, rows_smem, finished, o_smem, l_smem) = refs
         scratch = _Scratch(q_smem, loads.opened(q_loaded), key_stages.opened(*key_refs),
-                           value_stages.opened(*value_refs), scores.opened(*score_refs), p_tmem,
-                           signals.opened(p_full), acc_tmem, signals.opened(o_done), scales,
+                           value_stages.opened(*value_refs), scores.opened(*score_refs), (p_even, p_odd),
+                           paired.opened(p_full), acc_tmem, paired.opened(o_done), scales,
                            handed.opened(scaled), signals.opened(corrected), rows_smem,
                            loads.opened(finished), o_smem, l_smem)
         block = _Block(spec.form == "causal", blocks, block_k)
@@ -369,10 +378,12 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     # one while the softmax writes the next.
     loads, signals = mosaic_sm100.Signals(tensor_core=False), mosaic_sm100.Signals()
     handed = mosaic_sm100.Signals(count=2, tensor_core=False)
+    # The weights' two buffers' signals and each `P V`'s, a slot a buffer.
+    paired = mosaic_sm100.Signals(count=2)
     scratch = (mosaic_sm100.operand((rows, width), dtype, width), loads.scratch(),
                key_stages.scratch(), value_stages.scratch(), scores.scratch(target),
-               mosaic_sm100.operand_columns(rows, block_k, dtype), signals.scratch(),
-               mosaic_sm100.accumulator_columns(rows, value_width), signals.scratch(),
+               *(mosaic_sm100.operand_columns(rows, block_k, dtype) for _ in range(2)), paired.scratch(),
+               mosaic_sm100.accumulator_columns(rows, value_width), paired.scratch(),
                plgpu.SMEM((2, rows), jnp.float32), handed.scratch(), signals.scratch(),
                plgpu.SMEM((2, rows), jnp.float32), loads.scratch(),
                mosaic_sm100.operand((rows, value_width), dtype, value_width), mosaic_sm100.vector(rows))

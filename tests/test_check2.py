@@ -747,6 +747,21 @@ def test_the_recurrence_step_witness_holds_the_interpreted_mainloop(regime):
 
 
 @INTERPRETS
+def test_the_recurrence_step_witness_holds_a_packed_call():
+    """The step witness (row 2084 (e)) on a packed bf16 call of three chunks whose second document begins at
+    the second chunk: its first chunk enters the zero memory a document starts from, held as stored, and
+    every record lies inside its step's enclosure."""
+    import jax.numpy as jnp
+
+    operands = rw.draw(0, "mild")
+    starts = jnp.zeros((1, operands[0].shape[1]), bool).at[0, rw.CHUNK].set(True)
+    run = rw.recorded(*operands, starts=starts, max_segments=2)
+    held = rw.witness(run, rw.interpreted_lane())
+    for name in rw.RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
+
+
+@INTERPRETS
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
     (`rw.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where fp32 is held."""
