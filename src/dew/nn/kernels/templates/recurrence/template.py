@@ -254,6 +254,15 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     return rule(query, key, value, g, beta, state, starts, firsts, skip)
 
 
+def walk_roles(family: mosaic.Family) -> int:
+    """The consumer roles a walk program of `family` takes (`Tiles.walkers`): its consumers beside a producer
+    (`Family.warpgroups`), each its own value blocks, else one, where a family without one runs its
+    consumers over one pipeline together, whose scoped allocations the walks do not make collective
+    (mma.sync's two consumers, d1a42595a22, failed to lower the walks on an A100: test_lowering and the
+    compile gate red at base 14e38ca857)."""
+    return family.consumers if family.warpgroups(1) > 1 else 1
+
+
 @dataclasses.dataclass(frozen=True)
 class Mosaic(base.Template[mainloop.Tiles]):
     """The chunked rule on the recurrence template's mainloop (`mosaic_rule`), its config
@@ -486,7 +495,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None
         _, columns, _ = _widths(ba, family, training=training)
         blocks = columns // tiles.block_v
-        for walkers in range(min(family.consumers, waves), 1, -1):
+        for walkers in range(min(walk_roles(family), waves), 1, -1):
             if blocks % walkers:
                 continue
             grouped = self._staged(ba, tiles.block_v, target, walkers=walkers,
