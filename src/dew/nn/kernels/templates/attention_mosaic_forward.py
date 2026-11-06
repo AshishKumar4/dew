@@ -544,7 +544,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     folding = algebra.folds(scale, power, natural=natural, score_mod=hooks.score_mod)
     taken = power if folding and spans.form != "spans" else 1.0
     call = padded_call(by_power(query, power / taken), key, value, spans, hooks, _block(tiles), table,
-                       query_block=tiles.consumers * tiles.block_q if inference else None)
+                       query_block=tiles.consumers * tiles.block_q if inference else None, by_position=True)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
                            initial=hooks.initial is not None,
