@@ -82,7 +82,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.engram",
                 "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.vision", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.kernels", "dew.nn.kernels", "dew.algebra", "dew.nn.sharding",
                 "dew.nn.wrapping", "dew.nn.scatter", "dew.nn.precision", "dew.nn.derivatives", "dew.nn.nested",
-                "dew.lora"]),
+                "dew.lora", "dew.nn.norms", "dew.kernels"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
                                 "dew.diffusion.presets", "dew.diffusion.discrete", "dew.sampling",
