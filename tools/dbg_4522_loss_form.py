@@ -35,6 +35,15 @@ def direct_loss(logits, targets, variant):
 def make(kind, variant):
     def one(variables, hidden, targets, weights, ids):
         def loss(variables, hidden):
+            if variant in ("actual", "equation"):
+                fields = {} if kind == "documents" else {"segment_ids": ids[None]}
+                adaptation = t.ChunkAdaptation(window=3, rate=0.5)
+                scores = (t.adapted_scores(t.MODEL, variables, hidden[None], targets[None],
+                                          weights[None], fields, adaptation, predict=False,
+                                          logits=False).losses if variant == "actual" else
+                          t.equation_71(t.MODEL, variables, hidden[None], targets[None], weights[None],
+                                        fields, adaptation, truth=False))
+                return jnp.sum(weights * scores[0])
             def single(state, target):
                 logits = t.MODEL.apply(
                     variables, t.MODEL.apply(variables, state[None], method="continuum_states"),
@@ -63,7 +72,7 @@ def make(kind, variant):
 kind = sys.argv[1] if len(sys.argv) > 1 else "documents"
 count = int(sys.argv[2]) if len(sys.argv) > 2 else 256
 variants = ("literal", "token-categorical", "batch-categorical", "batch-logsoftmax", "batch-wide",
-            "batch-log1p")
+            "batch-log1p", "actual", "equation")
 programs = {(variant, mode): jax.jit(make(kind, variant), compiler_options=(
     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))
     for variant in variants for mode in ("on", "off")}
