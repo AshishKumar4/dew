@@ -115,6 +115,7 @@ from dew.inference.serving_kernel import (
     page_programs,
     page_shapes,
     prefill_program,
+    prefilled_shardings,
     resident_formats,
     row_state,
     split_donated,
@@ -146,7 +147,7 @@ from dew.nn.inputs import (
 )
 from dew.nn.kernels import generation
 from dew.nn.kernels.options import Fetched, compiler_options, program as outer_program
-from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
+from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name, row_axis
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
@@ -702,10 +703,14 @@ class Server:
         rows = self.rows
         if isinstance(rows, PagedRows) and rows.stateful:
             entries = rows.states * self.groups
-            states = jax.tree_util.tree_map_with_path(
-                lambda path, leaf: jax.device_put(jnp.zeros((entries, *leaf.shape[1:]), leaf.dtype),
-                                                  leaf.sharding) if row_state(path) else None,
-                self.cache)
+
+            def store(path, leaf):
+                # Each entry where a slot's row is: a run's bank holds its layers first (`row_axis`).
+                axis = row_axis(path)
+                return jax.device_put(jnp.zeros((*leaf.shape[:axis], entries, *leaf.shape[axis + 1:]),
+                                                leaf.dtype), leaf.sharding) if row_state(path) else None
+
+            states = jax.tree_util.tree_map_with_path(store, self.cache)
             self._states = states
             self._restored, self._captured = map(Fetched, state_programs(formats, states))
         self._host: dict[int, list[np.ndarray]] | None = None
@@ -1124,7 +1129,7 @@ class Server:
                                       rows, self.progress)
         # Onto the decoding rows: the server's mesh's, or the default device's, where an unmeshed state is.
         return dataclasses.replace(admission, prefilled=_moved(
-            prefilled, default_placement() if self._admitted is None else self._admitted,
+            prefilled, default_placement() if self._admitted is None else prefilled_shardings(self._admitted),
             phase="prefilled rows to the decoding mesh"))
 
     def _owed(self) -> dict[str, list[list[int]]]:
@@ -1159,7 +1164,7 @@ class Server:
                       if self.pooled else pinned_get(jax.tree.leaves(read)))
             for index, (_, slot) in enumerate(batch):
                 if slot // host in self._local:
-                    self._host[slot] = [np.asarray(leaf)[:, index].copy() for leaf in leaves]
+                    self._host[slot] = [np.asarray(leaf)[index].copy() for leaf in leaves]
         share = width // self.groups
         by_group = [[pair for pair in uploads if pair[0] // host == group] for group in range(self.groups)]
         shapes = page_shapes(self._resident, self._carried, share)
@@ -1171,7 +1176,7 @@ class Server:
                     pages[group, index] = page
                     if group in self._local:
                         for rows, held_page in zip(held, self._host[slot], strict=True):
-                            rows[self._local.index(group), :, index] = held_page
+                            rows[self._local.index(group), index] = held_page
             self._resident, self._carried = self._written_pages(
                 self._resident, self._carried, pages,
                 jax.tree.unflatten(jax.tree.structure(shapes), self._placed(held)))
@@ -1479,20 +1484,22 @@ def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
 def _on_mesh(variables: Variables, mesh: Mesh) -> Variables:
     """`variables` placed on `mesh` as they lie on their own, each leaf's partition spec kept: a copy of a
     server's weights on its prefill mesh. A leaf on one device is replicated."""
-    return _moved(variables, lambda leaf: NamedSharding(
+    return _moved(variables, lambda path, leaf: NamedSharding(
         mesh, leaf.sharding.spec if isinstance(leaf.sharding, NamedSharding) else P()),
         phase="weights to the prefill mesh")
 
 
-def _moved[T](tree: T, sharding: jax.sharding.Sharding | Callable[[jax.Array], jax.sharding.Sharding], *,
-              phase: str) -> T:
-    """`tree` placed by `sharding`, one for every leaf or each leaf's: where JAX moves it between the
-    device sets (`jax.device_put`, every array within this process's devices), as it does; between meshes
-    over several processes, each leaf gathered to every process's host (`collective_host`, every process
-    calling it) and each process's shards made of it, as JAX's transfers cannot move a sharded array to
-    another processes' device set."""
-    leaves, structure = jax.tree.flatten(tree)
-    targets = [sharding if isinstance(sharding, jax.sharding.Sharding) else sharding(leaf) for leaf in leaves]
+def _moved[T](tree: T, sharding: jax.sharding.Sharding | Callable[[tuple, jax.Array], jax.sharding.Sharding],
+              *, phase: str) -> T:
+    """`tree` placed by `sharding`, one for every leaf or each leaf's by its path: where JAX moves it between
+    the device sets (`jax.device_put`, every array within this process's devices), as it does; between
+    meshes over several processes, each leaf gathered to every process's host (`collective_host`, every
+    process calling it) and each process's shards made of it, as JAX's transfers cannot move a sharded
+    array to another processes' device set."""
+    paths, structure = jax.tree_util.tree_flatten_with_path(tree)
+    leaves = [leaf for _, leaf in paths]
+    targets = [sharding if isinstance(sharding, jax.sharding.Sharding) else sharding(path, leaf)
+               for path, leaf in paths]
     if all(leaf.is_fully_addressable and target.is_fully_addressable
            for leaf, target in zip(leaves, targets, strict=True)):
         return jax.tree.unflatten(structure, jax.device_put(leaves, targets))
