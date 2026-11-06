@@ -267,3 +267,9 @@ def kernel_gradient_holds(native, products: list, out) -> np.ndarray:
     `products` admit (`native_dot_holds`)."""
     return np.stack([native_dot_holds(each, group, out, flushes=False)
                      for each, group in zip(native, products, strict=True)])
+
+
+PTX_EX2 = 2
+"""PTX ISA 9.4 §9.7.3.21: "The maximum ulp error is 2 ulp from correctly rounded result across the full
+range of inputs" of ex2.approx.f32, Mosaic GPU's `exp2` under `approx_math`, which the recurrence and
+attention mainloops' launches compile with."""

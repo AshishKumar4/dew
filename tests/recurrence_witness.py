@@ -176,16 +176,22 @@ def aligned(iv: Iv, fmt: Format) -> np.ndarray:
     return np.maximum(at(iv.lo, fmt), at(iv.hi, fmt))
 
 
-def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
+def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16, into: Iv | None = None) -> Iv:
     """`a @ b` (`[M, K] @ [K, N]`) as one product the tensor cores accumulate in fp32: each term's exact range
     (products of 16-bit values of `fmt`), summed within the native-dot contract's bound
     (`native_certificates.native_dot_holds`: gamma_n at a truncating add's unit, n the terms that may be
     nonzero, an add of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's
     magnitudes are the terms' as the tensor cores align them (`aligned`): a subnormal operand's at `fmt`'s
-    least normal, the exponent its field holds."""
+    least normal, the exponent its field holds. With `into`, the product accumulated into fp32 registers
+    holding values within it (a tensor core's accumulate-in-place): one more term of the sum."""
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
+    if into is not None:
+        terms = Iv(np.concatenate([terms.lo, into.lo[..., None]], -1),
+                   np.concatenate([terms.hi, into.hi[..., None]], -1))
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1)
     magnitude = (aligned(a, fmt)[:, None, :] * aligned(b, fmt).T[None, :, :]).sum(-1) * (1 + 2.0 ** -50)
+    if into is not None:
+        magnitude = magnitude + np.maximum(np.abs(into.lo), np.abs(into.hi)) * (1 + 2.0 ** -50)
     # The native-dot contract's allowance, and the float64 interval sums' own roundings beside it.
     slack = (allowance(magnitude, live, TRUNCATING["float32"], truncating_underflow(lane.flushes))
              + (live + 1) * 2.0 ** -52 * magnitude)
@@ -369,15 +375,27 @@ def stored_memory(iv: Iv, lane: Lane) -> Iv:
     return staged(iv)
 
 
-def exp2_reach(native) -> int:
+def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
     """The most steps of the fp32 grid `native(x)`, an fp32 `exp2` of fp32 operands, lies from `2^x` correctly
-    rounded (`op_certificates.exp2_rounded`), over the fractions `algebra.raised` and `algebra.decayed` take,
-    (-2, 2): 2^17 of them, densely and drawn, the integers there (exact cases) among them."""
+    rounded (`op_certificates.exp2_rounded`), over the operands a mainloop takes, (`low`, `high`): by
+    default the fractions `algebra.raised` and `algebra.decayed` take, (-2, 2); 2^17 of them, densely and
+    drawn, the integers there (exact cases) among them. A zero is the flush `exp2` admits (its enclosure is
+    zero where its lower end, that many steps down, falls below the normal range), not a step: measured
+    over the nonzero results, and a zero where that end is normal refuses the lane."""
     rng = np.random.default_rng(2084)
-    x = np.concatenate([np.linspace(-2, 2, 1 << 16, dtype=np.float32), np.arange(-2, 3, dtype=np.float32),
-                        rng.uniform(-2, 2, (1 << 16) - 5).astype(np.float32)])
-    found = grid_index(np.asarray(native(x), np.float64))
-    return int(np.max(np.abs(found - grid_index(exp2_rounded(x, FLOAT32)))))
+    whole = np.arange(np.ceil(low), np.floor(high) + 1, dtype=np.float32)
+    x = np.concatenate([np.linspace(low, high, 1 << 16, dtype=np.float32), whole,
+                        rng.uniform(low, high, (1 << 16) - len(whole)).astype(np.float32)])
+    found, exact = np.asarray(native(x), np.float64), exp2_rounded(x, FLOAT32)
+    flushed = found == 0
+    reach = int(np.max(np.abs(grid_index(found) - grid_index(exact))[~flushed]))
+    lowest = exact[flushed]
+    for _ in range(reach):
+        lowest = stepped(lowest, FLOAT32, -np.inf)
+    normal = lowest >= 2.0 ** FLOAT32.emin
+    if np.any(normal):
+        raise ArithmeticError(f"the lane's exp2 flushes a normal result at {x[flushed][normal][:4]}")
+    return reach
 
 
 RECORDS = ("a", "w", "c", "o", "h", "leaving")
@@ -407,7 +425,9 @@ class Run:
     corrected values `c` and output `o` `[N, H, C, Dv]`, an fp32 call's three parts summed; and the fp32
     memory each chunk leaves, `carries` `[N + 1, H, Dk, Dv]` from the initial memory: the final memory of the
     call over the chunks before it, at the same tiles (`recorded`), the state the states launch carries in
-    fp32 and stores rounded as `h`, which `h`'s enclosure holds bit for bit (`enclosed`)."""
+    fp32 and stores rounded as `h`, which `h`'s enclosure holds bit for bit (`enclosed`); and `begins` `[N]`,
+    the chunks a packed call's documents begin, which enter the zero memory a document starts from in place
+    of the one the chunk before leaves."""
     q: np.ndarray
     k: np.ndarray
     v: np.ndarray
@@ -419,6 +439,7 @@ class Run:
     c: np.ndarray
     o: np.ndarray
     carries: np.ndarray
+    begins: np.ndarray
 
     @property
     def chunks(self) -> int:
@@ -428,13 +449,18 @@ class Run:
     def heads(self) -> int:
         return self.a.shape[1]
 
+    def entered(self, n: int, head: int) -> np.ndarray:
+        """The fp32 memory chunk `n` and value head `head` enter: zero where a document begins it (`begins`),
+        else the one the chunk before leaves (`carries`)."""
+        return np.zeros_like(self.carries[n, head]) if self.begins[n] else self.carries[n, head]
+
     def step(self, n: int, head: int, *, carry: Iv | None = None) -> Step:
         """Chunk `n` and value head `head`'s step: its operands, its records and the fp32 memory it enters
-        (`carries`), unless given."""
+        (`entered`), unless given."""
         rows, key = slice(n * CHUNK, (n + 1) * CHUNK), head // (self.heads // self.k.shape[1])
         return Step(self.q[rows, key], self.k[rows, key], self.v[rows, head], self.g[rows, head],
                     self.beta[rows, head], self.a[n, head], self.w[n, head], self.h[n, head], self.c[n, head],
-                    point(self.carries[n, head]) if carry is None else carry)
+                    point(self.entered(n, head)) if carry is None else carry)
 
 
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
@@ -447,7 +473,10 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     (`mainloop.forward`), which this witness does not hold. Operands `[1, T, ...]`. With
     `carried`, each chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to
     it, whose final memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`,
-    each chunk's: end_j == start_{j+1}); without, the initial and the final memories alone."""
+    each chunk's: end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's
+    documents (`starts` `[1, T]`) begin on the chunks' grid, where the launches lay a row's chunks as they
+    are; a document beginning inside a chunk lays its own (`mainloop._layout`), which this witness does not
+    index."""
     import jax
     import jax.numpy as jnp
 
@@ -483,6 +512,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
     # call's come first where its documents start on the chunks' grid.
     laid = np.shape(a)[0] // CHUNK
+    begins = (np.zeros(length, bool) if starts is None else np.asarray(starts, bool)[0])
+    assert not begins[np.arange(length) % CHUNK != 0].any(), "a document begins on the chunks' grid"
 
     def summed(x, rows):
         return np.asarray(x, np.float64).reshape(rows, -1)
@@ -498,7 +529,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                c=chunked(c, value_width),
                o=np.asarray(kept_o, np.float64)[0].reshape(chunks, CHUNK, heads, value_width).transpose(
                    0, 2, 1, 3),
-               carries=np.stack(carries))
+               carries=np.stack(carries), begins=begins[::CHUNK])
 
 
 def hosted(operands: tuple) -> dict[str, np.ndarray]:
@@ -525,7 +556,7 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     for n in range(run.chunks):
         for head in range(run.heads):
             step = enclosures(run.step(n, head), scale, lane)
-            step["leaving"], step["h"] = step["h"], stored_memory(point(run.carries[n, head]), lane)
+            step["leaving"], step["h"] = step["h"], stored_memory(point(run.entered(n, head)), lane)
             for name, iv in step.items():
                 found.setdefault(name, []).append(iv)
     return {name: Iv(*(np.stack([getattr(iv, end) for iv in ivs]).reshape(run.chunks, run.heads,
