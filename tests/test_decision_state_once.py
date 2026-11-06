@@ -41,12 +41,13 @@ OWN = StateFirstLayout(
               AnswerCue(template="\nAnswer:", many="\nAnswer:")))
 """A lettered row of a question of its own, its state first."""
 SHARED = dataclasses.replace(OWN, shared_state=3)
-QUESTIONS = {"team": Choice("Which team handles it?", ["cards", "loans", "fraud"]),
+QUESTIONS = {"team": Choice("Which team handles it?", ["cards", "loans", "fraud", "none"]),
              "way": Choice("Which way is it?", ["up", "down", "left", "right"]),
-             "urgent": Choice("Is it urgent?", ["yes", "no"])}
-STATE_ONCE_SEEDS = 8
-"""Check 1's declared seeds for rows over one state against each question's own row, as the packed rows'
-of two streams (`STREAM_SEEDS`)."""
+             "urgent": Choice("How urgent is it?", ["now", "today", "this week", "later"])}
+"""Questions of four options each, the readout's count, so each question's logits are a row of four."""
+STATE_ONCE_SEEDS = 16
+"""Check 1's declared seeds for rows over one state against each question's own row: at 8, as the packed
+rows' of two streams (`STREAM_SEEDS`), a question of two options' rows were left unresolved over 40."""
 
 
 def own_and_shared(layout=SHARED, state: str = STATES[2]):
