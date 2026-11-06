@@ -279,7 +279,9 @@ def _qwen_moe_export(model: CausalTransformer, *, scheduled: bool) -> Mapping[st
     routed = set(model.sparse_layers)
     return {'num_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
             'moe_intermediate_size': mixture.expert_features,
-            'shared_expert_intermediate_size': mixture.shared_features,
+            # Qwen3-MoE's config states no shared expert, which its model holds none of.
+            **({'shared_expert_intermediate_size': mixture.shared_features}
+               if mixture.shared_features else {}),
             **({'norm_topk_prob': mixture.norm_topk_prob, 'decoder_sparse_step': 1,
                 'mlp_only_layers': [index for index in range(model.num_layers) if index not in routed]}
                if scheduled else {})}

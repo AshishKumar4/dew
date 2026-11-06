@@ -437,9 +437,10 @@ class Rebased:
         return iter(())
 
 
-type ConfigRead = Callable[[Mapping[str, object], set[str], dict[str, object]], None]
+type ConfigRead = Callable[[Mapping[str, object], set[str], dict[str, object]], dict[str, object]]
 """A config part's read: the source config, the keys read so far (`used`, which it adds its own to), and the
-record its earlier parts filled, which it fills further."""
+record its earlier parts filled, which it returns filled further (a reader of a whole record its own,
+typed as it builds it: `NativeFields`)."""
 
 type ConfigWrite = Callable[[Any], Mapping[str, object]]
 """A config part's write: a model's keys in the family's config, refusing a model it cannot spell
@@ -474,12 +475,14 @@ class ConfigField:
     value: Callable[[object], object] | None = None
     spell: Callable[[object], object] | None = None
 
-    def read(self, hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> None:
+    def read(self, hf_config: Mapping[str, object], used: set[str],
+             record: dict[str, object]) -> dict[str, object]:
         used.add(self.key)
         if self.key not in hf_config and self.default is _MISSING:
             raise KeyError(self.key)
         stated = hf_config.get(self.key, self.default)
         record[self.field] = stated if self.parse is None else self.parse(stated, self.key)
+        return record
 
     def write(self, model: object) -> Mapping[str, object]:
         held = getattr(model, self.field) if self.value is None else self.value(model)
@@ -497,9 +500,11 @@ class ConfigLayout:
     def __init__(self, *parts: ConfigPart | ConfigField | ConfigLayout) -> None:
         object.__setattr__(self, 'parts', parts)
 
-    def read(self, hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> None:
+    def read(self, hf_config: Mapping[str, object], used: set[str],
+             record: dict[str, object]) -> dict[str, object]:
         for part in self.parts:
-            part.read(hf_config, used, record)
+            record = part.read(hf_config, used, record)
+        return record
 
     def write(self, model: object) -> Mapping[str, object]:
         written: dict[str, object] = {}
@@ -552,44 +557,63 @@ class SourceLayout:
 def source_layout(model: object, *, config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
     """The layout `model` is written in as its family's release, or what it cannot write (`Unwritable`):
     the one answer every writer asks (a run's export, a bundle's save, a decision's release). A decoder's
-    family is the one its fields match (`hf_decoders.export_config`; a differential extension's, the
-    decoder's it extends, folded as it is written), its config the one it writes there,
-    read back as the same model (`refuse_lossy_export`), and every parameter and router state a route of
-    the family's writes (`decoder_parts.unrouted`). `config` is a loaded source's own config.json, which a
-    save writes as published, its representability still the model's."""
-    import jax
-    import jax.numpy as jnp
-
-    from dew.interop import decoder_parts, hf_decoders
+    family is the one its fields match (`hf_decoders.export_config`; a differential extension's or a low-rank
+    adapter's, the decoder's they extend, folded or merged as it is written), its config the one it writes
+    there, read back as the same model (`refuse_lossy_export`), and every parameter and router state a
+    route of the family's writes (`decoder_parts.unrouted`). `config` is a loaded source's own config.json,
+    which a save writes as published, its representability still the model's."""
+    from dew.interop import hf_decoders
+    from dew.lora import unadapted
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.registry import from_record
 
     if not isinstance(model, CausalTransformer):
         return Unwritable(f"no family writes a {type(model).__name__}")
-    decoder = from_record(CausalTransformer, model)
+    decoder = from_record(CausalTransformer, unadapted(model))
     if decoder.cross_attention is not None:
         return Unwritable("cross-attention has no layout in any family")
-    # A differential extension is folded into each layer's output projection as it is written
-    # (`Pretrained.export`): the layout is the decoder's it extends.
+    # A differential extension is folded into each layer's output projection and an adapter's factors
+    # merged into their kernels as it is written (`Pretrained.export`): the layout is the decoder's they
+    # extend.
     base = decoder.with_dex(None)
+    held = _decoder_layout(base)
+    if isinstance(held, Unwritable):
+        return held
+
+    def tensors(variables: Mapping[str, object]) -> Mapping[str, object]:
+        # The bundle's own export: its storage read as layers, the extension folded, the factors merged,
+        # the family's writer.
+        from dew.interop.pretrained import PretrainedDecoder
+
+        return PretrainedDecoder.from_model(decoder, variables).bound(model, variables).export()
+
+    return SourceLayout(held if config is None else config, {}, tensors, hf_decoders.release_code(base))
+
+
+def _decoder_layout(decoder: object) -> Mapping[str, object] | Unwritable:
+    """The config a plain decoder (`source_layout`'s) is written with, or what its family's layout cannot
+    hold of it: its config refused, or a parameter or router state no route writes, its leaves' paths
+    abstract (`jax.eval_shape`: no weight is drawn)."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.interop import decoder_parts, hf_decoders
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    assert isinstance(decoder, CausalTransformer)
     try:
-        written = hf_decoders.export_config(base)
+        written = hf_decoders.export_config(decoder)
     except decoder_parts.ExportRefused as refusal:
         return Unwritable(str(refusal))
     family = hf_decoders.families()[str(written['model_type'])]
-    shapes = jax.eval_shape(lambda: base.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32)))
-    missing = decoder_parts.unrouted(family, base, shapes)
+    # A sequence longer than its prediction depths, which each read a token past the trunk's.
+    tokens = jnp.ones((1, decoder.num_nextn_predict_layers + 2), jnp.int32)
+    shapes = jax.eval_shape(lambda: decoder.init(jax.random.key(0), tokens))
+    missing = decoder_parts.unrouted(family, decoder, shapes)
     if missing:
         return Unwritable(f"{', '.join('/'.join(path) for path in missing)} has no tensor in the "
                           f"{family.export_model_type} layout")
-
-    def tensors(variables: Mapping[str, object]) -> Mapping[str, object]:
-        # The bundle's own export: its storage read as layers, the extension folded, the family's writer.
-        from dew.interop.pretrained import PretrainedDecoder
-
-        return PretrainedDecoder.from_model(decoder, variables).export()
-
-    return SourceLayout(written if config is None else config, {}, tensors, hf_decoders.release_code(base))
+    return written
 
 
 __all__ = ["INDEX", "Condition", "Config", "ConfigField", "ConfigLayout", "ConfigPart", "ConfigRead",

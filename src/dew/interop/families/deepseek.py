@@ -1055,6 +1055,8 @@ def v4_layer_routes(compressor: Slot, state: Slot, *own: Route) -> Table:
             'wo_b': 'o_b_proj'})}),
         _v4('attn.q_norm.weight', 'self_attn/q_a_norm/scale'),
         _v4('attn.kv_norm.weight', 'self_attn/kv_norm/scale'),
+        # transformers' reverse conversion spells it `attn.norm` (its kv_norm rename read backwards).
+        _v4('attn.norm.weight', 'self_attn/kv_norm/scale'),
         _v4('attn.attn_sink', 'self_attn/sinks'),
         _v4('attn.{compressor}.{projection}.weight', 'self_attn/{compressor}/{projection}/kernel',
             {'compressor': compressor, 'projection': mapped({'wkv': 'kv_proj', 'wgate': 'gate_proj'})}),
@@ -1133,7 +1135,8 @@ def v4_routes(layers: Table, dspark: Leaves, *trunk: Routes, depth: Leaves | Non
                               base='layers.0.'),
             prediction_routes('mtp.{depth}.', 'mtp', {}, DECODER_ROUTES, slots=slots,
                               when=_depths_without_dspark))),
-        layers, DECODER_ROUTES)
+        # A checkpoint transformers saved: its trunk prefixed `model.`, a layer's tail the release's own.
+        layers, Prefixed('model.', layers), DECODER_ROUTES)
 
 
 def v4_depth(name: str, config: Mapping[str, object]) -> int | None:
@@ -1251,6 +1254,8 @@ DEEPSEEK_V32 = DecoderFamily(
     'DeepseekV32ForCausalLM',
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
+    # A query without its LoRA states its rank null, which the config class's default would fill.
+    export_nulls=('q_lora_rank',),
     padding_idx=True,
     defaults={'max_position_embeddings': 163840},
 )
@@ -1267,6 +1272,8 @@ DEEPSEEK_V2 = DecoderFamily(
     'DeepseekV2ForCausalLM',
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
+    # A query without its LoRA states its rank null, which the config class's default would fill.
+    export_nulls=('q_lora_rank',),
     aliases={'num_experts': 'n_routed_experts'},
     # DeepseekV2Config's defaults for the fields its decoder and routing read.
     defaults={'n_shared_experts': 2, 'n_routed_experts': 64, 'routed_scaling_factor': 1.0,
@@ -1306,6 +1313,8 @@ DEEPSEEK_V3 = DecoderFamily(
     'DeepseekV3ForCausalLM',
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
+    # A query without its LoRA states its rank null, which the config class's default would fill.
+    export_nulls=('q_lora_rank',),
     aliases={'num_local_experts': 'n_routed_experts', 'num_mtp_layers': 'num_nextn_predict_layers'},
     # DeepseekV3Config's defaults for the fields its decoder and routing read: its routed weights
     # scale by 2.5.

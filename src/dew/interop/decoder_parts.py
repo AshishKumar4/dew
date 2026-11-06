@@ -965,11 +965,13 @@ def softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
     return _records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok')
 
 
-def _read_local_experts(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> None:
+def _read_local_experts(hf_config: Mapping[str, object], used: set[str],
+                        record: dict[str, object]) -> dict[str, object]:
     used.add('num_local_experts')
     record['mixture'] = native_fields(Mixture)(
         experts=_records.integer(hf_config['num_local_experts'], 'num_local_experts'),
         top_k=softmax_top_k(hf_config, used))
+    return record
 
 
 def _write_local_experts(model: CausalTransformer) -> Mapping[str, object]:
@@ -1287,8 +1289,12 @@ def spelled(renames: Renames, *, leaves: Leaves | None = None, layer_leaves: Lea
 def reads(translate: Callable[[Mapping[str, object], set[str]], DecoderFields]) -> ConfigRead:
     """A reader of a whole record (`translate`, the source config and the keys read) as a config part's
     read (`ConfigPart`)."""
-    def read(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> None:
-        record.update(translate(hf_config, used))
+    def read(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> dict[str, object]:
+        translated = translate(hf_config, used)
+        if not record:
+            return translated
+        record.update(translated)
+        return record
     return read
 
 
@@ -1345,18 +1351,21 @@ DEPTH = after(_trunk_layers)
 
 
 def prediction_copies(stored: str, slots: Mapping[str, Slot] | None = None,
-                      count: Callable[[Config], int] = _depths) -> tuple[Copy, ...]:
-    """A prediction depth's copies of the trunk's table and head, by their names past `stored`
-    (`embed_tokens.weight`, `shared_head.head.weight`), which a load checks against the trunk's leaf and
-    an export writes from it: a tied trunk keeps the head in the embedding, which stores the same
-    [vocab, features] the copy does, an untied one the head's own kernel."""
+                      count: Callable[[Config], int] = _depths, *,
+                      written: bool = True) -> tuple[Routes, ...]:
+    """A declared prediction depth's copies of the trunk's table and head, by their names past `stored`
+    (`embed_tokens.weight`, `shared_head.head.weight`), which a load checks against the trunk's leaf and,
+    where the release stores them (`written`), an export writes from it: a tied trunk keeps the head in
+    the embedding, which stores the same [vocab, features] the copy does, an untied one the head's own
+    kernel. A copy of a depth the record does not declare is no tensor of it."""
     held = MappingProxyType(dict(slots or {}))
-    return (Copy(Route(stored + 'embed_tokens.weight', 'params/embed_tokens/embedding', held), 'depth',
-                 count),
-            Copy(Route(stored + 'shared_head.head.weight', 'params/embed_tokens/embedding', held, _tied),
-                 'depth', count),
-            Copy(Route(stored + 'shared_head.head.weight', 'params/lm_head/kernel', held, _untied),
-                 'depth', count))
+    declared = declared_depths()
+    routes = (Route(stored + 'embed_tokens.weight', 'params/embed_tokens/embedding', held, declared),
+              Route(stored + 'shared_head.head.weight', 'params/embed_tokens/embedding', held,
+                    both(declared, _tied)),
+              Route(stored + 'shared_head.head.weight', 'params/lm_head/kernel', held,
+                    both(declared, _untied)))
+    return tuple(Copy(route, 'depth', count) for route in routes) if written else routes
 
 
 def layer_depth(name: str, config: Mapping[str, object]) -> int | None:
@@ -1369,13 +1378,14 @@ def layer_depth(name: str, config: Mapping[str, object]) -> int | None:
     return None
 
 
-def layer_depth_routes(trunk: Routes) -> Table:
+def layer_depth_routes(trunk: Routes, *, copies: bool = True) -> Table:
     """The routes of DeepSeek-V3's layout, which GLM's MoE releases share: prediction depth d at
     `model.layers.{num_layers + d}.*`, its own leaves (`PREDICTION_LEAVES`), a block named as a trunk
-    layer's, and copies of the trunk's embedding and head (`prediction_copies`); any other name is the
-    trunk's, `trunk`'s."""
+    layer's, and copies of the trunk's embedding and head (`prediction_copies`), which a release that
+    holds none (`copies` False, GLM-5 Next's) reads where present and never writes; any other name is
+    the trunk's, `trunk`'s."""
     stored, slots = 'model.layers.{depth}.', {'depth': DEPTH}
-    return Table(*prediction_copies(stored, slots),
+    return Table(*prediction_copies(stored, slots, written=copies),
                  prediction_routes(stored, 'mtp', PREDICTION_LEAVES, trunk, slots=slots,
                                    when=declared_depths()),
                  trunk)
@@ -1390,8 +1400,9 @@ def _untied(config: Config, slots: Mapping[str, str]) -> bool:
 
 
 def in_trunk(config: Config, slots: Mapping[str, str]) -> bool:
-    """Whether a route's `layer` is one of the trunk's (a prediction depth stored past them is not)."""
-    return int(slots['layer']) < _trunk_layers(config)
+    """Whether a route's `layer` is one of the trunk's (a prediction depth stored past them is not); a
+    record that states no depth (a block's own, read alone) bounds none."""
+    return 'num_layers' not in config or int(slots['layer']) < _trunk_layers(config)
 
 
 def layer_type(config: Config, layer: str) -> str:
@@ -1459,6 +1470,12 @@ TRUNK_ROUTES = Table(
 
 
 LAYER_ROUTES = Table(
+    # Qwen3.5's delta net, the block's mixer, lands where self_attn does: a linear layer's before a
+    # hyper-connected one's Kimi Delta Attention, whose leaves share its names (Qwen4-Exp holds both).
+    in_layer('linear_attn.{projection}.weight', 'self_attn/{projection}/kernel',
+             {'projection': one_of(*_LINEAR_PROJECTIONS)}, _linear_layer),
+    *(in_layer('linear_attn.' + '.'.join(leaf), 'self_attn/' + '/'.join(leaf), when=_linear_layer)
+      for leaf in sorted(_LINEAR_LEAVES)),
     # V4's stream mappings and its hyper-connected layers' attention leaves.
     in_layer('hc_{site}_{part}', '{site}_hc/{part}', {'site': one_of('attn', 'ffn'), 'part': one_of(*_V4_HC)},
              _hyper),
@@ -1495,11 +1512,6 @@ LAYER_ROUTES = Table(
              {'projection': one_of(*MOE_SHARED)}),
     in_layer('mlp.shared_experts.{projection}.weight', 'mlp/shared_experts/{projection}/kernel',
              {'projection': one_of(*MOE_SHARED)}),
-    # Qwen3.5's delta net, the block's mixer, lands where self_attn does.
-    in_layer('linear_attn.{projection}.weight', 'self_attn/{projection}/kernel',
-             {'projection': one_of(*_LINEAR_PROJECTIONS)}, _linear_layer),
-    *(in_layer('linear_attn.' + '.'.join(leaf), 'self_attn/' + '/'.join(leaf), when=_linear_layer)
-      for leaf in sorted(_LINEAR_LEAVES)),
     *(in_layer(f'{module}.weight', f'{module}/{leaf}') for module, leaf in _PER_LAYER_INPUTS.items()),
     *(route for theirs, ours in _PRE_NORMS.items()
       for route in (in_layer(f'{theirs}.weight', f'{ours}/scale', when=_plain),
@@ -2236,9 +2248,7 @@ class DecoderFamily:
     def translate_config(self, hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
         """The record `hf_config`, the family's own spelling of its fields (`translated` reads its aliases,
         defaults and repeats first), states (`config`), each key read added to `used`."""
-        record: dict[str, object] = {}
-        self.config.read(hf_config, used, record)
-        return cast(DecoderFields, record)
+        return cast(DecoderFields, self.config.read(hf_config, used, {}))
 
     def export_fields(self, model: CausalTransformer) -> Mapping[str, object]:
         """The family's own keys `model`'s fields state (`config`), beside the shared ones
