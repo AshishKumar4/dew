@@ -2409,6 +2409,26 @@ class CausalTransformer(LinearProducts):
         return tuple(chunk for mixer, chunk in built if mixer.reads_blocks)
 
     @nn.nowrap
+    def fixed_routers(self) -> Mapping[str, str]:
+        """Its routers whose expert weights are fixed whatever they score, which no term of a plain loss
+        reaches (`Mixture.fixed_weights`, `ValueExperts.fixed_weights`), each by name and the scope its
+        score projection takes (`Mixture.router_scope`): its feed-forward's mixture, an MLP mixer's of a
+        layer kind, its prediction depths' and its drafter's among them (`layer_kinds`, and the depths'
+        feed-forward kind), its value experts'."""
+        feeding = self.mtp_feedforward_type if self.num_nextn_predict_layers else None
+        kinds = {**self.layer_kinds(self.per_layer_types),
+                 **({} if feeding is None else {feeding: self.kind_of(feeding)})}
+        mixers = {name: kind.mixer or self.mixer for name, kind in kinds.items()}
+        mixed = {f"the {name} layers' MLP mixer": mixer.mixture.router_scope(mixer.activation)
+                 for name, mixer in mixers.items() if isinstance(mixer, MLPMixer)
+                 and mixer.mixture is not None and mixer.mixture.fixed_weights}
+        return {**({"mixture": self.mixture.router_scope(self.mlp)}
+                   if self.mixture is not None and self.mixture.fixed_weights else {}),
+                **mixed,
+                **({"value_experts": "v_router"} if self.value_experts is not None
+                   and self.value_experts.fixed_weights else {})}
+
+    @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
         """A cache rebuilt per request, a reader beyond the token, a context
         read beside the tokens, or a layer whose mixer, over the context it is

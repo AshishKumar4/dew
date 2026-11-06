@@ -32,6 +32,8 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from dew._records import JSON
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -69,6 +71,10 @@ class DecoderWrapper(nn.Module):
     @property
     def vocab_size(self) -> int:
         return self._decoder.vocab_size
+
+    @nn.nowrap
+    def fixed_routers(self) -> Mapping[str, str]:
+        return self._decoder.fixed_routers()
 
     @property
     def max_seq_len(self) -> int:
