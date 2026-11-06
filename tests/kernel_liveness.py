@@ -911,12 +911,15 @@ class _Pass:
         local = {a for arg in block.arguments for a in self.atoms.of[arg] if a is not None and a in last}
         local |= {a for a in outer - preserved if a in last}
         outer = preserved
+        ahead, tail = self._prefetched(block, ops)
         for index, op in enumerate(ops):
             made = {a for r in op.results for a in self.atoms.of.get(r, ()) if a is not None}
             # A region op's results are born where its operands it consumes have died (a loop's carries
             # leave it as its results): they never coexist.
             edge = index + bool(op.regions)
             live = outer | {a for a in local if last[a] >= edge} | made
+            if index >= tail:
+                live |= ahead
             if made and ELEMENTWISE.match(op.name.removeprefix(PREFIX)) and not op.regions:
                 # R6: an ALU instruction writes its destination over a source that dies at it, so an
                 # elementwise op's result takes the registers of an operand last read there (an output
@@ -940,6 +943,35 @@ class _Pass:
                                    f"{region}/{index}:{region_index}", preserved=survives)
             local |= {a for a in made if a in last}
             local = {a for a in local if last[a] > index}
+
+    def _prefetched(self, block, ops: list) -> tuple[set, int]:
+        """A walk loop's next turn's leading operand loads, held through this turn's tail: the fragments
+        a loop body loads (ldmatrix) before its first product, where the body issues its products straight
+        (a tile loop's one step, no loop of steps within), and the index of the first op past its last
+        product. ptxas issues the next tile's first fragment loads under this tile's last sums (sm80's
+        exactly summed forward at one step: its peak at the tile boundary, 134 at a cap of 136, where the
+        body's own order holds 126). None elsewhere."""
+        if block.owner.operation.name.removeprefix(PREFIX) not in ("scf.for", "scf.while"):
+            return set(), len(ops)
+
+        def issues(op) -> bool:
+            found = []
+
+            def visit(inner):
+                if _issues_product(inner):
+                    found.append(inner)
+                    return ir.WalkResult.INTERRUPT
+                return ir.WalkResult.ADVANCE
+
+            op.walk(visit)
+            return bool(found)
+
+        placed = [index for index, op in enumerate(ops) if issues(op)]
+        if not placed or any(ops[index].regions for index in placed):
+            return set(), len(ops)
+        ahead = {a for op in ops[:placed[0]] if op.name.removeprefix(PREFIX) == "nvvm.ldmatrix"
+                 for r in op.results for a in self.atoms.of.get(r, ()) if a is not None}
+        return ahead, placed[-1] + 1
 
     def _launch(self, op) -> Peak:
         launch = op.opview
