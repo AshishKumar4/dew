@@ -13,7 +13,12 @@ import numpy as np
 from dew import _records
 from dew._records import JSON
 from dew.diffusion.schedules.flow import token_mu
-from dew.diffusion.schedules.source_grids import named_choice, published_betas
+from dew.diffusion.schedules.source_grids import (
+    flow_from_clean,
+    flow_from_noise,
+    named_choice,
+    published_betas,
+)
 from dew.diffusion.transforms import (
     ConsistencyBoundary,
     DirectPredictionTransform,
@@ -92,6 +97,9 @@ _LEADING = {"timestep_spacing": "leading", "steps_offset": 0}
 _TRANSFORMS = {"use_karras_sigmas": False, "use_exponential_sigmas": False,
                "use_beta_sigmas": False}
 _FLOW = {"use_flow_sigmas": False, "flow_shift": 1.0}
+FlowWalk = Callable[[float, int, int], np.ndarray]
+"""A class's `use_flow_sigmas` sigmas from its `flow_shift`, training steps and inference steps
+(`source_grids.flow_from_clean`, `flow_from_noise`)."""
 _DPM = {"solver_order": 2, "algorithm_type": "dpmsolver++", "solver_type": "midpoint",
         "final_sigmas_type": "zero", "lambda_min_clipped": -float("inf"), "variance_type": None}
 _DISTILLED = _fields(_THRESHOLD, {"original_inference_steps": 50, "clip_sample": False,
@@ -147,8 +155,8 @@ class _Class:
     recovered model times before truncating them (DPMSolverMultistep except
     on the cosine table); the others keep the log-linear inverse as it comes,
     and no class rounds an exponential or beta grid's. `flow_sigmas`: its
-    `use_flow_sigmas` walk is reconstructed, for the classes the published
-    flow pipelines ship (SANA's DPM-Solver++, Wan's UniPC). `grid_terminal`:
+    `use_flow_sigmas` walk, for the classes the published flow pipelines ship
+    (SANA's DPM-Solver++, Wan's UniPC), each its own. `grid_terminal`:
     a transformed grid ends on its own last sigma. `stride`: it steps
     `train_steps // steps` back. `recompute_epsilon`: it recomputes epsilon
     from a limited x_0 whatever its algorithm. `boundary`: it applies the
@@ -163,7 +171,7 @@ class _Class:
     predictions: tuple[str, ...] = _ALL_PREDICTIONS
     algorithms: tuple[Algorithm, ...] = ()
     karras_round: Callable[[Control], bool] = _never_rounds
-    flow_sigmas: bool = False
+    flow_sigmas: FlowWalk | None = None
     grid_terminal: bool = False
     stride: bool = False
     recompute_epsilon: bool = False
@@ -212,7 +220,7 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
                                                    euler_at_final=False, use_lu_lambdas=False,
                                                    rescale_betas_zero_snr=False),
                                  lambda c: _dpm_multistep(c), algorithms=_DPM_ALGORITHMS,
-                                 karras_round=_rounds_off_cosine, flow_sigmas=True),
+                                 karras_round=_rounds_off_cosine, flow_sigmas=flow_from_clean),
     "DPMSolverSinglestep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _TRANSFORMS, _FLOW,
                                                     _DPM, lower_order_final=False),
                                   # `set_timesteps` rewrites lower_order_final for a zero
@@ -236,7 +244,7 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
                                                rescale_betas_zero_snr=False),
                              lambda c: UniPC(c.order, _solver_type(c.value, ("bh2", "bh1")),
                                              c.flag("predict_x0"), c.flag("lower_order_final"), c.corrector),
-                             karras_round=_always_rounds, flow_sigmas=True, grid_terminal=True),
+                             karras_round=_always_rounds, flow_sigmas=flow_from_noise, grid_terminal=True),
     "EDMDPMSolverMultistep": _Class("edm", _fields(
         _THRESHOLD, num_train_timesteps=1000, prediction_type="epsilon", sigma_min=0.002,
         sigma_max=80.0, sigma_data=0.5, sigma_schedule="karras", rho=7.0, solver_order=2,
@@ -343,6 +351,8 @@ class SourcePolicy:
     flow_shift: float | None
     """A log-SNR class's `flow_shift` under `use_flow_sigmas`: its grid is then
     the shifted rectified-flow path rather than the beta table's."""
+    flow_walk: FlowWalk | None
+    """The class's walk of that path (`_Class.flow_sigmas`), under `use_flow_sigmas`."""
 
 
 def resolve_config(config: Mapping[str, object]
@@ -371,8 +381,8 @@ def resolve_config(config: Mapping[str, object]
     # convention, so the family names the transform. A log-SNR class on
     # flow sigmas reads the velocity its flow checkpoint predicts.
     flow_sigmas = _records.boolean(value("use_flow_sigmas", absent=False), "use_flow_sigmas")
-    if flow_sigmas and not source.flow_sigmas:
-        walked = " and ".join(name for name, other in _SOURCES.items() if other.flow_sigmas)
+    if flow_sigmas and source.flow_sigmas is None:
+        walked = " and ".join(name for name, other in _SOURCES.items() if other.flow_sigmas is not None)
         raise ValueError(f"Native source scheduling reconstructs use_flow_sigmas for {walked}, not {kind}")
     prediction = ("flow_prediction" if source.family == "flow"
                   else named_choice(value("prediction_type"), "prediction_type",
@@ -576,7 +586,7 @@ def _resolve(kind: str, source: _Class, value: Control,
         distilled="original_inference_steps" in declared,
         original_steps=original_steps,
         timestep_scaling=_records.number(value("timestep_scaling", 10.0), "timestep_scaling"),
-        flow=flow, flow_shift=flow_shift)
+        flow=flow, flow_shift=flow_shift, flow_walk=None if flow_shift is None else source.flow_sigmas)
     return policy, source.solver(_Controls(value, order, algorithm, terminal, disabled))
 
 
