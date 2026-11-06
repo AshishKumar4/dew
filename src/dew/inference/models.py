@@ -161,7 +161,8 @@ def write_run_release(run: SavedRun, destination: str | Path, *, ema: bool | Non
     (`SavedRun.variables`, its average where `ema`) as safetensors, the files its task keeps by the step
     (`step_records`) at their places, and its inference declaration in the release record, which
     `ReleasedRun` reads back. The export of a run whose model no family's source layout states
-    (`Pretrained.publishes`), a model's own (`SavedModel.save_pretrained`) among them."""
+    (`dew.interop.saved_sources.source_publishes`), a model's own (`SavedModel.save_pretrained`) among
+    them."""
     from dew.interop.saved_sources import step_records
 
     records = step_records(json_value(run.record, "artifact"), run.directory, run.step)

@@ -53,7 +53,7 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
                publishes: bool = True) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release, its EMA
     weights where `ema`: a task's own released layout (`ReleasedTask`), the model in its family's
-    source layout where one states it (`Pretrained.publishes`), or else the run's native release, its
+    source layout where one states it (`source_publishes`), or else the run's native release, its
     step's declaration and variables, which `dew.pipeline` loads as the run (`write_run_release`). Its
     weights restore where `mesh` and `layout` place them,
     so no device holds more of them than a load does, and the writer reads them home a tensor at a time
@@ -72,7 +72,7 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
         released = task.from_saved(run, ema=ema, mesh=mesh, layout=layout)
         with reading_home("saved run export", writes=publishes):
             released.save_pretrained(str(destination))
-    elif not released_task and Pretrained.publishes(run):
+    elif not released_task and source_publishes(run):
         bundle = Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout)
         with reading_home("saved run export", writes=publishes):
             bundle.save(destination)
@@ -80,6 +80,27 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
         with reading_home("saved run export", writes=publishes):
             write_run_release(run, destination, ema=ema, mesh=mesh, layout=layout)
 
+
+
+def source_publishes(run: SavedRun) -> bool:
+    """Whether a family's source layout states `run`'s model (`Pretrained.from_saved`): a causal decoder's
+    with no cross-attention layers (`source_states`), or a block decoder's that transformers' class builds
+    (`diffusion_gemma.publishable`). The export of any other run is its native release
+    (`dew.inference.models.write_run_release`)."""
+    from dew.inference.tasks import saved_model
+    from dew.interop import diffusion_gemma
+    from dew.interop.pretrained import source_states
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.registry import from_record, models
+
+    model_config = saved_model(run.record, None)
+    trained = models[model_config.name]
+    if trained is CausalTransformer:
+        return source_states(model_config.build())
+    if trained is models["diffusion_gemma"]:
+        return diffusion_gemma.publishable(from_record(DiffusionGemma, model_config.fields))
+    return False
 
 def is_saved_run(name_or_dir: str | Path) -> bool:
     """Whether `name_or_dir` is a saved Dew run's directory, on this host or remote storage
