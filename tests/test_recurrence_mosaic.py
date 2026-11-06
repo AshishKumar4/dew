@@ -424,13 +424,11 @@ def test_the_mosaic_launches_state_their_work(training):
     """A bf16 gated delta rule's forward, or its forward and gradient, through the template, lowered for the
     GPU the test runs on, or off one an H100 (Mosaic GPU lowers no Hopper copy for an A100's device):
     every launch states its cost (`_kernel`'s, `templates.cost.estimate`), which Dew's FLOP count reads to
-    size it (`instrumentation._stated_flops`: no launch unsized, row 1895's kernel report), their products
+    size it (`lowered.kernel_calls`' `flops`: no launch unsized, row 1895's kernel report), their products
     together at least the model's recurrent function's (`flops.delta_flops`: the chunked form's preparation
     and inversion are work past it)."""
-    import re
-
     from dew.nn.flops import delta_flops
-    from dew.telemetry.instrumentation import _stated_flops
+    from dew.nn.kernels import lowered
 
     rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 128
     operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
@@ -445,11 +443,11 @@ def test_the_mosaic_launches_state_their_work(training):
     lowered_for = generation.device_generation() if mainloop.family_of() is not None else "sm90"
     with generation.assumed(lowered_for):
         fn = jax.grad(rule, argnums=(0, 1, 2)) if training else rule
-        text = jax.jit(fn).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
-    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
-    assert launches and all(_stated_flops(line) is not None for line in launches)
+        program = jax.jit(fn).trace(*operands).lower(lowering_platforms=("cuda",))
+    launches = [call for call in lowered.kernel_calls(program) if call.kind == "mosaic_gpu"]
+    assert launches and all(call.flops is not None for call in launches)
     model = delta_flops(np.asarray([length] * rows), value_heads, width, width)
-    assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
+    assert sum(call.flops or 0.0 for call in launches) >= model * (2 if training else 1)
 
 
 @lowers('sm90')
@@ -509,12 +507,10 @@ def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_produc
     """A gated delta rule's forward through the template, lowered for an H100: each launch
     states the products it issues, its operands' part pairs (`product.terms`: one for bf16, six for an fp32
     operand's three bf16 parts under the accurate forms), and declares the model's products apart
-    (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads for the model's work."""
-    import re
-
+    (`lowered.KernelCall.model_flops`), which Dew's FLOP count reads for the model's work."""
+    from dew.nn.kernels import lowered
     from dew.nn.kernels.templates import product
     from dew.nn.precision import ACCURATE
-    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
 
     rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 64
     operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), dtype)] * 2 + [
@@ -525,15 +521,10 @@ def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_produc
     rule = functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), bound=1.0)
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), generation.run_precision(ACCURATE), jax.sharding.use_abstract_mesh(mesh):
-        text = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
-    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
-    ratios = set()
-    for line in launches:
-        declared = _MODEL_FLOPS.search(line)
-        assert declared is not None, line[:200]
-        model, hardware = float(declared.group(1)), _stated_flops(line) or 0.0
-        if model:
-            ratios.add(hardware / model)
+        program = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",))
+    launches = [call for call in lowered.kernel_calls(program) if call.kind == "mosaic_gpu"]
+    assert launches and all(call.model_flops is not None for call in launches)
+    ratios = {(call.flops or 0.0) / call.model_flops for call in launches if call.model_flops}
     if dtype == jnp.bfloat16:
         assert ratios == {1.0}
     else:
@@ -547,10 +538,8 @@ def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
     inverse's doubling merges in fp32 (`Call.ranged`), two bf16 parts on warpgroup products, which take no
     transposed TF32 (`mainloop.FAST_PARTS`), so the intra solve, all doubling, states their three leading
     pairs a model product, and no launch more; each stated the held bf16 operand's one (row 4032)."""
-    import re
-
+    from dew.nn.kernels import lowered
     from dew.nn.kernels.templates import product
-    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
 
     rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 64
     operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
@@ -561,10 +550,9 @@ def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
     rule = functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), floor=FLOOR)
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        text = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
-    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
-    models = [(float(_MODEL_FLOPS.search(line).group(1)), _stated_flops(line) or 0.0) for line in launches]
-    ratios = {hardware / model for model, hardware in models if model}
+        program = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",))
+    launches = [call for call in lowered.kernel_calls(program) if call.kind == "mosaic_gpu"]
+    ratios = {(call.flops or 0.0) / call.model_flops for call in launches if call.model_flops}
     pairs = float(len(product.terms(mainloop.FAST_PARTS, mainloop.FAST_PARTS)))
     assert pairs in ratios and max(ratios) == pairs
 
