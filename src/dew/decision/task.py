@@ -960,11 +960,13 @@ class Decide(SavedRunTask, InItsForm):
         for name in finalists:
             question, answer = questions[name], final[name]
             assert isinstance(answer, ChoiceAnswer)
-            probabilities = _knocked_out(dict(zip(answer.options, answer.probabilities, strict=True)),
-                                         first[name], rounds.residual)
-            spread = np.asarray([probabilities[option] for option in question.options], np.float64)
-            final[name] = replace(answer, options=tuple(question.options), probabilities=spread,
-                                  confidence=self.confidence(question, spread))
+            combined = _knocked_out(dict(zip(answer.options, answer.probabilities, strict=True)),
+                                    first[name], rounds.residual)
+            # Every option in the engine's order, the finalists as the final round holds them first, so
+            # equal answers resolve as its `choice_answer` resolves them; abstaining as the whole question.
+            spread = np.asarray(list(combined.values()), np.float64)
+            final[name] = ChoiceAnswer(tuple(combined), spread, self.confidence(question, spread),
+                                       abstained=self.calibration.abstains(question, spread))
         return final
 
     def calibrated(self, held_out: Iterable[Example | Mapping[str, object]] | Reader, *,

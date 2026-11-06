@@ -420,14 +420,19 @@ class Layout:
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
-             tokens: Sequence[int] | None = None) -> list[Encoded]:
+             tokens: Sequence[int] | None = None, request: Mapping[str, Question] | None = None
+             ) -> list[Encoded]:
         """Lay out `questions` about `state`, each question's options in its `orders` entry.
 
         Slot s of a question shows its option order[s]; a question `orders` does not
         name keeps its own order (or the layout's). `media` are the tokens the
         backbone's processor gave a request's images, which a layout with an
         `image` text places in the row. `tokens` are the state's (`state`),
-        where the caller has them already.
+        where the caller has them already. `request` is the whole request the
+        questions are asked from, as a summary of it writes it
+        (`RequestSummary`): `questions` where None, every question a server
+        is asked, and a training read's every question where it lays out its
+        labelled ones.
         """
         raise NotImplementedError
 
@@ -783,14 +788,16 @@ class QuestionLayout(Layout):
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
-             tokens: Sequence[int] | None = None) -> list[Encoded]:
+             tokens: Sequence[int] | None = None, request: Mapping[str, Question] | None = None
+             ) -> list[Encoded]:
         if media:
             raise ValueError(f"a {type(self).__name__} row has no place for images")
         if tokens is None and self._unit == "pieces":
             # The request's questions share its state, encoded once for them all.
             tokens = self.state(encoder, specials, state)
         return [self._written(encoder, specials, question, (orders or {}).get(name), name, state=state,
-                              tokens=tokens, conversation=_conversation(state), request=questions)
+                              tokens=tokens, conversation=_conversation(state),
+                              request=questions if request is None else request)
                 for name, question in questions.items()]
 
     def encode(self, encoder: Tokenizer, specials: Specials, question: Question,
@@ -2033,11 +2040,13 @@ class JointLayout(Layout):
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
-             tokens: Sequence[int] | None = None) -> list[Encoded]:
+             tokens: Sequence[int] | None = None, request: Mapping[str, Question] | None = None
+             ) -> list[Encoded]:
         """The request's one row, rendered as chunks (`dew.decision.renderer`, piece by piece as the
         joint release encodes it): each run of text between the turn's other parts one chunk, the
         images, each copy of the state and the schema chunks of ids, and each question's and option's
-        tokens the marks its chunks carry."""
+        tokens the marks its chunks carry. Its row holds no summary of the request (`JOINT_KINDS`),
+        whose `request` it reads none of."""
         pieces = _Pieces(encoder)
         if media and not any(isinstance(segment, Media) for segment in self.segments):
             raise ValueError("this joint layout's segments have no place for images")
