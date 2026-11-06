@@ -20,16 +20,16 @@ from collections.abc import Mapping
 from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    DECODER_ROUTES,
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     base_config,
-    decoder_tensors,
-    dew_path,
-    hf_tensor_name,
+    in_layer,
     read_rope,
     refuse,
 )
+from dew.interop.layouts import Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, NormSpec
 from dew.nn.moe import EXPERT_BIAS, EXPERT_BIAS_COLLECTION
@@ -152,37 +152,16 @@ def _k2_horizon_export(model: CausalTransformer) -> Mapping[str, object]:
     return record
 
 
-def _routed_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """`dew_path` with the routers' own names: an MLP router's bias, which enters its selection alone
-    (`Router.expert_bias`), and the value experts' router and projections (`RoutedValues`)."""
-    parts = name.split('.')
-    if len(parts) >= 6 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
-        layer, tail = f'layers_{parts[2]}', parts[3:]
-        values = (layer, 'self_attn', 'experts')
-        if tail == ['mlp', 'gate', 'bias']:
-            return (EXPERT_BIAS_COLLECTION, layer, 'mlp', 'gate', EXPERT_BIAS)
-        if tail == ['self_attn', 'v_router', 'weight']:
-            return ('params', *values, 'v_router', 'kernel')
-        if tail == ['self_attn', 'v_router', 'bias']:
-            return (EXPERT_BIAS_COLLECTION, *values, 'v_router', EXPERT_BIAS)
-        if (len(tail) == 4 and tail[:2] == ['self_attn', 'v_experts'] and tail[2].isdigit()
-                and tail[3] == 'weight'):
-            return ('params', *values, tail[2], 'v_proj', 'kernel')
-    return dew_path(name, config)
-
-
-def _routed_name(dew_name: str, config: Mapping[str, object]) -> str | None:
-    """`_routed_path` backwards, every other leaf by the shared names (`hf_tensor_name`)."""
-    parts = dew_name.split('.')
-    if parts[0].startswith('layers_'):
-        layer, tail = f"model.layers.{parts[0].removeprefix('layers_')}", parts[1:]
-        if tail == ['mlp', 'gate', EXPERT_BIAS]:
-            return f'{layer}.mlp.gate.bias'
-        if tail[:3] == ['self_attn', 'experts', 'v_router'] and tail[3:] in (['kernel'], [EXPERT_BIAS]):
-            return f"{layer}.self_attn.v_router.{'weight' if tail[3] == 'kernel' else 'bias'}"
-        if len(tail) == 5 and tail[:2] == ['self_attn', 'experts'] and tail[3:] == ['v_proj', 'kernel']:
-            return f'{layer}.self_attn.v_experts.{tail[2]}.weight'
-    return hf_tensor_name(dew_name, config)
+_ROUTES = Table(
+    # An MLP router's bias, which enters its selection alone (`Router.expert_bias`).
+    in_layer('mlp.gate.bias', 'mlp/gate/' + EXPERT_BIAS).moved(EXPERT_BIAS_COLLECTION),
+    # The value experts' router and projections (`RoutedValues`).
+    in_layer('self_attn.v_router.weight', 'self_attn/experts/v_router/kernel'),
+    in_layer('self_attn.v_router.bias',
+             'self_attn/experts/v_router/' + EXPERT_BIAS).moved(EXPERT_BIAS_COLLECTION),
+    in_layer('self_attn.v_experts.{expert}.weight', 'self_attn/experts/{expert}/v_proj/kernel'),
+    DECODER_ROUTES)
+"""K2 Horizon's names: the shared decoder's, with the routers' own."""
 
 
 # A model whose norms group their statistics; the 0.9B's single group exports as Llama, whose norm
@@ -192,7 +171,7 @@ K2_HORIZON = DecoderFamily(
     ('k2_horizon',), _k2_horizon_config,
     lambda fields: _groups(fields) != 1 or fields.value_experts is not None,
     'k2_horizon', 'K2HorizonForCausalLM', _k2_horizon_export, preserve_source_layout=False,
-    weight_path=_routed_path, export_path=_routed_name, export_weights=decoder_tensors,
+    routes=_ROUTES,
     # The remote K2HorizonConfig's context, which a YaRN record's omitted lengths read.
     defaults={'max_position_embeddings': 32768},
 )

@@ -13,11 +13,10 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 
-from flax.traverse_util import flatten_dict
-
 from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    DEEPSEEK_ROUTES,
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
@@ -25,24 +24,18 @@ from dew.interop.decoder_parts import (
     MixtureFields,
     Ropes,
     base_config,
-    check_decoder_tree,
     fixed_fields,
-    hf_tensor_name,
     kind_mixers,
     layer_depth,
-    layer_depth_path,
-    layout_tensors,
-    leaf_layouts,
     read_partial_rope,
     record_float,
     record_int,
     refuse,
     specified_layer_types,
-    translated,
 )
 from dew.interop.families.deepseek import LAYOUT_FIELDS, deepseek_config, deepseek_mixture
 from dew.interop.families.qwen import single_prediction_depth
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.layouts import Copy, Route, Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
@@ -265,60 +258,15 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
-def _glm5_next_names(path: tuple[str, ...], config: Mapping[str, object],
-                     fields: DecoderFields) -> str | tuple[str, ...]:
-    """The source name of the leaf at `path`, its collection first, or of each
-    expert's slice of a stacked expert kernel, refused unless the load reads
-    it back into that leaf (`layer_depth_path`).
-
-    Prediction depth d is layer `num_layers + d`, its block's leaves named as
-    a trunk layer's and its final norm as `shared_head.norm`. mHC's site
-    tensors are `hc_{site}_{leaf}`.
-    """
-    def checked(name: str | None, leaf: tuple[str, ...]) -> str:
-        if name is None or layer_depth_path(name, fields) != leaf:
-            refuse('.'.join(path), 'the source has no matching persistent leaf')
-        return name
-
-    head, *tail = path[1:]
-    if head.startswith('layers_'):
-        prefix = f"model.layers.{int(head.removeprefix('layers_'))}."
-    elif head.startswith('mtp_'):
-        layer = _records.integer(fields['num_layers'], 'num_layers') + int(head.removeprefix('mtp_'))
-        prefix = f'model.layers.{layer}.'
-        tail = tail[1:] if tail[0] == 'block' else tail
-        if tail == ['final_norm', 'scale']:
-            tail = ['shared_head', 'norm', 'scale']
-    else:
-        return checked(hf_tensor_name('.'.join(path[1:]), config), path)
-    if len(tail) == 4 and tail[:2] == ['mlp', 'experts'] and tail[3] == 'kernel':
-        return tuple(checked(f'{prefix}mlp.experts.{expert}.{tail[2]}.weight',
-                             (*path[:-2], str(expert), *path[-2:]))
-                     for expert in range(_records.integer(config['n_routed_experts'], 'n_routed_experts')))
-    if len(tail) == 2 and tail[0] in ('attn_hc', 'ffn_hc'):
-        return checked(f"{prefix}hc_{tail[0].removesuffix('_hc')}_{tail[1]}", path)
-    ending = 'weight' if tail[-1] in ('kernel', 'scale') else tail[-1]
-    return checked(prefix + '.'.join([*tail[:-1], ending]), path)
-
-
-def _glm5_next_export_weights(family: DecoderFamily, model: CausalTransformer,
-                              variables: Mapping[str, object], config: Mapping[str, object]) -> LazyTensors:
-    """Write every collection but the decode cache under `_glm5_next_names`.
-
-    The collections are first held to the model's own (`check_decoder_tree`),
-    so a leaf the model does not declare is refused rather than dropped.
-    """
-    persistent = {name: tree for name, tree in variables.items() if name != 'cache'}
-    check_decoder_tree(persistent, model)
-    fields = translated(config, family)
-    layouts = leaf_layouts(flatten_dict(persistent), lambda path: _glm5_next_names(path, config, fields))
-    if model.tie_embeddings:
-        # transformers 5.16.1 ties the head only in the multimodal wrapper
-        # (modeling_glm5_next.py:2068), so a reader of the text model alone
-        # takes it from its own tensor.
-        layouts['lm_head.weight'] = dataclasses.replace(layouts['model.embed_tokens.weight'],
-                                                        name='lm_head.weight')
-    return layout_tensors(layouts, persistent)
+GLM5_NEXT_ROUTES = Table(
+    DEEPSEEK_ROUTES,
+    # transformers 5.16.1 ties the head only in the multimodal wrapper (modeling_glm5_next.py:2068), so a
+    # reader of the text model alone takes it from its own tensor: a tied export writes it too.
+    Copy(Route('lm_head.weight', 'params/embed_tokens/embedding', when=lambda config, slots: bool(
+        config['tie_embeddings']))))
+"""GLM-5 Next's names: DeepSeek-V3's, prediction depth d stored as layer `num_layers + d`, its block's
+leaves named as a trunk layer's and its final norm as `shared_head.norm`, and mHC's site tensors
+`hc_{site}_{leaf}`."""
 
 
 def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -443,8 +391,7 @@ GLM5_NEXT_TEXT = DecoderFamily(
     'glm5_next_text',
     'Glm5NextTextForCausalLM',
     _glm5_next_export,
-    weight_path=layer_depth_path, prediction_depth=layer_depth,
-    export_weights=_glm5_next_export_weights,
+    routes=GLM5_NEXT_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # The config class's norm epsilon.
     defaults={'rms_norm_eps': 1e-5, 'pad_token_id': 154820},
@@ -462,7 +409,7 @@ GLM4_MOE = DecoderFamily(
     'glm4_moe',
     'Glm4MoeForCausalLM',
     lambda model: {},
-    weight_path=layer_depth_path, prediction_depth=layer_depth,
+    routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # Glm4MoeConfig's defaults for the fields its decoder reads.
     defaults={'rms_norm_eps': 1e-5, 'num_key_value_heads': 8, 'max_position_embeddings': 131072,
@@ -484,7 +431,7 @@ GLM_MOE_DSA = DecoderFamily(
     'glm_moe_dsa',
     'GlmMoeDsaForCausalLM',
     lambda model: {},
-    weight_path=layer_depth_path, prediction_depth=layer_depth,
+    routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # The config class's norm epsilon.
     defaults={'max_position_embeddings': 202752, 'rms_norm_eps': 1e-5},

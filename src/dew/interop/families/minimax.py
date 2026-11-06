@@ -24,7 +24,6 @@ no release has, is refused by name.
 """
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
@@ -38,9 +37,9 @@ from dew.interop.decoder_parts import (
     kinds_of,
     read_partial_rope,
     refuse,
-    renamed_path,
     softmax_top_k,
     specified_layer_types,
+    spelled,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -185,7 +184,7 @@ MINIMAX = DecoderFamily(
     'minimax',
     'MiniMaxForCausalLM',
     _minimax_export,
-    weight_path=partial(renamed_path, MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
+    routes=spelled(MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
     preserve_source_layout=False,
     padding_idx=True,
     # MiniMaxConfig's defaults (configuration_minimax.py), the releases' own class's too.

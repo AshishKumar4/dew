@@ -20,7 +20,6 @@ A run picks its loop count as vLLM's `--hf-overrides` does: the loaded model's
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 
 from dew import _records
@@ -29,13 +28,14 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     RopeSpelling,
     base_config,
-    decoder_tensors,
     kinds_of,
+    layer_type,
     native_fields,
     read_rope,
     refuse,
     specified_layer_types,
 )
+from dew.interop.layouts import Config, Route, Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers.mlp import MLPMixer
@@ -175,40 +175,23 @@ rate the slot's own."""
 _TRUNK: dict[str, tuple[str, ...]] = {
     'backbone.embeddings.weight': ('embed_tokens', 'embedding'),
     'lm_head.weight': ('lm_head', 'kernel'), 'lm_head.logit_scale': ('logit_scale',)}
-_LAYER = re.compile(r'backbone\.layers\.(\d+)\.(.+)')
 
 
-def _sublayer(index: int, config: Mapping[str, object]) -> dict[str, tuple[str, ...]]:
-    """Layer `index`'s tensors by their paths: an MLP's or an attention's, as its kind says."""
-    kind = _records.strings(config['layer_types'], 'layer_types')[index]
-    return _MLP if kind == 'mlp' else _ATTENTION
+def _mlp_layer(config: Config, slots: Mapping[str, str]) -> bool:
+    """Whether a route's `layer` is an MLP layer, by the record's kinds."""
+    return layer_type(config, slots['layer']) == 'mlp'
 
 
-def _dory_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """A Dory tensor's path: layer j's in block j."""
-    if name in _TRUNK:
-        return ('params', *_TRUNK[name])
-    match = _LAYER.fullmatch(name)
-    if match is None:
-        raise ValueError(f'{name!r} is no Dory tensor')
-    index, tail = int(match[1]), match[2]
-    table = _sublayer(index, config)
-    if tail not in table:
-        raise ValueError(f'{name!r} is no tensor of a Dory {"mlp" if table is _MLP else "attention"} layer')
-    return ('params', f'layers_{index}', *table[tail])
+def _attention_layer(config: Config, slots: Mapping[str, str]) -> bool:
+    return not _mlp_layer(config, slots)
 
 
-def _dory_name(dew_name: str, config: Mapping[str, object]) -> str | None:
-    """The Dory name of a flat Dew parameter name, `_dory_path`'s inverse."""
-    path = tuple(dew_name.split('.'))
-    trunk = next((name for name, leaf in _TRUNK.items() if leaf == path), None)
-    if trunk is not None:
-        return trunk
-    index = int(path[0].removeprefix('layers_'))
-    tail = next((name for name, leaf in _sublayer(index, config).items() if leaf == path[1:]), None)
-    if tail is None:
-        raise ValueError(f'{dew_name!r} is no Dory parameter')
-    return f'backbone.layers.{index}.{tail}'
+_ROUTES = Table(
+    *(Route(name, 'params/' + '/'.join(path)) for name, path in _TRUNK.items()),
+    *(Route('backbone.layers.{layer}.' + name, 'params/layers_{layer}/' + '/'.join(path), when=held)
+      for table, held in ((_MLP, _mlp_layer), (_ATTENTION, _attention_layer))
+      for name, path in table.items()))
+"""Dory's names: layer j's tensors in block j, an MLP's or an attention's as its kind says."""
 
 
 def _dory_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -247,7 +230,7 @@ def _dory_export(model: CausalTransformer) -> Mapping[str, object]:
 
 DORY = DecoderFamily(
     ('dory',), _dory_config, lambda fields: fields.ngpt is not None, 'dory', 'DoryForCausalLM', _dory_export,
-    weight_path=_dory_path, export_path=_dory_name, export_weights=decoder_tensors,
+    routes=_ROUTES,
     preserve_source_layout=True, defaults=_DEFAULTS,
     tied_head_names=('lm_head.weight', 'backbone.embeddings.weight'),
 )

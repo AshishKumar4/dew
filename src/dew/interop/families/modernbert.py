@@ -13,7 +13,6 @@ does not run, so they build the dense [S, S] logits a global layer does: at
 """
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
@@ -31,11 +30,11 @@ from dew.interop.decoder_parts import (
     hf_ungated,
     read_rope,
     refuse,
-    renamed_name,
-    renamed_path,
     specified_layer_types,
+    spelled,
     ungated_mlp,
 )
+from dew.interop.layouts import Spelled, Table
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -164,8 +163,15 @@ def _modernbert_prepare(tensors: Mapping[str, Stored],
     return {_nested(name): tensor for name, tensor in tensors.items()}
 
 
-def _modernbert_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    return renamed_path(_MODERNBERT_NAMES, _nested(name), config, leaves=_HEAD)
+_MASKED_LM_ROUTES = spelled(_MODERNBERT_NAMES, leaves=_HEAD)
+
+_MODERNBERT_ROUTES = Table(
+    _MASKED_LM_ROUTES,
+    # A bare `ModernBertModel` checkpoint's names, which a load reads as the masked LM nests them.
+    Spelled((('embeddings', 'model.embeddings'), ('layers', 'model.layers'),
+             ('final_norm', 'model.final_norm')), _MASKED_LM_ROUTES))
+"""ModernBERT's names: the masked LM's (`_MODERNBERT_NAMES`, its head's `_HEAD`), which an export writes, and
+a bare encoder's, which a load reads too."""
 
 
 def _modernbert_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -205,7 +211,7 @@ MODERNBERT = DecoderFamily(
     ('modernbert',), _modernbert_config,
     lambda fields: not fields.causal and fields.embedding_norm and not fields.first_attention_norm,
     'modernbert', 'ModernBertForMaskedLM', _modernbert_export,
-    weight_path=_modernbert_path, export_path=partial(renamed_name, _MODERNBERT_NAMES, leaves=_HEAD),
+    routes=_MODERNBERT_ROUTES,
     prepare=_modernbert_prepare, spelling=_nested, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
     tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),
     defaults={'pad_token_id': 50283},

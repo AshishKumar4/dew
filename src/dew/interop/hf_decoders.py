@@ -53,6 +53,7 @@ from dew.interop.decoder_parts import (
     SourceCode,
     WrapperFields,
     _unread,
+    decoder_tensors,
     folder_config,
     held_parts,
     hf_activation,
@@ -1304,7 +1305,7 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
                        'tie_embeddings'))
     if tied != model.tie_embeddings:
         raise ValueError('tie_word_embeddings disagrees with the native model')
-    return family.export_weights(family, model, variables, {**config, 'tie_word_embeddings': tied})
+    return decoder_tensors(family, model, variables, {**config, 'tie_word_embeddings': tied})
 
 
 def export_config(model) -> Mapping[str, object]:

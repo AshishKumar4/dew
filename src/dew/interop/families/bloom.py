@@ -1,7 +1,6 @@
 """BLOOM's ALiBi attention, embedding LayerNorm and head-interleaved qkv."""
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
@@ -11,11 +10,9 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,
-    decoder_tensors,
     grouped_qkv,
     refuse,
-    renamed_name,
-    renamed_path,
+    spelled,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -74,9 +71,8 @@ BLOOM = DecoderFamily(
     ('bloom',), _bloom_config,
     lambda fields: fields.position_embedding == 'alibi' and fields.embedding_norm,
     'bloom', 'BloomForCausalLM', _bloom_export,
-    weight_path=partial(renamed_path, _BLOOM_NAMES), export_path=partial(renamed_name, _BLOOM_NAMES),
+    routes=spelled(_BLOOM_NAMES),
     packed=grouped_qkv('.self_attention.query_key_value'),
-    export_weights=decoder_tensors,
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
 )

@@ -3,10 +3,10 @@
 `config_from_hf` reads `Mamba2Config`'s fields (configuration_mamba2.py)
 into the backbone's: the SSD geometry onto the `mamba2` mixer value, the
 block without a feed-forward as `mlp_features=0`, the final norm's epsilon
-and the head's tying. `weight_path` maps the checkpoint's tensor names
-(`backbone.layers.N.mixer.*`, `backbone.norm_f`, `lm_head`) onto the
-variables tree for `dew.interop.hf_decoders.translate_weights`, and
-`export_path` maps them back.
+and the head's tying. `ROUTES` names the checkpoint's tensors
+(`backbone.layers.N.mixer.*`, `backbone.norm_f`, `lm_head`) both ways
+(`backbone_routes`): a load reads them onto the variables tree and an
+export writes them back.
 
 mamba_ssm's own checkpoints (state-spaces/mamba2-*) read through the same
 path: `config_from_mamba_ssm` writes their config as the `Mamba2Config` dict
@@ -26,7 +26,8 @@ from typing import TYPE_CHECKING
 
 from dew import _records
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_parts import record_bool, record_int
+from dew.interop.decoder_parts import in_trunk, record_bool, record_int
+from dew.interop.layouts import Route, Routes, Table
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
@@ -41,7 +42,6 @@ MODEL_TYPE = "mamba2"
 # on export. Linear weights are kernels; the conv taps keep `[D, 1, K]`.
 TRUNK: Mapping[str, tuple[str, ...]] = {"backbone.embeddings.weight": ("embed_tokens", "embedding"),
                                          "backbone.norm_f.weight": ("norm", "scale")}
-_TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in TRUNK.items()}
 LAYER: Mapping[str, tuple[str, ...]] = {
     "norm.weight": ("input_layernorm", "scale"), "mixer.norm.weight": ("self_attn", "norm", "weight"),
     **{f"mixer.{leaf}": ("self_attn", leaf) for leaf in ("A_log", "dt_bias", "D")},
@@ -49,7 +49,6 @@ LAYER: Mapping[str, tuple[str, ...]] = {
        for linear in ("in_proj", "out_proj") for kind in ("weight", "bias")},
     **{f"mixer.conv1d.{kind}": ("self_attn", "conv1d", kind) for kind in ("weight", "bias")},
 }
-_LAYER_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in LAYER.items()}
 
 
 def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None) -> DecoderFields:
@@ -117,42 +116,22 @@ def mixer_decoder(hf_config: Mapping[str, object], hidden: int, mixer: MixerBase
         tie_embeddings=tie_embeddings, residual_in_fp32=residual_in_fp32, mixer=mixer)
 
 
-def weight_path(name: str, config: Mapping[str, object], *, layer: Mapping[str, tuple[str, ...]] = LAYER,
-                family: str = "Mamba-2") -> tuple[str, ...] | None:
-    """Return the variables-tree path for one `Mamba2ForCausalLM` tensor name.
-
-    The tied head's copy comes back as None. An unknown name raises. Mamba's
-    checkpoints share the `backbone` trunk and pass their own `layer` names.
-    """
-    parts = name.split(".")
-    if name in TRUNK:
-        return ("params", *TRUNK[name])
-    if name == "lm_head.weight":
-        return None if config.get("tie_embeddings") else ("params", "lm_head", "kernel")
-    if len(parts) >= 4 and parts[:2] == ["backbone", "layers"] and parts[2].isdigit():
-        tail = layer.get(".".join(parts[3:]))
-        if tail is not None:
-            return ("params", f"layers_{parts[2]}", *tail)
-    raise ValueError(f"{name!r} has no place in a {family} CausalTransformer")
+def backbone_routes(layer: Mapping[str, tuple[str, ...]], *own: Routes) -> Table:
+    """The names of a model on the `backbone` trunk (`Mamba2ForCausalLM`'s, Mamba's, Nemotron-H's): the
+    trunk's (`TRUNK`), the head's, a tied one's copy filling no leaf, and each layer's `layer` names past
+    `backbone.layers.N.`; and the family's `own` routes before them."""
+    return Table(
+        *own,
+        *(Route(name, 'params/' + '/'.join(path)) for name, path in TRUNK.items()),
+        Route('lm_head.weight', None, when=lambda config, slots: bool(config.get('tie_embeddings'))),
+        Route('lm_head.weight', 'params/lm_head/kernel',
+              when=lambda config, slots: not config.get('tie_embeddings')),
+        *(Route('backbone.layers.{layer}.' + name, 'params/layers_{layer}/' + '/'.join(path), when=in_trunk)
+          for name, path in layer.items()))
 
 
-def export_path(dew_name: str, config: Mapping[str, object], *,
-                layer_names: Mapping[tuple[str, ...], str] = _LAYER_NAMES,
-                family: str = "Mamba-2") -> str | None:
-    """Return the `Mamba2ForCausalLM` tensor name for one flattened dew parameter path.
-
-    The inverse of `weight_path`. The tied head comes back as None, since its
-    embedding copy is written instead. A hybrid on the same `backbone` trunk
-    (Nemotron-H) passes its own `layer_names`.
-    """
-    parts = tuple(dew_name.split("."))
-    if parts in _TRUNK_NAMES:
-        return _TRUNK_NAMES[parts]
-    if parts == ("lm_head", "kernel"):
-        return None if config.get("tie_embeddings") else "lm_head.weight"
-    if parts[0].startswith("layers_") and parts[1:] in layer_names:
-        return f"backbone.layers.{parts[0].removeprefix('layers_')}.{layer_names[parts[1:]]}"
-    raise ValueError(f"{dew_name!r} is not a {family} CausalTransformer parameter")
+ROUTES = backbone_routes(LAYER)
+"""`Mamba2ForCausalLM`'s names."""
 
 
 # mamba_ssm's own checkpoint format (state-spaces/mamba2-*): a config.json

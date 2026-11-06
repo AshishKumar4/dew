@@ -2,7 +2,6 @@
 
 import dataclasses
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.decoder_parts import (
@@ -11,13 +10,11 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Renames,
     base_config,
-    decoder_tensors,
     hf_ungated,
     partial_rope,
     read_rope,
     refuse,
-    renamed_name,
-    renamed_path,
+    spelled,
     ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -76,8 +73,7 @@ PHI = DecoderFamily(
     ('phi',), _phi_config,
     lambda fields: fields.shared_parallel_norm and fields.head_bias and fields.attention_bias,
     'phi', 'PhiForCausalLM', _phi_export,
-    weight_path=partial(renamed_path, _PHI_NAMES), export_path=partial(renamed_name, _PHI_NAMES),
-    export_weights=decoder_tensors, preserve_source_layout=False,
+    routes=spelled(_PHI_NAMES), preserve_source_layout=False,
     # PhiConfig's context (configuration_phi.py:73), which a YaRN record's omitted lengths read.
     defaults={'max_position_embeddings': 2048},
     padding_idx=True,

@@ -11,7 +11,6 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Packed,
     base_config,
-    decoder_tensors,
     qkv_widths,
     refuse,
     rope_records,
@@ -117,8 +116,7 @@ PHI3 = DecoderFamily(
     ('phi3',), _phi3_config,
     lambda fields: isinstance(fields.rope_scaling, LongRopeScaling),
     'phi3', 'Phi3ForCausalLM', _phi3_export,
-    packed=_PHI3_PACKED,
-    export_weights=decoder_tensors, preserve_source_layout=True,
+    packed=_PHI3_PACKED, preserve_source_layout=True,
     # Phi3Config's norm epsilon and context.
     defaults={'rms_norm_eps': 1e-5, 'max_position_embeddings': 4096, 'pad_token_id': 32000},
     padding_idx=True,

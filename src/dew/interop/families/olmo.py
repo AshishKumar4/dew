@@ -56,7 +56,6 @@ OLMO3 = DecoderFamily(
     'olmo3',
     'Olmo3ForCausalLM',
     lambda model: {},
-    sandwich_norms=True,
     preserve_source_layout=True,
     # Olmo3Config's norm epsilon, window and context.
     defaults={'rms_norm_eps': 1e-5, 'sliding_window': 4096, 'max_position_embeddings': 2048,

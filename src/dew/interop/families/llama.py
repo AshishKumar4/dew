@@ -10,7 +10,6 @@ softmax-routed feed-forward and the expert tensor names that routing brings.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
@@ -26,12 +25,11 @@ from dew.interop.decoder_parts import (
     every_layer_windowed,
     read_rope,
     refuse,
-    renamed,
-    renamed_name,
-    renamed_path,
     softmax_top_k,
+    spelled,
 )
-from dew.interop.families.qwen import qwen35_moe_path
+from dew.interop.families.qwen import QWEN_MOE_ROUTES
+from dew.interop.layouts import Spelled
 from dew.nn.backbones.decoder_block import Mixture
 
 
@@ -116,10 +114,6 @@ _GRANITEMOE_PACKED = (
 )
 
 
-def _granitemoe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    return qwen35_moe_path(renamed(name, _GRANITEMOE_NAMES), config)
-
-
 GRANITEMOE = DecoderFamily(
     ('granitemoe',),
     _granitemoe_config,
@@ -129,8 +123,7 @@ GRANITEMOE = DecoderFamily(
     'granitemoe',
     'GraniteMoeForCausalLM',
     lambda model: {},
-    weight_path=_granitemoe_path,
-    export_path=partial(renamed_name, _GRANITEMOE_NAMES),
+    routes=Spelled(_GRANITEMOE_NAMES, QWEN_MOE_ROUTES),
     packed=_GRANITEMOE_PACKED,
     preserve_source_layout=True,
     padding_idx=True,
@@ -144,7 +137,7 @@ MIXTRAL = DecoderFamily(
     'mixtral',
     'MixtralForCausalLM',
     lambda model: {},
-    weight_path=partial(renamed_path, MOE_NAMES),
+    routes=spelled(MOE_NAMES),
     preserve_source_layout=True,
     # MixtralConfig's defaults (its rope base is its spelling's).
     defaults={'num_experts_per_tok': 2, 'num_local_experts': 8, 'rms_norm_eps': 1e-5,
