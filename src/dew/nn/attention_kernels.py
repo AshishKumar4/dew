@@ -540,17 +540,19 @@ def _decode_preferred(case: AttentionCase) -> str:
     return 'decode' if generation.backend() == 'gpu' else 'xla'
 
 
-_FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel at every fp32 decode shape "
-                "timed, its products IEEE fp32 as the kernel's (`highest`; wall a step over 50 steps in one "
-                "loop, five interleaved rounds, 1 to 128 rows over 4096 and 32768 keys, 32 or 16 query "
-                "heads over 8, 128 or 64 wide): {}")
+_FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel and the attention template's "
+                "decode at every fp32 decode shape timed, its products IEEE fp32 as theirs (`highest`; wall "
+                "a step over 50 steps in one loop, interleaved rounds, 1 to 128 rows over 4096 and 32768 "
+                "keys, 32 or 16 query heads over 8, 128 or 64 wide): {}")
 DECODE_DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
     ('sm80', 'float32 decode'): ('xla', _FP32_DECODE.format(
-        "on an A100 2.63 to 3.64 times as fast, 51.2 against 140.5 us at one row over 4096 keys, 7311 "
-        "against 25058 at 32 rows over 32768 (ET-DFP32B-a100)")),
+        "on an A100 2.63 to 3.64 times the decode kernel's speed, 51.2 against 140.5 us at one row over "
+        "4096 keys (ET-DFP32B-a100), and 25 to 161 times the template's, 52.5 against 5215.5 us there "
+        "(ET-4312-a100)")),
     ('sm90', 'float32 decode'): ('xla', _FP32_DECODE.format(
-        "on an H100 2.75 to 3.60 times as fast, 23.8 against 72.4 us at one row over 4096 keys, 3870 "
-        "against 12351 at 32 rows over 32768 (ET-DFP32B-h100)")),
+        "on an H100 2.75 to 3.60 times the decode kernel's speed, 23.8 against 72.4 us at one row over "
+        "4096 keys (ET-DFP32B-h100), and 31 to 250 times the template's, 23.6 against 3669.2 us there "
+        "(ET-4312-h100)")),
 }
 """The decode selector's declared cells (`Op.declared`), by (device generation, kind of call), each an old
 route measured faster than the decode kernel at every shape a receipt timed on the generation, and that
