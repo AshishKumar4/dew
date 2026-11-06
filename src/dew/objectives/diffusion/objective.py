@@ -41,7 +41,6 @@ from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.flops import MissingFlopsCount
-from dew.nn.inspection import INSPECTED
 from dew.nn.kernels.options import Held
 from dew.nn.mp import Uncertainty
 from dew.nn.protocols import (
@@ -801,8 +800,8 @@ class DiffusionObjective(Objective[Ratio]):
         # The representation's features of the clean images, which both alignments read.
         targets = (None if self.alignment is None
                    else self.alignment.targets(variables[REPRESENTATION], images))
-        losses, aligned, inspected = self._denoised(variables, self.model_variables(variables), samples, t,
-                                                    noise, call, targets, batch, step)
+        losses, aligned, (qk, inspected) = self._denoised(variables, self.model_variables(variables), samples,
+                                                          t, noise, call, targets, batch, step)
         weighted = losses * expand(step.boundary("loss weights", self.process.weight(t)), losses)
         if self.uncertainty is not None:
             head = {collection: variables[collection][UNCERTAINTY] for collection in ("params", "constants")}
@@ -817,7 +816,7 @@ class DiffusionObjective(Objective[Ratio]):
             metrics["alignment"] = aligned
             total = total + self.alignment.weight / 2 * aligned * mass
         if self.end_to_end is None or end_to_end is None:
-            return Ratio(total, mass), Aux(metrics=metrics, inspected=inspected)
+            return Ratio(total, mass), Aux(metrics=metrics, qk_stats=qk, inspected=inspected)
         # The autoencoder's update: its regularizer and the alignment of its
         # latent, read through the frozen model and projector in evaluation
         # mode (the batch norm on its running statistics, no condition
@@ -834,7 +833,7 @@ class DiffusionObjective(Objective[Ratio]):
         autoencoder = end_to_end.regularizer + self.end_to_end.align_weight * through
         total = total + (autoencoder + end_to_end.hinge) * mass
         updates = {LATENT_STATS: end_to_end.statistics} if step.training else None
-        return Ratio(total, mass), Aux(metrics=metrics, variables=updates, inspected=inspected)
+        return Ratio(total, mass), Aux(metrics=metrics, variables=updates, qk_stats=qk, inspected=inspected)
 
     def _denoised(self, params, variables, samples, t, noise, call, targets, batch: Batch, step: Step):
         """The per-element denoising loss at `(t, noise)`; under `alignment`, the REPA loss of the
@@ -862,9 +861,9 @@ class DiffusionObjective(Objective[Ratio]):
         if self.alignment is not None:
             aligned = self.alignment.loss({"params": params["params"][ALIGNMENT]}, self._captured(captured),
                                           targets, batch)
-        inspected = captured.get(INSPECTED, {}) if step.watched is not None else None
+        observed = step.observed(captured)
         preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
-        return optax.l2_loss(preds, target), aligned, inspected
+        return optax.l2_loss(preds, target), aligned, observed
 
     def _end_to_end_latents(self, params, images, key, step: Step, batch: Batch) -> TunedLatents:
         """The trained autoencoder's posterior draw of `images` and what the

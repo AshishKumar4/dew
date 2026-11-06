@@ -199,7 +199,7 @@ test = [
 av = ["moviepy"]
 # FID's Inception weight download
 metrics = ["requests"]
-wandb = ["wandb"]
+wandb = ["wandb>=0.19.9"]
 # MLflowTracker: a run in a tracking store, local file store included.
 mlflow = ["mlflow"]
 # TensorBoardTracker: an event file, written with tensorboard's own writer.

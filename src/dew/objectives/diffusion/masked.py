@@ -37,7 +37,6 @@ from dew.batch import TEXT_KEY, Batch, Variables, flat_field, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.inspection import INSPECTED
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import progressed
@@ -237,8 +236,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
             statistics, effects, metrics = self.balance.compose(
                 params, prediction, routing, batch, queries, fields)
             reported.update(metrics)
-        qk = sown.get("qk", {}) if step.qk_stats else None
-        inspected = sown.get(INSPECTED, {}) if step.watched is not None else None
+        qk, inspected = step.observed(sown)
         aux = Aux(metrics=reported, qk_stats=qk, effects=effects, inspected=inspected)
         return statistics, aux, TokenScores(losses * weights, real.astype(losses.dtype), correct)
 
