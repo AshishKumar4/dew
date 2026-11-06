@@ -79,11 +79,11 @@ Scope is per rule, because the rules are not all about the same thing:
   name of exactly one test function of tests/test_contracts_*.py
   (`assert_contract`: every order finite against its float64 truth and an
   independent plain formula) (row 4411; `lint_derivatives`).
-- SLOP029 is about `tests`: no test's every assertion is a process's exit
-  status (a `returncode`, `subprocess.call` or `os.system` compared with a
-  constant or tested for truth), which a command that exits 0 having done
-  nothing passes; it asserts the state the command reports or leaves (bible
-  §7's class 7).
+- SLOP029 is about `tests`: no test's every assertion is that a process
+  failed, read from its exit status alone (a `returncode`, `subprocess.call`
+  or `os.system` unequal to 0, equal to another constant or tested for truth),
+  which a crash passes as well as the refusal it is after; it asserts the
+  state the refusal reports or leaves (bible §7's class 7).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1267,38 +1267,43 @@ EXITS = {"subprocess.call", "os.system"}
 """The calls whose value is a process's exit status alone (SLOP029)."""
 
 
-def _status_only(test: ast.expr, table: dict[str, str]) -> bool:
-    """Is assertion `test` a process's exit status and nothing else: its `returncode` (or a call of
-    `EXITS`) compared with a constant, negated or tested for truth, or such checks joined by `and`?"""
+def _fails_only(test: ast.expr, table: dict[str, str]) -> bool:
+    """Is assertion `test` that a process failed, read from its exit status and nothing else: its
+    `returncode` (or a call of `EXITS`) compared unequal to 0 or equal to another constant, or tested for
+    truth, or such checks joined by `and`? Any failure passes it, a crash as well as the refusal it is
+    after."""
     if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
-        return all(_status_only(value, table) for value in test.values)
-    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-        test = test.operand
+        return all(_fails_only(value, table) for value in test.values)
 
     def status(expr: ast.expr) -> bool:
         return (isinstance(expr, ast.Attribute) and expr.attr == "returncode") or (
             isinstance(expr, ast.Call) and scopes.resolved(expr.func, table) in EXITS)
 
     if isinstance(test, ast.Compare) and len(test.ops) == 1:
-        sides = (test.left, test.comparators[0])
-        return any(status(side) for side in sides) and all(
-            status(side) or isinstance(side, ast.Constant) for side in sides)
+        left, right = test.left, test.comparators[0]
+        constant = right if status(left) else left if status(right) else None
+        if not isinstance(constant, ast.Constant) or not isinstance(constant.value, int):
+            return False
+        return (isinstance(test.ops[0], ast.NotEq) and constant.value == 0) or (
+            isinstance(test.ops[0], ast.Eq) and constant.value != 0)
     return status(test)
 
 
 def statuses(module: Module) -> Iterator[Finding]:
-    """SLOP029: a test whose every assertion is a process's exit status (`_status_only`), so a command
-    that exits 0 having done nothing passes (bible §7's class 7): assert the structured state it leaves
-    (its records, its output parsed, the files it writes) as well."""
+    """SLOP029: a test whose every assertion is that a process failed, read from its exit status alone
+    (`_fails_only`), which a crash passes as well as the refusal it is after (bible §7's class 7): assert
+    the structured state the refusal reports or leaves (its verdict, its records, the files it never
+    wrote) as well."""
     named = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
     for function in ast.walk(module.tree):
         defined = isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
         if not (defined and function.name.startswith("test")):
             continue
         asserts = [node for node in scopes.own(function) if isinstance(node, ast.Assert)]
-        if asserts and all(_status_only(node.test, dict(named.get(id(node), {}))) for node in asserts):
+        if asserts and all(_fails_only(node.test, dict(named.get(id(node), {}))) for node in asserts):
             yield Finding(module.relative, function.lineno, function.col_offset + 1, "SLOP029",
-                          "asserts only a process's exit status; assert the state it reports or leaves")
+                          "asserts only that a process failed, from its exit status, which a crash passes; "
+                          "assert the state the refusal reports or leaves")
 
 
 def skips(module: Module) -> Iterator[Finding]:

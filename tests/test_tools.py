@@ -1290,17 +1290,17 @@ BANNED_ASSERTION_LINTS = {
         "tests/test_cli.py": (
             "import subprocess\n"
             "import json\n"
-            "def test_exit_alone():\n"
-            "    done = subprocess.run(['sparx'], capture_output=True)\n"
-            "    assert done.returncode == 0, done.stderr\n"
-            "def test_call_alone():\n"
-            "    assert subprocess.call(['sparx']) == 0\n"
-            "def test_with_its_state():\n"
-            "    done = subprocess.run(['sparx'], capture_output=True)\n"
-            "    assert done.returncode == 0\n"
-            "    assert json.loads(done.stdout) == {'rows': 1}\n"
-            "def test_no_assertions():\n"
-            "    subprocess.run(['sparx'], check=True)\n"),
+            "def test_refused_by_its_exit_alone():\n"
+            "    done = subprocess.run(['sparx', '--bad'], capture_output=True)\n"
+            "    assert done.returncode != 0, done.stderr\n"
+            "def test_call_refused():\n"
+            "    assert subprocess.call(['sparx', '--bad']) == 2\n"
+            "def test_refused_with_its_state():\n"
+            "    done = subprocess.run(['sparx', '--bad'], capture_output=True)\n"
+            "    assert done.returncode == 2\n"
+            "    assert json.loads(done.stdout) == {'refused': 'bad'}\n"
+            "def test_runs():\n"
+            "    assert subprocess.run(['sparx']).returncode == 0\n"),
     }, "tests/test_cli.py", (3, 6)),
 }
 """Bible §7's banned assertions the slop lint enforces (owner, 2026-11-06), a case each, by code: the files
@@ -1308,8 +1308,9 @@ linted, the file the findings are in, their lines. SLOP008 (class 3): a private 
 test made, spied on or replaced; a public attribute or a dunder is not. SLOP011 (class 5): a sentence looked
 for in captured output that a helper returns, read through its unpacked name; a name rebound to its parse is
 not.
-SLOP029 (class 7): a test whose every assertion is a process's exit status; one that asserts the state the
-process reports as well, or asserts nothing, is not."""
+SLOP029 (class 7): a test whose every assertion is that a process failed, from its exit status alone; one that
+asserts the state the refusal reports as well, or that a process ran (exit 0, its own checks inside it), is
+not."""
 
 
 @pytest.mark.parametrize("code", sorted(BANNED_ASSERTION_LINTS))
