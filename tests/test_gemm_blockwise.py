@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import gemm, generation
 
@@ -79,3 +79,30 @@ def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
                         jax.jit(functools.partial(gradient, "xla")), draw, "blockwise kernel gradient",
                         seeds=blockwise_matrix.SEEDS, truth_fn=truth)
     assert ("blockwise_fp8", "mosaic_gpu") in {(route.choice, route.kernel) for route in routes}
+
+
+def test_a_blockwise_fp8_projections_training_step_is_on_par():
+    """On an H100, interpreted, one training step through the blockwise FP8 recipe
+    (`gemm.blockwise_fp8_projection`: its output and both gradients), the template named, on par with the
+    recipe through XLA's arms (check 1), from the recipe in float64 (tests/blockwise_matrix.py's
+    `recipe_truth`): the step-level parity a preset's projections hold (row 2513)."""
+    group_blocks = jnp.asarray([1, 0, 2], jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(384, 256)), jnp.float32),
+                jnp.asarray(rng.normal(size=(3, 256, 128)) / 16, jnp.float32),
+                jnp.asarray(rng.normal(size=(384, 128)), jnp.float32))
+
+    def step(kernel):
+        def projection(x, w):
+            with generation.chosen(blockwise_fp8=kernel):
+                return gemm.blockwise_fp8_projection(x, w, group_blocks, out_dtype=jnp.float32,
+                                                     interpret_on_cpu=True)
+        return with_gradients(projection)
+
+    with generation.assumed("sm90"):
+        assert_as_exact(jax.jit(step("mosaic_gpu")), jax.jit(step("xla")), draw,
+                        "blockwise fp8 training step",
+                        seeds=blockwise_matrix.SEEDS,
+                        truth_fn=with_gradients(blockwise_matrix.recipe_truth(group_blocks)))
