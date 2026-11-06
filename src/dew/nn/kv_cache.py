@@ -749,8 +749,9 @@ class KVStore:
             starts = extras[0] if given else None
             sinks = extras[len(given)] if sunk else None
             if kernel == 'template' and dequantizes:
-                return template_quantized(query, key, value, table if paged else None, lengths, *extras[-2:],
-                                          starts, sinks if sunk else None, softcap=softcap)
+                key_scale, value_scale = extras[-2:]
+                return template_quantized(query, key, value, table if paged else None, lengths, key_scale,
+                                          value_scale, starts, sinks, softcap=softcap)
             if kernel == 'template':
                 return template_paged(softcap)(query, key, value, table, lengths, starts, sinks)
             if kernel == 'triton':

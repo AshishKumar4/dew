@@ -507,9 +507,13 @@ class MosaicForward(_Mainloop[Tiles]):
         value_width = config.columns or value_width
         steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
+        # A paged call's key tile of several pages loaded a page at a time, as its launch loads it (a
+        # cp.async stream's pages joined into one tile beside its slots, `Family.lifetimes`).
+        page = _page(ba)
+        pieces = config.block_k // page if page is not None and page < config.block_k else 1
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
-                                           min(config.stages, steps), out_dtype=out_dtype,
+                                           min(config.stages, steps), out_dtype=out_dtype, pieces=pieces,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
                                            parts=self.parts)
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
