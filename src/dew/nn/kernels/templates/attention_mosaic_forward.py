@@ -1601,8 +1601,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     own (`_consumer`)."""
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, place[0])
-    family.loaded(((q_view, q_smem, q_loaded),))
-    q = family.held(q_smem)
+    q = _query_of(program, q_view, q_smem, q_loaded)
     pl.when(consumer == 1)(turn)
     held = None if spans is None else program.bounds(first, spans, place[0])
 
