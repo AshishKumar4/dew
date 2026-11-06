@@ -7,6 +7,8 @@ import os
 import signal
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pytest
 from process_support import running
@@ -126,6 +128,90 @@ def test_a_started_command_that_cannot_execute_raises_its_error_as_popen_does_an
     with pytest.raises(FileNotFoundError) as raised:
         start(["a-program-no-path-holds"], stdout=subprocess.PIPE)
     assert raised.value.filename == "a-program-no-path-holds"
+
+
+def test_a_started_command_meets_the_signals_popen_restores_as_popen_leaves_them():
+    """Popen restores the signals Python ignores (SIGPIPE, SIGXFSZ) to their defaults in the process it
+    executes; the command `start` executes behind its gate meets them so too: one that sends itself SIGPIPE
+    ends by it, as under Popen, where an ignored SIGPIPE would let it run on."""
+    command = ["sh", "-c", "kill -PIPE $$; exit 3"]
+    assert subprocess.run(command, timeout=60).returncode == -signal.SIGPIPE
+    started = start(command)
+    try:
+        assert started.wait(timeout=60) == -signal.SIGPIPE
+    finally:
+        stop(started)
+
+
+class Interrupted(Exception):
+    """What a caller's deadline, or a Ctrl-C, raises in a start under way."""
+
+
+def test_a_start_interrupted_before_its_command_runs_leaves_no_group_behind(tmp_path):
+    """An interruption that reaches `start` while its group starts (in its Popen, or while its gate is
+    released and executes the command) stops the group: its command, once it runs, does not outlive the
+    start that raised, though its owner, the test, runs on. Alarms at a millisecond apart land across the
+    start's steps."""
+    armed = {"on": False}
+
+    def interrupt(number: int, frame: object) -> None:
+        if armed["on"]:
+            raise Interrupted
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    interrupted, survivors = 0, []
+    try:
+        for step in range(40):
+            recorded = tmp_path / f"{step}.pid"
+            armed["on"] = True
+            signal.setitimer(signal.ITIMER_REAL, 0.001 * (step + 1))
+            try:
+                started = start(["sh", "-c", f"echo $$ > {recorded}; exec sleep 600"])
+                armed["on"] = False
+            except Interrupted:
+                interrupted += 1
+            else:
+                stop(started)
+                continue
+            finally:
+                armed["on"] = False
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            time.sleep(0.5)
+            if recorded.exists() and not gone_within(pid := int(recorded.read_text()), 5):
+                survivors.append(pid)
+                os.kill(pid, signal.SIGKILL)
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+    assert interrupted and not survivors
+
+
+def test_threads_starting_their_first_groups_at_once_in_a_process_without_dew_all_start_them(tmp_path):
+    """CI's harness never imports dew (its XLA flags would reach every test process), so its first group's
+    start loads dew._cleanup by its path (tools/armada/child_groups.py), from as many threads as start
+    groups at once (ci.py's gpu-lane): every one gets the module whole and starts its group."""
+    loader = Path(__file__).resolve().parents[1] / "tools" / "armada" / "child_groups.py"
+    program = ("import importlib.util, sys, threading\n"
+               f"spec = importlib.util.spec_from_file_location('child_groups', {str(loader)!r})\n"
+               "groups = importlib.util.module_from_spec(spec)\n"
+               "spec.loader.exec_module(groups)\n"
+               "barrier, started, failed = threading.Barrier(16), [], []\n"
+               "def one():\n"
+               "    barrier.wait()\n"
+               "    try:\n"
+               "        started.append(groups.start([sys.executable, '-c', 'pass']))\n"
+               "    except Exception as error:\n"
+               "        failed.append(repr(error))\n"
+               "threads = [threading.Thread(target=one) for _ in range(16)]\n"
+               "for thread in threads:\n"
+               "    thread.start()\n"
+               "for thread in threads:\n"
+               "    thread.join()\n"
+               "left = [pid for process in started for pid in groups.stop(process)]\n"
+               "print(len(started), failed, left)\n")
+    for _ in range(5):
+        done = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True,
+                              timeout=300, cwd=tmp_path)
+        assert done.stdout == "16 [] []\n", done.stdout + done.stderr
 
 
 class Own(Exception):
