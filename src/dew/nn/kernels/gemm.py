@@ -387,8 +387,8 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, tile: mosaic_g
         decoded = NvFp4(words, scales, jnp.float32(1)).decoded()
         return jnp.dot(rows, decoded, preferred_element_type=jnp.float32)
 
-    differentiable = generation.linear_tangent(forward, backward, portable, live_cotangents=True,
-                                                kind=KernelGlue())
+    differentiable = contracted("test_an_nvfp4_products_kernels_hold_every_order")(
+        generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
     return differentiable(rows, words, scales)
 
 
@@ -482,8 +482,9 @@ def _low_rank_backward(out_dtype, precision, interpret_on_cpu, residuals, cotang
 
 # The launches' derivative glue (`derivatives.KernelGlue`): an operand no reverse pass reaches is a symbolic
 # zero, whose gradient is never formed.
-_low_rank = declared_derivative(KernelGlue(), _low_rank_value, _low_rank_forward, _low_rank_backward,
-                                nondiff_argnums=(5, 6, 7), symbolic_zeros=True)
+_low_rank = contracted("test_an_adapted_product_holds_every_reverse_order")(
+    declared_derivative(KernelGlue(), _low_rank_value, _low_rank_forward, _low_rank_backward,
+                        nondiff_argnums=(5, 6, 7), symbolic_zeros=True))
 
 
 def dot_general(xla):

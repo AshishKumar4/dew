@@ -667,7 +667,8 @@ def _adjoined(issue: Callable) -> Callable:
                 return (jnp.sum(d * right, axis=0), d * left[None, :])
             return issue(role + "_dlhs", d, right.T), issue(role + "_drhs", left.T, d)
 
-        return declared_derivative(KernelGlue(), functools.partial(issue, role), forward, backward)
+        return contracted("test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders")(
+            declared_derivative(KernelGlue(), functools.partial(issue, role), forward, backward))
 
     def issued(role: str, left, right):
         return rule(role)(left, right)
@@ -713,7 +714,8 @@ def _kept_rule() -> Callable:
     def backward(lower, d_lower):
         return _inverse_cotangent(lower, d_lower), jnp.zeros_like(lower)
 
-    return declared_derivative(Protected(), lambda overlaps, lower: lower, forward, backward)
+    return contracted("test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders")(
+        declared_derivative(Protected(), lambda overlaps, lower: lower, forward, backward))
 
 
 def _applied(lower, given):
