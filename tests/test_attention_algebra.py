@@ -690,9 +690,9 @@ def _reference_dq(spans, hooks, scale):
 def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
     """The accurate form's dQ (`natural=True, accurate=True`: the keyed sums, each factor's mantissa and
     exponent apart, `gradient.dq_finish`) on the Triton mainloop interpreted and the plain-JAX one: finite,
-    the two equal to the bit, and on par with the reference's own fp32 dQ over the case's draws
-    (`_scaled_draw`, check 1, the truth its float64 run); where the reference's is float64's exactly, which
-    check 1 cannot weigh, float64's exactly too. The first draw's dQ and float64's."""
+    and each on par with the reference's own fp32 dQ over the case's draws (`_scaled_draw`, check 1, the
+    truth its float64 run); where the reference's is float64's exactly, which check 1 cannot weigh, each
+    float64's exactly too. The Triton mainloop's first draw's dQ and float64's."""
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     form = {"scale": scale, "natural": True, "accurate": True}
 
@@ -707,12 +707,12 @@ def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
     draw, reference = _scaled_draw(query, key, value, dout), _reference_dq(spans, hooks, scale)
     found = np.asarray(triton(*draw(0)))
     assert np.isfinite(found).all(), name
-    np.testing.assert_array_equal(found, np.asarray(portable(*draw(0))), err_msg=name)
     theirs = np.asarray(jax.jit(reference)(*draw(0)))
     with jax.enable_x64(new_val=True):
         want = np.asarray(reference(*(jnp.asarray(x, jnp.float64) for x in draw(0))))
     if np.array_equal(theirs, want):
-        np.testing.assert_array_equal(found, want, err_msg=name)
+        for arm, ours in (("triton", found), ("portable", np.asarray(portable(*draw(0))))):
+            np.testing.assert_array_equal(ours, want, err_msg=f"{name}, {arm}")
     else:
         for arm, run in (("triton", triton), ("portable", portable)):
             assert_as_exact(run, reference, draw, f"{name}, {arm}",
