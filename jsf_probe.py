@@ -9,6 +9,8 @@ from dew.nn.kernels.templates.recurrence import mainloop as ML
 from dew.nn.kernels import generation
 
 kw, vw, heads, length, form, seed, mode = sys.argv[1:]
+check = mode.endswith('-check')
+mode = mode.removesuffix('-check')
 direct = mode.startswith('direct-')
 mode = mode.removeprefix('direct-')
 kw, vw, heads, length, seed = map(int, (kw, vw, heads, length, seed))
@@ -96,6 +98,7 @@ with jax.enable_x64():
         lambda y: y.astype(jnp.float64) if hasattr(y, 'dtype') and jnp.issubdtype(y.dtype, jnp.inexact) else y,
         x))[1]
 truth = np.asarray(truth, np.float64)
+summaries = {}
 for kernel in ('xla', 'mosaic_gpu'):
     a = np.asarray(run(kernel), np.float64)
     delta = a - truth
@@ -103,6 +106,13 @@ for kernel in ('xla', 'mosaic_gpu'):
     rel = np.max(np.sqrt(np.mean(delta ** 2, axis=-1)) /
                  np.maximum(np.sqrt(np.mean(truth ** 2, axis=-1)), 1e-30))
     print('K', sys.argv[1:], kernel, 'rms', rms, 'worst-row', rel, flush=True)
+    summaries[kernel] = rms, rel
+if check:
+    mine, reference = summaries['mosaic_gpu'], summaries['xla']
+    passed = mine[0] <= 1.5 * reference[0] and mine[1] <= 4 * reference[1]
+    print('K', 'PASS' if passed else 'FAIL', 'RMS ratio', mine[0]/reference[0],
+          'worst-row ratio', mine[1]/reference[1], flush=True)
+    assert passed, 'final memory is not on par with the portable math'
 
 if mode == 'capture':
     captured = {}

@@ -1,0 +1,6 @@
+16|8|2|70|formed|0|direct-base-check
+16|8|2|70|formed|0|direct-held32-check
+16|8|2|70|formed|1|direct-base-check
+16|8|2|70|formed|1|direct-held32-check
+16|8|2|70|formed|2|direct-base-check
+16|8|2|70|formed|2|direct-held32-check
