@@ -842,7 +842,8 @@ class PretrainedDecoder(Pretrained):
         is given; a wrapper's config states the video placeholder id it marks.
         """
         if isinstance(model, MultimodalTransformer):
-            config = _wrapper_config(model, processor)
+            # As a decoder's below: the config is the wrapper's the extensions extend.
+            config = _wrapper_config(model.with_cross_attention(None).with_dex(None), processor)
             text = _records.record(config["text_config"], "text_config")
             return cls(model, variables, processor, config, None, record_fields(model, MultimodalTransformer),
                        {**decoders.GENERATION_DEFAULTS, 'use_cache': text.get('use_cache', True)}
@@ -1358,12 +1359,13 @@ _WRAPPER_WRITERS = {"qwen3_5": _WrapperWriter("Qwen3_5ForConditionalGeneration",
 
 def wrapper_writes(model: nn.Module) -> bool:
     """Whether a family's layout states `model`, a multimodal wrapper: one of a family Dew writes
-    (`_WRAPPER_WRITERS`) whose media are a vision tower and its projector, which
-    `PretrainedDecoder.from_model` writes in that layout (`_wrapper_config`); a run's export of any other
-    is its native release (`dew.interop.saved_sources.source_publishes`)."""
+    (`_WRAPPER_WRITERS`) whose media are a vision tower and its projector and whose layers hold no
+    cross-attention (`source_states`), which `PretrainedDecoder.from_model` writes in that layout
+    (`_wrapper_config`); a run's export of any other is its native release
+    (`dew.interop.saved_sources.source_publishes`)."""
     return (isinstance(model, MultimodalTransformer) and model.family in _WRAPPER_WRITERS
             and model.vision is not None and model.projection is not None and model.audio is None
-            and model.audio_projection is None)
+            and model.audio_projection is None and source_states(model))
 
 
 def _wrapper_language(model: MultimodalTransformer) -> dict[str, object]:
