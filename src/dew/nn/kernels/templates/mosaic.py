@@ -902,8 +902,10 @@ multiples of them (a ring slot's `Pieces`)."""
 
 def swizzle_transforms(dtype, swizzle: int) -> tuple:
     """A shared-memory tile's transforms at `swizzle` bytes: `TILE_ROWS`-row tiles a swizzle's row wide,
-    swizzled."""
-    return TILING((TILE_ROWS, swizzle_columns(dtype, swizzle))), SWIZZLE(swizzle)
+    swizzled; a row narrower than the narrowest swizzle (16 bytes: an NVFP4 stage's block scales, row 3621)
+    tiled alone, a 16-byte swizzle being no permutation, which Mosaic GPU's swizzle transform refuses."""
+    tiling = TILING((TILE_ROWS, swizzle_columns(dtype, swizzle)))
+    return (tiling,) if swizzle < NARROWEST_SWIZZLE_BYTES else (tiling, SWIZZLE(swizzle))
 
 
 def plain(shape: tuple, dtype):

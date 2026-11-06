@@ -46,7 +46,7 @@ from dew.nn.derivatives import KernelGlue, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
-from dew.nn.kernels.templates.gemm import rows_padded
+from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded
 from dew.nn.kernels.templates.product import declared
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import seen_whole
@@ -269,7 +269,7 @@ class NvFp4:
 NVFP4_GROUP = 128
 """The depths an NVFP4 matrix's staged order groups (`staged_rows`): a group's sixteen word rows decode, code
 by code, into its eight sixteen-row depth slices."""
-NVFP4_STAGE = 256
+NVFP4_STAGE = mosaic_gpu.NVFP4_STEP
 """The depths a stage of the mainloop's NVFP4 decode reads: two groups, so each column's scales are a
 16-byte row (a TMA copy's least)."""
 
@@ -300,19 +300,94 @@ def _staged_words(codes: jax.Array) -> jax.Array:
     return bits.packed(bits.encoded(bits_, bits.E2M1).T, bits.E2M1).T
 
 
+NVFP4_ROW = 'ledger 3621'
+"""The NVFP4 product's in-stage decode (K51)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedCase:
+    """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
+    it on the target (`grouped_matmul.MosaicPackedGmm`), None where it plans none."""
+
+    tile: mosaic_gpu.Tiles | None
+
+
+NVFP4: selection.Op[PackedCase] = selection.Op('nvfp4', (
+    selection.Kernel('packed', (
+        selection.Requirement(
+            'planned', lambda case: case.tile is not None, "the template plans no tile of the packed "
+            "product here: a Mosaic GPU family's, its depth whole 256s and its width whole 64-column tiles",
+            NVFP4_ROW),
+        selection.Requirement(
+            'measured', lambda case: False, "no receipt yet has the in-stage decode beat the decoded "
+            "matrix's product", NVFP4_ROW, kind='measured'))),
+    selection.Kernel('xla', (), generic=True)))
+"""An NVFP4 product's selector (`nvfp4_product`): the template's mainloop decoding each stage of the packed
+matrix in place (`mosaic_gpu.gmm`'s `scales`) where named (`generation.chosen(nvfp4='packed')`) and planned,
+which passes the measured requirement no receipt has met yet; else the matrix decoded once a call and its
+product (`gemm`)."""
+
+
 def nvfp4_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype, interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs · W` of an NVFP4 matrix `W` (`NvFp4`), its weights frozen (a quantized checkpoint's): `lhs`
     rounded to bfloat16, each value of `W` decoded exactly to bfloat16 (`NvFp4.decoded`, its block's
-    scale applied, 2^8 owed), the products summed in fp32 (`gemm`), and the accumulator times the deferred
-    factor (`NvFp4.factor`) before the one rounding to `out_dtype`: the deferred factor is the epilogue's
-    first operation, ahead of any output hook (PLAN piece 10). The decoded matrix is materialized once a call
-    here; the mainloop's matrix-operand hook decodes each stage in place (row 3621's next form)."""
-    decoded = matrix.decoded()
-    # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact product's,
-    # whatever precision the program defaults to.
-    summed = gemm(lhs.astype(jnp.bfloat16), decoded, None, out_dtype=jnp.float32,
-                  precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)
+    scale applied, 2^8 owed), the products summed in fp32, and the accumulator times the deferred factor
+    (`NvFp4.factor`) before the one rounding to `out_dtype`: the deferred factor is the epilogue's first
+    operation, ahead of any output hook (PLAN piece 10). Its selector (`NVFP4`) runs the template's mainloop
+    decoding each stage in place (`_packed`) where named, else decodes the matrix once a call (`gemm`)."""
+    rows = lhs.astype(jnp.bfloat16)
+    launch = grouped_matmul.MosaicPackedGmm()
+    width, depth = matrix.words.shape[0], 8 * matrix.words.shape[1]
+    bound = launch.bind(jax.ShapeDtypeStruct(rows.shape, rows.dtype),
+                        jax.ShapeDtypeStruct((1, width, depth), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((1,), jnp.int32), out_dtype='float32', trans_rhs=True,
+                        interpret=interpret_on_cpu, dense=True)
+    target = generation.gpu_target()
+    tile = launch.derived(bound, target) if launch.eligible(bound, target) else None
+    if selection.select(NVFP4, PackedCase(tile)).kernel == 'packed':
+        assert tile is not None, "the selector names the packed kernel where it plans a tile"
+        summed = _packed(rows, matrix.words, matrix.scales, tile, interpret_on_cpu)
+    else:
+        # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
+        # product's, whatever precision the program defaults to.
+        summed = gemm(rows, matrix.decoded(), None, out_dtype=jnp.float32,
+                      precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)
     return (summed * matrix.factor).astype(out_dtype)
+
+
+def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, tile: mosaic_gpu.Tiles,
+            interpret: bool) -> jax.Array:
+    """The packed matrix's product in fp32 (`nvfp4_product`'s packed kernel): the template's mainloop, each
+    stage of `words` and `scales` decoded in place (`mosaic_gpu.gmm`'s `scales`), differentiable at every
+    order as `gemm` is (`generation.linear_tangent`): its tangent the decoded product's in XLA, its reverse
+    mode the rows' gradient through the decoded values (the frozen words and scales taking none)."""
+    launch = grouped_matmul.MosaicPackedGmm()
+
+    def forward(rows, words, scales):
+        out = mosaic_gpu.gmm(rows, words[None], jnp.asarray([rows.shape[0]], jnp.int32), tiles=tile,
+                             transpose_rhs=True, out_dtype=jnp.float32,
+                             multiprocessors=launch._launched(tile, interpret),
+                             interpret=grouped_matmul.INTERPRETED if interpret else False, dense=True,
+                             scales=scales[None])
+        return out, ()
+
+    def backward(saved, operands, cotangent, live):
+        # The cotangent times the decoded values' transpose, summed in fp32, rounded once to the rows'.
+        del saved
+        rows, words, scales = operands
+        leaves = (gemm(cotangent.astype(jnp.bfloat16), NvFp4(words, scales, jnp.float32(1)).decoded(), None,
+                       transpose_rhs=True, out_dtype=rows.dtype, precision=jax.lax.Precision.DEFAULT,
+                       interpret_on_cpu=interpret),
+                  zero_from_primal(words), zero_from_primal(scales))
+        return tuple(leaves[index] for index in live)
+
+    def portable(rows, words, scales):
+        decoded = NvFp4(words, scales, jnp.float32(1)).decoded()
+        return jnp.dot(rows, decoded, preferred_element_type=jnp.float32)
+
+    differentiable = generation.linear_tangent(forward, backward, portable, live_cotangents=True,
+                                                kind=KernelGlue())
+    return differentiable(rows, words, scales)
 
 
 def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scale, *, out_dtype,

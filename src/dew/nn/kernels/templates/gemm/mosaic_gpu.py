@@ -54,6 +54,7 @@ from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.algebra import bits
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
 from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, sides_extended, sides_padded
@@ -114,14 +115,16 @@ class Tiles:
 
 
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
-            candidate, launch_of, grouped: bool) -> Tiles | None:
+            candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its
     bundles in preference order, which share its facts but their loaders and registers) for a call whose
     output has `rows` rows (a group's,
     on average, where `grouped`: a product's rows split among its groups) and `width` columns and whose
     steps run over `depth` (None: a group's rows, padded to whole steps), from the family's facts, the
     call's extents and the device's multiprocessors alone (no table, no ranking;
-    docs/design/kernel-templates.md §7). `candidate(tile)` is the launch's legality apart from its
+    docs/design/kernel-templates.md §7); `depths`, where given, the steps the launch's stage takes in place
+    of the family's (a packed matrix's decode, `NVFP4_STEP`). `candidate(tile)` is the launch's legality apart
+    from its
     resources (its granularity, its blocks dividing the call, its side operands' copies), and
     `launch_of(tile)` the launch whose ring and residency the planner sizes (`resources.plan`: its
     allocations a stage, its registers within a consumer's) on `target`.
@@ -170,7 +173,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     unit = family.column_unit(dtype)
     widest = min(width, family.widest_product or width)
     columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
-    steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
+    steps = [step for step in depths or family.depths(dtype) if depth is None or depth % step == 0]
     busy = 1 + family.loads_ahead + family.in_flight
 
     def tiled(consumers: int, programs: int) -> Tiles | None:
@@ -398,19 +401,28 @@ def _typed(dtype) -> jax.ShapeDtypeStruct:
 def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, transpose_rhs: bool,
                     prologue_axes: tuple, prologue_dtypes: tuple, epilogue_axes: tuple,
                     epilogue_dtypes: tuple, dtypes: tuple, paired: bool = False,
-                    transpose_lhs: bool = False) -> Allocations:
+                    transpose_lhs: bool = False, packed: bool = False) -> Allocations:
     """Dew: `gmm`'s allocations at `tiles` (`Allocations`), for rows of `dtype` and a matrix of `rhs_dtype`
     (two with `paired`), its side operands' axes and dtypes and its outputs' dtypes: a stream for the rows,
     each matrix and each prologue side operand that follows the steps (`_stepped`), each epilogue side
     operand's staging at a consumer's share of the tile, each prologue side operand without depth's at the
-    tile's rows; a `transpose_lhs` call's rows stream their `[depth, rows]` blocks."""
+    tile's rows; a `transpose_lhs` call's rows stream their `[depth, rows]` blocks. A `packed` matrix (an
+    NVFP4 one's, `scales`' in `gmm`) streams each 128 depths' words (`words_{q}`, a column's sixteen a
+    64-byte row, which cp.async's two-dimensional copies take and a register tile loads whole) and its block
+    scales K-major, and each consumer
+    decodes a stage into bfloat16 buffers of its own (`_stage_decoded`), one more than its family keeps
+    product groups in flight (`mosaic.Family.in_flight`), so no decode overwrites a stage a product still
+    reads."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     part = (block_m // tiles.warpgroups, block_n)
     stepped, _, fixed = _stepped(family, prologue_axes, 'depth')
     extent = {'rows': block_m, 'depth': block_k}
     rhs_block = (block_n, block_k) if transpose_rhs else (block_k, block_n)
     lhs_block = (block_k, block_m) if transpose_lhs else (block_m, block_k)
-    blocks = {'rows': (lhs_block, dtype), 'matrix': (rhs_block, rhs_dtype),
+    matrix = ({**{f'words_{q}': ((block_n, 16), jnp.uint32) for q in range(block_k // 128)},
+               'scales': ((block_n, block_k // 16), jnp.float8_e4m3fn)} if packed
+              else {'matrix': (rhs_block, rhs_dtype)})
+    blocks = {'rows': (lhs_block, dtype), **matrix,
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **{f'side_{i}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i]) for i in stepped}}
     sides = family.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
@@ -418,8 +430,11 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                                     for side_axes, side in zip(epilogue_axes, epilogue_dtypes, strict=True)])
     held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
                                     for i in fixed])
+    decoded = ([plgpu.SMEM((tiles.warpgroups, family.in_flight + 1, block_n, block_k), jnp.bfloat16)]
+               if packed else [])
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
-                                held['fixed_barriers']), tuple((part, jnp.dtype(out)) for out in dtypes))
+                                held['fixed_barriers'], decoded),
+                       tuple((part, jnp.dtype(out)) for out in dtypes))
 
 
 def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dtype,
@@ -457,7 +472,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         epilogue_operands: tuple = (), epilogue_axes: tuple = (),
         out_dtypes: tuple | None = None, dense: bool = False,
         paired: jax.Array | None = None, exact_sums: bool = False,
-        transpose_lhs: bool = False, first: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
+        transpose_lhs: bool = False, first: jax.Array | None = None,
+        scales: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
     routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`.
@@ -469,6 +485,12 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     product whose rows are the call's weight (its swapped orientation, `Tiles.swapped`). With `first`, an
     int32 scalar, `rhs` is a stack of more matrices than `group_sizes` has groups, group `g` reading matrix
     `first + g` where it lies (a banked layer's experts); the grid and the tile table are the groups'.
+    With `scales`, `rhs` is an NVFP4 matrix's (`gemm.NvFp4`), read transposed: its E2M1 codes eight a
+    uint32 in the staged order (`[groups, width, depth / 8]`) and `scales` its blocks' E4M3 scales
+    (`[groups, width, depth / 16]`); each step decodes its stage exactly into bfloat16 (each code times its
+    block's scale over `bits.NVFP4_OWED`, `_stage_decoded`), so the product is the rows times those values,
+    the deferred factor the caller's. Its depth step is whole 256s and its width tile whole 64s, with no
+    hooks, pair, exact sums, cluster or split.
 
 Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` (a cooperative
     tile's consumer, half its rows) in its shared memory stage before the warpgroup MMA reads it;
@@ -484,6 +506,16 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     g = group_sizes.shape[0]
     if transpose_rhs:
         k2, n = n, k2
+    # A packed matrix's words hold eight depths each.
+    k2 = k2 if scales is None else 8 * k2
+    if scales is not None and (
+            not transpose_rhs or rhs.dtype != jnp.uint32 or scales.shape != (matrices, n, k2 // 16)
+            or block_k % NVFP4_STEP or block_n % 64 or paired is not None or exact_sums or transpose_lhs
+            or prologue is not None or epilogue is not None or tiles.cluster > 1 or tiles.splits > 1
+            or tiles.swapped):
+        raise ValueError(f"an NVFP4 matrix {rhs.shape} with scales {scales.shape} is read transposed in "
+                         f"256-deep steps and 64-column tiles with no hooks, pair, exact sums, cluster or "
+                         f"split, not by {tiles}")
     if dense and matrices != 1:
         raise ValueError("a dense product takes one matrix")
     if first is not None and (dense or paired is not None):
@@ -556,13 +588,18 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                          multiprocessors=programs, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
                          sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired, tail=tail,
-                         exact_sums=exact_sums, transpose_lhs=transpose_lhs)
+                         exact_sums=exact_sums, transpose_lhs=transpose_lhs, scales=scales)
     if tiles.splits > 1:
         # Each run's fp32 partial, summed in its order (the same sums every call) and rounded once.
         total = functools.reduce(jnp.add, tuple(outs[0]))
         outs = tuple(total.astype(dtype) for dtype in dtypes)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
+
+
+NVFP4_STEP = 256
+"""The depth an NVFP4 matrix's step decodes (`gmm`'s `scales`): two 128-depth groups of its staged order, so
+each column's block scales are a 16-byte row, a copy's least."""
 
 
 def split_runs(steps: int, splits: int) -> bool:
@@ -592,7 +629,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple, dense: bool = False,
                   transpose_lhs: bool = False,
                   paired: jax.Array | None = None, tail: tail_of.Tail | None = None,
-                  exact_sums: bool = False) -> tuple:
+                  exact_sums: bool = False, scales: jax.Array | None = None) -> tuple:
     """Dew: `gmm` on its instruction family's bundle (`family_of`): `tiles.warpgroups` consumer roles, each
     its share of the rows by all the columns, one MMA a step (two: CUTLASS's cooperative split, 2-7% faster
     on every H100 scoreboard row than halving the columns), persistent over the tiles in a planar snake,
@@ -623,16 +660,19 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                   prologue_dtypes=tuple(side.dtype for side in prologue_operands),
                                   epilogue_axes=epilogue_axes,
                                   epilogue_dtypes=tuple(side.dtype for side in epilogue_operands),
-                                  dtypes=dtypes, paired=paired is not None, transpose_lhs=transpose_lhs)
+                                  dtypes=dtypes, paired=paired is not None, transpose_lhs=transpose_lhs,
+                                  packed=scales is not None)
     matrices = ('matrix',) if paired is None else ('matrix', 'paired')
+    # The streams that follow the matrix's group and column tile: its own, and a packed one's scales.
+    streamed = matrices + (() if scales is None else ('scales',))
     steps = k // block_k
     # A pair's tiles: g groups' boundaries, and the unrouted rows.
     grid = (pl.cdiv(m, block_m * pair) + (0 if dense else g), n // block_n)
 
     def body(*gmems):
         table_gmem, gmems = (None, gmems) if dense else (gmems[0], gmems[1:])
-        lhs_gmem, *matrix_gmems = gmems[:1 + len(matrices)]
-        refs = gmems[1 + len(matrices):]
+        lhs_gmem, *matrix_gmems = gmems[:1 + len(streamed)]
+        refs = gmems[1 + len(streamed):]
         prologue_gmems, side_gmems, o_gmems = _split(refs, len(prologue_operands), len(epilogue_operands))
         o_gmems, workspace = (o_gmems, None) if tail is None else (o_gmems[:-1], o_gmems[-1])
         ready = None if tail is None else family.partials_ready((multiprocessors, consumers), bool(interpret))
@@ -640,12 +680,12 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 
         schedule = functools.partial(
             _gmm_scheduled, table_gmem=table_gmem, lhs_gmem=lhs_gmem, splits=tiles.splits,
-            matrix_gmems=dict(zip(matrices, matrix_gmems, strict=True)), prologue_gmems=prologue_gmems,
+            matrix_gmems=dict(zip(streamed, matrix_gmems, strict=True)), prologue_gmems=prologue_gmems,
             shape=(m, steps, g), grid=grid, tiles=tiles, dense=dense, tail=tail, programs=multiprocessors,
             transpose_rhs=transpose_rhs, axes_of={i: prologue_axes[i] for i in stepped},
             interpreted=bool(interpret), transpose_lhs=transpose_lhs)
 
-        def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, *, streams):
+        def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, decoded, *, streams):
             def issue(wg, tile, walk, *, active):
                 _, row_start, _, start, *_ = tile
                 if tail is not None and not active:
@@ -660,7 +700,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          read_tiles={i: prologue_gmems[i] for i in read},
                                          mine_rows=pl.ds(wg * share, share), transpose_rhs=transpose_rhs,
                                          matrices=matrices, interpret=bool(interpret), first=start,
-                                         transpose_lhs=transpose_lhs)
+                                         transpose_lhs=transpose_lhs,
+                                         decoded=decoded[0].at[wg] if decoded else None)
                 # The unrouted rows, and a slot past the last tile, multiply nothing: zeros.
                 return _walked_products(family, walk, step, part, len(matrices), exact_sums)
 
@@ -695,6 +736,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     workspace = () if tail is None else (
         jax.ShapeDtypeStruct((multiprocessors, consumers, *part), jnp.float32),)
     operands = (lhs, rhs) if paired is None else (lhs, rhs, paired)
+    operands = operands if scales is None else (*operands, scales)
     kernel = family.kernel(body, out_type=(*out_type, *workspace),
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
@@ -819,6 +861,13 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
     matrices = {name: (_matrix_columns(gmem.at[matrix], column_tile,
                                        block_n=tiles.block_n, transpose_rhs=transpose_rhs),
                        lambda j: rhs_index(first + j)) for name, gmem in matrix_gmems.items()}
+    if 'scales' in matrix_gmems:
+        # A packed matrix's words, a stream for each 128 depths of a step: step j's group q, sixteen words a
+        # column at the tile's columns.
+        groups_of = tiles.block_k // 128
+        words = matrices.pop('matrix')[0]
+        matrices |= {f'words_{q}': (words, lambda j, q=q: (0, groups_of * (first + j) + q))
+                     for q in range(groups_of)}
     return {'rows': lhs_view, **matrices,
             **{f'side_{i}': (prologue_gmems[i].at[axes.placed(side_axes, {'rows': rows})],
                              lambda j, side_axes=side_axes: axes.placed(side_axes, {'rows': 0}, first + j))
@@ -845,7 +894,8 @@ def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int
 
 def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, prologue, prologue_axes: tuple,
               fixed_tiles: dict, read_tiles: dict, mine_rows, transpose_rhs: bool, matrices: tuple,
-              interpret: bool, first=0, apart: tuple | None = None, transpose_lhs: bool = False):
+              interpret: bool, first=0, apart: tuple | None = None, transpose_lhs: bool = False,
+              decoded=None):
     """Dew: a consumer's step of the cooperative `gmm` (`mosaic.Family.walk`): its half of the rows' slot,
     transformed by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`,
     a depth vector the family does not copy read at step `index` from global memory: `read_tiles`),
@@ -853,9 +903,17 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
     product taken apart as an fp32 tile of that shape (`_walked_products`' exact sums). The prologue's
     value stays in registers, where the products take it as their left operand (warpgroup MMA's register
     operand A, mma.sync's fragments): rewritten into the stage and read back, the gated prologue of a
-    Llama-3-8B gate_up ran at 8.3x its plain product on an H100 (row 1336)."""
+    Llama-3-8B gate_up ran at 8.3x its plain product on an H100 (row 1336). With `decoded` (this consumer's
+    buffers, a packed matrix's), the step decodes its stage of words and scales into its buffer
+    (`_stage_decoded`), published before its products read it as the matrix's stage."""
     stage = slots['rows']
-    oriented = {name: slots[name].transpose((1, 0)) if transpose_rhs else slots[name] for name in matrices}
+    read = {name: slots[name] for name in matrices if decoded is None}
+    if decoded is not None:
+        read['matrix'] = decoded.at[index % decoded.shape[0]]
+        words = [slots[f'words_{q}'] for q in range(decoded.shape[-1] // 128)]
+        _stage_decoded(words, slots['scales'], read['matrix'], interpret)
+        family.published()
+    oriented = {name: read[name].transpose((1, 0)) if transpose_rhs else read[name] for name in matrices}
     # This warpgroup's half of the rows, the only half its MMA reads (a `[depth, rows]` stage's, transposed).
     mine = stage.at[:, mine_rows].transpose((1, 0)) if transpose_lhs else stage.at[mine_rows]
     if prologue is not None:
@@ -874,6 +932,47 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
         return nothing, tuple(family.product(mine, oriented[name], apart) for name in matrices)
     return nothing, tuple(family.products(acc, mine, oriented[name], interpret)
                           for acc, name in zip(accumulators, matrices, strict=True))
+
+
+def _stage_decoded(words, scales, out, interpret: bool) -> None:
+    """Dew: a stage of an NVFP4 matrix (`words`, each 128 depths' `[columns, 16]` uint32 in the staged order,
+    `gemm.staged_rows`; `scales` `[columns, depth / 16]` E4M3) decoded into `out` (`[columns, depth]`
+    bfloat16): each 128 depths' sixteen words a column give, code by code, its eight sixteen-depth slices
+    (`bits.NVFP4_BFLOAT16_FORM`'s registers, each split into its two bfloat16 lanes, `_nvfp4_lanes`), each
+    times its block's scale over `bits.NVFP4_OWED`, exactly: every value of an E2M1 code times a power-of-two
+    scale within bfloat16's range. Its registers lie in the warpgroup MMA's fragment layout, in which a
+    column's scale is a column vector and a lane's slice a contiguous store (the strided layout found no
+    assignment for this decode)."""
+    layout = None if interpret else plgpu.Layout.WGMMA
+
+    def loaded(ref):
+        return ref[...] if layout is None else plgpu.load(ref, layout=layout, optimized=False)
+    owed = loaded(scales).astype(jnp.float32) * jnp.float32(1 / bits.NVFP4_OWED)
+    which = jax.lax.broadcasted_iota(jnp.int32, owed.shape, 1)
+    for group, group_words in enumerate(words):
+        for code, lane in enumerate(_nvfp4_lanes(loaded(group_words))):
+            # The block's scale a column: its group's code-th, picked from the loaded row by a mask (a
+            # column slice of a register tile has no layout).
+            scale = jnp.sum(jnp.where(which == 8 * group + code, owed, 0.0), axis=1)
+            out[:, pl.ds(128 * group + 16 * code, 16)] = (lane * scale[:, None]).astype(jnp.bfloat16)
+
+
+def _nvfp4_lanes(words: jax.Array) -> list[jax.Array]:
+    """Dew: the eight codes of each of `words` (uint32), each code's E2M1 value in float32, code by code
+    (`bits.NVFP4_BFLOAT16_FORM`'s four bfloat16x2 registers, each split low half first): each lane's bits
+    as an fp32 pattern, its exponent restored by 2^126 (the form leaves each code times 2^-126, its
+    subnormal codes `0.5` as a bfloat16 subnormal, restored from its mantissa), so `0.0`, `0.5` and each
+    normal code come out exact."""
+    lanes = []
+    for register in bits.NVFP4_BFLOAT16_FORM.traced(words):
+        for half in (register << jnp.uint32(16), register & jnp.uint32(0xFFFF0000)):
+            sign = half & jnp.uint32(0x80000000)
+            normal = jax.lax.bitcast_convert_type(half + jnp.uint32(126 << 23), jnp.float32)
+            mantissa = (half >> jnp.uint32(16)) & jnp.uint32(0x7F)
+            subnormal = mantissa.astype(jnp.float32) * jnp.float32(2.0 ** -7)
+            subnormal = jnp.where(sign != 0, -subnormal, subnormal)
+            lanes.append(jnp.where(half & jnp.uint32(0x7F800000) == 0, subnormal, normal))
+    return lanes
 
 
 def _transformed(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> jax.Array:

@@ -213,6 +213,7 @@ seams: "kernel-choices": {
 		grouped_matmul:     "the grouped_matmul kernel, a choice a dispatch reports"
 		local_attention:    "the local_attention kernel, a choice a dispatch reports"
 		low_rank:           "the low_rank kernel (LoRA's adapted product fused or apart, row 1304), a choice a dispatch reports"
+		nvfp4:              "the nvfp4 kernel (an NVFP4 matrix's product decoded in stage or once a call, row 3621), a choice a dispatch reports"
 		mla:                "the mla kernel, a choice a dispatch reports"
 		narrow_copies:      "the narrow_copies kernel, a choice a dispatch reports"
 		paged_decode:       "the paged_decode kernel, a choice a dispatch reports"
