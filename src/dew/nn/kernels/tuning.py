@@ -26,7 +26,7 @@ launch's config, which the others take exactly, so every process compiles the
 same program: its pick, or the heuristic. With `measure`, on a GPU the
 process has to itself (`dew._cache.measures_picks`), every variant of a launch
 without a pick compiles on a thread pool and runs alone, its kernel's device
-time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept;
+time read by CUPTI behind an eviction (`dew.telemetry.benchmark.behind`), and the fastest is kept;
 a win over the derived config is a gap in the derivation, fixed there for
 the whole family, which `gaps` names for maintainers. Picks persist per GPU model, jaxlib and jax beside XLA's
 own (`dew._cache.kernel_picks_path`; Pallas lowers a kernel in jax, which a release moves without jaxlib), in
@@ -82,11 +82,6 @@ from . import generation
 from .templates import report
 
 _log = logging.getLogger(__name__)
-
-FLUSH_BYTES = 256 << 20
-"""The bytes read before each timed launch: twice the largest L2 among Dew's
-GPUs (an RTX PRO 6000's 128 MB), so no launch finds its operands in cache,
-as none does in a training step."""
 
 REPEATS = 5
 """The timed launches of each config."""
@@ -891,28 +886,25 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels (`dew.telemetry.benchmark.device_time`), each run after
-    `FLUSH_BYTES` are read, so every config starts with its operands out of
-    cache."""
-    from dew.telemetry.benchmark import CuptiHeld, device_time
+    kernels (`dew.telemetry.benchmark.device_time`), each run behind an
+    eviction, so every config starts with its operands out of cache."""
+    from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
-    flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
-    evicting = owned_program(jnp.sum).executable(flush)
+    flush = eviction()
 
     def compiled(config):
         configured = op.replace(config=config)
 
-        def run(flush, arrays):
-            # The launch waits for the flush, which reads the whole buffer through the cache.
-            total, arrays = jax.lax.optimization_barrier((jnp.sum(flush), arrays))
+        def launched(arrays):
             args, kwargs = fill(arrays)
-            return total, configured(*args, **kwargs)
+            return configured(*args, **kwargs)
 
         start = time.perf_counter()
         # A candidate's lowering and its compile timed apart, the compile of its config as it is: a config
-        # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`).
-        lowered = owned_program(run).lower(flush, arrays)
+        # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`). The
+        # launch runs behind the flush, which reads the whole buffer through the cache.
+        lowered = owned_program(behind(launched)).lower(flush, (arrays,))
         middle = time.perf_counter()
         executable = lowered.compile()
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3
@@ -926,35 +918,31 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     # the launch keeps its heuristic until a later compile.
     try:
         with device_time() as device:
-            flushes = {kernel.name for kernel in device.kernels(evicting, flush)}
             for config, future in futures.items():
                 try:
                     executable, lowering, compiling = future.result()
-                    runs = [device.kernels(executable, flush, arrays) for _ in range(REPEATS)]
+                    runs = [device.behind(executable, flush, arrays) for _ in range(REPEATS)]
                 except jax.errors.JaxRuntimeError as error:
                     if not _resource_exhausted(error):
                         raise
                     timings[config] = error
                     continue
+                except NoKernels as error:
+                    # CUPTI read none of the config's own kernels: its time would read as zero, so no pick.
+                    timings[config] = error
+                    continue
                 read[config] = runs, lowering, compiling
     except CuptiHeld as error:
         return Timings(dict.fromkeys(ba.autotuning_configs, error))
-    return Timings({**timings, **_benchmarks(read, flushes)})
+    return Timings({**timings, **_benchmarks(read)})
 
 
-def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData | Exception]:
-    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out;
-    a config a run of which CUPTI read none of its own kernels in is no pick, as its time would read as
-    zero."""
-    benchmarks: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
-    for config, (runs, lowering, compiling) in read.items():
-        own = [[ms for name, ms in run if name not in flushes] for run in runs]
-        if not all(own):
-            benchmarks[config] = ValueError(f"CUPTI read none of config {config}'s own kernels")
-            continue
-        benchmarks[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
-                                                   metadata={}, evaluation_times_ms=tuple(map(sum, own)))
-    return benchmarks
+def _benchmarks(read: Mapping) -> dict[Hashable, tokamax.BenchmarkData]:
+    """The configs `_measured` timed, each run's time the sum of its own kernels' (`DeviceTime.behind`)."""
+    return {config: tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering, metadata={},
+                                          evaluation_times_ms=tuple(sum(kernel.milliseconds for kernel in run)
+                                                                    for run in runs))
+            for config, (runs, lowering, compiling) in read.items()}
 
 
 def _config(fastest: Timings | None) -> Hashable:

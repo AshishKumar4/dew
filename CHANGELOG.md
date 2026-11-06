@@ -15,6 +15,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   MoE rows). Hopper's grouped kernel gradient stays on the template, every other cell keeps the route it had,
   and a call CUTLASS cannot run (operands that are not bf16, a width that is not a multiple of 8, a fused hook,
   exact sums) takes the selector's next route, as before.
+- A served GRPO rollout (`RolloutScheduler.served`, `--rollout.served`) runs over several processes: one
+  server spans the trainer's mesh, each process's rows seated on its own devices, and every process steps
+  it together on the run's thread as each call admits its groups (`NativeRolloutServer.waited`), where
+  such a run was refused. Its draws run between the trainer's steps, not beside them.
+- An adapter set's model (`dew.lora.AdapterSet`) names each row's adapter as its call's `adapters` field
+  (`model.apply(variables, tokens, adapters=rows)`), which a decode carries for each row
+  (`DecoderState.adapters`); the context `dew.lora.selected` is gone.
 - An environment run's record moves from `dew.objectives.rl.config` to `dew.config.env`, beside the other
   run kinds' records: `EnvRunConfig`, `EnvConfig`, `RolloutConfig`, `TeacherConfig`, `EpisodesConfig` and
   `idle`, with no alias left, so the objectives import no configuration. A record names its kind as before.

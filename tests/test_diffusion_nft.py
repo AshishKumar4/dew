@@ -252,3 +252,33 @@ def test_the_loss_corrupts_by_its_process_own_noise_levels():
     expected = np.mean(nft.adv_clip_max / nft.beta * per)
     assert_computes_the_oracle(np.asarray([found]), np.asarray([expected]), "the NFT loss",
                                roundings=roundings)
+
+
+def test_an_inpainting_rollout_samples_and_trains_with_its_masked_image_inputs():
+    """An inpainting model, its masked image and mask beside the latents, samples with the inputs its
+    source gives them, each sample keeping them (`spatial`, as Flow-GRPO's rollout records them), and the
+    loss reads them again, where both read the latents alone and the model refused them (row 4409): a fit's
+    update moves the policy, and the loss of a rollout's batch under another mask is another."""
+    from test_flow_grpo import Inpainting, Pooled
+
+    from dew.objectives.base import Step
+
+    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
+    inputs = InputSpec(Field("image", (4, 4, 3)), mask=Field("mask", (4, 4, 1)))
+    nft = DiffusionNFTObjective(Inpainting(), process, inputs, autoencoder=Pooled(), steps=5, kl=0.0)
+    rows = np.arange(jax.device_count()) % 2
+    pixels = np.asarray(jax.random.randint(jax.random.key(41), (2, 4, 4, 3), 0, 256), np.uint8)[rows]
+    mask = np.zeros((len(rows), 4, 4, 1), np.float32)
+    mask[:, :, 2:] = 1
+    source = {"image": pixels, "mask": mask}
+    rollout, initial, final = fitted(nft, reward, source, groups=2, steps=5, train_steps=3)
+    assert int(final.updates) == 1
+    gain = [float(nft.model_variables(state.variables)["params"]["gain"]) for state in (initial, final)]
+    assert np.isfinite(gain).all() and gain[0] != gain[1]
+    batch = rollout(initial, source, jax.random.key(23))
+    assert set(batch["spatial"]) == {"mask", "masked_image"}
+    assert len(batch["spatial"]["mask"]) == len(batch["latents"])
+    step = Step(jnp.asarray(0), jax.random.key(32), {"params": initial.variables["params"]})
+    flipped = {**batch, "spatial": {**batch["spatial"], "mask": 1 - batch["spatial"]["mask"]}}
+    losses = [float(nft.scalar_loss(initial.variables, held, step)[0]) for held in (batch, flipped)]
+    assert np.isfinite(losses).all() and losses[0] != losses[1]
