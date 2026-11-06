@@ -62,6 +62,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle,
     bundle_of,
     extents,
+    launch_scope,
     layouts,
     query_swizzle,
     reducing,
@@ -463,7 +464,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                            min(config.stages, steps), out_dtype=out_dtype)
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
         guarded = algebra.headroom(value.dtype) and ba.arguments.get("residuals") is not Kept.SPLIT
-        return resources.shared_bytes(family, _scope(family, allocations, reducing(
+        return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
             family, config.consumers, self.score_mod, self.output_mod, guarded=guarded)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles, *, peaks: bool = False,
@@ -740,19 +741,6 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,
                 table, sources)
-
-
-def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True
-           ) -> resources.Scope:
-    """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
-    walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), with the algebra's
-    reductions' scratch where it `reduces` (a launch reducing its scores, weights or cotangents across
-    warps) and its `reducing_warpgroups`' scratch (`resources.Scope`)."""
-    scoped, streams, *after = allocations
-    held, walks = family.lifetimes(streams)
-    return resources.Scope(program=(scoped, *held), walks=walks,
-                           after=tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ())),
-                           reduces=reduces, reducing_warpgroups=reducing_warpgroups)
 
 
 DQ_ROWS = 7
@@ -1111,7 +1099,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k)),
                              True))
-        return max(resources.shared_bytes(layout, _scope(layout, allocations, reducing(
+        return max(resources.shared_bytes(layout, launch_scope(layout, allocations, reducing(
             layout, tiles.consumers, self.score_mod), reduces=reduces))
             for layout, tiles, allocations, reduces in launches)
 
