@@ -31,6 +31,7 @@ from dew.decision.layout import (
 )
 from dew.decision.model import DecisionModel, stream_runs
 from dew.decision.rows import Encoding, Fit
+from dew.decision.shared_state import entered_documents, entering
 from dew.decision.task import laid_out
 from dew.nn.attention_masks import visibility_mask
 
@@ -96,14 +97,18 @@ def test_questions_that_outgrow_a_row_take_several_each_repeating_the_state():
 
 
 def test_each_question_reads_the_shared_part_and_itself_and_with_siblings_those_before_it():
-    """The model's runs of a row over one state (`stream_runs` of `Layout.attention`): a token of the shared
-    part reads it up to itself; a question's token reads the shared part whole and its own part up to
-    itself, and with `siblings` each question before it whole; no question reads one after it."""
+    """The model's runs of a row over one state: apart, its questions' documents each entering the shared
+    part's (`entered_documents`, `Entered.runs`), with `siblings` the layout's streams
+    (`stream_runs`). A token of the shared part reads it up to itself; a question's token reads the shared
+    part whole and its own part up to itself, and with `siblings` each question before it whole; no
+    question reads one after it."""
     for siblings in (False, True):
         layout = dataclasses.replace(SHARED, siblings=siblings)
         _, [row] = own_and_shared(layout)
         inputs = DecisionInputs.collate([row], SPECIALS.pad, attention=layout.attention)
-        runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
+        assert inputs.reads is not None and entering(inputs.reads) is not siblings
+        runs = (entered_documents(inputs.streams, inputs.segments, len(inputs.reads)).runs() if not siblings
+                else stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments))
         length = inputs.tokens.shape[1]
         seen = np.asarray(visibility_mask(length, length, causal=False, sliding_window=None,
                                           key_runs=runs))[0, 0]
