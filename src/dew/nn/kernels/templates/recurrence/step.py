@@ -20,8 +20,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.templates import mosaic, scan
-
-L2NORM_EPS = recurrence.L2NORM_EPS
+from dew.nn.precision import L2NORM_EPS, rms_weighted
 
 
 def serves(hooks: recurrence.Hooks, operands: recurrence.Step) -> bool:
@@ -300,5 +299,5 @@ def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret:
                         optimized=False).astype(jnp.float32)
     # As `precision.rms_statistics` takes it: the sum times the count's reciprocal.
     mean = scan.summed(out * out, exchanged, interpret=interpret) * (1.0 / inputs['value'].shape[-1])
-    return recurrence.rms_weighted(out, lax.rsqrt(mean + hooks.output.epsilon), weight=weight, gate=gate,
+    return rms_weighted(out, lax.rsqrt(mean + hooks.output.epsilon), weight=weight, gate=gate,
                                    activation=hooks.output.activation)

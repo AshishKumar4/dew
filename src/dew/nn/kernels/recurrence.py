@@ -19,8 +19,6 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
-import math
-from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -30,7 +28,6 @@ from dew._hashing import fmix32
 from dew.nn.derivatives import KernelGlue, Protected
 from dew.nn.kernels import launches
 from dew.nn.precision import (
-    L2NORM_EPS,
     at_least_fp32,
     compensated_add,
     l2norm,
@@ -40,8 +37,8 @@ from dew.nn.precision import (
 )
 
 from ..sharding import explicit_spec
-from . import chunked_launch, short_conv, tuning
-from .generation import linear_tangent, triton_runs
+from . import chunked_launch, short_conv
+from .generation import linear_tangent
 
 
 @dataclasses.dataclass(frozen=True)
@@ -426,296 +423,6 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     return out.astype(operand if dtype is None else dtype), history, held
 
 
-def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
-    """One row and one value head of a decode token (`step`): the prologue's conv and l2 norm, the
-    gates, the update and the epilogue, each piece of arithmetic `step_reference`'s in fp32, its
-    quotients and roots rounded once (`short_conv`'s). The conv's channels are read where the row holds
-    them, `[K - 1, C]` history and `[C]` token, queries, keys and values in turn; the history the next
-    token reads is written apart, its key head's queries and keys by the head's first value head, so no
-    program reads a history another moved on; an idle row's as it was."""
-    names = _names(hooks)
-    inputs = dict(zip(('active', *names), refs[:len(names) + 1], strict=True))
-    outputs = refs[len(names) + 1:]
-    state_out, out_ref = outputs[0], outputs[-1]
-    state_ref = inputs['state']
-    head = pl.program_id(1)
-    active = inputs['active'][0] != 0
-    key_width, value_width = state_ref.shape
-
-    def scalar(name):
-        """A head's one entry of a `[1]` block, as a one-entry vector the arithmetic broadcasts."""
-        return inputs[name][...].astype(jnp.float32)
-
-    conv = (_ConvRefs(inputs['token'], inputs['held'], inputs['taps'], outputs[1], key_heads, key_width,
-                      value_width, head, group) if hooks.conv is not None else None)
-
-    @pl.when(active)
-    def _():
-        windows = conv.windows() if conv is not None else None
-        if hooks.conv is not None and conv is not None and windows is not None:
-            query, key, value = conv.convolved(windows, hooks.conv, interpret)
-        else:
-            query, key, value = (inputs[name][...].astype(jnp.float32) for name in ('query', 'key', 'value'))
-        if hooks.l2norm:
-            query, key = (x[None] for x in (query, key))
-            query = query * short_conv._inverse_norm(query, L2NORM_EPS, interpret=interpret)
-            query = query * (key_width ** -0.5 if hooks.scale is None else hooks.scale)
-            key = key * short_conv._inverse_norm(key, L2NORM_EPS, interpret=interpret)
-            query, key = query[0], key[0]
-        elif hooks.scale is not None:
-            query = query * hooks.scale
-        if hooks.gates is not None and hooks.gates.write == 'sigmoid' and hooks.gates.limit is None:
-            decay = jnp.exp(_gated_decay(scalar('gate'), scalar('log_a'), scalar('bias')))
-            write_gate = short_conv._sigmoid(scalar('beta'), interpret=interpret)
-        elif hooks.gates is not None:
-            step = jax.nn.softplus(scalar('gate') + scalar('bias'))
-            if hooks.gates.limit is not None:
-                step = jnp.clip(step, *hooks.gates.limit)
-            decay = jnp.exp(-jnp.exp(scalar('log_a')) * step)
-            write_gate = (step if hooks.gates.write == 'step'
-                          else short_conv._sigmoid(scalar('beta'), interpret=interpret))
-        elif hooks.rated:
-            write_gate = scalar('beta')
-            decay = jnp.exp(scalar('rate') * write_gate)
-        else:
-            decay = (jnp.ones((1,), jnp.float32) if hooks.decay == 'none'
-                     else jnp.exp(inputs['log_decay'][...].astype(jnp.float32)))
-            write_gate = scalar('beta') if hooks.gated_write else jnp.ones((1,), jnp.float32)
-        decay = jnp.broadcast_to(decay, key.shape)
-        out, updated = update(state_ref[...].astype(jnp.float32), query, key, value, decay, write_gate,
-                              delta=hooks.delta)
-        if hooks.skip:
-            out = out + scalar('skip') * value
-        if hooks.output is not None:
-            gate, weight = (inputs[name][...].astype(jnp.float32) for name in ('z', 'weight'))
-            out = gated_rms(out, gate, weight, hooks.output)
-        state_out[...] = _held(updated, key, value, state_out.dtype)
-        out_ref[...] = out.astype(out_ref.dtype)
-        if conv is not None and windows is not None:
-            conv.write([stream[1:] for stream in windows])
-
-    @pl.when(jnp.logical_not(active))
-    def _():
-        out_ref[...] = jnp.zeros(out_ref.shape, out_ref.dtype)
-        if conv is not None:
-            conv.write(conv.held())
-
-
-@dataclasses.dataclass(frozen=True)
-class _ConvRefs:
-    """A decode program's view of the prologue's conv: the row's token `[C]` and history `[K - 1, C]`,
-    the taps `[C, K]` and the moved history it writes, its value head's queries, keys and values the
-    channels `pieces` names."""
-    token: Any
-    history: Any
-    taps: Any
-    moved: Any
-    key_heads: int
-    key_width: int
-    value_width: int
-    head: Any
-    group: int
-
-    @property
-    def pieces(self):
-        """Each stream's first channel and width: its key head's queries and keys, its own values."""
-        key_head = self.head // self.group
-        return ((key_head * self.key_width, self.key_width),
-                ((self.key_heads + key_head) * self.key_width, self.key_width),
-                (2 * self.key_heads * self.key_width + self.head * self.value_width, self.value_width))
-
-    def windows(self):
-        """Each stream's conv window, `K` rows `[1, D]` fp32: the held history rounded to the token's
-        dtype, as the layer's conv reads it, then the token."""
-        count = self.taps.shape[-1]
-
-        def window(first, width):
-            channels = pl.ds(first, width)
-            held = [self.history[j, channels][None, :].astype(self.token.dtype).astype(jnp.float32)
-                    for j in range(count - 1)]
-            return [*held, self.token[channels][None, :].astype(jnp.float32)]
-
-        return [window(*piece) for piece in self.pieces]
-
-    def convolved(self, windows, conv: Conv, interpret: bool):
-        """The queries, keys and values `[D]`: each stream's taps over its window, then the activation."""
-        streams = []
-        for stream, (first, width) in zip(windows, self.pieces, strict=True):
-            taps = [self.taps[pl.ds(first, width), j].astype(jnp.float32) for j in range(len(stream))]
-            pre = short_conv.preactivation(stream, taps, None)
-            streams.append(pre if conv.activation is None
-                           else pre * short_conv._sigmoid(pre, interpret=interpret))
-        return tuple(x[0] for x in streams)
-
-    def held(self):
-        """Each stream's history as it was, for an idle row."""
-        count = self.taps.shape[-1]
-        return [[self.history[j, pl.ds(*piece)][None, :] for j in range(count - 1)] for piece in self.pieces]
-
-    def write(self, moved):
-        """Each stream's moved history, a row at a time: the values, and the queries and keys where the
-        program is its key head's first."""
-        def store(piece, rows):
-            for j, row in enumerate(rows):
-                self.moved[j, pl.ds(*piece)] = row[0].astype(self.moved.dtype)
-
-        pieces = self.pieces
-        store(pieces[2], moved[2])
-
-        @pl.when(self.head % self.group == 0)
-        def _():
-            store(pieces[0], moved[0])
-            store(pieces[1], moved[1])
-
-
-@dataclasses.dataclass(frozen=True)
-class Launch:
-    """A decode launch's program: `block` value columns of a head's state (0 for all of them, which a
-    conv or the epilogue's norm needs, each reading a whole head) and its warps."""
-    block: int
-    warps: int
-
-
-WARPS = Launch(0, 8)
-"""The launch over a whole head."""
-COLUMNS = Launch(32, 4)
-"""The launch over value columns: 32 a program, four warps (as fast as eight or faster on an H100 and an A100,
-step-configs at b98bf618f). Mamba-2 2.7B's decode token took 1.3 to 1.5% longer on an A100 at 64, its
-program's 164 registers holding three blocks a multiprocessor against 82's five, and an H100 within 2% either
-way (step-ncu2 at 6a4dc937b, 32 and 128 rows)."""
-
-KEYED_COLUMNS = 64
-"""The value columns a program takes under a decay a key dimension: its key dimension's decays and
-exponentials amortized over twice the block, 21% fewer instructions a token. Kimi Linear's decode token at
-128 rows took 0.2003 ms on an H100 at 64 against 0.2082 at 32, and on an A100 0.4333 against 0.4268, its 157
-registers three blocks a multiprocessor against 89's five (grid-ab and step-ncu2 at 6a4dc937b): the H100's
-gain the larger."""
-
-
-@dataclasses.dataclass(frozen=True)
-class StepLaunch(tuning.KernelOp):
-    """A decode token in one launch over rows and value heads (`_kernel`), its `hooks` inlined. Off a GPU
-    it interprets."""
-
-    config_cls: ClassVar[type[Launch]] = Launch
-
-    ROWS: ClassVar[tuple[str, ...]] = tuple(field.name for field in dataclasses.fields(Step)
-                                            if field.metadata.get('rows'))
-
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        """Normal floats and every row active, so a timed launch steps each row's state and history."""
-        return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
-                for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
-
-    def _fwd(self, active: jax.Array, *, state: jax.Array, query: jax.Array | None = None,
-             key: jax.Array | None = None, value: jax.Array | None = None, token: jax.Array | None = None,
-             held: jax.Array | None = None, taps: jax.Array | None = None, log_decay: jax.Array | None = None,
-             gate: jax.Array | None = None, beta: jax.Array | None = None, log_a: jax.Array | None = None,
-             bias: jax.Array | None = None, skip: jax.Array | None = None, z: jax.Array | None = None,
-             weight: jax.Array | None = None, rate: jax.Array | None = None, hooks: Hooks, dtype: str,
-             interpret: bool, config: Launch, return_residuals: bool = False):
-        from jax.experimental.pallas import triton as plgpu
-
-        # The operands as the token's `Step`, whose fields name them (`OPERANDS`).
-        operands = Step(state=state, query=query, key=key, value=value, token=token, held=held, taps=taps,
-                        log_decay=log_decay, gate=gate, beta=beta, log_a=log_a, bias=bias, skip=skip, z=z,
-                        weight=weight, rate=rate)
-        given = {name: getattr(operands, name) for name in _names(hooks)}
-        rows, value_heads, key_width, value_width = given['state'].shape
-        key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
-                     if hooks.conv is not None else given['query'].shape[1])
-
-        # A hook that reads a whole head takes a whole-head config (`_whole`).
-        block = config.block or value_width
-
-        def whole(array):
-            """An array every program reads whole."""
-            return pl.BlockSpec(array.shape, lambda r, h, c: (0,) * array.ndim)
-
-        def per_row(array):
-            """A row's whole block."""
-            return pl.BlockSpec((None, *array.shape[1:]), lambda r, h, c: (r, *(0,) * (array.ndim - 1)))
-
-        def keyed(array):
-            """The program's key head's `[rows, Hk, Dk]` block, `[Dk]`."""
-            group = value_heads // key_heads
-            return pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h // group, 0))
-
-        def valued(array):
-            """The program's head's and columns' block of a `[rows, Hv, Dv]` array, `[block]`."""
-            return pl.BlockSpec((None, None, block), lambda r, h, c: (r, h, c))
-
-        def one(array, *, rows: bool):
-            """The program's head's one entry, `[1]`."""
-            return (pl.BlockSpec((None, 1), lambda r, h, c: (r, h)) if rows
-                    else pl.BlockSpec((1,), lambda r, h, c: (h,)))
-
-        def keyed_by_value(array):
-            """The program's value head's `[rows, Hv, Dk]` block, `[Dk]`."""
-            return pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h, 0))
-
-        held_state = pl.BlockSpec((None, None, key_width, block), lambda r, h, c: (r, h, 0, c))
-        specs = {
-            'token': per_row, 'held': per_row, 'taps': whole, 'weight': whole, 'query': keyed, 'key': keyed,
-            'value': valued, 'z': valued, 'state': lambda array: held_state,
-            'gate': functools.partial(one, rows=True), 'beta': functools.partial(one, rows=True),
-            'log_a': functools.partial(one, rows=False), 'bias': functools.partial(one, rows=False),
-            'skip': functools.partial(one, rows=False), 'rate': functools.partial(one, rows=False),
-            'log_decay': keyed_by_value if hooks.decay == 'vector' else functools.partial(one, rows=True),
-        }
-        flags = pl.BlockSpec((None, 1), lambda r, h, c: (r, 0))
-        in_specs = [flags, *(specs[name](given[name]) for name in given)]
-        out_specs = [held_state]
-        out_shape = [jax.ShapeDtypeStruct(given['state'].shape, given['state'].dtype)]
-        if hooks.conv is not None:
-            out_specs.append(per_row(given['held']))
-            out_shape.append(jax.ShapeDtypeStruct(given['held'].shape, given['held'].dtype))
-        out_specs.append(valued(None))
-        out_shape.append(jax.ShapeDtypeStruct((rows, value_heads, value_width), jnp.dtype(dtype)))
-        kernel = functools.partial(_kernel, hooks=hooks, group=value_heads // key_heads, key_heads=key_heads,
-                                   interpret=interpret)
-        return tuple(launches.pallas_call(
-            kernel, grid=(rows, value_heads, value_width // block), in_specs=in_specs, out_specs=out_specs,
-            out_shape=out_shape, input_output_aliases={len(given): 0},
-            compiler_params=plgpu.CompilerParams(num_warps=config.warps),
-            interpret=interpret, name="recurrence_step",
-        )(active, *given.values())), None
-
-    def _get_heuristics_config(self, ba) -> Launch:
-        if _whole(ba.kwargs['hooks']):
-            return WARPS
-        widest = KEYED_COLUMNS if ba.kwargs['hooks'].decay == 'vector' else COLUMNS.block
-        return dataclasses.replace(COLUMNS, block=column_block(ba.arguments['state'].shape[-1], widest))
-
-    def pinnable(self, ba, config) -> bool:
-        # A program's block of value columns: a whole head where a hook reads one (`_whole`), else a whole
-        # head or a block dividing the state's width.
-        width = ba.arguments['state'].shape[-1]
-        return isinstance(config, Launch) and (
-            config.block == 0 or (not _whole(ba.kwargs['hooks']) and 0 < config.block <= width
-                                  and width % config.block == 0))
-
-    def unpinnable(self, ba, config) -> str:
-        if not isinstance(config, Launch):
-            return super().unpinnable(ba, config)
-        return ("its block of value columns is neither the whole head a hook here reads whole nor a block "
-                "dividing the state's width")
-
-
-def column_block(width: int, widest: int = COLUMNS.block) -> int:
-    """A program's block of a head's `width` value columns: the widest power of two dividing it up to
-    `widest` (itself one), so the programs a head takes cover its every column and a Triton block's
-    size is a power of two. `min(COLUMNS.block, width)` launched `width // block` programs, which left an
-    80-wide head's last 16 columns unwritten and their state stale (quality audit, 2026-11-03)."""
-    return math.gcd(width, widest)
-
-
-def _whole(hooks: Hooks) -> bool:
-    """Whether a program needs a head's whole state: a conv reads all of a head's values, the epilogue's
-    norm all of its output."""
-    return hooks.conv is not None or hooks.output is not None
-
-
 def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
     """`step` of a one-tap `conv`: its token scaled by the taps and activated in at least fp32, as the
     launch's prologue sums one term, kept in that precision as the prologue keeps it, then the launch
@@ -757,23 +464,17 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
 
 
 def _launched(hooks: Hooks, operands: Step, *, dtype):
-    """`step`'s launch on its operands."""
+    """`step`'s launch on its operands: the recurrence template's decode step on Mosaic GPU
+    (`templates.recurrence.step`), interpreted off a GPU; a one-tap conv's token taken as a scale first."""
+    from .templates import bundles
+    from .templates.recurrence import mainloop, step as template
+
     given = read(hooks, operands)
     if hooks.conv is not None and given['held'].shape[1] == 0:
         return _one_tap(hooks, hooks.conv, operands, given, dtype)
-    rows = given['state'].shape[0]
-    flags = (jnp.ones(rows, jnp.int32) if operands.active is None
-             else jnp.asarray(operands.active).astype(jnp.int32))[:, None]
-    operand = given['token' if hooks.conv is not None else 'value'].dtype
-    if 'beta' in given:
-        given['beta'] = given['beta'].reshape(rows, -1)
-    if 'log_decay' in given and hooks.decay == 'scalar':
-        given['log_decay'] = given['log_decay'].reshape(rows, -1)
-    named = jnp.dtype(operand if dtype is None else dtype).name
-    # By name, None where a hook is off.
-    state, *history, out = StepLaunch()(flags, **{name: given.get(name) for name in OPERANDS}, hooks=hooks,
-                                        dtype=named, interpret=not triton_runs())
-    return out, history[0] if history else None, state
+    family = mainloop.family_of(jnp.float32)
+    return template.step(hooks, operands, dtype=dtype, family=family or bundles.INTERPRETED,
+                         interpret=family is None)
 
 
 def _cumsum_kernel(chunk_ref, s_ref, o_ref, *rest, chunk: int, aligned: bool, scale: float | None,
