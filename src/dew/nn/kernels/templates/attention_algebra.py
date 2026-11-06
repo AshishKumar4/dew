@@ -630,9 +630,9 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
         return kept(live, launch(form, live)[0], outputs)
 
     def plain_launch(form: Forward) -> tuple[O, jax.Array, jax.Array]:
-        result = launch(form, None)
-        assert result[1] is not None, "a launch states its rows' rewalk flags in a masked walk alone"
-        return result
+        launched = launch(form, None)
+        assert launched[1] is not None, "a launch states its rows' rewalk flags in a masked walk alone"
+        return launched
 
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
         if not form.headroom:

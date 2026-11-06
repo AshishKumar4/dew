@@ -316,7 +316,7 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
             numbers = jax.tree.map(int, params["dimension_numbers"])
             a, b = value(left), value(right)
             oriented = _oriented(numbers, (a.ndim, b.ndim)) if product is not None else None
-            if oriented is not None:
+            if product is not None and oriented is not None:
                 # Any one-axis contraction of two matrices is the mainloop's product of them oriented as it
                 # takes them, `[m, k] @ [k, n]`: a transposed operand's product its own, never Dew's.
                 a, b = (operand.T if flip else operand
