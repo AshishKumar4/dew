@@ -1,0 +1,10 @@
+{
+ "bytes": 6906,
+ "kind": "release",
+ "license": "modified-mit",
+ "path": "releases/537d7a708e1654766fc628c99667bdb9364136d3541633d6522ac43cef9bfea0/kimi_k25_processor.py",
+ "reference": "moonshotai/Kimi-K2.5@4d01dfe0332d63057c186e0b262165819efb6611/kimi_k25_processor.py",
+ "repo": "dewml/fixtures",
+ "revision": "8e3e6c028bd89f695bc96e11fc413f0032611037",
+ "sha256": "537d7a708e1654766fc628c99667bdb9364136d3541633d6522ac43cef9bfea0"
+}

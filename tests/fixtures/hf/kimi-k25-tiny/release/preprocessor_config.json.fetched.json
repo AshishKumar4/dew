@@ -1,0 +1,10 @@
+{
+ "bytes": 742,
+ "kind": "release",
+ "license": "modified-mit",
+ "path": "releases/0c43520fbcc076dacbffcf0273f0dfa0ee318ff9aa55537cf7f2788d906de7b2/preprocessor_config.json",
+ "reference": "moonshotai/Kimi-K2.5@4d01dfe0332d63057c186e0b262165819efb6611/preprocessor_config.json",
+ "repo": "dewml/fixtures",
+ "revision": "8e3e6c028bd89f695bc96e11fc413f0032611037",
+ "sha256": "0c43520fbcc076dacbffcf0273f0dfa0ee318ff9aa55537cf7f2788d906de7b2"
+}

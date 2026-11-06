@@ -1,0 +1,10 @@
+{
+ "bytes": 3759,
+ "kind": "release",
+ "license": "modified-mit",
+ "path": "releases/7c91e4b3578b518bfb388d2e3dc645daf0fbf843656e887db75d12891e0030ff/chat_template.jinja",
+ "reference": "moonshotai/Kimi-K2.5@4d01dfe0332d63057c186e0b262165819efb6611/chat_template.jinja",
+ "repo": "dewml/fixtures",
+ "revision": "8e3e6c028bd89f695bc96e11fc413f0032611037",
+ "sha256": "7c91e4b3578b518bfb388d2e3dc645daf0fbf843656e887db75d12891e0030ff"
+}

@@ -1,0 +1,16 @@
+{
+  "backend": "tokenizers",
+  "bos_token": "w0",
+  "eos_token": "w1",
+  "extra_special_tokens": [
+    "<|media_pad|>",
+    "<|kimi_k25_video_placeholder|>",
+    "<|media_begin|>",
+    "<|media_end|>",
+    "<|media_content|>"
+  ],
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "w0",
+  "processor_class": "Kimi_K25Processor",
+  "tokenizer_class": "TokenizersBackend"
+}
