@@ -31,8 +31,8 @@ import optax
 import pytest
 from affine_run import BATCH, Counting, Features, Spread, val_batches
 from flax import linen as nn
-from layout_parity import layouts_agree
 from model_support import float64_twin
+from placement_parity import layouts_agree, x64
 from process_support import run_pool
 from reference_error import assert_as_exact
 from selection_margins import MARGIN, top_margin
@@ -69,7 +69,7 @@ def fit(layout, directory, steps, optimizer=None, **options):
 def trained(layout, seed, steps, optimizer=None, **options):
     """`steps` updates of the affine model from the start `seed` draws, without evaluation or checkpoints:
     a check-1 arm's run (`layouts_agree`), in float64 where the process runs in it."""
-    wide = jax.config.read("jax_enable_x64")
+    wide = x64()
 
     def stream(partition):
         def held(value):
@@ -78,7 +78,7 @@ def trained(layout, seed, steps, optimizer=None, **options):
         return (jax.tree.map(held, batch) for batch in Counting())
 
     trainer = Trainer(Features(), optimizer or optax.adam(0.1), key=jax.random.key(int(seed)),
-                      layout=layout, **options)
+                      layout=layout, param_dtype="float64" if wide else None, **options)
     return trainer.fit(Loader(train=stream, val=None, records=None, batch=BATCH), steps=steps,
                        log_every=steps)
 

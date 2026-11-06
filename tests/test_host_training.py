@@ -14,7 +14,7 @@ import pytest
 from flax import linen as nn
 from flax.core import freeze as frozen_dict
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
-from layout_parity import layouts_agree
+from placement_parity import layouts_agree, widened_start, x64
 from steady_state import steady_state
 from test_training_transactions import SHORT_SCALE, Terms, Tiny, batches
 
@@ -56,16 +56,17 @@ def equal(left, right):
 
 def compiled_for(make):
     """A trainer `make(layout)` builds for each layout and precision, and its step compiled once over the
-    first call's `data`, each call placing the trainer's start afresh."""
+    first call's `data`, each call placing the trainer's start afresh, a float64 truth's the float32
+    run's own widened (`widened_start`)."""
     held = {}
 
     def placed(layout, data):
-        key = (layout, jax.config.read("jax_enable_x64"))
+        key = (layout, x64())
         if key not in held:
             trainer = make(layout)
-            held[key] = trainer, trainer.compile(trainer.place()[0], data)
+            held[key] = trainer, trainer.compile(widened_start(trainer), data)
         trainer, step = held[key]
-        return trainer.place()[0], step
+        return widened_start(trainer), step
     return placed
 
 
