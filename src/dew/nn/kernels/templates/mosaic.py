@@ -1775,11 +1775,13 @@ class Transport[Allocated, Opened](abc.ABC):
         del pending
 
     @abc.abstractmethod
-    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+    def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         """`value` added into its view (fp32, in global memory) through `smem` (a chunk of its columns at a
         time where `smem` is narrower, `chunked`), atomically against every other role's adds into it;
         interpreted, a read and a write of the view, atomic against other
-        programs' alone (the interpreter runs a program's roles at once and a grid's programs in turn)."""
+        programs' alone (the interpreter runs a program's roles at once and a grid's programs in turn).
+        `smem` is written once at most `pending` of the program's earlier adds may still be reading theirs
+        (each through a buffer of its own: a caller's slots of a stage in turn), 0 its own add's last."""
 
     def partials_ready(self, shape: tuple[int, ...], interpret: bool):
         """The semaphores of `shape` a tile's partials are signalled on across programs (`fixed_up`); none
@@ -2124,15 +2126,16 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def store_wait(self, pending: int) -> None:
         plgpu.wait_smem_to_gmem(pending, wait_read_only=True)
 
-    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+    def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         if interpret:
             # Mosaic GPU's interpreter (jax 0.11.2) takes no TMA reduction.
             view[...] = view[...] + value
             return
-        # A TMA reduce from `smem` a chunk of its columns at a time (`chunked`), the previous add's reads of
-        # it done first; its writes go on.
-        for piece, place in chunked(value, view, smem):
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        # A TMA reduce from `smem` a chunk of its columns at a time (`chunked`), the reads of it the add
+        # before made done first (`pending` of the earlier ones' through their own buffers still going on);
+        # its writes go on.
+        for index, (piece, place) in enumerate(chunked(value, view, smem)):
+            plgpu.wait_smem_to_gmem(pending if index == 0 else 0, wait_read_only=True)
             smem[...] = piece
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(smem, place, reduction_op="add")

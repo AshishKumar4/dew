@@ -90,7 +90,10 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
 def _fused_out(family: mosaic.Family, sums: tuple, views: tuple, index, rows: int, stage, *, grouped: bool,
                interpret: bool) -> None:
     """A fused consumer `index`'s dK and dV `sums` out to their `views` through its rows of the output
-    `stage`: added into the key heads' sums where query heads share them (`grouped`), else stored."""
+    `stage`: added into the key heads' sums where query heads share them (`grouped`), else stored; once the
+    walk's dQ adds have read the stage, whose slots they took (`_dq_added`)."""
+    if not interpret:
+        family.store_wait(0)
     smem = stage.at[index, pl.ds(0, rows)]
     if grouped:
         for value, view in zip(sums, views, strict=True):
