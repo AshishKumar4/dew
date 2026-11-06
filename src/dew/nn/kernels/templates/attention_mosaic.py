@@ -71,6 +71,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     stagings,
     values_deferred,
     varying_slopes,
+    walked_extents,
     whole_tiles,
 )
 from dew.nn.kernels.templates.base import Template, Unfitted
@@ -86,8 +87,8 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     step issuing its products back to back, which turns only make wait); fewer where the `held` rows a
     consumer accumulates (a forward's queries, a dK/dV launch's keys) fill fewer of the family's units; each
     consumer's rows the family's unit (`_extents`' least: the rows its products cover, `Family.role_rows`, in
-    whole swizzled rows); the tile
-    it walks the largest unit multiple of the `walked` extent whose live set a consumer's registers hold and
+    whole swizzled rows); the tile it walks the largest of its extents (`walked_extents`: a product's depth,
+    in whole swizzled rows) within the `walked` extent whose live set a consumer's registers hold and
     whose two stages the block holds (`fits`), two the ring's busy depth, a slot loading while one is read;
     where its family's products read operands from registers, a tile its transposed streams staged at the
     family's own swizzle do not fit fits them staged narrowest (`Tiles.narrow`), a wide stage's bandwidth
@@ -96,7 +97,7 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     rows = extents(family, dtype, held)[-1]
     most = family.consumers if overlapped else 1
     for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
-        for extent in extents(family, dtype, walked):
+        for extent in walked_extents(family, dtype, walked):
             for narrow in stagings(family):
                 config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
                 if fits(config):
@@ -198,7 +199,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         family = bundle_of(config, query.dtype)
         walked = getattr(config, self.WALKED)
         reach = max(walked * 2, query.shape[1], _keys(ba))
-        sizes = [size for size in extents(family, query.dtype, reach) if size in (walked // 2, walked * 2)]
+        sizes = [size for size in walked_extents(family, query.dtype, reach)
+                 if size in (walked // 2, walked * 2)]
         changes = [*({self.WALKED: size} for size in sizes),
                    {"stages": config.stages - 1}, {"stages": config.stages + 1},
                    {"consumers": config.consumers - 1}, {"consumers": config.consumers + 1}]
@@ -388,7 +390,7 @@ class MosaicForward(_Mainloop[Tiles]):
         itemsize = jnp.dtype(query.dtype).itemsize
         per_key = sum(_width(array.shape[3], family, query.dtype) for array in (query, value)) * itemsize
         in_flight = rate / target.multiprocessors * fixed
-        for extent in reversed(extents(family, query.dtype, config.block_k)):
+        for extent in reversed(walked_extents(family, query.dtype, config.block_k)):
             candidate = dataclasses.replace(config, block_k=extent)
             if config.stages * extent * per_key >= in_flight and self._launch_legal(ba, candidate, target):
                 return self._relaunched(ba, candidate, target) or config
@@ -415,7 +417,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                           columns=None if columns == whole else columns)
                       for columns in widths
                       for consumers in range(config.consumers, 0, -1)
-                      for block in extents(family, query.dtype, config.block_k)
+                      for block in walked_extents(family, query.dtype, config.block_k)
                       if config.block_k % block == 0)
         relaunch = next((tiles for tiles in relaunches if self._launch_legal(ba, tiles, target)), None)
         if relaunch is None:

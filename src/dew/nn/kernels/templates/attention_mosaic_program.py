@@ -353,11 +353,12 @@ def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
     return _multiples(family, math.lcm(family.role_rows, family.column_unit(dtype)), extent)
 
 
-def key_extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
-    """A forward walk's key tile extents on `family`, largest first: whole multiples of its swizzled rows
-    (`Family.column_unit`), a key tile's keys its weights' product's depth and no consumer's rows, within
-    `extents`' bounds: mma.sync's guarded walk takes 32-key tiles, where its 64-row unit held no guarded
-    state at width 128 (FS-GUARD80-2)."""
+def walked_extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
+    """A walked tile's extents on `family`, largest first: whole multiples of its swizzled rows
+    (`Family.column_unit`), a walked tile (a forward's or a dQ launch's keys, a dK/dV launch's queries) a
+    product's depth and no consumer's rows, within `extents`' bounds: mma.sync's walks take 32-row tiles,
+    where its 64-row unit held no guarded state at width 128 (FS-GUARD80-2) and no plain tile's stages at
+    width 256 (64 x 64 staged 199,696 bytes of an A100's 166,912, 64 x 32 134,160, et-d256e)."""
     return _multiples(family, family.column_unit(dtype), extent)
 
 
