@@ -14,6 +14,7 @@ import pytest
 from flax import linen as nn
 from flax.core import freeze as frozen_dict
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
+from layout_parity import layouts_agree
 from steady_state import steady_state
 from test_training_transactions import SHORT_SCALE, Terms, Tiny, batches
 
@@ -51,34 +52,6 @@ def _leaves(left, right):
 def equal(left, right):
     for path, a, b in _leaves(left, right):
         np.testing.assert_array_equal(a, b, err_msg=path)
-
-
-LAYOUT_SEEDS = 8
-"""Check 1's declared seeds for a run under the host layout against the same run under the device's."""
-
-
-def floats(state) -> dict[str, np.ndarray]:
-    """A state's floating leaves by path, as check 1 holds them (`layouts_agree`)."""
-    return {jax.tree_util.keystr(path): np.asarray(leaf)
-            for path, leaf in jax.tree_util.tree_leaves_with_path(state)
-            if jnp.issubdtype(leaf.dtype, jnp.floating)}
-
-
-def layouts_agree(run, draw, label: str):
-    """The state `run(layout, *inputs)` steps to under the host layout, on par from float64 with the device
-    layout's over the seeds' draws (check 1), the truth the device layout's run in float64 on the draw
-    widened; its other leaves (counts, steps, keys) exact between the two at the first draw. The layouts
-    compile two programs, which XLA holds to no common bits (docs/design/testing.md)."""
-    from reference_error import as_given, assert_as_exact, widened
-
-    def arm(layout):
-        return as_given(lambda *inputs: floats(run(layout, *inputs)))
-
-    assert_as_exact(arm(HOST), arm(DEVICE), draw, label, seeds=LAYOUT_SEEDS,
-                    truth_fn=as_given(lambda *inputs: floats(run(DEVICE, *widened(inputs)))))
-    for path, device, host in _leaves(*(run(layout, *draw(0)) for layout in (DEVICE, HOST))):
-        if not np.issubdtype(device.dtype, np.floating):
-            np.testing.assert_array_equal(device, host, err_msg=path)
 
 
 def compiled_for(make):
@@ -155,7 +128,7 @@ def test_complete_optimizer_tree_crosses_the_execution_boundary(optimizer):
         rng = np.random.default_rng([127, seed])
         return np.float32(rng.uniform(.1, 1.)), np.float32(rng.uniform(10., 80.))
 
-    layouts_agree(run, draw, "three updates across the execution boundary")
+    layouts_agree(run, draw, "three updates across the execution boundary", HOST, DEVICE)
 
 
 @pytest.mark.parametrize("composite", [False, True])
@@ -188,7 +161,8 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
                                                                jnp.float32)}
                      for batch in data)
 
-    layouts_agree(run, draw, "an accumulation window replayed across the execution boundary")
+    layouts_agree(run, draw, "an accumulation window replayed across the execution boundary", HOST,
+                  DEVICE)
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(
