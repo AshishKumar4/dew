@@ -463,6 +463,18 @@ def gemma_features(model_type, config, waveforms):
 
 
 NVFP4_QDQ = Path(__file__).parent / "fixtures" / "codecs" / "nvfp4_qdq"
+
+
+def quantized_checkpoints() -> list[Path]:
+    """Every checkpoint fixture whose weights a codec stores: its config declares a format Dew reads
+    (`codecs.source_quantization`) and the fixture holds its weights, found from the fixtures as they are
+    (row 178)."""
+    from dew.interop.codecs import source_quantization
+
+    root = Path(__file__).parent / "fixtures"
+    return [config.parent for config in sorted(root.glob("**/config.json"))
+            if any(config.parent.glob("*.safetensors"))
+            and source_quantization(json.loads(config.read_text())) is not None]
 """Two compressed-tensors NVFP4 checkpoints of one tiny Qwen3 with input QDQ, one per local-scale
 rounding, each with the author's reference forward (`reference.npz`)."""
 

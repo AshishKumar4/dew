@@ -1,13 +1,13 @@
-"""A checkpoint's input quantization in every view of its projection sites.
+"""A quantized checkpoint in every view of its projection sites.
 
-Each quantized Linear holds its input scale in its own `QUANTIZATION`
-variables, so the views that rename or restack its scope carry the scale
-with its kernel: the scanned stack, the pipeline's stages, the packed query,
-key and value of the serving step, and every entry method of the model. Each
-view's logits are held by check 1 to the plain loop's over drawn ids, the truth
-the loaded model's own float64 forward; the plain loop is held to the
-compressed-tensors author's reference in tests/test_codec_checkpoints.py, and the
-model without its input QDQ fails the same check.
+Each quantized Linear holds its stored weight's codec and its input scale in its own variables, so the
+views that rename or restack its scope carry them with its kernel: the scanned stack and the pipeline's
+stages, for every checkpoint fixture a codec stores (`quantized_checkpoints`: ModelOpt's, compressed-tensors'
+FP8, NVFP4, input-QDQ and integer packings, block FP8; row 178), and the packed query, key and value of the
+serving step and every entry method of the model, for the input-QDQ checkpoints. Each view's logits are
+held by check 1 to the plain loop's over drawn ids, the truth the loaded model's own float64 forward; the
+plain loop is held to each codec's author reference in tests/test_codec_checkpoints.py, and the model
+without its input QDQ fails the same check.
 """
 
 import dataclasses
@@ -18,7 +18,13 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from float64_terms import float64_forward
-from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case, token_draw
+from interop_support import (
+    NVFP4_QDQ_CASES,
+    clearing_selections,
+    nvfp4_qdq_case,
+    quantized_checkpoints,
+    token_draw,
+)
 from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact
 
 import dew
@@ -38,18 +44,35 @@ def case(request):
     return directory, Pretrained.load(directory, dtype="float32", attention_impl="reference"), reference
 
 
+CHECKPOINTS = quantized_checkpoints()
+
+
+@pytest.fixture(scope="module", params=CHECKPOINTS, ids=[directory.name for directory in CHECKPOINTS])
+def stored(request):
+    """A codec's checkpoint, loaded."""
+    return Pretrained.load(request.param, dtype="float32", attention_impl="reference")
+
+
 VIEW_SEEDS = 8
 """Each view's declared check-1 seeds against the plain loop, sized by `seeds_for` paired on armada."""
+IDS = (2, 8)
+"""A drawn batch's rows and tokens."""
 
 
-def assert_view(view, model, variables, reference, label):
+def assert_view(view, model, variables, reference, label, *, draw=None):
     """`view(ids)`, a view of `model`'s logits over `variables` (a JAX function, which the gate compiles;
-    `as_given` where it runs outside one program), held by check 1 to its plain loop over drawn ids of the
-    reference's shape, the truth the plain loop's own float64 forward (`float64_forward`)."""
-    assert_as_exact(view, lambda ids: model.apply(variables, ids),
-                    token_draw(0xF4, int(reference["ids"].max()) + 1, reference["ids"].shape), label,
-                    seeds=VIEW_SEEDS,
+    `as_given` where it runs outside one program), held by check 1 to its plain loop over drawn ids (of the
+    reference's shape, or `draw`'s), the truth the plain loop's own float64 forward (`float64_forward`)."""
+    draw = draw or token_draw(0xF4, int(reference["ids"].max()) + 1, reference["ids"].shape)
+    assert_as_exact(view, lambda ids: model.apply(variables, ids), draw, label, seeds=VIEW_SEEDS,
                     truth_fn=as_given(lambda ids: np.asarray(float64_forward(model, variables, ids)[0])))
+
+
+def assert_stored_view(view, loaded, label):
+    """`assert_view` of a codec's checkpoint (`stored`) over ids drawn below its vocabulary, its selections
+    cleared where it routes (`clearing_selections`)."""
+    draw = clearing_selections(loaded, token_draw(0xF5, loaded.model.vocab_size, IDS), label)
+    assert_view(view, loaded.model, loaded.variables, None, label, draw=draw)
 
 
 def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case):
@@ -63,13 +86,11 @@ def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case)
     assert not isinstance(failed.value, Inconclusive)
 
 
-def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
+def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(stored):
     """A scanned run stacks every collection on the layer axis, the scales
     with the kernels, so each layer reads its own."""
-    _, loaded, reference = case
-    scanned = loaded.model.clone(scan_layers=True)
-    assert_view(lambda ids: scanned.apply(loaded.variables, ids), loaded.model, loaded.variables, reference,
-                "scanned")
+    scanned = stored.model.clone(scan_layers=True)
+    assert_stored_view(lambda ids: scanned.apply(stored.variables, ids), stored, "scanned")
 
 
 def quantized_apart(case):
@@ -143,13 +164,12 @@ def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(ca
 
 
 @pytest.mark.mesh(devices=2)
-def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(case):
-    """Two stages of one layer each, two microbatches of one row: the stage
-    axis stacks the scales as it stacks the kernels."""
-    _, loaded, reference = case
+def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(stored):
+    """Two stages, two microbatches of one row: the stage axis stacks the scales as it stacks the
+    kernels."""
     mesh = MeshSpec(stage=2).build(jax.devices()[:2])
-    placed = jax.device_put(loaded.variables, Layout().shardings(mesh, loaded.variables))
-    staged = jax.jit(loaded.model.apply)
+    placed = jax.device_put(stored.variables, Layout().shardings(mesh, stored.variables))
+    staged = jax.jit(stored.model.apply)
 
     # Placed on a mesh and run in microbatches by its own program: as given.
     @as_given
@@ -157,7 +177,7 @@ def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(case):
         with jax.set_mesh(mesh), pipeline_microbatches(2):
             return staged(placed, jnp.asarray(ids, jnp.int32))
 
-    assert_view(view, loaded.model, loaded.variables, reference, "two stages")
+    assert_stored_view(view, stored, "two stages")
 
 
 def test_packed_projections_carry_their_members_shared_scale(case):
