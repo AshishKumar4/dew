@@ -16,6 +16,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
     _coords,
+    _rows,
     _Spans,
     _streamed,
     _views_of,
@@ -39,8 +40,9 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     products' left operands and dQ's; dK's and dV's output stage (fp32, the head widths equal,
     `MosaicBackward.legal`), held across the walks where a tile's dQ adds read it
     (`Transport.adds_through_shared`); the two loads' barriers; its query and output-cotangent streams in
-    `stages` slots (`Family.streams`), and its query tiles' per-row statistics (`STATISTICS`) a stream each
-    beside them, which a step reads from shared memory, loaded ahead with its tile as FlashAttention 3's
+    `stages` slots (`Family.streams`), and where its copies move a vector (`Transport.copies_vectors`) its
+    query tiles' per-row statistics (`STATISTICS`) a stream each beside them, which a step reads from shared
+    memory (elsewhere from global memory, `_rows`), loaded ahead with its tile as FlashAttention 3's
     producer loads LSE and dPsum (hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's `smem_lse`, `smem_dpsum`), not
     from global memory once the step starts (ET-TPLPROF-h100: the fused launch stalled on long scoreboards
     46.2k against FlashAttention 3's 21.8k); and the output stage scoped after the walks where no add reads
@@ -54,15 +56,16 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
               plgpu.SMEM((consumers, 2, block_q, block_k), dtype), *([stage] if held else []),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
-              **{name: ((block_q,), kind) for name, kind in STATISTICS.items()}}
+              **({name: ((block_q,), kind) for name, kind in STATISTICS.items()}
+                 if family.copies_vectors else {})}
     return scoped, family.streams(blocks, stages, consumers), [] if held else [stage]
 
 def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,
                 carry, accumulators, *, masked: bool | None = None):
     """A fused dK/dV consumer's query tile `index`, queries first (`[bq, bk]`, the hookless fast form's
     one launch): its scores and score cotangents from the query and output cotangent slots (`slots`) and its
-    resident keys and values (`resident`), under the tile's queries' statistics (`rows_of(slots)`, their
-    slots') and
+    resident keys and values (`resident`), under the tile's queries' statistics (`rows_of(slots, first
+    query)`, their slots' where streamed) and
     coordinates (`coords_of(first query)`), a tile every query sees whole (`whole(index)`) unmasked, or
     each tile `masked` or not where the walk's segment says (a run of whole tiles, `whole_run`). Its
     weights and score cotangents staged in `staged`, whose transposes are dV's and dK's left operands
@@ -75,8 +78,8 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
     coords = coords_of(q_first, read=walk.places_read(masked=masked))
-    narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots), coords, whole(index),
-                                  shape, masked=masked)
+    narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
+                                  whole(index), shape, masked=masked)
     family.staged(narrowed, staged.at[0])
     dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot, walk.interpret)
     cotangents_staged = staged.at[1]
@@ -144,16 +147,20 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         out_smem = out_smem[0] if out_smem else None
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
+        streamed_rows = family.copies_vectors
         views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head),
-                 **{name: (ref.at[row, head], lambda j: (j,)) for name, ref in zip(STATISTICS, stat_refs,
-                                                                                   strict=True)}}
+                 **({name: (ref.at[row, head], lambda j: (j,)) for name, ref in zip(STATISTICS, stat_refs,
+                                                                                    strict=True)}
+                    if streamed_rows else {})}
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(consumers)])
 
-        def rows_of(slots):
-            return tuple(family.rows_of(slots[name]) for name in STATISTICS)
+        def rows_of(slots, q_first):
+            if streamed_rows:
+                return tuple(family.rows_of(slots[name]) for name in STATISTICS)
+            return tuple(_rows(family, ref, row, head, q_first, block_q) for ref in stat_refs)
 
         def consumer(index):
             k_first = pair_first + index * block_k
