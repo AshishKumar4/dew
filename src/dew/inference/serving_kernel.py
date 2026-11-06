@@ -29,7 +29,13 @@ from dew.mesh import logical_spec
 from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
 from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
-from dew.nn.kernels.options import Option, OuterProgram, compiler_options, program as outer_program
+from dew.nn.kernels.options import (
+    Option,
+    OuterProgram,
+    Placements,
+    compiler_options,
+    program as outer_program,
+)
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import (
     POOLED,
@@ -842,12 +848,12 @@ def page_programs(formats: Formats, rows: NamedSharding | None) -> tuple[OuterPr
     return _host_moves(_read_pages, _written_pages, split_donated(formats), rows)
 
 
-def _host_moves(read: Callable, write: Callable, placed: tuple, rows: NamedSharding | None
+def _host_moves(read: Callable, write: Callable, placed: tuple[Placements, ...], rows: NamedSharding | None
                 ) -> tuple[OuterProgram, OuterProgram]:
     """The pair of programs that move a device store's places, placed as `placed` (its arguments before the
     places), to the host and back (`read`, `write`): the write's places handed in a row per group placed as
     `rows`, its store donated."""
-    out = placed if len(placed) > 1 else placed[0]
+    out: Placements = placed if len(placed) > 1 else placed[0]
     return (outer_program(read, in_shardings=(*placed, None)),
             outer_program(write, donate_argnums=(0,), in_shardings=(*placed, None, rows), out_shardings=out))
 
