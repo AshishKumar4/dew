@@ -1,4 +1,4 @@
-"""Actual Diffusers 0.34.0 Wan 2.1 objects, saved and walked, for tests/fixtures.
+"""Actual Diffusers Wan 2.1 objects, saved and walked, for tests/fixtures, at the release the test extra pins.
 
 The transformer half constructs tiny `WanTransformer3DModel` instances with
 every parameter moved off its initialization, saves each with
@@ -23,7 +23,7 @@ the walk it steps the published UniPC scheduler alone, at 10 and 50 steps,
 on a fixed sequence of model outputs that no sample feeds back into: its
 timesteps and the sample after every step, in float32 and in float64.
 
-Run with the Dew test environment's diffusers 0.34.0 and torch, on CPU:
+Run with the Dew test environment's diffusers and torch, on CPU:
 
     python tools/diffusers_wan_reference.py transformer OUTPUT_DIR
     python tools/diffusers_wan_reference.py bundle OUTPUT_DIR tests/fixtures/wan_transformer.tar.xz
@@ -48,7 +48,7 @@ from diffusers_reference_helpers import recording, restore_transformers_names
 from reference_releases import RELEASES
 from torch_precision import default_dtype, float64, float64_twin, widened
 
-COHORT = "diffusers-0.34"
+COHORT = "diffusers"
 DIFFUSERS = RELEASES[COHORT]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
 BASE = {"patch_size": [1, 2, 2], "num_attention_heads": 2, "attention_head_dim": 12, "in_channels": 4,
