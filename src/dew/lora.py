@@ -528,7 +528,7 @@ class Adapter:
         merged: dict = {}
         for path, target in self.targets.items():
             node = _node(variables, path)
-            kernel = _updated(node["kernel"], node["lora_A"], node["lora_B"], self.scale(target))
+            kernel = _merged(node["kernel"], node["lora_A"], node["lora_B"], self.scale(target))
             _insert(merged, (*path, "kernel"), kernel)
         dropped = {(*path, factor) for path in self.targets for factor in FACTORS}
         return select(overlay(variables, merged), lambda path: path not in dropped)
@@ -687,12 +687,22 @@ def _scale(target: Target, rslora: bool) -> float:
     return target.alpha / (math.sqrt(target.rank) if rslora else target.rank)
 
 
+def _merged(kernel, a, b, scale: float) -> jax.Array | Deferred:
+    """`_updated`, or over leaves an export reads as it writes them (a bank's rows, `stored_layers`) the
+    merge it builds as it writes it (`Deferred`)."""
+    if not any(deferred(leaf) for leaf in (kernel, a, b)):
+        return _updated(kernel, a, b, scale)
+
+    def built() -> jax.Array:
+        read = [jnp.asarray(np.asarray(leaf)) for leaf in (kernel, a, b)]
+        return _updated(read[0], read[1], read[2], scale)
+
+    return Deferred(kernel.shape, kernel.dtype, built)
+
+
 def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax.Array:
     """`kernel` plus `scale` times the factors' product, summed in at least fp32 at full precision
-    and stored in the kernel's dtype, as PEFT's `merge_and_unload` does; over leaves an export reads as
-    it writes them (a bank's rows, `stored_layers`), the merge it builds as it writes it (`Deferred`)."""
-    if any(deferred(leaf) for leaf in (kernel, a, b)):
-        return Deferred(kernel.shape, kernel.dtype, lambda: _updated(*map(np.asarray, (kernel, a, b)), scale))
+    and stored in the kernel's dtype, as PEFT's `merge_and_unload` does."""
     dtype = at_least_fp32(kernel.dtype)
     delta = accumulated(functools.partial(jnp.tensordot, axes=1, precision=jax.lax.Precision.HIGHEST),
                         a.astype(dtype), b.astype(dtype))
