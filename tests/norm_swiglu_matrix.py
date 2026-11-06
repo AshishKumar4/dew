@@ -53,6 +53,8 @@ REFERENCE = "xla"
 CHOICES = frozenset({"rms_norm", "swiglu"})
 """The `generation.CHOICES` entries the cells run, the kernel under test the Pallas kernels: each cell asserts
 that its routes run its op's kernel (`KERNEL`) and that any other choice runs at XLA."""
+KERNELS = {"rms_norm": frozenset({KERNEL}), "swiglu": frozenset({KERNEL})}
+"""The kernels under test of each choice the cells run: each op's Pallas kernel."""
 
 
 def _entry(case: dict[str, str], output):
