@@ -294,6 +294,7 @@ def test_dew_data_publish_publishes_a_parquet_stream_at_the_plan_version_it_name
     from dew._cli.main import main
     from dew.data.cache import Cache
     from dew.data.compile import publish
+    from dew.data.generation import Generation
 
     url = written(f"cli-{uuid4().hex}")
     chain = tmp_path / "chain.py"
@@ -304,10 +305,11 @@ def test_dew_data_publish_publishes_a_parquet_stream_at_the_plan_version_it_name
         cache = f"memory://parquet-files-cli-cache-{uuid4().hex}"
         capsys.readouterr()
         assert main(["data", "publish", str(chain), cache, "--plan-version", str(version)]) == 0
-        published = capsys.readouterr().out.split()[-1]
-        made[version] = published.rsplit("/", 1)[-1]
+        published = Generation(capsys.readouterr().out.split()[-1]).manifest
         again = publish(Pipeline(Files(url, format="parquet")),
                         Cache(f"memory://parquet-files-api-{uuid4().hex}"), read="streamed",
                         plan_version=version)
-        assert again.url.rsplit("/", 1)[-1] == made[version]
+        # The fill's dependency and its manifest are what the version decides; the rest is the generation's.
+        made[version] = (published["dependency"], published["manifest"])
+        assert made[version] == (again.manifest["dependency"], again.manifest["manifest"])
     assert made[9] != made[10]
