@@ -37,6 +37,8 @@ class ReleaseParity:
     """The wire requests of each seed, `[[{state, questions: {id: wire}}, ...], ...]`."""
     gradients: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Each recorded `gradient.<name>`'s head parameter, by its path in the head's tree."""
+    attention_impl: str = "reference"
+    """The attention the release is loaded with, as its own tests load it."""
     every_slot: bool = False
     """Whether the recording states its scores at every option slot `[R, Q, O]`, 0 past the real options,
     rather than at the real ones alone."""
@@ -50,7 +52,8 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
     from dew.interop import Pretrained
 
     # A release of an engine outside Dew states no task of Dew's: its bundle's (`Decide.of`).
-    task = Decide.of(Pretrained.load(parity.release(scratch), dtype="float32", attention_impl="reference"))
+    task = Decide.of(Pretrained.load(parity.release(scratch), dtype="float32",
+                                     attention_impl=parity.attention_impl))
     seeds = declared_seeds(parity.recording)[parity.site]
     draw, reference, truth = indexed_recording(recording(parity.recording), parity.site, seeds)
     requests = json.loads(parity.requests.read_text())

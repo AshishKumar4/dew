@@ -26,11 +26,17 @@ def slot_release(mode: str, attention: str):
 
 
 JOINT = Path(__file__).parent / "fixtures" / "joint_checkpoint" / "tiny"
+JOINT_BACKBONE = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 
 
 def joint_release(scratch: Path) -> Path:
-    """The tiny joint release, as its fixture holds it."""
-    return JOINT
+    """The tiny joint release: its backbone's files beside its head's, as the release publishes them."""
+    release = scratch / "joint"
+    release.mkdir()
+    head = (JOINT / "joint_head_config.json", JOINT / "joint_head.safetensors")
+    for source in [*JOINT_BACKBONE.iterdir(), *head]:
+        (release / source.name).symlink_to(source.resolve())
+    return release
 
 
 RELEASES = [
@@ -39,7 +45,7 @@ RELEASES = [
                     {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)} if mode == "head" else {})
       for mode in ("slot_lm", "head") for attention in ("causal", "block")),
     *(ReleaseParity(f"joint {site}", joint_release, JOINT / "parity.npz", site, JOINT / "requests.json",
-                    every_slot=True)
+                    every_slot=True, attention_impl="xla")
       for site in ("joint", "joint_head")),
 ]
 """Every release declared, at every site its engine's recording holds."""
