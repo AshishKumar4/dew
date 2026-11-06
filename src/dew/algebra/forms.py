@@ -181,10 +181,11 @@ def rewritten(derived: Derived, *, accurate: bool, saturation: program.Saturatio
 
 def inlined(function: Callable) -> Callable:
     """`function` with each choice by the platform a program lowers for (`lax.platform_dependent`, a `cond` on
-    a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, and each call
-    of a jitted function traced inline (Dew's product under a wide CPU arithmetic is a jitted choice), so its
-    product enters the e-graph as one whatever the platform; a form evaluates products as Dew's
-    (`evaluated`)."""
+    a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, each call of a
+    jitted function traced inline (Dew's product under a wide CPU arithmetic is a jitted choice), so its
+    product enters the e-graph as one whatever the platform, and each placement on a mesh as its operand
+    (a sharding constraint in a declaration traced under a mesh: a tile is placed already); a form
+    evaluates products as Dew's (`evaluated`)."""
     def run(*values):
         closed = jax.make_jaxpr(function)(*values)
         outputs = evaluated_inline(closed.jaxpr, closed.consts, values)
@@ -193,8 +194,14 @@ def inlined(function: Callable) -> Callable:
     return run
 
 
+PLACEMENTS = frozenset({"reshard", "sharding_constraint", "mesh_cast"})
+"""The equations that place a value on a mesh and leave it as it is (each output its operand), taken as
+the identity where a walk's tiles are traced (`evaluated_inline`)."""
+
+
 def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
-    """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`inlined`)."""
+    """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`inlined`) and each
+    placement its operand (`PLACEMENTS`)."""
     env: dict = {}
 
     def read(atom):
@@ -214,6 +221,9 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
         elif equation.primitive.name in ("jit", "pjit", "closed_call"):
             called = equation.params.get("jaxpr") or equation.params["call_jaxpr"]
             outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])
+        elif equation.primitive.name in PLACEMENTS:
+            # Its values its operands': a tile a walk reads is placed already.
+            outs = [read(atom) for atom in equation.invars]
         else:
             outs = bound(equation, map(read, equation.invars))
         env.update(zip(equation.outvars, outs, strict=True))
