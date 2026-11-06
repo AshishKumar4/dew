@@ -120,10 +120,8 @@ def members(group: int) -> list[int]:
 GATE = ("import os, signal, sys\n"
         "held, failed = int(sys.argv[1]), int(sys.argv[2])\n"
         "os.set_inheritable(failed, False)\n"
-        "if sys.argv[3]:\n"
-        "    for name in ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ'):\n"
-        "        if hasattr(signal, name):\n"
-        "            signal.signal(getattr(signal, name), signal.SIG_DFL)\n"
+        "for name in filter(None, sys.argv[3].split(',')):\n"
+        "    signal.signal(getattr(signal, name), signal.SIG_DFL)\n"
         "if os.read(held, 1):\n"
         "    os.close(held)\n"
         "    try:\n"
@@ -134,9 +132,9 @@ GATE = ("import os, signal, sys\n"
 """What a `start`ed group's leader runs before its command, as the same process: it waits for its owner's
 release, given once the lifeline holds its id, then executes the command, or writes the error its
 execution raised; an owner gone before it released the command (its pipe closed with nothing written)
-leaves it to exit having run nothing. It restores the signals Python ignores (SIGPIPE, SIGXFSZ) to their
-defaults first, as Popen's `restore_signals` does for the process it executes, so the command meets them
-as Popen leaves them, a pipe's writer ending by its SIGPIPE."""
+leaves it to exit having run nothing. It sets the signals it is given (`_restored`) to their defaults
+first, as Popen leaves them in the process it executes, so the command meets them so, a pipe's writer
+ending by its SIGPIPE."""
 
 
 def start(command: Sequence[str], **options) -> subprocess.Popen:
@@ -146,60 +144,84 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     lifeline's knowing it took the group with it, where the command had run beside a lifeline that never
     learned it (row 4395). Returns once the command is executing, raising the error its execution raised
     (a missing program's `FileNotFoundError`) as Popen does. The lifelines of groups that ended on their own
-    are let go first, their pipes closed. A start interrupted before its command runs, or whose command
-    cannot execute, stops the group it started and closes its pipes: no caller holds it."""
+    are let go first, their pipes closed. A start interrupted, or whose command cannot execute, stops the
+    group it started, lets its lifeline go and closes every descriptor it opened: no caller holds them."""
     with _HELD:
         ended = [_LIFELINES.pop(leader) for leader, (_, held) in list(_LIFELINES.items())
                  if held.poll() is not None]
     for written, _ in ended:
         os.close(written)
-    read, write = os.pipe2(os.O_CLOEXEC)
-    # Isolated (-I): run as a script, this file's own directory would otherwise lead sys.path, where dew's
-    # io.py and logging.py stand in for the standard library's.
+    program = options.pop("executable", command[0])
+    defaults = ",".join(_restored(options.pop("restore_signals", True)))
+    passed = options.pop("pass_fds", ())
+    # The descriptors this start holds, each closed once it is done with, or handed to `_LIFELINES` (the
+    # owner pipe's write end): what is left here when it raises is closed then.
+    owned: list[int] = []
+    line = process = None
     try:
+        owned.extend(os.pipe2(os.O_CLOEXEC))
+        read, write = owned
+        # Isolated (-I): run as a script, this file's own directory would otherwise lead sys.path, where
+        # dew's io.py and logging.py stand in for the standard library's.
         line = subprocess.Popen([sys.executable, "-I", __file__, str(read)], pass_fds=(read,),
                                 start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
-    except BaseException:
-        # A lifeline started, or not, before the interruption ends with its owner pipe's close.
-        os.close(write)
-        raise
-    finally:
-        os.close(read)
-    held, release = os.pipe2(os.O_CLOEXEC)
-    told, failed = os.pipe2(os.O_CLOEXEC)
-    program = options.pop("executable", command[0])
-    restored = "1" if options.pop("restore_signals", True) else ""
-    passed = (*options.pop("pass_fds", ()), held, failed)
-    try:
-        process = subprocess.Popen([sys.executable, "-I", "-S", "-c", GATE, str(held), str(failed), restored,
-                                    program, *command], start_new_session=True, pass_fds=passed, **options)
-    except BaseException:
-        for end in (write, release, told):
-            os.close(end)
-        line.wait()
-        raise
-    finally:
-        os.close(held)
-        os.close(failed)
-    try:
+        _close(owned, read)
+        owned.extend(os.pipe2(os.O_CLOEXEC))
+        owned.extend(os.pipe2(os.O_CLOEXEC))
+        held, release, told, failed = owned[1:]
+        process = subprocess.Popen([sys.executable, "-I", "-S", "-c", GATE, str(held), str(failed), defaults,
+                                    program, *command], start_new_session=True,
+                                   pass_fds=(*passed, held, failed), **options)
+        _close(owned, held)
+        _close(owned, failed)
+        process.args = command
+        os.write(write, f"{process.pid}\n".encode())
         with _HELD:
             _LIFELINES[process.pid] = (write, line)
-        process.args = command
-        with open(release, "wb", buffering=0) as releasing, open(told, "rb") as said:
-            os.write(write, f"{process.pid}\n".encode())
-            releasing.write(b"1")
-            # Closed by the command's execution, or written with its error.
-            number = said.read()
+            owned.remove(write)
+        os.write(release, b"1")
+        # Closed by the command's execution, or written with its error.
+        number = b"".join(iter(lambda: os.read(told, 64), b""))
         if number:
             raise OSError(int(number), os.strerror(int(number)), program)
     except BaseException:
-        stop(process)
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                stream.close()
+        if process is not None:
+            # Its lifeline too, where the table holds it.
+            stop(process)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        unheld = line is not None and write in owned
+        for end in owned:
+            os.close(end)
+        owned.clear()
+        if unheld:
+            line.wait()
         raise
+    finally:
+        for end in owned:
+            os.close(end)
     return process
+
+
+SIGNALS = ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
+"""The signals Popen's `restore_signals` sets to their defaults in the process it executes: those Python
+ignores, which a Python process, the gate among them, would otherwise pass on ignored."""
+
+
+def _restored(restore: bool) -> list[str]:
+    """The `SIGNALS` the gate sets to their defaults before its command: every one with `restore`, as
+    Popen's; without it, those this process does not ignore, which a command Popen executes inherits at
+    their defaults (a handler does not outlive an exec) where the gate, a Python process, ignores them."""
+    return [name for name in SIGNALS if hasattr(signal, name)
+            and (restore or signal.getsignal(getattr(signal, name)) != signal.SIG_IGN)]
+
+
+def _close(owned: list[int], end: int) -> None:
+    """Close descriptor `end`, which `owned` then no longer holds."""
+    owned.remove(end)
+    os.close(end)
 
 
 def stop(process: subprocess.Popen, grace: float = 0.0, interrupt: int = signal.SIGTERM,
