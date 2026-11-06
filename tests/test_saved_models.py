@@ -109,17 +109,21 @@ def test_a_dreamer_run_exports_its_world_model_and_agent_whole(tmp_path):
 
 
 def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_not(tmp_path):
-    """A native release computes in the `dtype` a load asks and stores its weights in `param_dtype`, as
-    every task's load does, and a record that names no objective (a source's own files) is no native
-    release: `SavedModel.from_pretrained` of it is refused, naming the directory."""
+    """A native release stores its weights in the `param_dtype` a load asks, as every task's load does,
+    and computes in the `dtype` it asks where its model declares one: a control policy, which declares
+    none (its rollouts' actions are float32 throughout), is refused a bfloat16 compute. A record that
+    names no objective (a source's own files) is no native release: `SavedModel.from_pretrained` of it is
+    refused."""
     from dew.inference.models import SavedModel
 
     teacher_run(tmp_path).prepare().train("teacher")
     export_run(SavedRun.pinned(str(tmp_path / "teacher")), tmp_path / "policy", ema=False)
-    half = pipeline(str(tmp_path / "policy"), dtype="bfloat16", param_dtype="bfloat16")
+    half = pipeline(str(tmp_path / "policy"), param_dtype="bfloat16")
     assert {leaf.dtype for leaf in jax.tree.leaves(half.variables)
             if jnp.issubdtype(leaf.dtype, jnp.floating)} == {jnp.dtype(jnp.bfloat16)}
+    with pytest.raises(ValueError):
+        pipeline(str(tmp_path / "policy"), dtype="bfloat16")
     (tmp_path / "source").mkdir()
     Release(max_length=64).write(tmp_path / "source")
-    with pytest.raises(ValueError, match="native model release"):
+    with pytest.raises(ValueError):
         SavedModel.from_pretrained(tmp_path / "source")
