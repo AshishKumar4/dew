@@ -721,7 +721,7 @@ class _Pass:
         self.atoms.making = f"{name}:{str(op.results[0].type)[:28]}" if len(op.results) else name
         produced = list(op.results)
         if (name not in FREE and self._rematerialized(op, name)
-                and (_read_in_outer_loop(op) or self._read_past_products(op))
+                and _read_in_outer_loop(op)
                 and _recomputed(op, set()) > RECOMPUTED):
             # Hoisted out of a loop that reads it, or read past the products issued after it (a walk's steps
             # laid out straight, between its prologue's address and its epilogue's store), and longer than
