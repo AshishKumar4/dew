@@ -1193,10 +1193,23 @@ class MosaicTgmm(_Mosaic):
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         if config.splits > 1 and ba.arguments['exact_sums']:
             return False
-        if ba.arguments['exact_sums'] and config.stages > WINDOWED_STAGES and (
-                mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype).summed_window(config.block_k) > 1):
+        if self._windowed(ba, config) and config.stages > WINDOWED_STAGES:
             return False
         return super().legal(ba, config, target)
+
+    def launch_of(self, ba, config: mosaic_gpu.Tiles) -> resources.Launch:
+        # The derivation sizes a windowed kernel gradient's ring no deeper than `legal` takes it (sized to
+        # sm89's deepest, it derived a tile `legal` refused, and the call fitted none, row 4331).
+        launch = super().launch_of(ba, config)
+        if not self._windowed(ba, config):
+            return launch
+        return dataclasses.replace(launch, most=min(launch.most, WINDOWED_STAGES))
+
+    def _windowed(self, ba, config: mosaic_gpu.Tiles) -> bool:
+        """Whether `config` runs `ba` as an exactly summed kernel gradient whose sums promote a window at a
+        time (`mosaic.Issuer.summed_window`), its ring at most `WINDOWED_STAGES` deep."""
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        return bool(ba.arguments['exact_sums']) and family.summed_window(config.block_k) > 1
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`)."""
