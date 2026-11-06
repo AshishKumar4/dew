@@ -22,6 +22,7 @@ import ctypes
 import functools
 import gc
 import hashlib
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -197,7 +198,20 @@ def released(args) -> dict:
 
     from dew._cli.main import main
     from dew.interop import saved_sources
-    from dew.interop.pretrained import PretrainedDecoder
+    from dew.interop.pretrained import Pretrained, PretrainedDecoder
+
+    restored = Pretrained.from_saved.__func__
+    readiness = []
+
+    def ready(cls, *positional, **options):
+        bundle = restored(cls, *positional, **options)
+        leaves = jax.tree.leaves(bundle.variables)
+        readiness.append((sum(not leaf.is_ready() for leaf in leaves), len(leaves)))
+        if os.environ.get("DBG_READY") == "1":
+            jax.block_until_ready(bundle.variables)
+        return bundle
+
+    Pretrained.from_saved = classmethod(ready)
 
     PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=RELEASE_SHARD)
     rank = jax.process_index()
@@ -217,7 +231,7 @@ def released(args) -> dict:
     return {"processes": jax.process_count(), "rank": rank, "release": str(release),
             "export_code": code,
             "release_files": digests(Path(release)), "read": read, "held": held[0], "exported": list(scopes),
-            "export_files": digests(destination)}
+            "export_files": digests(destination), "readiness": readiness}
 
 
 MODES = {"exported": exported, "released": released}
