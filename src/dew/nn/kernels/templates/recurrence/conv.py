@@ -113,6 +113,13 @@ class _Piece:
         return total if self.bias is None else total + self.bias
 
 
+def _named(kernel: str, first: int, width: int) -> str:
+    """A piece's launch's name, which its call's location carries (`lowered.kernel_calls`): its kernel's and
+    its channels'. A call's pieces are each a module of its own (`first` static), which a profile and the
+    compile gate tell apart by name (`kernel_compile.kernel_modules`)."""
+    return f"{kernel}_{first}_{width}"
+
+
 def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: int | None, activation: bool,
             eps: float, dtype, family: mosaic.Family, interpret: bool = False):
     """A piece's output `[B, T, width]` of `x`'s channels `first` to `first + width`, convolved by `taps`
@@ -142,11 +149,13 @@ def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: in
 
         lax.fori_loop(0, TOKENS, token, None)
 
+    name = _named("short_conv", first, width)
     launched = mosaic.kernel(entry, out_type=jax.ShapeDtypeStruct((rows, length, width), dtype),
                              grid=(rows, pl.cdiv(length, TOKENS), width // scan.THREADS),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
-                             family=family.name, name="short_conv", scratch=(scan.scratch(),))
-    return launched(*(operand for operand in operands if operand is not None))
+                             family=family.name, name=name, scratch=(scan.scratch(),))
+    with jax.named_scope(name):
+        return launched(*(operand for operand in operands if operand is not None))
 
 
 def backward(x, taps, bias, valid, documents, dy, *, first: int, width: int, head: int | None,
@@ -206,8 +215,10 @@ def backward(x, taps, bias, valid, documents, dy, *, first: int, width: int, hea
 
     f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
     out_type = (f32((rows, length, width)), f32((rows, blocks, count, width)), f32((rows, blocks, width)))
+    name = _named("short_conv_backward", first, width)
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, width // scan.THREADS),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
-                             family=family.name, name="short_conv_backward", scratch=(scan.scratch(),))
-    dx, dw, db = launched(*(operand for operand in operands if operand is not None), dy)
+                             family=family.name, name=name, scratch=(scan.scratch(),))
+    with jax.named_scope(name):
+        dx, dw, db = launched(*(operand for operand in operands if operand is not None), dy)
     return dx, jnp.sum(dw, axis=(0, 1)), jnp.sum(db, axis=(0, 1))
