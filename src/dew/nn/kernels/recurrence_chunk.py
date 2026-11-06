@@ -605,8 +605,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                 scale=scale, wide=epilogue, firsts=firsts)
             if kernel == 'derived':
                 # The portable math's forms derived from the token update, where a call names them.
-                return derived_rule(query, key, value, g, beta, state, starts, scale=scale, delta=hooks.delta,
-                                    chunk_size=chunk_size, dtype=work, bound=hooks.inverse_bound)
+                return xla_mainloop(Tiles(chunk_size), query, key, value, g, beta, state, starts, scale=scale,
+                                    delta=hooks.delta, dtype=work, bound=hooks.inverse_bound)
             group = value.shape[2] // key.shape[2]
             if group > 1:
                 query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
@@ -855,7 +855,7 @@ GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
 recurrence template at its derived tiles, else the port on any GPU Dew's Triton kernels run on, else the
 portable math (`chunk_delta_rule`). The portable math's forms derived from the token update
-(`derived_rule`) run where a call names them (`generation.chosen(gated_delta_rule='derived')`), until they
+(`xla_mainloop`) run where a call names them (`generation.chosen(gated_delta_rule='derived')`), until they
 match the hand forms in check 1 at the edges, in every derivative order and in time."""
 
 
@@ -863,9 +863,17 @@ RESET = "first"
 """The derived rule's reset operand (`scan.Scan.reset`): a packed document's first tokens."""
 
 
-def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: float, delta: bool,
-                 chunk_size: int, dtype, bound: float | None = None):
-    """The recurrence over chunks by the forms derived from its token update (`dew.algebra.scan`, the compact
+@dataclasses.dataclass(frozen=True)
+class Tiles:
+    """The plain-JAX mainloop's config (`xla_mainloop`): its walk's chunk of `chunk` tokens."""
+
+    chunk: int
+
+
+def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, *, scale: float,
+                 delta: bool, dtype, bound: float | None = None):
+    """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
+    forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
     carry alone in sequence): each value head's update `h = D h - beta k (k^T D h) + beta
     k v^T` with the delta rule (`recurrence.update`'s), `h = D h + beta k v^T` without it, `D = exp(g)` a
@@ -904,6 +912,7 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
     forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
                                        state=((width, columns), dtype), reset=reset, ranges=ranges),
                              saturation=SATURATION)
+    chunk_size = config.chunk
     chunks = -(-length // chunk_size)
     padded = chunks * chunk_size - length
 
