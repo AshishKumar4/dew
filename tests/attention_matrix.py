@@ -26,6 +26,8 @@ from test_attention_mosaic import FED, _residuals
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
 
+CHOICES = frozenset({"attention", "attention_mainloop"})
+"""The kernel choices this family's cells run under test (tests/test_kernel_matrix.py's union, row 184)."""
 LENGTH = 1024
 DOCUMENTS = 4
 CAP = 2.0
