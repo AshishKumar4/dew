@@ -221,7 +221,7 @@ def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scal
     width]`, `a` `[depth, rank]` and `b` `[rank, width]`; `scale` a scalar.
 
     Its reverse mode (first order): the input gradient is one product too, `[dy | u] · [kernel | a]ᵀ` with
-    `u = scale · (dy · bᵀ)` rounded once; the factors' gradients are `scale · lhsᵀ · (dy · bᵀ)` and `tᵀ ·
+    `u = scale · (dy · bᵀ)` rounded once; the factors' gradients are `lhsᵀ · (scale · (dy · bᵀ))` and `tᵀ ·
     dy`, the rank-wide kernel gradients; each operand's only where it is differentiated (a frozen kernel's,
     `lhsᵀ · dy`, never). The concatenations are copies, a materialized strategy (b); a mainloop walking the
     appended pair in place is row 1304's next form."""
@@ -274,21 +274,23 @@ def _low_rank_backward(out_dtype, precision, interpret_on_cpu, residuals, cotang
     wants_lhs, wants_kernel, wants_a, wants_b, wants_scale = map(bool, perturbed.shape)
     dy = cotangent.astype(lhs.dtype)
     wide = at_least_fp32(lhs.dtype)
-    # The cotangent of `t` before its scale, dy · bᵀ, summed wide.
+    # The cotangent of `t` before its scale, dy · bᵀ, summed wide, and after it: the scale taken before any
+    # product with it, as the adapter's own program takes it (a product near float32's largest that the
+    # scale brings back in range never overflows first).
     through = jnp.dot(dy, b.astype(lhs.dtype).T, precision=precision, preferred_element_type=wide)
+    scaled = scale.astype(wide) * through
     d_lhs = d_kernel = d_a = d_b = d_scale = None
     if wants_lhs:
-        u = (scale.astype(wide) * through).astype(lhs.dtype)
-        d_lhs = gemm(_appended(dy, u, 1), _appended(kernel, a, 1), transpose_rhs=True, out_dtype=lhs.dtype,
-                     precision=precision, interpret_on_cpu=interpret_on_cpu)
+        d_lhs = gemm(_appended(dy, scaled.astype(lhs.dtype), 1), _appended(kernel, a, 1), transpose_rhs=True,
+                     out_dtype=lhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
     if wants_kernel:
         d_kernel = gemm_t(lhs, dy, None, out_dtype=kernel.dtype, precision=precision,
                           interpret_on_cpu=interpret_on_cpu)[0]
-    # The factors' gradients from the wide `through` and `t` (the rank-wide products' sums, unrounded), as
+    # The factors' gradients from the wide `scaled` and `t` (the rank-wide products' sums, unrounded), as
     # the adapter's own program differentiates its fp32 low-rank products.
     if wants_a:
-        d_a = (scale.astype(wide) * jnp.dot(lhs.T.astype(wide), through, precision=precision,
-                                            preferred_element_type=wide)).astype(a.dtype)
+        d_a = jnp.dot(lhs.T.astype(wide), scaled, precision=precision,
+                      preferred_element_type=wide).astype(a.dtype)
     if wants_b:
         # `t` holds the scale already: tᵀ · dy is the factor's gradient whole.
         d_b = jnp.dot(t.T, dy.astype(wide), precision=precision, preferred_element_type=wide).astype(b.dtype)
