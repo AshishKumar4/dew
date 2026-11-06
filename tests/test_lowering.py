@@ -1532,7 +1532,7 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
                                                 "dense": True})
     assert gradient.padded(weights, tile) == 1 - 64 * 300 / (128 * 512)
     attention = attention_mosaic.MosaicForward()
-    tiles = attention_mosaic_program.Tiles(block_q=64, block_k=128, stages=2, consumers=2)
+    tiles = attention_mosaic_program.Tiles(block_q=64, block_k=128, stages=2, consumers=2, family="wgmma")
     scores = tokamax.BoundArguments(attention, {"query": spec(1, 100, 2, 64), "key": spec(1, 200, 2, 64)})
     assert attention.padded(scores, tiles) == 1 - 100 * 200 / (128 * 256)
 

@@ -893,25 +893,25 @@ def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width
 
 def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiprocessors_a_target_states():
     """A balanced tail's hand-off is priced in MMA steps at one multiprocessor's tensor rate, so a part's
-    8 multiprocessors or 64 move neither the step nor the hand-off's steps (row 3790; 3781's pricing,
-    where a step at the device's peak over its multiprocessors read 16 times too short). At an H100's
-    measured 0.78 us hand-off, a tail of 2 to 5 steps a tile takes no balancing, as the walk whole is
-    cheaper, and one of 16 does."""
+    8 multiprocessors or 64 move neither the step, nor the hand-off's steps, nor a tail of 8 programs'
+    decision (row 3790; 3781's pricing, where a step at the device's peak over its multiprocessors read 16
+    times too short)."""
     h100 = generation.gpu_target("sm90")
     few, more = (dataclasses.replace(h100, multiprocessors=count) for count in (8, 64))
     assert mosaic_gpu.step_seconds(COOPERATIVE, few) == mosaic_gpu.step_seconds(COOPERATIVE, more)
-    handoff = mosaic_gpu.handoff_steps(COOPERATIVE, few)
-    assert handoff == mosaic_gpu.handoff_steps(COOPERATIVE, more) and handoff > 1
-    assert all(tail.balanced(11, steps, 8, handoff_steps=handoff) is None for steps in range(2, 6))
-    assert tail.balanced(11, 16, 8, handoff_steps=handoff) is not None
+    assert mosaic_gpu.handoff_steps(COOPERATIVE, few) == mosaic_gpu.handoff_steps(COOPERATIVE, more)
+    for steps in (2, 4, 16, 64):
+        decided = {mosaic_gpu.balanced_tail(COOPERATIVE, (1, 11), steps, (2, 2), target, 8) is not None
+                   for target in (few, more)}
+        assert len(decided) == 1, steps
 
 
 @runs("sm90")
 @pytest.mark.parametrize(("rows", "depth", "width"), [(320, 128, 2816), (200, 128, 2816), (320, 256, 1408)])
 def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width):
     """A dense kernel gradient on a Hopper part of 8 multiprocessors whose 11 output tiles leave its last
-    wave at most half full (`tail.balanced`, its hand-off unmeasured, so the tail is taken at these few
-    steps a tile): its tail's steps balanced over the programs, a program's range crossing a tile's
+    wave at most half full (`mosaic_gpu.balanced_tail`, its hand-off unmeasured, so the tail is taken at
+    these few steps a tile): its tail's steps balanced over the programs, a program's range crossing a tile's
     boundary, each tile fixed up across them, on par with XLA's over the draws (check 1), truth float64's;
     at rows a step does not divide, and at a tile of 256 x 128."""
     draw = _dense_draw(rows, depth, width, cotangent=True)
@@ -922,8 +922,8 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
         call = gradient.bind(spec((rows, depth)), spec((rows, width)), jax.ShapeDtypeStruct((1,), jnp.int32),
                              interpret=False, out_dtype="bfloat16", dense=True)
         tile = gradient.derived(call, target)
-    assert tail.balanced(depth // tile.block_m * (width // tile.block_n), -(-rows // tile.block_k), 8,
-                         handoff_steps=mosaic_gpu.handoff_steps(tile, target)) is not None
+    assert mosaic_gpu.balanced_tail(tile, (depth // tile.block_m, width // tile.block_n),
+                                    -(-rows // tile.block_k), (2, 2), target, 8) is not None
 
     def dew(x, w, dy):
         del w
@@ -942,15 +942,16 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
 @pytest.mark.parametrize(("rows", "depth", "width"), [(1408, 128, 128), (200, 256, 640)])
 def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, depth, width):
     """A dense forward product on a Hopper part of 8 multiprocessors whose 11 or 10 output tiles leave its
-    last wave at most half full (`tail.balanced`, `gmm`'s dense tail): its tail's steps balanced over the
-    programs, each program's partial fixed up across them, through an RMS norm's prologue and a bias's
-    epilogue, on par with the plain program over the draws (check 1), truth float64's; at rows a tile does
-    not divide. The template's interpreted route launches one program, so this calls the kernel (row 3587),
-    on a Hopper part whose hand-off is unmeasured, so the tail is taken at these few steps a tile."""
+    last wave at most half full (`mosaic_gpu.balanced_tail`, `gmm`'s dense tail): its tail's steps
+    balanced over the programs, each program's partial fixed up across them, through an RMS norm's prologue
+    and a bias's epilogue, on par with the plain program over the draws (check 1), truth float64's; at rows a
+    tile does not divide. The template's interpreted route launches one program, so this calls the kernel
+    (row 3587), on a Hopper part whose hand-off is unmeasured, so the tail is taken at these few steps a
+    tile."""
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
-    assert tail.balanced(-(-rows // COOPERATIVE.block_m) * (width // COOPERATIVE.block_n),
-                         depth // COOPERATIVE.block_k, 8,
-                         handoff_steps=mosaic_gpu.handoff_steps(COOPERATIVE, target)) is not None
+    grid = (-(-rows // COOPERATIVE.block_m), width // COOPERATIVE.block_n)
+    steps = depth // COOPERATIVE.block_k
+    assert mosaic_gpu.balanced_tail(COOPERATIVE, grid, steps, (2, 2), target, 8) is not None
 
     def draw(seed):
         rng = np.random.default_rng(seed)

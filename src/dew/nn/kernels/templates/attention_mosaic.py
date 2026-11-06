@@ -414,7 +414,7 @@ class MosaicForward(_Mainloop[Tiles]):
 
             for columns in _column_blocks_of(family, query.dtype, ba.arguments["value"].shape[3]):
                 def tiles(rows: int, walked: int, consumers: int, family=family, columns=columns) -> Tiles:
-                    return Tiles(rows, walked, 2, consumers, family.name, columns=columns)
+                    return Tiles(rows, walked, 2, consumers, family=family.name, columns=columns)
 
                 config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
                                   lambda config: self._launch_legal(ba, config, target), overlapped=True,
@@ -583,9 +583,10 @@ class MosaicForward(_Mainloop[Tiles]):
             # 64: 48 bytes on two consumers, 24 on one): the Pallas-Triton mainloop's.
             return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
                            "operands, no dropout")
-        if self.parts > 1 and family.feeds_itself:
+        if self.parts > 1 and (family.feeds_itself or not family.pieces_of_views):
             # Its parts a copy each into a slot's rows (`mosaic.Pieces`), which a producer's loads take and
-            # a consumer's own pipeline does not (`mosaic_sm80.Mma.streams`).
+            # neither a consumer's own ring nor cp.async's pipeline, whose pieces are a table's runs
+            # (`mosaic.Transport.pieces_of_views`), does.
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)

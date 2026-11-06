@@ -48,7 +48,7 @@ from ..precision import at_least_fp32, rounded_operand
 from ..programs import equations
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, mosaic, report, resources, tail as tail_of
+from .templates import base, bundles, mosaic, report, resources
 from .templates.axes import GROUPS, held as held_axes
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
@@ -1175,10 +1175,11 @@ class MosaicTgmm(_Mosaic):
         if not (ba.arguments['dense'] and not ba.arguments['exact_sums'] and family.fixes_up):
             return False
         depth, _, width = self._generated_extents(ba)
-        tiles = depth // tile.block_m * (width // tile.block_n)
-        steps = -(-ba.arguments['tokens'].shape[0] // tile.block_k)
-        return tail_of.balanced(tiles, steps, _multiprocessors(target),
-                                handoff_steps=mosaic_gpu.handoff_steps(tile, target)) is not None
+        tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
+        steps = -(-tokens.shape[0] // tile.block_k)
+        return mosaic_gpu.balanced_tail(tile, (depth // tile.block_m, width // tile.block_n), steps,
+                                        (tokens.dtype.itemsize, cotangent.dtype.itemsize), target,
+                                        _multiprocessors(target) * tile.programs) is not None
 
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
         depth, _, width = self._generated_extents(ba)
