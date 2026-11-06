@@ -1867,9 +1867,9 @@ class Transport[Allocated, Opened](abc.ABC):
             plgpu.barrier_arrive(barrier)
             plgpu.barrier_wait(barrier)
 
-    def schedule(self, consumers: int):
+    def schedule(self, consumers: int) -> pallas_core.ScratchShape:
         """The scoped allocation of `consumers`' turns on the tensor cores (`turn`): one barrier each of
-        them arrives at."""
+        them arrives at (a TPU core's, one role a core, a semaphore it never signals)."""
         return plgpu.Barrier(num_arrivals=consumers)
 
     def turn(self, schedule, consumers: int, *, arrive: bool = True, wait: bool = True) -> None:
