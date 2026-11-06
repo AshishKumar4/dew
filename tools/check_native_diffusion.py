@@ -7,6 +7,7 @@ component Dew wrote and its UNet recomputes the trained prediction
 (`diffusers_reads`).
 """
 import argparse
+import contextlib
 import json
 import sys
 import tempfile
@@ -155,18 +156,25 @@ def public_start(task, source, reference, meta, key, given, null, process, times
     return task.prepare(**shared, initial=prior)
 
 
-def diffusers_reads(source, export, prediction, noise, given):
+TRAINED_SEEDS = 8
+"""Every task's declared seeds for check 1 of its trained UNet against Diffusers' (`diffusers_reads`),
+sized by `seeds_for` paired with Dew's on armada (11-06): 8 at each of the eight tasks."""
+TRAINED_TIME = 10.0
+"""The timestep the trained UNet is read at."""
+
+
+def diffusers_reads(task, source, export, model, variables, noise, given):
     """Diffusers' own classes load every weighted component of `export`
     cleanly (tools/diffusers_consumer.py; a component nothing here reads, the
     safety checker, is held to the `source` directory's file, which it
-    writes back untrained), and its declared UNet, over the
-    same noise, timestep and conditions in float32 and float64, holds Dew's
-    trained `prediction` to tests/reference_error.py's rule, and returns
-    the rule's ratio."""
-    from one_draw import assert_as_exact_as_the_reference
-    from reference_error import distance
+    writes back untrained), and its declared UNet holds Dew's trained one
+    on par (check 1) over drawn noise, prompt states, pooled embedding and
+    inpaint channels, of `noise`'s and `given`'s shapes, at `given`'s time
+    ids, both measured from Diffusers' own UNet run in float64."""
+    from reference_error import as_given, assert_as_exact
     from safetensors.numpy import load_file
 
+    from dew.diffusion.process import DenoisingCondition
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
@@ -176,17 +184,39 @@ def diffusers_reads(source, export, prediction, noise, given):
         for key, value in held.items():
             np.testing.assert_array_equal(written[key], value, err_msg=f"{name}/{key}")
     condition = given["conditioning"]
-    sample = np.concatenate([np.asarray(noise)] + [np.asarray(given[name]) for name in ("mask", "masked_image")
-                                                   if name in given], -1)
-    inputs = (export, sample, 10.0, np.asarray(condition.context),
-              None if condition.pooled is None else np.asarray(condition.pooled),
-              None if condition.time_ids is None else np.asarray(condition.time_ids))
-    theirs, truth = consumer.unet_prediction(*inputs), consumer.unet_prediction(*inputs, wide=True)
-    assert_as_exact_as_the_reference(np.asarray(prediction), theirs, truth, "trained UNet")
-    return distance(np.asarray(prediction), truth) / distance(theirs, truth)
+    spatial = [name for name in ("mask", "masked_image") if name in given]
+    shapes = {"noise": np.shape(noise), "context": np.shape(condition.context),
+              **({} if condition.pooled is None else {"pooled": np.shape(condition.pooled)}),
+              **{name: np.shape(given[name]) for name in spatial}}
+
+    def draw(seed):
+        rng = np.random.default_rng([0x7A2, seed])
+        return tuple(rng.standard_normal(shape).astype(np.float32) for shape in shapes.values())
+
+    def named(inputs):
+        return dict(zip(shapes, inputs, strict=True))
+
+    def dew(*inputs):
+        drawn = named(inputs)
+        conditioning = DenoisingCondition(drawn["context"], drawn.get("pooled"), condition.time_ids)
+        return model.apply(variables, drawn["noise"], jnp.full((1,), TRAINED_TIME),
+                           conditioning=conditioning, **{name: drawn[name] for name in spatial})
+
+    def diffusers(wide):
+        predict = consumer.unet_predictor(export, wide=wide)
+
+        def run(*inputs):
+            drawn = named(inputs)
+            sample = np.concatenate([drawn["noise"], *(drawn[name] for name in spatial)], -1)
+            return predict(sample, TRAINED_TIME, drawn["context"], drawn.get("pooled"),
+                           None if condition.time_ids is None else np.asarray(condition.time_ids))
+        return as_given(run)
+
+    assert_as_exact(dew, diffusers(False), draw, f"{task} trained UNet", seeds=TRAINED_SEEDS,
+                    truth_fn=diffusers(True))
 
 
-def train_and_reload(source, reference, key, given, noise):
+def train_and_reload(task, source, reference, key, given, noise):
     objective = DiffusionObjective(source.model, source.process, source.inputs, autoencoder=source.autoencoder,
                                    variables=source.variables, unconditional_prob=0.0, ema_decay=None, steps=2)
     pixels = reference["pixels"][None] if "pixels" in reference else np.rint(reference["images"] * 255).astype(np.uint8)
@@ -209,7 +239,7 @@ def train_and_reload(source, reference, key, given, noise):
         before = source.model.apply(trained, noise, jnp.asarray([10]), **given)
         loaded = restored.model.apply(restored.variables, noise, jnp.asarray([10]), **given)
         np.testing.assert_array_equal(loaded, before)
-        ratio = diffusers_reads(source.source, saved, before, noise, given)
+        diffusers_reads(task, source.source, saved, restored.model, restored.variables, noise, given)
         np.testing.assert_array_equal(restored.autoencoder.decode(restored.variables["autoencoder"], noise),
                                       source.autoencoder.decode(trained["autoencoder"], noise))
         if source.finish is not None:
@@ -220,7 +250,7 @@ def train_and_reload(source, reference, key, given, noise):
             source.save(saved, variables=blocked)
             restored = bundle(saved)
             np.testing.assert_array_equal(restored.finish(restored.variables, images), -1)
-    return {"loss_before": float(value), "loss_after": float(after), "diffusers_ratio": ratio}
+    return {"loss_before": float(value), "loss_after": float(after)}
 
 
 PARTS = ("walk", "update")
@@ -250,7 +280,8 @@ def check_pipeline(directory, part: str, streamed: bool = False):
     given, null, process, times = selection(source, meta)
     prepared = public_start(source.text_to_image(), source, reference, meta, key, given, null, process, times)
     given, _ = walked(prepared, given, null)
-    training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
+    noise = jnp.asarray(reference["noise"])
+    training = train_and_reload(directory.name, source, reference, key, given, noise)
     print(json.dumps({"directory": str(directory), "reload": 0.0, "training": training}))
 
 
@@ -467,37 +498,85 @@ def regress(directory, case):
     print(case, "passed")
 
 
-def check_model(directory):
+MODEL_TIME = 13.0
+"""The geometry cases' UNet timestep, as tools/native_unet_reference.py made their weights for."""
+MODEL_TIME_IDS = {"sdxl-inpaint": (32, 48, 0, 0, 32, 48), "refiner": (32, 48, 0, 0, 6)}
+"""SDXL's micro-conditioning where a case's UNet takes it: the original size, the crop and the target
+size, the refiner's aesthetic score in place of its target."""
+MODEL_ROWS = 4
+"""A draw's independent rows: the pooled embedding's gradient holds 8 values a row, too few in one row for
+its rounding to resolve over draws."""
+MODEL_SEEDS = {"sd1": 8, "sd2": 8, "sdxl-inpaint": 16, "refiner": 256}
+"""Each geometry case's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` paired with
+Dew's on armada (11-06); the reference compared with itself needed 16, 8, 256 and 256."""
+
+
+def model_site(directory):
+    """A multilevel UNet geometry's check-1 arms: Dew's UNet and Diffusers' own Flax UNet on the same
+    weights, each one's prediction and the gradients of its drawn inputs (the latents, the prompt states,
+    a pooled embedding where the UNet takes one) under a drawn cotangent, and Diffusers' module built at
+    float64 for the truth, its weights widened, the float32 its modules name read as float64
+    (`flax_precision.float64`). Returns `(dew, reference, truth, draw)`."""
+    import flax_precision
+    from diffusers import FlaxUNet2DConditionModel
+    from reference_error import with_gradients
+
     from dew.diffusion.process import DenoisingCondition
     from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
     from dew.nn.backbones.unet_condition import UNet2DCondition
-    directory = Path(directory)
-    reference = np.load(directory / "reference.npz")
-    model = UNet2DCondition(**unet_fields(json.loads((directory / "unet/config.json").read_text()), attention_impl="xla"))
-    parameters, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
-    condition = DenoisingCondition(jnp.asarray(reference["context"]),
-        jnp.asarray(reference["pooled"]) if "pooled" in reference else None,
-        jnp.asarray(reference["time_ids"]) if "time_ids" in reference else None)
-    def predict(value):
-        return model.apply({"params": parameters}, value, jnp.asarray(reference["time"]), conditioning=condition)
-    x = jnp.asarray(reference["input"])
-    output = jax.jit(predict)(x)
-    gradient = jax.jit(jax.grad(lambda value: jnp.sum(predict(value) * reference["probe"])))(x)
-    # Held to Diffusers' own float64 run on the same weights and inputs (tools/native_unet_reference.py
-    # --float64) by the float64 rule: a constant between two float32 implementations read one input's
-    # VJP 1.1e-4 off on one CPU and within on another.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from one_draw import assert_as_exact_as_the_reference
-    from reference_error import distance
 
-    truth = np.load(Path(__file__).resolve().parents[1] / "tests/fixtures/native_unet_float64.npz")
-    errors = {}
-    for name, ours, theirs, key in (("prediction", output, reference["output"], "output"),
-                                    ("input_vjp", gradient, reference["vjp"], "vjp")):
-        wide = truth[f"{directory.name}/{key}"]
-        errors[name] = {"dew": distance(ours, wide), "reference": distance(theirs, wide)}
-        assert_as_exact_as_the_reference(ours, theirs, wide, f"{directory.name} {name}")
-    print(json.dumps({"model": directory.name, "errors": errors}))
+    directory = Path(directory)
+    config = json.loads((directory / "unet/config.json").read_text())
+    model = UNet2DCondition(**unet_fields(config, attention_impl="xla"))
+    parameters, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
+    source, weights = FlaxUNet2DConditionModel.from_pretrained(directory / "unet")
+    wide, _ = FlaxUNet2DConditionModel.from_pretrained(directory / "unet", dtype=jnp.float64)
+    ids = MODEL_TIME_IDS.get(directory.name)
+    time_ids = None if ids is None else jnp.asarray([ids] * MODEL_ROWS, jnp.int32)
+    shapes = [(MODEL_ROWS, 8, 12, config["in_channels"]), (MODEL_ROWS, 8, config["cross_attention_dim"])]
+    if ids is not None:
+        # The pooled embedding: what the added projection reads beside the micro-conditioning's embeddings.
+        embedded = len(ids) * config["addition_time_embed_dim"]
+        pooled = config["projection_class_embeddings_input_dim"] - embedded
+        shapes.append((MODEL_ROWS, pooled))
+
+    def draw(seed):
+        """The latents (Dew's channels-last), the prompt states, any pooled embedding, and the cotangent."""
+        rng = np.random.default_rng([0x0E3, seed])
+        latents, context, *pooled = (rng.standard_normal(shape) for shape in shapes)
+        cotangent = rng.standard_normal((MODEL_ROWS, 8, 12, 4))
+        return tuple(value.astype(np.float32) for value in (latents, context * 0.1, *pooled, cotangent))
+
+    def dew(latents, context, *pooled):
+        condition = DenoisingCondition(context, *pooled, *(() if time_ids is None else (time_ids,)))
+        time = jnp.full((MODEL_ROWS,), MODEL_TIME, latents.dtype)
+        return model.apply({"params": parameters}, latents, time, conditioning=condition)
+
+    def diffusers(module, widening=contextlib.nullcontext):
+        def run(latents, context, *pooled):
+            dtype = latents.dtype
+            # The truth's time ids in float64, as its widened projections read them.
+            added = None if time_ids is None else {"text_embeds": pooled[0], "time_ids": time_ids.astype(dtype)}
+            time = jnp.full((MODEL_ROWS,), MODEL_TIME, dtype)
+            with widening():
+                output = module.apply({"params": jax.tree.map(lambda leaf: leaf.astype(dtype), weights)},
+                                      latents.transpose(0, 3, 1, 2), time, context, added_cond_kwargs=added).sample
+            return output.transpose(0, 2, 3, 1)
+        return run
+
+    return (with_gradients(dew), with_gradients(diffusers(source)),
+            with_gradients(diffusers(wide, flax_precision.float64)), draw)
+
+
+def check_model(directory):
+    """A multilevel UNet geometry on par with Diffusers' own over drawn inputs (check 1, `model_site`)."""
+    from reference_error import assert_as_exact
+
+    directory = Path(directory)
+    dew, reference, truth, draw = model_site(directory)
+    assert_as_exact(dew, reference, draw, f"{directory.name} prediction and gradients",
+                    seeds=MODEL_SEEDS[directory.name], truth_fn=truth)
+    print(json.dumps({"model": directory.name, "held": True}))
 
 
 if __name__ == "__main__":

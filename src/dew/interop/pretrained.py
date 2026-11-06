@@ -696,9 +696,10 @@ class Pretrained:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
-        # fit's store is read by its layers' names (`stored_layers`).
+        # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
+        # home as they are written.
         values = unpacked(self.model, stored_layers(self.model, unboxed(self.variables if variables is None
-                                                                        else variables)))
+                                                                        else variables), banks=True))
         if self.adapter is not None:
             values = self.adapter.merge(values)
         if isinstance(self.model, Differential) and self.model.dex is not None:

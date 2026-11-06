@@ -1299,33 +1299,20 @@ DIFFUSION_DENOISER_TEXT = {
 
 
 def diffusion_gemma_tiny(fields: dict, canvas_length: int):
-    """A tiny DiffusionGemma for block diffusion over the text config `fields`
-    (its `model_type` dropped) and one small vision tower, in float32 and
-    evaluation mode. The reference ties its encoder and decoder text weights,
-    so the decoder's are copied from the encoder's after initialization; the
-    dew tree holds them once, and the loader's tied check refuses a
-    checkpoint that disagrees there."""
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaConfig,
-        DiffusionGemmaTextConfig,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
-    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+    """tools/diffusion_gemma_reference.py's `diffusion_gemma_model` with its encoder and decoder text weights
+    tied: the reference ties them, so
+    the decoder's are copied from the encoder's after initialization; the dew tree holds them once, and the
+    loader's tied check refuses a checkpoint that disagrees there."""
+    from diffusion_gemma_reference import diffusion_gemma_model
 
-    text = DiffusionGemmaTextConfig(**{key: value for key, value in fields.items() if key != "model_type"})
-    vision = Gemma4VisionConfig(
-        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
-        num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
-        pooling_kernel_size=2, position_embedding_size=64)
-    model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
-        text_config=text, vision_config=vision, canvas_length=canvas_length, tie_word_embeddings=False))
+    model = diffusion_gemma_model(fields, canvas_length)
     state = model.state_dict()
     for name in list(state):
         if name.startswith("model.decoder.layers.") or name in (
                 "model.decoder.embed_tokens.weight", "model.decoder.norm.weight"):
             state[name].copy_(state[name.replace("model.decoder.", "model.encoder.language_model.", 1)])
     model.load_state_dict(state)
-    return model.float().eval()
+    return model
 
 
 def save_diffusion_gemma(model, fields: dict, fixture: str) -> Path:
