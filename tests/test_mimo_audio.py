@@ -10,6 +10,7 @@ its batches bounded at 30 frames, where the 13-frame clip runs alone and odd.
 """
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -21,7 +22,16 @@ import pytest
 from flax import linen as nn
 from float64_terms import float64_forward
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact, assert_rounds_where_the_reference_does, ieee_fixture
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_rounds_where_the_reference_does,
+    declared_seeds,
+    ieee_fixture,
+    indexed_recording,
+    recording,
+)
+from tool_support import run_from
 
 from dew.nn.mimo_audio import (
     AudioTokenizerEncoder,
@@ -57,27 +67,69 @@ def test_log_mel_frames_are_as_exact_as_torchaudio():
     assert_as_exact_as_the_reference(frames, refs["mel"], refs["mel_f64"], "log mel")
 
 
+RECORDING = FIXTURE / "recording.npz"
+"""The release's tokenizer and audio encoder over drawn mels and codes (tools/mimo_reference.py
+--record-audio), summarized over seeds for check 1."""
+
+
+@functools.cache
+def generator():
+    """tools/mimo_reference.py, whose seeded draws the recorded sites' inputs are drawn again by."""
+    with run_from("mimo_reference", "tools") as module:
+        return module
+
+
+def recorded_site(site: str, inputs_of, truth_fn):
+    """`site`'s draw, recorded reference and truth over its declared seeds, Dew's float64 run `truth_fn`
+    its truth, held to the recording's sketch, and the count."""
+    seeds = declared_seeds(RECORDING)[site]
+    return (*indexed_recording(recording(RECORDING), site, seeds, inputs_of=inputs_of, truth_fn=truth_fn),
+            seeds)
+
+
+def segmented(config, mels, lengths):
+    """The clips cut into segments of `audio_segment_size` frames, as tokenize_audio_batch cuts them, and
+    each segment's span."""
+    size = config.audio_segment_size
+    segments = [(clip, start) for clip, length in enumerate(lengths) for start in range(0, length, size)]
+    padded = np.pad(mels, ((0, 0), (0, size), (0, 0)))
+    return (np.stack([padded[clip, start:start + size] for clip, start in segments]),
+            jnp.asarray([min(size, lengths[clip] - start) for clip, start in segments], jnp.int32))
+
+
 @pytest.mark.parametrize("prefix, bound", [("", 256000), ("bounded_", 30)])
 def test_the_tokenizer_s_features_and_codes_are_the_reference_s(prefix, bound):
-    """Each segment's pooled features within the float64 gate, and the codes they quantize to, the
+    """Each segment's pooled features over drawn mels on par with the reference's from its float64
+    run's (check 1, the recording's), and over the fixture's mels the codes they quantize to the
     reference's exactly; the reference's own features quantize to its codes under Dew's RVQ. Bounded,
     a batch's own longest ends its convolutions and its pooling (`batch_longest`)."""
     config, variables, refs = load()
     config = dataclasses.replace(config, tokenizer_batch_frames=bound)
-    # The clips cut into segments of `audio_segment_size` frames, as tokenize_audio_batch cuts them.
-    size = config.audio_segment_size
-    segments = [(clip, start) for clip, length in enumerate(refs["lengths"])
-                for start in range(0, length, size)]
-    padded = np.pad(refs["mels"], ((0, 0), (0, size), (0, 0)))
-    mels = np.stack([padded[clip, start:start + size] for clip, start in segments])
-    spans = jnp.asarray([min(size, refs["lengths"][clip] - start) for clip, start in segments], jnp.int32)
     encoder, held = AudioTokenizerEncoder(config.tokenizer), {"params": variables["params"]["tokenizer"]}
+    lengths = generator().LENGTHS
+
+    def mels_of(inputs):
+        width = max(lengths)
+        return np.stack([np.pad(inputs[f"mel_{clip}"], ((0, width - length), (0, 0)))
+                         for clip, length in enumerate(lengths)])
+
+    def ours(inputs):
+        mels, spans = segmented(config, mels_of(inputs), lengths)
+        features, valid = encoder.apply(held, mels, spans, batch_longest(spans, config))
+        return {"features": np.asarray(features)[np.asarray(valid)]}
+
+    def wide(inputs):
+        mels, spans = segmented(config, mels_of(inputs), lengths)
+        (features, valid), _ = float64_forward(encoder, held, mels, spans, batch_longest(spans, config))
+        return {"features": np.asarray(features)[np.asarray(valid)]}
+
+    site = f"{'bounded ' if prefix else ''}tokenizer features"
+    draw, reference, truth, seeds = recorded_site(site, generator().mels_draw, wide)
+    assert_as_exact(as_given(lambda index, inputs: ours(inputs)), reference, draw, site, seeds=seeds,
+                    truth_fn=truth)
+    mels, spans = segmented(config, refs["mels"], refs["lengths"])
     features, valid = encoder.apply(held, mels, spans, batch_longest(spans, config))
     features = np.asarray(features)[np.asarray(valid)]
-    (_, wide_valid), (terms, _) = float64_forward(encoder, held, mels, spans, batch_longest(spans, config))
-    np.testing.assert_array_equal(np.asarray(wide_valid), np.asarray(valid))
-    assert_as_exact_as_the_reference(features, refs[f"{prefix}features"], refs[f"{prefix}features_f64"],
-                                     "tokenizer features", terms=np.asarray(terms)[np.asarray(valid)])
     books = [variables["params"]["quantizer"][f"codebook_{stage}"]
              for stage in range(len(config.tokenizer.codebook_size))]
     expected = np.concatenate([refs[f"{prefix}codes_{clip}"] for clip in range(len(refs["lengths"]))])
@@ -86,10 +138,39 @@ def test_the_tokenizer_s_features_and_codes_are_the_reference_s(prefix, bound):
     np.testing.assert_array_equal(np.asarray(residual_quantize(reference, books)), expected)
 
 
+def test_the_audio_encoder_is_as_exact_as_the_reference():
+    """Drawn codes of two clips, the second's last group partial, through the speech embeddings, the
+    bidirectional groups and the projection: each clip's groups on par with the reference's from its
+    float64 run's (check 1, the recording's)."""
+    config, variables, _ = load()
+    held = {"params": variables["params"]["encoder"]}
+    lengths = generator().CODE_LENGTHS
+    groups = [-(-length // config.group_size) for length in lengths]
+
+    encoder = MiMoAudioCodeEncoder(config)
+
+    def codes_and_counts(inputs):
+        codes = [inputs[f"codes_{clip}"] for clip in range(len(lengths))]
+        return (np.stack([np.pad(c, ((0, max(lengths) - len(c)), (0, 0))) for c in codes]),
+                np.asarray(lengths, np.int32))
+
+    def clips(out):
+        """Each clip's real groups, in order."""
+        out = np.asarray(out)
+        return {"encoded": np.concatenate([out[clip, :count] for clip, count in enumerate(groups)])}
+
+    def wide(inputs):
+        return clips(float64_forward(encoder, held, *codes_and_counts(inputs))[0])
+
+    draw, reference, truth, seeds = recorded_site("audio encoder", generator().codes_draw, wide)
+    assert_as_exact(as_given(lambda index, inputs: clips(encoder.apply(held, *codes_and_counts(inputs)))),
+                    reference, draw, "audio encoder", seeds=seeds, truth_fn=truth)
+
+
 @pytest.mark.parametrize("prefix, bound", [("", 256000), ("bounded_", 30)])
-def test_the_audio_encoder_is_as_exact_as_the_reference(prefix, bound):
-    """The reference's codes through the speech embeddings, the bidirectional groups and the
-    projection, each clip's groups within the float64 gate; the tower end to end gives the same."""
+def test_the_tower_end_to_end_encodes_its_tokenizers_codes(prefix, bound):
+    """The tower end to end over the fixture's clips counts and encodes each clip's groups as the code
+    encoder does over the reference's codes."""
     config, variables, refs = load()
     config = dataclasses.replace(config, tokenizer_batch_frames=bound)
     count = len(refs["lengths"])
@@ -102,8 +183,6 @@ def test_the_audio_encoder_is_as_exact_as_the_reference(prefix, bound):
     encoding = config.build().apply(variables, refs["mels"], mask)
     for clip in range(count):
         groups = len(refs[f"{prefix}embedded_{clip}"])
-        assert_as_exact_as_the_reference(np.asarray(out)[clip, :groups], refs[f"{prefix}embedded_{clip}"],
-                                         refs[f"{prefix}embedded_f64_{clip}"], f"audio encoder clip {clip}")
         assert int(np.asarray(encoding.mask)[clip].sum()) == groups
         np.testing.assert_allclose(np.asarray(encoding.features)[clip, :groups],
                                    np.asarray(out)[clip, :groups], rtol=0, atol=1e-5)
@@ -129,8 +208,9 @@ def test_a_bf16_checkpoint_binds_in_its_own_dtype_and_runs():
     assert np.isfinite(np.asarray(encoding.features, np.float32)).all()
 
 
-CODE_ENCODER_SEEDS = 8
-"""The bfloat16 code encoder's declared check-1 seeds against Qwen2Model, sized by `seeds_for` paired."""
+CODE_ENCODER_SEEDS = 16
+"""The bfloat16 code encoder's declared check-1 seeds against Qwen2Model, sized by `seeds_for` paired on
+armada."""
 
 
 def test_the_code_encoder_in_bf16_rounds_as_its_qwen2_reference_does():
