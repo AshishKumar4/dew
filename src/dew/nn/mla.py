@@ -27,7 +27,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl, kernel_for_materialized_mask, scaled_dot_product_attention
-from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits
+from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits, visibility_mask
 from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
@@ -922,7 +922,7 @@ class MultiHeadLatentAttention(LinearProducts):
 
     def _cached_visibility(self, metadata, turned, shape: tuple[int, int], total: int) -> jax.Array | None:
         """A dense layer's cached call's own visibility `[B, 1, T, total]` over the cache's `total` slots
-        (`call_visibility`, `dense_visibility`), None where it states none: its pairwise mask or key runs,
+        (`call_visibility`, `visibility_mask`), None where it states none: its pairwise mask or key runs,
         a tree call's each token's cache and ancestors, over the slots that hold a token, each key at its
         slot unless the call places it (`attention_key_positions`), each query at its rotary position
         `turned`, which the window and the chunk read."""
@@ -936,9 +936,10 @@ class MultiHeadLatentAttention(LinearProducts):
         if own is None:
             return None
         mask, runs, window, key_places = own
-        return dense_visibility(mask, None, causal=False, window=window, valid=cached_validity(self, total),
-                                runs=runs, places=turned, key_places=key_places, queries=length, keys=total,
-                                chunk=self.attention_chunk)
+        # The runs index the cache's slots; the queries' and keys' places count a window and a chunk.
+        return visibility_mask(length, total, causal=False, sliding_window=window, mask=mask,
+                               key_valid=cached_validity(self, total), key_runs=runs,
+                               places=(turned, key_places), chunk=self.attention_chunk)
 
     def _visible(self, slots, total: int):
         """`[B, 1, T, total]`: which of the cache's `total` slots each query at `slots` sees, those up
