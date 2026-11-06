@@ -31,7 +31,7 @@ CASES = {
 """`published`: V-JEPA's `vit_*`/`vit_predictor` construction (LayerNorm epsilon 1e-6, MLP ratio 4),
 narrowed; `variant`: the constructors' own LayerNorm epsilon (1e-5), MLP ratio 2, odd head counts and a
 two-channel image. Each is drawn to its worker (`build`'s arguments), with its context and target counts."""
-JEPA_SEEDS = {"published": 8, "variant": 8}
+JEPA_SEEDS = {"published": 8, "variant": 16}
 """Each configuration's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
 OUTPUTS = ("context", "predictions", "gradients")
 """The leaves `dew` gives, each site's recorded leaves."""

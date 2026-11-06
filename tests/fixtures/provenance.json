@@ -2648,16 +2648,27 @@
    "sources": [{"repo": "huggingface/transformers", "version": "93c8b7b485963a10800c91f55304db6be211c2bd", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.1", "runs": "torch"}],
    "tool": "tools/kda_reference.py"
   },
-  "jepa/vjepa.npz": {
-   "tool": "tools/vjepa_reference.py",
+  "jepa/published.npz": {
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "facebookresearch/jepa",
-     "version": "51c59d518fc63c08464af6de585f78ac0c7ed4d5",
-     "runs": "fetched"
+     "revision": "51c59d518fc63c08464af6de585f78ac0c7ed4d5",
+     "runs": "src/models vision_transformer and predictor"
     }
    ],
-   "note": "src/models (vision_transformer, predictor, utils) with src/masks/utils.py and src/utils/tensors.py fetched at the commit, SHA-256 checked; image mode, mask-token predictor, V-JEPA's own exact GELU; float32 and float64 (widened, float64 sincos tables) forward and gradients. Torch 2.14.0+cpu."
+   "note": "V-JEPA's image-mode encoder and mask-token predictor in its vit construction, narrowed (tests/test_jepa_source.py CASES), run by tools/vjepa_worker.py jepa-published on the CPU (torch 2.14.0+cpu, exact GELU) over each seed's drawn weights, images, disjoint context and target patches and cotangents: the context embeddings, the predictions and the gradients of the images and every trainable parameter, in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "jepa/variant.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "facebookresearch/jepa",
+     "revision": "51c59d518fc63c08464af6de585f78ac0c7ed4d5",
+     "runs": "src/models vision_transformer and predictor"
+    }
+   ],
+   "note": "V-JEPA's image-mode encoder and mask-token predictor with the constructors' own LayerNorm epsilon, MLP ratio 2, odd head counts and a two-channel image (tests/test_jepa_source.py CASES), run by tools/vjepa_worker.py jepa-variant on the CPU (torch 2.14.0+cpu, exact GELU) over each seed's drawn weights, images, disjoint context and target patches and cotangents: the context embeddings, the predictions and the gradients of the images and every trainable parameter, in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
   },
   "jit": {
    "tool": "tools/jit_reference.py",
@@ -3629,16 +3640,27 @@
    ],
    "note": "Fetches and executes published Router class."
   },
-  "uvit/bao.npz": {
-   "tool": "tools/uvit_reference.py",
+  "uvit/published.npz": {
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "baofff/U-ViT",
-     "version": "ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
-     "runs": "fetched"
+     "revision": "ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
+     "runs": "libs/uvit_t2i.py UViT and libs/timm.py"
     }
    ],
-   "note": "libs/uvit_t2i.py and libs/timm.py fetched at the commit, SHA-256 checked, math attention; float32 and float64 (widened) forward and gradients. Torch 2.14.0+cpu."
+   "note": "U-ViT's mscoco configuration narrowed (tests/test_uvit_source.py CASES) run by tools/uvit_worker.py uvit-published on the CPU (torch 2.14.0+cpu, math attention) over each seed's drawn weights, images, text states, times and cotangent: its output and the gradients of the image, the text and every parameter, in float32 and, its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "uvit/variant.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "baofff/U-ViT",
+     "revision": "ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
+     "runs": "libs/uvit_t2i.py UViT and libs/timm.py"
+    }
+   ],
+   "note": "U-ViT with the time MLP on, no output convolution and an odd number of heads (tests/test_uvit_source.py CASES) run by tools/uvit_worker.py uvit-variant on the CPU (torch 2.14.0+cpu, math attention) over each seed's drawn weights, images, text states, times and cotangent: its output and the gradients of the image, the text and every parameter, in float32 and, its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "v_loss/loss.npz": {
    "tool": "tools/v_loss_reference.py",
