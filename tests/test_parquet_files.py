@@ -64,8 +64,8 @@ def test_a_streamed_parquet_store_resumes_within_a_file_where_it_stopped():
     url = written("resumed")
 
     def opened():
-        return compile(Pipeline(Files(url, format="parquet")).batch(2), read="streamed",
-                       loading=READ).train(DataPartition())
+        return compile(Pipeline(Files(url, format="parquet")).batch(2), read="streamed", loading=READ,
+                       epochs=1).train(DataPartition())
 
     saving = opened()
     try:
@@ -93,7 +93,7 @@ def test_a_parquet_streams_position_saved_under_plan_version_9_resumes_by_9_alon
     lines.child("rows.jsonl").write(b"".join(b'{"id": %d}\n' % row for row in range(FILES * GROUPS * ROWS)))
 
     def opened(source, version=None):
-        return compile(Pipeline(source).batch(2), read="streamed", loading=READ,
+        return compile(Pipeline(source).batch(2), read="streamed", loading=READ, epochs=1,
                        **({} if version is None else {"plan_version": version})).train(DataPartition())
 
     for source in (Files(url, format="parquet"), Files(lines.url, format="jsonl")):
