@@ -1068,6 +1068,13 @@ about it is an estimate.
   its own evaluation. Windows of four steps into three found nothing further (2026-11-06, one round within
   its bounds). Whether its PTX beats the compiler's lowering of `encoded` is its consumer's measurement
   (sm80's FP8 and FP4 epilogue, row 3733).
+- **Decodes searched** (2026-11-06, the tool's `e4m3-decode-*`, `e5m2-decode-*` and `e8m0` references): an
+  FP8 word's four codes into two bfloat16 pairs in their natural byte order take 13 steps a register (11
+  issues on the ALU, two IMADs placing two fields in one multiply), from a seed of 15 or 16; the free layout's
+  linear form takes 2 a register (the linear search, a shift and a masked XOR), so a consumer of FP8 weights
+  stores them in its free layout once (`BitForm.prepared`), as NVFP4's does, and no natural-order form is
+  checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8 steps: no
+  cheaper program within the windows. Neither has a consumer yet (sm80's FP8 weights, sm100's MX).
 - **Not in the linear search**: PRMT and LOP3's other tables as a register's combiner. A register's LOP3
   must zero its other bits, and a three-way XOR with a mask takes four operands, which LOP3 does not; a
   byte selection adds nothing a free layout's encoder does not, and a fixed layout's byte moves are the
