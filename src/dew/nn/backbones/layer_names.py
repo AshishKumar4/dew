@@ -104,22 +104,23 @@ def stored_rows(path, leaf, shape: tuple[int, ...]) -> list[StoredRow]:
             for row in range(int(np.prod(shape)))]
 
 
-def stored_layers(model, variables: Variables) -> Variables:
-    """`variables` with every run a stage-local store stacks by stage, or a banked store holds as one array
-    under the run's name (`layers_3_7`, `dew.inference.banks`), on its stored layers (`layers_N`), each
-    whole, as a reader by layer name reads them: an export, an adapter's merge or save. The runs are
-    those `model` declares (`StagedStacks.stage_sites`, `BankedStacks.bank_sites`), each cut back by the
-    view it was stacked under (`StackView.layer_form`): a stage-local one's into arrays, a bank's into
-    rows read as they are read (`StoredRow`), beside what the store holds of each layer apart (a DEX
-    layer's own parameters); variables that hold no such run are returned as they are. A model run
-    reads the store as it is (`off_stages`)."""
+def stored_layers(model, variables: Variables, *, banks: bool = False) -> Variables:
+    """`variables` with every run a stage-local store stacks by stage on its stored layers (`layers_N`),
+    each whole, as a reader by layer name reads them: an export, an adapter's merge or save; with `banks`,
+    an export's read, also every run a banked store holds as one array under the run's name
+    (`layers_3_7`, `dew.inference.banks`), which a model call reads as it is. The runs are those `model`
+    declares (`StagedStacks.stage_sites`, `BankedStacks.bank_sites`), each cut back by the view it was
+    stacked under (`StackView.layer_form`): a stage-local one's into arrays, a bank's into rows read as
+    they are read (`StoredRow`), beside what the store holds of each layer apart (a DEX layer's own
+    parameters); variables that hold no such run are returned as they are. A model run reads the store
+    as it is (`off_stages`)."""
     stages = stage_count(variables)
     if stages > 1 and isinstance(model, StagedStacks):
         sites, cut = model.stage_sites(variables, stages), array_rows
 
         def held(node) -> bool:
             return isinstance(node, Mapping) and 'stages' in node
-    elif stages == 1 and isinstance(model, BankedStacks):
+    elif banks and stages == 1 and isinstance(model, BankedStacks):
         sites, cut = model.bank_sites(variables), stored_rows
 
         def held(node) -> bool:
