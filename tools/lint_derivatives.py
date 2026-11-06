@@ -88,12 +88,17 @@ def derivative_seams(relative: str, tree: ast.Module) -> Iterator[tuple[str, str
         yield f"{relative}::{name}", maker, node, contract
 
 
-@functools.cache
 def contract_tests(checkout: Path) -> collections.Counter[str]:
     """The test functions of `checkout`'s tests/test_contracts_*.py, each the holder of a contract, with
-    how many files define each name (a seam's contract names one alone)."""
-    return collections.Counter(node.name for path in (checkout / "tests").glob("test_contracts_*.py")
-                               for node in ast.parse(path.read_text()).body
+    how many files define each name (a seam's contract names one alone), read once a version of the files
+    (each file's modification time), whichever tree it lints."""
+    files = sorted((checkout / "tests").glob("test_contracts_*.py"))
+    return _contract_tests(tuple((path, path.stat().st_mtime_ns) for path in files))
+
+
+@functools.cache
+def _contract_tests(files: tuple[tuple[Path, int], ...]) -> collections.Counter[str]:
+    return collections.Counter(node.name for path, _ in files for node in ast.parse(path.read_text()).body
                                if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"))
 
 
