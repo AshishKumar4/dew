@@ -15,8 +15,8 @@ Each array file stores fp32 and float64 references, IEEE products.
 - `mimo-audio-tiny/mel.npz` (`--mel`): torchaudio stops at torch 2.11, so this part runs in an
   environment of torch 2.11 and torchaudio 2.11, the transform built in the dtype it computes in.
 - `mimo-vision-tiny/recording.npz` (`--record-vision`): the fixture's tower and merger over drawn pixels
-  (`vision_draw`) and drawn trunk features (`merger_draw`), their outputs and float64 truths recorded
-  over seeds for check 1 (`recorded_references.record_case`).
+  (`vision_draw`) and drawn trunk features (`merger_draw`), their evidence and float64 truths' sketches
+  recorded over seeds for check 1 (`recorded_references.record_case`, summarized).
 
     python tools/mimo_reference.py
     <torch 2.11 + torchaudio python> tools/mimo_reference.py --mel
@@ -239,8 +239,9 @@ def record_mimo_vision() -> None:
         with float64():
             return narrow_out, merged(wide, inputs["trunk"], torch.float64)
 
-    arrays = {**record_case("mimo tower", vision_draw, tower_case, store_inputs=False),
-              **record_case("mimo merger", merger_draw, merger_case, store_inputs=False)}
+    # Summarized: the test's float64 run is held to the truth's sketch (`indexed_recording`'s `truth_fn`).
+    arrays = {**record_case("mimo tower", vision_draw, tower_case, store_inputs=False, summary=True),
+              **record_case("mimo merger", merger_draw, merger_case, store_inputs=False, summary=True)}
     written = save(directory / "recording.npz", {**arrays, "provenance": provenance(
         MIMO_REPO, MIMO_REVISION, "cpu",
         "PYTHONPATH=src:tests python tools/mimo_reference.py --record-vision",

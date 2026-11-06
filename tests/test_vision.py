@@ -38,7 +38,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -335,10 +334,17 @@ def mimo_generator():
         return module
 
 
-def mimo_site(site: str, inputs_of):
-    """`site`'s draw, recorded reference and truth over its declared seeds, and the count."""
-    seeds = declared_seeds(MIMO_RECORDING)[site]
-    return (*indexed_recording(recording(MIMO_RECORDING), site, seeds, inputs_of=inputs_of), seeds)
+def recorded_site(path, site: str, inputs_of, truth_fn):
+    """`site`'s draw, recorded reference and truth over its declared seeds in the summarized recording at
+    `path`, Dew's float64 run `truth_fn` its truth, held to the recording's sketch, and the count."""
+    seeds = declared_seeds(path)[site]
+    return (*indexed_recording(recording(path), site, seeds, inputs_of=inputs_of, truth_fn=truth_fn), seeds)
+
+
+def widened(build):
+    """`build()` run with float64 enabled, its arrays float64: a module's float64 twin and its variables."""
+    with jax.enable_x64(new_val=True):
+        return build()
 
 
 def test_mimo_tower_is_as_exact_as_the_reference():
@@ -350,7 +356,15 @@ def test_mimo_tower_is_as_exact_as_the_reference():
     tower = towers.from_record(mimo.translate_mimo_vision_config(config)).build()
     variables, _ = tower_variables("mimo", tensors, "float32")
     grid = np.asarray(mimo_generator().MIMO_GRIDS, np.int32)
-    draw, reference, truth, seeds = mimo_site("mimo tower", mimo_generator().vision_draw)
+    wide = widened(lambda: tower_variables("mimo", tensors, "float64")[0])
+
+    def wide_trunk(inputs):
+        with jax.enable_x64(new_val=True):
+            pixels = jnp.asarray(inputs["pixels"], jnp.float64)
+            return {"tower": real(tower.clone(dtype=jnp.float64).apply(wide, pixels, grid), grid)}
+
+    draw, reference, truth, seeds = recorded_site(MIMO_RECORDING, "mimo tower", mimo_generator().vision_draw,
+                                                  wide_trunk)
     trunk = jax.jit(lambda variables, pixels: tower.apply(variables, pixels, grid))
 
     def dew(held):
@@ -378,41 +392,84 @@ def test_mimo_merger_is_as_exact_as_the_reference(native):
             out_width=config["text_config"]["hidden_size"])
     variables = {"params": projector_variables("mimo", projector_tensors, "float32")[0]}
     grid = np.asarray(mimo_generator().MIMO_GRIDS, np.int32)
-    draw, reference, truth, seeds = mimo_site("mimo merger", mimo_generator().merger_draw)
+    wide = widened(lambda: {"params": projector_variables("mimo", projector_tensors, "float64")[0]})
+
+    def wide_merged(inputs):
+        with jax.enable_x64(new_val=True):
+            trunk = jnp.asarray(inputs["trunk"], jnp.float64)
+            return {"merger": real(projector.clone(dtype=jnp.float64).apply(wide, trunk), grid, 2)}
+
+    draw, reference, truth, seeds = recorded_site(MIMO_RECORDING, "mimo merger", mimo_generator().merger_draw,
+                                                  wide_merged)
     merged = jax.jit(lambda trunk: projector.apply(variables, trunk))
     assert_as_exact(as_given(lambda index, inputs: {"merger": real(merged(inputs["trunk"]), grid, 2)}),
                     reference, draw, "mimo merger", seeds=seeds, truth_fn=truth)
 
 
+MUSE_RECORDING = FIXTURES / "muse-glimmer-vision-tiny" / "recording.npz"
+
+
+@functools.cache
+def muse_generator():
+    """tools/muse_glimmer_reference.py, whose seeded draws the recorded sites' inputs are drawn again by."""
+    with run_from("muse_glimmer_reference", "tools") as module:
+        return module
+
+
 def test_muse_glimmer_tower_is_as_exact_as_the_reference():
     """Muse Glimmer's trunk on a 6x10 grid of 4-patch windows, some partial, and an 8x4 one: the
-    resampled table, the windows and full layers, the column-first rotary, within the float64 gate,
-    and the first row again from its NCHW image packed in the processor's time-then-channel order."""
-    config, tensors, _, refs = shared_fixture("muse-glimmer-vision-tiny")
+    resampled table, the windows and full layers, the column-first rotary, over drawn pixels on par
+    with transformers' from its float64 run's (check 1, tools/muse_glimmer_reference.py --record); and
+    the first grid again from a drawn NCHW image Dew packs as the processor does (time, then channel)."""
+    config, tensors, _, _ = shared_fixture("muse-glimmer-vision-tiny")
     tower = towers.from_record(muse_glimmer.translate_muse_glimmer_vision_config(config)).build()
     variables, _ = tower_variables("muse_glimmer", tensors, "float32")
-    grid = refs["grid"]
-    out = tower.apply(variables, refs["pixels"], grid)
-    assert_as_exact_as_the_reference(real(out, grid), real(refs["tower"], grid),
-                                     real(refs["tower_f64"], grid), "muse glimmer tower")
-    image = tower.apply(variables, refs["image"])
-    count = int(np.prod(grid[0]))
-    assert_as_exact_as_the_reference(np.asarray(image)[0], refs["tower"][0, :count],
-                                     refs["tower_f64"][0, :count], "muse glimmer image")
+    grid = np.asarray(muse_generator().MUSE_GRIDS, np.int32)
+    wide = widened(lambda: tower_variables("muse_glimmer", tensors, "float64")[0])
+
+    def wide_run(inputs, name, read):
+        with jax.enable_x64(new_val=True):
+            given = jnp.asarray(inputs[name], jnp.float64)
+            return {"tower": read(tower.clone(dtype=jnp.float64), given)}
+
+    draw, reference, truth, seeds = recorded_site(
+        MUSE_RECORDING, "muse glimmer tower", muse_generator().pixels_draw,
+        lambda inputs: wide_run(inputs, "pixels", lambda wide_tower, pixels: real(
+            wide_tower.apply(wide, pixels, grid), grid)))
+    trunk = jax.jit(lambda pixels: tower.apply(variables, pixels, grid))
+    assert_as_exact(as_given(lambda index, inputs: {"tower": real(trunk(inputs["pixels"]), grid)}),
+                    reference, draw, "muse glimmer tower", seeds=seeds, truth_fn=truth)
+    draw, reference, truth, seeds = recorded_site(
+        MUSE_RECORDING, "muse glimmer image", muse_generator().image_draw,
+        lambda inputs: wide_run(inputs, "image", lambda wide_tower, image: np.asarray(
+            wide_tower.apply(wide, image))[0]))
+    image = jax.jit(lambda pixels: tower.apply(variables, pixels))
+    assert_as_exact(as_given(lambda index, inputs: {"tower": np.asarray(image(inputs["image"]))[0]}),
+                    reference, draw, "muse glimmer image", seeds=seeds, truth_fn=truth)
 
 
 def test_muse_glimmer_projector_is_as_exact_as_the_reference():
     """The pixel shuffle channel by channel, the adapter's two activated maps, the projection and the
-    scale-free norm, each tensor named as the checkpoint router leaves it (`projector_layout`)."""
-    config, _, projector_tensors, refs = shared_fixture("muse-glimmer-vision-tiny")
+    scale-free norm, each tensor named as the checkpoint router leaves it (`projector_layout`): over
+    drawn trunk features on par with transformers' from its float64 run's (check 1)."""
+    config, _, projector_tensors, _ = shared_fixture("muse-glimmer-vision-tiny")
     projector = projectors.from_record(muse_glimmer.translate_muse_glimmer_projector_config(config))
     routed = {name[len(prefix):]: tensor for name, tensor in projector_tensors.items()
               for prefix in projector_layout("muse_glimmer").prefix if name.startswith(prefix)}
     variables = {"params": projector_variables("muse_glimmer", routed, "float32")[0]}
-    out = projector.apply(variables, refs["tower"])
-    grid = refs["grid"]
-    assert_as_exact_as_the_reference(real(out, grid, 2), real(refs["projector"], grid, 2),
-                                     real(refs["projector_f64"], grid, 2), "muse glimmer projector")
+    grid = np.asarray(muse_generator().MUSE_GRIDS, np.int32)
+    wide = widened(lambda: {"params": projector_variables("muse_glimmer", routed, "float64")[0]})
+
+    def wide_projected(inputs):
+        with jax.enable_x64(new_val=True):
+            trunk = jnp.asarray(inputs["trunk"], jnp.float64)
+            return {"projector": real(projector.clone(dtype=jnp.float64).apply(wide, trunk), grid, 2)}
+
+    draw, reference, truth, seeds = recorded_site(MUSE_RECORDING, "muse glimmer projector",
+                                                  muse_generator().trunk_draw, wide_projected)
+    projected = jax.jit(lambda trunk: projector.apply(variables, trunk))
+    assert_as_exact(as_given(lambda index, inputs: {"projector": real(projected(inputs["trunk"]), grid, 2)}),
+                    reference, draw, "muse glimmer projector", seeds=seeds, truth_fn=truth)
 
 
 def test_gemma4_clipping_matches_reference_forward_and_backward():

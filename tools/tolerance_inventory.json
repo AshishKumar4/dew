@@ -706,7 +706,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_vision.py": {
-   "comparisons": 21,
+   "comparisons": 15,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_source.py": {

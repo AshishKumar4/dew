@@ -355,11 +355,14 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source):
         positions = jnp.broadcast_to(jnp.arange(prompt) + SHIFT, (ids.shape[0], prompt))
         prompted = ModelInputs(ids[:, :prompt], {"positions": positions})
         state, _ = prefill_state(plain, variables, prompted, ops)
-        steps = [state.logits]
-        for column in range(prompt, ids.shape[1]):
-            state = ops.advance(state, ids[:, column], jnp.ones(ids.shape[0], bool))
-            steps.append(state.logits)
-        return jnp.stack(steps, axis=1)
+
+        def step(state, column):
+            state = ops.advance(state, column, jnp.ones(ids.shape[0], bool))
+            return state, state.logits
+
+        # One step's program, scanned over the rest of each row.
+        _, steps = jax.lax.scan(step, state, ids[:, prompt:].T)
+        return jnp.concatenate([state.logits[:, None], jnp.moveaxis(steps, 0, 1)], axis=1)
 
     assert_as_exact(jax.jit(walked), lambda variables, ids: plain_logits(variables, ids)[:, prompt - 1:],
                     draw, "a shifted cached walk", seeds=SHIFT_SEEDS,
