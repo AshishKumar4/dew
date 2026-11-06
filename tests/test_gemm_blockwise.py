@@ -88,12 +88,6 @@ def test_a_blockwise_fp8_projections_training_step_is_on_par():
     `recipe_truth`): the step-level parity a preset's projections hold (row 2513)."""
     group_blocks = jnp.asarray([1, 0, 2], jnp.int32)
 
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.normal(size=(384, 256)), jnp.float32),
-                jnp.asarray(rng.normal(size=(3, 256, 128)) / 16, jnp.float32),
-                jnp.asarray(rng.normal(size=(384, 128)), jnp.float32))
-
     def step(kernel):
         def projection(x, w):
             with generation.chosen(blockwise_fp8=kernel):
@@ -102,7 +96,7 @@ def test_a_blockwise_fp8_projections_training_step_is_on_par():
         return with_gradients(projection)
 
     with generation.assumed("sm90"):
-        assert_as_exact(jax.jit(step("mosaic_gpu")), jax.jit(step("xla")), draw,
+        assert_as_exact(jax.jit(step("mosaic_gpu")), jax.jit(step("xla")), blockwise_matrix.step_operands,
                         "blockwise fp8 training step",
                         seeds=blockwise_matrix.SEEDS,
                         truth_fn=with_gradients(blockwise_matrix.recipe_truth(group_blocks)))

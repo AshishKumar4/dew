@@ -968,11 +968,17 @@ def test_an_hoppers_blockwise_fp8_kernel_gradient_runs_the_template_named_for_it
     """A blockwise-scaled FP8 kernel gradient, the template named, compiled for a compile-only H100: its
     program launches the template's kernel gradient (`kernel_compile.Expected`, its route evidence; row
     4518)."""
+    _assert_launches("sm90", "blockwise fp8 gradient", _blockwise_gradient, 4, "dew_tgmm")
+
+
+def _assert_launches(target: str, name: str, case, operands: int, launch: str):
+    """`case`, compiled for a compile-only `target` on one device, its `operands` unplaced, launches the
+    template's `launch` (`kernel_compile.Expected`, its route evidence)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
-    expected = Expected(axes=(("data", 1),), specs=(None,) * 4, launches=frozenset({"dew_tgmm"}))
-    cases = [support.KernelCase("blockwise fp8 gradient", _blockwise_gradient, expected=expected)]
-    assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
+    expected = Expected(axes=(("data", 1),), specs=(None,) * operands, launches=frozenset({launch}))
+    cases = [support.KernelCase(name, case, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, target)) == []
 
 
 def _mx_projection():
@@ -993,11 +999,7 @@ def test_a_blackwells_mx_product_runs_the_template_named_for_it():
     """An MX MoE projection, the template named, compiled for a compile-only B200: its program launches the
     template's grouped product (`kernel_compile.Expected`, its route evidence), each 32 depths of its FP8
     operands scaled in the block-scaled tensor cores' products (row 4519)."""
-    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
-
-    expected = Expected(axes=(("data", 1),), specs=(None,) * 2, launches=frozenset({"dew_gmm"}))
-    cases = [support.KernelCase("mx projection", _mx_projection, expected=expected)]
-    assert route_failures(cases, compile_mosaic_kernels(cases, "sm100")) == []
+    _assert_launches("sm100", "mx projection", _mx_projection, 2, "dew_gmm")
 
 
 def test_each_triton_call_needs_a_launch_of_its_own():

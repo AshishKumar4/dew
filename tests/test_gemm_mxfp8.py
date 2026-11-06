@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import mx_matrix
 import numpy as np
 import pytest
+from blockwise_matrix import step_operands
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import gemm, generation
@@ -73,17 +74,11 @@ def test_an_mxfp8_projections_training_step_is_on_par():
     draws (check 1), against the same step's float32 sums of the decoded operands."""
     blocks = jnp.asarray([1, 0, 2], jnp.int32)
 
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.normal(size=(384, 256)), jnp.float32),
-                jnp.asarray(rng.normal(size=(3, 256, 128)) / 16, jnp.float32),
-                jnp.asarray(rng.normal(size=(384, 128)), jnp.float32))
-
     def projection(x, w):
         with generation.chosen(mxfp8="xla"):
             return gemm.mxfp8_projection(x, w, blocks, out_dtype=jnp.float32)
 
     plain = mx_matrix.recipe_truth(blocks, jnp.float32)
-    assert_as_exact(jax.jit(with_gradients(projection)), jax.jit(with_gradients(plain)), draw,
+    assert_as_exact(jax.jit(with_gradients(projection)), jax.jit(with_gradients(plain)), step_operands,
                     "mxfp8 training step", seeds=SEEDS,
                     truth_fn=with_gradients(mx_matrix.recipe_truth(blocks)))

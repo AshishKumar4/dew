@@ -596,24 +596,16 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
     shards, their outputs and gradients on par with one device's."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 
-    (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32)
-    branch, ds = (jax.random.normal(jax.random.key(index), x.shape) for index in (28, 29))
-    gate, up, dout = (jax.random.normal(jax.random.key(index), (4, 8, 24)) for index in (30, 31, 32))
-
-    def run(x, branch, scale, ds, dy, gate, up, dout):
-        seam = evaluated(fused_seam(1e-5, x.dtype, offset=True, after_cast=True), (x, branch, scale),
-                         (ds, dy))
-        return seam, evaluated(fused_swiglu(), (gate, up), dout)
-
-    operands = (x, branch, scale, ds, dy, gate, up, dout)
-    alone = jax.jit(run)(*operands)
+    operands = _checked_shard_operands()
+    scale = operands[2]  # the weight, placed whole
+    alone = jax.jit(_checked_shard_run)(*operands)
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
     with jax.set_mesh(mesh):
         placed = [jax.device_put(operand, NamedSharding(mesh, P() if operand is scale else P("data")))
                   for operand in operands]
-        graph = traced(run, *placed)
+        graph = traced(_checked_shard_run, *placed)
         assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
-        meshed = jax.jit(run)(*placed)
+        meshed = jax.jit(_checked_shard_run)(*placed)
     assert_as_alone(meshed, alone)
 
 
@@ -625,7 +617,7 @@ def assert_as_alone(meshed, alone):
 
 
 def _checked_shard_operands():
-    """The checked `shard_map` test's operands (`_checked_shard_run`'s): the seam's and SwiGLU's, and their
+    """The per-shard tests' operands (`_checked_shard_run`'s): the seam's and SwiGLU's, and their
     cotangents."""
     (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32)
     branch, ds = (jax.random.normal(jax.random.key(index), x.shape) for index in (28, 29))
