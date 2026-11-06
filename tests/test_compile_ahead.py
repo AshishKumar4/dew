@@ -378,6 +378,26 @@ def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets
     assert ran.returncode == 0, ran.stderr[-3000:]
 
 
+@pytest.mark.parametrize("implementation", ["auto", "template"])
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_runs(generation,
+                                                                                    implementation):
+    """A training step compiled ahead for a compile-only GPU of `generation` on this host, which has no GPU
+    attached: its attention the route the GPU takes ('auto': FlashAttention where the cell declares it, its
+    FFI targets lowered for the target the wheel is told, `attention_kernels.flash_target`; the template
+    where named), so no kernel lowers in another's place (`AheadOfTime.substituted`, row 4616: every
+    compile ahead's attention ran as XLA's, and each GPU job compiled its own step at run time)."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2,
+                         attention_impl=implementation)
+    trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+                      mesh=MeshSpec().build(compile_only_gpus(generation, 1)),
+                      layout=Layout(min_shard=TINY_SHARD))
+    built = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+    assert not built.substituted, built.substituted
+
+
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])
 def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(generation):
     """A Mosaic GPU kernel compiled for a compile-only GPU of each generation from Hopper on, in a process
