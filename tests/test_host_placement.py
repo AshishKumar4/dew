@@ -369,7 +369,7 @@ def test_a_banked_store_packed_for_serving_or_adapted_exports_as_its_layers_do(t
     tuned = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.asarray(rng.normal(size=leaf.shape) / 4, leaf.dtype)
         if str(getattr(path[-1], "key", "")) == "lora_B" else leaf, lone.variables)
-    stacked = spec.apply(scanned, banked, key=1).model
+    stacked = spec.apply(scanned, variables, key=1).model
     merged = written(lone.model, tuned, "lone")
     adapted = written(stacked, HeldBanks(tuned).place(stacked, layout=DEVICE), "adapted")
     assert adapted.keys() == merged.keys()
