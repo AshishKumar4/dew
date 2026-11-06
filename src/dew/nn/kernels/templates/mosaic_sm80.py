@@ -584,11 +584,11 @@ class Mma(MmaIssuer, CpAsync):
     consumers = 1
 
     def column_unit(self, dtype) -> int:
-        # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
-        # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64
-        # columns; row 2078's probe: every attention launch on sm80 at 64-column tiles).
+        # Its stores move rows through registers, laid over the role's threads (`stores_columns`): a warp's
+        # threads at least, each holding an element, a tile's rows then whole multiples of the rest (the
+        # guarded attention walk's 32-column blocks, whose 64 held no tile's registers at width 128).
         del dtype
-        return resources.THREADS // 2
+        return resources.THREADS // 4
 
     def depths(self, dtype) -> tuple[int, ...]:
         # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
