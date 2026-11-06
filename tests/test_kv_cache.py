@@ -363,7 +363,7 @@ def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpret
     def reference(key, value, query):
         if rotation is not None:
             key, query = rotated(key, rotation), rotated(query, rotation)
-        key, value = (dequantize(*quantize(array, stored), jnp.bfloat16) for array in (key, value))
+        key, value = (dequantize(*quantize(array, stored), query.dtype) for array in (key, value))
         spans = template.spans(1, capacity, rows, lengths=lengths)
         return template.reference(query[:, None], key, value, spans)[:, 0]
 

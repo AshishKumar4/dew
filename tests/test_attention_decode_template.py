@@ -275,20 +275,25 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
 
 
 
+QUANTIZED = [("sm90", "dense"), ("sm90", 16), ("sm80", "dense"), ("sm80", 128)]
+"""The quantized decode's devices and layouts: dense, and pages of 16 keys several to a key tile on an H100
+(an A100's copies load a step's tile whole, `Transport.copies_in_pieces`), of whole key tiles on an A100."""
+
+
 @INTERPRETS
-@pytest.mark.parametrize("layout", ["dense", "paged-16"])
+@pytest.mark.parametrize(("device", "page"), QUANTIZED)
 @pytest.mark.parametrize("stored", ["int8", "float8_e4m3fn"])
-@pytest.mark.parametrize("device", ["sm90", "sm80"])
-def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(layout, stored, device):
+def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(device, page, stored):
     """A decode step over a quantized cache (`dew.nn.kv_cache.quantize`: codes a token and head, each with its
     fp32 scale), its codes read and dequantized in the walk (`attention_decode.attend`'s `scales`, ledger
-    3624), dense or in pages of 16 keys several to a key tile, on par with the reference path over the keys
-    and values the cache dequantizes them to (check 1), as an H100 and an A100 run it."""
+    3624), dense or paged (`QUANTIZED`), on par with the reference path over the keys and values the cache
+    dequantizes them to (check 1), as an H100 and an A100 run it."""
     from dew.nn.kv_cache import dequantize, quantize
 
     positions, heads, kv_heads = CALLS["one-query"]
     spans = _spans(positions)
-    page = 16
+    layout = "dense" if page == "dense" else "paged"
+    page = KEYS if page == "dense" else page
     per_row = KEYS // page
     table = jnp.asarray(np.random.default_rng(7).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
 
@@ -315,8 +320,8 @@ def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(layout, stor
         query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(seed)
         return query, key, value
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"quantized decode {layout} {stored} {device}",
-                    seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    f"quantized decode {layout} {page} {stored} {device}", seeds=SEEDS)
 
 def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     """A key head's group of query heads as its rows (`packed`) and back (`template.ungrouped_rows`): the
