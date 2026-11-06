@@ -30,6 +30,7 @@ from dew.nn.scatter import DROPPED, gather_positions
 from dew.sampling import decoding
 from dew.sampling.decoding import Finish, StepState
 from dew.sampling.guided import Grammar
+from dew.sampling.trees import DraftTree, TreeBlock
 
 
 @struct.dataclass
@@ -91,10 +92,12 @@ class Verify(Protocol):
     """`DecodeOps.verify`: a block of tokens per row behind a validity mask, fed to the model, and the
     state, every position's logits and hidden states it leaves. A row whose tokens cross the model's
     cache rebuild (`DecodeOps.crosses`) rebuilds its caches; without `rebuilds`, a call no row crosses,
-    the program carries no rebuild."""
+    the program carries no rebuild. A `tree` block's tokens are a tree's root and nodes, each reading
+    the row's prefix and its ancestors (`dew.sampling.trees.TreeBlock`)."""
 
     def __call__(self, state: DecoderState, tokens: jax.Array, valid: jax.Array, /, *,
-                 rebuilds: bool = True) -> tuple[DecoderState, jax.Array, jax.Array | None]: ...
+                 rebuilds: bool = True, tree: TreeBlock | None = None
+                 ) -> tuple[DecoderState, jax.Array, jax.Array | None]: ...
 
 
 Propose = Callable[[DecoderState, jax.Array, jax.Array | None, jax.Array | None, jax.Array,
@@ -118,6 +121,8 @@ class DecodeOps:
     `record` appends the states `verify` returned for a stretch's real
     positions to the drafter's windows, and `draft` drafts the next block from
     each row's first token, handing each position's logits to a `choose`.
+    `draft_tree` drafts a tree of candidates after each row's root token
+    (`dew.sampling.trees.DraftTree`), which `TreeSpeculative` verifies.
     `crosses` says which rows a call taking them from `lengths` tokens to
     `following` carries past the position where the model's cached keys go
     stale (`text.rebuild_position`), each such row rebuilding every cache in
@@ -132,6 +137,7 @@ class DecodeOps:
     depths: int = 0
     record: Record | None = None
     draft: DraftBlock | None = None
+    draft_tree: DraftTree | None = None
     crosses: Callable[[jax.Array, jax.Array], jax.Array] | None = None
 
 
