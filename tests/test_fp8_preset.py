@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import float64_twin
-from reference_error import as_given, assert_as_exact, widened, with_gradients
+from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import gemm, generation
@@ -64,7 +64,9 @@ def test_the_routers_gates_and_head_never_reach_the_fp8_projection():
 def test_a_grouped_output_projection_takes_the_recipe_group_by_group():
     """A batched projection (DeepSeek V4's grouped `o_a_proj`, a `DenseGeneral` whose kernel holds a
     matrix a group) under the 'fp8' numerics takes the recipe as its groups' matrices, each group's rows
-    against its own: bit for bit the recipe over each group apart."""
+    against its own: each group's output the recipe over that group apart, the two the same FP8 products
+    summed in fp32 by two programs, within two fp32 reductions' bound of each other
+    (`assert_fp32_reduction_bound`)."""
     from dew.nn.dense import DenseGeneral
     from dew.nn.precision import projection_role
 
@@ -76,10 +78,19 @@ def test_a_grouped_output_projection_takes_the_recipe_group_by_group():
         out = layer.apply(params, x)
     assert [route.kernel != "unquantized" for route in found if route.choice == "blockwise_fp8"] == [True]
     kernel = params["params"]["kernel"]
+    # The recipe's operands, dequantized: E4M3 codes times power-of-two scales, whose products are exact.
+    block_codes, block_scales = gemm.blocks_quantized(kernel)
+    matrices = np.asarray(block_codes, np.float64) * np.repeat(np.repeat(
+        np.asarray(block_scales, np.float64), WIDTH, axis=1), WIDTH, axis=2)
     for group in range(x.shape[0]):
+        rows = x[group].reshape(-1, WIDTH)
         with generation.run_precision(FP8), projection_role("mixer"):
-            alone = gemm.recipe_projection(x[group].reshape(-1, WIDTH), kernel[group], out_dtype=jnp.float32)
-        np.testing.assert_array_equal(np.asarray(out[group]).reshape(-1, WIDTH), np.asarray(alone))
+            alone = gemm.recipe_projection(rows, kernel[group], out_dtype=jnp.float32)
+        row_codes, row_scales = gemm.rows_quantized(rows)
+        dequantized = np.asarray(row_codes, np.float64) * np.repeat(np.asarray(row_scales, np.float64), WIDTH,
+                                                                    axis=-1)
+        assert_fp32_reduction_bound(np.asarray(out[group]).reshape(-1, WIDTH), alone,
+                                    np.abs(dequantized) @ np.abs(matrices[group]), WIDTH)
 
 
 def test_a_projection_the_recipe_takes_under_a_product_wrapper_is_refused():
