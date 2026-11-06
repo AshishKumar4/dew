@@ -100,6 +100,14 @@ def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype
     return out_type
 
 
+def _stores_through_query(family: mosaic.Family, width: int, value_width: int, dtype, out_dtype) -> bool:
+    """Whether an inference launch's output stores through its query's stage: where the two are as wide
+    and as narrow, and the query's stage is staged as an output's is (`query_swizzle` None; a register
+    family's 8-row tiles 32 bytes wide refuse the store ladder's rungs of fewer rows, FS-4324-DIAG1: "slice
+    size (4) ... divisible by the tile size (8)" on an A100)."""
+    return (value_width == width and out_dtype in (None, jnp.dtype(dtype)) and query_swizzle(family) is None)
+
+
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
                          pieces: int = 1) -> tuple[list, dict]:
@@ -116,7 +124,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
               plgpu.SMEM((consumers, block_q), jnp.float32)]
     if residuals:
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), jnp.float32))
-    elif not peaks and (value_width != width or out_dtype not in (None, dtype)):
+    elif not peaks and not _stores_through_query(family, width, value_width, dtype, out_dtype):
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), out_dtype or dtype))
     if residuals or peaks:
         scoped.append(plgpu.SMEM((consumers, block_q), jnp.int32))
@@ -274,7 +282,12 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # the initial state's sums of its own columns (`_column_blocks`), a block a launch at any width.
         # Each block reads its columns of the values where they lie (`_launch`'s `column_width`), no copy of
         # them, and their magnitudes from the tiles it walks (`Family.key_magnitudes`).
-        for first, columns, held in _column_blocks(v, hooked, unit, whole=False):
+        column_blocks = _column_blocks(v, hooked, unit, whole=False)
+        # Every block in one launch, a program a block (`_launch`'s `column_blocks`), where the blocks share
+        # their state, no initial state's sums of their own columns: a decode step's guarded rewalk at width
+        # 128 took two launches of 1.74 us each (ET-DPROF-h100, row 4043).
+        together = len(column_blocks) > 1 and hooked.initial is None
+        for first, columns, held in column_blocks[:1] if together else column_blocks:
             guard = _Guard(live.astype(jnp.int32))
             _, block, *block_rows = _launch(
                 q, k, v, guarded_spans, held._replace(output=()), guard, spec=form, hooks=_unhooked(hooks),
@@ -282,7 +295,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                 splits=splits, table=paged, sources=sources,
                 out_dtype=jnp.float32 if hooked_blocks else out_dtype,
                 finishes=finishes, column_width=columns.shape[-1] if first is not None else None,
-                walks=walks)
+                walks=walks, column_blocks=len(column_blocks) if together else 1)
             blocks.append(block)
             # Every block's rows alike: its logits are the row's whole.
             finished = finished or tuple(block_rows)
@@ -1015,7 +1028,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False,
             kept: bool = False, finishes: bool = False, splits: int = 1,
             table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
-            walks: jax.Array | None = None, sources: jax.Array | None = None, shared_by: int = 1):
+            walks: jax.Array | None = None, sources: jax.Array | None = None, shared_by: int = 1,
+            column_blocks: int = 1):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -1039,7 +1053,9 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     columns (each block's launch recomputes it whole). With `walks` (a masked launch's,
     `algebra.walked_launches`': `[B, Qp // block_q]` int32, nonzero at a query block holding a row it
     walks), a program none of whose query blocks it names loads and writes nothing, its outputs there
-    unread.
+    unread. With `column_blocks`, a launch walks that many blocks of `column_width` columns from the first,
+    a program a block (its heads' grid axis the heads by the blocks), its output every block's columns; its
+    per-row outputs each block's alike, as its logits are the row's whole.
     """
     if splits > 1 and (training or peaks or hooked.initial is not None):
         raise ValueError("a split launch walks an inference call with no initial state")
@@ -1054,7 +1070,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     # A block of the values' columns its index a scalar the programs read, so every block's launch is one
     # kernel (`_key_views`): a static index compiled a kernel a block, four at width 256 (the forward's
     # resource gate's cases 50 to 150 s on a CPU).
-    block = None if column_width is None else jnp.full((1,), (columns or 0) // column_width, jnp.int32)
+    block = (None if column_width is None or column_blocks > 1
+             else jnp.full((1,), (columns or 0) // column_width, jnp.int32))
     target = generation.gpu_target()
     return _launched(query, key, value,
                      _Read(spans, hooked, guard, anchors, None if table is None else table[0], walks, sources,
@@ -1065,16 +1082,17 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                      counted=counted, finishes=finishes, target=target,
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
-                     column_width=column_width, shared_by=shared_by)
+                     column_width=column_width, shared_by=shared_by, column_blocks=column_blocks)
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
-                      "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by"))
+                      "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
+                      "column_blocks"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
-              column_width: int | None = None, shared_by: int = 1):
+              column_width: int | None = None, shared_by: int = 1, column_blocks: int = 1):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
@@ -1100,22 +1118,27 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     # The output stores through the query's stage where the two are as wide (its rows are read before the
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
-    reuse = value_width == width and out_dtype == query.dtype
+    reuse = _stores_through_query(family, width, value_width, query.dtype, out_dtype)
     # A paged call's key tile of several pages loaded a page at a time (`_paged_views`).
     pieces = block_k // page if page is not None and page < block_k else 1
     scoped, rings = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
                                          program.stages, peaks=peaks, out_dtype=out_dtype, pieces=pieces)
-    out_type = _out_types(batch, queries, heads, value_width, out_dtype, splits=splits, peaks=peaks,
-                          training=training, finishes=finishes)
+    out_type = _out_types(batch, queries, heads, value_width * column_blocks, out_dtype, splits=splits,
+                          peaks=peaks, training=training, finishes=finishes)
     layout = _Layout(treedef, len(out_type), len(scoped) - 2, peaks or (reuse and not training))
 
     def body(*refs, streams):
         refs = layout.unpacked(*refs)
         read = refs.read
-        row, head = lax.axis_index("batch"), lax.axis_index("heads")
+        row, axis = lax.axis_index("batch"), lax.axis_index("heads")
+        # A launch of several column blocks a program a block along its heads' axis.
+        if column_blocks > 1:
+            head, column = lax.div(axis, column_blocks), lax.rem(axis, column_blocks)
+        else:
+            head, column = axis, None if read.block is None else read.block[0]
         named = {"keys": refs.k} if peaks else {"keys": refs.k, "values": refs.v}
         views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page,
-                           block_k=block_k, column_block=None if read.block is None else read.block[0])
+                           block_k=block_k, column_block=column)
         streams = family.opened(streams, views)
         pair_first = program.query_tile(queries // pair) * pair
         streamed = _streamed([program.reach(pair_first + index * block_q, read.spans, row)[:2]
@@ -1141,6 +1164,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                        refs.stages[0].at[index])
             else:
                 status, out_view, finished = block.inference(refs.written, finishes)
+                if column_blocks > 1:
+                    out_view = out_view.at[:, pl.ds(column * value_width, value_width)]
             _consumer(program, spec, index, refs.q.at[row, pl.ds(block.first, block_q), head], out_view,
                       status, *stages, refs.out_smem.at[index], refs.row_smem.at[index], streams, views, turn,
                       streamed, block.first, read.spans, read.hooked, read.guard,
@@ -1179,7 +1204,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)
     model = (0 if not counted else None if query_share is None or value_share is None
              else query_share // shared_by + value_share)
-    return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair * splits, batch),
+    grid = (heads * column_blocks, queries // pair * splits, batch)
+    return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
                          approx_math=approx_math, name=name, cost=cost, model_flops=model,
