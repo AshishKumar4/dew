@@ -700,7 +700,7 @@ class MultiHeadLatentAttention(LinearProducts):
             queries, [self.qk_nope_head_dim], axis=-1)
         query_basis, own = None, False
         if decode:
-            q_rot, key, value, mask, query_basis = self._decode_step(
+            q_rot, key, value, mask, query_basis, own = self._decode_step(
                 x, q_rot, rot, latent, q_resid, logical_positions if rotary is None else rotary, valid, call,
                 prediction_phase)
             if self.sparse:
@@ -870,8 +870,10 @@ class MultiHeadLatentAttention(LinearProducts):
     def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, call,
                       prediction_phase: PredictionPhase):
         """One decode step's rotated query heads, its keys and values with the
-        cache's joined, the mask over them, and what puts the scaled query in the
-        basis the cached keys are in (None for none): the expanded keys and the
+        cache's joined, the mask over them, what puts the scaled query in the
+        basis the cached keys are in (None for none), and whether the call's own
+        pairwise mask or key runs gave the mask (`_cached_visibility`), which then
+        replaces its queries' validity: the expanded keys and the
         indexer's selection under the sparse layout, or the latents expanded
         after the append under the dense one. `kv_cache`, the cache's layout,
         stores either form paged or quantized."""
@@ -902,7 +904,7 @@ class MultiHeadLatentAttention(LinearProducts):
                 x, q_resid, index_full, keep, freqs_cos, freqs_sin, call, row_valid, slots=positions,
                 allocated=allocated, committed=committed, prediction_phase=prediction_phase)
             mask = selection_mask(selection, key.shape[1])[:, None]
-            query_basis = basis.query
+            query_basis, own = basis.query, None
         else:
             # The latent and its rotary part, one head each, as the attention cache's keys and values,
             # the latents read back in their own basis, which the expansion reads.
@@ -918,7 +920,7 @@ class MultiHeadLatentAttention(LinearProducts):
                                           else logical_positions, x.shape[:2], key.shape[1])
             mask = self._visible(positions, key.shape[1]) if own is None else own
             query_basis = None
-        return q_rot, key, value, mask, query_basis
+        return q_rot, key, value, mask, query_basis, own is not None
 
     def _cached_visibility(self, metadata, turned, shape: tuple[int, int], total: int) -> jax.Array | None:
         """A dense layer's cached call's own visibility `[B, 1, T, total]` over the cache's `total` slots
