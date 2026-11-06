@@ -117,20 +117,26 @@ def members(group: int) -> list[int]:
     return found
 
 
-GATE = ("import os, sys\n"
+GATE = ("import os, signal, sys\n"
         "held, failed = int(sys.argv[1]), int(sys.argv[2])\n"
         "os.set_inheritable(failed, False)\n"
+        "if sys.argv[3]:\n"
+        "    for name in ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ'):\n"
+        "        if hasattr(signal, name):\n"
+        "            signal.signal(getattr(signal, name), signal.SIG_DFL)\n"
         "if os.read(held, 1):\n"
         "    os.close(held)\n"
         "    try:\n"
-        "        os.execvp(sys.argv[3], sys.argv[4:])\n"
+        "        os.execvp(sys.argv[4], sys.argv[5:])\n"
         "    except OSError as error:\n"
         "        os.write(failed, str(error.errno).encode())\n"
         "os._exit(127)\n")
 """What a `start`ed group's leader runs before its command, as the same process: it waits for its owner's
 release, given once the lifeline holds its id, then executes the command, or writes the error its
 execution raised; an owner gone before it released the command (its pipe closed with nothing written)
-leaves it to exit having run nothing."""
+leaves it to exit having run nothing. It restores the signals Python ignores (SIGPIPE, SIGXFSZ) to their
+defaults first, as Popen's `restore_signals` does for the process it executes, so the command meets them
+as Popen leaves them, a pipe's writer ending by its SIGPIPE."""
 
 
 def start(command: Sequence[str], **options) -> subprocess.Popen:
@@ -140,7 +146,8 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     lifeline's knowing it took the group with it, where the command had run beside a lifeline that never
     learned it (row 4395). Returns once the command is executing, raising the error its execution raised
     (a missing program's `FileNotFoundError`) as Popen does. The lifelines of groups that ended on their own
-    are let go first, their pipes closed."""
+    are let go first, their pipes closed. A start interrupted before its command runs, or whose command
+    cannot execute, stops the group it started and closes its pipes: no caller holds it."""
     with _HELD:
         ended = [_LIFELINES.pop(leader) for leader, (_, held) in list(_LIFELINES.items())
                  if held.poll() is not None]
@@ -149,17 +156,24 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     read, write = os.pipe2(os.O_CLOEXEC)
     # Isolated (-I): run as a script, this file's own directory would otherwise lead sys.path, where dew's
     # io.py and logging.py stand in for the standard library's.
-    line = subprocess.Popen([sys.executable, "-I", __file__, str(read)], pass_fds=(read,),
-                            start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
-    os.close(read)
+    try:
+        line = subprocess.Popen([sys.executable, "-I", __file__, str(read)], pass_fds=(read,),
+                                start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    except BaseException:
+        # A lifeline started, or not, before the interruption ends with its owner pipe's close.
+        os.close(write)
+        raise
+    finally:
+        os.close(read)
     held, release = os.pipe2(os.O_CLOEXEC)
     told, failed = os.pipe2(os.O_CLOEXEC)
     program = options.pop("executable", command[0])
+    restored = "1" if options.pop("restore_signals", True) else ""
     passed = (*options.pop("pass_fds", ()), held, failed)
     try:
-        process = subprocess.Popen([sys.executable, "-I", "-S", "-c", GATE, str(held), str(failed), program,
-                                    *command], start_new_session=True, pass_fds=passed, **options)
+        process = subprocess.Popen([sys.executable, "-I", "-S", "-c", GATE, str(held), str(failed), restored,
+                                    program, *command], start_new_session=True, pass_fds=passed, **options)
     except BaseException:
         for end in (write, release, told):
             os.close(end)
@@ -168,21 +182,23 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     finally:
         os.close(held)
         os.close(failed)
-    process.args = command
-    os.write(write, f"{process.pid}\n".encode())
-    with _HELD:
-        _LIFELINES[process.pid] = (write, line)
-    os.write(release, b"1")
-    os.close(release)
-    # Closed by the command's execution, or written with its error.
-    with open(told, "rb") as said:
-        number = said.read()
-    if number:
+    try:
+        with _HELD:
+            _LIFELINES[process.pid] = (write, line)
+        process.args = command
+        with open(release, "wb", buffering=0) as releasing, open(told, "rb") as said:
+            os.write(write, f"{process.pid}\n".encode())
+            releasing.write(b"1")
+            # Closed by the command's execution, or written with its error.
+            number = said.read()
+        if number:
+            raise OSError(int(number), os.strerror(int(number)), program)
+    except BaseException:
         stop(process)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
-        raise OSError(int(number), os.strerror(int(number)), program)
+        raise
     return process
 
 
