@@ -247,13 +247,13 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     _, scanned, variables, tokens = pair(**SHAPES[shape])
     resident, on_host = stores(scanned, variables)
     greedy = Sampling(temperature=0.0)
-    fetched = generate(scanned, on_host, tokens, 4, key=0, sampling=greedy)
-    held = generate(scanned, resident, tokens, 4, key=0, sampling=greedy)
-    # Each step's logits, the resident run's own continuation read back whole.
-    read = jnp.concatenate([jnp.asarray(tokens), held.tokens[:, :-1]], axis=1)
-    decisions = np.asarray(scanned.apply(resident, read), np.float64)[:, tokens.shape[1] - 1:]
+    fetched = generate(scanned, on_host, tokens, 4, key=0, sampling=greedy).host()
+    held = generate(scanned, resident, tokens, 4, key=0, sampling=greedy).host()
+    # Each step's logits: the resident run's prompt and continuation read back whole, its last token aside.
+    decisions = np.asarray(scanned.apply(resident, jnp.asarray(held.tokens[:, :-1])),
+                           np.float64)[:, held.prompt_width - 1:]
     if np.all(top_margin(decisions, 1) > MARGIN):
-        np.testing.assert_array_equal(np.asarray(fetched.tokens), np.asarray(held.tokens))
+        np.testing.assert_array_equal(fetched.tokens, held.tokens)
 
     cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
     assert sorted(cache) == sorted(name for name in on_host["params"] if name.startswith("layers_"))
