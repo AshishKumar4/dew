@@ -8,7 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tool_support import git
+import pytest
+from tool_support import git, load
 
 TIMING = Path(__file__).resolve().parents[1] / "tools/timing.py"
 
@@ -103,6 +104,30 @@ def test_a_window_times_every_arm_in_reversed_rounds_beside_its_a_a_each_revisio
     refused = subprocess.run([sys.executable, str(TIMING), "run", str(tmp_path / "manifest.json"), "--out",
                               str(tmp_path / "refused")], cwd=repo, capture_output=True, text=True)
     assert refused.returncode == 1 and not (tmp_path / "refused").exists()
+
+
+def test_a_windows_verdict_pairs_each_arms_round_with_the_references_and_leaves_its_warm_up_out(tmp_path):
+    """A window's verdict from its rows: each arm's round median over the reference's of the same round, six
+    rounds past the warm-up judged against the A/A's by `dew.telemetry.benchmark.judged` at 0.95 (its least
+    and greatest round, rank 1): here a fast warm-up round of the arm, which judged would hold 1, decides
+    nothing, and the arm's rounds lie apart from 1 and from the A/A's."""
+    timing = load("timing")
+    measured = {"ref": [10.0] * 7, "ref~aa": [10.0, 9.9, 10.1, 10.0, 10.2, 9.8, 10.0],
+                "arm": [5.0, 12.0, 12.2, 11.9, 12.1, 12.4, 12.3]}
+    rows = [{"case": "c", "cell": {"n": 1}, "arm": arm, "round": index - 1, "warmup": index == 0,
+             "repeat": repeat, "order": index, "wall_ms": value + repeat / 1000, "device_ms": None,
+             "digest": "d", "gpu": "cpu"}
+            for arm, values in measured.items() for index, value in enumerate(values) for repeat in (0, 1)]
+    (tmp_path / "timing.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
+    manifest = {"clock": "wall", "cases": [{"name": "c", "cells": [{"n": 1}], "reference": "ref",
+                                            "arms": [{"name": "ref"}, {"name": "arm"}]}]}
+    timing.summarized(manifest, tmp_path)
+    (cell,) = json.loads((tmp_path / "summary.json").read_text())["cases"][0]["cells"]
+    arms = {found["arm"]: found for found in cell["arms"]}
+    assert arms["arm"]["ratios"] == pytest.approx([1.2, 1.22, 1.19, 1.21, 1.24, 1.23], abs=1e-3)
+    assert arms["arm"]["ratio_interval"] == pytest.approx([1.19, 1.24], abs=1e-3)
+    assert cell["noise_band"] == pytest.approx([0.98, 1.02], abs=1e-3) and arms["arm"]["differs"] is True
+    assert arms["ref"]["differs"] is None and cell["unjudged"] is None
 
 
 def test_the_dense_cells_build_every_product_for_each_implementation_on_the_cpu():

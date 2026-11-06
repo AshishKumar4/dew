@@ -160,21 +160,51 @@ def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_n
     assert alone_low <= 1.0 <= alone_high < low <= 4.0 and result.differs
 
 
-def test_paired_ratios_are_judged_against_their_a_a_by_one_rule_and_too_few_are_refused():
-    """`judged`, the one judgment `compared` and a timing window (tools/timing.py) read a time by: a call's
-    paired ratios differ from their reference only where their interval lies apart from 1 and outside the
-    A/A's, so ratios the A/A's own noise makes, or ones whose interval holds 1, do not; and ratios too few to
-    reach an interval at the level are refused, as `_median_rank` refuses them."""
+@pytest.mark.parametrize(("ratios", "alone", "level", "ratio", "interval", "noise", "differs"), [
+    # Six pairs at 0.95 hold their median between their least and greatest (rank 1).
+    ((1.31, 1.29, 1.30, 1.33, 1.28, 1.32), (0.99, 1.01, 1.00, 1.02, 0.98, 1.00), 0.95,
+     1.305, (1.28, 1.33), (0.98, 1.02), True),
+    # Ten pairs at 0.95 between their second least and second greatest (rank 2): the tenth's outlier at 0.97
+    # leaves the interval apart from 1.
+    ((1.10, 1.12, 1.11, 1.13, 0.97, 1.09, 1.12, 1.10, 1.11, 1.14),
+     (1.00, 0.99, 1.01, 1.00, 1.02, 0.98, 1.00, 1.01, 0.99, 1.00), 0.95, 1.11, (1.09, 1.13), (0.99, 1.01),
+     True),
+    # The same ten at 0.99 (rank 1): the outlier's 0.97 holds 1, so nothing differs.
+    ((1.10, 1.12, 1.11, 1.13, 0.97, 1.09, 1.12, 1.10, 1.11, 1.14),
+     (1.00, 0.99, 1.01, 1.00, 1.02, 0.98, 1.00, 1.01, 0.99, 1.00), 0.99, 1.11, (0.97, 1.14), (0.98, 1.02),
+     False),
+    # Apart from 1 but within the A/A's noise: the placement's own, not a difference, however far its median.
+    ((1.03, 1.04, 1.05, 1.03, 1.06, 1.04), (0.95, 1.07, 1.00, 0.97, 1.03, 1.01), 0.95, 1.04, (1.03, 1.06),
+     (0.95, 1.07), False),
+    # Holding 1, though apart from the A/A's: chance accounts for it.
+    ((0.99, 1.02, 1.03, 1.04, 1.05, 1.03), (0.97, 0.98, 0.98, 0.97, 0.98, 0.98), 0.95, 1.03, (0.99, 1.05),
+     (0.97, 0.98), False),
+    # Ties at the ends.
+    ((1.2, 1.2, 1.2, 1.2, 1.2, 1.2), (1.0, 1.0, 1.0, 1.0, 1.0, 1.0), 0.95, 1.2, (1.2, 1.2), (1.0, 1.0), True),
+])
+def test_paired_ratios_are_judged_against_their_a_a_by_one_rule(ratios, alone, level, ratio, interval,
+                                                                  noise, differs):
+    """`judged`, the one judgment `compared` and a timing window (tools/timing.py) read a time by: the paired
+    ratios' median, the interval their order statistics hold it in at `level` (`_median_rank`), the A/A's
+    interval beside it, and a difference only where the interval lies apart from 1 and outside the A/A's."""
     from dew.telemetry.benchmark import judged
 
-    noise = [1.0 + (index - 31.5) / 1000 for index in range(64)]
-    assert judged([4 * value for value in noise], noise).differs
-    assert not judged(noise, noise).differs
-    # Apart from 1, but within the A/A's wider noise: the placement's own.
-    wide = [1.0 + (index - 31.5) / 100 for index in range(64)]
-    assert not judged([1.02 * value for value in noise], wide).differs
-    with pytest.raises(ValueError, match="take more"):
-        judged(noise[:4], noise)
+    judgment = judged(ratios, alone, level=level)
+    assert (judgment.ratio, judgment.interval, judgment.alone, judgment.differs) == (
+        pytest.approx(ratio), pytest.approx(interval), pytest.approx(noise), differs)
+
+
+def test_ratios_too_few_for_an_interval_at_their_level_are_refused_and_six_are_not():
+    """Five pairs hold their median at 0.9375 at most, so `judged` refuses them at 0.95, either side short
+    (the call's or the A/A's), as `_median_rank` does; six it judges."""
+    from dew.telemetry.benchmark import judged
+
+    six = (1.0, 1.1, 1.2, 1.3, 1.4, 1.5)
+    with pytest.raises(ValueError):
+        judged(six[:5], six)
+    with pytest.raises(ValueError):
+        judged(six, six[:5])
+    assert judged(six, six).interval == (1.0, 1.5)
 
 
 def test_a_medians_rank_holds_it_at_its_level_and_no_higher_rank_does():
