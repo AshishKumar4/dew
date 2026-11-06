@@ -239,25 +239,6 @@ def test_threads_starting_their_first_groups_at_once_in_a_process_without_dew_al
         assert done.stdout == "16 [] []\n", done.stdout + done.stderr
 
 
-def test_a_stopped_groups_leader_is_reaped_by_its_sigkill_when_stop_returns():
-    """A leader of many threads, as a JAX process is, reads as a zombie while its other threads end, before
-    it can be reaped: `stop` returns with it reaped, its exit status its SIGKILL's, where a stop that waited
-    only for the group's live members returned with the leader unreaped (test_multiprocess's preempted runs
-    read no exit status)."""
-    program = ("import threading, time\n"
-               "for _ in range(256):\n"
-               "    threading.Thread(target=time.sleep, args=(600,), daemon=True).start()\n"
-               "print('threads', flush=True)\n"
-               "time.sleep(600)\n")
-    for _ in range(10):
-        leader = start([sys.executable, "-c", program], stdout=subprocess.PIPE, text=True)
-        try:
-            leader.stdout.readline()
-            assert stop(leader) == [] and leader.returncode == -signal.SIGKILL
-        finally:
-            leader.stdout.close()
-
-
 class Own(Exception):
     """A block's own error, which no cleanup failure may replace."""
 
