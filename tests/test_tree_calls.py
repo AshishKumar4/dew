@@ -49,27 +49,35 @@ def test_a_chain_called_as_a_tree_reads_what_the_plain_cached_call_reads():
                  held, left)
 
 
-def test_a_tree_is_refused_where_no_mixer_reads_it_or_the_call_cannot_carry_it():
-    """A gated delta net reads no tree (it would run the tokens as a chain), so a hybrid refuses a tree
-    call by name; a tree outside a cached call, without the key runs that mask its attention, of another
-    length than the call's tokens, or with a parent not before its child is refused."""
-    hybrid = CausalTransformer(
+def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry_it():
+    """A mamba mixer reads no tree (it would run the tokens as a chain), and an n-gram lookup reads the
+    call's tokens in their order, so each model refuses a tree call; a tree outside a cached call,
+    without the key runs that mask its attention, of another length than the call's tokens, with a parent
+    not before its child, or branching without its tokens' positions is refused."""
+    from dew.nn.engram import Engram
+
+    mamba = CausalTransformer(
         vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8, mlp_features=32,
-        max_seq_len=16, dtype="float32", layer_types=("linear_attention", "full_attention"),
-        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
-            "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
-            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}})
+        max_seq_len=16, dtype="float32", layer_types=("mamba", "full_attention"),
+        kinds={"mamba": {"mixer": {"class": "mamba2", "fields": {
+            "num_heads": 4, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4}}}})
+    engram = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32"}, engram=Engram(
+        layer_ids=(0,), num_embeddings=(88,), max_ngram_size=3, vocab_size=VOCAB, n_heads=2, head_dim=4,
+        compressed_vocab_size=VOCAB))
     decoder = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32"})
     ids = jax.random.randint(jax.random.key(0), (2, PROMPT + BLOCK), 0, VOCAB)
     block, runs = ids[:, PROMPT:], chain_runs(2, PROMPT, BLOCK)
-    for model in (hybrid, decoder):
+    placed = PROMPT + jnp.asarray([[0, 1, 1]] * 2)
+    for model in (mamba, engram, decoder):
         params = model.init(jax.random.key(1), ids)
         cache = {**params, "cache": cached(model, params, ids[:, :PROMPT])}
-        refused = [{"attention_tree": (-1, 0, 0), "attention_key_runs": runs}] if model is hybrid else [
-            {"decode": False, "attention_tree": (-1, 0, 0), "attention_key_runs": runs},
-            {"attention_tree": (-1, 0, 0)},
-            {"attention_tree": (-1, 0), "attention_key_runs": runs},
-            {"attention_tree": (-1, 2, 0), "attention_key_runs": runs}]
+        tree = {"attention_tree": (-1, 0, 0), "attention_key_runs": runs, "rotary_positions": placed}
+        refused = [tree] if model is not decoder else [
+            {**tree, "decode": False},
+            {"attention_tree": (-1, 0, 0), "rotary_positions": placed},
+            {**tree, "attention_tree": (-1, 0)},
+            {**tree, "attention_tree": (-1, 2, 0)},
+            {"attention_tree": (-1, 0, 0), "attention_key_runs": runs}]
         for options in refused:
             with pytest.raises(ValueError):
                 model.apply(cache, block, mutable=["cache"], **{"decode": True, **options})
@@ -101,6 +109,11 @@ def paths(tree: tuple[int, ...]) -> list[list[int]]:
     return held
 
 
+def depths(tree: tuple[int, ...]) -> list[int]:
+    """Each tree token's depth, its root's 0."""
+    return [len(path) - 1 for path in paths(tree)]
+
+
 def tree_runs(rows: int, prompt: int, tree: tuple[int, ...]) -> jax.Array:
     """The key runs `[rows, S, R, 2]` of a tree call after `prompt` cached tokens: each token reads the
     cache and its path's slots, one run each, an empty run filling the deepest path's count."""
@@ -114,10 +127,10 @@ def tree_runs(rows: int, prompt: int, tree: tuple[int, ...]) -> jax.Array:
 
 
 def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone():
-    """A gated delta net's tree call (`dew.nn.linear.tree_conv`, `tree_rule`) beside attention's: each
-    token's logits are on par with its root-to-token path decoded as a plain cached call from the same
-    cache, from the float64 run's (check 1), its conv over its ancestors and past the root the cache's
-    history, its recurrence from its parent's state."""
+    """A gated delta net's tree call (`dew.nn.linear.tree_conv`, `tree_rule`) beside attention's, each
+    token at its depth's position: each token's logits are on par with its root-to-token path decoded as
+    a plain cached call from the same cache, from the float64 run's (check 1), its conv over its
+    ancestors and past the root the cache's history, its recurrence from its parent's state."""
     model = hybrid_model()
     wide = float64_twin(model)
     rows = 2
@@ -131,8 +144,10 @@ def test_a_hybrids_tree_call_reads_each_token_as_its_path_decoded_alone():
     @jax.jit
     def tree_logits(params, prompt, block):
         cache = cached(model, params, prompt)
+        placed = jnp.broadcast_to(PROMPT + jnp.asarray(depths(TREE)), (rows, len(TREE)))
         logits, _ = model.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
-                                attention_tree=TREE, attention_key_runs=tree_runs(rows, PROMPT, TREE))
+                                attention_tree=TREE, attention_key_runs=tree_runs(rows, PROMPT, TREE),
+                                rotary_positions=placed)
         return logits
 
     def decoded(decoder):
