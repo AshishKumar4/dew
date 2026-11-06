@@ -7,6 +7,7 @@ component Dew wrote and its UNet recomputes the trained prediction
 (`diffusers_reads`).
 """
 import argparse
+import contextlib
 import json
 import sys
 import tempfile
@@ -514,7 +515,9 @@ def model_site(directory):
     """A multilevel UNet geometry's check-1 arms: Dew's UNet and Diffusers' own Flax UNet on the same
     weights, each one's prediction and the gradients of its drawn inputs (the latents, the prompt states,
     a pooled embedding where the UNet takes one) under a drawn cotangent, and Diffusers' module built at
-    float64 for the truth, its weights widened. Returns `(dew, reference, truth, draw)`."""
+    float64 for the truth, its weights widened, the float32 its modules name read as float64
+    (`flax_precision.float64`). Returns `(dew, reference, truth, draw)`."""
+    import flax_precision
     from diffusers import FlaxUNet2DConditionModel
     from reference_error import with_gradients
 
@@ -549,17 +552,20 @@ def model_site(directory):
         time = jnp.full((MODEL_ROWS,), MODEL_TIME, latents.dtype)
         return model.apply({"params": parameters}, latents, time, conditioning=condition)
 
-    def diffusers(module):
+    def diffusers(module, widening=contextlib.nullcontext):
         def run(latents, context, *pooled):
             dtype = latents.dtype
-            added = None if time_ids is None else {"text_embeds": pooled[0], "time_ids": time_ids}
+            # The truth's time ids in float64, as its widened projections read them.
+            added = None if time_ids is None else {"text_embeds": pooled[0], "time_ids": time_ids.astype(dtype)}
             time = jnp.full((MODEL_ROWS,), MODEL_TIME, dtype)
-            output = module.apply({"params": jax.tree.map(lambda leaf: leaf.astype(dtype), weights)},
-                                  latents.transpose(0, 3, 1, 2), time, context, added_cond_kwargs=added).sample
+            with widening():
+                output = module.apply({"params": jax.tree.map(lambda leaf: leaf.astype(dtype), weights)},
+                                      latents.transpose(0, 3, 1, 2), time, context, added_cond_kwargs=added).sample
             return output.transpose(0, 2, 3, 1)
         return run
 
-    return with_gradients(dew), with_gradients(diffusers(source)), with_gradients(diffusers(wide)), draw
+    return (with_gradients(dew), with_gradients(diffusers(source)),
+            with_gradients(diffusers(wide, flax_precision.float64)), draw)
 
 
 def check_model(directory):
