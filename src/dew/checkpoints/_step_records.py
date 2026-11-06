@@ -20,12 +20,13 @@ if TYPE_CHECKING:
     from dew.data.dataset import DataPartition
 
 
-def step_record(deltas: list[str], control: dict | None, rung: JSON, artifact: JSON,
+def step_record(deltas: Mapping[str, list[str]], control: dict | None, rung: JSON, artifact: JSON,
                 boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> dict:
-    """What a persistent and a local save both record of a step: its EMA deltas, its control
-    state, its rung, its inference artifact and its boxed axes."""
-    return {"ema_deltas": deltas, "control": copy.deepcopy(control or {}), "rung": rung, "artifact": artifact,
-            "boxed": boxed_record(boxed)}
+    """What a persistent and a local save both record of a step: the leaves of each average it stores as
+    their differences from their weights, by the average's name, its control state, its rung, its inference
+    artifact and its boxed axes."""
+    return {"deltas": dict(deltas), "control": copy.deepcopy(control or {}), "rung": rung,
+            "artifact": artifact, "boxed": boxed_record(boxed)}
 
 
 def boxed_record(boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> list[dict[str, list[str | None]]]:

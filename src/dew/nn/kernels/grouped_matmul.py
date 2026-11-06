@@ -1745,6 +1745,36 @@ def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     return branches, fallback
 
 
+def _as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
+    """`tokens` and `kernel` as XLA's portable product multiplies them, and its precision (`xla_ragged_dot`,
+    `xla_dot`)."""
+    if any(operand.dtype in EIGHT for operand in (tokens, kernel)):
+        # FP8 codes are each exact in bfloat16: the product is theirs there, summed in the preferred type
+        # (the FP8 contract's reference arm, testing.md, FP8 products). XLA's GPU compiler rewrites no
+        # ragged dot of widened FP8 codes into its narrower-summing FP8 GEMM (sm90's lowering of this
+        # product holds no F8 GEMM, FS-1625-HLO, row 1625).
+        return tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16), jax.lax.Precision.DEFAULT
+    if all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
+        return tokens, kernel, jax.lax.Precision.DEFAULT
+    if tokens.dtype != kernel.dtype:
+        # A 16-bit operand beside a wider one would reach the TPU kernel
+        # 16-bit at HIGHEST too; widened, it is the same values (exactly),
+        # and the wider operand keeps the precision the call asked for.
+        wide = jnp.promote_types(tokens.dtype, kernel.dtype)
+        return tokens.astype(wide), kernel.astype(wide), precision
+    return tokens, kernel, precision
+
+
+def xla_dot(tokens: jax.Array, matrix: jax.Array, *, precision: PrecisionLike = None,
+            preferred_element_type: Dtype | None = None) -> jax.Array:
+    """A dense product, every row through one matrix (`[depth, width]`), as `xla_ragged_dot` multiplies a
+    group's rows (`_as_multiplied`), as XLA's own dot: no group, so no row masked, and no ragged dot to
+    trace or to expand (a dense call's portable branch, `gemm`'s)."""
+    tokens, matrix, precision = _as_multiplied(tokens, matrix, precision)
+    return jax.lax.dot_general(tokens, matrix, (((1,), (0,)), ((), ())), precision=precision,
+                               preferred_element_type=preferred_element_type)
+
+
 def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
                    precision: PrecisionLike = None,
                    preferred_element_type: Dtype | None = None) -> jax.Array:
@@ -1759,21 +1789,7 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     Those rows are zeroed going in and coming out, so neither the output
     nor a dropped row's gradient carries them.
     """
-    if any(operand.dtype in EIGHT for operand in (tokens, kernel)):
-        # FP8 codes are each exact in bfloat16: the product is theirs there, summed in the preferred type
-        # (the FP8 contract's reference arm, testing.md, FP8 products). XLA's GPU compiler rewrites no
-        # ragged dot of widened FP8 codes into its narrower-summing FP8 GEMM (sm90's lowering of this
-        # product holds no F8 GEMM, FS-1625-HLO, row 1625).
-        tokens, kernel = tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16)
-        precision = jax.lax.Precision.DEFAULT
-    elif all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
-        precision = jax.lax.Precision.DEFAULT
-    elif tokens.dtype != kernel.dtype:
-        # A 16-bit operand beside a wider one would reach the TPU kernel
-        # 16-bit at HIGHEST too; widened, it is the same values (exactly),
-        # and the wider operand keeps the precision the call asked for.
-        wide = jnp.promote_types(tokens.dtype, kernel.dtype)
-        tokens, kernel = tokens.astype(wide), kernel.astype(wide)
+    tokens, kernel, precision = _as_multiplied(tokens, kernel, precision)
     # bincount widens under x64; TPU ragged-dot only lowers int32 counts.
     # Keep the wider domain for CPU calls whose row count actually needs it.
     index_dtype = jnp.int32 if tokens.shape[0] <= np.iinfo(np.int32).max else jnp.int64
