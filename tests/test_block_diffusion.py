@@ -21,6 +21,7 @@ from safetensors.numpy import load_file
 from dew.batch import coordinates
 from dew.interop import diffusion_gemma as adapter
 from dew.nn.inputs import ModelInputs
+from dew.nn.kv_cache import KVCache
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 WORKFLOW = FIXTURES / "diffusion-gemma-workflow"
@@ -98,6 +99,38 @@ def test_native_shared_model_forward_matches_reference(system):
     for expected, actual in zip(jax.tree.leaves(before), jax.tree.leaves(cache), strict=True):
         np.testing.assert_array_equal(actual, expected)
 
+
+
+def _laid(model, layout):
+    """`model` keeping its cache in `layout` (`dew.nn.kv_cache.KVCache`)."""
+    return model.clone(text=model.text.with_kv_cache(layout))
+
+
+def test_a_canvas_over_a_paged_cache_matches_reference(system):
+    """A canvas whose encoder prefix sits in a paged cache reads it as a dense one does: its bare logits
+    held to the reference as `test_native_shared_model_forward_matches_reference` holds them (ledger
+    838)."""
+    model, variables, _, reference, _ = system
+    model = _laid(model, KVCache(page_size=4))
+    cache = prefill(model, variables, reference["prompt"])
+    bare = model.apply({**variables, "cache": cache}, reference["canvas"])
+    assert_as_exact_as_the_reference(bare, reference["bare"], reference["bare_f64"], "bare, paged")
+
+
+@pytest.mark.parametrize("quantized", ["int8", "float8_e4m3fn"])
+def test_a_canvas_over_a_quantized_cache_reads_it_alike_paged_or_dense(system, quantized):
+    """A canvas whose encoder prefix sits in a quantized cache (int8's keys stored rotated, its queries and
+    keys taken into the rotation) reads the same logits whether the cache is paged or dense: the stored
+    codes and scales are the same, only their places differ (ledger 838)."""
+    model, variables, _, reference, _ = system
+
+    def logits(layout):
+        laid = _laid(model, layout)
+        cache = prefill(laid, variables, reference["prompt"])
+        return laid.apply({**variables, "cache": cache}, reference["canvas"])
+
+    np.testing.assert_array_equal(logits(KVCache(quantized=quantized, page_size=4)),
+                                  logits(KVCache(quantized=quantized)))
 
 def test_multi_canvas_generation_matches_full_reference_loop(system):
     model, variables, process, reference, _ = system

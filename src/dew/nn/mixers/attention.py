@@ -54,7 +54,6 @@ from dew.nn.kernels.selection import select, selected
 from dew.nn.kernels.templates import attention as template
 from dew.nn.kv_cache import (
     PAGED,
-    PLACES,
     TABLE,
     Append,
     KVCache,
@@ -1045,9 +1044,6 @@ class CausalSelfAttention(nn.Module):
                         self, key, self.ctx.max_seq_len, value_dim=self.value_dim,
                         valid=None if attention_metadata is None else attention_metadata.valid,
                         layout=self.ctx.kv_cache, places=self._reads_places, groups=self._group_fields())
-            elif self.ctx.kv_cache != KVCache():
-                self.ctx.refuse("attention", {"kv_cache": True}, "a bidirectional canvas reads its "
-                                "encoder prefix as dense, full-precision keys")
             elif self.ctx.kv_shared:
                 raise ValueError(
                     "a bidirectional canvas over a cache shares no keys across "
@@ -1122,12 +1118,21 @@ class CausalSelfAttention(nn.Module):
         window = (None if decode or not (causal or self.ctx.bidirectional_window)
                   else self.ctx.sliding_window)
         cursor = starts = None  # the decode mask the kernels stand in for, when this call builds it
+        prefix_valid = None
         if prefix is not None:
             # Every canvas query reads the same retained encoder keys and all
             # canvas keys (modeling_diffusion_gemma.py:1399-1401). A local
-            # layer retains the last window-1 prefix keys.
-            cached_key = self.get_variable("cache", "cached_key")
-            cached_value = self.get_variable("cache", "cached_value")
+            # layer retains the last window-1 prefix keys. The encoder's keys are
+            # read from its cache in whatever layout keeps them (`KVStore.read`:
+            # paged, quantized, its keys in the layout's rotation, where the
+            # canvas's queries and keys are taken too, as a sharing layer's).
+            store = KVStore.open(self, self.ctx.kv_cache, B, self.ctx.max_seq_len, key.shape[-2],
+                                 key.shape[-1], key.dtype, value_dim=self.value_dim,
+                                 places=self._reads_places)
+            cached_key, cached_value = store.read()
+            rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
+            if rotation is not None:
+                query, key = rotated(query, rotation), rotated(key, rotation)
             alloc = cached_key.shape[-3]
             prefix_slots = jnp.arange(alloc)[None, :]
             valid_prefix = cached_validity(self, alloc)
@@ -1135,14 +1140,12 @@ class CausalSelfAttention(nn.Module):
                 valid_prefix = valid_prefix & (prefix_slots > prefix[:, None] - self.ctx.sliding_window)
             canvas_valid = (jnp.ones((B, S), bool) if attention_metadata is None
                             or attention_metadata.valid is None else attention_metadata.valid)
-            keep = jnp.concatenate([valid_prefix, canvas_valid], axis=-1)
-            mask = jnp.broadcast_to(keep[:, None, None, :], (B, 1, S, alloc + S))
-            key = jnp.concatenate([cached_key, key], axis=-3)
-            value = jnp.concatenate([cached_value, value], axis=-3)
+            # The real keys the kernel reads beside the call (its key validity), no dense mask.
+            prefix_valid = jnp.concatenate([valid_prefix, canvas_valid], axis=-1)
+            key = jnp.concatenate([cached_key.astype(key.dtype), key], axis=-3)
+            value = jnp.concatenate([cached_value.astype(value.dtype), value], axis=-3)
             causal, window = False, None
-            # The encoder's dense cache keeps a place a slot, `[rows, alloc, 1]`.
-            key_places = (jnp.concatenate([self.get_variable("cache", PLACES)[..., 0],
-                                           jnp.broadcast_to(places, (B, S))], axis=-1)
+            key_places = (jnp.concatenate([store.read_places(), jnp.broadcast_to(places, (B, S))], axis=-1)
                           if self._reads_places else jnp.arange(alloc + S))
         elif self.ctx.kv_shared and decode:
             # The provider's stashed keys carry the full history, read as its own cache is.
@@ -1182,7 +1185,7 @@ class CausalSelfAttention(nn.Module):
         cached = isinstance(documents, CrossDocuments)
         if (cached or groups != _Groups()) and self.ctx.attention_impl != 'auto':
             implementation = masked()  # a named kernel's handoff (`_mask_kernel`)
-        valid = None
+        valid = prefix_valid
         if prefix is None and self._restricts_visibility(attention_metadata, decode, causal) and not cached:
             # A decode step's mask and a cache call's documents hold the rows' validity; an uncached
             # call's real keys reach the kernel beside the rest, its window counting real tokens.
