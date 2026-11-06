@@ -111,12 +111,13 @@ def test_a_windows_verdict_pairs_each_arms_round_with_the_references_and_leaves_
     and greatest round, rank 1): here a fast warm-up round of the arm, which judged would hold 1, decides
     nothing, and the arm's rounds lie apart from 1 and from the A/A's."""
     timing = load("timing")
-    # Values a binary float holds exactly, so every ratio is its literal: the reference 8 ms each round, the A/A
-    # about it, the arm about 10, its warm-up round (index 0) at 4.
+    # Values a binary float holds exactly, so every ratio is its literal: the reference 8 ms each round, the
+    # A/A about it, the arm about 10, its warm-up round (index 0) at 4.
     measured = {"ref": [8.0] * 7, "ref~aa": [8.0, 8.0, 7.5, 8.5, 8.0, 9.0, 7.0],
                 "arm": [4.0, 10.0, 10.5, 9.5, 11.0, 12.0, 10.0]}
     rows = [{"case": "c", "cell": {"n": 1}, "arm": arm, "round": index - 1, "warmup": index == 0,
-             "repeat": repeat, "order": index, "wall_ms": value, "device_ms": None, "digest": "d", "gpu": "cpu"}
+             "repeat": repeat, "order": index, "wall_ms": value, "device_ms": None, "digest": "d",
+             "gpu": "cpu"}
             for arm, values in measured.items() for index, value in enumerate(values) for repeat in (0, 1)]
     (tmp_path / "timing.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
     manifest = {"clock": "wall", "cases": [{"name": "c", "cells": [{"n": 1}], "reference": "ref",
