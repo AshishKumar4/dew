@@ -101,6 +101,8 @@ from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     ORDERS,
+    as_given,
+    assert_as_exact,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
@@ -573,7 +575,6 @@ def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it
     are on par with transformers' from its float64 run's (check 1)."""
     import jax.numpy as jnp
     import torch
-    from reference_error import as_given, assert_as_exact
     from transformers import AutoModelForCausalLM
 
     from dew.interop import PretrainedDecoder

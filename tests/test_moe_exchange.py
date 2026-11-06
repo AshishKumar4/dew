@@ -201,8 +201,9 @@ def expert_loop(x, weights, indices, kept, parameters):
     return jnp.einsum("bskm,bsk->bsm", slots, weights * kept)
 
 
-CAPACITY_SEEDS = 8
-"""The dropping layer's declared check-1 seeds against the dropless one, sized by `seeds_for` paired."""
+CAPACITY_SEEDS = 16
+"""The dropping layer's declared check-1 seeds against the dropless one, sized by `seeds_for` paired on
+armada: 8 for every case and mesh but the tight case's global dispatch on one of them, 16."""
 
 
 @pytest.mark.mesh(devices=4)
@@ -273,7 +274,8 @@ def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
     for name in names:
         assert_computes_the_oracle(first[name], wanted[name], f"{case} {name}",
                                    roundings=8 + 12 + shape["top_k"] + shape["batch"] * shape["length"])
-    assert_as_exact(as_given(dropping), as_given(reference), draw, f"{case} {dispatch} capacity drops",
+    assert_as_exact(as_given(dropping), as_given(reference), draw,
+                    f"{case} {dispatch} capacity drops over {spec}",
                     seeds=CAPACITY_SEEDS, truth_fn=as_given(truth))
 
 
