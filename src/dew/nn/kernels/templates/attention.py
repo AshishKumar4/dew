@@ -36,8 +36,9 @@ import jax
 import jax.numpy as jnp
 
 from dew._hashing import fmix32
+from dew.nn.derivatives import Protected, declared_derivative
 from dew.nn.kernels import tuning
-from dew.nn.precision import at_least_fp32, float32_einsum
+from dew.nn.precision import at_least_fp32, compensated_sum, float32_einsum
 
 
 @jax.tree_util.register_dataclass
@@ -603,10 +604,24 @@ class Initial:
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     """The `Initial` of one value-free logit a query head, `values` `[H]`, in fp32 or their own wider
-    dtype (`at_least_fp32`)."""
+    dtype (`at_least_fp32`), each head's gradient its rows' terms summed once rounded (`_spread_sinks`)."""
     wide = at_least_fp32(values.dtype)
-    m = jnp.broadcast_to(values.astype(wide)[None, :, None], (batch, values.shape[0], queries))
+    m = _spread_sinks(values.astype(wide), (batch, values.shape[0], queries))
     return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
+
+
+def _spread(values: jax.Array, shape: tuple[int, int, int]) -> jax.Array:
+    """A head's sink, `values` `[H]`, read by every batch row and query of `shape` `[B, H, Q]` (`sinks`): a
+    protected span (`_spread_sinks`) whose cotangent sums over the rows and queries in one compensated
+    reduction, rounded once (`compensated_sum`). A sink's gradient sums a term per row, which XLA's float32
+    reduction left 1.4 times as far from float64 as the sum rounded once; beside a reference that YNNPACK's
+    fusions sum (row 4524)."""
+    return jnp.broadcast_to(values[None, :, None], shape)
+
+
+_spread_sinks = declared_derivative(
+    Protected(), _spread, lambda values, shape: (_spread(values, shape), None),
+    lambda shape, _, cotangent: (compensated_sum(cotangent, (0, 2)),), nondiff_argnums=(1,))
 
 
 @dataclasses.dataclass(frozen=True)
