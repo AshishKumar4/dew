@@ -27,6 +27,7 @@ from steady_state import guarded, steady_state
 from tool_policy import ToolPolicy
 
 from dew.inference import RunProcessor, TextGeneration
+from dew.inference.banks import HeldBanks
 from dew.inference.loading import place
 from dew.inference.serving import Server
 from dew.interop.decoder_parts import decoder_axes
@@ -1003,6 +1004,27 @@ def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits):
         assert_same_generation(generation, lone)
 
 
+def test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaimed():
+    """`test_a_host_tier_keeps_prefix_pages_the_pool_reclaims`'s host case over a banked store, whose paged
+    pool holds its run's layers first (`dew.nn.kv_cache.row_axis`): the reclaimed pages go to host memory
+    a page at a time, every layer of each, and come back into fresh pages where the prompt reads its 8
+    tokens, every request drawing what its lone call draws."""
+    bound = banked_task(Sampling(temperature=1.0))
+    shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
+    requests = [shared, *others, shared]
+    alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
+    server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
+                              kv_cache=KVCache(page_size=4, pages=8), host_pages=8)
+    drawn = []
+    for index, held in enumerate(requests):
+        ticket = server.submit(held, budget, key=index)
+        server.run()
+        drawn.append(ticket.result())
+    assert "layers_0_3" in server.cache and server.prefix_hits == 8
+    for generation, lone in zip(drawn, alone, strict=True):
+        assert_same_generation(generation, lone)
+
+
 def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alone():
     """Four samples of one prompt and another prompt behind them, submitted together to a paged server with
     a prefix cache: the first sample writes the prompt's full pages, the other three wait and read them
@@ -1477,6 +1499,37 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
                                        decode_steps=decode_steps)
     assert_sharded(served.variables["params"], server.mesh)
     assert server.groups == jax.device_count()
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+
+
+def banked_task(sampling: Sampling) -> TextGeneration:
+    """A scanned MoE decoder's task over a banked store (`dew.inference.banks.HeldBanks.place`, the run's
+    weights one array a leaf, `layers_0_3`), on one device, as the task's lone calls run: a mesh over the
+    suite's devices splits the slots."""
+    def routed(*, scanned: bool) -> CausalTransformer:
+        return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=4, num_heads=2, head_dim=8,
+                                 mlp_features=32, max_seq_len=128, dtype="float32", scan_layers=scanned,
+                                 mixture=Mixture(experts=4, top_k=2))
+
+    scanned = routed(scanned=True)
+    weights = routed(scanned=False).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    banked = HeldBanks(weights).place(scanned, mesh=MeshSpec().build([jax.devices()[0]]))
+    return TextGeneration(scanned, banked, RunProcessor(Digits()), sampling=sampling)
+
+
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+                         ids=["dense", "paged"])
+def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_task_draws(options):
+    """A scanned MoE decoder over a banked store keeps its resident cache banked as its weights are, the
+    run's layers one array under the run's name, which every step reads and writes where it lies: an
+    admitted prompt lands in its row of every layer of it, dense or paged, and each row draws what the task
+    over the same store draws alone."""
+    bound = banked_task(Sampling(temperature=0, eos_token_ids=EOS))
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(bound, **options)
+    assert "layers_0_3" in server.cache and not any(f"layers_{index}" in server.cache for index in range(4))
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
 
