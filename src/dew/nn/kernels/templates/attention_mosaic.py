@@ -304,7 +304,7 @@ class MosaicForward(_Mainloop[Tiles]):
             case Kept.SPLIT:
                 if scales is not None:
                     raise NotImplementedError("a quantized cache's keys are read by inference alone")
-                return _trained_forward(query, key, value, spans, hooks, **form), None
+                return _trained_forward(query, key, value, spans, hooks, parts=self.parts, **form), None
             case Kept.NONE | Kept.OUTPUT:
                 # The inference walk, its rows beside the output where it keeps them.
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
@@ -566,9 +566,9 @@ class MosaicForward(_Mainloop[Tiles]):
                       tuple(map(Param, ba.arguments["output_params"], self.output_kinds)),
                       ba.arguments["drop"])
         if self.parts > 1 and (ba.arguments["table"] is not None or ba.arguments["sources"] is not None
-                               or ba.arguments["residuals"] is Kept.SPLIT or hooks.drop is not None):
-            return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
-                           "operands, no dropout")
+                               or hooks.drop is not None):
+            return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk a call over dense operands, no "
+                           "dropout")
         if self.parts > 1 and family.feeds_itself:
             # Its parts a copy each into a slot's rows (`mosaic.Pieces`), which a producer's loads take and
             # a consumer's own pipeline does not (`mosaic_sm80.Mma.streams`).
