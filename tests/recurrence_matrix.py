@@ -8,12 +8,13 @@ them, with the kernel the cell names (`generation.chosen`):
 - the portable math ('xla');
 - its derived forms ('derived', the delta rule's).
 
-Its output, final memory and every operand's gradient are held to the form's port's (check 1): fla's kernels
-for the delta rule's forms ('fla'), mamba_ssm's for the rated scan ('pallas'), each on its upstream's numbers
-in the case's dtype, as a 16-bit call or the fast forms round their products as fla and mamba_ssm do; the
-recurrence a token at a time in float64 the truth. What a kernel serves is the route's own: the step traced
-under the cell's generation, its selectors deciding (`recurrence_chunk.port_kernel`, `scan_kernel`), a named
-kernel insisting on the call and refusing what it does not take (`KernelRefused`).
+Its output, final memory and every operand's gradient are held to its reference's (check 1): the form's
+port where it takes the call, fla's kernels for the delta rule's forms ('fla'), mamba_ssm's for the rated scan
+('pallas'), each on its upstream's numbers in the case's dtype, as a 16-bit call or the fast forms round their
+products as fla and mamba_ssm do; else the portable math as the GPU computes it; the recurrence a token at a
+time in float64 the truth. What a kernel serves is the route's own: the step traced under the cell's
+generation, its selectors deciding (`recurrence_chunk.port_kernel`, `scan_kernel`), a named kernel insisting
+on the call and refusing what it does not take (`KernelRefused`).
 """
 
 import dataclasses
@@ -37,7 +38,10 @@ norm), Kimi Linear's decay a key dimension with its output norm, a step write ga
 and Mamba-2's rated scan with its skip."""
 
 PORTS = {"gated_delta_rule": "fla", "ssd": "pallas"}
-"""Each op's port, its cells' reference."""
+"""Each op's port, its cells' reference where it takes the call (`_reference`)."""
+
+CHOICES = frozenset({"gated_delta_rule", "ssd"})
+"""The generation.CHOICES entries the family's cells run (row 184): the chunked op's selectors'."""
 
 
 def _op(hooks) -> str:
@@ -93,26 +97,35 @@ def _wide(results):
 
 
 @functools.cache
-def _served(case: tuple[tuple[str, str], ...]) -> bool:
-    """Whether the route takes `case`'s training step on its kernel under its generation: traced
-    (`jax.eval_shape`), the route's own selectors deciding, a named kernel refusing what it does not take
-    (`KernelRefused`)."""
+def _routed(case: tuple[tuple[str, str], ...], kernel: str) -> frozenset | None:
+    """The routes (`generation.routes`: choice and kernel) `case`'s training step on `kernel` takes under its
+    generation, traced (`jax.eval_shape`), the route's own selectors deciding; None where a named kernel
+    refuses it (`KernelRefused`)."""
     named = dict(case)
-    if named["kernel"] == "derived" and _op(FORMS[named["form"]]) == "ssd":
-        return False
-    with generation.assumed(named["generation"]):
+    with generation.assumed(named["generation"]), generation.routes() as found:
         try:
-            for kernel in (named["kernel"], _port(named)):
-                jax.eval_shape(_step(named, kernel), *_drawn(named, 0))
+            jax.eval_shape(_step(named, kernel), *_drawn(named, 0))
         except KernelRefused:
-            return False
-    return True
+            return None
+    return frozenset((route.choice, route.kernel) for route in found)
+
+
+def _reference(case: dict[str, str]) -> str:
+    """The kernel `case`'s cell is held to: its form's port where the port takes the call (`PORTS`, the
+    upstream's numbers, which a 16-bit call and the fast forms round as), else the portable math ('xla'), as
+    the cell's GPU computes it at the run's precision (a step write gate's form, which no port runs)."""
+    port = _port(case)
+    taken = _routed(tuple(case.items()), port) or frozenset()
+    return port if any(kernel == port for _, kernel in taken) else "xla"
 
 
 def supported(case: dict[str, str]) -> bool:
-    """Whether the route serves `case` (tests/kernel_matrix.py): its kernel and its form's port take the
-    case's training call (`_served`, the route's own selector)."""
-    return _served(tuple(case.items()))
+    """Whether the route serves `case` (tests/kernel_matrix.py): its kernel takes the case's training call
+    (`_routed`, the route's own selectors: not refused, nor handed to another kernel) and is not its own
+    reference (`_reference`)."""
+    taken = _routed(tuple(case.items()), case["kernel"])
+    return (taken is not None and any(kernel == case["kernel"] for _, kernel in taken)
+            and _reference(case) != case["kernel"])
 
 
 CASES = (
@@ -142,15 +155,17 @@ CASES = (
     generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
     for case in CASES], ids="-".join)
 def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
-    """The chunked op's training step of `case` on its GPU, its kernel named, on par with its form's port's
-    (check 1, the recurrence a token at a time in float64 the truth): the output, the final memory and every
-    operand's gradient."""
+    """The chunked op's training step of `case` on its GPU, its kernel named, on par with its reference's
+    (`_reference`; check 1, the recurrence a token at a time in float64 the truth): the output, the final
+    memory and every operand's gradient. Its routes are its family's (`CHOICES`)."""
     named = dict(zip(AXES["recurrence"], case, strict=True))
     hooks, starts = FORMS[named["form"]], _starts(named)
 
     def truth(operands):
         return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
 
-    assert_as_exact(jax.jit(_step(named, named["kernel"])), jax.jit(_step(named, _port(named))),
-                    functools.partial(_drawn, named), "-".join(case), seeds=FEWEST_SEEDS,
-                    truth_fn=with_gradients(truth))
+    with generation.routes() as found:
+        assert_as_exact(jax.jit(_step(named, named["kernel"])), jax.jit(_step(named, _reference(named))),
+                        functools.partial(_drawn, named), "-".join(case), seeds=FEWEST_SEEDS,
+                        truth_fn=with_gradients(truth))
+    assert {route.choice for route in found} <= CHOICES
