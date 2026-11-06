@@ -10,7 +10,7 @@ import pytest
 from test_env_runs import ppo
 from tool_support import load
 
-from dew.objectives.rl.config import EnvRunConfig, EpisodesConfig
+from dew.config.env import EnvRunConfig, EpisodesConfig
 from dew.training import LocalTracker
 
 rl_acceptance = load("rl_acceptance")

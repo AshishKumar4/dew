@@ -224,7 +224,7 @@ fitted to them, and a rule set ships only with measured receipts.
     builds gets the pass: `options.program` for evaluation and loads, `Objective.program` for the
     host-master step's forward and the evaluation, rollout and sample programs, and the serving kernel's step and
     decode programs, whose tuner lowers and compiles the same function.
-  - The resident training step, `Trainer._jitted`'s `owned_program(step, …)` (`dew.training.trainer`), which every
+  - The resident training step, `step_program`'s `owned_program(step, …)` (`dew.training._candidates`), which every
     default `dew train` runs and the planner compiles through `compiled_if_it_fits`, is such an outer program, and so does every objective's step it builds, an RL update's included.
   - The host-master phases (`dew.training.transaction`) and the RL rollouts (`dew.objectives.rl.control`,
     `dreamer`, `dew.rl.simulator`, `dew.rl.flight`, `dew.rl.hyperlux`) jit theirs the same way: the rollout over
@@ -550,7 +550,7 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   every node it prices, and the chosen DAG is extracted by egglog with every chosen node free. Over the
   algebra's and the templates' test derivations it priced no template's form below greedy's and took twice its
   time, so greedy stays the default. The test suite holds each derivation's greedy choice to the exact optimum
-  (`dew.cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
+  (`dew._cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
   exactly (`derive.Reduction.exact`).
 - A price states itself as levels compared in order (`extract.Linear`). Each level is the larger of its
   pieces, each a sum over the chosen nodes, and its nodes' largest peak (a span), plus what the nodes add
@@ -654,12 +654,12 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums=(), static
     # `dew.algebra.rewritten_program` bind `SATURATION`
 
 @dataclass(frozen=True)
-class Passes:                         # dew.cache
+class Passes:                         # dew._cache
     on: bool = True                   # the pass runs
     target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
     checked: bool = False             # each derivation's greedy extraction held to the exact optimum
 
-ALGEBRA = jax.make_user_context(default_value=Passes())   # dew.cache, in JAX's trace context
+ALGEBRA = jax.make_user_context(default_value=Passes())   # dew._cache, in JAX's trace context
 
 @contextlib.contextmanager
 def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets ALGEBRA
@@ -678,7 +678,7 @@ class Rewrite:                        # one region's
   program's own; a static argument keeps the program's Python control flow concrete (a rollout's length, a
   policy's `random`).
 - The pass sits where a function is jitted (§2): `OuterProgram._jitted` jits `rewritten(fn)`, so `lower`,
-  `trace`, `compiled` and every relowering read one program; `Trainer._jitted` jits the rewritten step, the
+  `trace`, `compiled` and every relowering read one program; `dew.training._candidates.step_program` jits the rewritten step, the
   host-master phases and the rollouts theirs. `footprint`'s `make_jaxpr` traces the same rewritten function.
 - A region is a window cluster (`program._windows`): each head a rule may lower the price at with the
   equations of the language that make its operands, `WINDOW` deep, windows that share an equation joined up to
@@ -812,9 +812,16 @@ Those are rounding and representation choices the fast class does not make. The 
 a derived form replaces a hand-written one only where it states the walk, passes check 1 and is no slower.
 
 **Drift to fix.**
-- Error-aware extraction with the compensation rules (`error_free`'s TwoSum and product splitting,
-  rewriting into compensated forms where check 1 needs them) is the next derivation build. It covers the
-  accurate forms and the guard.
+- The accurate forms (row 4228, theme AL03) are the declaration's numerics, not rewrites: the accurate
+  numerics admit only the `exact` sets, so no rule could reach them. A declaration states its exponential's
+  implementation (`Reduction.exponential`) and the rescale a carried state takes from one anchor to the next
+  (`Reduction.rescale`, the language's binary `rescale`, `terms.RESCALE`, which no rule rewrites), and may
+  hold its largest weight to 1 by a select (`exp(where(x < b, x - b, 0))`, `b` the broadcast of `x`'s own
+  maximum). A compensated walk's running sums are the mainloop's own additions over the derived forms
+  (`Derived.step`'s `stepped`, the mainloop's one step over each sum's parts, `Accumulated` and `Added`). The template's hand forms run until it
+  takes these (row 4228); the guard's shifted sums follow, its control flow the template's. Error-aware
+  extraction (§1.5) waits for a cell whose cheapest form fails check 1 where an equal one passes: row 3310's
+  was the test's schedule, not a form.
 - The chunk's decays (`scan._decays`: the compensated prefix and its exponentials) and a gram's evaluation
   by decay kind (`scan._paired`) are written, not extracted. The compensated prefix is the declaration's
   numerics, not a candidate: a plain prefix loses about 1e-6 of a deep decay, which no price weighs.
@@ -836,6 +843,8 @@ class Reduction:                     # attention, and any walk whose state is a 
     exponent: Literal[2, "e"]        # stated by each template per call (a scale folded with log2(e)), never found
     ranges: Mapping[str, float] = {} # operands' magnitude bounds by name (§6.3)
     exact: bool = False              # extracted exactly where greedy prices dearer (§6.5)
+    exponential: Callable | None = None   # (x, scale=1.0) -> exp(x scale), its exponential's implementation
+    rescale: Callable | None = None  # (carried, now) -> exp((carried - now) c), c its weights' literal or 1
 
 @dataclass(frozen=True)
 class Scan:                          # a recurrence

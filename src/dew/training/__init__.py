@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from dew._exports import lookup as _lookup
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew._devices import CPUOnlyJax
     from dew.averaging import ema_update
     from dew.checkpoints import Checkpoints, Keep
     from dew.distributed.placement import Layout, MeshSpec
@@ -22,7 +23,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.training.evaluation import Episodes, EvalSuite, Evaluation
     from dew.training.inspection import Inspection, inspected
     from dew.training.observe import Observe
-    from dew.training.profiling import ProfileWindow
+    from dew.training.profiling import ProfileWindow, RunProfile
     from dew.training.runtime import Preempted, prepare_process, run_timestamp
     from dew.training.selection import Best
     from dew.training.tracker import (
@@ -41,6 +42,7 @@ _EXPORTS = {
     "Aux": "dew.objectives.base",
     "Best": "dew.training.selection",
     "Checkpoints": "dew.checkpoints",
+    "CPUOnlyJax": "dew._devices",
     "Cooldowns": "dew.training.cooldown",
     "DiLoCo": "dew.training.diloco",
     "Inspection": "dew.training.inspection",
@@ -62,6 +64,7 @@ _EXPORTS = {
     "PassesProgress": "dew.training.transaction",
     "Preempted": "dew.training.runtime",
     "ProfileWindow": "dew.training.profiling",
+    "RunProfile": "dew.training.profiling",
     "Rollout": "dew.training.trainer",
     "Step": "dew.objectives.base",
     "TensorBoardTracker": "dew.training.tracker",
@@ -83,6 +86,7 @@ __getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 __all__ = [
     "Aux",
     "Best",
+    "CPUOnlyJax",
     "Checkpoints",
     "Cooldowns",
     "DiLoCo",
@@ -105,6 +109,7 @@ __all__ = [
     "Preempted",
     "ProfileWindow",
     "Rollout",
+    "RunProfile",
     "Step",
     "TensorBoardTracker",
     "Tracker",

@@ -26,6 +26,23 @@ VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
 under default layouts)."""
 
+
+def bitcast(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation`'s result is a bitcast of its one operand under a row-major layout: a shape
+    primitive's (`VIEWS`), a stack of one value (a new leading axis of one), or an unstack along an axis of
+    one (that axis dropped), which XLA lowers to a reshape (`lax.stack`, `lax.unstack`): a scanned head's
+    loop reads its weight gradient's carry by unstacking it and writes it back by stacking, each a view of
+    the carry's buffer, which the derivation counted twice over (Qwen3.5-4B's fused tiled head, 2 x 2.37
+    GiB, row 4089)."""
+    name = equation.primitive.name
+    if name in VIEWS:
+        return True
+    if name == "stack":
+        return len(equation.invars) == 1
+    if name == "unstack":
+        return len(equation.outvars) == 1
+    return False
+
 UNEVALUATED = frozenset({"pure_callback", "io_callback", "debug_callback", "ffi_call", "pallas_call",
                          "axis_index"})
 """Primitives XLA's evaluator computes no offset through: those JAX lowers to a custom call, and the
@@ -52,17 +69,25 @@ def deviceless(device) -> bool:
     return device.client.runtime_type == "compile_only_runtime"
 
 
-def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
+def compiled(program: jcore.Jaxpr, lowering: str,
+             made: dict[int, tuple[jcore.Jaxpr, jcore.Jaxpr]] | None = None) -> jcore.Jaxpr:
     """`program` as JAX lowers it for the platform `lowering` (`lowering_platform`) and XLA compiles it:
     each `shard_map` over manual axes of one device inline, its body's equations among the rest
     (`_shard_map_lowering_shardy`, jax/_src/shard_map.py, makes no manual computation of it), each
     `platform_dependent` conditional the branch `lowering` keeps, inline, no conditional around it
     (`_cond_lowering`, jax/_src/lax/control_flow/conditionals.py, keeps the branches whose platforms
-    hold the lowering's, and lowers a sole branch as the computation itself), and each call (`CALLS`)
+    hold the lowering's, and lowers a sole branch as the computation itself), each scan of one turn
+    inline (`once`), and each call (`CALLS`)
     as its program in its caller, a differentiated checkpoint's operands behind its barrier
     (`prevented`), a nested `jit` among them (a wide sum's, `precision.accumulated`, traced once for its
     types: called, its GEMMs were no fusion's of the slices that read them, row 3193); through every program
     an equation runs but a native Pallas kernel's, which XLA never sees (`opaque`)."""
+    # Each program once a call, by its object (`made`): one body traced once is held by every equation that
+    # runs it (a layer's checkpoint, a scan's), each inlining it afresh (`inlined`); compiled for each,
+    # a Qwen3.5-4B step's gradient compiled 90,259 programs (row 4261).
+    made = {} if made is None else made
+    if (held := made.get(id(program))) is not None and held[0] is program:
+        return held[1]
     renamed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
     equations: list[jcore.JaxprEqn] = []
 
@@ -83,20 +108,61 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
         elif name == "cond" and params.get("branches_platforms") is not None:
             branch = params["branches"][platform_branch(params["branches_platforms"], lowering)]
             body, consts, reading = branch.jaxpr, branch.consts, operands[1:]
+        elif name == "scan" and params["length"] == 1 and not params["jaxpr"].jaxpr.effects:
+            inner, returned = once(equation, operands, lowering, made)
+            equations.extend(inner)
+            renamed.update(zip(equation.outvars, returned, strict=True))
+            continue
         elif (program_called := called(equation)) is not None:
             body, consts = program_called, tuple(program_called.consts)
             if params.get("differentiated"):
                 barrier, reading = prevented(operands, params.get("prevent_cse", False))
                 equations.extend(barrier)
         if body is not None:
-            inner, returned = inlined(compiled(body, lowering), reading, consts)
+            inner, returned = inlined(compiled(body, lowering, made), reading, consts)
             equations.extend(inner)
             renamed.update(zip(equation.outvars, returned, strict=True))
             continue
         if not opaque(equation):
-            params = {key: within(value, lowering) for key, value in params.items()}
+            params = {key: within(value, lowering, made) for key, value in params.items()}
         equations.append(equation.replace(invars=operands, params=params))
-    return program.replace(eqns=equations, outvars=[read(value) for value in program.outvars])
+    lowered = program.replace(eqns=equations, outvars=[read(value) for value in program.outvars])
+    made[id(program)] = (program, lowered)
+    return lowered
+
+
+def once(equation: jcore.JaxprEqn, operands: Sequence[jcore.Var | jcore.Literal], lowering: str,
+         made: dict[int, tuple[jcore.Jaxpr, jcore.Jaxpr]]
+         ) -> tuple[list[jcore.JaxprEqn], list[jcore.Var | jcore.Literal]]:
+    """The equations of `equation`, a scan of one turn whose body has no effect, run inline over
+    `operands`, and its results: XLA removes a loop of one trip, its body a call it inlines where none of
+    its computations has a side effect (`TryRemoveWhileLoop`, xla/service/while_loop_simplifier.cc), so
+    what the loop read from memory its body's own equations fuse. Each stacked operand is read as its one
+    slice and each stacked result is that slice's stack, each a bitcast (`VIEWS`). Qwen3.5-4B's fused
+    tiled head at four microbatches, its rows one tile, was derived holding its zero carry and its cast
+    weights beside the loop: 14.4 GiB of temporaries against XLA's 8.1 (row 4089)."""
+    params = equation.params
+    _, _, stacked = params["ft_in"].update(range(len(operands))).unpack()
+    unstacked, sliced = reshaped([operands[at] for at in stacked], lambda value: jax.lax.squeeze(value, (0,)))
+    reading = list(operands)
+    for at, value in zip(stacked, sliced, strict=True):
+        reading[at] = value
+    body = params["jaxpr"]
+    inner, returned = inlined(compiled(body.jaxpr, lowering, made), reading, body.consts)
+    _, turned = params["ft_out"].update(range(len(returned))).unpack()
+    restacked, stacks = reshaped([returned[at] for at in turned],
+                                 lambda value: jax.lax.reshape(value, (1, *value.shape)))
+    for at, value in zip(turned, stacks, strict=True):
+        returned[at] = value
+    return [*unstacked, *inner, *restacked], returned
+
+
+def reshaped(values: Sequence[jcore.Var | jcore.Literal], reshape: Callable
+             ) -> tuple[list[jcore.JaxprEqn], list[jcore.Var | jcore.Literal]]:
+    """The equations that `reshape` each of `values`, and their results."""
+    traced = jax.make_jaxpr(lambda *each: [reshape(value) for value in each])(
+        *(value.aval for value in values))
+    return inlined(traced.jaxpr, values, traced.consts)
 
 
 def prevented(operands: Sequence[jcore.Var | jcore.Literal], prevent_cse: bool | Sequence[bool]
@@ -115,15 +181,15 @@ def prevented(operands: Sequence[jcore.Var | jcore.Literal], prevent_cse: bool |
     return barrier, [next(returned) if kept else value for value, kept in zip(operands, chosen, strict=True)]
 
 
-def within(value, lowering: str):
+def within(value, lowering: str, made: dict[int, tuple[jcore.Jaxpr, jcore.Jaxpr]] | None = None):
     """`value`, an equation's parameter, with each program in it as `compiled` makes it: a plain
     sequence of programs (a conditional's branches) item by item; a named tuple (a gather's dimension
     numbers, a key's implementation) holds none and stays as it is. A program carries its own constants
     (on JAX 0.12 a closed program is a `Jaxpr`), which `compiled` keeps."""
     if isinstance(value, jcore.Jaxpr):
-        return compiled(value, lowering)
+        return compiled(value, lowering, made)
     if type(value) in (tuple, list):
-        return type(value)(within(each, lowering) for each in value)
+        return type(value)(within(each, lowering, made) for each in value)
     return value
 
 
@@ -220,7 +286,7 @@ class Slicing:
                     sliced.update(equation.outvars)
                 elif equation.outvars[0] in program.outvars and computed(equation.invars[1]):
                     updated.update(_bitcast_sources(equation.invars[1], producers, readers))
-            elif name in VIEWS and reads and reads[0] in sliced:
+            elif bitcast(equation) and reads and reads[0] in sliced:
                 sliced.update(equation.outvars)
             elif (reads and all(read in counted for read in reads) and name not in ("scan", "while", "cond")
                   and evaluable(equation)):
@@ -325,7 +391,7 @@ def _bitcast_sources(value: jcore.Var, producers: Mapping, readers: Mapping) -> 
     if len(readers.get(value, ())) != 1:
         return set()
     found = {value}
-    while (equation := producers.get(value)) is not None and equation.primitive.name in VIEWS \
+    while (equation := producers.get(value)) is not None and bitcast(equation) \
             and computed(equation.invars[0]) and len(readers.get(equation.invars[0], ())) == 1:
         value = equation.invars[0]
         found.add(value)
@@ -378,7 +444,14 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
     # The evaluator computes on the host, outside any mesh a plan for compile-only devices sets.
     with jax.set_mesh(None), jax.ensure_compile_time_eval():
         for equation in reversed(reading):
-            out = equation.primitive.bind(*map(read, equation.invars), **equation.params)
+            operands = list(map(read, equation.invars))
+            if equation.primitive.name == "dot_general" and len(operands) == 3:
+                # A product with its bias, as the derivation reads a sum XLA's GEMM computes
+                # (`footprint.biased`): the product of the first two, plus the third.
+                *operands, bias = operands
+                out = equation.primitive.bind(*operands, **equation.params) + bias
+            else:
+                out = equation.primitive.bind(*operands, **equation.params)
             values.update(zip(equation.outvars, out if equation.primitive.multiple_results else [out],
                               strict=True))
     return [int(read(offset)) for offset in offsets]

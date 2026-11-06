@@ -873,17 +873,22 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
     def raw(generation):
         return generation.raw_log_probs[0, :generation.lengths[0]]
 
+    # Each side's forward compiled once over the seeds, where run op by op it took most of the case's
+    # four minutes on armada (ledger 4373).
+    packed_logits = jax.jit(lambda prompt: served.model.apply(served.variables, prompt))
+    canonical_logits = jax.jit(lambda prompt: reference.model.apply(reference.variables, prompt))
+
     @as_given
     def packed_side(seed):
         _, actual, from_server = drawn(int(seed))
-        return {"logits": np.asarray(served.model.apply(served.variables, prompt_of(seed))),
-                "task": raw(actual), "server": raw(from_server)}
+        return {"logits": np.asarray(packed_logits(prompt_of(seed))), "task": raw(actual),
+                "server": raw(from_server)}
 
     @as_given
     def canonical_side(seed):
         expected, _, _ = drawn(int(seed))
-        return {"logits": np.asarray(reference.model.apply(reference.variables, prompt_of(seed))),
-                "task": raw(expected), "server": raw(expected)}
+        return {"logits": np.asarray(canonical_logits(prompt_of(seed))), "task": raw(expected),
+                "server": raw(expected)}
 
     def exact(params):
         """The served weights as the float64 values they hold: each quantized kernel's integers times
@@ -893,20 +898,25 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
         return jax.tree.map(value, params, is_leaf=lambda node: isinstance(node, Annotated))
 
     wide = canonical.model.clone(dtype=jnp.float64)
-
-    def truth(seed):
-        """The quantized model's float64 logits over the seed's prompt and its raw log-likelihood of
-        the canonical draw's tokens, teacher-forced."""
-        expected, _, _ = drawn(int(seed))
+    with jax.enable_x64(new_val=True):
         weights = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64)
                                if np.issubdtype(np.asarray(leaf).dtype, np.floating) else leaf,
                                {**reference.variables, "params": exact(reference.variables["params"])})
+        wide_logits = jax.jit(lambda tokens: wide.apply(weights, tokens))
+
+    @as_given
+    def truth(seed):
+        """The quantized model's float64 logits over the seed's prompt and its raw log-likelihood of
+        the canonical draw's tokens, teacher-forced: a host function of the seed, as the arms are."""
+        expected, _, _ = drawn(int(seed))
         prompt = prompt_of(seed)
         tokens = expected.tokens[0, expected.prompt_width:expected.prompt_width + expected.lengths[0]]
-        log_probs = jax.nn.log_softmax(wide.apply(weights, np.concatenate([prompt[0], tokens])[None])[0], -1)
+        with jax.enable_x64(new_val=True):
+            log_probs = jax.nn.log_softmax(wide_logits(np.concatenate([prompt[0], tokens])[None])[0], -1)
+            logits = np.asarray(wide_logits(prompt))
         width = prompt.shape[1]
         picked = np.asarray(log_probs[np.arange(width - 1, width - 1 + len(tokens)), tokens])
-        return {"logits": np.asarray(wide.apply(weights, prompt)), "task": picked, "server": picked}
+        return {"logits": logits, "task": picked, "server": picked}
 
     assert_as_exact(packed_side, canonical_side, lambda seed: (np.int32(seed),), "packed quantized pipeline",
                     seeds=PACKED_SEEDS, truth_fn=truth)
@@ -1209,8 +1219,8 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     assert_as_exact(as_given(lambda *inputs: {"loss": piped(*inputs)[0]}),
                     as_given(lambda *inputs: {"loss": loop(*inputs)[0]}),
                     draw, "quantized pipeline loss", seeds=PIPELINE_SEEDS,
-                    truth_fn=lambda variables, rows, cotangent: {"loss": np.asarray(unquantized(
-                        variables["params"], variables, {"text": rows}, cotangent)[0])})
+                    truth_fn=as_given(lambda variables, rows, cotangent: {"loss": np.asarray(unquantized(
+                        variables["params"], variables, {"text": rows}, cotangent)[0])}))
 
 
 def test_stochastic_rounding_draws_from_its_own_stream():

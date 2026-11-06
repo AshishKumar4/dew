@@ -174,9 +174,11 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
     costs more to run than its records cost to read back (`Costly`: a learned tokenizer's encoding)
     and the chain writes no cache: each corpus of a mixture or phases its own, in a root this process
     may write. The maps are the ones
-    a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`), and in an indexed read
-    none that rejects, whose cache a read by index reads back as a stream, slower than it reruns
-    them. It stands for them only in a memory or indexed read, by each input's place in a store
+    a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`), one that rejects among
+    them too: a read by index reads its cache back as each input's outputs, faster than it reruns them
+    (row 803: 1,500 1024x768 JPEGs decoded and resized in 2.4 s on 16 threads, read back in 0.6 s).
+    A stream reads it as the steps it stands for are read (`dew.data.lowering._transparent`, row 4217).
+    It stands for them only by each input's place in a store
     whose content is named, in a clean checkout whose steps are exact (`Manifest`), and nowhere
     else, so a chain no cache could serve reads as it is written, never refused. It holds the
     records the maps make, and fills, publishes, replays and evicts as `cache(url)` does (`Cache`),
@@ -186,7 +188,11 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
     run's to name or refuse (`automatic_root`)."""
     from dew.data.cache import Cache
 
-    if root is None or read == "streamed":
+    if root is None:
+        return pipeline
+    if read == "streamed" and any(isinstance(stage, MapWithIndex) for stage in pipeline.stages):
+        # A stream positions its records once, under the steps that read their places, which a cache
+        # standing for some of them would split.
         return pipeline
     if isinstance(pipeline.source, (Mixture, Phases)):
         return with_children(pipeline, lambda child: _automatic(child, read, root))
@@ -195,7 +201,7 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
 
     def kept(stage: Stage) -> bool:
         return (isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
-                and not _external(stage) and not (read == "indexed" and stage.rejects))
+                and not _external(stage))
 
     at = next((index for index, stage in enumerate(pipeline.stages) if not kept(stage)), len(pipeline.stages))
     prefix = pipeline.stages[:at]
@@ -207,7 +213,8 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
     key = _cache_key(pipeline.source, prefix, read)
     if key is None or not (key.clean and key.exact):
         return pipeline
-    cached = Artifact(Cache(root, optional=True), automatic=True)
+    # A stream's corpus may be larger than the root: its fill takes only the room the root has free.
+    cached = Artifact(Cache(root, optional=True, evicts=read != "streamed"), automatic=True)
     return dataclasses.replace(pipeline, stages=(*prefix, cached, *pipeline.stages[at:]))
 
 
@@ -244,6 +251,10 @@ class _Facts(View[Source]):
     read: Read
     stated_snapshot: Mapping[str, object]
     stated_metadata: Mapping[str, object]
+    stated_description: str
+    """The source's description as the compile took it, which every reader the compile makes names its
+    corpus by: a store in memory describes itself by a hash of every record it holds, which a reader
+    opened outside the compile would take again (row 803)."""
     held: _PinnedRead | None = None
     """The memory read pinning took, which the compile's memory reads of the source reuse, so its
     facts and the rows a run materializes are one read's."""
@@ -253,6 +264,9 @@ class _Facts(View[Source]):
 
     def label(self) -> str:
         return self.stated_label
+
+    def describe(self) -> str:
+        return self.stated_description
 
     def fingerprint(self) -> Mapping[str, object]:
         return self.stated_snapshot
@@ -318,7 +332,7 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         source = _consumed(source, read)
         records, metadata = _stated(source, read, measuring, whole)
         held = None if records is None else _PinnedRead(records)
-        return _Facts(source, read, source.fingerprint(), metadata, held, label)
+        return _Facts(source, read, source.fingerprint(), metadata, source.describe(), held, label)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         # Each read in this compilation, which fingerprints each source once (`compiling`).
@@ -745,7 +759,7 @@ def compile(
     read has no record count, bounds it to that many passes over the source examples it states a pass
     holds once it is prepared (`_staged`, `Loader.pass_examples`). `plan_version` is the data plan version
     it reads by (`dew.data.plan.PLAN_VERSIONS`): this Dew's, or the one a resumed run saved under, which
-    reads its order as it did (`dew.config.RunConfig`'s `trainer.data_plan`)."""
+    reads its order as it did (`dew.config.RunConfig.data_plan_version`)."""
     if plan_version not in PLAN_VERSIONS:
         raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
                          f"{plan_version}: resume a run saved under another with the Dew that wrote it")
@@ -807,7 +821,7 @@ def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective
         training=True,
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
-        automatic=automatic_root(loading) if read != "streamed" else None,
+        automatic=automatic_root(loading),
         examples=examples if written is None else None,
         epochs=epochs,
     )
@@ -1373,6 +1387,7 @@ def _training_reader(
             build.loading,
             resume=resume,
             endless=build.lowering.endless,
+            published=statistics.mirrored(),
         )
     else:
         if build.elastic:

@@ -96,6 +96,10 @@ RELEASES = {
     # The family's own pin (dew.interop.release_pins), as LFM3's.
     "mimo-v2-tiny": (*_PINNED["MIMO_V2"][:2], ("configuration_mimo_v2.py", "modeling_mimo_v2.py"),
                      "AutoModelForCausalLM"),
+    # The same release whole: its ViT and its audio encoder beside the decoder, the audio tokenizer in its
+    # folder (`audio_tokenizer`, `load_audio_tokenizer`).
+    "mimo-v2-vl-tiny": (*_PINNED["MIMO_V2"][:2], ("configuration_mimo_v2.py", "modeling_mimo_v2.py"),
+                        "AutoModelForCausalLM"),
     # The family's own pin (dew.interop.release_pins). modeling_lfm3.py imports its
     # Triton conv from lfm3_conv.py, which its CPU run passes by.
     "lfm3-tiny": (*_PINNED["LFM3"][:2],
@@ -110,8 +114,19 @@ RELEASES = {
                                                "video_processing_lfm3_vl.py"),
                      "AutoModelForImageTextToText"),
 }
+PROCESSORS = {
+    # Kimi K2.5's processor (KimiK25Processor and its vision processor), its release's own code, whose
+    # public call takes `medias` and returns `grid_thws` (`dew.interop.processors.Processor.media`), its
+    # config, and the chat template that writes an image part's placeholder.
+    "kimi-k25-tiny": ("moonshotai/Kimi-K2.5", "4d01dfe0332d63057c186e0b262165819efb6611",
+                      ("kimi_k25_processor.py", "kimi_k25_vision_processing.py", "media_utils.py",
+                       "preprocessor_config.json", "chat_template.jinja")),
+}
+"""Each fixture whose release a check runs only the processor of: the Hub repo, the commit its files are
+read at, and the files, its code beside the config and template that code reads (`vendor`)."""
 LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "lfm3-vl-tiny": "lfm1.0",
-            "mimo-v2-tiny": "mit",
+            "kimi-k25-tiny": "modified-mit",
+            "mimo-v2-tiny": "mit", "mimo-v2-vl-tiny": "mit",
             "dream-tiny": "apache-2.0", "llada-tiny": "mit"}
 """The license of each release a recording (`--record`) runs, as its Hub card states it."""
 """Each fixture's release: the Hub repo, the commit its code is read at, the
@@ -131,17 +146,18 @@ def release_file(name: str, file: str) -> Path:
     vendored = FIXTURES / name / "release" / file
     if vendored.with_name(vendored.name + PINNED).is_file():
         return local(vendored)
-    repo, revision = RELEASES[name][:2]
+    repo, revision = (RELEASES[name] if name in RELEASES else PROCESSORS[name])[:2]
     return Path(hf_hub_download(repo, file, revision=revision))
 
 
 def vendor(name: str) -> None:
-    """`name`'s release files, its code and its `config.json`, pinned into the fetched store from the Hub
-    at the release's commit, with its license (`fetched_fixtures.pin_release`), so a check that opens the
-    release reads them offline (`release_file`)."""
+    """`name`'s release files, its code (a model's, `RELEASES`, or a processor's, `PROCESSORS`) and its
+    `config.json`, pinned into the fetched store from the Hub at the release's commit, with its license
+    (`fetched_fixtures.pin_release`), so a check that opens the release reads them offline
+    (`release_file`)."""
     from fetched_fixtures import pin_release
 
-    repo, revision, files, _ = RELEASES[name]
+    repo, revision, files = RELEASES[name][:3] if name in RELEASES else PROCESSORS[name]
     for file in (*files, "config.json"):
         data = Path(hf_hub_download(repo, file, revision=revision)).read_bytes()
         print(pin_release(FIXTURES / name / "release" / file, data, reference=f"{repo}@{revision}/{file}",
@@ -168,37 +184,141 @@ def released_classes(name: str, workspace: Path):
     return configured, model
 
 
+OMITTED = {"mimo-v2-vl-tiny": (
+    "visual.merger.ln_q.bias", "visual.merger.mlp.0.bias", "visual.merger.mlp.2.bias",
+    "audio_encoder.input_local_transformer.embed_tokens.weight")}
+"""Each fixture's tensors its release's checkpoint does not store, which its loader initializes as a missing
+key: MiMo-V2.6's merger's biases, zeros (transformers' `_init_weights`), and its audio encoder's unused
+token table (`_keys_to_ignore_on_load_missing`)."""
+
+PREDICTING = ("mimo-v2-vl-tiny",)
+"""The fixtures that carry MiMo-V2's prediction layer (`prediction_layer`), under `model.mtp.layers.0.`, which
+the release's own class skips on load."""
+
+AUDIO_TOKENIZER = "audio_tokenizer"
+"""The folder a release keeps its audio tokenizer in, its own config and weights, which its model loads
+(MiMo-V2.6's `load_audio_tokenizer`)."""
+
+
 def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Module:
     """The release's own model class over the fixture's config and weights,
-    or, with `draw`, weights it draws and writes as the fixture's."""
+    or, with `draw`, weights it draws and writes as the fixture's; with the audio tokenizer in its folder
+    (`AUDIO_TOKENIZER`) loaded as the release loads it, in the model's dtype."""
     configured, built = released_classes(name, scratch)
     model = built(configured(json.loads((FIXTURES / name / "config.json").read_text())))
+    tokenizer = FIXTURES / name / AUDIO_TOKENIZER
+    omitted = OMITTED.get(name, ())
+    predicting = name in PREDICTING
     if draw:
         torch.manual_seed(0)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.1)
-        save_file(_stored_once(model.state_dict()), str(FIXTURES / name / "model.safetensors"))
+        stored = {key: value for key, value in _stored_once(model.state_dict()).items() if key not in omitted}
+        if predicting:
+            layer = prediction_layer(model)
+            with torch.no_grad():
+                for parameter in layer.parameters():
+                    parameter.copy_(torch.randn_like(parameter) * 0.1)
+            stored.update({PREDICTION_STEM + released_name(key): value.contiguous()
+                           for key, value in layer.state_dict().items()})
+        save_file(stored, str(FIXTURES / name / "model.safetensors"))
         config = json.loads((FIXTURES / name / "config.json").read_text())
         ids = torch.randint(0, vocabulary(config), (2, 16)).numpy().astype(np.int32)
         np.save(FIXTURES / name / "input_ids.npy", ids)
         if "vision_config" in config:
             media_tokenizer(config, FIXTURES / name)
+        if (tokenizer / "config.json").is_file():
+            draw_audio_tokenizer(model, tokenizer)
     state = model.state_dict()
-    missing, unexpected = model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")),
-                                                strict=False)
+    held = load_file(str(FIXTURES / name / "model.safetensors"))
+    predicted = {key: held.pop(key) for key in list(held) if key.startswith(PREDICTION_STEM)}
+    missing, unexpected = model.load_state_dict(held, strict=False)
+    with torch.no_grad():
+        for key in omitted:
+            # As the release's loader initializes a missing bias; an unused table stays as it is.
+            if key.endswith(".bias"):
+                state[key].zero_()
     # A tied head is its embedding's tensor, which the file stores once (`_stored_once`).
     shared = set(state) - set(_stored_once(state))
-    if unexpected or set(missing) != shared:
+    if unexpected or set(missing) != shared | set(omitted):
         raise ValueError(f"{name}: the file's tensors differ from the model's: missing {missing}, "
                          f"unexpected {unexpected}")
+    if predicting:
+        # The prediction layer's tensors into the layer composed beside the model, whose own load skips them.
+        model.prediction_layer = prediction_layer(model)
+        model.prediction_layer.load_state_dict({key: predicted[PREDICTION_STEM + released_name(key)]
+                                                for key in model.prediction_layer.state_dict()})
+    if (tokenizer / "model.safetensors").is_file():
+        model.load_audio_tokenizer(str(tokenizer), device="cpu", dtype=next(model.parameters()).dtype)
     return model.eval()
 
 
+PREDICTION_STEM = "model.mtp.layers.0."
+"""Where a MiMo-V2 checkpoint keeps its one prediction layer (vLLM's `model.mtp.layers.{i}.`)."""
+
+
+def released_name(key: str) -> str:
+    """A tensor of `prediction_layer` under its name past `PREDICTION_STEM`: its block's as vLLM names them,
+    the norm before the feed-forward `pre_mlp_layernorm`."""
+    return key.removeprefix("block.").replace("post_attention_layernorm", "pre_mlp_layernorm")
+
+
+def prediction_layer(model: torch.nn.Module) -> torch.nn.Module:
+    """MiMo-V2's prediction layer as vLLM composes it (vllm/model_executor/models/mimo_v2_mtp.py at 19aba3e,
+    `MiMoV2MTPLayer`), of the release's own modules: the token's embedding and the previous position's final
+    state each RMS-normed (`enorm`, `hnorm`), side by side through one bias-free map (`eh_proj`), then one
+    decoder layer of the sliding kind's attention (its heads, window, base and sinks) over a dense
+    feed-forward at `intermediate_size`, attending causally within its window as the release's sliding
+    layers do (`create_sliding_window_causal_mask`, the release's rotary of the sliding kind), and a final
+    RMS norm (`final_layernorm`); its logits are the model's own head's."""
+    import copy
+
+    modeling = sys.modules[type(model).__module__]
+    config = copy.deepcopy(model.config)
+    config.hybrid_layer_pattern = [1] * config.num_hidden_layers
+    config.moe_layer_freq = [0] * config.num_hidden_layers
+    size, eps = config.hidden_size, config.layernorm_epsilon
+
+    class PredictionLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.enorm = modeling.MiMoV2RMSNorm(size, eps=eps)
+            self.hnorm = modeling.MiMoV2RMSNorm(size, eps=eps)
+            self.eh_proj = torch.nn.Linear(2 * size, size, bias=False)
+            self.block = modeling.MiMoV2DecoderLayer(config, 0)
+            self.final_layernorm = modeling.MiMoV2RMSNorm(size, eps=eps)
+
+        def forward(self, embeds, hidden):
+            x = self.eh_proj(torch.cat([self.enorm(embeds), self.hnorm(hidden)], dim=-1))
+            places = torch.arange(x.shape[1])
+            mask = modeling.create_sliding_window_causal_mask(
+                config=config, input_embeds=x, attention_mask=None, cache_position=places,
+                past_key_values=None, position_ids=places[None])
+            x = self.block(x, attention_mask=mask, position_ids=places[None], cache_position=places,
+                           position_embeddings=model.model.swa_rotary_emb(x, places[None]))
+            return self.final_layernorm(x)
+    return PredictionLayer()
+
+
+def draw_audio_tokenizer(model: torch.nn.Module, folder: Path) -> None:
+    """The audio tokenizer of the release's own class (MiMoAudioTokenizer) over the folder's config, its
+    parameters and codebooks drawn as the model's are, written as the folder's weights."""
+    modeling = sys.modules[type(model).__module__]
+    config = json.loads((folder / "config.json").read_text())
+    tokenizer = modeling.MiMoAudioTokenizer(modeling.MiMoAudioTokenizerConfig(**config))
+    with torch.no_grad():
+        for tensor in [*tokenizer.parameters(),
+                       *(buffer for name, buffer in tokenizer.named_buffers() if name.endswith(".embed"))]:
+            tensor.copy_(torch.randn_like(tensor) * 0.1)
+    save_file(_stored_once(tokenizer.state_dict()), str(folder / "model.safetensors"))
+
+
 MEDIA_TOKENS = {"image_token_id": "<|image|>", "video_token_id": "<|video|>",
-                "vision_start_token_id": "<|vision_start|>", "vision_end_token_id": "<|vision_end|>"}
+                "vision_start_token_id": "<|vision_start|>", "vision_end_token_id": "<|vision_end|>",
+                "audio_token_id": "<|audio|>"}
 """A wrapper fixture's media tokens by the config field placing each, as its release's processor spells them
-(Lfm3VlProcessor's defaults, processing_lfm3_vl.py)."""
+(Lfm3VlProcessor's defaults, processing_lfm3_vl.py), each where its config places one."""
 
 
 def media_tokenizer(config: dict, directory: Path) -> None:
@@ -209,7 +329,7 @@ def media_tokenizer(config: dict, directory: Path) -> None:
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    named = {config[field]: token for field, token in MEDIA_TOKENS.items()}
+    named = {config[field]: token for field, token in MEDIA_TOKENS.items() if config.get(field) is not None}
     ends = {"pad_token": config["pad_token_id"], "bos_token": config["bos_token_id"],
             "eos_token": config["eos_token_id"]}
     words = {named.get(index, f"w{index}"): index for index in range(vocabulary(config))}
@@ -287,10 +407,16 @@ def opens(name: str, export: Path, scratch: Path) -> dict[str, bool]:
     return json.loads(run.stdout.strip().splitlines()[-1])
 
 
-def released_outputs(model, site: str, inputs: dict) -> dict[str, np.ndarray]:
+SPELLED = {"mimo-v2-vl-tiny": {"pixel_values_videos": "video_pixel_values"}}
+"""Each release's names for the media fields its forward spells otherwise than its processor's: MiMo-V2.6's
+video patches (`MiMoV2ForCausalLM.forward`)."""
+
+
+def released_outputs(model, site: str, inputs: dict, name: str = "") -> dict[str, np.ndarray]:
     """The release's outputs at a recorded `site` (tests/remote_code_draws.py), as Dew's forward
     gives them (tests/model_support.py's `remote_code_site`), the gradients by the release's own tensor
-    names. An update steps `model` and restores its weights after."""
+    names, the media under `name`'s own spellings (`SPELLED`). An update steps `model` and restores its
+    weights after."""
     ids = torch.from_numpy(inputs["ids"].astype(np.int64))
     if site == "update":
         weights = {name: tensor.clone() for name, tensor in model.state_dict().items()}
@@ -324,12 +450,28 @@ def released_outputs(model, site: str, inputs: dict) -> dict[str, np.ndarray]:
         if site == "biased":
             logits = model(input_ids=ids, attention_mask=torch.from_numpy(inputs["attention_mask"])).logits
             return {"row0": logits[0].numpy(), "row1": logits[1, PADDED:].numpy()}
-        if site in ("image", "video"):
+        if site in ("image", "video", "frames"):
             # The patch vectors in the model's dtype, as its processor's float32 ones are cast to it.
             dtype = next(model.parameters()).dtype
-            media = {name: torch.from_numpy(value).to(dtype if name.startswith("pixel") else torch.int64)
-                     for name, value in inputs.items() if name != "ids"}
+            spelled = SPELLED.get(name, {})
+            media = {spelled.get(field, field): torch.from_numpy(value).to(
+                dtype if field.startswith("pixel") else torch.int64)
+                for field, value in inputs.items() if field != "ids"}
             return {"logits": model(input_ids=ids, **media).logits.numpy()}
+        if site == "mtp":
+            # The prediction layer's logits: each position's final state beside the next token's embedding.
+            hidden = model.model(input_ids=ids).last_hidden_state
+            embeds = model.model.embed_tokens(ids[:, 1:])
+            return {"logits": model.lm_head(model.prediction_layer(embeds, hidden[:, :-1])).numpy()}
+        if site == "audio":
+            # Each clip's valid mel frames through the release's own pipeline (`get_audio_feature`: its
+            # tokenizer's codes, then its encoder), in the model's dtype, filling the placeholders.
+            dtype = next(model.parameters()).dtype
+            clips = zip(inputs["input_features"], inputs["input_features_mask"], strict=True)
+            mels = [torch.from_numpy(clip[valid]).to(dtype) for clip, valid in clips]
+            embeds = model.audio_encoder.get_audio_feature(mels, model.speech_embeddings,
+                                                           model.audio_tokenizer.encoder)
+            return {"logits": model(input_ids=ids, audio_embeds=embeds).logits.numpy()}
         return {"logits": model(input_ids=ids).logits.numpy()}
 
 
@@ -343,9 +485,9 @@ def serve(name: str) -> None:
 
         def run(request: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             site = str(request.pop("site"))
-            reference = released_outputs(native, site, request)
+            reference = released_outputs(native, site, request, name)
             with float64():
-                truth = released_outputs(wide, site, request)
+                truth = released_outputs(wide, site, request, name)
             return reference_worker.paired(reference, truth)
 
         reference_worker.serve(run, frames=True)

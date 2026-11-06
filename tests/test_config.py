@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import jax.numpy as jnp
@@ -81,7 +82,7 @@ def test_named_validation_splits_read_back_in_their_order(tmp_path):
 
 
 def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_reads_by_eight(tmp_path):
-    """A run leaves its data plan version to its build, which records this Dew's (`RunConfig.pinned`), so
+    """A run leaves its data plan version to its build, which records this Dew's (`RunConfig.resumed`), so
     a resume reads its order as it did whatever version a later Dew reads by; a saved run whose record
     names none was written under version 8, which it reads by (`earlier_data_plan`, row 3840); its command
     run again resumes there (tests/test_saved_runs.py, each saved run of an earlier main)."""
@@ -91,15 +92,53 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_reads_by_e
 
     config = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
                        trainer=TrainerConfig(steps=1))
-    assert config.data_plan is None and config.pinned().data_plan == PLAN_VERSIONS[-1] == 9
-    saved = config.pinned().record()
-    assert RunConfig.read(saved).data_plan == 9
+    assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 9
+    saved = config.resumed().record()
+    assert RunConfig.read(saved).data_plan_version == 9
     earlier = {**saved, "fields": {name: value for name, value in saved["fields"].items()
-                                   if name != "data_plan"}}
+                                   if name != "data_plan_version"}}
     directory = tmp_path / "planned"
     directory.mkdir()
     (directory / "run.json").write_text(json.dumps(earlier))
-    assert RunConfig.load(str(directory)).data_plan == 8
+    assert RunConfig.load(str(directory)).data_plan_version == 8
+
+
+def test_a_run_trained_on_a_compiled_loader_records_the_version_the_loader_reads_by(tmp_path):
+    """A run handed a loader already compiled (`RunConfig.train` of a `Loader`) reads the order the loader
+    was compiled in, so its record names the loader's data plan version, which rebuilding the run reads by,
+    not this Dew's (train 589's review: a loader compiled at 8 trained under a record naming 9)."""
+    import numpy as np
+    from affine_run import FEATURES
+
+    from dew.data import Memory
+    from dew.data.compile import compile
+    from dew.data.plan import PLAN_VERSIONS
+
+    rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
+    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(), plan_version=8)
+    assert loader.plan.version == 8 != PLAN_VERSIONS[-1]
+    config = TrainerConfig(name="loaded", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
+                           checkpoint_every=None)
+    RunConfig(trainer=config).train(Regression(), loader, name="loaded")
+    assert RunConfig.load(str(tmp_path / "runs" / "loaded")).data_plan_version == 8
+
+
+def test_a_run_naming_another_version_than_its_compiled_loader_is_refused(tmp_path):
+    """A run that names its data plan version and is handed a loader compiled at another would train the
+    loader's order under a record naming its own, so it is refused, naming both, before it trains (train
+    593's review)."""
+    import numpy as np
+    from affine_run import FEATURES
+
+    from dew.data import Memory
+    from dew.data.compile import compile
+
+    rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
+    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(), plan_version=9)
+    config = TrainerConfig(name="named", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
+                           checkpoint_every=None)
+    with pytest.raises(ValueError):
+        RunConfig(trainer=config, data_plan_version=8).train(Regression(), loader, name="named")
 
 
 def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
@@ -415,6 +454,119 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     assert state.scale is not None
     assert state.accumulation is not None
     assert any(path.is_file() for path in trace.rglob("*"))
+
+
+def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_records(tmp_path):
+    """A run profiles two of its steps once ten have run past its first compile, by default, through Dew's
+    own profiler, its capture kept under the run's directory and reported beside its records
+    (`ProfileTraced`); a run naming no window traces none; inside another capture (`dew.Profiler`), which
+    holds the process's one profiling session, a run's own window yields where one naming its directory
+    refuses (row 4112)."""
+    import dew
+    from dew.config import local_records
+    from dew.training import ProfileWindow
+
+    def trained(name: str, **fields) -> Path:
+        config = TrainerConfig(name=name, checkpoint_dir=str(tmp_path / "runs"), steps=14, eval_every=None,
+                               checkpoint_every=None, **fields)
+        RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
+                                        name=name)
+        return tmp_path / "runs" / name
+
+    # The run's window keeps its trace and manifest alone: it asks no XProf and converts no reports.
+    from dew.telemetry import profile as telemetry_profile
+
+    def unasked():
+        raise AssertionError("a run's own window asked for XProf")
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(telemetry_profile, "require_profile_support", unasked)
+        profiled = trained("profiled")
+    assert any(path.is_file() for path in (profiled / "profile").rglob("*"))
+    assert not any(path.name == "reports" for path in (profiled / "profile").rglob("*"))
+    written = (profiled / "tracking" / "records.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in written]
+    (traced,) = [row["value"] for row in records if row["type"] == "ProfileTraced"]
+    assert traced["steps"] == 2
+    # A run in a bucket keeps its capture with its other local records, in Dew's cache (`local_records`).
+    remote = TrainerConfig(name="remote", checkpoint_dir="gs://bucket/runs").window("gs://bucket/runs/remote",
+                                                                                   "remote")
+    assert remote is not None and remote.directory == local_records("gs://bucket/runs/remote", "remote",
+                                                                    "profile")
+    assert "://" not in remote.directory
+    plain = trained("plain", run_profile=None)
+    assert not (plain / "profile").exists()
+    with dew.Profiler(tmp_path / "outer"):
+        inside = trained("inside")
+        with pytest.raises(ValueError):
+            trained("asked", profile=ProfileWindow(str(tmp_path / "asked"), 2))
+    assert not (inside / "profile").exists()
+
+
+def test_a_window_whose_manifest_is_not_written_leaves_the_run_training(caplog):
+    """A profile window that reports nothing writes its manifest as it stops, a diagnostic of the run's:
+    where it cannot be written (`dew.telemetry.profile.ExportFailed`, which only such a window's stop
+    raises), the stop logs it and the run trains on (train 607's and 610's reviews)."""
+    import logging
+
+    from dew.telemetry.profile import ExportFailed
+    from dew.training.profiling import stop_capture
+
+    class Unwritten:
+        """A profiler whose capture stopped and whose manifest could not be written."""
+
+        def stop(self, *, wait: bool = True) -> None:
+            raise ExportFailed("writing the capture's manifest failed", [OSError("read-only directory")])
+
+    with caplog.at_level(logging.WARNING, logger="dew"):
+        stop_capture(Unwritten(), None)
+    assert any(record.name == "dew.training.profiling" and record.levelno == logging.WARNING
+               for record in caplog.records)
+
+
+@pytest.mark.parametrize(("saved", "expected"), [
+    ({"directory": None, "steps": 2, "warmup": 10}, "default"),
+    ({"directory": None, "steps": 25, "warmup": 50, "capture": {"host_tracer_level": 1}}, "customized"),
+    (None, "none"),
+])
+def test_a_run_saved_before_its_own_window_was_a_field_traces_as_it_was_configured(tmp_path, saved, expected):
+    """A run a Dew saved before a run's own window was its `run_profile` (row 4255) loads as it traced: a
+    window naming no directory, the run's own, as its `run_profile` with its steps, warmup and capture,
+    trace-only, so it resumes on a plain install asking no XProf; no window at all as none of its own."""
+    from dew.telemetry.profile import CaptureOptions
+    from dew.training.profiling import RunProfile
+
+    record = RunConfig(trainer=TrainerConfig(name="saved", checkpoint_dir=str(tmp_path))).record()
+    trainer = record["fields"]["trainer"]
+    held = trainer.get("fields", trainer)
+    held.pop("run_profile", None)
+    held["profile"] = saved
+    (tmp_path / "run.json").write_text(json.dumps(record))
+    loaded = RunConfig.load(str(tmp_path / "run.json")).trainer
+    window = loaded.window(str(tmp_path / "saved"), "saved")
+    assert loaded.profile is None
+    if expected == "none":
+        assert loaded.run_profile is None and window is None
+        return
+    own = RunProfile() if expected == "default" else RunProfile(25, 50, CaptureOptions(host_tracer_level=1))
+    assert loaded.run_profile == own
+    assert window is not None and (window.steps, window.warmup, window.capture) == (own.steps, own.warmup,
+                                                                                  own.capture)
+    assert not window.reports
+
+
+def test_a_runs_own_window_and_a_named_one_round_trip_through_its_record(tmp_path):
+    """A run's own window, customized, and a window the run names each read back from the run's record as
+    they were saved (row 4255's review)."""
+    from dew.telemetry.profile import CaptureOptions
+    from dew.training import ProfileWindow
+    from dew.training.profiling import RunProfile
+
+    for trainer in (TrainerConfig(run_profile=RunProfile(3, 4, CaptureOptions(host_tracer_level=1))),
+                    TrainerConfig(profile=ProfileWindow(str(tmp_path / "named"), 5, warmup=6)),
+                    TrainerConfig(run_profile=None)):
+        saved = RunConfig(trainer=trainer).save(str(tmp_path / "saved"))
+        assert RunConfig.load(saved).trainer == trainer
 
 
 def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):

@@ -23,11 +23,12 @@ import pytest
 from affine_run import FEATURES, Regression
 from export_support import Stalled
 from jax.extend.backend import get_backend
+from process_support import assert_exits_cleanly
 from reference_error import as_given, assert_as_exact, seeds_for
 from sharded import collectives
 from token_support import write_token_corpus
 
-from dew import cache
+from dew import _cache
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
@@ -352,14 +353,14 @@ def a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_th
             lowered.append(seconds)
 
     counts = []
-    settled = cache.KERNEL_TUNES.get_global()
+    settled = _cache.KERNEL_TUNES.get_global()
     jax.monitoring.register_event_duration_secs_listener(lowering)
     try:
         for _ in range(2):
             trained(lm(), steps=0)
             counts.append(len(lowered))
             lowered.clear()
-            changed, settled = cache.KERNEL_TUNES.get_global() != settled, cache.KERNEL_TUNES.get_global()
+            changed, settled = _cache.KERNEL_TUNES.get_global() != settled, _cache.KERNEL_TUNES.get_global()
             assert counts[-1] == 1 + changed
     finally:
         jax.monitoring.unregister_event_duration_listener(lowering)
@@ -402,6 +403,39 @@ def live_executables() -> int:
     return len(get_backend().live_executables())
 
 
+def test_a_plan_search_keeps_the_freeze_a_process_made_before_it():
+    """A plan search raises Python's youngest collection threshold while it runs (`held_objects`) and
+    leaves the permanent generation to the process: one that froze its objects before importing Dew, as one
+    that forks its workers does, has its freeze as it made it after a step planned and compiled, Dew
+    freezing and unfreezing nothing, and its thresholds as they were, in a fresh interpreter (row 3341's
+    review)."""
+    assert_exits_cleanly("""
+import gc
+
+touched = []
+freeze, unfreeze = gc.freeze, gc.unfreeze
+gc.freeze = lambda: touched.append("freeze")
+gc.unfreeze = lambda: touched.append("unfreeze")
+gc.collect()
+freeze()
+thresholds = gc.get_threshold()
+
+import sys
+sys.path.insert(0, "tests")
+from test_plan import BATCH, lm
+
+trainer = lm()
+state, _, _ = trainer.place()
+trainer.compile(state, BATCH)
+assert not touched and gc.get_threshold() == thresholds, (touched, gc.get_threshold())
+from dew.training.planning import held_objects
+with held_objects():
+    assert gc.get_threshold()[0] > thresholds[0]
+assert not touched and gc.get_threshold() == thresholds
+unfreeze()
+""")
+
+
 COST = b"\x0a\x0c\x0a\x01x\x11" + struct.pack("<d", 1.0)
 """A profile of one instruction, `x`, at a microsecond, as XLA's ProfiledInstructionsProto writes it: what
 an NVIDIA GPU's profile holds, which a CPU's compile takes and does not read."""
@@ -413,6 +447,9 @@ def stepped(trainer, steps: int = 3, trials: Callable[[TrainState], Trials] | No
     trials."""
     state, _, _ = trainer.place()
     held = None if trials is None else trials(state)
+    # The garbage of the steps before collected, which the plan search would hold frozen while it runs
+    # (`dew.training.planning.held_objects`) where an executable counted inside it is part of it.
+    gc.collect()
     step = trainer.compile(state, BATCH, held)
     state = state if held is None else held.state
     for _ in range(steps):
@@ -890,28 +927,39 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
-    """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
-    fits it in fewer, so the plan is four at no recomputation. The half rung's failed fit probes
-    remain in the record, but no optional full-batch frontier is compiled."""
+    """An A100's plan: no recomputation fits the batch at four microbatches and not in fewer, so the plan
+    is four at no recomputation, which the derivation picks and its one compile confirms (row 3341): no
+    split it refuses, no half rung and no optional full-batch frontier is compiled."""
     free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
-    assert_searched(asked(trainer), (4, None), 2, half="all_but_delta_memory")
+    assert asked(trainer) == [(4, None, True)]
 
 
 def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):
-    """Without a delta rule no rung is a half rung: the search asks the batch whole and the splits
-    that find the fewest microbatches that fit, each at no recomputation, and stops there."""
+    """Without a delta rule no rung is a half rung: where the derivation cannot judge the step (its
+    devices state no memory to judge it against), the search asks the batch whole and the splits that
+    find the fewest microbatches that fit, each at no recomputation, and stops there; where it can, the
+    derivation picks the fewest that fit, four, and its one compile confirms them (row 3341)."""
+    from dew.training.planning import FitSearch
+
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
-    trainer = lm()
-    state, _, _ = trainer.place()
-    trials = Trials(state, BATCH)
-    trainer.compile(state, BATCH, trials)
-    assert_searched(asked(trainer), (4, None), 2)
-    assert all(remat is None for _, remat, _ in asked(trainer))
+    for judging in (False, True):
+        with monkeypatch.context() as unjudged:
+            if not judging:
+                unjudged.setattr(FitSearch, "judging", lambda search: False)
+            trainer = lm()
+            state, _, _ = trainer.place()
+            trials = Trials(state, BATCH)
+            trainer.compile(state, BATCH, trials)
+        if judging:
+            assert asked(trainer) == [(4, None, True)]
+        else:
+            assert_searched(asked(trainer), (4, None), 2)
+            assert all(remat is None for _, remat, _ in asked(trainer))
 
 
 def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():

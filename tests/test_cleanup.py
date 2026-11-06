@@ -1,5 +1,6 @@
-"""dew.cleanup's process groups: real processes, each the leader of a session of its own, ended as the
-library and the CI harness end them."""
+"""dew._cleanup: its teardown, every step run and each failure saying which step it was, and its process
+groups, real processes, each the leader of a session of its own, ended as the library and the CI harness end
+them."""
 
 import contextlib
 import os
@@ -11,7 +12,7 @@ import pytest
 from process_support import running
 from test_process_support import gone_within
 
-from dew import cleanup
+from dew._cleanup import attempted, end_group, owned_group, process_group, start, stop
 
 LEAVES_A_CHILD = (
     "import os, time\n"
@@ -50,7 +51,7 @@ def test_ending_a_group_ends_the_child_its_leader_left_and_gives_the_leaders_cod
     exit status that of its SIGKILL: no process of the group is left to hold its pipes or its memory."""
     with started(leader_with_child("time.sleep(600)")) as leader:
         child = child_of(leader)
-        assert cleanup.end_group(leader) == -signal.SIGKILL
+        assert end_group(leader) == -signal.SIGKILL
         assert gone_within(child, 30)
 
 
@@ -65,7 +66,7 @@ def test_a_leader_is_given_its_grace_to_end_by_its_own_hand_before_the_group_is_
                "time.sleep(600)\n")
     with started(program) as leader:
         leader.stdout.readline()
-        assert cleanup.end_group(leader, grace=30 if handled else 1) == code
+        assert end_group(leader, grace=30 if handled else 1) == code
 
 
 def test_a_group_whose_leader_was_reaped_is_signalled_only_where_its_owner_started_it():
@@ -75,14 +76,14 @@ def test_a_group_whose_leader_was_reaped_is_signalled_only_where_its_owner_start
     with started(leader_with_child("")) as unowned:
         stranded = child_of(unowned)
         unowned.wait()
-        assert cleanup.stop(unowned) == []
+        assert stop(unowned) == []
         assert running(stranded)
         os.kill(stranded, signal.SIGKILL)
-    owned = cleanup.start([sys.executable, "-c", leader_with_child("")], stdout=subprocess.PIPE, text=True)
+    owned = start([sys.executable, "-c", leader_with_child("")], stdout=subprocess.PIPE, text=True)
     try:
         held = child_of(owned)
         owned.wait()
-        assert cleanup.stop(owned) == []
+        assert stop(owned) == []
         assert not running(held)
     finally:
         owned.stdout.close()
@@ -98,7 +99,7 @@ def test_a_group_owned_for_a_block_ends_with_it_and_a_failing_close_is_a_note_on
     error, which stays the one raised, and the rest of the cleanup is done."""
     own = Own("the block's own")
     command = [sys.executable, "-c", leader_with_child("time.sleep(600)")]
-    with pytest.raises(Own) as raised, cleanup.owned_group(
+    with pytest.raises(Own) as raised, owned_group(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as leader:
         child = child_of(leader)
         leader.stdin.write("a request nothing reads")
@@ -110,8 +111,46 @@ def test_a_group_owned_for_a_block_ends_with_it_and_a_failing_close_is_a_note_on
 
 def test_a_process_group_ends_with_its_block_and_closes_its_pipes():
     """A `process_group` ends the group, the child its leader left among it, as its block ends."""
-    with cleanup.process_group([sys.executable, "-c", leader_with_child("time.sleep(600)")],
+    with process_group([sys.executable, "-c", leader_with_child("time.sleep(600)")],
                                stdout=subprocess.PIPE, text=True) as leader:
         child = child_of(leader)
     assert leader.returncode is not None and leader.stdout.closed
     assert gone_within(child, 30)
+
+
+def test_every_step_runs_and_each_failure_carries_its_own_step():
+    """Two failing steps around one that passes: all three run, the first failure is raised, and it
+    carries each failed step's label, its own and the later one's; the passing step's label is on none."""
+    ran = []
+
+    def failing(name):
+        def step():
+            ran.append(name)
+            raise OSError(name)
+
+        return step
+
+    with pytest.raises(OSError) as raised:
+        attempted([("closing the rollout", failing("rollout")),
+                   ("closing the log", lambda: ran.append("log")),
+                   ("closing the tracker", failing("tracker"))])
+    assert ran == ["rollout", "log", "tracker"]
+    notes = " ".join(raised.value.__notes__)
+    assert "closing the rollout" in notes and "closing the tracker" in notes
+    assert "closing the log" not in notes
+
+
+def test_a_run_unwinding_with_its_own_failure_keeps_it_and_notes_its_rollouts_failed_close():
+    """A run unwinding with its own failure whose rollout fails to close (`dew.config._closed`) raises
+    nothing of the close's: its own failure stays the one raised, noted with the close that failed, its
+    step and its error (row 4276)."""
+    from dew.config import _closed
+
+    class Rollout:
+        def close(self) -> None:
+            raise OSError("the engine")
+
+    primary = RuntimeError("the run's own")
+    _closed(None, None, primary, Rollout())
+    notes = " ".join(primary.__notes__)
+    assert "closing the rollout failed" in notes and "OSError('the engine')" in notes

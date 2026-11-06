@@ -22,7 +22,7 @@ import optax
 from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
-from dew import position
+from dew import _position
 from dew._coordination import agreed, agreed_next, agreed_reads, pool_size
 from dew._records import JSON, integers
 from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
@@ -39,7 +39,7 @@ from dew.data.dataset import (
     stream_ends,
 )
 from dew.data.pipeline import Dataset
-from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position
+from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position, split_fields
 from dew.distributed.placement import MeshSpec, Placement
 from dew.held_updates import waiting
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
@@ -55,7 +55,7 @@ from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.model_flops import TOKENS
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture, stop_capture
-from dew.training.rollout import Rollout
+from dew.training.rollout import Rollout, rolled_out
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
 
@@ -360,7 +360,7 @@ class FitRun:
     emptied: Emptied | None = None
     """A pooled run's batches of the pool's tree with nothing in them, which a share that ran out steps
     with (`pooled_read`)."""
-    profiled: tuple[int, int] | None = None
+    profiled: tuple[int, int, str] | None = None
     """The steps a stopped profile window traced and the step it stopped at, whose export the run's
     cleanup waits for before it reports the window (`Trainer._exported_profile`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
@@ -394,7 +394,7 @@ class FitRun:
         it until the run's cleanup waits for them and its outcome reports the window
         (`Trainer._reported_outcome`)."""
         stop_capture(profiler, self.loss)
-        self.profiled = (self.traced, self.current)
+        self.profiled = (self.traced, self.current, str(profiler.directory))
 
     def committed_examples(self, interval: Interval, points: Sequence[int], state: TrainState,
                            window: int) -> tuple[int, int]:
@@ -750,6 +750,31 @@ def emptied(batch: Batch) -> Batch:
             CONSUMED_COUNT: ConsumedCount(0)}
 
 
+def read_batch(run: FitRun, interval: Interval, state: TrainState, rollout: Rollout | None, mesh: Mesh,
+               marked, examples: int | None, *, agree: bool, phase: str = "training read",
+               branch: bool = False) -> tuple[Batch, Batch, bytes | None] | None:
+    """The one way a training loop's next batch becomes its step's input, the run's and a cooldown
+    branch's alike (row 4125): read (`waited_read`), drawn past the rollout (`rolled_out`) and its device
+    fields apart (`split_fields`), a run on the examples clock closing its update window where its batch
+    does (the run's step at its bound, `FitRun.closing`; a `branch`'s every step, `closes_window`). Returns
+    the batch, its device fields and the position a rollout read ahead to; None where the stream ran out."""
+    batch = waited_read(run, interval, agree=agree, phase=phase)
+    if batch is None:
+        return None
+    batch, ahead = rolled_out(rollout, state, batch, mesh, marked, interval, run,
+                              examples=None if branch else examples, closes=not branch)
+    device, _ = split_fields(batch)
+    return batch, closes_window(device, examples) if branch else device, ahead
+
+
+def counted_step(interval: Interval, run: FitRun, row_tokens: Callable[[Batch], int | None], batch: Batch,
+                 device: Batch, flops, loss, finite, committed, aux) -> None:
+    """A step's batch and results counted in `interval`, its tokens (`row_tokens`) on `run`'s clock: the
+    run's step and a cooldown branch's alike (row 4125)."""
+    interval.count(batch, flops, loss, finite, committed, aux, run.clock.stepped(row_tokens(device),
+                                                                                   rows_of(device)))
+
+
 def closes_window(batch: Batch, examples: int | None, *, last: bool = False) -> Batch:
     """`batch` as a run on the examples clock (bounded to `examples`) hands its step: marked whether it is
     the run's `last`, closing its update window (`CLOSES_WINDOW`), every batch of such a run marked, so
@@ -952,7 +977,7 @@ def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int]
     state = None if run.train is None else run.train.source_state
     if ends is None or state is None:
         return None
-    stage = len(position.read(state).completed)
+    stage = len(_position.read(state).completed)
     if stage >= len(ends) - 1 or (committed := run.clock.read) < (end := ends[stage] or 0):
         return None
     assert run.train is not None and run.partition is not None

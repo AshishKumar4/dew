@@ -220,6 +220,39 @@ def test_router_reproduces_the_deepseek_choice(name, router):
     assert_routes_as_recorded(tensors, weights, indices)
 
 
+def test_a_sqrt_softplus_routers_gradient_is_finite_where_softplus_underflows():
+    """DeepSeek V4's router scores `sqrt(softplus(logits))`: where an expert's logit takes softplus below
+    float32's least normal, the plain formula's derivative, `sqrt`'s at zero, is infinite, and the
+    router's gradient came out NaN from an unselected expert's zero cotangent (row 3919); its score
+    there is the formula's tail (`test_the_sqrt_softplus_score_is_the_formula_and_its_tail`), and the
+    gradient finite."""
+    router = v4_router(expert_bias=False)
+    hidden = jax.random.normal(jax.random.key(0), (4, CONFIG["deepseek_v4"]["hidden_size"]))
+    variables = router.init(jax.random.key(1), hidden)
+    # Logits far down for every expert but a few, softplus underflowing for most.
+    pushed = jax.tree.map(lambda leaf: leaf * 4000.0, variables)
+
+    def routed(variables):
+        weights, _ = router.apply(variables, hidden)
+        return jnp.sum(weights)
+
+    gradient = jax.grad(routed)(pushed)
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(gradient))
+
+
+def test_the_sqrt_softplus_score_is_the_formula_and_its_tail():
+    """`moe.sqrt_softplus` is the plain `sqrt(softplus(logits))` bit for bit wherever `exp(logits)` is
+    above float32's epsilon, and below it the formula's tail `exp(logits / 2)`, the formula's to within
+    that epsilon: an expert down the tail keeps a positive score where the plain formula's is zero."""
+    from dew.nn import moe
+
+    logits = jnp.asarray([-170.0, -110.0, -40.0, -16.0, -15.0, 0.0, 30.0], jnp.float32)
+    scores, plain = np.asarray(moe.sqrt_softplus(logits)), np.asarray(jnp.sqrt(jax.nn.softplus(logits)))
+    above = np.asarray(logits) >= np.log(np.finfo(np.float32).eps)
+    np.testing.assert_array_equal(scores[above], plain[above])
+    assert np.all(scores > 0) and not np.all(plain > 0)
+
+
 @pytest.mark.parametrize("fill", [0.0, None], ids=["axk2-zero", "deepseek-inf"])
 def test_a_router_chooses_an_expert_outside_its_best_groups_by_the_score_its_reference_fills_in(fill):
     """A grouped router whose best group's experts all choose below zero: A.X-K2's fills every expert

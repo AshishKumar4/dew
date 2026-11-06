@@ -31,7 +31,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import httpx
 
-from dew.cleanup import owned_group
+from dew._cleanup import owned_group
 
 PROMPTS = ("Name three prime numbers.", "What is the capital of France?", "Write a haiku about rain.")
 BUDGET = 24

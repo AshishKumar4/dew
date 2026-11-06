@@ -19,7 +19,7 @@ import collections
 import contextlib
 import dataclasses
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -28,18 +28,26 @@ import numpy as np
 from jax.core import ShapedArray
 
 from dew import algebra
+from dew._devices import xla_flag
 from dew._records import JSON
+from dew.algebra.terms import parameter_key, parameters_key
 from dew.batch import Batch
 from dew.data.dataset import rows_of
-from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
-from dew.nn.kernels.generation import _compute_capability
-from dew.nn.programs import bodies, computed
+from dew.nn.kernels.generation import _compute_capability, gpu_target
+from dew.nn.programs import bodies, computed, opaque
 from dew.objectives.base import Objective
 from dew.state import TrainState
-from dew.training.compiled_program import VIEWS, Slicing, compiled, deviceless, dimensions, lowering_platform
-from dew.training.memory import judged
+from dew.training.compiled_program import (
+    Slicing,
+    bitcast,
+    compiled,
+    deviceless,
+    dimensions,
+    lowering_platform,
+)
+from dew.training.memory import head_fused_of, head_tile_of, judged
 from dew.training.narrow import forward_variables
 from dew.training.transaction import attempt_step
 
@@ -150,6 +158,10 @@ LOWERED = {"gpu": "cuda"}
 """The platform JAX lowers for where a derivation names only its kind (`lowering_platform`)."""
 
 LOOPS = frozenset({"scan", "while"})
+
+PRODUCTS = frozenset({"dot_general", "conv_general_dilated", "ragged_dot_general"})
+"""The products a weight's gradient is made by, past which a value is a cotangent the backward reads on
+(`sunk`)."""
 """The primitives that run their body turn after turn, their results held across the turns."""
 
 GEMM_REWRITE_SIZE = 100
@@ -176,12 +188,204 @@ def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.
 
 
 def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: Workspace,
-                  lowering: str | None = None, consumed: bool = False) -> tuple[int, Peak]:
+                  lowering: str | None = None, consumed: bool = False,
+                  deferred: bool = False) -> tuple[int, Peak]:
     """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
-    backward (`traced_gradient`), as each derives it from its own."""
-    traced = traced_gradient(loss, params, arguments)
-    lowering = lowering or LOWERED.get(platform, platform)
-    return _kept(*traced, platform, lowering), _peak(*traced, platform, workspace, lowering, consumed)
+    backward (`traced_gradient`), lowered once (`compiled`, its outputs the gradient and the residuals
+    alike: an equation's lowering reads no output), as each derives it from its own (row 4261: lowered
+    for each, the two lowerings were 16 of a Qwen3.5-4B candidate's 28 seconds)."""
+    program, count, shapes = traced_gradient(loss, params, arguments)
+    lowered = simplified(program, platform, lowering)
+    return (_kept(lowered, count, shapes, platform),
+            _peak(lowered, count, platform, workspace, consumed, deferred))
+
+
+def simplified(program: jcore.Jaxpr, platform: str, lowering: str | None = None) -> jcore.Jaxpr:
+    """`program` as XLA compiles it for `platform`, as JAX lowers it for `lowering` (`compiled`;
+    `platform`'s own name where none is given, a GPU's CUDA's), each equation that repeats another one
+    (`deduplicated`), each sum into a scatter (`folded`) and, on a GPU, each sum a product computes
+    (`biased`) as XLA's simplifiers and its GEMM rewriter make them, the rewriter a GPU's alone, in every
+    program it runs, a loop's body among them, as XLA's passes run over every computation (`throughout`)."""
+    gemm = biased if platform == "gpu" else (lambda each: each)
+    return throughout(lambda each: gemm(folded(deduplicated(each))),
+                      compiled(program, lowering or LOWERED.get(platform, platform)))
+
+
+def throughout(rewrite: Callable[[jcore.Jaxpr], jcore.Jaxpr], program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` rewritten by `rewrite`, and so each program its equations run (a loop's body, a
+    conditional's branches), each rewritten once however many equations run it."""
+    made: dict[int, tuple[jcore.Jaxpr, jcore.Jaxpr]] = {}
+
+    def within(value):
+        if isinstance(value, jcore.Jaxpr):
+            if (held := made.get(id(value))) is not None and held[0] is value:
+                return held[1]
+            # A native kernel's program is no computation XLA's passes run over (`opaque`).
+            inner = rewrite(value.replace(eqns=[equation if opaque(equation) else equation.replace(params={
+                key: within(param) for key, param in equation.params.items()}) for equation in value.eqns]))
+            made[id(value)] = (value, inner)
+            return inner
+        if type(value) in (tuple, list):
+            return type(value)(within(each) for each in value)
+        return value
+
+    return within(program)
+
+
+def biased(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a cuBLAS product (`cublas_product`) read by that sum alone and a value of
+    its type the product's own: a product of three operands, the sum's addend its third, run where the
+    sum ran, as XLA's GEMM rewriter folds the sum into the GEMM, its bias (`FuseMatrixBiasAdd`,
+    xla/backends/gpu/transforms/gemm_rewriter.cc: a GEMM of one user, its beta 1), which writes in the
+    bias's buffer where nothing else reads it (`in_place`). A tiled head's weight gradient adds each
+    tile's product to its loop's carry: Qwen3.5-4B's step under 'full' at two microbatches was derived
+    holding each tile's 2.37 GiB product beside the carry, which XLA's GEMM writes in (row 4089)."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    readers = collections.Counter(value for equation in program.eqns for value in equation.invars
+                                  if isinstance(value, jcore.Var))
+    readers.update(value for value in program.outvars if isinstance(value, jcore.Var))
+    dropped: set[int] = set()
+    replaced: dict[int, jcore.JaxprEqn] = {}
+    for equation in program.eqns:
+        if equation.primitive.name not in ("add", "add_any") or len(equation.invars) != 2:
+            continue
+        out = equation.outvars[0]
+        first, second = equation.invars
+        for made, addend in ((first, second), (second, first)):
+            if not isinstance(made, jcore.Var) or not isinstance(addend, jcore.Var):
+                continue
+            product = producers.get(made)
+            if (product is None or not cublas_product(product) or len(product.invars) != 2
+                    or readers[made] != 1 or made.aval != out.aval or addend.aval != out.aval
+                    or not isinstance(out.aval, ShapedArray) or np.issubdtype(out.aval.dtype, np.integer)
+                    or id(product) in dropped):
+                continue
+            dropped.add(id(product))
+            replaced[id(equation)] = product.replace(invars=[*product.invars, addend], outvars=[out])
+            break
+    if not replaced:
+        return program
+    return program.replace(eqns=[replaced.get(id(equation), equation) for equation in program.eqns
+                                 if id(equation) not in dropped])
+
+
+def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a value and a zero that value (`zeros_added`), and each sum of a value
+    and a scatter-add read by that sum alone a scatter-add into the sum of that value and the scatter's
+    base, the base dropped where it is a zero, as XLA's simplifier folds them (`A + scatter(B, I, U) =>
+    scatter(A + B, I, U)` and `A + 0 => A`, `AlgebraicSimplifierVisitor::HandleAdd`,
+    xla/hlo/transforms/simplifiers/algebraic_simplifier.cc):
+    a tied embedding's gradient, its head's product and the scatter of its rows' cotangents, is one
+    buffer, which the scatter writes in place (`in_place`). Qwen3.5-4B's step under 'full' was derived
+    holding the product, the scatter and their sum at its end, 7.1 GiB against XLA's 4.4 (row 4089)."""
+    program = zeros_added(program)
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    readers = collections.Counter(value for equation in program.eqns for value in equation.invars
+                                  if isinstance(value, jcore.Var))
+    readers.update(value for value in program.outvars if isinstance(value, jcore.Var))
+    dropped: set[int] = set()
+    replaced: dict[int, list[jcore.JaxprEqn]] = {}
+    for equation in program.eqns:
+        if equation.primitive.name not in ("add", "add_any") or len(equation.invars) != 2:
+            continue
+        first, second = equation.invars
+        for scattered, other in ((first, second), (second, first)):
+            if not isinstance(scattered, jcore.Var):
+                continue
+            scatter = producers.get(scattered)
+            if (scatter is None or scatter.primitive.name != "scatter-add" or readers[scattered] != 1
+                    or scattered.aval != equation.outvars[0].aval or id(scatter) in dropped):
+                continue
+            base, *rest = scatter.invars
+            if zero(base, producers):
+                summed, sums = other, []
+            else:
+                summed = jcore.Var(equation.outvars[0].aval)
+                sums = [equation.replace(invars=[other, base], outvars=[summed])]
+            dropped.add(id(scatter))
+            replaced[id(equation)] = [*sums, scatter.replace(invars=[summed, *rest],
+                                                             outvars=equation.outvars)]
+            break
+    if not replaced:
+        return program
+    return program.replace(eqns=[each for equation in program.eqns if id(equation) not in dropped
+                                 for each in replaced.get(id(equation), [equation])])
+
+
+def zero(value: jcore.Var | jcore.Literal, producers: Mapping) -> bool:
+    """Whether `value` is a zero: a literal zero, or one broadcast, cast or laid out otherwise (`bitcast`):
+    a scanned head's zero carry, which its loop of one turn, run inline (`compiled_program.once`), reads
+    unstacked."""
+    producer = producers.get(value) if isinstance(value, jcore.Var) else None
+    while producer is not None and producer.invars and (
+            producer.primitive.name in ("broadcast_in_dim", "convert_element_type") or bitcast(producer)):
+        value = producer.invars[0]
+        producer = producers.get(value) if isinstance(value, jcore.Var) else None
+    return isinstance(value, jcore.Literal) and not np.any(np.asarray(value.val))
+
+
+def zeros_added(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a value and a zero of its shape that value (`A + 0 => A`,
+    `AlgebraicSimplifierVisitor::HandleAdd`): a tiled head of one tile adds its weight gradient to its
+    loop's zero carry, which its body runs inline (`compiled_program.once`)."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    renamed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
+    kept = []
+    for equation in program.eqns:
+        operands = [renamed.get(value, value) if isinstance(value, jcore.Var) else value
+                    for value in equation.invars]
+        if equation.primitive.name in ("add", "add_any") and len(operands) == 2:
+            first, second = operands
+            out = equation.outvars[0]
+            for added, other in ((first, second), (second, first)):
+                if zero(added, producers) and other.aval == out.aval:
+                    renamed[out] = other
+                    break
+            if out in renamed:
+                continue
+        kept.append(equation.replace(invars=operands))
+    if not renamed:
+        return program
+    return program.replace(eqns=kept, outvars=[renamed.get(value, value) if isinstance(value, jcore.Var)
+                                               else value for value in program.outvars])
+
+
+def operand_key(value: jcore.Var | jcore.Literal) -> Hashable:
+    """An equation's operand as two equal equations read it: a variable itself, a literal by its type and
+    value (`parameter_key`)."""
+    if isinstance(value, jcore.Literal):
+        return ("literal", str(value.aval), parameter_key(value.val))
+    return value
+
+
+def deduplicated(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each equation that repeats an earlier one, its primitive and parameters over the
+    same operands (`parameters_key`), read as that one, as XLA computes it once (`HloCSE`,
+    xla/hlo/transforms/simplifiers/hlo_cse.cc): a tied head's weights cast for the embedding and cast
+    again for the head are one cast, which the embedding's optimization barrier holds and the head reads
+    (Qwen3.5-4B's fused tiled head, 1.18 GiB derived twice: row 4089). An equation with effects is its
+    own, as XLA's side-effecting instructions are, and so is an optimization barrier, which a recomputed
+    region reads through to be computed again, and one whose parameters hold a function: a callback's is
+    named by its module and qualified name alone (`parameter_key`), which two closures of one factory
+    share, and JAX lowers each callback to a custom call of its own host callback's index
+    (`emit_python_callback`, jax/_src/callback.py), which XLA computes apart."""
+    renamed: dict[jcore.Var, jcore.Var] = {}
+    first: dict[Hashable, list] = {}
+    kept = []
+    for equation in program.eqns:
+        operands = [renamed.get(value, value) if computed(value) else value for value in equation.invars]
+        own = (equation.effects or equation.primitive.name == "optimization_barrier"
+               or any(map(callable, equation.params.values())))
+        key = None if own else (parameters_key(equation.primitive, equation.params),
+                                tuple(map(operand_key, operands)))
+        if key is not None and key in first:
+            renamed.update(zip(equation.outvars, first[key], strict=True))
+            continue
+        if key is not None:
+            first[key] = equation.outvars
+        kept.append(equation.replace(invars=operands))
+    return program.replace(eqns=kept, outvars=[renamed.get(value, value) if computed(value) else value
+                                               for value in program.outvars])
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -195,12 +399,13 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     none. A value the pullback closes over keeps its own traced sharding; one whose trace states none, and
     every other value, count whole. Matching an axis's size to the batch size cannot identify its
     sharding: a weight or a scan's layer axis can have that size too."""
-    lowering = lowering or LOWERED.get(platform, platform)
-    return _kept(*traced_gradient(loss, params, arguments), platform, lowering)
+    program, count, shapes = traced_gradient(loss, params, arguments)
+    return _kept(simplified(program, platform, lowering), count, shapes, platform)
 
 
 def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
-                  workspace: Workspace, lowering: str | None = None, consumed: bool = False) -> Peak:
+                  workspace: Workspace, lowering: str | None = None, consumed: bool = False,
+                  deferred: bool = False) -> Peak:
     """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
     device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
     `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
@@ -213,23 +418,86 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
     `HloInputOutputAliasConfig`), and XLA's memory-minimizing schedule runs a consumer that frees its
     operand as soon as it is ready (`ListScheduler::BytesFreedIfScheduled`,
     xla/hlo/transforms/simplifiers/hlo_memory_scheduler.cc; `ScheduleGpuModule`,
-    xla/service/gpu/gpu_hlo_schedule.cc)."""
-    return _peak(*traced_gradient(loss, params, arguments), platform, workspace,
-                 lowering or LOWERED.get(platform, platform), consumed)
+    xla/service/gpu/gpu_hlo_schedule.cc). With `deferred`, the gradient's own equations run after the rest
+    of the backward (`sunk`)."""
+    program, count, _ = traced_gradient(loss, params, arguments)
+    return _peak(simplified(program, platform, lowering), count, platform, workspace, consumed, deferred)
 
 
-def _kept(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, lowering: str) -> int:
-    """`residual_bytes` of `traced_gradient`'s program, its outputs past the first `count` the residuals."""
-    return _residuals(compiled(program.replace(outvars=program.outvars[count:]), lowering), shapes, platform)
+def _kept(lowered: jcore.Jaxpr, count: int, shapes: Sequence, platform: str) -> int:
+    """`residual_bytes` of `traced_gradient`'s program as it is `lowered` (`compiled`), its outputs past
+    the first `count` the residuals."""
+    return _residuals(lowered.replace(outvars=lowered.outvars[count:]), shapes, platform)
 
 
-def _peak(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, workspace: Workspace,
-          lowering: str, consumed: bool = False) -> Peak:
-    """`gradient_peak` of `traced_gradient`'s program, its first `count` outputs the gradient."""
-    del shapes
-    lowered = compiled(program.replace(outvars=program.outvars[:count]), lowering)
-    return Peak(peak_bytes(lowered, platform, workspace, consumed=consumed),
-                not bounded_below(lowered, platform))
+def _peak(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace, consumed: bool = False,
+          deferred: bool = False) -> Peak:
+    """`gradient_peak` of `traced_gradient`'s program as it is `lowered` (`compiled`), its first `count`
+    outputs the gradient."""
+    gradient = lowered.replace(outvars=lowered.outvars[:count])
+    # Hoisted last: a constant the gradient returns runs ahead of the work however its weight gradients run.
+    ordered = hoisted(sunk(gradient) if deferred else gradient)
+    return Peak(peak_bytes(ordered, platform, workspace, consumed=consumed),
+                not bounded_below(gradient, platform))
+
+
+def hoisted(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each output computed from literals alone run first, with the equations that compute
+    it, in their order: a constant the program returns and no equation of its work reads, which XLA
+    schedules ahead of that work, holding it to its reader past the program, each one computed once
+    where equal ones repeat (`deduplicated`, which the derivation reads it through). The gradient of a
+    parameter the loss reads none of is such a constant, a broadcast zero JAX writes at the backward's
+    end, which XLA made during the forward, one a shape: Qwen3.5-4B's step at 4 x 2048 tokens under
+    'minimal_with_scan_and_conv', compiled for an H100, held one zero gradient of each of 25 shapes of
+    its multi-token head's and its vision tower's 312, 0.48 GiB of 1.69, from step 2,480 of its schedule
+    to the update at 15,091, its peak at 4,863 among them (row 4089, its buffer dump). A constant the
+    work reads (a loop's zero carry) is made where the work needs it, as XLA makes it."""
+    constant: dict[jcore.Var, int] = {}
+    for index, equation in enumerate(program.eqns):
+        reads = [value for value in equation.invars if computed(value)]
+        if not equation.effects and all(value in constant for value in reads):
+            constant.update((out, index) for out in equation.outvars if computed(out))
+    # A constant equation is hoisted where every reader of its results is a hoisted one or the outputs.
+    readers: dict[jcore.Var, set[int]] = collections.defaultdict(set)
+    for index, equation in enumerate(program.eqns):
+        for value in equation.invars:
+            if computed(value):
+                readers[value].add(index)
+    returned = {value for value in program.outvars if computed(value)}
+    early: set[int] = set()
+    for index in sorted(set(constant.values()), reverse=True):
+        made = [out for out in program.eqns[index].outvars if computed(out)]
+        if any(out in returned or readers[out] for out in made) and all(
+                reader in early for out in made for reader in readers[out]):
+            early.add(index)
+    ordered = sorted(range(len(program.eqns)), key=lambda index: index not in early)
+    return program.replace(eqns=[program.eqns[index] for index in ordered])
+
+
+def sunk(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program`, a gradient's, with each weight's gradient run after every other equation, in their order:
+    the equations whose results reach its outputs through no product (`PRODUCTS`), each weight's gradient
+    product and what sums, casts or lays it out, the backward's cotangents, which the products of the
+    layers before read, left where they are, and the operands those products read held to the end. XLA
+    schedules a step's gradient so where its head takes the backward a tile at a time (`head_tile`,
+    unfused) on some GPUs (`GpuTarget.late_weight_gradients`): Qwen3.5-4B's step at 2 x 4096 tokens under
+    'full', compiled for an H100, held 29 layers' four [8192, 9216] product operands at its peak, 16.3 of
+    its 34.6 GiB, and no layer's gradient (row 3341, its calibration's buffer dumps)."""
+    outputs = {value for value in program.outvars if computed(value)}
+    readers: dict[jcore.Var, list[int]] = collections.defaultdict(list)
+    for index, equation in enumerate(program.eqns):
+        for value in {read for read in equation.invars if computed(read)}:
+            readers[value].append(index)
+    late: set[int] = set()
+    for index in range(len(program.eqns) - 1, -1, -1):
+        made = [out for out in program.eqns[index].outvars if computed(out)]
+        # Every result read by late equations alone, none a product, and one at least read or returned.
+        if any(readers[out] or out in outputs for out in made) and all(
+                reader in late and program.eqns[reader].primitive.name not in PRODUCTS
+                for out in made for reader in readers[out]):
+            late.add(index)
+    ordered = sorted(range(len(program.eqns)), key=lambda index: index in late)
+    return program.replace(eqns=[program.eqns[index] for index in ordered])
 
 
 def _residuals(program: jcore.Jaxpr, shapes: Sequence, platform: str) -> int:
@@ -298,28 +566,101 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         made = [out for out in equation.outvars
                 if out in last and frontier.buffered(out) and out not in carried]
         made_bytes = sum(map(device_share, made))
+        # A scatter or a product with a bias writes its result in a buffer it reads last (`in_place`).
+        taken = in_place(frontier, equation, held, last, index)
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
                                     returned_carry(equation, body)) for body in bodies(equation)), default=0)
-            # A barrier's results are its operands' own storage: the buffers made for its fused operands
-            # are the ones it holds, not a second set read beside them.
-            barrier = equation.primitive.name == "optimization_barrier"
-            operands = 0 if frontier.fusing(equation) or barrier else sum(
-                device_share(value) for value in {value for value in equation.invars if computed(value)}
-                if frontier.made_for(value))
+            made_for = unfused(frontier, equation)
+            operands = sum(map(device_share, made_for))
             products = 0 if not cublas_product(equation) else (
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
             running = (looped(frontier, last, index, equation, made, carried) + inner
-                       if equation.primitive.name in LOOPS else max(inner, made_bytes))
-            most = max(most, live + running + operands + products)
+                       if equation.primitive.name in LOOPS else max(inner, made_bytes) - taken)
+            # The fusions that make its operands run before it, each buffer they alone read freed with them
+            # (`freed`): the most is theirs, or its own past them.
+            freed = sum(map(device_share, dying(frontier, equation, made_for, held, last, index)))
+            most = max(most, live + operands, live - freed + running + operands + products)
         held.update(made)
         live += made_bytes
         for done in [value for value in held if last[value] == index]:
             held.discard(done)
             live -= device_share(done)
     return most
+
+
+def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
+    """The operands `equation` reads from buffers made for its read, beside the ones it holds: each fused one
+    of an equation that takes its operands from memory (`Frontier.fusing` says no), none of one that
+    recomputes them, nor of an optimization barrier, whose results are its operands' own storage (the
+    buffers made for its fused operands are the ones it holds, not a second set read beside them). A
+    scatter fuses its indices and updates but those reading its base, which XLA computes apart, as it
+    computes the base apart into the buffer the scatter writes (`CanEmitInputFusedScatter`,
+    xla/service/gpu/gpu_fusible.cc): its updates computed from its base hold a buffer of their own."""
+    name = equation.primitive.name
+    if name == "optimization_barrier" or not equation.invars:
+        return set()
+    if name.startswith("scatter"):
+        base = frontier.roots(equation.invars[:1])
+        return {value for value in equation.invars[1:] if computed(value) and value is not equation.invars[0]
+                and frontier.made_for(value) and frontier.roots([value]) & base}
+    if frontier.fusing(equation):
+        return set()
+    return {value for value in equation.invars if computed(value) and frontier.made_for(value)}
+
+
+def dying(frontier: Frontier, equation: jcore.JaxprEqn, made_for: set[jcore.Var], held: set, last: Mapping,
+          index: int) -> set[jcore.Var]:
+    """The buffers the program holds (`held`) that the fusions making `equation`'s operands (`made_for`,
+    `unfused`) read last, the equation, the program's `index`th, reading none of them itself: each such
+    fusion is a kernel of its own XLA runs before the equation, past which a buffer no other instruction
+    reads is freed (its live range ending at its last use, `HloLiveRange`,
+    xla/hlo/utils/hlo_live_range.cc). A head's weight-gradient product reads the logits' cotangent, which
+    XLA computes from the logits a recomputed head holds behind its barrier and frees them: Qwen3.5-4B's
+    step at four microbatches was derived holding both, 0.95 GiB over XLA's 7.42 (row 4089)."""
+    if not made_for:
+        return set()
+    direct = frontier.reading([value for value in equation.invars
+                               if computed(value) and value not in made_for])
+    return {buffer for buffer in frontier.reading(made_for)
+            if buffer in held and last.get(buffer) == index and buffer not in direct}
+
+
+def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapping, index: int) -> int:
+    """The bytes of the buffer `equation`, the program's `index`th, writes its result in: a scatter's
+    base's, or a product's bias's (`biased`), the one buffer the program holds (`held`) that it is or views
+    (`Frontier.reading`), where the equation reads that buffer last, its other operands read none of it,
+    and it is its result's size, as XLA shares a scatter's first operand's buffer with its result
+    (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, xla/hlo/analysis/hlo_dataflow_analysis.cc) and
+    a GEMM's bias's that nothing else reads, before it or after (`FuseMatrixBiasAdd`'s `can_overwrite_bias`,
+    xla/backends/gpu/transforms/gemm_rewriter.cc); none for any other equation."""
+    name = equation.primitive.name
+    if name.startswith("scatter") and equation.invars:
+        at = 0
+    elif name == "dot_general" and len(equation.invars) == 3:
+        at = 2
+    else:
+        return 0
+    base = equation.invars[at]
+    if not computed(base) or equation.invars.count(base) != 1 or frontier.made_for(base):
+        return 0
+    kept = frontier.reading([base])
+    if len(kept) != 1:
+        return 0
+    (buffer,) = kept
+    # Its other operands read none of that buffer, which writing it in place would overwrite under them.
+    others = [value for number, value in enumerate(equation.invars) if number != at]
+    if buffer not in held or last.get(buffer) != index or buffer in frontier.reading(others):
+        return 0
+    # A GEMM writes in its bias only where the product is the bias's one reader (`can_overwrite_bias`),
+    # whatever read it before.
+    if at == 2 and {frontier.readers[base], frontier.readers[buffer]} != {1}:
+        return 0
+    if device_share(buffer) != device_share(equation.outvars[0]):
+        return 0
+    return device_share(buffer)
 
 
 def carry(equation: jcore.JaxprEqn) -> list[tuple]:
@@ -393,7 +734,7 @@ def sharing(frontier: Frontier, last: Mapping, index: int, equation: jcore.Jaxpr
 class Frontier:
     """Which values of `program` XLA's fusion for `platform` keeps a buffer of: each but one a primitive
     it recomputes in its consumers computes (`recomputed`), which reads those it is computed from in
-    its place, and one a layout primitive (`VIEWS`) makes of another's buffer, which XLA's layout
+    its place, and one a layout primitive (`bitcast`) makes of another's buffer, which XLA's layout
     assignment lays that buffer out for; the program's outputs, where it returns them (`returned`),
     always but as such a view; neither its inputs nor its literals."""
 
@@ -412,6 +753,7 @@ class Frontier:
         self.forwards = {out: operand for equation in program.eqns
                          if equation.primitive.name == "optimization_barrier"
                          for out, operand in zip(equation.outvars, equation.invars, strict=True)}
+        self.barred = {operand for operand in self.forwards.values() if computed(operand)}
 
     def stored(self, operand) -> bool:
         """Whether `operand` is held in a buffer: an input, a value computed into one, or a view of one."""
@@ -420,7 +762,7 @@ class Frontier:
 
     def view(self, value) -> bool:
         """Whether `value` is another value's storage: a shape primitive's of a value held or read
-        (`VIEWS`), or a transpose's of a value the program computes into a buffer and reads nowhere
+        (`bitcast`), or a transpose's of a value the program computes into a buffer and reads nowhere
         else (`TRANSPOSES`)."""
         equation = self.producers.get(value)
         if value in self.forwards:
@@ -428,16 +770,21 @@ class Frontier:
         if equation is None or not equation.invars or not computed(equation.invars[0]):
             return False
         operand = equation.invars[0]
-        if equation.primitive.name in VIEWS:
+        if bitcast(equation):
             return operand in self.inputs or not self.fused(operand) or self.view(operand)
         # XLA lays a value out once, so a transpose is its storage only where it is its one reader.
         return (equation.primitive.name in TRANSPOSES and operand not in self.inputs
                 and self.readers[operand] == 1 and (not self.fused(operand) or self.view(operand)))
 
     def fused(self, value) -> bool:
-        """Whether `value` holds no buffer of its own: recomputed where it is read, or a view."""
+        """Whether `value` holds no buffer of its own: recomputed where it is read, or a view; a value an
+        optimization barrier reads is computed into a buffer of its own, which the barrier's result is
+        and every other reader reads (`forwards`), unless it is a view of another's (`view`)."""
         if not computed(value) or value in self.inputs:
             return False
+        if value in self.barred:
+            # A barrier's operand holds a buffer unless it is another's storage.
+            return self.view(value)
         equation = self.producers.get(value)
         if value in self.forwards:
             return self.stored(self.forwards[value])
@@ -459,9 +806,32 @@ class Frontier:
         chains as it reads them: an elementwise one's (`recomputed`) or a reduction's, a variadic
         `reduce` among them, which XLA fuses into its own kernel whatever its operands' number
         (`PriorityFusion::ChooseKind`, `CanFuseWithNativeEmitter`,
-        xla/backends/gpu/transforms/priority_fusion.cc)."""
+        xla/backends/gpu/transforms/priority_fusion.cc), or a scatter's, an input fusion as a reduction's
+        is (`IsInputFusibleScatter`, xla/service/gpu/gpu_fusible.cc), its base computed apart into its
+        result and its updates read from its base apart (`unfused`):
+        Qwen3.5-4B's tied embedding's gradient, a scatter-add into zeros, was derived holding the zeros
+        beside it, 2.37 GiB over XLA's 4.76 at its step's peak under 'full' (row 4089)."""
         name = equation.primitive.name
-        return recomputed(equation, self.platform) or name == "reduce" or name.startswith(("reduce_", "arg"))
+        return (recomputed(equation, self.platform) or name == "reduce"
+                or name.startswith(("reduce_", "arg", "scatter")))
+
+    def roots(self, values: Iterable) -> set[jcore.Var]:
+        """The buffers reading `values` holds (`reading`) and the inputs they are computed from or view: what
+        they depend on, the program's inputs among it."""
+        found: set[jcore.Var] = set()
+        pending = [value for value in values if computed(value)]
+        seen: set[jcore.Var] = set()
+        while pending:
+            value = pending.pop()
+            if value in seen:
+                continue
+            seen.add(value)
+            if value in self.inputs or not self.fused(value):
+                found.add(value)
+                continue
+            read = [self.forwards[value]] if value in self.forwards else self.producers[value].invars
+            pending.extend(each for each in read if computed(each))
+        return found
 
     def reading(self, values: Iterable) -> set[jcore.Var]:
         """The buffers reading `values` holds: each value's own, or for one fused, those it is
@@ -540,6 +910,9 @@ def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
     keep it: on a GPU every elementwise primitive (`ELEMENTWISE`), elsewhere the cheap ones (`CHEAP`, and
     `REAL_CHEAP` over real values). A program it reads has its calls inlined (`compiled`)."""
     name = equation.primitive.name
+    if bitcast(equation):
+        # A bitcast holds no buffer of its own, on any platform.
+        return True
     if platform == "gpu":
         return name in ELEMENTWISE
     if name in REAL_CHEAP:
@@ -578,6 +951,13 @@ def gemm_workspace(device) -> Workspace:
         return Workspace(0, 0)
     rewritten = (32 if int(capability.split('.')[0]) >= 9 else 4) << 20
     return Workspace(DEFAULT_WORKSPACE if deviceless(device) else rewritten, rewritten)
+
+
+def late_weight_gradients(device) -> bool:
+    """Whether XLA runs a step's weight gradients on `device` after the whole backward where its head takes
+    its gradient a tile at a time, unfused (`GpuTarget.late_weight_gradients`, `sunk`)."""
+    capability = _compute_capability(device) if device.platform == 'gpu' else None
+    return bool(capability) and gpu_target(f"sm{capability.replace('.', '')}").late_weight_gradients
 
 
 def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int,
@@ -646,9 +1026,13 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                 axis_types=mesh.axis_types)):
             lowering = lowering_platform(target)
             reads = consumed()
+            # A head that takes its gradient in the backward a tile at a time, unfused, has XLA run the
+            # weight gradients after the backward on some GPUs (`late_weight_gradients`).
+            late = (head_tile_of(objective) is not None and not head_fused_of(objective)
+                    and late_weight_gradients(target))
             residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
                                             platform=target.platform, workspace=gemm_workspace(target),
-                                            lowering=lowering, consumed=reads)
+                                            lowering=lowering, consumed=reads, deferred=late)
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}

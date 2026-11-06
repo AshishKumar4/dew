@@ -29,6 +29,7 @@ from flax.core import freeze
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
+from dew._cache import persist_compilations
 from dew._coordination import agreed
 from dew._records import (
     UNREAD,
@@ -50,7 +51,6 @@ from dew.batch import (
     token_positions,
     token_validity,
 )
-from dew.cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
@@ -79,6 +79,8 @@ from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
+
+    from dew.checkpoints import Checkpoints
 
     # A run processor's tokenizer is read through its methods alone, so image generation, which builds none,
     # reads no tokenizer library (tests/test_imports.py's optional backends).
@@ -372,12 +374,11 @@ class SavedRun:
         persist_compilations()
         with Checkpoints(directory) as checkpoints:
             step = checkpoints.pinned(step)
-            record = checkpoints.artifact(step)
-        import_trusted(record, trust)
+            import_trusted(checkpoints.artifact(step), trust)
+            record = saved_artifact(checkpoints, step)
         if record is None:
             raise ValueError("this checkpoint's objective declares no inference record; declare "
                              "Objective.inference_record, or call objective.pipeline(state)")
-        record = earlier_shapes(named_fields(record, 'checkpoint artifact'))
         if 'unrecorded' in record:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
         objective = declared_objective(record)
@@ -500,6 +501,15 @@ _EARLIER_AUTOENCODERS = {
 }
 """The built-in autoencoders an earlier run recorded by name, each the wrapper's and its module's
 import paths the record names now (`earlier_shapes`)."""
+
+def saved_artifact(checkpoints: Checkpoints, step: int) -> Mapping[str, object] | None:
+    """The inference declaration `step` of `checkpoints` records, in the shapes Dew writes now
+    (`earlier_shapes`); None where its objective declares none. The one reader of a step's declaration:
+    a saved run's (`SavedRun.at`) and the option writing its run record reads from it
+    (`dew.config.earlier_option_writing`). The packages it trusts are imported first, by its reader."""
+    record = checkpoints.artifact(step)
+    return None if record is None else earlier_shapes(named_fields(record, 'checkpoint artifact'))
+
 
 def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     """A run's record with its components in the shapes Dew writes now, every earlier shape read here
@@ -1204,8 +1214,9 @@ class MaskedGeneration(_NativeTextTask):
         record declares, over the checkpoint's weights,
         and refines responses with MDLM over the run's own mask token, using
         the solver and step count the run saved. The model must score the
-        whole row with every position reading the others (`Logits`, and
-        `TokenModel` with `causal` False) and name a mask token (`TokenModel.mask_token_id`)
+        whole row with every position reading the others (its logits or its
+        own forward, `dew.nn.protocols.forward_method`, and `TokenModel` with
+        `causal` False) and name a mask token (`TokenModel.mask_token_id`)
         that matches the saved process, or loading raises `ValueError`.
 
         The arguments work as in `TextGeneration.from_saved`, and the run's

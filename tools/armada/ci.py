@@ -126,22 +126,31 @@ from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
 
-def _beside(name: str):
-    """tools/armada/`name`.py, the module beside this file, loaded by its path: this file runs as a
-    script and is loaded by the tests, and puts nothing on sys.path."""
-    spec = importlib.util.spec_from_file_location(f"armada_{name}", Path(__file__).with_name(f"{name}.py"))
+def _loaded(path: Path):
+    """The module at `path`, loaded by its path: this file runs as a script and is loaded by the tests, and
+    puts nothing on sys.path. Its neighbours here, and the gate's standard-library contract the plan shares
+    (tests/check1_wire.py)."""
+    spec = importlib.util.spec_from_file_location(f"armada_{path.stem}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-child_groups = _beside("child_groups")
-session = _beside("session")
-coverage_report = _beside("coverage_report")
-r2 = _beside("r2")
-watched = _beside("watched")
-followed = _beside("followed")
+HERE = Path(__file__).resolve().parent
+@functools.cache
+def check1_wire():
+    """Check 1's map and judge contract, its one owner (tests/check1_wire.py): what runs a site's test as a
+    map task (DRAWS, RECORDS), as their judge (POOL), a judge's ask for its later map tasks (LATER), its
+    stages log (STAGES) and the units its stages draw (`staged_units`). Loaded where a plan shards a site,
+    so a checkout of the harness alone (a page generator's scratch copy) imports this file."""
+    return _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
+child_groups = _loaded(HERE / "child_groups.py")
+session = _loaded(HERE / "session.py")
+coverage_report = _loaded(HERE / "coverage_report.py")
+r2 = _loaded(HERE / "r2.py")
+watched = _loaded(HERE / "watched.py")
+followed = _loaded(HERE / "followed.py")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
@@ -160,7 +169,7 @@ PYTHONS = tuple(sorted((classifier.removeprefix(_PREFIX) for classifier in _CLAS
                         if re.fullmatch(re.escape(_PREFIX) + r"\d+\.\d+", classifier)),
                        key=lambda version: tuple(int(part) for part in version.split("."))))
 """The tested versions pyproject.toml's classifiers declare, oldest first: the floor runs every
-test on every run, the newest every test on the daily run (DEW_WHOLE_SUITE) and on a pushed
+test on every run, the newest every test on the whole suite's run (DEW_WHOLE_SUITE) and on a pushed
 run, whatever its cache's policy, the files whose behaviour changed with it (`NEWEST_FILES`).
 `pythons` prints them for tools/armada/install.sh, and `pythons --check` holds .python-version
 and the environment's smoke (.armada.json) to them."""
@@ -189,7 +198,7 @@ NEWEST_FILES = (
 )
 """The files the newest Python runs whole on a pushed run, its cache's policy on or off: those its
 changes broke before, and the ones around the same machinery. It imports every other test file there
-(`COLLECT`), and runs every file on the daily run (DEW_WHOLE_SUITE): a policy-off train ran every file
+(`COLLECT`), and runs every file on the whole suite's run (DEW_WHOLE_SUITE): a policy-off train ran every file
 on both Pythons, doubling its suite (train 542's 3.14 rows were 43 container-hours of 87), which the
 daily, the land queue's gate, runs anyway. The list is kept by hand, from those breaks, because no
 record can derive it: the test cache records the checkout's files a run executed and read (executed.py),
@@ -209,7 +218,7 @@ across the containers of an armada gang."""
 HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
-          "src/dew/cleanup.py", "tools/armada/split.py", "tools/armada/executed.py",
+          "src/dew/_cleanup.py", "tools/armada/split.py", "tools/armada/executed.py",
           "tools/armada/followed.py", "tools/armada/lifetime.py", "tools/armada/watched.py")
 """The files every test file's key covers whole, beside every lock (a GPU node builds its environment
 from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
@@ -310,8 +319,14 @@ FETCHED = ".fetched.json"
 def built(path: Path) -> bool:
     """Whether `path` is a build's output, never an input: compiled bytecode, or an editable install's
     metadata (setuptools' <name>.egg-info), which a task's environment writes into its checkout and a
-    planner's lacks."""
-    return "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts)
+    planner's lacks; or a directory holding nothing else, as a package a commit deleted leaves its bytecode
+    in a checkout the environment's snapshot carries across commits, which a planner's clean tree lacks (train
+    636: src/dew/cli/, its __pycache__ alone, listed in src/dew's entries, keyed every task's rows apart from
+    their plan's, and two tasks ran 120 kept rows each past their deadline)."""
+    if "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts):
+        return True
+    return path.is_dir() and not path.is_symlink() and all(
+        entry.name.startswith(".") or built(entry) for entry in path.iterdir())
 
 
 def contents(name: str) -> bytes:
@@ -1019,20 +1034,6 @@ either as armada's map and judge (`site_entries`): map tasks of P units each ove
 its work take, and one judge."""
 SITE_MARK = re.compile(r"\bmark\.(?:" + "|".join(SHARDS) + r")\b")
 """A site's mark as a test file's source spells it (`sites`), which a file that holds none never parses."""
-REDRAW = 4
-"""Check 1's REDRAW (tests/check1_statistics.py, which the plan cannot import: it has no JAX): a site its
-first stage leaves undecided draws REDRAW times its declared seeds further, so its map tasks together draw
-seeds 0 to (1 + REDRAW) times the declared count."""
-DRAWS, RECORDS, POOL, LATER = "DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL", "DEW_CHECK1_LATER"
-"""What runs a site's test as a map task, which takes the units DRAWS names (`start:stop`) and writes what
-they give into the directory RECORDS names, judging nothing, or as their judge, which pools the records
-under POOL and judges them as a test that took every unit itself would (tests/map_judge.py's
-`record_units` and `pooled_units`): a check-1 site its seeds' draws (tests/reference_error.py), and a test
-marked `shards` the units of its own work, given alike. A judge whose judgement needs units its later map
-tasks draw writes the file LATER names (`ask_later`), and its row asks for them (armada's `more`)."""
-STAGES = "DEW_CHECK1_STAGES"
-"""Check 1's stages log (tests/reference_error.py's STAGES_LOG, which the plan cannot import: it has no
-JAX): the file a judge appends each judgement it completes to, its stage among it (`later_judged`)."""
 LATER_JUDGED = "check1_later"
 """A check-1 site judge's row's word that its judgement needed its later map tasks (`later_judged`), which the
 next plan reads to draw them in the first wave (`eager_sites`)."""
@@ -1111,8 +1112,8 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
                 and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
             declared = counts[SHARDS[kind]]
-            units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
-            weighed = (1 + REDRAW) * counts.get("conditioning", 0)
+            units = check1_wire().staged_units(declared) if kind == "check1_shards" else declared
+            weighed = check1_wire().staged_units(counts.get("conditioning", 0))
             found[test] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
                                counts.get("conditioning_per_task", 0))
             read.add(id(mark.func))
@@ -1240,8 +1241,8 @@ def plan(target: float, timings: dict) -> list[dict]:
     the work, not the longest task, as warm estimates did. A site marked one of `SHARDS` runs as armada's
     map and judge, apart from its file's tasks (`site_entries`)."""
     cache = os.environ.get("DEW_TEST_CACHE") or "on"
-    # The daily run alone (DEW_WHOLE_SUITE) runs whole_suite cells (`selected`) and every file on the newest
-    # Python.
+    # The whole suite's run alone (DEW_WHOLE_SUITE: the daily run's and the whole dispatch's) runs whole_suite
+    # cells (`selected`) and every file on the newest Python.
     cells = "1" if os.environ.get("DEW_WHOLE_SUITE") else "0"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     # Every file's check-1 sites its marks shard, refused where one site's map tasks outnumber what its
@@ -1531,9 +1532,12 @@ def site_environment(site: re.Match | None) -> dict[str, str]:
         stages_file().unlink(missing_ok=True)
         # Check 1 appends to its log where the directory is (`_logged`).
         stages_file().parent.mkdir(parents=True, exist_ok=True)
-        return {POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), LATER: str(later_file()),
-                STAGES: str(stages_file())}
-    return {DRAWS: f"{site['start']}:{site['stop']}", RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
+        wire = check1_wire()
+        return {wire.POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), wire.LATER: str(later_file()),
+                wire.STAGES: str(stages_file())}
+    wire = check1_wire()
+    return {wire.DRAWS: f"{site['start']}:{site['stop']}",
+            wire.RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
 
 
 def asked(site: re.Match | None) -> dict[str, bool]:
@@ -1941,7 +1945,7 @@ def selected(command: list[str], network: bool, whole: bool = False, release: bo
              site: bool = False) -> list[str]:
     """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
     tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
-    the daily run (`whole`: DEW_WHOLE_SUITE, CI's schedule), whatever
+    the whole suite's run (`whole`: DEW_WHOLE_SUITE, CI's schedule and its whole dispatch), whatever
     the cache's policy: a policy-off train runs every file, never a whole-suite cell (the maintainer,
     2026-10-28: train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The
     release checks run in their own tasks alone (`release`), every one whatever else marks it, under a

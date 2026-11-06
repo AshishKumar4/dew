@@ -19,7 +19,7 @@ import pytest
 from test_process_support import gone_within
 from tool_support import load
 
-from dew.cleanup import owned_group
+from dew._cleanup import owned_group
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROBE = REPO_ROOT / "tests" / "reference_worker_probe.py"

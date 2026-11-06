@@ -20,12 +20,12 @@ from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
+from dew._files import write_atomically
 from dew._records import JSON, number, record
 from dew.batch import EXAMPLE_ROWS, Batch, Variables
 from dew.data.dataset import Checkpointable, DataPartition, RampedStream, rows_of, stream_identity
 from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology
-from dew.files import write_atomically
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
 from dew.nn.kernels.options import Placements, owned_program
 from dew.nn.sharding import microbatched
@@ -205,7 +205,7 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: boo
     (`rows`; a rollout's are its own, checked where its step traces), and a
     ramp stage's, for a later stage, an hour in. A ramp reads each stage's
     batch whole; an accumulation window pools its stages' batches as it pools
-    any, but for a loss that replays its window's batches (`Trainer._prepared`).
+    any, but for a loss that replays its window's batches (`dew.training._candidates.prepared_for`).
     """
     if resumed:
         kept = isinstance(source, Checkpointable)
@@ -256,7 +256,8 @@ def microbatch_shapes(batch: Batch, split: int) -> Batch:
 
 STEP_BATCH = 2
 """Where a compiled train step takes its batch among its arguments: after the moving state and the
-frozen tree (`dew.state.apart`, `Trainer._jitted`), before the part of the step it runs."""
+frozen tree (`dew.state.apart`, `dew.training._candidates.step_program`), before the part of the step
+it runs."""
 
 
 def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[bool, ...]:

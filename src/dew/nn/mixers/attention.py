@@ -330,6 +330,10 @@ class CausalSelfAttention(nn.Module):
     rotary_pairs: Literal['half', 'adjacent'] = 'half'
     """The channels each angle turns (`dew.nn.rope.rotate`): the HF decoders'
     halves, or the adjacent pairs of Llama 4's vision tower."""
+    rotary_interleaved: bool = False
+    """Whether the `rotary_axes` take their angles in turn, pair by pair, where they otherwise
+    each turn their own run of pairs (`dew.nn.rope.axis_tables`): MoonViT's patch grid, a column's
+    pair beside a row's."""
     rotary_per_axis: bool = False
     """Whether each of the `rotary_axes` turns its own channels in halves,
     Gemma 4's vision rope (`apply_multidimensional_rope`), where Qwen 3.5's
@@ -744,7 +748,8 @@ class CausalSelfAttention(nn.Module):
             if rotary_positions is None or rotary_positions.ndim != 3:
                 raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "
                                  "[B, S, axes] from attention_metadata.rotary_positions")
-            return axis_tables(rotary_positions, self.rotary_axes, self.ctx.rope_theta, dtype=dtype)
+            return axis_tables(rotary_positions, self.rotary_axes, self.ctx.rope_theta, dtype=dtype,
+                               interleaved=self.rotary_interleaved)
         section = None
         if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
             if self.ctx.partial_rotary_type != "default":
@@ -815,6 +820,11 @@ class CausalSelfAttention(nn.Module):
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL, train: bool = False):
         decode, kv_store, attention_metadata = call.decode, call.kv_store, call.metadata
+        # Wide logits are the reference attention's (`MixerContext.wide_logits`), which a cached call's and a
+        # local layer's kernels are not.
+        self.ctx.refuse("attention", {"wide_logits": self.ctx.wide_logits and (
+            decode or self._runs_local(attention_metadata, decode))},
+            "a cached call's and a local layer's kernels form their logits in the inputs' dtype")
         # The run's progress, the call's declared input (`dew.nn.progress`), None at its end.
         progress = None if attention_metadata is None else attention_metadata.progress
         B, S, _ = x.shape
@@ -988,6 +998,7 @@ class CausalSelfAttention(nn.Module):
         attention = checkpoint_name(scaled_dot_product_attention(
             query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax, implementation=self.ctx.attention_impl,
+            wide_logits=self.ctx.wide_logits,
             key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
             max_segments=max_segments, sinks=self.sinks, softcap=self.ctx.attn_logit_softcap), 'context')
         B, S = query.shape[:2]
@@ -1076,7 +1087,8 @@ class CausalSelfAttention(nn.Module):
         return mask_kernel(self.ctx.attention_impl, query, key, as_bias=decode and query.shape[1] > 1,
                            dtype=self.ctx.dtype, precision=self.ctx.precision,
                            force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                           softcap=self.ctx.attn_logit_softcap, sinks=bool(self.ctx.attention_sinks))
+                           softcap=self.ctx.attn_logit_softcap, sinks=bool(self.ctx.attention_sinks),
+                           wide_logits=self.ctx.wide_logits)
 
     def _masking(
         self,
@@ -1286,8 +1298,9 @@ class CausalSelfAttention(nn.Module):
             return checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                implementation=self.ctx.attention_impl, causal=causal, sliding_window=window,
-                mask=mask, bias=bias, sinks=sinks, softcap=self.ctx.attn_logit_softcap, segment_ids=documents,
+                implementation=self.ctx.attention_impl, wide_logits=self.ctx.wide_logits, causal=causal,
+                sliding_window=window, mask=mask, bias=bias, sinks=sinks, softcap=self.ctx.attn_logit_softcap,
+                segment_ids=documents,
                 block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held,
                 dropout_rate=self.ctx.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
                 deterministic=False), 'context')
@@ -1304,7 +1317,7 @@ class CausalSelfAttention(nn.Module):
             attention = checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                implementation=implementation, causal=causal,
+                implementation=implementation, wide_logits=self.ctx.wide_logits, causal=causal,
                 sliding_window=window, mask=mask, bias=bias, sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap, segment_ids=documents, max_segments=max_segments,
                 block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held),

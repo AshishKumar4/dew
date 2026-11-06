@@ -1,7 +1,8 @@
 """Serving for scoring: requests answered by forward passes over their rows, batched as they arrive.
 
-A scoring request reads no cache and draws nothing: a classifier's answer, a decision's, a reward or an
-embedding is a forward over its rows. `ScoringServer` queues such requests and runs one pass of the
+A scoring request reads no cache: a classifier's answer, a decision's, a reward or an embedding is a
+forward over its rows, and a text-to-image request a walk over its prompts whose draws are its own key's
+(`dew.inference.images.TextToImage.scoring`). `ScoringServer` queues such requests and runs one pass of the
 task's (`Scoring`) a `step`: the waiting rows oldest first, as many as the task says one pass holds
 (`Scoring.planned`), its compiled shapes bucketed so a compile is reused across passes. A request whose
 rows outrun one pass carries its rows not yet scored to the next step, and is answered once its last
@@ -20,9 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
-import threading
 import time
-from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -30,7 +29,7 @@ from typing import Protocol, runtime_checkable
 import jax
 
 from dew.batch import Variables
-from dew.inference.engine import Timed, normalized, reloaded, settled
+from dew.inference.engine import Timed, Waiting, normalized, reloaded, settled
 from dew.inference.tasks import held
 from dew.nn.inputs import mesh_of
 from dew.nn.protocols import StagedStacks
@@ -142,12 +141,15 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         weights."""
         self.mesh = mesh_of(placed)
         self._source_shapes = jax.tree_util.tree_flatten_with_path(jax.eval_shape(lambda: placed))[0]
-        self._queue: deque[_Request[Row, Payload, Output, Answer]] = deque()
-        self._ingress = threading.Lock()
-        """Orders a submission's append with a failure's sweep."""
-        self._failed: BaseException | None = None
+        self._waiting: Waiting[_Request[Row, Payload, Output, Answer]] = Waiting(
+            "the server stopped after a step failed")
+        """The requests waiting for a pass, or for the rest of their rows."""
         self.arrived: Callable[[], None] = _nothing
         """Called after each submission: an `Engine` serving this kind wakes to it."""
+        self.pooled = self.mesh is not None and not jax.sharding.NamedSharding(
+            self.mesh, jax.sharding.PartitionSpec()).is_fully_addressable
+        """Whether its weights' mesh spans several processes (`Kind.pooled`), which an `Engine`, stepping a
+        kind of one process, refuses."""
         self.programs: tuple[object, ...] = ()
         """The shapes of the programs compiled up front (`from_task`), one each."""
 
@@ -177,12 +179,12 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
 
     @property
     def queued(self) -> int:
-        return len(self._queue)
+        return len(self._waiting.queue)
 
     @property
     def busy(self) -> bool:
         """Whether a request waits for a pass, or for the rest of its rows."""
-        return bool(self._queue)
+        return bool(self._waiting.queue)
 
     def submit(self, request: Request) -> Timed[Answer]:
         """Queue one request and return its future answer. The task lays it out here, so a request it
@@ -190,12 +192,10 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         # Laid out by the task served now, which scores it with its weights, whatever reloads meanwhile.
         served = self._served
         waiting: _Request[Row, Payload, Output, Answer] = _Request(served[0].admit(request), served)
-        with self._ingress:
-            if self._failed is not None:
-                raise RuntimeError("the server stopped after a step failed") from self._failed
-            if waiting.scored.rows:
-                self._queue.append(waiting)
-        if not waiting.scored.rows:
+        if waiting.scored.rows:
+            self._waiting.append(waiting)
+        else:
+            self._waiting.check()
             # A request of no rows needs no pass: it is answered as it is admitted.
             waiting.future.set_running_or_notify_cancel()
             waiting.future.admitted = waiting.future.finished = time.perf_counter()
@@ -206,8 +206,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
 
     def step(self) -> None:
         """Run one pass over the waiting rows, and answer every request whose last row it scores."""
-        if self._failed is not None:
-            raise RuntimeError("the server stopped after a step failed") from self._failed
+        self._waiting.check()
         chosen = self._chosen()
         if not chosen:
             return
@@ -227,7 +226,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
                 raise
         now = time.perf_counter()
         for request, answer in zip(done, answers, strict=True):
-            self._queue.remove(request)
+            self._waiting.queue.remove(request)
             request.future.finished = now
             settled(request.future, answer)
 
@@ -239,7 +238,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         plan: PassPlan[Row] | None = None
         now = time.perf_counter()
         # The bounded prefix alone: a turn looks at no more than `rows` requests of the queue.
-        for request in list(itertools.islice(self._queue, self.rows)):
+        for request in list(itertools.islice(self._waiting.queue, self.rows)):
             if chosen and request.served is not chosen[0][0].served:
                 break
             task = request.served[0]
@@ -254,7 +253,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
                 # a reload, starts a plan of its own.
                 if request.taken == 0:
                     if not request.future.set_running_or_notify_cancel():
-                        self._queue.remove(request)
+                        self._waiting.queue.remove(request)
                         plan = plan if chosen else None
                         break
                     request.future.admitted = now
@@ -264,7 +263,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
 
     def run(self) -> None:
         """Step until no request waits."""
-        while self._queue:
+        while self._waiting.queue:
             self.step()
 
     def reload(self, task: Scoring[Request, Row, Payload, Output, Answer], variables: Variables) -> None:
@@ -292,11 +291,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
              ) -> None:
         """Stop serving after `failure`: every waiting request, and `taken`'s, settles with it, and a
         later submission or step is refused."""
-        with self._ingress:
-            self._failed = failure
-            waiting = list(dict.fromkeys([*taken, *self._queue]))
-            self._queue.clear()
-        for request in waiting:
+        for request in self._waiting.failed(failure, *taken):
             settled(request.future, failure)
 
 

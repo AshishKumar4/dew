@@ -1,12 +1,12 @@
 """Compile Pallas kernels for a GPU or a TPU on this CPU with the compiler the device itself runs: the CPU
 suite's first filter for declared kernel configs (tests/test_kernel_configs.py) and the template mainloops'
 resource gate (Mosaic GPU's shared and tensor memory and spills, `compile_mosaic_kernels`; libtpu's
-compile of a Mosaic TPU kernel within its stated VMEM, `compile_tpu_kernels`). XLA's CUDA backend (this
-jaxlib's CUDA plugin: the `kernel-compile` extra on a host with no GPU, a GPU host's own CUDA extra)
-compiles a program for a compile-only device of the generation, no GPU attached, through the Triton
-jaxlib bundles: so a kernel's shared bytes here are the bytes the GPU asks for, the GPU's own refusal
-included. A host without the plugin fails here rather than skip. A GPU's tests are the verdict on
-everything else.
+compile of a Mosaic TPU kernel within its stated VMEM, `compile_tpu_kernels`). XLA's CUDA backend (Dew's
+PJRT plugin, `jax-cuda12-pjrt` or `jax-cuda13-pjrt`: the `kernel-compile` extra's on a host with no GPU, a
+GPU host's own CUDA extra's) compiles a program for a compile-only device of the generation, no GPU
+attached, through the Triton it builds: so a kernel's shared bytes here are the bytes the GPU asks for, the
+GPU's own refusal included. A host without the plugin fails here rather than skip. A GPU's tests are the
+verdict on everything else.
 """
 
 import contextlib
@@ -147,13 +147,14 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
         # A kernel no binary carries is no compiled kernel, whatever its PTX's compile says.
         unread = tuple(field for field, read in (
             ("shared bytes", shared is not None and binary is not None and binary.shared is not None),
-            ("tensor memory columns", tmem), ("binary", binary)) if not read)
+            ("tensor memory columns", tmem), ("binary", binary),
+            ("machine code", binary is None or binary.sass is not None)) if not read)
         kernel, launch = report.kernel_of(name)
         found_reports.append(Report(
             kernel, binary.shared if binary is not None else None,
             sum(map(int, tmem.groups())) if tmem else None,
             None, None, unread, (modules or {}).get(name), launch,
-            sass=tuple(binary.sass) if binary is not None else ()))
+            sass=tuple(binary.sass or ()) if binary is not None else ()))
     return found_reports
 
 

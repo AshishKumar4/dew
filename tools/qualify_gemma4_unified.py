@@ -255,7 +255,8 @@ def main():
 
         count = seeds_for(as_given(lambda seed: observed(int(seed))),
                           lambda seed: (np.asarray(seed, np.int64),), args.site,
-                          start=args.start, most=args.most, truth_fn=lambda seed: truth(*draw(int(seed))))
+                          start=args.start, most=args.most,
+                          truth_fn=as_given(lambda seed: truth(*draw(int(seed)))))
         weights = hashlib.sha256((source / "model.safetensors").read_bytes()).hexdigest()
         config = hashlib.sha256((source / "config.json").read_bytes()).hexdigest()
     record = {"site": args.site, "seeds": count, "revision": git_head(ROOT),

@@ -49,7 +49,7 @@ from pathlib import Path
 
 import httpx
 
-from dew.cleanup import owned_group
+from dew._cleanup import owned_group
 from dew.interop.gateway import Gateway
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"

@@ -3,6 +3,7 @@ softmax over keys stated on whole operands, walked in key tiles through its deri
 two and merged, each held to the float64 truth (check 1) against the whole-operand function; and the
 declarations no monoid along the walk holds, refused."""
 
+import functools
 from collections.abc import Callable
 from typing import Literal
 
@@ -10,10 +11,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from check1_statistics import GateFailure
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import SATURATION, derive
+from dew.algebra import SATURATION, derive, forms as algebra_forms
 from dew.nn import precision
 
 QUERIES, KEYS, WIDTH, TILE = 16, 96, 32, 32
@@ -173,25 +175,136 @@ def test_the_derived_walk_computes_the_declared_function(name, walk):
 
 
 def test_a_walks_sums_added_by_its_mainloop_take_each_tiles_factor_and_sum():
-    """A mainloop that makes a walked sum's additions itself (`Derived.step`'s `add`, a compensated walk's
-    running sums) takes each tile's rescale factor and its tile's sum: added twice over, the softmax's
+    """A mainloop that makes a walked sum's additions itself (`Derived.step`'s `stepped`, a compensated walk's
+    running sums) takes each tile's rescale factor, its tile's sum and the terms it sums (`Added`), the other
+    reductions left to the forms: the terms summed and added twice over, the softmax's
     denominator doubles on every tile, and the walk's attention is the declared function's halved, on par
     against the float64 truth (check 1)."""
     forms = derive.derive(declared(attention), accurate=False, saturation=SATURATION)
 
-    def doubled(state, factor, summed):
-        return state * factor + 2 * summed
+    def doubled(states, parts):
+        return tuple(state * part.factor + 2 * jnp.sum(part.terms, axis=-1)
+                     if isinstance(part, algebra_forms.Added) else None
+                     for state, part in zip(states, parts, strict=True))
 
     def run(q, k, v):
         values = operands(q, k, v)
         tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
         state = forms.init(shaped(tiles[0]))
         for tile in tiles:
-            state = forms.step(state, tile, add=doubled)
+            state = forms.step(state, tile, stepped=doubled)
         return forms.finish(state, values, shapes=shaped(tiles[0]))
 
     assert_as_exact(jax.jit(run), jax.jit(lambda q, k, v: whole(attention)(q, k, v) / 2), draw,
                     "attention, its sums added twice", seeds=16)
+
+
+def test_a_walks_merge_by_its_mainloop_takes_each_sums_two_factors():
+    """A mainloop that merges two walks' sums itself (`Derived.merge`'s `merged`, a guarded walk's join of
+    shifts) takes each rescaled sum's two factors (`Merged`), the maximum left to the forms: the denominator's
+    merged twice over, the merged walk's attention is the declared function's halved, on par against the
+    float64 truth (check 1)."""
+    forms = derive.derive(declared(attention), accurate=False, saturation=SATURATION)
+    tiles = KEYS // TILE
+
+    def run(q, k, v):
+        values = operands(q, k, v)
+        shapes = shaped(tile_of(values, 0))
+        roles = [role for role, _ in forms.slots(shapes)]
+
+        def doubled(firsts, seconds, parts):
+            return tuple(2 * (first * part.first + second * part.second) if role == "sum" else None
+                         for role, first, second, part in zip(roles, firsts, seconds, parts, strict=True))
+
+        first = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2)])
+        second = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2, tiles)])
+        return forms.finish(forms.merge(first, second, values, shapes=shapes, merged=doubled), values,
+                            shapes=shapes)
+
+    assert_as_exact(jax.jit(run), jax.jit(lambda q, k, v: whole(attention)(q, k, v) / 2), draw,
+                    "attention, its sums merged twice", seeds=16)
+
+
+def held(q, k, v, rows, keys):
+    """Attention whose largest logit weighs exactly 1, its exponent held to 0 by a select (the accurate
+    form's weights over scaled logits, against a compiler's contraction of the scale into the subtraction)."""
+    del rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    m = jnp.max(s, axis=-1)
+    p = jnp.exp(jnp.where(s < m[:, None], s - m[:, None], 0.0))
+    return (p @ v) / jnp.sum(p, axis=-1)[:, None]
+
+
+def held_floored(q, k, v, rows, keys):
+    """The held form over each query's keys up to its own place, the first query seeing none, its maximum
+    floored at fp32's least finite value (`attention_algebra.softmax_of`'s), so that query weighs every key
+    0."""
+    seen = (keys[None, :] <= rows[:, None]) & (rows[:, None] > 0)
+    s = jnp.where(seen, (q @ k.T) * WIDTH ** -0.5, -jnp.inf)
+    safe = jnp.maximum(jnp.max(s, axis=-1), jnp.finfo(s.dtype).min)[:, None]
+    p = jnp.exp(jnp.where(s < safe, s - safe, 0.0))
+    return (p @ v) / jnp.where(jnp.sum(p, axis=-1) == 0, 1.0, jnp.sum(p, axis=-1))[:, None]
+
+
+def raw(q, k, v, rows, keys):
+    """Attention over its raw products, the scale taken after the subtraction (the accurate form's raw
+    logits: the largest's exponent exactly 0, whatever the scale)."""
+    del rows, keys
+    s = q @ k.T
+    m = jnp.max(s, axis=-1)
+    p = jnp.exp((s - m[:, None]) * SCALE)
+    return (p @ v) / jnp.sum(p, axis=-1)[:, None]
+
+
+SCALE = WIDTH ** -0.5
+
+
+def natural_exp(x, scale=1.0):
+    """An exponential of the declaration's own, of `x` times `scale`: `exp` by way of `exp2` (a launch's
+    lowering of it)."""
+    return jnp.exp2(x * np.float32(scale * np.log2(np.e)))
+
+
+def compensated_rescale(carried, now, scale=1.0):
+    """`exp((carried - now) scale)` with the subtraction's rounding carried to first order (TwoSum), as
+    attention's accurate form rescales a state."""
+    difference, error = precision.two_sum(carried, -now)
+    factor = natural_exp(difference, scale)
+    return jnp.where(jnp.isfinite(error), factor * (1.0 + error * scale), factor)
+
+
+@pytest.mark.parametrize("stated", ["held", "held floored", "declared numerics", "raw"])
+def test_an_accurate_declarations_own_forms_walk_as_its_function(stated):
+    """A declaration under the accurate numerics whose weights hold the largest to 1 by a select (against its
+    maximum, or that maximum floored where a query may see no key), or over raw products scaled after their
+    subtraction, its exponential carrying the scale, or which
+    states its own exponential and rescale (`Reduction.exponential`, `rescale`: attention's accurate
+    forward's), walked over every key tile by its derived step and finished: on par with the whole-operand
+    function against the float64 truth (check 1)."""
+    function = {"held": held, "held floored": held_floored, "declared numerics": attention,
+                "raw": raw}[stated]
+    numerics = {"declared numerics": {"exponential": natural_exp, "rescale": compensated_rescale},
+                "raw": {"exponential": natural_exp,
+                        "rescale": functools.partial(compensated_rescale, scale=SCALE)}}
+    declaration = derive.Reduction(function, AXES, walked="keys", exponent="e", **numerics.get(stated, {}))
+    forms = derive.derive(declaration, accurate=True, saturation=SATURATION)
+    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(function)), draw, f"{stated} walked",
+                    seeds=16)
+
+
+def test_a_declared_exponential_is_the_one_its_walk_computes_by():
+    """A declaration's exponential (`Reduction.exponential`) is what its derived walk computes its weights by:
+    one stated in bfloat16, its rescale in fp32 and its declaration's function computing in fp32, walks off
+    par with it (check 1 refuses the walk), where a walk that took JAX's own exponential would be on par."""
+    def rounded(x):
+        return jnp.exp(x.astype(jnp.bfloat16)).astype(jnp.float32)
+
+    declaration = derive.Reduction(attention, AXES, walked="keys", exponent="e", exponential=rounded,
+                                   rescale=lambda carried, now: jnp.exp(carried - now))
+    forms = derive.derive(declaration, accurate=True, saturation=SATURATION)
+    with pytest.raises(GateFailure):
+        assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(attention)), draw, "bfloat16 exponential",
+                        seeds=16)
 
 
 def unshifted(q, k, v, rows, keys):

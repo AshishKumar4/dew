@@ -196,6 +196,7 @@ def float64_block(block):
 
     wide = wide_block(block)
 
+    @as_given
     def run(hidden, valid):
         with float64(), torch.no_grad():
             out = wide(torch.from_numpy(np.asarray(hidden)), torch.from_numpy(np.asarray(valid)))[0]
@@ -412,6 +413,7 @@ def test_a_row_with_a_hole_pools_as_its_cache_does():
         valid[0, 3] = False
         return hidden, valid
 
+    @as_given
     def truth(hidden, valid):
         wide = module(dtype=jnp.float64).apply(widened(variables), hidden, call(valid))
         return {'output': on_valid_rows(wide, valid)}

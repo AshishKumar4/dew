@@ -95,10 +95,10 @@ seams: instructions: {
 
 seams: "tensor-commits": {
 	kind:    "choke-point"
-	purpose: "a Blackwell product's completion is committed by its bundle's Tensor or its template's product warp, the barrier its readers wait on"
+	purpose: "a Blackwell product's completion is committed by its bundle's Tensor, its issuer's Signal or its template's product warp, the barrier its readers wait on"
 	paths:   _src
 	type:    "jax.experimental.pallas.mosaic_gpu.tcgen05_commit*"
-	onlyIn:  ["Tensor.*", "_products", "_products.*"]
+	onlyIn:  ["Tensor.*", "Signal.*", "_products", "_products.*"]
 }
 
 seams: "language-model-config": {
@@ -139,6 +139,60 @@ seams: "scan-cells": {
 	declared: {
 		"(wgmma, training)":    "Nemotron-H's SSD training on an H100"
 		"(mma.sync, training)": "the SSD's training on an A100"
+	}
+}
+
+seams: "grouped-cells": {
+	kind:    "declared-set"
+	purpose: "each cell routes the grouped GEMM to an old route on a receipt that shows it faster than the template; the list only shrinks"
+	paths:   ["src/dew/nn/kernels/grouped_matmul.py"]
+	entries: "DECLARED"
+	declared: {
+		"(mma.sync, grouped input_gradient)": "Triton's grouped input gradient on an A100 (FSCELLS1-a100, FSCELLS2-a100)"
+		"(mma.sync, dense forward)":          "XLA's dense forward on an A100 (DENSE1)"
+		"(mma.sync, dense input_gradient)":   "XLA's dense input gradient on an A100 (DENSE1)"
+		"(mma.sync, dense kernel_gradient)":  "XLA's dense kernel gradient on an A100 (DENSE1)"
+		"(wgmma, grouped forward)":           "CUTLASS's grouped forward on an H100 (PAIR1-h100)"
+		"(wgmma, grouped input_gradient)":    "CUTLASS's grouped input gradient on an H100 (PAIR1-h100)"
+		"(wgmma, dense forward)":             "XLA's dense forward on an H100 (DENSE1)"
+		"(wgmma, dense input_gradient)":      "XLA's dense input gradient on an H100 (DENSE1)"
+		"(wgmma, dense kernel_gradient)":     "XLA's dense kernel gradient on an H100 (DENSE1)"
+	}
+}
+
+seams: "join-cells": {
+	kind:    "declared-set"
+	purpose: "each cell runs a join's projections as one GEMM on a device whose receipt shows the join faster"
+	paths:   ["src/dew/nn/joined.py"]
+	entries: "JOINED_FASTER"
+	declared: {
+		"(gate_up, sm80)":     "the gate and up projections joined on an A100 (dbf402f36)"
+		"(delta_gates, sm80)": "a delta net's gates joined on an A100 (e5198da4e)"
+		"(delta_gates, sm90)": "a delta net's gates joined on an H100 (e5198da4e)"
+	}
+}
+
+seams: "norm-cells": {
+	kind:    "declared-set"
+	purpose: "each cell routes the RMS norm to its fused kernel on a receipt that shows it faster than XLA's"
+	paths:   ["src/dew/nn/kernels/norm_swiglu.py"]
+	entries: "NORM_CELLS"
+	declared: {
+		"(sm80, bfloat16)": "the fused norm in bf16 on an A100 (FUSED_FASTER, 14a0df682)"
+		"(sm90, bfloat16)": "the fused norm in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
+		"(sm80, float16)":  "the fused norm in fp16 on an A100 (FP16_NORM_FASTER, FSNORM16)"
+		"(sm90, float16)":  "the fused norm in fp16 on an H100 (FP16_NORM_FASTER, FSNORM16)"
+	}
+}
+
+seams: "swiglu-cells": {
+	kind:    "declared-set"
+	purpose: "each cell routes the SiLU product to its fused kernel on a receipt that shows it faster than XLA's"
+	paths:   ["src/dew/nn/kernels/norm_swiglu.py"]
+	entries: "SWIGLU_CELLS"
+	declared: {
+		"(sm80, bfloat16)": "the fused SiLU product in bf16 on an A100 (FUSED_FASTER, 14a0df682)"
+		"(sm90, bfloat16)": "the fused SiLU product in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
 	}
 }
 
@@ -197,7 +251,7 @@ seams: "dump-flags": {
 seams: commands: {
 	kind:    "declared-set"
 	purpose: "each command is a verb of the dew CLI users' scripts call"
-	paths:   ["src/dew/cli/main.py"]
+	paths:   ["src/dew/_cli/main.py"]
 	entries: "COMMANDS"
 	declared: {
 		export:  "export a run's weights"
@@ -211,7 +265,7 @@ seams: commands: {
 seams: "data-commands": {
 	kind:    "declared-set"
 	purpose: "each command is a verb of dew data users' scripts call"
-	paths:   ["src/dew/cli/main.py"]
+	paths:   ["src/dew/_cli/main.py"]
 	entries: "DATA_COMMANDS"
 	declared: {
 		export:    "export a dataset"

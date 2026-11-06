@@ -206,13 +206,13 @@ class Session:
 @contextlib.contextmanager
 def session(command: Sequence[str], *, env: Mapping[str, str] | None = None) -> Iterator[Session]:
     """`command`, `[python, script, *arguments]`, started as a worker (`serve`): its script run under this
-    file (`bootstrap`) as a group its recorder owns (dew.cleanup's `owned_group`), whose lifeline kills it
+    file (`bootstrap`) as a group its recorder owns (dew._cleanup's `owned_group`), whose lifeline kills it
     if the recorder dies without unwinding, and `ask`ed through the `Session` the block holds. `env` is its
     environment, the recorder's where none is given, but for TMPDIR: the worker's temporary files are the
     session's, in a directory removed after the worker's group is stopped. However the block ends, an error
     among them, the group is stopped and reaped, its pipes closed and the directory removed, each step
     attempted whichever fail, the block's own error the one raised."""
-    from dew.cleanup import attempted, owned_group
+    from dew._cleanup import attempted, owned_group
 
     python, script, *arguments = command
     root = Path(tempfile.mkdtemp(prefix="reference-"))

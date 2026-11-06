@@ -23,8 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import assert_as_exact, chain_roundings
+from reference_error import assert_as_exact, assert_same_artifact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_text_encoders import transformers_clip
@@ -37,8 +36,7 @@ CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
 # The family parity contracts, read from the tests that hold Dew to these fixtures, not bounds fitted
 # to a CI CPU: test_moe.py (routers and expert sums), test_vae_16ch.py (raw encode/decode). The CLIP
-# towers' outputs are held as their own test holds them, to the reference's float64 run
-# (`transformers_clip`).
+# towers' outputs are held where they are consumed (tests/test_text_encoders.py).
 MOE_OUTPUTS = {
     "mixtral.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
     "deepseek.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
@@ -49,11 +47,8 @@ CLIP_OUTPUTS = ("last_hidden_state", "pooler_output", "text_embeds", "image_embe
 VAE_OUTPUTS = {"latent": VAE_TOLERANCE, "decoded": VAE_TOLERANCE}
 
 
-def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float],
-                          truth: dict[str, np.ndarray] | None = None) -> None:
-    """Only named arithmetic outputs use the family's fp32 parity bound, or, where `truth` gives
-    their float64 values, are held as exact as the committed float32 output from them
-    (tests/reference_error.py).
+def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float]) -> None:
+    """Only named arithmetic outputs use the family's fp32 parity bound.
 
     Seeds do not promise cross-platform bit identity for arithmetic:
     https://docs.pytorch.org/docs/2.14/notes/randomness.html
@@ -64,16 +59,12 @@ def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, f
     """
     with np.load(written) as ours, np.load(committed) as theirs:
         assert set(ours.files) == set(theirs.files)
-        truth = {} if truth is None else truth
-        assert numerical.keys() <= set(theirs.files) and truth.keys() <= set(theirs.files)
+        assert numerical.keys() <= set(theirs.files)
         for name in theirs.files:
             actual, expected = ours[name], theirs[name]
             assert actual.shape == expected.shape, name
             assert actual.dtype == expected.dtype, name
-            if name in truth:
-                assert_as_exact_as_the_reference(actual.astype(np.float64), expected.astype(np.float64),
-                                                 truth[name], name)
-            elif name in numerical:
+            if name in numerical:
                 assert np.isfinite(actual).all() and np.isfinite(expected).all(), name
                 difference = float(np.max(np.abs(actual - expected)))
                 assert difference < numerical[name], f"{name}: max error {difference:.3e}"
@@ -140,8 +131,9 @@ def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
-    """Exact checkpoint, tokenizer and pixels; both towers' outputs as exact as the committed ones,
-    both from the reference's float64 run."""
+    """Exact checkpoint, tokenizer and pixels, and the recorded outputs' names, shapes and dtypes; each
+    output an evaluation of transformers' float32 towers on those inputs (`assert_same_artifact`, an
+    artifact check against the float64 run, not a parity)."""
     import torch
 
     load("clip_reference").write_tiny(tmp_path)
@@ -149,9 +141,18 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
     committed = FIXTURES / "clip" / "tiny"
     assert_fixture_json(tmp_path, committed, "clip_reference")
     assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
-    with np.load(committed / "reference.npz") as inputs:
-        truth = transformers_clip(tmp_path, dict(inputs), torch.float64, CLIP_OUTPUTS)
-    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", {}, truth)
+    with np.load(tmp_path / "reference.npz") as ours, np.load(committed / "reference.npz") as theirs:
+        assert set(ours.files) == set(theirs.files) and set(CLIP_OUTPUTS) <= set(theirs.files)
+        for name in theirs.files:
+            assert (ours[name].shape, ours[name].dtype) == (theirs[name].shape, theirs[name].dtype), name
+            if name not in CLIP_OUTPUTS:
+                np.testing.assert_array_equal(ours[name], theirs[name], err_msg=name)
+        inputs = dict(theirs)
+        recomputed, wide = (transformers_clip(tmp_path, inputs, dtype, CLIP_OUTPUTS)
+                            for dtype in (torch.float32, torch.float64))
+        for name in CLIP_OUTPUTS:
+            assert_same_artifact(np.asarray(recomputed[name], np.float64),
+                                 np.asarray(theirs[name], np.float64), wide[name], name)
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +246,7 @@ LINES = [f"line {i}: the quick brown fox jumps over the lazy dog" for i in range
 def token_directory(tmp_path: Path) -> Path:
     """A byte-tokenized corpus, as the curve's documented producer writes it: `dew data export` over
     a text file's lines, each a document closed by EOS."""
-    from dew.cli.main import DataExport
+    from dew._cli.main import DataExport
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("".join(f"{line}\n" for line in LINES))
@@ -550,6 +551,29 @@ def test_layout_parity_reads_the_first_step_as_the_trainer_does():
     assert int(step.committed) == 5 and step.example_count == 4
 
 
+def test_layout_parity_reads_every_first_step_through_the_trainers(monkeypatch):
+    """The reference's audit, its float64 anchor and the anchor's loss each read the trainer's first step
+    (`first_step`, ledger 3057, 3092) over the state they judge, which the test above holds to the
+    trainer's: a site that built its Step by hand would pass by it, and is caught here."""
+    tool = load("layout_parity")
+    read = []
+    first_step = tool.first_step
+
+    def spied(state, variables, ema, batch):
+        read.append(int(state.updates))
+        return first_step(state, variables, ema, batch)
+
+    monkeypatch.setattr(tool, "first_step", spied)
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        tool.Judge(reference, tool.References(Path(directory)), "jepa").audit()
+        tool.Anchor(reference, "jepa")
+        state, _, _ = tool._trainer(reference, {}, one_device=True).place()
+        tool.anchor_loss(reference, tool.drawn_batch(reference, 0), state.replace(
+            updates=jnp.asarray(5, jnp.int32)))
+    assert read == [0, 0, 5]
+
+
 def test_layout_parity_holds_every_arm_to_the_references_sample():
     """An arm that drew and started from the reference's values, at every example, is coupled to it; one
     whose draw is transformed for one example, or that records a name the reference does not, is
@@ -642,11 +666,11 @@ def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
     """A prepare run with a window of two draws keeps both draws of every check-1 seed and of its
     redraw's (`REDRAW`): a run reading those references finds the reference and the float64 anchor of
     the last draw a windowed check reads, and none past it."""
-    from reference_error import REDRAW
+    from check1_wire import staged_units
 
     tool = load("layout_parity")
     _, reference = tool.model_case("jepa", "float32", {}, {})
-    last = (1 + REDRAW) * 2 * 2 - 1
+    last = staged_units(2) * 2 - 1
     with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
         prepare = tool.References(Path(directory), prepare=True)
         assert tool.prepared(["jepa"], dtype="float32", seeds=2, windows=2, mixture={}, objective={},
@@ -1927,6 +1951,73 @@ def test_a_mosaic_gpu_kernel_outside_the_launch_point_is_reported(tmp_path):
     point = "from jax.experimental.pallas import mosaic_gpu as plgpu\nbuild = plgpu.kernel\n"
     assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
     assert _linted(tmp_path / "suite", {"tests/test_bundle.py": bundle, "tools/bundle.py": bundle}) == []
+
+
+def test_each_form_of_a_custom_derivative_is_a_seam():
+    """SLOP028's scan (`derivative_seams`) on each form a seam takes, and what makes it: a decorator, one
+    within functools.partial, an assignment of a call, an annotated one, a nested function's, a
+    linear_tangent call within an expression, a surrogate's declaration, assigned or decorating, a
+    declaring builder's, its kind read from its first argument, and a maker's call returned and called
+    at once or passed on (row 4450); a plain function is none."""
+    import ast
+
+    rules = load("lint_derivatives")
+    text = (
+        "import functools\nimport jax\n"
+        "@jax.custom_jvp\ndef a(x): return x\n"
+        "@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))\ndef b(x, n): return x\n"
+        "c = jax.custom_jvp(lambda x: x)\n"
+        "d: Callable = jax.custom_vjp(lambda x: x)\n"
+        "def outer(x):\n    @jax.custom_vjp\n    def inner(x): return x\n    return inner(x)\n"
+        "def tangent(x):\n    return linear_tangent(f, g, h)(x)\n"
+        "e = surrogate(lambda x: x, lambda primals, tangents, value: tangents[0])\n"
+        "@functools.partial(surrogate, derivative=lambda primals, tangents, value: tangents[0])\n"
+        "def f(x): return x\n"
+        "g = declared_derivative(Surrogate(), p, forward, backward)\n"
+        "h = derivatives.declared_tangent(derivatives.Protected(), p, rule, nondiff_argnums=(1,))\n"
+        "@functools.partial(declared_tangent, KernelGlue(), tangent=rule)\n"
+        "def k(x): return x\n"
+        "def returned(x):\n    return surrogate(f, g)(x)\n"
+        "nested = functools.partial(functools.partial(jax.custom_jvp, nondiff_argnums=(1,)))(f)\n"
+        "tangent_partial = functools.partial(linear_tangent(f, g, h))\n"
+        "wrapped = contracted('test_ok')(functools.partial(jax.custom_jvp(p)))\n"
+        "def passed(p):\n    return wrap(jax.custom_jvp(p))\n"
+        "def plain(x): return x\n")
+    found = [seam for seam, _, _, _ in rules.derivative_seams("m.py", ast.parse(text))]
+    assert len(found) == len(set(found)), f"a seam counted twice: {found}"
+    assert {seam: maker for seam, maker, _, _ in rules.derivative_seams("m.py", ast.parse(text))} == {
+        "m.py::a": "custom_jvp", "m.py::b": "custom_vjp", "m.py::c": "custom_jvp", "m.py::d": "custom_vjp",
+        "m.py::outer.inner": "custom_vjp", "m.py::tangent.linear_tangent": "linear_tangent",
+        "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "declared_derivative:Surrogate",
+        "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue",
+        "m.py::returned.surrogate": "surrogate", "m.py::passed.custom_jvp": "custom_jvp",
+        "m.py::nested": "custom_jvp", "m.py::linear_tangent": "linear_tangent", "m.py::wrapped": "custom_jvp"}
+
+
+def test_a_custom_derivative_without_its_contract_is_reported(tmp_path):
+    """SLOP028: in `src/<package>`, a custom derivative with no `contracted(test)` at its seam, or one
+    naming no test function of tests/test_contracts_*.py or one two of those files define, is reported;
+    each form declared with a contract its checkout holds once is not, nor a seam in the tests or the
+    tools."""
+    contracts = "def test_a_seam_holds(): pass\ndef test_twice(): pass\n"
+    seams = ("import functools\nimport jax\n"
+             "from sparx.nn.derivatives import contracted, linear_tangent, surrogate\n"
+             "@jax.custom_jvp\ndef bare(x): return x\n"
+             "@contracted('test_a_missing_one')\n@jax.custom_jvp\ndef unknown(x): return x\n"
+             "@contracted('test_twice')\n@jax.custom_jvp\ndef shared(x): return x\n"
+             "@contracted('test_a_seam_holds')\n@jax.custom_vjp\ndef held(x): return x\n"
+             "wrapped = contracted('test_a_seam_holds')(surrogate(f, g))\n"
+             "plain = surrogate(f, g)\n"
+             "def step(x):\n"
+             "    return contracted('test_a_seam_holds')(linear_tangent(f, g, h))(x)\n"
+             "def loose(x):\n    return linear_tangent(f, g, h)(x)\n")
+    files = {"tests/test_contracts_seams.py": contracts, "src/sparx/nn/seams.py": seams,
+             "tests/test_contracts_more.py": "def test_twice(): pass\n"}
+    assert [found for found in _linted(tmp_path / "source", files) if found[2] == "SLOP028"] == [
+        ("src/sparx/nn/seams.py", line, "SLOP028") for line in (5, 8, 11, 16, 20)]
+    suite = {"tests/test_contracts_seams.py": contracts, "tests/test_seams.py": seams,
+             "tools/seams.py": seams}
+    assert [found for found in _linted(tmp_path / "suite", suite) if found[2] == "SLOP028"] == []
 
 
 def test_an_outer_program_built_outside_the_compile_point_is_reported(tmp_path):

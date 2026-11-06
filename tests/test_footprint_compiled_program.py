@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from dew.nn.programs import called
 from dew.training.compiled_program import compiled, deviceless, lowering_platform
 from dew.training.footprint import Workspace, gemm_workspace, gradient_peak, peak_bytes
 
@@ -83,6 +84,52 @@ def test_a_called_program_holds_what_it_would_inline(case):
         assert peak(called) == held
 
 
+def test_a_program_held_by_many_equations_is_compiled_once_and_holds_what_it_did():
+    """A body traced once and run by many equations (a layer's checkpoint called again and again) is
+    compiled once a call (`compiled`'s `made`), each equation inlining it afresh, and the program compiled
+    so holds what the same layers inline hold: a Qwen3.5-4B step's gradient compiled 90,259 programs,
+    eight of its derivation's sixteen seconds a candidate (row 4261)."""
+    checkpointed = jax.checkpoint(lambda h, w: jnp.tanh(h @ w))
+
+    def layers(layer):
+        def run(h, weights):
+            for w in weights:
+                h = layer(h, w)
+            return jnp.sum(h)
+        return run
+
+    class Stores(dict):
+        """A memo that counts each program's stores."""
+
+        def __init__(self):
+            super().__init__()
+            self.stores: dict[int, int] = {}
+
+        def __setitem__(self, key, value):
+            self.stores[key] = self.stores.get(key, 0) + 1
+            super().__setitem__(key, value)
+
+    weights = [jax.ShapeDtypeStruct((64, 64), jnp.float32)] * 8
+    rows = jax.ShapeDtypeStruct((16, 64), jnp.float32)
+    program = jax.make_jaxpr(jax.grad(layers(checkpointed)))(rows, weights).jaxpr
+    bodies = [body for equation in program.eqns if (body := called(equation)) is not None]
+    assert len(bodies) >= 8 and len({id(body) for body in bodies}) < len(bodies)
+    class Unheld(dict):
+        """A memo that holds nothing: each program compiled where it is met."""
+
+        def get(self, key, default=None):
+            return default
+
+    made = Stores()
+    once = compiled(program, "cuda", made)
+    assert set(made.stores.values()) == {1}
+    each = compiled(program, "cuda", Unheld())
+    assert [equation.primitive for equation in once.eqns] == [equation.primitive for equation in each.eqns]
+    defined = [out for equation in once.eqns for out in equation.outvars]
+    assert len(set(map(id, defined))) == len(defined)
+    assert peak_bytes(once, "gpu", Workspace(0, 0)) == peak_bytes(each, "gpu", Workspace(0, 0))
+
+
 def test_a_shard_map_over_one_device_holds_what_it_would_inline():
     """A `shard_map` whose manual axes are all of size one is its body inline in the program XLA compiles
     (`_shard_map_lowering_shardy`, jax/_src/shard_map.py: no manual computation is made), so a gradient
@@ -112,6 +159,37 @@ def test_a_shard_map_over_one_device_holds_what_it_would_inline():
         workspace = Workspace(size, size)
         assert gradient_peak(mapped, params, (rows,), platform="gpu", workspace=workspace) == gradient_peak(
             through(layer), params, (rows,), platform="gpu", workspace=workspace)
+
+
+def test_a_loop_of_one_turn_holds_what_its_body_inline_does():
+    """A scan of one turn is its body run inline in the program XLA compiles, which removes a loop of one
+    trip (`TryRemoveWhileLoop`, xla/service/while_loop_simplifier.cc): what the loop read from memory, its
+    zero carry and the weights it casts outside it, its body's own equations fuse, its stacked operand read
+    as its one slice and its stacked result that slice's stack. A tiled head whose rows are one tile was
+    derived holding both beside the loop: Qwen3.5-4B's fused tiled head at four microbatches, 14.4 GiB of
+    temporaries against XLA's 8.1 (row 4089)."""
+    weights = jax.ShapeDtypeStruct((1024, 4096), jnp.float32)
+    rows = jax.ShapeDtypeStruct((1, 64, 1024), jnp.bfloat16)
+
+    def turn(narrow):
+        def run(gradient, tile):
+            logits = (tile @ narrow).astype(jnp.float32)
+            return gradient + tile.T.astype(jnp.float32) @ logits, jnp.sum(logits, axis=-1)
+        return run
+
+    def scanned(weights, rows):
+        return jax.lax.scan(turn(weights.astype(jnp.bfloat16)), jnp.zeros(weights.shape, jnp.float32), rows)
+
+    def inline(weights, rows):
+        gradient, sums = turn(weights.astype(jnp.bfloat16))(jnp.zeros(weights.shape, jnp.float32),
+                                                            jax.lax.squeeze(rows, (0,)))
+        return gradient, jax.lax.reshape(sums, (1, *sums.shape))
+
+    def peak(function):
+        return peak_bytes(compiled(jax.make_jaxpr(function)(weights, rows).jaxpr, "cuda"), "gpu",
+                          Workspace(0, 0))
+
+    assert peak(scanned) == peak(inline)
 
 
 def test_a_pallas_kernel_holds_what_its_lowering_holds():
@@ -208,7 +286,10 @@ def test_a_compile_only_gpus_gemm_holds_the_workspace_its_deviceless_compile_giv
     from dew.training.ahead import compile_only_gpus
 
     (gpu,) = compile_only_gpus(generation, 1, 1 << 30)
-    weights, rows = jax.ShapeDtypeStruct((64, 64), jnp.float32), jax.ShapeDtypeStruct((512, 64), jnp.float32)
+    # A gradient larger than the product its operand is computed from, which that operand's fusion frees
+    # (`dying`), so the gradient's product, its workspace beside it, is the step's peak.
+    weights = jax.ShapeDtypeStruct((1024, 64), jnp.float32)
+    rows = jax.ShapeDtypeStruct((512, 1024), jnp.float32)
 
     def loss(weights, rows):
         return jnp.sum((rows @ weights) ** 2), ()

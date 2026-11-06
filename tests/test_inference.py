@@ -19,6 +19,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import STUB_TEXT
+from reference_error import assert_computes_the_oracle
 from steady_state import steady_state
 
 import dew
@@ -141,12 +142,14 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
     every level's centre, every tie between two levels, the float32
     neighbours either side of each, and values past the range (both round
     half to even in float32, so both miss exact rounding on the same 191
-    near-tie inputs). `unit_range` holds the float64 rule against
-    `pil_to_numpy`'s division and `normalize` over all 256 bytes (3.7e-8
-    against 2.7e-8 rms)."""
+    near-tie inputs). `unit_range` is every byte's value in [-1, 1]
+    correctly rounded, one IEEE division of an exact difference (`divided`),
+    where `pil_to_numpy`'s division and `normalize` round twice."""
+    from fractions import Fraction
+
     import torch
     from diffusers.image_processor import VaeImageProcessor
-    from one_draw import assert_as_exact_as_the_reference
+    from op_certificates import FLOAT32, fraction_rounded
 
     processor = VaeImageProcessor()
     levels = np.arange(256, dtype=np.float64)
@@ -160,8 +163,12 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
     np.testing.assert_array_equal(ours, theirs)
 
     data = np.arange(256, dtype=np.uint8)
-    normalized = processor.normalize(torch.from_numpy(data.astype(np.float32) / 255.0)).numpy()
-    assert_as_exact_as_the_reference(np.asarray(unit_range(data)), normalized, data / 127.5 - 1, "unit_range")
+    exact = [Fraction(2 * int(byte) - 255, 255) for byte in data]
+    rounded = np.asarray([fraction_rounded(value, FLOAT32) for value in exact], np.float32)
+    np.testing.assert_array_equal(np.asarray(unit_range(data)), rounded)
+    # Diffusers' map is the same function: its float64 run within float64's rounding of the exact values.
+    normalized = processor.normalize(torch.from_numpy(data.astype(np.float64) / 255.0)).numpy()
+    assert_computes_the_oracle(normalized, np.asarray(list(map(float, exact))), "normalize", roundings=3)
 
     padded = np.concatenate([pixels, pixels, np.full_like(pixels, -1)], axis=0)
     pictures = Images(jnp.asarray(padded), rows=2).pil()
@@ -664,6 +671,62 @@ def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
         np.testing.assert_array_equal(there.tokens, here.tokens, err_msg=str(spec))
 
 
+LAYOUT_SEEDS = 128
+"""The layout sites' declared seeds, sized by `seeds_for` paired with each layout's draw on armada's CPUs:
+128 for every layout (fsdp-stage's on two machines, the others' on one), a sizing that took 17 to 55 s of
+each case's run when the case sized itself (row 4341)."""
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [{"sequence": 2}, {"fsdp": 2, "stage": 2}, {"tensor": 2, "sequence": 2}],
+                         ids=["sequence", "fsdp-stage", "tensor-sequence"])
+def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path, spec):
+    """A trained decoder placed on each layout the trainer runs, a sequence axis, a pipeline's stage axis
+    and their products, draws what it draws on one device, on par with that draw against its float64
+    twin (check 1); a server on the layout serves what a call draws (ledger 1817)."""
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact
+
+    from dew.inference import Server
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run, ema_decay=None, fields={"num_layers": 2})
+    layout = Layout(min_shard=1, tolerance=1.0)
+    sampling = Sampling(temperature=1.0, eos_token_ids=255)
+    devices = jax.devices()[:4]
+    alone = dew.pipeline(str(run), mesh=MeshSpec().build(devices[:1]), layout=layout)
+    placed = dew.pipeline(str(run), mesh=MeshSpec(**spec).build(devices), layout=layout)
+    wide = dataclasses.replace(alone, model=alone.model.clone(dtype=jnp.float64),
+                               variables=widened(alone.variables))
+
+    def draw(seed):
+        return (np.asarray([2 * seed, 2 * seed + 1]),)
+
+    def drawn(task, dtype="float32"):
+        @as_given
+        def likelihoods(keys):
+            with jax.enable_x64(new_val=dtype == "float64"):
+                return tuple(task("the ", 4, key=int(key), sampling=sampling).host().raw_log_probs
+                             for key in keys)
+
+        return likelihoods
+
+    @as_given
+    def served(keys):
+        tickets = [server.submit("the ", 4, key=int(key)) for key in keys]
+        server.run()
+        return tuple(ticket.result().host().raw_log_probs for ticket in tickets)
+
+    label = f"sampled on {spec}"
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=LAYOUT_SEEDS,
+                    truth_fn=drawn(wide, "float64"))
+    server = Server.from_task(dataclasses.replace(placed, sampling=sampling), slots=2, capacity=16)
+    assert_as_exact(served, drawn(alone), draw, label, seeds=LAYOUT_SEEDS, truth_fn=drawn(wide, "float64"))
+
+
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     """A just-trained state is the pipeline: the averaged weights when the
     objective keeps them, the live ones on request, the objective's own
@@ -886,6 +949,102 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
 
 
 @pytest.mark.mesh
+def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
+    """A text-to-image task served by a `ScoringServer` (`TextToImage.scoring`), as an `Engine` serves it
+    beside other kinds: requests alike share a pass up to its six images, a request of another prompt
+    count or other settings (its steps, its negative prompt) walks in a pass of its own, one prepared
+    under a key and step count apart from its walk's among them, and each request's images are those
+    its lone call draws under its keys and settings, on par with that call
+    against the float64 pipeline over the same prepared noise and conditions (check 1)."""
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.inference import ImageRequest, ScoringServer
+
+    make_run(tmp_path)
+    pipe = TextToImage.from_run(str(tmp_path))
+    requests = ({"prompts": ("a water lily", "a sunflower")}, {"prompts": ("a rose", "a tulip")},
+                {"prompts": ("a water lily", "a sunflower")}, {"prompts": ("a daisy",)},
+                {"prompts": ("an iris", "a lotus"), "steps": 4, "negative": "blurry", "prepare_steps": 2})
+    # The third request is the first again, under the first's key; the last's noise is prepared under a
+    # key of its own, apart from its walk's.
+    again, apart = 2, 1000
+    server = ScoringServer.from_task(*pipe.scoring(steps=3, guidance=2.0, images=6))
+    wide = dataclasses.replace(pipe, model=pipe.model.clone(dtype=jnp.float64),
+                               variables=widened(pipe.variables))
+
+    def draw(seed):
+        keys = np.arange(len(requests)) + len(requests) * seed
+        keys[again] = keys[0]
+        return (keys,)
+
+    def preparing(request, key):
+        """The key and steps the request's noise and conditions are prepared under."""
+        if "prepare_steps" not in request:
+            return key, request.get("steps", 3)
+        return key + apart, request["prepare_steps"]
+
+    def prepared(request, key):
+        """The request's lone call's inputs and its settings."""
+        prepare_key, prepare_steps = preparing(request, key)
+        return (pipe.prepare(list(request["prompts"]), key=prepare_key, steps=prepare_steps,
+                             unconditional=request.get("negative")),
+                {"steps": request.get("steps", 3), "guidance": 2.0})
+
+    @as_given
+    def served(keys):
+        futures, streamed = [], {index: [] for index in range(len(requests) - 1)}
+        for index, (request, key) in enumerate(zip(requests, keys, strict=True)):
+            prepare_key, prepare_steps = preparing(request, int(key))
+            # Every request but the last streams its walk: each step's number and rows' clean predictions.
+            on_step = None if index not in streamed else (
+                lambda step, rows, held=streamed[index]: held.append((step, np.array(rows))))
+            futures.append(server.submit(ImageRequest(**{**request, "prepare_steps": prepare_steps},
+                                                      key=int(key), prepare_key=prepare_key,
+                                                      on_step=on_step)))
+        server.run()
+        admitted = [future.admitted for future in futures]
+        assert admitted[0] == admitted[1] == admitted[2] and len(set(admitted[2:])) == 3
+        # A walk's solver steps between its grid's points; the closing denoise is no step. Each stream is
+        # whole before its request is answered, and its own: the request repeated beside the first in its
+        # pass streams the first's predictions, the second another's.
+        walked = list(range(1, len(pipe.process.times(3))))
+        for held, rows in zip(streamed.values(), (2, 2, 2, 1), strict=True):
+            assert [step for step, _ in held] == walked and {latent.shape[0] for _, latent in held} == {rows}
+        for (_, first), (_, second), (_, repeated) in zip(streamed[0], streamed[1], streamed[again],
+                                                          strict=True):
+            np.testing.assert_array_equal(repeated, first)
+            assert not np.array_equal(second, first)
+        return tuple(future.result().host().images for future in futures)
+
+    @as_given
+    def alone(keys):
+        images = []
+        for request, key in zip(requests, keys, strict=True):
+            inputs, settings = prepared(request, int(key))
+            images.append(pipe(inputs, **settings, key=int(key)).host().images)
+        return tuple(images)
+
+    @as_given
+    def truth(keys):
+        images = []
+        for request, key in zip(requests, keys, strict=True):
+            inputs, settings = prepared(request, int(key))
+
+            def real(leaf, count=inputs.rows):
+                """A prepared leaf's real rows, on the host: the mesh pads them to its devices."""
+                return np.asarray(leaf) if leaf.shape[0] == 1 else np.asarray(leaf)[:count]
+
+            held = widened(jax.tree.map(real, inputs))
+            with jax.enable_x64(new_val=True):
+                images.append(wide(held, **settings, key=int(key)).host().images)
+        return tuple(images)
+
+    label = "served images"
+    count = seeds_for(alone, draw, label, truth_fn=truth, dew_fn=served)
+    assert_as_exact(served, alone, draw, label, seeds=count, truth_fn=truth)
+
+
 def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     """Placed under the trainer's layout, the weights shard over the mesh,
     prompts split over its batch axes, the result keeps that sharding, and
@@ -904,6 +1063,58 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     assert result.rows == 3
     np.testing.assert_allclose(result.host().images, plain(["a", "b", "c"], steps=3, key=7).host().images,
                                atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [{"tensor": 2}, {"sequence": 2}, {"fsdp": 2, "stage": 2}],
+                         ids=["tensor", "sequence", "fsdp-stage"])
+def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path, spec):
+    """A trained text-to-image run placed on each layout the trainer runs, a tensor axis, a sequence axis
+    and a pipeline's stage axis with FSDP, draws the images it draws on one device, called and served
+    (`TextToImage.scoring`), on par with one device against its float64 twin over the same prepared noise
+    and conditions (check 1) (ledger 1817)."""
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.inference import ImageRequest, ScoringServer
+    from dew.training import Layout, MeshSpec
+
+    make_run(tmp_path)
+    devices = jax.devices()[:4]
+    layout = Layout(min_shard=1, tolerance=1.0)
+    alone = dew.pipeline(str(tmp_path), mesh=MeshSpec().build(devices[:1]), layout=layout)
+    placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(**spec).build(devices), layout=layout)
+    server = ScoringServer.from_task(*placed.scoring(steps=3, images=2))
+    wide = dataclasses.replace(alone, model=alone.model.clone(dtype=jnp.float64),
+                               variables=widened(alone.variables))
+    prompts = ["a", "b"]
+
+    def draw(seed):
+        return (np.asarray([seed]),)
+
+    def drawn(task):
+        @as_given
+        def images(keys):
+            return task(prompts, steps=3, key=int(keys[0])).host().images
+
+        return images
+
+    @as_given
+    def served(keys):
+        answer = server.submit(ImageRequest(prompts, int(keys[0]), steps=3))
+        server.run()
+        return answer.result().host().images
+
+    @as_given
+    def truth(keys):
+        held = widened(alone.prepare(prompts, key=int(keys[0]), steps=3))
+        with jax.enable_x64(new_val=True):
+            return wide(held, steps=3, key=int(keys[0])).host().images
+
+    label = f"images on {spec}"
+    count = seeds_for(drawn(alone), draw, label, truth_fn=truth, dew_fn=drawn(placed))
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=truth)
+    assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=truth)
 
 
 def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajectory(tmp_path):

@@ -9,7 +9,8 @@ from typing import Any
 import jax
 import jax.extend.core as jax_core
 
-from dew.nn.programs import CALLS, CUMULATIVE, ENTRYWISE, REDUCTIONS, jax_name
+from dew.nn.derivatives import contracted
+from dew.nn.programs import CALLS, CUMULATIVE, ENTRYWISE, REDUCTIONS, equations, jax_name
 
 
 class Untransposable(NotImplementedError):
@@ -134,6 +135,7 @@ def _custom(eqn, *operands, **params):
         raise Untransposable(f"a {eqn.primitive.name} whose program or derivative reads an axis or a "
                              "constant tile")
 
+    @contracted("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order")
     @jax.custom_vjp
     def held(*values):
         return _run(primal.jaxpr, primal.consts, values)
@@ -167,6 +169,7 @@ def _held_jvp(primal, call, traced: list, floating: list[int]) -> Callable:
                                   for program in (primal, tangents)):
         raise Untransposable("a custom_jvp_call whose program or derivative reads an axis or a constant tile")
 
+    @contracted("test_a_transposed_hooks_custom_derivative_holds_every_order")
     @jax.custom_jvp
     def held(*values):
         return _run(primal.jaxpr, primal.consts, values)
@@ -181,14 +184,10 @@ def _held_jvp(primal, call, traced: list, floating: list[int]) -> Callable:
 
 def _tiles_in(closed) -> bool:
     """Whether a closed program holds a constant tile, among its constants or its operations' literals, its
-    nested programs' too."""
-    def literal_tiles(jaxpr: jax_core.Jaxpr) -> bool:
-        return any(isinstance(var, jax_core.Literal) and _rank(var) == 2
-                   for eqn in jaxpr.eqns for var in eqn.invars) or any(
-            literal_tiles(inner) for eqn in jaxpr.eqns for inner in jax_core.jaxprs_in_params(eqn.params))
-
+    nested programs' too (`dew.nn.programs.equations`)."""
     return (any(len(getattr(value, "shape", ())) == 2 for value in closed.consts)
-            or literal_tiles(closed.jaxpr))
+            or any(isinstance(var, jax_core.Literal) and _rank(var) == 2
+                   for eqn in equations(closed.jaxpr) for var in eqn.invars))
 
 
 def entrywise(eqn) -> bool:

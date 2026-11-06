@@ -18,10 +18,10 @@ import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, get_callable_args
 
+from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
-from dew.algebra.terms import Region, Term, integer, key, text
-from dew.cache import ALGEBRA
+from dew.algebra.terms import RESCALE, Region, Term, integer, key, text
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
 from dew.nn.kernels.templates.cost import Work
@@ -111,6 +111,9 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         elements = made(graph, args[:1], held)
         special = text(args[1]) in EXPONENTIALS
         return Work(exponentials=elements) if special else Work(operations=elements)
+    if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == RESCALE:
+        # A declaration's own rescale of two anchors (`derive.Reduction.rescale`): an exponential an element.
+        return Work(exponentials=made(graph, (args[0], args[2]), held))
     if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == CONTRACTED["mul"]:
         # Its reader's fused multiply-add computes it (`rules._contracted`).
         return Work()

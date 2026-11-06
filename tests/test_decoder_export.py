@@ -96,11 +96,13 @@ from lane_environment import outside_suite
 from flax import linen as nn
 from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
-from model_support import cached_round_trips, flat_tree, prediction_logits, streamed_export
+from model_support import cached_round_trips, encoded_form, flat_tree, prediction_logits, streamed_export
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     ORDERS,
+    as_given,
+    assert_as_exact,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
@@ -561,11 +563,16 @@ def test_a_failed_export_ends_with_its_own_error(tmp_path):
     assert run.returncode == 1, run.stderr[-2000:]
 
 
+FULL_ROTARY_SEEDS = 8
+"""The full-width rotary export's declared check-1 seeds against transformers' reading of it, sized by
+`seeds_for` paired."""
+
+
 def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it(tmp_path):
     """A Qwen3 decoder built with `partial_rotary_factor=1.0` rotates its whole head, as with none
     stated: written from the model and its variables alone (`PretrainedDecoder.from_model`), it
-    saves, reloads to its own logits, and transformers reads the export to logits Dew's are as
-    exact as, both from transformers' in float64."""
+    saves, reloads to its own logits, and transformers reads the export: over drawn rows Dew's logits
+    are on par with transformers' from its float64 run's (check 1)."""
     import jax.numpy as jnp
     import torch
     from transformers import AutoModelForCausalLM
@@ -582,15 +589,26 @@ def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, jnp.asarray(ids))),
                                   expected)
 
-    def theirs(dtype):
+    def read(dtype):
         with float64() if dtype == torch.float64 else torch.no_grad():
-            reference = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
-            with torch.no_grad():
-                logits = reference.to(dtype).eval()(torch.from_numpy(ids).long(), use_cache=False).logits
-        return logits.double().numpy()
+            read = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
+            return read.to(dtype).eval()
 
-    assert_as_exact_as_the_reference(expected.astype(np.float64), theirs(torch.float32),
-                                     theirs(torch.float64), "full-width rotary export logits")
+    narrow, wide = read(torch.float32), read(torch.float64)
+
+    def theirs(reference):
+        @as_given
+        def logits(tokens):
+            with float64() if reference is wide else torch.no_grad(), torch.no_grad():
+                return reference(torch.from_numpy(np.asarray(tokens)).long(), use_cache=False).logits.numpy()
+        return logits
+
+    def draw(seed):
+        rng = np.random.default_rng([0x1563, seed])
+        return (rng.integers(0, model.vocab_size, ids.shape).astype(np.int32),)
+
+    assert_as_exact(jax.jit(lambda tokens: model.apply(loaded.variables, tokens)), theirs(narrow), draw,
+                    "full-width rotary export logits", seeds=FULL_ROTARY_SEEDS, truth_fn=theirs(wide))
 
 
 def test_a_policy_transformers_cannot_hold_is_refused_not_dropped():
@@ -703,7 +721,7 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
     config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
     quantization = source_quantization(config)
     assert quantization is not None
-    source = quantization.requantize(tensors, (name,))
+    source = encoded_form(quantization, tensors, (name,))
     save_hf_layout(source, config, tmp_path / "fp8")
     loaded = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference")
     assert loaded.quantized_tensors == (name,)
@@ -719,7 +737,7 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
                                    load_shards(tmp_path / "export"))
     dense = {stored.removeprefix(bare): tensor for stored, tensor in
              dataclasses.replace(loaded, config=plain, quantized_tensors=()).export(updated).items()}
-    expected = quantization.requantize(dense, (name,))
+    expected = encoded_form(quantization, dense, (name,))
     exported = load_shards(tmp_path / "export")
     assert json.loads((tmp_path / "export" / "config.json").read_text()) == config
     assert set(exported) == set(expected) == set(source)
@@ -730,6 +748,72 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
     reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
     decoded = Pretrained.load(tmp_path / "decoded", dtype="float32", attention_impl="reference")
     assert_restores(decoded.model, decoded.variables, reloaded, np.load(FIXTURES / fixture / "input_ids.npy"))
+
+
+def test_a_quantized_export_encodes_each_weight_as_it_is_read_against_its_stored_tensors(tmp_path):
+    """A quantized source's export is a table built as it is read (row 4316): building it over parameters
+    whose values are gone reads none of them, the family's spelled encoder included, its specs its
+    source's stored tensors, and only a read finds them gone. The format's table
+    (`SourceQuantization.requantize`) reads and encodes no weight before a writer reads one of its
+    tensors, each weight's group once however its tensors are read (the weight twice before its scale,
+    from several threads); a weight whose geometry no longer fits what its source stored is refused as it
+    is read, and one whose stored tensors are unknown at once; a composite of two tables refuses a name
+    both hold."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dew.interop import codecs
+    from dew.interop.safetensors_io import LazyTensors, joined_tensors, tensor_specs
+
+    fixture, name, bare = PREPARED["gpt-neox"]
+    tensors = {stored.removeprefix(bare): tensor
+               for stored, tensor in load_shards(FIXTURES / fixture).items()}
+    config = json.loads((FIXTURES / fixture / "config.json").read_text())
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+    quantization = codecs.source_quantization(config)
+    assert quantization is not None
+    save_hf_layout(encoded_form(quantization, tensors, (name,)), config, tmp_path / "fp8")
+    loaded = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference")
+    stored = loaded.quantized_specs
+    assert set(stored) == {name, f"{name}_scale_inv"}
+    headers = tensor_specs(load_shards(tmp_path / "fp8"))
+    gone = jax.tree.map(jax.numpy.array, loaded.variables)
+    for leaf in jax.tree.leaves(gone):
+        leaf.delete()
+    table = loaded.export(gone)
+    assert isinstance(table, LazyTensors)
+    with pytest.raises(RuntimeError):
+        table[name]
+    assert {part: tensor_specs(table)[part] for part in stored} == {part: headers[part] for part in stored}
+    written = loaded.export()
+    for part, spec in stored.items():
+        assert (written[part].shape, written[part].dtype) == (spec.shape, spec.dtype), part
+    with pytest.raises(ValueError):
+        dataclasses.replace(loaded, quantized_specs={}).export()
+
+    dense = {**tensors, name: quantization.decode(written, name)}
+    reads, encoded = [], []
+    lazy = LazyTensors(tensor_specs(dense), lambda part: reads.append(part) or dense[part])
+    counted = dataclasses.replace(quantization, encode=lambda weight, value: encoded.append(weight)
+                                  or quantization.encode(weight, value))
+    table = counted.requantize(lazy, (name,), stored)
+    assert reads == encoded == []
+    first, again, scale = table[name], table[name], table[f"{name}_scale_inv"]
+    np.testing.assert_array_equal(first, again)
+    assert encoded == [name] and reads == [name]
+    with ThreadPoolExecutor(4) as pool:
+        every = dict(zip(table, pool.map(table.__getitem__, list(table)), strict=True))
+    assert encoded == [name, name]
+    np.testing.assert_array_equal(every[f"{name}_scale_inv"], scale)
+    resized = {part: jax.ShapeDtypeStruct((spec.shape[0] + 1, *spec.shape[1:]), spec.dtype)
+               for part, spec in stored.items()}
+    with pytest.raises(ValueError):
+        quantization.requantize(dense, (name,), resized)[name]
+    with pytest.raises(ValueError):
+        quantization.requantize(dense, (name,), {})
+    with pytest.raises(ValueError):
+        joined_tensors({"backbone": {"w": np.zeros(2)}, "readout": {"w": np.ones(2)}})
+    joined = joined_tensors({"backbone": table, "readout": {"head.weight": np.ones(2, np.float32)}})
+    assert isinstance(joined, LazyTensors) and set(joined) == {*table, "head.weight"}
 
 
 def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(tmp_path):
@@ -745,7 +829,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     source = FIXTURES / "gpt-oss-tiny"
     tensors = load_file(str(source / "model.safetensors"))
     stems = tuple(name for name in tensors if name.endswith((".experts.gate_up_proj", ".experts.down_proj")))
-    packed = MXFP4.requantize(tensors, stems)
+    packed = encoded_form(MXFP4, tensors, stems)
     config = json.loads((source / "config.json").read_text())
     config["quantization_config"] = {"quant_method": "mxfp4"}
     directory = tmp_path / "source"
@@ -837,7 +921,7 @@ def test_codec_rejects_integer_parameter_storage(kind):
         with pytest.raises(ValueError):
             fp8_blocks(1).dequantize(packed, param_dtype="int32")
     else:
-        packed = MXFP4.requantize({"weight": np.full((1, 32, 2), 1.5, np.float32)}, ("weight",))
+        packed = encoded_form(MXFP4, {"weight": np.full((1, 32, 2), 1.5, np.float32)}, ("weight",))
         with pytest.raises(ValueError):
             MXFP4.dequantize(packed, param_dtype="int32")
 
@@ -852,13 +936,14 @@ def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
     tensors = load_shards(fixture)
     config = json.loads((fixture / "config.json").read_text())
     if kind == "fp8":
-        packed = fp8_blocks(128, ue8m0=False).requantize(tensors, ("model.layers.0.self_attn.o_proj.weight",))
+        packed = encoded_form(fp8_blocks(128, ue8m0=False), tensors,
+                              ("model.layers.0.self_attn.o_proj.weight",))
         config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
                                          "weight_block_size": [128, 128]}
     else:
         stems = tuple(name for name in tensors if name.endswith(
             (".experts.gate_up_proj", ".experts.down_proj")))
-        packed = MXFP4.requantize(tensors, stems)
+        packed = encoded_form(MXFP4, tensors, stems)
         config["quantization_config"] = {"quant_method": "mxfp4"}
     directory = tmp_path / "quantized"
     save_hf_layout(packed, config, directory)
@@ -904,9 +989,11 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, fixtur
     save_hf_layout(tensors, config, directory)
     if not same_values:
         with pytest.raises(ValueError):
-            Pretrained.load(directory, param_dtype="bfloat16")
+            Pretrained.load(directory, param_dtype="bfloat16", text_only=True)
     else:
-        loaded = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+        # The language model alone: Kimi K2.5's head and embedding are its decoder's.
+        loaded = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla",
+                                 text_only=True)
         values = loaded.variables["params"]["embed_tokens"]["embedding"]
         assert np.asarray(values).dtype == ml_dtypes.bfloat16
         np.testing.assert_array_equal(values, np.full(shape, decoded).astype(ml_dtypes.bfloat16))
@@ -1207,47 +1294,66 @@ def test_a_model_its_family_config_cannot_carry_is_refused_at_export(fixture, ch
         PretrainedDecoder.from_model(model, loaded.variables)
 
 
-@pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
-def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
-    import jax.numpy as jnp
-
+def glm5_exported(variant: str, directory: Path):
+    """`variant`'s GLM-5 decoder (`glm5_native_export_case`), its variables and ids, written standalone to
+    `directory` with its caches' collections (`PretrainedDecoder.from_model`) and loaded back."""
     from dew.interop import PretrainedDecoder
-    from dew.sampling import Sampling, Speculative, generate
 
     model, variables, ids = glm5_native_export_case(variant)
-    expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
     cache = model.apply(variables, ids.shape[0], method="init_cache", mutable=["cache"])[1]
     if model.num_nextn_predict_layers:
-        cache = model.apply({**variables, **cache}, ids.shape[0], method="init_mtp_cache", mutable=["cache"])[
-            1
-        ]
-    PretrainedDecoder.from_model(model, {**variables, **cache}).save(tmp_path)
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+        cache = model.apply({**variables, **cache}, ids.shape[0], method="init_mtp_cache",
+                            mutable=["cache"])[1]
+    PretrainedDecoder.from_model(model, {**variables, **cache}).save(directory)
+    return model, variables, ids, Pretrained.load(directory, dtype="float32", attention_impl="reference")
+
+
+@pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
+def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
+    """A GLM-5 decoder written standalone reloads to its own logits and leaves, and transformers reads
+    the export to them; its prediction depths' logits and drafts are the next test's, apart so each fits
+    its group (ledger 4287)."""
+    import jax.numpy as jnp
+
+    model, variables, ids, restored = glm5_exported(variant, tmp_path)
+    expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
     actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=LOGITS, rtol=0)
     np.testing.assert_allclose(tool.reference_logits(CASES["glm5_next"], tmp_path, ids),
                                expected, atol=LOGITS, rtol=0)
     written = json.loads((tmp_path / "config.json").read_text())
     assert written["index_share_for_mtp_iteration"] == model.index_share_for_mtp_iteration
-    if model.num_nextn_predict_layers:
-        # Each forward compiled once, as a user runs it, not op by op.
-        prediction = jax.jit(functools.partial(prediction_logits, model))(variables, jnp.asarray(ids))
-        reloaded_prediction = jax.jit(functools.partial(prediction_logits, restored.model))(
-            restored.variables, jnp.asarray(ids))
-        np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
-        np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
-                                   prediction, atol=LOGITS, rtol=0)
-        ordinary = generate(model, variables, jnp.asarray(ids[:, :5]), 4, key=jax.random.key(0),
-                            sampling=Sampling(temperature=0)).host()
-        speculative = restored.text_generation(sampling=Sampling(temperature=0))(
-            ids[:, :5], max_new_tokens=4, key=0, strategy=Speculative(block=3)).host()
-        np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
-        np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
     for collection in ("params", "moe"):
         if collection in variables:
             actual_leaves = flat_tree(restored.variables[collection])
             for name, value in flat_tree(variables[collection]).items():
                 np.testing.assert_array_equal(actual_leaves[name], value)
+
+
+@pytest.mark.parametrize("variant", ["released", "native_geometry"])
+def test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did(variant, tmp_path):
+    """A GLM-5 decoder with prediction depths (the dense variant has none), written standalone: its
+    reloaded depths' logits are its own and transformers' over the export, and the reload drafts
+    speculatively the greedy tokens the original decodes."""
+    import jax.numpy as jnp
+
+    from dew.sampling import Sampling, Speculative, generate
+
+    model, variables, ids, restored = glm5_exported(variant, tmp_path)
+    assert model.num_nextn_predict_layers and restored.model.num_nextn_predict_layers
+    # Each forward compiled once, as a user runs it, not op by op.
+    prediction = jax.jit(functools.partial(prediction_logits, model))(variables, jnp.asarray(ids))
+    reloaded_prediction = jax.jit(functools.partial(prediction_logits, restored.model))(
+        restored.variables, jnp.asarray(ids))
+    np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
+    np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
+                               prediction, atol=LOGITS, rtol=0)
+    ordinary = generate(model, variables, jnp.asarray(ids[:, :5]), 4, key=jax.random.key(0),
+                        sampling=Sampling(temperature=0)).host()
+    speculative = restored.text_generation(sampling=Sampling(temperature=0))(
+        ids[:, :5], max_new_tokens=4, key=0, strategy=Speculative(block=3)).host()
+    np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
+    np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
 
 
 def assert_same_tensors(written: dict, expected: dict) -> None:

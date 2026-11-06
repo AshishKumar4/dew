@@ -19,7 +19,7 @@ from reference_error import (
     widened,
 )
 
-from dew.accuracy import distance, within
+from dew._accuracy import distance, within
 
 STAGES = 4
 """The batches of ORDERS fresh orders an element is measured over before it fails

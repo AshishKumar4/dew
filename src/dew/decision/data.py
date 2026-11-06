@@ -14,6 +14,7 @@ import numpy as np
 from dew import _records
 from dew._records import JSON, json_value, record
 from dew.batch import Batch
+from dew.data.facts import PerMember
 from dew.data.lowering import prepared_rows
 from dew.data.pipeline import Configured, Dataset, Pipeline, Stage, mix
 from dew.data.sources.base import Read, Rows, Source, View, _consumed, stated as store_facts
@@ -359,7 +360,10 @@ class _DecisionSource(View[Source]):
         them: given, or a table's one question over the options it names."""
         options = None if self.table is None else self.table.options
         slots = self.slots or ({"questions": 1, "options": len(options)} if options else None)
-        return {**store_facts(self.source), **self.mixture, **({"slots": dict(slots)} if slots else {})}
+        # Its weight in the mixture is its own, which the corpora read together join (`PerMember`).
+        mixture = {name: PerMember(record(value, name)) if name == "mixture_weights" else value
+                   for name, value in self.mixture.items()}
+        return {**store_facts(self.source), **mixture, **({"slots": dict(slots)} if slots else {})}
 
     def consumed(self, read: Read) -> "_DecisionSource":
         consumed = dataclasses.replace(self, source=_consumed(self.source, read))
@@ -505,7 +509,7 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
         name: _records.number(value, f"weights.{name}")
         for name, value in record(stated.get("weights", {}), "weights").items()
     } | dict(weights or {})
-    training, held, kept = [], [], []
+    training, held, kept, trained = [], [], [], []
     for name, weight in sorted(shares.items()):
         if weight <= 0:
             continue
@@ -515,17 +519,19 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
                 read = read.shuffle(_drawn(seed, name), streamed=STREAMED_WINDOW)
             if read is not None:
                 destination.append(read)
+                if split == "train":
+                    trained.append(name)
         kept.append(weight)
     if not training:
         raise ValueError(f"no corpus of {root_url} has a positive weight")
-    # Each corpus states the mixture it is read in: its positive weights and where the manifest that made
-    # it is read, with the digest of the bytes read there, which a run's summary reads it from and checks
-    # (`made_by`), a few words a corpus, not its copy.
-    made = {"mixture_weights": {name: weight for name, weight in sorted(shares.items()) if weight > 0},
-            "mixture_root": root_url, **({} if descriptor is None else {"mixture_descriptor": descriptor}),
+    # Each corpus states the mixture it is read in: its own weight there, which the corpora read together
+    # join (`PerMember`), and where the manifest that made it is read, with the digest of the bytes read
+    # there, which a run's summary reads it from and checks (`made_by`), a few words a corpus, not its copy.
+    made = {"mixture_root": root_url, **({} if descriptor is None else {"mixture_descriptor": descriptor}),
             "mixture_sha256": digest}
-    training = [dataclasses.replace(child, source=dataclasses.replace(child.source, mixture=made))
-                for child in training]
+    training = [dataclasses.replace(child, source=dataclasses.replace(
+        child.source, mixture={"mixture_weights": {name: shares[name]}, **made}))
+        for child, name in zip(training, trained, strict=True)]
     if order not in ("seeded", "schedule"):
         raise ValueError(f"a mixture's corpus order is 'seeded' or 'schedule', not {order!r}")
     chosen = seed if order == "seeded" else None

@@ -42,10 +42,10 @@ from jax._src.pallas.mosaic_gpu import (
 )
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
-from jax.extend import core as jax_core
 
-from ..derivatives import Protected, declared_tangent, marked_call_p
+from ..derivatives import Protected, contracted, declared_tangent, marked_call_p
 from ..precision import at_least_fp32, rounded_operand
+from ..programs import equations
 from . import generation, selection, tuning
 from .generation import INHERENT
 from .templates import base, bundles, mosaic, report, resources, tail as tail_of
@@ -149,13 +149,6 @@ EXACT_STEP = 64
 each add within a step's MMA chain, and exact sums promote only between steps."""
 
 
-def _equations(jaxpr):
-    """Every equation of `jaxpr` and of the programs nested in it, at any depth."""
-    yield from jaxpr.eqns
-    for inner in jax_core.subjaxprs(jaxpr):
-        yield from _equations(inner)
-
-
 def _lowers(hook, tiles: tuple, sides, rules) -> bool:
     """Whether a Pallas lowering's `rules` hold a rule for every primitive of `hook` on its `tiles` and its
     side tiles: Mosaic GPU's, at warpgroup semantics, have none for a transpose, which Triton's lowering
@@ -163,7 +156,7 @@ def _lowers(hook, tiles: tuple, sides, rules) -> bool:
     if hook is None:
         return True
     return all(equation.primitive in rules or equation.primitive is marked_call_p
-               for equation in _equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
+               for equation in equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
 
 
 def _hooks_lower(ba, dtype, rules) -> bool:
@@ -621,6 +614,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # compile gate tests the actual
         # launch and residency caps: ptxas's spill decisions are not monotone, so a least spill-free cap
         # cannot decide a launch.
+        ba, config = self._ran(ba, config)
         dtype = ba.arguments['tokens'].dtype
         family, block = mosaic_gpu.family_of(config, dtype), (config.block_m, config.block_n, config.block_k)
         hooks = ba.arguments['hooks']
@@ -745,6 +739,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         `mosaic_gpu.derived` reads them."""
 
     def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
+        return self._derived(ba, target)
+
+    def _derived(self, ba, target, admits=None) -> mosaic_gpu.Tiles | None:
+        """The derivation's tile of `ba` on `target` (`mosaic_gpu.derived`), each candidate also one `admits`
+        takes where given (a swapped call's own rule, `MosaicGmm._left_fits`)."""
         layouts = self._families(ba, target)
         if not layouts:
             return None
@@ -752,7 +751,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return mosaic_gpu.derived(layouts, rows=rows, depth=depth, width=width,
                                   dtype=ba.arguments['tokens'].dtype,
                                   multiprocessors=_multiprocessors(target), target=target,
-                                  candidate=lambda tile: self.candidate(ba, tile, target),
+                                  candidate=lambda tile: (self.candidate(ba, tile, target)
+                                                          and (admits is None or admits(tile))),
                                   launch_of=lambda tile: self.launch_of(ba, tile), grouped=depth is not None)
 
     def neighbours(self, ba, config: mosaic_gpu.Tiles) -> tuple[mosaic_gpu.Tiles, ...]:
@@ -783,7 +783,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """Whether `config` runs the call on `target` (`Template.legal`): a candidate (`candidate`) whose
         ring of `config.stages` and registers the planner holds at its programs (`resources.plan`, as the
         derivation sizes them). A cluster's legality is each multiprocessor's: its staged bytes and
-        registers are a tile's alone."""
+        registers are a tile's alone. A tile is judged as the call it runs (`_ran`)."""
+        ba, config = self._ran(ba, config)
         if not self.candidate(ba, config, target):
             return False
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
@@ -794,7 +795,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """The launch the planner sizes at `config`'s shape (`resources.plan`): its allocations at a ring
         depth (`_allocations`), its consumers, its registers a consumer thread (`registers`), and at most
         the stages its program's share of the family's shared memory holds of a step's two operand blocks
-        at an element a byte and its contraction has steps, at least two."""
+        at an element a byte and its contraction has steps, at least two: the call's a launch at `config`
+        runs (`_ran`), the launch naming `config`."""
+        launched = config
+        ba, config = self._ran(ba, config)
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         depth = self._generated_extents(ba)[1]
         steps = None if depth is None else -(-depth // config.block_k)
@@ -808,7 +812,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if steps is not None:
             # A ring deeper than its contraction's steps holds no more of them.
             most = min(most, max(2, steps))
-        return resources.Launch(scope, config.warpgroups, self.registers(ba, config), most=most, tile=config)
+        return resources.Launch(scope, config.warpgroups, self.registers(ba, config), most=most,
+                                tile=launched)
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` is a tile of the call on `target` apart from its resources: of the launch's
@@ -843,6 +848,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         extent, least = family.copy_extent, 1 if family.copies_vectors else family.role_rows
         return all((extent is None or self.extents(config)[axis] <= extent)
                    and self.extents(config)[axis] % least == 0 for axis in axes)
+
+    def _ran(self, ba, config: mosaic_gpu.Tiles) -> tuple:
+        """The call and tile a launch at `config` runs, which its legality, registers and launch read: the
+        call itself by default."""
+        return ba, config
 
     @abc.abstractmethod
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
@@ -935,11 +945,77 @@ class MosaicGmm(_Mosaic):
         return {'rows': tile.block_m, 'depth': tile.block_k, 'columns': tile.block_n}
 
 
+    def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
+        # A dense product of fewer rows than a role's (a decode step's) runs swapped: its matrix takes the
+        # MMA's rows and its rows the columns, whose unit is narrower, so its tile multiplies no padding rows
+        # (CUTLASS's and cuBLAS's swap of A and B; megabake's 4 x 2048 x 2048 product went from 10.0 to
+        # 4.7 us swapped, cuBLAS's time, row 1762). It is derived as the swapped call's own tile.
+        swapped = self._swapped(ba, target)
+        if swapped is None:
+            return super().derived(ba, target)
+        tile = self._derived(swapped, target, admits=lambda tile: self._left_fits(ba, tile))
+        return None if tile is None else dataclasses.replace(tile, swapped=True)
+
+    def _left_fits(self, ba, config: mosaic_gpu.Tiles) -> bool:
+        """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
+        width]` is read transposed, whose stage casts to the products' layout in whole row atoms on a family
+        reading registers (`Family.transposed_rows`, as the kernel gradient's transposed rows)."""
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        return (ba.arguments['trans_rhs'] or not family.operands_in_registers
+                or config.block_k % family.transposed_rows == 0)
+
+    def _swapped(self, ba, target):
+        """The dense product `ba` as its swapped tile runs it: its matrix `[width, depth]` the rows, however
+        it lies, and its rows a matrix of them, padded to whole column units of every family the target
+        runs, read transposed (`mosaic_gpu.gmm`'s `transpose_lhs` where the matrix lies `[depth, width]`).
+        None where it runs as it is: a call with hooks, a paired, FP8 or grouped one, or one whose rows fill
+        a role (`Family.role_rows`)."""
+        families = self._families(ba, target)
+        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
+        if (not families or not ba.arguments.get('dense') or ba.arguments['hooks'] != NO_HOOKS
+                or ba.arguments.get('paired') is not None or jnp.dtype(tokens.dtype).itemsize != 2
+                or tokens.shape[0] >= min(family.role_rows for family in families)):
+            return None
+        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        unit = max(family.column_unit(tokens.dtype) for family in families)
+        abstract = functools.partial(jax.ShapeDtypeStruct, dtype=tokens.dtype)
+        options = {name: value for name, value in ba.arguments.items()
+                   if name not in ('tokens', 'kernel', 'sizes', 'trans_rhs')}
+        return self.bind(abstract((width, depth)), abstract((1, -(-tokens.shape[0] // unit) * unit, depth)),
+                         ba.arguments['sizes'], **options, trans_rhs=True)
+
+    def _ran(self, ba, config: mosaic_gpu.Tiles) -> tuple:
+        """`_Mosaic._ran`: a swapped tile runs the call swapped (`_swapped`), the tile unswapped, on the
+        target being selected for (`generation.gpu_target`)."""
+        if not config.swapped:
+            return ba, config
+        swapped = self._swapped(ba, generation.gpu_target())
+        assert swapped is not None, "a swapped tile is a swappable call's (`legal`)"
+        return swapped, dataclasses.replace(config, swapped=False)
+
+    def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        if config.swapped and (self._swapped(ba, target) is None or not self._left_fits(ba, config)):
+            return False
+        return super().legal(ba, config, target)
+
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
+        if config.swapped:
+            # The product transposed: the matrix's rows times the rows, padded to whole column tiles and
+            # read transposed, the output transposed back.
+            rows = tokens.shape[0]
+            padded = jnp.pad(tokens, ((0, -rows % config.block_n), (0, 0)))
+            tile = dataclasses.replace(config, swapped=False)
+            out = mosaic_gpu.gmm(kernel[0], padded[None], sizes, tiles=tile, transpose_rhs=True,
+                                 transpose_lhs=not trans_rhs, out_dtype=out_dtype,
+                                 multiprocessors=self._launched(tile, interpret),
+                                 interpret=INTERPRETED if interpret else False, dense=True,
+                                 exact_sums=exact_sums)
+            assert isinstance(out, jax.Array), "one output (`out_dtypes` is not passed)"
+            return out[:, :rows].T, None
         return mosaic_gpu.gmm(tokens, kernel, sizes, tiles=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False,
@@ -1010,21 +1086,12 @@ class MosaicTgmm(_Mosaic):
                                       step_seconds=mosaic_gpu.step_seconds(tile, target),
                                       bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
 
-    # A split tile runs the fp32 partials' call at its tile unsplit (`mosaic_gpu.tgmm`): its legality,
-    # registers and launch are that call's.
+    # A split tile runs the fp32 partials' call at its tile unsplit (`mosaic_gpu.tgmm`, `_ran`): its
+    # legality, registers and launch are that call's; exact sums take no split.
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         if config.splits > 1 and ba.arguments['exact_sums']:
             return False
-        ran, tile = self._ran(ba, config)
-        return super().legal(ran, tile, target)
-
-    def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
-        ran, tile = self._ran(ba, config)
-        return super().registers(ran, tile)
-
-    def launch_of(self, ba, config: mosaic_gpu.Tiles) -> resources.Launch:
-        ran, tile = self._ran(ba, config)
-        return dataclasses.replace(super().launch_of(ran, tile), tile=config)
+        return super().legal(ba, config, target)
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`)."""
@@ -1728,7 +1795,8 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     return output, tangent
 
 
-portable_projection = declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
-                                       nondiff_argnums=(3, 4, 5), symbolic_zeros=True)
+portable_projection = contracted("test_a_portable_grouped_projection_holds_every_order")(
+    declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
+                     nondiff_argnums=(3, 4, 5), symbolic_zeros=True))
 
 

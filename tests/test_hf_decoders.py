@@ -58,9 +58,10 @@ Tolerances and the differences actually observed, fp32 on CPU:
   magnitude 6.8. Three gated delta net layers and one gated attention layer
   with a sliced quarter-head rope; the delta net's own numbers are in
   tests/test_linear_attention.py.
-- qwen3-next-tiny: max |logit difference| 2.3e-05 on the trunk and 1.8e-05
-  on the MTP layer, on logits of magnitude 6.6, tolerance 1e-4 scaled by
-  that magnitude. The Qwen3.5 hybrid with the delta net's projections fused
+- qwen3-next-tiny: max |logit difference| 2.3e-05 on the trunk, on logits of
+  magnitude 6.6, tolerance 1e-4 scaled by that magnitude; its MTP layer is
+  check 1's against the published composition live
+  (tests/test_hf_decoder_hybrids.py). The Qwen3.5 hybrid with the delta net's projections fused
   and grouped by key head, and every layer routing softmax top-2 over eight
   experts beside a sigmoid-gated shared expert.
 - gpt-oss-tiny: max |logit difference| 2.5e-06, tolerance 1e-4. Sink
@@ -121,7 +122,6 @@ from interop_support import (
     transformers_model,
 )
 from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, declared_seeds, recording
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -267,34 +267,35 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
         reloaded = np.asarray(again.model.apply(again.variables, ids))
         np.testing.assert_array_equal(reloaded, ours)
 
+ACCURATE_SEEDS = 8
+"""The accurate-policy site's declared check-1 seeds, sized by `seeds_for` paired on a GPU."""
+
+
 def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu():
     """A float32 decoder under a run's ACCURATE precision policy (`generation.run_precision`, ledger
     2500) multiplies every product that states no precision in IEEE float32: its logits on a GPU are as
     exact as transformers' float32 ones, both from transformers' float64 ones, JAX's own default (TF32
     there, as JAX documents) cleared first. The policy sets the products' precision; the decoder's
-    float32 dtype keeps their operands float32."""
-    import contextlib
-
-    import torch
+    float32 dtype keeps their operands float32. Check 1 over drawn ids of the fixture's shape."""
+    from interop_support import token_draw, torch_logits
     from transformers import AutoModelForCausalLM
 
+    from dew.nn.kernels import generation
+    from dew.nn.precision import ACCURATE
     from tools.torch_precision import float64
 
     directory = FIXTURES / "qwen3-tiny"
     ids = np.load(directory / "input_ids.npy")
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
-    from dew.nn.kernels import generation
-    from dew.nn.precision import ACCURATE
-
     with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
-        ours = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, jnp.asarray(ids)), np.float64)
-
-    def theirs(dtype):
-        with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
-            model = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager")
-            return model.to(dtype).eval()(torch.from_numpy(ids).long()).logits.double().numpy()
-
-    assert_as_exact_as_the_reference(ours, theirs(torch.float32), theirs(torch.float64), "float32 logits")
+        forward = jax.jit(loaded.model.apply).trace(loaded.variables, jnp.asarray(ids)).lower().compile()
+    reference = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").eval()
+    with float64():
+        wide = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").double().eval()
+    # Compiled once under the policy, as a run under it compiles: the gate runs it as given.
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64)),
+                    torch_logits(reference), token_draw(0x0A3, reference.config.vocab_size, ids.shape),
+                    "float32 logits", seeds=ACCURATE_SEEDS, truth_fn=torch_logits(wide, float64))
 
 
 @pytest.mark.parametrize(("name", "stale"), [
@@ -1307,7 +1308,7 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
     assert_as_exact(as_given(lambda seed: actual(draws[int(seed)])),
                     as_given(lambda seed: expected(draws[int(seed)])),
                     lambda seed: (np.asarray(seed, np.int32),), name + ' trained export', seeds=8,
-                    truth_fn=lambda seed: np.asarray(expected(draws[int(seed)]), np.float64))
+                    truth_fn=as_given(lambda seed: np.asarray(expected(draws[int(seed)]), np.float64)))
     prompt = ids[:1, :4]
     generated = reloaded.text_generation()(prompt, 4, key=7, steps=3).host().tokens
     np.testing.assert_array_equal(generated[:, :4], prompt)
@@ -1731,8 +1732,9 @@ def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
     does (`decoder_config`, ledger 3006): Qwen 3.5's wrapper unties its head at its own scope over a text
     config that ties it, which tools/kernel_picks.py's decoder (`model_of`) unties as the load does, and
     states its modeling overrides there, which `model_of`'s decoder builds as the load does (its full
-    attention block-bidirectional); a registered family that reads its whole record (Kimi K2.5's) is
-    read as it is."""
+    attention block-bidirectional); a media bundle its family reads whole (Kimi K2.5's) is its text
+    checkpoint's record, its towers' sections gone, which its language model alone builds as the load
+    does; and any other registered family's record is read as it is (Llama's)."""
     import argparse
 
     from tool_support import run_from
@@ -1758,7 +1760,15 @@ def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
     assert built.kinds["full_attention"].mixer.bidirectional_blocks
     assert built.kinds == blocked.kinds
     whole = json.loads((FIXTURES / "kimi-k25-tiny" / "config.json").read_text())
-    assert decoder_config(whole) is whole
+    text = decoder_config(whole)
+    assert "vision_config" in whole and "vision_config" not in text
+    assert {name: value for name, value in whole.items() if name in text} == dict(text)
+    kimi = model_of(argparse.Namespace(config=str(FIXTURES / "kimi-k25-tiny"), revision=None,
+                                       dtype="float32"))
+    alone = Pretrained.load(FIXTURES / "kimi-k25-tiny", text_only=True, dtype="float32").model
+    assert kimi.kinds == alone.kinds and kimi.num_layers == alone.num_layers
+    plain = json.loads((FIXTURES / "llama-tiny" / "config.json").read_text())
+    assert decoder_config(plain) is plain
 
 
 def test_a_decoder_of_the_default_feed_forward_width_exports(tmp_path):

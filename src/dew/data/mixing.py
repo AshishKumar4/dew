@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import itertools
@@ -22,6 +23,7 @@ from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
 from dew.data.pipeline import Owed, Record, Rejected, accounts, member_of, members_of
+from dew.data.shared import SharedMapping
 
 _log = logging.getLogger(__name__)
 
@@ -82,15 +84,22 @@ class CorpusCounts:
     """The tokens the cuts of the members delivered rows left out removed, by what each cut
     (`_dew_left_out_cut`), counted with them."""
     declined: Counter[str] = dataclasses.field(default_factory=Counter)
+    tokens: int = 0
+    """The valid target tokens of the rows its reader weighed as it accepted them, under its member where a
+    mixture's rows are (row 4119): what a mixture measured in tokens (`mix(..., by="tokens")`) drew of each
+    member, the shares it balances, or a layout's windows that hold a target. A step after the weighing
+    that refuses a weighed row counts it under `data/rejected`, its tokens staying weighed."""
 
-    def delivered(self, element: Batch | bytes, examples: int | None = None) -> None:
+    def delivered(self, element: Batch | bytes, examples: int | None = None,
+                  tokens: int | None = None) -> None:
         """Count one row the corpus delivered: accepted, cut short where it says it was
         (`_dew_truncated`), each cut it reports (`_dew_cut`: by what it cut, the rows it shortened and
         the tokens it removed), the members it left out by reason (`_dew_rejected`) and the tokens their
         cuts removed (`_dew_left_out_cut`), and the augmentation a read declines for it, by reason
         (`_dew_declined`). A mixture's counter counts the `examples` of this corpus the row completes
-        (`MEMBERS`)."""
+        (`MEMBERS`), and a counter that weighs rows its valid target `tokens`."""
         self.delivered_rows += 1
+        self.tokens += tokens or 0
         if examples is not None:
             self.accepted += examples
         elif not isinstance(element, Mapping):
@@ -103,10 +112,10 @@ class CorpusCounts:
         if not isinstance(element, Mapping):
             return
         self.truncated += int(bool(element.get("_dew_truncated", False)))
-        for kind, (rows, tokens) in element.get("_dew_cut", {}).items():
+        for kind, (rows, removed) in element.get("_dew_cut", {}).items():
             self.cut_examples[kind] += 1
             self.cut_rows[kind] += int(rows)
-            self.cut_removed[kind] += int(tokens)
+            self.cut_removed[kind] += int(removed)
         for reason, count in element.get("_dew_rejected", {}).items():
             self.left_out[reason] += int(count)
         self.left_out_cut.update(element.get("_dew_left_out_cut", {}))
@@ -122,7 +131,7 @@ class CorpusCounts:
     def counted_anew(self) -> None:
         """Start over the counts of delivered rows, for a read that counts them again whole (a memory
         read's rows, read once more as it holds them)."""
-        self.accepted, self.truncated, self.delivered_rows = 0, 0, 0
+        self.accepted, self.truncated, self.delivered_rows, self.tokens = 0, 0, 0, 0
         for counted in (self.cut_examples, self.cut_rows, self.cut_removed, self.left_out, self.left_out_cut,
                         self.declined):
             counted.clear()
@@ -144,8 +153,10 @@ class CorpusCounts:
         delivered, its rejections and the augmentation it declined by reason as integers, the share
         of those rows cut short and the chunks per chunked record."""
         examples = {f"data/rows/{label}": self.accepted} if self.rows else {}
+        tokens = {f"data/weighed_tokens/{label}": self.tokens} if self.tokens else {}
         return {
             **examples,
+            **tokens,
             f"data/truncated/{label}": self.truncated / max(1, self.delivered_rows),
             f"data/chunks_per_record/{label}": self.chunks / max(1, self.chunk_records),
             **{f"data/rejected/{label}/{reason}": count for reason, count in self.refused.items()},
@@ -172,6 +183,7 @@ class CorpusCounts:
             "rejected_cut": dict(self.rejected_cut),
             "left_out_cut": dict(self.left_out_cut),
             "declined": dict(self.declined),
+            "tokens": self.tokens,
         }
 
     def restore(self, state: Mapping[str, object]) -> None:
@@ -181,6 +193,7 @@ class CorpusCounts:
         self.delivered_rows = integer(state["delivered_rows"], "delivered_rows")
         self.chunks = integer(state["chunks"], "chunks")
         self.chunk_records = integer(state["chunk_records"], "chunk_records")
+        self.tokens = integer(state["tokens"], "tokens")
         self.rejected = Counter(
             {name: integer(value, name) for name, value in record(state["rejected"], "rejected").items()}
         )
@@ -191,13 +204,15 @@ class CorpusCounts:
     def followed(self, reader: CorpusCounts) -> CorpusCounts:
         """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
         read after them: the reader delivered the rows and counted those cut short, and its examples
-        where it counts them (`rows`), else the prefix did, and the two dropped and chunked apart."""
+        where it counts them (`rows`), else the prefix did, and the two dropped and chunked apart; the
+        tokens are the first weighing's, whichever weighed."""
         examples = {} if reader.rows else {
             "rows": self.rows, "examples": self.examples, "accepted": self.accepted}
         return dataclasses.replace(
             reader, **examples, attempted=max(self.attempted, reader.attempted),
             chunks=self.chunks + reader.chunks, chunk_records=self.chunk_records + reader.chunk_records,
-            rejected=self.rejected + reader.rejected, rejected_cut=self.rejected_cut + reader.rejected_cut)
+            rejected=self.rejected + reader.rejected, rejected_cut=self.rejected_cut + reader.rejected_cut,
+            tokens=max(self.tokens, reader.tokens))
 
     def expanded(self, outputs: Sequence[Record]) -> None:
         """Count one chunked document and its fan-out before later stages can reject chunks."""
@@ -223,16 +238,40 @@ class _KeepAccepted:
         self.owed = Owed()
         """The source examples the rows it rejected since the last it kept were the last of (`CONSUMED`),
         which that next row carries on (`_AcceptedIterator`)."""
+        self.rejections = 0
+        """How many records it rejected, its own and its members', counted as it rejects them."""
+        self._states: SharedMapping[Mapping[str, object]] | None = None
+        self._touched: set[str] = set(self.members)
+        """The members whose counts moved since `_states` was made, which alone a capture makes again."""
 
     def _of(self, member: str | None) -> CorpusCounts:
         """The counts a row of `member` (`MEMBER`) is counted under: its member's, else the counter's own."""
         if member is None or not self.members:
             return self.counts
+        self._touched.add(member)
         return self.members[member]
+
+    def member_states(self) -> SharedMapping[Mapping[str, object]]:
+        """Each member's counts as they stand, by member key (`MEMBERS`): the states captured before, the
+        members' that moved since made again, the rest shared with them (`SharedMapping`), so a capture before
+        each record costs it the members it counted, not every member (row 4079)."""
+        touched = {key: {"corpus": self.members[key].name, "label": self.members[key].label,
+                         "counts": self.members[key].state()} for key in self._touched}
+        self._states = SharedMapping.of(touched) if self._states is None else self._states.replaced(touched)
+        self._touched.clear()
+        return self._states
+
+    def restored(self) -> None:
+        """Every member's counts and the rejections as a restore left them: each member's state made again
+        at its next capture, the rejections counted afresh."""
+        self._touched = set(self.members)
+        self.rejections = sum(sum(counts.rejected.values())
+                              for counts in (self.counts, *self.members.values()))
 
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         if isinstance(element, Rejected):
+            self.rejections += 1
             reason = element.reason
             self.owed.owe(element.consumed)
             self._of(element.member).dropped(element)
@@ -241,14 +280,15 @@ class _KeepAccepted:
             if count is not None and count < 0:
                 raise ValueError(f"corpus {self.counts.name} has a negative valid-target count: {count}")
             if count != 0:
-                self._delivered(element)
+                self._delivered(element, count)
                 self.consecutive = 0
                 return True
             reason = "zero_targets"
+            self.rejections += 1
             self.owed.owe(accounts(element)[0])
             self._of(member_of(element)).rejected[reason] += 1
         self.consecutive += 1
-        if not self.warned and self._rejected_count() / self.counts.attempted > _WARN_OVER:
+        if not self.warned and self.rejections / self.counts.attempted > _WARN_OVER:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
                          self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
@@ -276,24 +316,21 @@ class _KeepAccepted:
         only where a raise or a log names the reasons, never a row at a time (row 3531)."""
         return sum((counts.rejected for counts in self.members.values()), self.counts.rejected.copy())
 
-    def _rejected_count(self) -> int:
-        """How many records it rejected, its own and its members', summed without merging their reasons:
-        read at each rejection only until it warns."""
-        return sum(sum(counts.rejected.values()) for counts in (self.counts, *self.members.values()))
-
-    def _delivered(self, element: Batch) -> None:
-        """Count a row delivered: under its member where a mixture's last counter credits its members,
-        each member the examples its rows complete (`MEMBERS`), the row's own counts its member's."""
+    def _delivered(self, element: Batch, tokens: int | None) -> None:
+        """Count a row delivered, of `tokens` valid targets where the counter weighs them: under its member
+        where a mixture's last counter credits its members, each member the examples its rows complete
+        (`MEMBERS`), the row's own counts its member's."""
         if not self.credits:
-            self.counts.delivered(element)
+            self.counts.delivered(element, tokens=tokens)
             return
         own = member_of(element)
         completed = members_of(element)
         owner = self._of(own)
         for member, examples in completed.items():
             if member != own:
+                self._touched.add(member)
                 self.members[member].accepted += examples
-        owner.delivered(element, 0 if own is None else completed.get(own, 0))
+        owner.delivered(element, 0 if own is None else completed.get(own, 0), tokens)
 
 
 COUNTER = "dew.corpus_counts"
@@ -362,11 +399,9 @@ class _AcceptedIterator(_CountedIterator[Batch]):
 
     def _counted(self) -> Mapping[str, object]:
         # A mixture's counter keeps its members' counts beside its own, by member key (`MEMBERS`).
-        members = {key: {"corpus": counts.name, "label": counts.label, "counts": counts.state()}
-                   for key, counts in self._predicate.members.items()}
         return {**super()._counted(), "consecutive": self._predicate.consecutive,
                 "warned": self._predicate.warned, "consumed": self._predicate.owed.examples,
-                "members": members}
+                "members": self._predicate.member_states()}
 
     def _restore(self, counted: Mapping[str, object]) -> None:
         super()._restore(counted)
@@ -378,6 +413,7 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         for key, counts in self._predicate.members.items():
             if key in members:
                 counts.restore(record(record(members[key], "member counter")["counts"], "member counts"))
+        self._predicate.restored()
 
 
 class Carried(pygrain.IterDataset[Batch]):
@@ -486,6 +522,9 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         super().__init__(reads)
         self._reads, self._weights, self._tokens, self._keys = tuple(reads), weights, tokens, keys
         self._delivered = [0] * len(reads)
+        # The targets each corpus delivered as a position holds them, the one corpus a row read replaced.
+        self._sent: SharedMapping[int] = SharedMapping(keys, self._delivered)
+        self._positions = _Captured(dict(zip(keys, self._reads, strict=True)))
 
     def __next__(self) -> Batch:
         total = sum(self._delivered)
@@ -494,6 +533,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
             range(len(self._reads)),
             key=lambda index: self._weights[index] * total - self._delivered[index] * scale,
         )
+        self._positions.moved(self._keys[chosen])
         value = next(self._reads[chosen])
         tokens = self._tokens(value)
         if tokens <= 0:
@@ -501,13 +541,11 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
                 "token deficit mix received a window without valid targets; filter it before mixing"
             )
         self._delivered[chosen] += tokens
+        self._sent = self._sent.replaced({self._keys[chosen]: self._delivered[chosen]})
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {
-            "parents": {key: read.get_state() for key, read in zip(self._keys, self._reads, strict=True)},
-            "delivered": dict(zip(self._keys, self._delivered, strict=True)),
-        }
+        return {"parents": self._positions.captured(), "delivered": self._sent}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         """Restore each corpus the state keeps by its key, and start one it keeps none of where its
@@ -522,6 +560,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         if any(count < 0 for count in delivered.values()):
             raise ValueError("token deficit state has negative delivered targets")
         kept = [key in parents for key in self._keys]
+        self._positions.restored()
         for key, read in zip(self._keys, self._reads, strict=True):
             if key in parents:
                 read.set_state(record(parents[key], "corpus iterator"))
@@ -529,6 +568,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         total, weight = sum(restored), sum(w for w, held in zip(self._weights, kept, strict=True) if held)
         self._delivered = [delivered[key] if held else (w * total // weight if weight else 0)
                            for key, w, held in zip(self._keys, self._weights, kept, strict=True)]
+        self._sent = SharedMapping(self._keys, self._delivered)
 
     def close(self) -> None:
         for read in self._reads:
@@ -883,6 +923,34 @@ class KeyedMix(pygrain.IterDataset[Batch]):
         return iter(pygrain.IterDataset.mix(parents, weights))
 
 
+class _Captured:
+    """A mix's corpora's positions by key, captured before each record the mix gives: the corpus it read
+    since the last capture captured again, every other's shared with it (`SharedMapping`), so a capture costs
+    a record the corpus it read, not every corpus (row 4079)."""
+
+    def __init__(self, reads: Mapping[str, pygrain.DatasetIterator[Batch]]):
+        self._reads = reads
+        self._held: SharedMapping[Mapping[str, object]] | None = None
+        self._moved: set[str] = set(reads)
+
+    def moved(self, key: str) -> None:
+        """Corpus `key` read, its position captured again at the next capture."""
+        self._moved.add(key)
+
+    def restored(self) -> None:
+        """Every corpus restored, each captured again at the next capture."""
+        self._moved = set(self._reads)
+
+    def captured(self) -> SharedMapping[Mapping[str, object]]:
+        # Each moved corpus's position copied whole as it is captured, a snapshot no read of it moves on
+        # (Grain's iterators may hand back what they keep), which the shared mapping holds as it is, and a
+        # copy of it with it (`SharedMapping.__deepcopy__`).
+        changed = {key: copy.deepcopy(self._reads[key].get_state()) for key in self._moved}
+        self._held = SharedMapping.of(changed) if self._held is None else self._held.replaced(changed)
+        self._moved.clear()
+        return self._held
+
+
 class _SeededMix(pygrain.DatasetIterator[Batch]):
     """A keyed mix's reads (`KeyedMix`) in the corpus order a seeded `Proportions` gives each position,
     its position saved as Grain saves its own mix's: each corpus's under its key, the positions read
@@ -892,24 +960,27 @@ class _SeededMix(pygrain.DatasetIterator[Batch]):
         super().__init__()
         self._reads, self._keys, self._proportions = dict(reads), tuple(reads), proportions
         self._index, self._stop = 0, False
+        self._positions = _Captured(self._reads)
 
     def __next__(self) -> Batch:
         if self._stop:
             raise StopIteration
         corpus, _ = self._proportions.at(self._index)
         self._index += 1
+        key = self._keys[corpus]
+        self._positions.moved(key)
         try:
-            return next(self._reads[self._keys[corpus]])
+            return next(self._reads[key])
         except StopIteration:
             self._stop = True
             raise
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": {key: read.get_state() for key, read in self._reads.items()},
-                "index": self._index, "stop": self._stop}
+        return {"parents": self._positions.captured(), "index": self._index, "stop": self._stop}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         parents = record(state["parents"], "seeded mix")
+        self._positions.restored()
         for key, read in self._reads.items():
             if (held := parents.get(key)) is not None:
                 read.set_state(record(held, "mixed corpus"))
@@ -1045,6 +1116,9 @@ def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts])
         combined.attempted = max(combined.attempted, counts.attempted)
         combined.chunks = max(combined.chunks, counts.chunks)
         combined.chunk_records = max(combined.chunk_records, counts.chunk_records)
+        # Counters inside one iterator weigh the same rows, a later one those an earlier left: the first
+        # weighing is the corpus's.
+        combined.tokens = max(combined.tokens, counts.tokens)
         # Members a row left out travel with the row, as its cuts do: the outermost counts them.
         combined.rejected.update(counts.rejected)
         combined.rejected_cut.update(counts.rejected_cut)
@@ -1059,7 +1133,7 @@ def _past(counted: dict[str, CorpusCounts], outer: CorpusCounts) -> None:
         outer, rows=inner.rows, examples=inner.examples, accepted=inner.accepted,
         attempted=max(inner.attempted, outer.attempted), chunks=max(inner.chunks, outer.chunks),
         chunk_records=max(inner.chunk_records, outer.chunk_records), rejected=inner.rejected + outer.rejected,
-        rejected_cut=inner.rejected_cut + outer.rejected_cut)
+        rejected_cut=inner.rejected_cut + outer.rejected_cut, tokens=max(inner.tokens, outer.tokens))
 
 
 def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
@@ -1070,6 +1144,7 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     combined.attempted += counts.attempted
     combined.accepted += counts.accepted
     combined.delivered_rows += counts.delivered_rows
+    combined.tokens += counts.tokens
     combined.truncated += counts.truncated
     combined.chunks += counts.chunks
     combined.chunk_records += counts.chunk_records

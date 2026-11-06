@@ -77,7 +77,8 @@ class Shard:
 
 
 def preparing(source: Source, size: int | None, into: str) -> None:
-    """Log the one line a source logs as it prepares a read: what, how large, and where."""
+    """Log the one line a source logs as it prepares a read: what, how large (its `preparation_bytes`),
+    and where."""
     stated = "size not stated" if size is None else f"{size / 2**20:.1f} MiB"
     logging.getLogger("dew.data").warning("preparing %s (%s) into %s", source.describe(), stated, into)
 
@@ -101,11 +102,20 @@ def _uncounted(metadata: Mapping[str, object]) -> Mapping[str, object]:
     return {name: value for name, value in metadata.items() if name not in _COUNTS}
 
 
+class ShardOpener(Protocol):
+    """Opens a shard (`ShardManifest.reader`): its records in order, read under the grain `ReadOptions` its
+    reading gives (`dew.data.shards`: the run's loading, or a mix member's share of it), Grain's own where
+    it gives none."""
+
+    def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class ShardManifest:
     """A streamed source's shards, in canonical order, and the reader that
-    opens one: a picklable function returning a checkpointable grain
-    `IterDataset` over the shard's records in order.
+    opens one: a picklable function of a shard and the grain `ReadOptions` its
+    reading reads it under (None for Grain's own), returning a checkpointable
+    grain `IterDataset` over the shard's records in order.
 
     When physical shards cannot fill the readers and workers, `subdivide`
     receives the needed count and returns exactly that many `Shard`s, each
@@ -117,7 +127,7 @@ class ShardManifest:
     (`_indexed_manifest`)."""
 
     shards: tuple[Shard, ...]
-    reader: Callable[[Shard], pygrain.IterDataset]
+    reader: ShardOpener
     subdivide: Callable[[int], tuple[Shard, ...]] | None = None
     index_ordered: bool = False
 
@@ -261,6 +271,14 @@ class View[S: Source]:
         return self
 
 
+@runtime_checkable
+class Selection(Protocol):
+    """A view whose records are a part of its source's alone (a holdout's), so a part is taken of records
+    its source's read gave once (`part`), as a compile shares one read of a store among its parts."""
+
+    def part(self, records: Records) -> Records: ...
+
+
 def beneath(source: Source, through: Collection[Rows]) -> Iterator[Source]:
     """`source`, then the source each view reads, down through every view whose rows are of a kind
     in `through`, ending at the first source that is not one."""
@@ -285,7 +303,7 @@ def materialized(source: Source) -> TypeGuard[Materialized]:
 
 
 def _indexed_manifest(source: Source, uri: str, rows: int,
-                      reader: Callable[[Shard], pygrain.IterDataset] | None = None) -> ShardManifest:
+                      reader: ShardOpener | None = None) -> ShardManifest:
     """The records `source` reads by index as a stream: consecutive ranges of
     at most `rows` records, each `Shard` named by the record it starts at,
     which no copy of the source names otherwise, wherever it is, and read at
@@ -310,11 +328,11 @@ class _IndexedSlice:
 
     source: Source
 
-    def __call__(self, shard: Shard) -> pygrain.IterDataset:
+    def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset:
         import grain.python as pygrain
 
         records = pygrain.MapDataset.source(self.source.records("indexed"))
-        return records[shard.start : shard.stop].to_iter_dataset()
+        return records[shard.start : shard.stop].to_iter_dataset(options)
 
 
 __all__ = ["READS", "Consumed", "Read", "Shard", "ShardManifest", "Source"]

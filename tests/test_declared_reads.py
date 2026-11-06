@@ -263,6 +263,42 @@ def test_a_declared_offset_index_replaced_under_its_facts_is_refused_where_it_is
         records[0]
 
 
+def test_a_declared_index_with_lengths_replaced_under_its_facts_is_refused_where_its_lengths_are_read():
+    """An index holding its records' lengths beside their offsets, read under facts its publisher declared,
+    gives its lengths as declared, and replaced by another valid index is refused (`Replaced`) where its
+    lengths are read, as where its offsets are (row 4144)."""
+    import numpy as np
+
+    def published(lengths: list[int]) -> tuple[Store, Store]:
+        rows = Store(f"memory://declared-lengths-{uuid4().hex}/rows.jsonl")
+        rows.write(b"".join(b'{"id":%d}\n' % length for length in lengths))
+        Files(rows.url).provision()
+        index = Store(rows.url.removesuffix(".jsonl") + ".index.npy")
+        offsets = np.load(io.BytesIO(index.read()), allow_pickle=False)
+        held = np.zeros(len(offsets), [*offsets.dtype.descr, ("length", "<u4")])
+        for name in offsets.dtype.names:
+            held[name] = offsets[name]
+        held["length"] = lengths
+        written = io.BytesIO()
+        np.save(written, held, allow_pickle=False)
+        index.write(written.getvalue())
+        return rows, index
+
+    def declared(lengths: list[int]):
+        root, index = published(lengths)
+        facts = {store.url: {"bytes": len(store.read()), "sha256": hashlib.sha256(store.read()).hexdigest()}
+                 for store in (root, index)}
+        return Files((root.url,), format="jsonl", index=index.url, file_info=facts), index
+
+    files, _ = declared([3, 5, 7])
+    assert files.lengths().tolist() == [3, 5, 7]
+    replaced, index = declared([3, 5, 7])
+    _, other = published([4, 4, 4])
+    index.write(other.read())
+    with pytest.raises(Replaced):
+        replaced.lengths()
+
+
 def test_an_indexed_reader_holds_the_declared_file_it_checked(tmp_path):
     """An indexed reader of a local file its publisher declared checks it once, as it first reads it, and
     reads every later record from the file it checked: a file put in its place since (a rename over it)

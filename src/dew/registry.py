@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
+    from dew.config import RunConfig
     from dew.diffusion.presets import Preset
     from dew.inputs.condition import ConditionEncoder
     from dew.interop.composite import SourceKind
@@ -150,8 +151,8 @@ def imported(path: str) -> Callable[..., Configured]:
         raise ValueError(f"{path!r} names {module}, which is outside Dew and not imported; import it "
                          f"first, or trust its package where the run loads (trust=({package!r},), "
                          f"--trust {package})")
-    # Whatever the path names, untyped until `callable` says what it is.
-    held: Any = importlib.import_module(module)
+    # Whatever the path names, an object until the check below says what it is.
+    held: object = importlib.import_module(module)
     for part in name.split("."):
         try:
             held = getattr(held, part)
@@ -269,7 +270,8 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         protocol they share, whose members are then classes of Dew's or of a
         trusted package, or functions declared to return one (`_derives`); None
         where the members share only an unnamed protocol."""
-        # What a lookup imported, untyped as an import is; typed on the way out.
+        # What a lookup imported, held to the kind's contract (`_holds`), its type `T`'s on the way out: a
+        # bound cannot name the kind's `Built`, so a member's call is typed by the table it is read through.
         self._imported: dict[str, Any] = {}
 
     def __getitem__(self, name: str) -> T:
@@ -613,6 +615,22 @@ def _key_type(annotation: Annotation) -> Annotation:
 _MAPPINGS = (dict, Mapping, MutableMapping)
 
 
+def _admits_function(annotation: Annotation) -> bool:
+    """Whether a value `annotation` declares may be a function, so that a function record
+    (`{"function": name}`) is the function it names: not a mapping's entry type itself nor a union of
+    data alone (`dew._records.JSON`: scalars, sequences and mappings), where `{"function": ...}` is data
+    a JSON round trip keeps as it is."""
+    origin = typing.get_origin(annotation)
+    if origin in _MAPPINGS:
+        return False
+    if origin in (Union, types.UnionType):
+        scalars = (bool, int, float, str, type(None))
+        containers = (*_MAPPINGS, list, tuple, Sequence)
+        return any(member not in scalars and typing.get_origin(member) not in containers
+                   and _admits_function(member) for member in _union_members(annotation))
+    return True
+
+
 def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str = "") -> Configured:
     """Return `value` as its annotation asks for it: a record becomes the value it
     describes, and anything already built is left alone.
@@ -631,7 +649,8 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if dtypes and name == "dtype":
         return resolve_dtype(value)
     annotation = resolve_alias(annotation)
-    if isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str):
+    if (isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str)
+            and _admits_function(annotation)):
         return imported(value["function"])
     if (isinstance(value, Mapping) and annotation not in (None, object)
             and typing.get_origin(annotation) not in _MAPPINGS and _sharing(value) is not None):
@@ -1403,7 +1422,7 @@ presets: Aliases[type[Preset], Preset] = Aliases("preset", {
     "shortcut": "dew.diffusion.presets:Shortcut",
     "sqrt": "dew.diffusion.presets:Sqrt",
 })
-solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
+solvers: Aliases[type[Solver], Solver] = Aliases("solver", {
     "consistency": "dew.sampling.solvers.gaussian:Consistency",
     "ddim": "dew.sampling.solvers.gaussian:DDIM",
     "ddpm": "dew.sampling.solvers.gaussian:DDPM",
@@ -1425,6 +1444,8 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "unmask": "dew.diffusion.discrete:Unmask",
     "confident": "dew.diffusion.discrete:Confident",
 })
+# An encoder's raw input is its own (`ConditionEncoder[Raw, Encoded]`, Raw invariant as an input is): the
+# table admits an encoder of any, which only the encoder's run reads.
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
     "clip_text": "dew.inputs.encoders:CLIPText",
@@ -1500,6 +1521,7 @@ towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "llama4": "dew.nn.vision.llama4:Llama4Vision",
     "mimo": "dew.nn.vision.mimo:MiMoVision",
     "mimo_audio": "dew.nn.mimo_audio:MiMoAudio",
+    "moonvit": "dew.nn.vision.moonvit:MoonViT",
     "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerVision",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Vision",
     "siglip": "dew.nn.vision.siglip:SiglipVision",
@@ -1512,6 +1534,8 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "lfm3_vl": "dew.nn.vision.lfm3:Lfm3VlProjector",
     "llama4": "dew.nn.vision.llama4:Llama4Projector",
     "mimo": "dew.nn.vision.mimo:MiMoProjector",
+    "moonvit": "dew.nn.vision.moonvit:MoonViTProjector",
+    "moonvit_v2": "dew.nn.vision.moonvit:MoonViTProjectorV2",
     "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerProjector",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
 }, base="dew.nn.vision.common:ProjectorBase")
@@ -1524,12 +1548,12 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 }, base="dew.optim:ScheduleBase")
 
 
-# A run config's own class sits above the registry, so the table's type names none. A run record
-# names its class by this table's alias (`RunConfig.record`), apart from every other kind.
-runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
+# A run config's own class sits above the registry, which names it for the type checker alone. A run
+# record names its class by this table's alias (`RunConfig.record`), apart from every other kind.
+runs: Aliases[type[RunConfig], RunConfig] = Aliases("run", {
     "decision": "dew.decision.config:DecisionRunConfig",
     "diffusion": "dew.config.diffusion:DiffusionRunConfig",
-    "env": "dew.objectives.rl.config:EnvRunConfig",
+    "env": "dew.config.env:EnvRunConfig",
     "jepa": "dew.config.jepa:JepaRunConfig",
     "lm": "dew.config.lm:LMRunConfig",
     "world_model": "dew.config.world_model:WorldModelRunConfig",
@@ -1544,12 +1568,12 @@ envs: Aliases[type | Callable[..., Configured], Any] = Aliases("env", {
     "playground": "dew.rl.playground:Playground.load",
     "skydreamer": "dew.rl.skydreamer:SkyDreamerRace",
 }, base="dew.rl.env:Env")
-"""The environments an environment run names (`dew.objectives.rl.config.EnvConfig`): a JAX `Env` class, a
+"""The environments an environment run names (`dew.config.env.EnvConfig`): a JAX `Env` class, a
 host `Simulator` class, or a function or classmethod that returns one; any other by its import path."""
 rollouts: Aliases[type[DreamerRollout] | type[ControlRollout], DreamerRollout | ControlRollout] = Aliases(
     "rollout", {"control": "dew.objectives.rl.control:ControlRollout",
                 "dreamer": "dew.objectives.rl.dreamer:DreamerRollout"})
-"""The rollouts an environment run collects its batches with (`dew.objectives.rl.config.RolloutConfig`)."""
+"""The rollouts an environment run collects its batches with (`dew.config.env.RolloutConfig`)."""
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,

@@ -103,6 +103,7 @@ def test_each_example_draws_its_own_bits_under_any_key_implementation(impl):
         return jnp.stack([jax.random.normal(jax.random.fold_in(base, example), (3, WIDTH))
                           for example in range(4)])
 
+    @as_given
     def truth(data):
         return np.stack([normal_truth(bits) for bits in example_bits(keyed(data), range(4), (3, WIDTH))])
 
@@ -139,6 +140,7 @@ def test_an_examples_draw_is_its_own_whatever_batch_it_is_drawn_in():
         return {f"{rows}x{shape}": jnp.stack([jax.random.normal(jax.random.fold_in(base, example), shape)
                                                for example in range(rows)]) for rows, shape in floats}
 
+    @as_given
     def truth(data):
         drawn = jax.random.wrap_key_data(data)
         return {f"{rows}x{shape}": np.stack([normal_truth(bits)

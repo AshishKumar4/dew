@@ -40,6 +40,9 @@ class TowerLayout:
     prefix: str
     path: Callable[[str], tuple[str, ...] | None]
     read: Reader = placed
+    roots: tuple[str, ...] = ()
+    """The leading names of a tower stored under several roots, an empty `prefix` beside them, whose
+    names `path` reads whole: MiMo-V2.6's audio tower, its encoder's and its tokenizer folder's."""
 
     def variables(self, hf_tensors: Mapping[str, Stored], param_dtype: str
                   ) -> tuple[Variables, tuple[WeightLayout, ...]]:
@@ -123,6 +126,9 @@ class TowerGeometry:
     times any frame reduction after them."""
     position_size: int | None = None
     retains_patch_slots: bool = False
+    pools_frames: bool = False
+    """Whether an item's frames pool into one frame's tokens (MoonViT's `tpool_patch_merger`): its tokens
+    are its first frame's merge blocks, wherever it holds more."""
 
 
 class TowerBase:
