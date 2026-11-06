@@ -419,15 +419,17 @@ def interpreted_lane() -> Lane:
 
 @dataclasses.dataclass(frozen=True)
 class Run:
-    """A call's operands as its launches read them and its records, one row: `q`, `k` `[T, Hk, Dk]`, `v` `[T,
-    H, Dv]`, `g`, `beta` `[T, H]` (float64 of their dtypes' values); each chunk and head's stored inverse less
+    """A call's operands as its launches read them and its records, one row: `q`, `k` `[N C, Hk, Dk]`, `v`
+    `[N C, H, Dv]`, `g`, `beta` `[N C, H]` (float64 of their dtypes' values), laid a chunk at a time as the
+    launches lay them (`laid_chunks`: a document's chunks its own, a chunk's rows past its tokens zero); each
+    chunk and head's stored inverse less
     its diagonal `a` `[N, H, C, C]`, weighted keys `w` `[N, H, C, Dk]`, entering memory `h` `[N, H, Dk, Dv]`,
     corrected values `c` and output `o` `[N, H, C, Dv]`, an fp32 call's three parts summed; and the fp32
     memory each chunk leaves, `carries` `[N + 1, H, Dk, Dv]` from the initial memory: the final memory of the
-    call over the chunks before it, at the same tiles (`recorded`), the state the states launch carries in
-    fp32 and stores rounded as `h`, which `h`'s enclosure holds bit for bit (`enclosed`); and `begins` `[N]`,
-    the chunks a packed call's documents begin, which enter the zero memory a document starts from in place
-    of the one the chunk before leaves."""
+    call over the tokens up to the chunk's last, at the same tiles (`recorded`), the state the states launch
+    carries in fp32 and stores rounded as `h`, which `h`'s enclosure holds bit for bit (`enclosed`); and
+    `begins` `[N]`, the chunks a packed call's documents past the row's first begin, which enter the zero
+    memory such a document starts from in place of the one the chunk before leaves."""
     q: np.ndarray
     k: np.ndarray
     v: np.ndarray
@@ -463,6 +465,24 @@ class Run:
                     point(self.entered(n, head)) if carry is None else carry)
 
 
+def laid_chunks(length: int, starts, max_segments: int | None) -> np.ndarray:
+    """The chunks a call of one row of `length` tokens lays its tokens in, `[N, 2]`: each chunk's first
+    token and its count, in the launches' order (`chunked_launch.sequences`, the mainloop's layout): a row's
+    own chunks, or each document's (its first token marked in `starts` `[1, T]`, up to `max_segments` a
+    row) its own, so a document beginning inside a chunk starts a chunk of its own."""
+    from dew.nn.inputs import cu_seqlens
+    from dew.nn.kernels import chunked_launch
+
+    if starts is None:
+        table = chunked_launch.sequences(1, length, chunk=CHUNK).chunks
+    else:
+        documents = length if max_segments is None else max_segments
+        table = chunked_launch.sequences(1, length, np.asarray(cu_seqlens(starts, documents + 1)),
+                                         chunk=CHUNK).chunks
+    table = np.asarray(table)[:, :2]
+    return table[table[:, 1] > 0]
+
+
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
              carried: bool = True) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
@@ -474,9 +494,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     `carried`, each chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to
     it, whose final memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`,
     each chunk's: end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's
-    documents (`starts` `[1, T]`) begin on the chunks' grid, where the launches lay a row's chunks as they
-    are; a document beginning inside a chunk lays its own (`mainloop._layout`), which this witness does not
-    index."""
+    documents (`starts` `[1, T]`) lay their own chunks (`laid_chunks`), a document beginning inside a chunk
+    included, its first chunk entering the zero memory."""
     import jax
     import jax.numpy as jnp
 
@@ -505,15 +524,17 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
             assert np.array_equal(np.asarray(native).view(np.uint8), np.asarray(own).view(np.uint8)), \
                 "the certify build is the production program"
         _, length, heads, value_width = v.shape
-        key_width, chunks = k.shape[-1], length // CHUNK
-        ends = [kept(*(x[:, :n * CHUNK] for x in operands[:5]), h0,
-                     starts=None if starts is None else starts[:, :n * CHUNK])[1]
-                for n in range(1, chunks)] if carried else []
+        key_width = k.shape[-1]
+        table = laid_chunks(length, starts, max_segments)
+        chunks = len(table)
+        # Each chunk's leaving memory: the final memory of the call over the tokens up to its last, the
+        # document it ends then the row's last.
+        ends = [kept(*(x[:, :first + count] for x in operands[:5]), h0,
+                     starts=None if starts is None else starts[:, :first + count])[1]
+                for first, count in table[:-1]] if carried else []
     # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
-    # call's come first where its documents start on the chunks' grid.
+    # call's come first.
     laid = np.shape(a)[0] // CHUNK
-    begins = (np.zeros(length, bool) if starts is None else np.asarray(starts, bool)[0])
-    assert not begins[np.arange(length) % CHUNK != 0].any(), "a document begins on the chunks' grid"
 
     def summed(x, rows):
         return np.asarray(x, np.float64).reshape(rows, -1)
@@ -525,11 +546,23 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     carries = [np.asarray(h0, np.float64)[0], *(np.asarray(end, np.float64)[0] for end in ends)]
     unknown = np.full(carries[0].shape, np.nan)
     carries += [unknown] * (chunks - len(carries)) + [np.asarray(kept_final, np.float64)[0]]
-    return Run(**hosted(operands), a=chunked(a, CHUNK), w=chunked(w, key_width), h=memories,
-               c=chunked(c, value_width),
-               o=np.asarray(kept_o, np.float64)[0].reshape(chunks, CHUNK, heads, value_width).transpose(
-                   0, 2, 1, 3),
-               carries=np.stack(carries), begins=begins[::CHUNK])
+    hosted_operands = {name: _laid(value, table) for name, value in hosted(operands).items()}
+    output = _laid(np.asarray(kept_o, np.float64)[0], table).reshape(chunks, CHUNK, heads, value_width)
+    # A document past the row's first begins on the zero memory (`chunked_launch.Sequences`).
+    begins = np.asarray([first > 0 and (starts is not None and bool(np.asarray(starts)[0, first]))
+                         for first, _ in table])
+    return Run(**hosted_operands, a=chunked(a, CHUNK), w=chunked(w, key_width), h=memories,
+               c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
+               begins=begins)
+
+
+def _laid(x: np.ndarray, table: np.ndarray) -> np.ndarray:
+    """A row's `[T, ...]` laid a chunk at a time by `table` (`laid_chunks`), `[N C, ...]`: each chunk's
+    tokens, its rows past them zero."""
+    found = np.zeros((len(table) * CHUNK, *x.shape[1:]), x.dtype)
+    for n, (first, count) in enumerate(table):
+        found[n * CHUNK:n * CHUNK + count] = x[first:first + count]
+    return found
 
 
 def hosted(operands: tuple) -> dict[str, np.ndarray]:
