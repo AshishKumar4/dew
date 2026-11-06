@@ -214,8 +214,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         # 64 still spills 40 bytes counted apart, its decode path the Triton mainloop's until it does not).
         magnitudes = [logits[0], (columns, block, jnp.float32)]
         if parts > 1:
-            # Its weights' remainder and the part taken from it (`_parted_products`).
-            logits = [*logits, (rows, block, jnp.float32), (rows, block, dtype)]
+            # The part taken from its weights' remainder, which takes the weights' place (`_parted_products`:
+            # the weights die at their product, their denominator taken before it).
+            logits = [*logits, (rows, block, dtype)]
         live = resources.live_registers(arranged, carried, logits + sums, magnitudes, *fragments)
         if arranged.operands_in_registers:
             # Its products' fragments loaded beside the step's tiles, which they read (mma.sync: priced

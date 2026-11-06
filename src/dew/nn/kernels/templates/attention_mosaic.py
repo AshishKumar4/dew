@@ -609,8 +609,8 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     bits = (block_q, block_k, jnp.int32)
     step = [logits, weights, *([weights] if residuals else [])]
     if parts > 1:
-        # Its weights' remainder and the part taken from it (`_parted_products`).
-        step += [logits, weights]
+        # The part taken from its weights' remainder, which takes the weights' place (`_parted_products`).
+        step += [weights]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
     if not family.folds_indices(block_k):
