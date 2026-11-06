@@ -1464,6 +1464,10 @@ class RunConfig:
     stage or the training batch."""
     data_seed: int = 0
     """The seed of the data's order and of its random steps."""
+    kernels: dict[str, str] = dataclasses.field(default_factory=dict)
+    """The kernel the run runs for each op it names (`dew.kernels.use`, ops `dew.kernels.choices`), for
+    every program it traces, its steps', evaluations' and samples' (`traced`): `--kernels attention xla`.
+    None named, each op's pick for its call (row 4649)."""
     data_plan_version: int | None = None
     """The data plan version the run reads its order by (`dew.data.plan.PLAN_VERSIONS`): None for the
     saved run's it resumes, or else this Dew's, which `resumed` resolves on every path a run trains by and
@@ -2162,8 +2166,7 @@ class RunConfig:
             # state restored.
             self._agree_resume(checkpoints, built, dataset, steps)
             agreed("run metadata", record_run)
-            # Every program the run traces takes its recorded precision policy.
-            with generation.run_precision(trainer.precision):
+            with self.traced():
                 state = built.fit(
                     # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
                     dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
@@ -2193,6 +2196,14 @@ class RunConfig:
             _closed(tracker, checkpoints, sys.exception(),
                     rollout if isinstance(rollout, Closeable) else None)
 
+    @contextlib.contextmanager
+    def traced(self) -> Iterator[None]:
+        """The block every program the run traces is traced within (its steps', evaluations' and samples'):
+        its recorded precision policy (`generation.run_precision`) and its kernel choices
+        (`dew.kernels.use`), which JAX keys its trace caches on."""
+        with generation.run_precision(self.trainer.precision), generation.chosen(**self.kernels):
+            yield
+
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
                                          steps: int | None, rollout: Rollout | None,
                                          name: str) -> CompiledAhead:
@@ -2207,7 +2218,7 @@ class RunConfig:
         held = epath.Path(self.trainer.directory(name)).is_dir()
         trainer = self.built(objective, mesh, rollout,
                              checkpoints=self.trainer.checkpoints(name) if held else None)
-        with generation.run_precision(self.trainer.precision):
+        with self.traced():
             # The run's bound in examples as its data was compiled to it (`viewed`).
             return target.compiled(trainer, dataset, steps, dataset.examples if steps is None else None,
                                    self.trainer.resume)
@@ -2226,7 +2237,7 @@ class RunConfig:
         held = epath.Path(run.trainer.directory(name)).is_dir()
         trainer = run.built(objective, run.trainer.mesh, rollout,
                             checkpoints=run.trainer.checkpoints(name) if held else None)
-        with generation.run_precision(run.trainer.precision):
+        with run.traced():
             # The run's bound in examples as its data was compiled to it: its `examples`, or its `epochs`'
             # passes over a read with no record count (`fitted`).
             batch = first_step_batch(trainer, loader, steps, loader.examples if steps is None else None)
