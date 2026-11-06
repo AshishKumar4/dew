@@ -26,7 +26,7 @@ launch's config, which the others take exactly, so every process compiles the
 same program: its pick, or the heuristic. With `measure`, on a GPU the
 process has to itself (`dew._cache.measures_picks`), every variant of a launch
 without a pick compiles on a thread pool and runs alone, its kernel's device
-time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept;
+time read by CUPTI behind an eviction (`dew.telemetry.benchmark.behind`), and the fastest is kept;
 a win over the derived config is a gap in the derivation, fixed there for
 the whole family, which `gaps` names for maintainers. Picks persist per GPU model, jaxlib and jax beside XLA's
 own (`dew._cache.kernel_picks_path`; Pallas lowers a kernel in jax, which a release moves without jaxlib), in
@@ -82,11 +82,6 @@ from . import generation
 from .templates import report
 
 _log = logging.getLogger(__name__)
-
-FLUSH_BYTES = 256 << 20
-"""The bytes read before each timed launch: twice the largest L2 among Dew's
-GPUs (an RTX PRO 6000's 128 MB), so no launch finds its operands in cache,
-as none does in a training step."""
 
 REPEATS = 5
 """The timed launches of each config."""
@@ -891,13 +886,12 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels (`dew.telemetry.benchmark.device_time`), each run after
-    `FLUSH_BYTES` are read, so every config starts with its operands out of
-    cache."""
-    from dew.telemetry.benchmark import CuptiHeld, behind, device_time
+    kernels (`dew.telemetry.benchmark.device_time`), each run behind an
+    eviction, so every config starts with its operands out of cache."""
+    from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
-    flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
+    flush = eviction()
 
     def compiled(config):
         configured = op.replace(config=config)
@@ -910,7 +904,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         # A candidate's lowering and its compile timed apart, the compile of its config as it is: a config
         # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`). The
         # launch runs behind the flush, which reads the whole buffer through the cache.
-        lowered = owned_program(behind(jnp.sum, launched)).lower(flush, (arrays,))
+        lowered = owned_program(behind(launched)).lower(flush, (arrays,))
         middle = time.perf_counter()
         executable = lowered.compile()
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3
@@ -927,13 +921,13 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
             for config, future in futures.items():
                 try:
                     executable, lowering, compiling = future.result()
-                    runs = [device.behind(executable, jnp.sum, flush, arrays) for _ in range(REPEATS)]
+                    runs = [device.behind(executable, flush, arrays) for _ in range(REPEATS)]
                 except jax.errors.JaxRuntimeError as error:
                     if not _resource_exhausted(error):
                         raise
                     timings[config] = error
                     continue
-                except ValueError as error:
+                except NoKernels as error:
                     # CUPTI read none of the config's own kernels: its time would read as zero, so no pick.
                     timings[config] = error
                     continue
