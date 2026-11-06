@@ -227,6 +227,13 @@ def inert(node: ast.AST | None) -> bool:
     return False
 
 
+def decorating(node: ast.expr) -> bool:
+    """Whether decorator `node` is inert (`INERT_DECORATORS`): a decorator is called on what it decorates, so
+    a name is one only where it is one of them, as a call that makes the decorator is where it calls one."""
+    return dotted(node) in INERT_DECORATORS and inert(node) if isinstance(node, ast.Call) else (
+        dotted(node) in INERT_DECORATORS)
+
+
 def headed(statement: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
     """What a function statement evaluates as it runs: its decorators, defaults, annotations and return's."""
     arguments = statement.args
@@ -247,9 +254,13 @@ def defining(statement: ast.stmt) -> list[str] | None:
         return None if any(alias.name == "*" for alias in statement.names) else [
             alias.asname or alias.name for alias in statement.names]
     if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return [statement.name] if all(inert(each) for each in headed(statement)) else None
+        head = [each for each in headed(statement) if each not in statement.decorator_list]
+        return [statement.name] if all(decorating(each) for each in statement.decorator_list) and all(
+            inert(each) for each in head) else None
     if isinstance(statement, ast.ClassDef):
-        head = [*statement.decorator_list, *statement.bases, *(each.value for each in statement.keywords)]
+        if not all(decorating(each) for each in statement.decorator_list):
+            return None
+        head = [*statement.bases, *(each.value for each in statement.keywords)]
         body = all(isinstance(each, ast.Pass)
                    or (isinstance(each, ast.Expr) and isinstance(each.value, ast.Constant))
                    or (not isinstance(each, (ast.Import, ast.ImportFrom)) and defining(each) is not None)
@@ -388,7 +399,10 @@ def parted(body: list[ast.stmt]) -> tuple[list[ast.stmt], dict[str, list[ast.stm
             effects.append(statement)
         roots = sorted({read.split(".")[0] for each in importing(statement) for read in loaded(each)}
                        - {followed.EVERY})
-        skeleton.append([sorted(set(names or ()) & BUILTINS), [[root, root in bound] for root in roots]])
+        # A statement that shadows no builtin and reads nothing as it runs, as a definition added or taken
+        # away is, leaves the skeleton as it was.
+        if (shadowed := sorted(set(names or ()) & BUILTINS)) or roots:
+            skeleton.append([shadowed, [[root, root in bound] for root in roots]])
         for name in names or ():
             defined[name].append(statement)
         bound.update(names or ())

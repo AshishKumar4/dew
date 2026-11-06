@@ -210,6 +210,11 @@ def test_each_start_needs_its_own_record_though_two_start_alike(ci, tmp_path, mo
 
 MODULE = """import functools
 LIMIT = 3
+UNREAD = 5
+
+
+def limited():
+    return LIMIT
 
 
 def scaled(x, by=2):
@@ -238,19 +243,22 @@ class Shape:
     (("        return self.sides * side", "        return side * self.sides"), [False, False]),
     (("def scaled(x, by=2):", "def scaled(x, by=3):"), [True, True]),
     (("LIMIT = 3", "LIMIT = 4"), [True, True]),
+    (("UNREAD = 5", "UNREAD = 6"), [False, False]),
     (("    sides = 4", "    sides = 5"), [True, True]),
     (("import functools\n", "import functools\n\n\n# a note above\n\n"), [False, False]),
 ], ids=["a function no test ran", "a function the first file ran", "a method the last file ran",
-        "a method no test ran", "a default", "a module's constant", "a class's attribute", "lines moved"])
+        "a method no test ran", "a default", "a module's constant", "a constant no code reads",
+        "a class's attribute", "lines moved"])
 def test_an_edit_reruns_the_files_whose_run_executed_what_it_changed(ci, tmp_path, monkeypatch,
                                                                        cache_worker, edit, rerun):
-    """A file's key covers the code its run executed, each function it ran and the top level of each module
-    it imported (all but function bodies: its imports, constants, classes' attributes and methods'
-    signatures, defaults and decorators), not a module's whole text: an edit to a function no run executed,
-    or one that only moves lines, reruns no file, and an edit to what a run executed reruns it and the files
-    its process ran after it, which what it ran may serve."""
+    """A file's key covers the code its run executed, each function it ran, and of each module it imported the
+    top level that ran as it was imported and each definition there its code reaches (an import, a constant, a
+    class's attributes and methods' signatures, a function's defaults and decorators), not a module's whole
+    text: an edit to a function no run executed, to a constant no code read, or one that only moves lines,
+    reruns no file, and an edit to what a run executed or reached reruns it and the files its process ran
+    after it, which what it ran may serve."""
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "test_a.py": ON_SRC + "import m\ndef test_a():\n    assert m.scaled(2) == 4\n",
+        "test_a.py": ON_SRC + "import m\ndef test_a():\n    assert m.scaled(2) == 4 and m.limited() == 3\n",
         "test_b.py": ON_SRC + "import m\ndef test_b():\n    assert m.Shape().area(3) == 9\n"},
         {"m.py": MODULE})
     assert reused() == [True, True]
