@@ -18,17 +18,14 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from data_support import LATEST
 from storage_support import moto_bucket
 from token_support import export_byte_tokens
 
 from dew.data.declared import Replaced
-from dew.data.plan import PLAN_VERSIONS
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
 from dew.data.storage import Store
-
-LATEST = PLAN_VERSIONS[-1]
-"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 @contextlib.contextmanager

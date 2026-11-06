@@ -935,6 +935,16 @@ shuffled by one seed read in orders of their own and a named corpus reads one or
 saved under an earlier version reads by it (carried to 1.0, ledger 1552)."""
 
 
+def read_by(version: int) -> int:
+    """`version`, refused where this Dew reads by none of it (`PLAN_VERSIONS`): what every read builds by
+    (`dew.data.compile._build`) and every cache key keys its fill by (`dew.data.analysis._cache_key`), where
+    another would read as the version it falls among (11 as 10, 5 as 8)."""
+    if version not in PLAN_VERSIONS:
+        raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
+                         f"{version}: resume a run saved under another with the Dew that wrote it")
+    return version
+
+
 def filled_version(fill: Mapping[str, object]) -> int:
     """The plan version whose shards a streamed fill numbers its rows by, from its cache key's `fill`
     (`Manifest.fill`): `FILE_SHARDS` where it names a Parquet store's shards its files, the version before it
