@@ -811,19 +811,20 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     segments = jnp.cumsum(vanished.astype(jnp.int32), axis=0)
     count = exponents.shape[0]
     below = (jnp.arange(count)[:, None] >= jnp.arange(count)[None, :])[:, :, None]
-    gaps = (high[:, None] - high[None, :]) + (low[:, None] - low[None, :])
     # A span holds a vanished token where its ends lie in two segments, or its start in the first's.
     joined = below & (segments[:, None] == segments[None, :])
     started, ending = segments == 0, segments == segments[-1]
     # Each exponent masked before its exponential, as each span's: one across a vanished token is no sum
     # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN).
-    return _Decays(entering=jnp.where(started, _exp(base2, jnp.where(started, high + low, 0.0)), 0.0),
-                   to_last=jnp.where(ending, _exp(base2, jnp.where(ending,
-                                                                   (high[-1] - high) + (low[-1] - low), 0.0)),
-                                     0.0),
-                   whole=jnp.where(started[-1], _exp(base2, jnp.where(started[-1], high[-1] + low[-1], 0.0)),
-                                   0.0),
-                   between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), 0.0))
+
+    def decayed(where, whole, part):
+        raised = _raised(base2, jnp.where(where, whole, 0.0), jnp.where(where, part, 0.0))
+        return jnp.where(where, raised, 0.0)
+
+    return _Decays(entering=decayed(started, high, low),
+                   to_last=decayed(ending, high[-1] - high, low[-1] - low),
+                   whole=decayed(started[-1], high[-1], low[-1]),
+                   between=decayed(joined, high[:, None] - high[None, :], low[:, None] - low[None, :]))
 
 
 def _decays_of(exponents, base2: bool) -> _Decays:
@@ -883,3 +884,15 @@ def _scanned(values, *, reverse: bool = False) -> jax.Array:
 
 def _exp(base2: bool, x):
     return jnp.exp2(x) if base2 else jnp.exp(x)
+
+
+def _raised(base2: bool, whole, part):
+    """The exponential of a compensated exponent `whole + part` without rounding it to one float first: a
+    base-2 one the recurrence's own (`recurrence_algebra.raised`, its integer an exact power of two), a
+    natural one as each part's exponential's product. Rounded whole, an exponent near -43 loses half its
+    ulp, 1.9e-6, a relative 1.3e-6 of every decay (ledger 2519's measure)."""
+    if base2:
+        from dew.nn.kernels import recurrence_algebra
+
+        return recurrence_algebra.raised(whole, part)
+    return jnp.exp(whole) * jnp.exp(part)
