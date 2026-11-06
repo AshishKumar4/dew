@@ -252,6 +252,17 @@ def slot(term: Term) -> i64: ...
 """A walked reduction's index among the walk's, its carried state's (`Term.state`)."""
 
 
+@function(merge=lambda old, new: old)
+def at_least(term: Term) -> i64: ...
+"""A floor `term` is at least (`floor_of`'s class): a floored maximum's carried state (`_floors`), and a
+maximum of a value at least it."""
+
+
+@function(merge=lambda old, new: old)
+def floor_of(literal: Term) -> i64: ...
+"""The class of a literal's value among the walk's floors (`_floors`): literals of one value one class."""
+
+
 def _exponentials(scaled: bool = False) -> list:
     """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential; and
     `scaled`, as `exp(-c k)`, an exponential of a difference times a positive literal `c` (raw logits, the
@@ -418,6 +429,24 @@ def _shapes():
             set_(shape(y)).to(to)),
         name="derived shapes")
 
+
+def _floored():
+    """The floors' rules (the module's account): a maximum is at least what either side is, and a maximum
+    of a value at least a floor with that floor's literal is the value."""
+    x, y, t = vars_("x y t", Term)
+    c, p = vars_("c p", i64)
+    return ruleset(
+        rule(eq(t).to(x.binary(String("max"), y, p)), eq(at_least(x)).to(c)).then(set_(at_least(t)).to(c)),
+        rule(eq(t).to(y.binary(String("max"), x, p)), eq(at_least(x)).to(c)).then(set_(at_least(t)).to(c)),
+        rule(eq(t).to(x.binary(String("max"), y, p)), eq(at_least(x)).to(c), eq(floor_of(y)).to(c)).then(
+            union(t).with_(x)),
+        rule(eq(t).to(y.binary(String("max"), x, p)), eq(at_least(x)).to(c), eq(floor_of(y)).to(c)).then(
+            union(t).with_(x)),
+        name="floored")
+
+
+FLOORED = _floored()
+"""A floored maximum's readings: its floor taken once, at its identity (`_floors`)."""
 
 WALKING = _walking()
 WALKING_SCALED = _walking(scaled=True)
@@ -612,6 +641,9 @@ class _Forms:
     merged: tuple[tuple[Term, Term] | None, ...] = ()
     """Each reduction's merge as a mainloop's own merge takes it (`merge_factors`): the factors its first and
     second states take, extracted with the forms; None for a merge of no such rule."""
+    floors: tuple[float | None, ...] = ()
+    """Each reduction's floor, the identity it is carried from where the declaration reads it only floored
+    (`_floors`); None for every other."""
 
 
 def context() -> tuple:
@@ -663,8 +695,9 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         typed = jax.eval_shape(lambda *values: tuple(evaluated(made.region, reduction,
                                                                [*made.consts, *values], {})
                                                      for reduction in made.reductions), *avals)
-        return tuple(jnp.full(aval.shape, _identity(reduction, aval.dtype), aval.dtype)
-                     for reduction, aval in zip(made.reductions, typed, strict=True))
+        return tuple(jnp.full(aval.shape, _identity(reduction, aval.dtype) if floor is None else floor,
+                              aval.dtype)
+                     for reduction, aval, floor in zip(made.reductions, typed, made.floors, strict=True))
 
     def carried(made: _Forms, *states) -> dict:
         return {terms.key(Term.state(i64(index), i64(side))): state[index]
@@ -795,7 +828,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     graph.register(declared, bundle)
     schedule = cost.walk(cost.target())
     _, before = extract.cheapest(graph, declared, cost.model(region, schedule))
-    facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), walking.saturate())
+    floors = _floors(graph, region, reductions)
+    facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), walking.saturate(), FLOORED.saturate())
     decoupled = DECOUPLED if declaration.rescale is None else DECOUPLED_RESCALED
     _decoupled_through(graph, region, facts, decoupled)
     saturated = program.saturate(graph, region, (*rules.admitted(accurate), decoupled),
@@ -849,7 +883,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
             raise Refused("a merge reads a walked operand: no tile is there to read")
     return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
                   walked_leaves, tuple(closed.consts), report, tuple(accumulated), tuple(added),
-                  tuple(merged))
+                  tuple(merged), floors)
 
 
 def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:
@@ -1041,6 +1075,51 @@ def _holds(graph: EGraph, fact) -> bool:
     except EggSmolError:
         return False
     return True
+
+
+def _floors(graph: EGraph, region: terms.Region, reductions: Sequence[Term]) -> tuple[float | None, ...]:
+    """Each walked maximum's floor where the declaration reads it only floored, `max(m, c)` at one finite
+    literal value `c` (attention's `max(m, least)`), else None: the walk carries it floored from `c` (its
+    identity, `init`), so each of its states is at least `c` (`at_least`) and a floor of one is the state
+    itself (`FLOORED`), the per-step floor and the correction's shift dropped (row 3520: the hand walk
+    carries its maximum floored from the least finite value)."""
+    places = {terms.key(reduction): index for index, reduction in enumerate(reductions)
+              if _role(reduction) == "max"}
+    floors: dict[int, object] = {}
+    barred = {places[terms.key(term)] for term in region.outputs
+              if term is not None and terms.key(term) in places}
+
+    def literal_of(term: Term):
+        if (args := get_callable_args(term, Term.literal)) is None:
+            return None
+        value = np.asarray(region.literals[terms.integer(args[0])])
+        return value.item() if value.shape == () and np.isfinite(value) else None
+
+    for term, _ in region.shapes:
+        for constructor in terms.LANGUAGE:
+            if (args := get_callable_args(term, constructor)) is None:
+                continue
+            children = [arg for arg in args if isinstance(arg, Term)]
+            for child in children:
+                if (index := places.get(terms.key(child))) is None:
+                    continue
+                binary = get_callable_args(term, Term.binary)
+                floor = None
+                if binary is not None and terms.text(binary[1]) == "max":
+                    other = binary[2] if terms.key(binary[0]) == terms.key(child) else binary[0]
+                    floor = literal_of(other)
+                if floor is None or floors.setdefault(index, floor) != floor:
+                    barred.add(index)
+    held = {index: floor for index, floor in floors.items() if index not in barred}
+    classes = {floor: number for number, floor in enumerate(dict.fromkeys(held.values()))}
+    for literal, value in enumerate(region.literals):
+        value = np.asarray(value)
+        if value.shape == () and value.item() in classes:
+            graph.register(set_(floor_of(Term.literal(i64(literal)))).to(i64(classes[value.item()])))
+    for index, floor in held.items():
+        for side in (0, 1):
+            graph.register(set_(at_least(Term.state(i64(index), i64(side)))).to(i64(classes[floor])))
+    return tuple(held.get(index) for index in range(len(reductions)))
 
 
 def _identity(reduction: Term, dtype) -> float:
