@@ -13,12 +13,21 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,
-    constant,
     fixed_attention_buffer,
     grouped_qkv,
     spelled,
 )
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Slot, Table, one_of, unread
+from dew.interop.layouts import (
+    ConfigField,
+    ConfigLayout,
+    ConfigPart,
+    Route,
+    Slot,
+    Table,
+    constant,
+    one_of,
+    unread,
+)
 from dew.interop.unread import Stored, equal
 from dew.nn.rope import inverse_frequencies
 

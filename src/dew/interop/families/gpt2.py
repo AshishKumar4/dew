@@ -17,7 +17,6 @@ from dew.interop.decoder_parts import (
     HeadRows,
     Packed,
     Renames,
-    constant,
     fixed_attention_buffer,
     refuse,
     spelled,
@@ -31,12 +30,14 @@ from dew.interop.layouts import (
     Slot,
     Spelled,
     Table,
+    constant,
     one_of,
     unread,
 )
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.registry import Configured
 
 
 def _heads(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
@@ -64,7 +65,7 @@ def _positions(hf_config: Mapping[str, object], used: set[str], record: DecoderF
     return record
 
 
-def _scaled(value: object, key: str) -> float | None:
+def _scaled(value: Configured, key: str) -> float | None:
     """GPT-2's scale_attn_weights: the head width's root, or none at all (1.0)."""
     return None if value is None or _records.boolean(value, key) else 1.0
 

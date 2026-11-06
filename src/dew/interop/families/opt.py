@@ -5,15 +5,8 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.decoder_config import expect, flag, inert, integer, ungated
-from dew.interop.decoder_parts import (
-    DecoderFamily,
-    DecoderFields,
-    Renames,
-    constant,
-    context_lengths,
-    spelled,
-)
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, unread
+from dew.interop.decoder_parts import DecoderFamily, DecoderFields, Renames, context_lengths, spelled
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, constant, unread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 

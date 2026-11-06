@@ -37,6 +37,7 @@ from dew.interop.decoder_parts import (
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Spelled, Table, constant, unread
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.registry import Configured
 
 _ENCODER = 'ModernBertModel'
 _MASKED_LM = 'ModernBertForMaskedLM'
@@ -59,7 +60,7 @@ def _heads(hf_config: Mapping[str, object], used: set[str], record: DecoderField
     return record
 
 
-def _gated(value: object, key: str) -> str:
+def _gated(value: Configured, key: str) -> str:
     activation = _records.text(value, key)
     if activation not in ACTIVATIONS:
         refuse(f'{key}={activation!r}', f'the GLU supports {sorted(ACTIVATIONS)}')

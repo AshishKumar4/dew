@@ -525,7 +525,7 @@ def _text_vlm_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrappe
 
 
 def _token(key: str, field: str, *aliases: str, default: int | None = None,
-           value: Callable[["MultimodalTransformer"], object] | None = None
+           value: Callable[["MultimodalTransformer"], int | None] | None = None
            ) -> "ConfigField[MultimodalTransformer]":
     """A placeholder id the wrapper states under `key` (or `aliases`), its config class's `default`
     where it has one (required where None), filling `field` of the wrapper's record, written from the

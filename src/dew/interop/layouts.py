@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     import numpy as np
 
     from dew.interop.decoder_parts import SourceCode
+    from dew.nn.backbones.causal_transformer import CausalTransformer
 
 type Config = Mapping[str, object]
 """The native record a route reads its conditions from (`DecoderFields`): the translated config on a load,
@@ -480,8 +481,12 @@ class ConfigPart[Model]:
         return ()
 
 
-_MISSING = object()
-REQUIRED = _MISSING
+@dataclass(frozen=True)
+class Required:
+    """The default of a key a config must state, whose class has none (`REQUIRED`)."""
+
+
+REQUIRED = Required()
 """A key a config must state: its class has no default for it."""
 
 
@@ -494,8 +499,8 @@ class ConfigField[Model]:
 
     key: str
     field: str
-    default: object = _MISSING
-    parse: Callable[[object, str], Configured] | None = None
+    default: Configured | Required = REQUIRED
+    parse: Callable[[Configured, str], Configured] | None = None
     value: Callable[[Model], object] | None = None
     spell: Callable[[object], object] | None = None
     aliases: tuple[str, ...] = ()
@@ -506,10 +511,14 @@ class ConfigField[Model]:
         keys = (self.key, *self.aliases)
         used.update(keys)
         key = next((key for key in keys if key in hf_config), None)
-        if key is None and self.default is _MISSING:
+        default = self.default
+        if key is not None:
+            stated = configured(hf_config[key])
+        elif isinstance(default, Required):
             raise KeyError(self.key)
-        stated = self.default if key is None else hf_config[key]
-        record[self.field] = configured(stated) if self.parse is None else self.parse(stated, key or self.key)
+        else:
+            stated = default
+        record[self.field] = stated if self.parse is None else self.parse(stated, key or self.key)
         return record
 
     def write(self, model: Model) -> Mapping[str, object]:
@@ -700,7 +709,8 @@ class SourceLayout:
             written.write_bytes(module.read_bytes())
 
 
-def source_layout(model: object, *, config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
+def source_layout(model: Configured, *,
+                  config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
     """The layout `model` is written in as its family's release, or what it cannot write (`Unwritable`):
     the one answer every writer asks (a run's export, a bundle's save, a decision's release). A decoder's
     family is the one its fields match (`hf_decoders.export_config`; a differential extension's or a low-rank
@@ -712,15 +722,17 @@ def source_layout(model: object, *, config: Mapping[str, object] | None = None) 
     from dew.lora import unadapted
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.protocols import MediaWrapper
     from dew.registry import from_record
 
-    if isinstance(model, MultimodalTransformer):
+    if isinstance(model, MediaWrapper):
         from dew.interop.wrappers import wrapper_layout
 
-        return wrapper_layout(model, config=config)
-    if not isinstance(model, CausalTransformer):
-        return Unwritable(f"no family writes a {type(model).__name__}")
-    decoder = from_record(CausalTransformer, unadapted(model))
+        return wrapper_layout(from_record(MultimodalTransformer, model), config=config)
+    try:
+        decoder = from_record(CausalTransformer, unadapted(model))
+    except ValueError as error:
+        return Unwritable(f"no family writes a {type(model).__name__}: {error}")
     if decoder.cross_attention is not None:
         return Unwritable("cross-attention has no layout in any family")
     # A differential extension is folded into each layer's output projection and an adapter's factors
@@ -741,7 +753,7 @@ def source_layout(model: object, *, config: Mapping[str, object] | None = None) 
     return SourceLayout(held if config is None else config, {}, tensors, hf_decoders.release_code(base))
 
 
-def _decoder_layout(decoder: object) -> Mapping[str, object] | Unwritable:
+def _decoder_layout(decoder: CausalTransformer) -> Mapping[str, object] | Unwritable:
     """The config a plain decoder (`source_layout`'s) is written with, or what its family's layout cannot
     hold of it: its config refused, or a parameter or router state no route writes, its leaves' paths
     abstract (`jax.eval_shape`: no weight is drawn)."""
@@ -749,9 +761,7 @@ def _decoder_layout(decoder: object) -> Mapping[str, object] | Unwritable:
     import jax.numpy as jnp
 
     from dew.interop import decoder_parts, hf_decoders
-    from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    assert isinstance(decoder, CausalTransformer)
     try:
         written = hf_decoders.export_config(decoder)
     except decoder_parts.ExportRefused as refusal:
@@ -786,6 +796,7 @@ __all__ = [
     "Prefixed",
     "Rebased",
     "Renames",
+    "Required",
     "Restated",
     "Route",
     "Routes",

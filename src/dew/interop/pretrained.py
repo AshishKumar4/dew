@@ -77,6 +77,7 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
+from dew.nn.protocols import MediaWrapper
 from dew.nn.sharding import boxed, current_boxes, drawn_axes
 from dew.objectives.base import SavedTask
 from dew.registry import (
@@ -823,17 +824,18 @@ class PretrainedDecoder(Pretrained):
         what generation_config.json records; None uses the native defaults with
         the exported model's cache mode.
         """
-        if isinstance(model, MultimodalTransformer):
+        if isinstance(model, MediaWrapper):
             # A wrapper is written in its family's release layout (`wrappers.wrapper_layout`), its
             # language model's under its text family's.
             from dew.interop.wrappers import wrapper_layout
 
-            layout = wrapper_layout(model)
+            wrapper = from_record(MultimodalTransformer, model)
+            layout = wrapper_layout(wrapper)
             if isinstance(layout, Unwritable):
-                raise TypeError(f"a {model.family} wrapper has no Hugging Face layout Dew writes: "
+                raise TypeError(f"a {wrapper.family} wrapper has no Hugging Face layout Dew writes: "
                                 f"{layout.reason}")
-            return cls(model, variables, None, layout.config, None,
-                       record_fields(model, MultimodalTransformer),
+            return cls(wrapper, variables, None, layout.config, None,
+                       record_fields(wrapper, MultimodalTransformer),
                        dict(decoders.GENERATION_DEFAULTS) if generation_config is None else generation_config,
                        export_adapter=lambda _, values, __: layout.tensors(values), tokenizer=tokenizer)
         try:

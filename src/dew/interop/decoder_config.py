@@ -40,6 +40,7 @@ from dew.interop.layouts import (
     ConfigLayout,
     ConfigPart,
     Nested,
+    Required,
     Restated,
     constant,
     unread,
@@ -165,7 +166,7 @@ def activation_part(key: str = 'hidden_act') -> ConfigPart[CausalTransformer]:
     return ConfigPart(_read_activation, lambda model: {key: hf_activation(model.mlp)})
 
 
-def inert(key: str, why: str, *, neutral: object = None) -> ConfigPart[CausalTransformer]:
+def inert(key: str, why: str, *, neutral: Configured = None) -> ConfigPart[CausalTransformer]:
     """A key the reference reads to no effect at `neutral` (or absent, or null), refused at any other
     value, saying `why`; written as nothing."""
     def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
@@ -472,7 +473,7 @@ def decoder_layout(spelling: DecoderSpelling = PLAIN_DECODER, *,
         constant('scale_after_cast', value=spelling.scale_after_cast))
 
 
-def integer(key: str, field: str, default: object = REQUIRED, *aliases: str) -> ConfigField:
+def integer(key: str, field: str, default: int | None | Required = REQUIRED, *aliases: str) -> ConfigField:
     """A config key holding an integer field, its class's `default` where it states none (none where
     REQUIRED), read under `aliases` where `key` is absent."""
     return ConfigField(key, field, default, parse=_records.integer, aliases=aliases)

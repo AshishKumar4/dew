@@ -30,7 +30,6 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     KindFields,
     MixtureFields,
-    constant,
     fixed_fields,
     kind_mixers,
     layer_depth,
@@ -47,7 +46,7 @@ from dew.interop.families.deepseek import (
     deepseek_mixture,
     deepseek_moe_export,
 )
-from dew.interop.layouts import ConfigLayout, ConfigPart, Copy, Route, Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Copy, Route, Table, constant
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer

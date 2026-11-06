@@ -4,15 +4,8 @@ from collections.abc import Mapping
 
 from dew import _records
 from dew.interop.decoder_config import DecoderSpelling, decoder_layout, expect, inert, ungated
-from dew.interop.decoder_parts import (
-    MEGATRON_NAMES,
-    DecoderFamily,
-    DecoderFields,
-    constant,
-    grouped_qkv,
-    spelled,
-)
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, unread
+from dew.interop.decoder_parts import MEGATRON_NAMES, DecoderFamily, DecoderFields, grouped_qkv, spelled
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, constant, unread
 
 
 def _multi_query(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:

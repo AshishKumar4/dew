@@ -24,7 +24,6 @@ from dew.interop.decoder_parts import (
     Renames,
     RopeSpelling,
     SourceCode,
-    constant,
     qkv_widths,
     record_float,
     record_int,
@@ -35,7 +34,7 @@ from dew.interop.decoder_parts import (
 from dew.interop.families.deepseek import deepseek_mixture
 from dew.interop.families.gemma import GEMMA4_DEFAULTS, GEMMA4_ROUTES, gemma4_layout
 from dew.interop.families.qwen import QWEN2_CONFIG
-from dew.interop.layouts import Choice, ConfigLayout, ConfigPart, Table, When
+from dew.interop.layouts import Choice, ConfigLayout, ConfigPart, Table, When, constant
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 

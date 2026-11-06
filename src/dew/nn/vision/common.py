@@ -20,7 +20,7 @@ from dew.interop.decoder_parts import read_rope_theta
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Routes, Table
 from dew.interop.unread import Stored
 from dew.interop.weights import placed
-from dew.registry import Record, projectors, towers
+from dew.registry import Configured, Record, projectors, towers
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -31,7 +31,7 @@ type Reader = Callable[[Mapping[str, Stored], Callable[[str], tuple[str, ...] | 
 `dew.interop.weights.placed`, or a patch-folding ViT's `translate_vit_weights`."""
 
 
-type StoredShapes = Callable[[object], Mapping[str, tuple[int, ...]]]
+type StoredShapes = Callable[[nn.Module], Mapping[str, tuple[int, ...]]]
 """The shapes a release stores some of a component's tensors in, by their names, from the component's
 fields (a tower's, a projector's), where the tensor folds or unfolds its leaf's axes as well as
 transposing them: a patch convolution `[out, in, time, h, w]` its Dense map `[in * time * h * w, out]`
@@ -114,7 +114,7 @@ class TowerLayout:
         SigLIP's pooling head, has none."""
         return self.read(hf_tensors, self.path, param_dtype)
 
-    def tensors(self, tower: object,
+    def tensors(self, tower: nn.Module,
                 variables: Mapping[str, Mapping[str, object]]) -> tuple[WeightLayout, ...]:
         """The layouts that write `tower`'s leaves (`variables`, its collections) under its names
         past `prefix` (`written`), each folded as a read one is (`shapes`)."""
@@ -376,7 +376,9 @@ def rope_base(vision: Mapping[str, object], default: float, *, axial: bool = Fal
         entry = {**{name: value for name, value in entry.items() if name != "type"}, "rope_type": "default"}
     theta = read_rope_theta(entry, "rope_parameters")
     return _records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta
-def integer_field(key: str, field: str | None = None, default: object = None, *,
+
+
+def integer_field(key: str, field: str | None = None, default: int | None = None, *,
                   required: bool = False) -> ConfigField:
     """A config key holding an integer field (`field`, the key's name where None), its config class's
     `default` where the config omits it (none where `required`)."""
@@ -384,7 +386,7 @@ def integer_field(key: str, field: str | None = None, default: object = None, *,
             else ConfigField(key, field or key, default, parse=_records.integer))
 
 
-def number_field(key: str, field: str | None = None, default: object = None) -> ConfigField:
+def number_field(key: str, field: str | None = None, default: float | None = None) -> ConfigField:
     """A config key holding a float field, its config class's `default` where the config omits it."""
     return ConfigField(key, field or key, default, parse=_records.number)
 
@@ -397,7 +399,7 @@ def side_field(key: str, default: int) -> ConfigField:
 def activation_field(runs: Collection[str], default: str, *keys: str) -> ConfigField:
     """The trunk's activation under the first of `keys` a config states (`activation_name`), refused
     outside `runs`, written under the first."""
-    def parse(value: object, key: str) -> str:
+    def parse(value: Configured, key: str) -> str:
         return activation_name({key: value}, runs, default, (key,))
     return ConfigField(keys[0], "hidden_act", default, parse=parse, aliases=keys[1:])
 

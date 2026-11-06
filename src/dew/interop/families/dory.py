@@ -48,6 +48,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.ngpt import NGPT
+from dew.registry import Configured
 
 _SPELLING = RopeSpelling(theta=10000.0, per_kind=True, local_theta=10000.0)
 """DoryConfig's rope: one record per attention kind at the class's default base
@@ -202,7 +203,7 @@ def _loop_written(model: CausalTransformer) -> Mapping[str, object]:
             'recurrent_kv_cache_mode': 'last_loop' if loop.shared_cache else 'per_loop'}
 
 
-def _deviation(value: object, key: str) -> float:
+def _deviation(value: Configured, key: str) -> float:
     std = _records.number(value, key)
     if std <= 0:
         refuse(f'{key} {std}', "nGPT's gains divide by it")

@@ -58,6 +58,7 @@ from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.gemma3n import AltUp
 from dew.nn.mixers import AttentionMixer
+from dew.registry import Configured
 
 
 def _trailing_sharers(hf_config: Mapping[str, object], layers: int, default: int) -> tuple[int, ...] | None:
@@ -158,7 +159,7 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     return theta, (None if local == theta else local), partial
 
 
-def _number(value: object, key: str) -> float | None:
+def _number(value: Configured, key: str) -> float | None:
     return None if value is None else _records.number(value, key)
 
 
@@ -172,7 +173,7 @@ GEMMA_CONFIG = ConfigLayout(decoder_layout(_GEMMA_DECODER), constant('scale_offs
 released config names hidden_act 'gelu', which the reference computes as the erf gelu
 (modeling_gemma.py:93, ACT2FN['gelu'])."""
 
-def _inverse_root(value: object, key: str) -> float | None:
+def _inverse_root(value: Configured, key: str) -> float | None:
     return None if value is None else _records.number(value, key) ** -0.5
 
 

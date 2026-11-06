@@ -36,7 +36,6 @@ from dew.interop.decoder_parts import (
     Leaves,
     Renames,
     config_flag,
-    constant,
     declared_depths,
     kind_mixers,
     native_layer_types,
@@ -45,10 +44,11 @@ from dew.interop.decoder_parts import (
     specified_layer_types,
     spelled,
 )
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Routes, Table, unread
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Routes, Table, constant, unread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.registry import Configured
 
 QWEN35_ROPE = partial_rope_part(default_factor=0.25, layout=('mrope_section', 'mrope_interleaved'))
 """The rotary qwen3_5_text and qwen3_next share (`partial_rope_part`), both ways.
@@ -221,7 +221,7 @@ def qwen_hybrid(*, fixed: Mapping[str, object] | None = None, spelling: DecoderS
 
 def single_depth(key: str) -> ConfigField[CausalTransformer]:
     """An optional single shared-embedding prediction depth under `key`, both ways."""
-    def parse(value: object, key: str) -> int:
+    def parse(value: Configured, key: str) -> int:
         if type(value) is not int or value not in (0, 1):
             refuse(key, 'only a single shared prediction layer is supported')
         return value

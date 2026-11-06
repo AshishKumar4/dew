@@ -10,12 +10,11 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,
-    constant,
     grouped_qkv,
     refuse,
     spelled,
 )
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, unread
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, constant, unread
 
 
 def _bloom_heads(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
