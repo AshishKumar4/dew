@@ -44,7 +44,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
     "recurrence": {
         "generation": ("sm90", "sm80"),
         "form": ("gated delta net", "kimi delta attention", "write gate", "rated scan"),
-        "kernel": ("mosaic_gpu", "port", "xla", "derived"),
+        "kernel": ("mosaic_gpu", "xla", "derived"),
         "dtype": ("bfloat16", "float32"),
         "documents": ("one", "packed"),
     },
@@ -59,8 +59,8 @@ operands' dtype; the head width. GEMM's: the GPU; a dense product or one over th
 empty); the matrix stored N-major (`[depth, width]`) or K-major (`transpose_rhs`, `[width, depth]`); no hook,
 a bias (a group's under a grouped call), a scale a row, or a paired gate and up product under SwiGLU; the
 operands' dtype. The recurrence's: the GPU; the form (tests/recurrence_matrix.py's `FORMS`); the kernel
-the call names (the port fla's or mamba_ssm's by the form); the operands' dtype; one sequence or packed
-documents."""
+the call names (its form's port, fla's or mamba_ssm's, the reference); the operands' dtype; one sequence or
+packed documents."""
 
 SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (
