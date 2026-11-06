@@ -74,7 +74,7 @@ from collections.abc import Callable, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import Truth, summed_as_run, unrewritten, widened
+from arm_arithmetic import Truth, Unrewritten, summed_as_run, unrewritten, widened
 from check1_statistics import (
     CONFIDENCE,
     FACTOR,
@@ -201,6 +201,24 @@ class _RunToRun:
 
     def __getattr__(self, name):
         return getattr(self.fn, name)
+
+
+def _layers(fn):
+    """`fn` and every arm it adapts, outermost first: through a declaration (`_RunToRun`), a window loop
+    (`_Windowed`) and a reference's unrewritten scope (`Unrewritten`)."""
+    while True:
+        yield fn
+        if isinstance(fn, _RunToRun | _Windowed):
+            fn = fn.fn
+        elif isinstance(fn, Unrewritten):
+            fn = fn.wrapped
+        else:
+            return
+
+
+def _varies(fn) -> bool:
+    """Whether `fn`, or an arm it adapts, is declared to vary from run to run (`run_to_run`)."""
+    return any(isinstance(layer, _RunToRun) for layer in _layers(fn))
 
 
 def run_to_run(fn, why: str):
@@ -384,9 +402,8 @@ class _Paired:
 
 
 def _paired_arms(arms) -> list[_Paired]:
-    """The paired arms among `arms`, a window loop's inner arm for it."""
-    return [arm for arm in (arm.fn if isinstance(arm, _Windowed) else arm for arm in arms)
-            if isinstance(arm, _Paired)]
+    """The paired arms among `arms`, through every arm each adapts (`_layers`)."""
+    return [layer for arm in arms for layer in _layers(arm) if isinstance(layer, _Paired)]
 
 
 SWITCHED: list[dict] = []
@@ -422,8 +439,8 @@ def _ynn_decided(label: str, arms, inputs) -> None:
         return
     _ynn_option_held()
     refused = None
-    for arm in arms:
-        if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
+    for arm in _paired_arms(arms):
+        if not hasattr(arm.without, "lower"):
             continue
         try:
             arm.without.lower(*inputs).compile()
@@ -952,7 +969,7 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
     seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842), and
     of an arm declared to vary from run to run (`run_to_run`) only on a CPU; the CPU lane runs every
     check-1 site, so each arm is held to it there."""
-    if not _repeat_promised() or (isinstance(fn, _RunToRun) and jax.default_backend() != "cpu"):
+    if not _repeat_promised() or (_varies(fn) and jax.default_backend() != "cpu"):
         return
     if (where := _same_bits(first, fn(*inputs))) is not None:
         raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "

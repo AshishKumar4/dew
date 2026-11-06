@@ -130,10 +130,12 @@ def assert_examples_independent(fn: Callable, draw: Callable, label: str, *, see
         np.testing.assert_array_equal(np.asarray(reordered)[::-1], np.asarray(kept),
                                       err_msg=f"{label}, reversed")
     bounds = np.linspace(0, len(examples[0]), parts + 1).astype(int)
+    # Each part's program compiled at its shape, as the gate compiles an arm (`jax.jit`).
+    part = jax.jit(fn)
 
     def joined(*examples):
-        pieces = [fn(*(value[start:stop] for value in examples)) for start, stop in itertools.pairwise(bounds)
-                  if stop > start]
+        pieces = [part(*(value[start:stop] for value in examples))
+                  for start, stop in itertools.pairwise(bounds) if stop > start]
         return jax.tree.map(lambda *leaves: np.concatenate([np.asarray(leaf) for leaf in leaves]), *pieces)
 
     assert_as_exact(as_given(joined), fn, draw, f"{label}, in {parts} parts", seeds=seeds, truth_fn=truth_fn)

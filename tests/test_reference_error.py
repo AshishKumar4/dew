@@ -107,6 +107,13 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
     assert lines[0]["ynn"] is not None
     assert [entry["label"] for entry in SWITCHED] == ["attention over one key"]
     SWITCHED.clear()
+    # An arm declared to vary run to run takes the site's decision as any arm does, through its declaration.
+    from reference_error import run_to_run
+
+    assert_as_exact(run_to_run(pulled_by_itself(xla_attention), "atomic adds"),
+                    pulled_by_itself(written_attention), one_key_draw, "attention over one key, declared",
+                    seeds=16)
+    SWITCHED.clear()
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
@@ -2487,3 +2494,9 @@ def test_an_arm_declared_to_vary_run_to_run_is_judged_by_its_one_run_and_held_to
     with pytest.raises(UnpairedDraw):
         assert_as_exact(arrival, ordered, draw, "undeclared", seeds=16, truth_fn=exact)
     assert_as_exact(run_to_run(arrival, "atomic adds"), ordered, draw, "declared", seeds=16, truth_fn=exact)
+    # Through a window loop (`over_windows`), the declaration holds as it does alone.
+    from reference_error import over_windows, windows
+
+    windowed = windows(draw, 4)
+    assert_as_exact(over_windows(run_to_run(arrival, "atomic adds")), over_windows(ordered), windowed,
+                    "declared, windowed", seeds=4, truth_fn=over_windows(exact))
