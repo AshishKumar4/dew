@@ -130,8 +130,9 @@ def main() -> None:
         "maxtext_tflops_per_device": [row.get("perf/per_device_tflops_per_sec") for row in timed],
         "mfu": None if peak_rate is None else work.training_flops_per_step * len(seconds)
             / sum(seconds) / (peak_rate * devices),
-        "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats],
-                   "bytes_limit": [int(s.get("bytes_limit", 0)) for s in stats]},
+        # A device's figure it does not state is None, never a 0 it did not measure.
+        "memory": {"peak_allocated_bytes": [s.get("peak_bytes_in_use") for s in stats],
+                   "bytes_limit": [s.get("bytes_limit") for s in stats]},
     }
     if args.profile_steps:
         attach_xplane_profile(record, workdir, args.profile_steps,
