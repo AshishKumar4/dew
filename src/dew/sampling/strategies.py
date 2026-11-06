@@ -127,7 +127,8 @@ class DecodeOps:
     `crosses` says which rows a call taking them from `lengths` tokens to
     `following` carries past the position where the model's cached keys go
     stale (`text.rebuild_position`), each such row rebuilding every cache in
-    `verify`; None where none goes stale.
+    `verify`; None where none goes stale. `capacity` is the cache slots a row
+    holds, None where unbounded.
     """
 
     advance: Advance
@@ -140,6 +141,7 @@ class DecodeOps:
     draft: DraftBlock | None = None
     draft_tree: DraftTree | None = None
     crosses: Callable[[jax.Array, jax.Array], jax.Array] | None = None
+    capacity: int | None = None
 
 
 class Strategy(Protocol):
@@ -657,10 +659,10 @@ class Speculative:
         """The most tokens a block emits a row: its candidates and the one after them."""
         return self.block + 1
 
-    @property
-    def reach(self) -> int:
-        """The tokens a block's candidates take a row past its last."""
-        return self.block
+    def walks(self, ops: DecodeOps, budget: int) -> int:
+        """The most blocks a row walks a token in: across the model's cache rebuild, until its candidates
+        are past it."""
+        return 0 if ops.crosses is None else min(self.block, budget)
 
     def stepped(self, state: DecoderState, step: StepState, terminated: jax.Array, ops: DecodeOps,
                 transform, stopping, budget: int | jax.Array) -> Block:
@@ -772,6 +774,22 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
     return _Drafted(drafting, candidates, scores, states, offered, ending)
 
 
+def _taken(key: jax.Array, log_ratio: jax.Array) -> jax.Array:
+    """Whether each row accepts a candidate whose target-over-draft log ratio is `log_ratio` `[rows]`: with
+    probability `min(1, exp(log_ratio))`, each row its own key's uniform `key` `[rows]` whatever rows it is
+    drawn beside (`counted`)."""
+    uniform = jax.vmap(jax.random.uniform)(counted(key))
+    return jnp.log(uniform) <= log_ratio
+
+
+def _positive_part(p: jax.Array, q: jax.Array) -> jax.Array:
+    """The normalized positive part of `p - q` over the last axis, the distribution a rejection draws from
+    (arXiv 2211.17192, algorithm 1); a row with none left keeps its unnormalized zeros."""
+    residual = jnp.maximum(p - q, 0.0)
+    weight = jnp.sum(residual, axis=-1, keepdims=True)
+    return residual / jnp.where(weight > 0, weight, 1.0)
+
+
 def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafted: _Drafted,
               step: StepState, active: jax.Array, budget: int | jax.Array, walking: jax.Array
               ) -> tuple[jax.Array, jax.Array]:
@@ -789,9 +807,7 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
     for at in range(1, block_size):
         ratio = (categorical.token_log_probs(targets[at], candidates[at])
                  - categorical.token_log_probs(drafts[at], candidates[at]))
-        # Each row its own key's uniform, whatever rows it is drawn beside (`counted`).
-        uniform = jax.vmap(jax.random.uniform)(counted(keys[:, block_size + at]))
-        accepted.append((jnp.log(uniform) <= ratio) & offered[at])
+        accepted.append(_taken(keys[:, block_size + at], ratio) & offered[at])
     available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
     matched = jnp.where(walking, 0, 1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1),
                                                 axis=1)).astype(jnp.int32)
@@ -799,9 +815,7 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
     target = jnp.take_along_axis(jnp.stack(targets, axis=1), matched[:, None, None], axis=1)[:, 0]
     draft = jnp.take_along_axis(jnp.stack(drafts, axis=1),
                                 jnp.minimum(matched, block_size - 1)[:, None, None], axis=1)[:, 0]
-    residual = jnp.maximum(categorical.probabilities(target) - categorical.probabilities(draft), 0.0)
-    weight = jnp.sum(residual, axis=-1, keepdims=True)
-    rest = jnp.log(residual / jnp.where(weight > 0, weight, 1.0))
+    rest = jnp.log(_positive_part(categorical.probabilities(target), categorical.probabilities(draft)))
     stopped = jnp.any(jnp.stack(ending, axis=1)
                       & (jnp.arange(block_size)[None, :] < matched[:, None]), axis=1)
     replacement = select(keys[:, 2 * block_size], jnp.where(turned_down[:, None], rest, target),
@@ -961,7 +975,6 @@ def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: D
     keep = slots < count[:, None]
 
     following, again, seen = verify(state, emitted, keep)
-    assert seen is not None
     last = jnp.maximum(count - 1, 0)
     # A row whose replay rebuilt its caches across a positional table change was reseeded over its
     # whole history, the emitted tokens among it (`DecoderState.rebuilt`): its stretch is not written
@@ -969,9 +982,10 @@ def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: D
     rebuilt = (jnp.zeros(keep.shape[0], bool) if following.rebuilt is None else following.rebuilt)
     stretch = keep & ~rebuilt[:, None]
     if ops.record is not None:
+        assert seen is not None, "a block drafter records the states the replay returns"
         following = ops.record(following, seen, stretch)
-    else:
-        assert ops.embed is not None
+    elif ops.embed is not None:
+        assert seen is not None, "prediction depths reseed from the states the replay returns"
         # The tails reseed hands back are every depth's predecessor at the
         # last emitted slot, the target's own state first; a row that
         # emitted nothing keeps what it had.
@@ -984,6 +998,12 @@ def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: D
 
         drafts = tuple(kept(fresh, held) for fresh, held in zip(carried[1:], following.drafts, strict=True))
         following = dataclasses.replace(replayed, hidden=kept(carried[0], following.hidden), drafts=drafts)
+    elif seen is not None:
+        # The target's own state at each row's last emitted token, its last slot's past a short block; a
+        # row that emitted nothing keeps what it had.
+        at_last = jnp.take_along_axis(seen, last[:, None, None], axis=1)[:, 0]
+        hidden = jnp.where((count > 0)[:, None], at_last, state.hidden)
+        following = dataclasses.replace(following, hidden=hidden)
     following = dataclasses.replace(
         following, logits=jnp.where((count > 0)[:, None],
                                     jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
@@ -1025,10 +1045,12 @@ class TreeSpeculative:
         """The most tokens a block emits a row: the root, a path to the deepest node and the one after it."""
         return int(self.shape.depths.max()) + 2
 
-    @property
-    def reach(self) -> int:
-        """The tokens a block's verify takes a row past its last: the root and every node."""
-        return self.shape.nodes + 1
+    def walks(self, ops: DecodeOps, budget: int) -> int:
+        """The most blocks a row walks a token in: across the model's cache rebuild until its tree is past
+        it, and every one where its cache holds no room for the tree (`tree_step`)."""
+        if ops.capacity is not None:
+            return budget
+        return 0 if ops.crosses is None else min(self.shape.nodes + 1, budget)
 
     def stepped(self, state: DecoderState, step: StepState, terminated: jax.Array, ops: DecodeOps,
                 transform, stopping, budget: int | jax.Array) -> Block:
@@ -1059,13 +1081,16 @@ def tree_step(state: DecoderState, step: StepState, terminated: jax.Array, plan:
         jax.random.fold_in(key, count), 3 + deepest * width))(step.keys, step.step)
     walking = (jnp.zeros(rows, bool) if ops.crosses is None or state.lengths is None else
                ops.crosses(state.lengths, state.lengths + shape.nodes + 1))
+    cursor = step.total()
+    if ops.capacity is not None:
+        # A row whose cache cannot hold the whole tree walks too: a node past it would score without its key.
+        walking = walking | (cursor + shape.nodes + 1 > ops.capacity)
 
     opening = dataclasses.replace(step, active=active & (step.step < budget))
     first = transform(opening, state.logits.astype(jnp.float32))
     root = select(keys[:, 0], first, opening.active)
     drafted = draft_tree(state, root, shape, keys[:, 1])
     fed = jnp.concatenate([root[:, None], drafted.tokens], axis=1)
-    cursor = step.total()
     block = TreeBlock(shape, cursor, _coordinates(state, step, jnp.zeros((1, 1), jnp.int32))[:, 0])
     _, verified, _ = verify(state, fed, jnp.broadcast_to((active & ~walking)[:, None], fed.shape),
                             rebuilds=False, tree=block)
@@ -1102,12 +1127,9 @@ def tree_step(state: DecoderState, step: StepState, terminated: jax.Array, plan:
                  else jnp.exp(row_of(drafted.log_q, held - 1)))
             seen = jnp.take_along_axis(p, token[:, None], axis=1)[:, 0]
             offered = jnp.take_along_axis(q, token[:, None], axis=1)[:, 0]
-            # Each row its own key's uniform, whatever rows it is drawn beside (`counted`).
-            uniform = jax.vmap(jax.random.uniform)(counted(keys[:, 3 + (depth - 1) * width + index]))
-            accepted = tested & (uniform * offered <= seen)
-            residual = jnp.maximum(p - q, 0.0)
-            weight = jnp.sum(residual, axis=-1, keepdims=True)
-            p = jnp.where((tested & ~accepted)[:, None], residual / jnp.where(weight > 0, weight, 1.0), p)
+            ratio = jnp.log(seen) - jnp.log(offered)
+            accepted = tested & _taken(keys[:, 3 + (depth - 1) * width + index], ratio)
+            p = jnp.where((tested & ~accepted)[:, None], _positive_part(p, q), p)
             found, chosen = found | accepted, jnp.where(accepted, kid, chosen)
         path.append(jnp.where(found, chosen, -1))
         at = chosen
@@ -1151,9 +1173,8 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
     empty = Draws(jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
                   jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32),
                   jnp.zeros(rows, bool))
-    # Each block emits two tokens a row at least, but a row's walk across a rebuild, one a block over at
-    # most as many blocks as its candidates reach.
-    walks = 0 if ops.crosses is None else min(plan.reach, budget)
+    # Each block emits two tokens a row at least, but a row's walk, one a block (`Speculative.walks`).
+    walks = plan.walks(ops, budget)
     blocks = -(-(budget + walks) // 2)
     out = lax.scan(outer, _SpeculativeCarry(state, start, empty), None, length=blocks)[0].out
     return dataclasses.replace(out, behavior_log_probs=jnp.where(out.valid, out.behavior_log_probs, 0.0),

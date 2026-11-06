@@ -35,10 +35,10 @@ CHOICES = frozenset({"decode", "paged_decode", "attention_mainloop"})
 """The kernel choices (`generation.CHOICES`) its cells run: a dense cache's step's selector and a paged
 pool's, and the template's mainloop where a cell names the template's decode."""
 KERNELS = {"decode": frozenset({"decode", "cudnn", "template"}),
-           "paged_decode": frozenset({"triton", "template"})}
+           "paged_decode": frozenset({"triton", "template", "tpu"})}
 """The kernels its cells run under test, each named by its choice (`generation.chosen`, the `kernel` axis):
 the decode selector's hand kernel, cuDNN's and the attention template's decode; the paged selector's Pallas
-kernel and the template's decode over the pages."""
+kernel and the template's decode over the pages on a GPU, jax's Pallas paged attention on a TPU."""
 
 
 def _choice(case: dict[str, str]) -> str:
@@ -167,17 +167,18 @@ CASES = (
     ('sm90', 'dense', 'gqa-16-8', 'sinks', 'bfloat16', '64', 'decode'),
     ('sm90', 'paged', 'mha-8', 'plain', 'float16', '128', 'template'),
     ('sm80', 'dense', 'gqa-16-8', 'softcap', 'float32', '128', 'template'),
-    ('sm80', 'paged', 'mha-8', 'softcap', 'bfloat16', '64', 'triton'),
+    ('v5e', 'paged', 'mha-8', 'softcap', 'bfloat16', '64', 'tpu'),
     ('sm80', 'dense', 'mha-8', 'plain', 'float16', '64', 'cudnn'),
-    ('sm80', 'dense', 'mha-8', 'sinks', 'float32', '128', 'decode'),
-    ('sm90', 'paged', 'gqa-16-8', 'plain', 'bfloat16', '128', 'triton'),
-    ('sm90', 'dense', 'gqa-16-8', 'softcap', 'float16', '64', 'decode'),
-    ('sm90', 'dense', 'gqa-16-8', 'sinks', 'float32', '64', 'template'),
-    ('sm90', 'dense', 'mha-8', 'plain', 'bfloat16', '128', 'cudnn'),
+    ('sm80', 'paged', 'gqa-16-8', 'sinks', 'bfloat16', '128', 'triton'),
+    ('v5e', 'paged', 'gqa-16-8', 'plain', 'bfloat16', '128', 'tpu'),
     ('sm90', 'dense', 'mha-8', 'plain', 'float32', '64', 'decode'),
-    ('sm90', 'paged', 'gqa-16-8', 'sinks', 'bfloat16', '64', 'triton'),
-    ('sm90', 'dense', 'gqa-16-8', 'sinks', 'bfloat16', '64', 'template'),
-    ('sm90', 'dense', 'gqa-16-8', 'sinks', 'float16', '64', 'decode'),
+    ('sm90', 'dense', 'gqa-16-8', 'softcap', 'float16', '128', 'decode'),
+    ('sm90', 'dense', 'mha-8', 'sinks', 'bfloat16', '64', 'template'),
+    ('sm90', 'paged', 'mha-8', 'plain', 'bfloat16', '64', 'triton'),
+    ('sm90', 'dense', 'mha-8', 'plain', 'bfloat16', '128', 'cudnn'),
+    ('sm80', 'dense', 'gqa-16-8', 'sinks', 'float16', '64', 'decode'),
+    ('sm90', 'dense', 'gqa-16-8', 'sinks', 'float32', '64', 'decode'),
+    ('sm90', 'paged', 'gqa-16-8', 'softcap', 'bfloat16', '64', 'triton'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the choices serve
 (`kernel_matrix.covering("decode")`, regenerated where the axes or the selectors' support change)."""
@@ -185,11 +186,11 @@ CASES = (
 
 @cell("decode", covers=lambda case: dict(zip(AXES["decode"], case, strict=True)))
 @pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+    generation.device_generation() != case[0], reason=f"a {case[0]} cell runs on its own device alone"))
     for case in CASES], ids="-".join)
 def a_decode_step_is_on_par(case: tuple[str, ...]) -> None:
-    """A decode step of `case` on its GPU, through its choice's route at its kernel, on par with the reference
-    path's (check 1); its routes its layout's choice at that kernel (`KERNELS`)."""
+    """A decode step of `case` on its device, through its choice's route at its kernel, on par with the
+    reference path's (check 1); its routes its layout's choice at that kernel (`KERNELS`)."""
     named = dict(zip(AXES["decode"], case, strict=True))
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_step(named, reference=False)), jax.jit(_step(named, reference=True)),

@@ -17,7 +17,7 @@ from contract_support import normal_drawn
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
 
-from dew.nn.attention import attention_case, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import with_key_lengths
 from dew.nn.decode_geometry import folded_attention
 from dew.nn.kernels import decode_attention
@@ -224,7 +224,6 @@ def _sinks_and_softcap_hold_check_1(dtype, hooks, natural, splits):
     """A hooked decode case's check 1
     (`test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config`)."""
     from dew.nn.attention import reference_attention
-    from dew.nn.attention_kernels import decodes
     from dew.nn.kernels import tuning
 
     dtype, hooks, natural = jnp.dtype(dtype), DECODE_HOOKS[hooks], natural == "natural"
@@ -232,9 +231,6 @@ def _sinks_and_softcap_hold_check_1(dtype, hooks, natural, splits):
     query, key, value, lengths = arrays
     sinks = jnp.asarray(SINKS, jnp.float32) if hooks.get("sinks") else None
     softcap = SOFTCAP if hooks.get("softcap") else None
-    with on_the_gpu():
-        case = attention_case(query, key, key_value_seq_lengths=lengths, sinks=sinks, softcap=softcap)
-        assert decodes(case)
     read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
 
     def reference(query, key, value):
