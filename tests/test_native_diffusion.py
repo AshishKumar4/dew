@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 from interop_support import extract_fixture
 
+from tools.diffusers_scheduler_pipeline_reference import SCHEDULERS, scheduler as grid_scheduler
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -59,28 +61,20 @@ def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, t
     run_check(saved_pipelines / task, "--part", part, *(["--streamed"] if task in STREAMED else []))
 
 
-SCHEDULER_GRIDS = ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz"
 EVALUATION_SEEDS = 8
 """The pipeline evaluation's declared draws (check 1), sized by `seeds_for` paired with the evaluation on
 armada."""
-
-
-def grid_cases() -> list[str]:
-    """The source schedulers tools/diffusers_scheduler_pipeline_reference.py
-    walked the saved SD pipeline with, one config each in SCHEDULER_GRIDS."""
-    with np.load(SCHEDULER_GRIDS) as grids:
-        return sorted(name.removesuffix(".config") for name in grids.files if name.endswith(".config"))
 
 
 @pytest.fixture(scope="module")
 def walked_grids(saved_pipelines) -> dict:
     """Every source grid walked by the saved SD pipeline, loaded once in one process, each case's
     errors and, where it is off the source, its failure (`check_grids`)."""
-    printed = run_check(saved_pipelines / "sd", "--grids", SCHEDULER_GRIDS, failing=True)
+    printed = run_check(saved_pipelines / "sd", "--grids", failing=True)
     return json.loads(printed.strip().splitlines()[-1])["grids"]
 
 
-@pytest.mark.parametrize("solver", grid_cases())
+@pytest.mark.parametrize("solver", sorted(SCHEDULERS))
 def test_native_solver_consumes_the_complete_source_grid(walked_grids, solver):
     assert "failed" not in walked_grids[solver], walked_grids[solver]["failed"]
 
@@ -286,8 +280,8 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     directory = tmp_path / "sd"
     shutil.copytree(saved_pipelines / "sd", directory)
     if scheduler == "lms":
-        with np.load(SCHEDULER_GRIDS) as grids:
-            (directory / "scheduler" / "scheduler_config.json").write_text(str(grids["lms.config"]))
+        lms = dict(grid_scheduler("lms", saved_pipelines / "sd").config)
+        (directory / "scheduler" / "scheduler_config.json").write_text(json.dumps(lms))
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
     size = source.inputs.sample.shape[0]
     settings = {"guidance": None, "steps": 3, "ema_decay": None}

@@ -301,7 +301,7 @@ class TokenFiles(Dataset):
         ends = np.concatenate([np.zeros(0, np.int64), *each])
         return ends[np.diff(ends, prepend=0) > 0]
 
-    def manifest(self) -> ShardManifest:
+    def manifest(self, version: int) -> ShardManifest:
         return _indexed_manifest(self, self.url, 1024)
 
     def lengths(self) -> np.ndarray:

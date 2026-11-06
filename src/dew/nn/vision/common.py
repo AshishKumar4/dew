@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Collection, Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, ClassVar
 
 from flax import linen as nn
@@ -15,6 +16,7 @@ from flax import linen as nn
 from dew import _records
 from dew.batch import Variables
 from dew.interop.decoder_parts import read_rope_theta
+from dew.interop.layouts import Route, Routes, Table
 from dew.interop.unread import Stored
 from dew.interop.weights import placed
 from dew.registry import Record, projectors, towers
@@ -28,21 +30,70 @@ type Reader = Callable[[Mapping[str, Stored], Callable[[str], tuple[str, ...] | 
 `dew.interop.weights.placed`, or a patch-folding ViT's `translate_vit_weights`."""
 
 
+type StoredShapes = Callable[[object], Mapping[str, tuple[int, ...]]]
+"""The shapes a release stores some of a component's tensors in, by their names, from the component's
+fields (a tower's, a projector's), where the tensor folds or unfolds its leaf's axes as well as
+transposing them: a patch convolution `[out, in, time, h, w]` its Dense map `[in * time * h * w, out]`
+holds, a position grid `[h, w, d]` its table's rows."""
+
+
+def written(routes: Routes, variables: Mapping[str, Mapping[str, object]], kept: Collection[str] = (),
+            shapes: Mapping[str, tuple[int, ...]] | None = None) -> tuple[WeightLayout, ...]:
+    """The layouts that write a component's leaves (`variables`, its collections; abstract ones will do)
+    under the names `routes` give them, oriented as a reader of those names orients them (a kernel's
+    `[out, in, ...]` as `[..., in, out]`, `stored_shape`), but a `kept` name as its leaf is, and a name
+    `shapes` folds stored in its shape; refused (`ExportRefused`) where a leaf has no name, which a model
+    of that layout cannot write."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.interop.decoder_parts import refuse_export
+    from dew.interop.streaming import WeightLayout
+    from dew.interop.weights import orders, stored_shape
+
+    layouts, missing = [], []
+    for collection, tree in variables.items():
+        for path, leaf in flatten_dict(dict(tree)).items():
+            rooted = (collection, *path)
+            name = routes.write(rooted, {})
+            if name is None:
+                missing.append("/".join(rooted))
+                continue
+            rank = len(leaf.shape)
+            order = None if name in kept else orders(rooted, rank)[1]
+            shape = (shapes or {}).get(name) or (tuple(leaf.shape) if name in kept
+                                                 else stored_shape(path, tuple(leaf.shape)))
+            layouts.append(WeightLayout(name, (rooted,), tuple(shape), order))
+    if missing:
+        refuse_export(", ".join(missing), "no tensor of the release's layout holds it")
+    return tuple(layouts)
+
+
 @dataclasses.dataclass(frozen=True)
 class TowerLayout:
-    """Where one tower kind's tensors sit in a media checkpoint and the leaves they fill: `prefix`
-    before every name, and `path` from a name past it to its leaf, rooted at its collection
-    (`params`, and Gemma 4's `constants` beside it). `read` binds them (`placed`, or, for a tower that
-    runs its patch convolution as one Dense map, `translate_vit_weights`). Loading
-    (`tower_variables`), routing a checkpoint's names (`hf_decoders`) and binding an export
-    (`interop.pretrained`) read it alike."""
+    """Where one tower kind's tensors sit in a media checkpoint and the leaves they fill, both ways:
+    `prefix` before every name, and `routes` (`dew.interop.layouts`) between a name past it and its
+    leaf, rooted at its collection (`params`, and Gemma 4's `constants` beside it). `read` binds them
+    (`placed`, or, for a tower that runs its patch convolution as one Dense map,
+    `translate_vit_weights`), and `shapes` states the stored shapes of what it folds, by the tower's
+    fields, so a tower built in Dew writes them as a read one does (`tensors`). Loading
+    (`tower_variables`), routing a checkpoint's names (`hf_decoders`) and writing a tower (`tensors`,
+    `interop.pretrained`) read it alike."""
 
     prefix: str
-    path: Callable[[str], tuple[str, ...] | None]
+    routes: Routes
     read: Reader = placed
     roots: tuple[str, ...] = ()
     """The leading names of a tower stored under several roots, an empty `prefix` beside them, whose
-    names `path` reads whole: MiMo-V2.6's audio tower, its encoder's and its tokenizer folder's."""
+    names `routes` read whole: MiMo-V2.6's audio tower, its encoder's and its tokenizer folder's."""
+    shapes: StoredShapes | None = None
+
+    def path(self, name: str) -> tuple[str, ...] | None:
+        """The leaf of tensor `name`, rooted at its collection; None for one the tower does not compute
+        with (a buffer, SigLIP's pooling head); an unknown name raises ValueError."""
+        found = self.routes.read(name, {})
+        if found is None:
+            raise ValueError(f"unknown tensor name {name!r}")
+        return found.path
 
     def variables(self, hf_tensors: Mapping[str, Stored], param_dtype: str
                   ) -> tuple[Variables, tuple[WeightLayout, ...]]:
@@ -50,6 +101,12 @@ class TowerLayout:
         write each tensor it placed back from them; a tensor the tower does not compute with, as
         SigLIP's pooling head, has none."""
         return self.read(hf_tensors, self.path, param_dtype)
+
+    def tensors(self, tower: object,
+                variables: Mapping[str, Mapping[str, object]]) -> tuple[WeightLayout, ...]:
+        """The layouts that write `tower`'s leaves (`variables`, its collections) under its names
+        past `prefix` (`written`), each folded as a read one is (`shapes`)."""
+        return written(self.routes, variables, shapes=None if self.shapes is None else self.shapes(tower))
 
 
 
@@ -64,6 +121,9 @@ class ProjectorLayout:
     tensors: Mapping[str, tuple[str, ...]]
     strip: str = ""
     read: Callable[..., tuple[Variables, tuple[WeightLayout, ...]]] | None = None
+    kept: frozenset[str] = frozenset()
+    """Names whose tensor is its leaf as it is, no Linear's transpose: a matrix the reference multiplies
+    as it stores it (Gemma 3's `mm_input_projection_weight`)."""
 
     def path(self, name: str) -> tuple[str, ...]:
         """The leaf of tensor `name`, shared by load and source export."""
@@ -72,6 +132,11 @@ class ProjectorLayout:
             raise ValueError(f"unknown projector tensor {name!r}")
         return self.tensors[name]
 
+    @property
+    def routes(self) -> Routes:
+        """`tensors` both ways, each leaf under `params` (`dew.interop.layouts`)."""
+        return Table(*(Route(name, "/".join(("params", *path))) for name, path in self.tensors.items()))
+
     def variables(self, hf_tensors: Mapping[str, Stored], param_dtype: str
                   ) -> tuple[Variables, tuple[WeightLayout, ...]]:
         """The projector's parameters, in the requested storage, and the layouts that write its
@@ -79,6 +144,11 @@ class ProjectorLayout:
         if self.read is not None:
             return self.read(hf_tensors, param_dtype=param_dtype)
         return placed(hf_tensors, self.path, param_dtype)
+
+    def written(self, params: Mapping[str, object]) -> tuple[WeightLayout, ...]:
+        """The layouts that write a projector's parameters (`params`) under its names past `prefix`
+        (the first of several), its `kept` names as their leaves are."""
+        return written(self.routes, {"params": params}, self.kept)
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
@@ -176,6 +246,38 @@ def block_tensor_path(parts: list[str], maps: Mapping[tuple[str, str], tuple[str
     if len(parts) == depth + 4 and (module, parts[depth + 2]) in maps:
         return (name, *maps[module, parts[depth + 2]], "kernel" if leaf == "weight" else "bias")
     return None
+
+
+def tensor_routes(tensors: Mapping[str, tuple[str, ...]], collection: str = "params") -> tuple[Route, ...]:
+    """Each of `tensors`, a name and its leaf's path, as a route onto that leaf under `collection`."""
+    return tuple(Route(name, "/".join((collection, *path))) for name, path in tensors.items())
+
+
+def block_routes(maps: Mapping[tuple[str, str], tuple[str, ...]], *, prefix: str = "blocks",
+                 norm_bias: bool = True, block: str = "blocks",
+                 norms: Mapping[str, str] = _BLOCK_NORMS) -> Table:
+    """An indexed block's tensors, both ways (`block_tensor_path`'s names): `{prefix}.N.<norm>.weight|bias`
+    onto `{block}_N`'s norm `norms` names (its scale and, where `norm_bias`, its bias), and
+    `{prefix}.N.<module>.<linear>.weight|bias` onto the map `maps` places each (module, linear) pair at,
+    its kernel and bias, under `params`."""
+    routes = []
+    for module, ours in norms.items():
+        routes.append(Route(f"{prefix}.{{index}}.{module}.weight", f"params/{block}_{{index}}/{ours}/scale"))
+        if norm_bias:
+            routes.append(Route(f"{prefix}.{{index}}.{module}.bias", f"params/{block}_{{index}}/{ours}/bias"))
+    for (module, linear), ours in maps.items():
+        leaf = "/".join(ours)
+        stored, held = f"{prefix}.{{index}}.{module}.{linear}", f"params/{block}_{{index}}/{leaf}"
+        routes += [Route(f"{stored}.weight", f"{held}/kernel"), Route(f"{stored}.bias", f"{held}/bias")]
+    return Table(*routes)
+
+
+def unplaced(pattern: str) -> Route:
+    """The names `pattern` (a regular expression) matches, which the component does not compute with: no
+    leaf (a buffer, a head no reader runs, a merger its projector reads)."""
+    from dew.interop.layouts import Slot
+
+    return Route("{name}", None, MappingProxyType({"name": Slot(pattern)}))
 
 
 def tower_layout(kind: str) -> TowerLayout:

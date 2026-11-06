@@ -80,6 +80,7 @@ scope is stated by each gate. Released-scale and tied-selector behavior are
 not established by the tiny untied-cutoff fixtures.
 """
 
+import builtins
 import dataclasses
 import functools
 import json
@@ -98,6 +99,7 @@ from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
 from model_support import cached_round_trips, encoded_form, flat_tree, prediction_logits, streamed_export
 from one_draw import assert_as_exact_as_the_reference
+from process_support import raised
 from reference_error import (
     FACTOR,
     ORDERS,
@@ -560,7 +562,10 @@ def test_a_failed_export_ends_with_its_own_error(tmp_path):
                           str(FIXTURES / "qwen3-tiny"), "main", str(out)], capture_output=True, text=True,
                          env=environment | {"JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src")},
                          timeout=300)
-    assert run.returncode == 1, run.stderr[-2000:]
+    # The save's own error, a file system's (`OSError`), where the out directory is a file.
+    errors = [name for name in raised(run) if isinstance(getattr(builtins, name, None), type)
+              and issubclass(getattr(builtins, name), OSError)]
+    assert errors, run.stderr[-2000:]
 
 
 FULL_ROTARY_SEEDS = 8

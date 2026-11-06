@@ -1,4 +1,4 @@
-"""Diffusers 0.34.0 scheduler files reconstructed from their own configs.
+"""Diffusers scheduler files reconstructed from their own configs, at the release the test extra pins.
 
 `tools/diffusers_reference.py` proves the solver updates over grids Dew's own
 processes supply. This tool proves the other half: that
@@ -24,12 +24,12 @@ stochastic class is fed the exact draws Dew's solver makes at that step;
 in both precisions and in Dew. A separate record checks the native bridge's
 identities against the source tree.
 
-Run on CPU in an isolated reference environment with Dew, diffusers==0.34.0
+Run on CPU in an isolated reference environment with Dew, the test extra's diffusers
 and torchsde==0.2.6:
 
     PYTHONPATH=src python tools/diffusers_source_reference.py
     PYTHONPATH=src python tools/diffusers_source_reference.py rounding \
-        tests/fixtures/diffusers/source_rounding.npz 32
+        tests/fixtures/diffusers/source_rounding.npz
     PYTHONPATH=src python tools/diffusers_source_reference.py seeds \
         tests/fixtures/diffusers/source_seeds.npz
 
@@ -45,7 +45,7 @@ import os
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -408,30 +408,71 @@ def trajectory_gradient(module: ModuleType, case: Case, initial: torch.Tensor,
     return gradient.numpy()
 
 
-STATE_CASES = ("dpm_multi.eps_threshold", "edm.default", "dpm_multi.flow", "cfg.zero_rescale")
-SEEDED_CASES = ("edm.exponential_v_threshold",)
-"""The pointwise cases whose rounding resolves over seeds within check 1's reach (`seeds`): an
-independent initial state and cotangent each, where the rest's few unclipped entries carry too
-heavy a tail and keep `rounding`'s copies."""
+def threshold_clearance(module: ModuleType, case: Case, initial: torch.Tensor,
+                        noises: list[np.ndarray]) -> float:
+    """How far the float64 walk from `initial` keeps clear of its dynamic thresholding's discontinuities,
+    relative to the bound's scale: at every step, each entry of the predicted sample from the per-sample
+    clip bound `s`, and the unclamped quantile from the clamp's bounds, 1 and `sample_max_value`. An entry
+    within rounding of either is clipped, or its bound clamped, in one precision and not the other."""
+    scheduler = getattr(module, case.scheduler)
+    seen = []
+    original = scheduler._threshold_sample
+
+    def recording(self, sample):
+        seen.append((sample.detach().clone(), self.config.dynamic_thresholding_ratio,
+                     self.config.sample_max_value))
+        return original(self, sample)
+
+    with patch.object(scheduler, "_threshold_sample", recording), float64_scheduler(module):
+        trajectory_gradient(module, case, initial, torch.zeros_like(initial), torch.float64, noises)
+    margins = [1.0]
+    for sample, ratio, top in seen:
+        flat = sample.reshape(sample.shape[0], -1).abs().double()
+        raw = torch.quantile(flat, ratio, dim=1)
+        bound = raw.clamp(1, top)[:, None]
+        margins.append(float(((flat - bound).abs() / bound).min()))
+        margins.append(float(torch.minimum((raw - 1).abs(), (raw - top).abs()).min() / top))
+    return min(margins)
+
+
+SEEDED_SHAPE = (8, 3, 32)
+"""A seeded case's latent: at SHAPE's 24 entries DDIM's and DDPM's few unclipped gradient entries did not
+resolve within 512 seeds (armada, 11-06)."""
+SEEDED_STEPS = {"ddim.threshold": 2}
+"""A seeded case's walk where it is shorter than its trajectory's: DDIM's dynamic thresholding over the
+case's 5 steps contracts its clipped entries onto the next step's clip bound, so from step 2 on dozens sit
+within rounding of it whatever the draw (float64 walk, 3 seeds: step 2 holds 2 to 10 entries within 1e-5 of
+the bound, step 3 22 to 58, step 4 33 to 69, the closest 3e-7, where steps 0 and 1 keep every entry 9e-4
+clear). Two steps keep both regimes, its quantile clamped at `sample_max_value` and inside the clamp, and
+their draws clear (`threshold_clearance`); the long walk's arithmetic is the unthresholded DDIM cases'."""
+SEEDED_CASES = tuple(name for name in CASES if name != "cfg.epsilon" and not name.startswith("dpm_sde."))
+"""Every case whose trajectory gradient check 1 holds over seeds (`seeds`), an independent initial state and
+cotangent each: all but CFG epsilon, whose rounding sits in its per-sample reductions and is averaged over
+pixel orders (`rounding`), and DPMSolverSDE, whose walk integrates the draws its own Brownian tree answers."""
 
 
 def seeds(destination: Path) -> None:
     """Each seeded case's trajectory gradient over the seeds check 1 draws (`record_case`): a seed's
-    initial state at the scheduler's `init_noise_sigma` and its cotangent, the float32 VJP from it and
-    the float64 one, the per-step draws Dew's solver makes at its key 0 fed to both, the count planned
-    on Dew's own walk (tests/diffusion_support.py's `source_final`)."""
+    initial state of SEEDED_SHAPE at the scheduler's `init_noise_sigma` and its cotangent, the float32 VJP
+    from it and the float64 one, the per-step draws Dew's solver makes at its key 0 fed to both, the count
+    confirmed paired with Dew's own walk (tests/diffusion_support.py's `source_final`), over the case's
+    steps or SEEDED_STEPS', which `<case>.steps` records. A thresholding case's draw
+    clears its clip by `selection_margins.MARGIN` (`threshold_clearance`): a seed takes its first draw that
+    does (`selection_margins.clearing`)."""
     import diffusers
     import jax
 
     sys.path.insert(0, str(FIXTURES.parents[1]))
     from diffusion_support import source_final
     from recorded_references import provenance, record_case, save
+    from selection_margins import MARGIN, clearing
 
     torch.set_num_threads(2)
-    noises = step_noise(SHAPE, STEPS, np.float64)
+    noises = step_noise(SEEDED_SHAPE, STEPS, np.float64)
     arrays: dict[str, np.ndarray] = {}
     for name in SEEDED_CASES:
         case, module = CASES[name], MODULES[CASES[name].scheduler]
+        case = replace(case, steps=SEEDED_STEPS.get(name, case.steps))
         scheduler = getattr(module, case.scheduler)(**case.config)
         with tempfile.TemporaryDirectory(prefix="dew-source-scheduler-") as saved:
             scheduler.save_pretrained(saved)
@@ -444,9 +485,15 @@ def seeds(destination: Path) -> None:
 
         def draw(seed, prior=prior):
             generator = torch.Generator().manual_seed(seed)
-            initial = (torch.randn(SHAPE, generator=generator, dtype=torch.float64) * prior).float()
-            cotangent = torch.randn(SHAPE, generator=generator, dtype=torch.float64).float()
+            initial = (torch.randn(SEEDED_SHAPE, generator=generator, dtype=torch.float64) * prior).float()
+            cotangent = torch.randn(SEEDED_SHAPE, generator=generator, dtype=torch.float64).float()
             return {"x_T": initial.numpy(), "cotangent": cotangent.numpy()}
+
+        if case.config.get("thresholding"):
+            def clears(inputs, case=case, module=module):
+                return threshold_clearance(module, case, torch.from_numpy(inputs["x_T"]), noises) >= MARGIN
+
+            draw = clearing(draw, clears)
 
         def evaluate(inputs, case=case, module=module):
             initial, cotangent = (torch.from_numpy(inputs[key]) for key in ("x_T", "cotangent"))
@@ -455,10 +502,13 @@ def seeds(destination: Path) -> None:
                 wide = trajectory_gradient(module, case, initial, cotangent, torch.float64, noises)
             return {"grad": single}, {"grad": wide}
 
-        def proxy(inputs, final=final):
+        def dew(inputs, final=final):
             return {"grad": jax.vjp(final, inputs["x_T"])[1](inputs["cotangent"])[0]}
 
-        arrays.update(record_case(name, draw, evaluate, proxy))
+        # Sized paired, as check 1's verdict pairs Dew with the reference: the reference compared with itself
+        # across draws did not resolve DDIM's thresholding within 512 seeds, its per-draw errors spanning 36x.
+        arrays.update(record_case(name, draw, evaluate, dew=jax.jit(dew)))
+        arrays[f"{name}.steps"] = np.asarray(case.steps)
     version = diffusers.__version__
     command = f"python tools/diffusers_source_reference.py seeds {destination}"
     save(destination, {**arrays, "provenance": provenance("diffusers", version, "cpu", command,
@@ -466,12 +516,9 @@ def seeds(destination: Path) -> None:
          reference=f"huggingface/diffusers {version}", license="Apache-2.0")
 
 
-def rounding(destination: Path, copies: int) -> None:
-    """Independent states for pointwise VJPs, pixel orders for CFG's reduction.
+def rounding(destination: Path) -> None:
+    """Pixel orders for CFG's reduction.
 
-    The five pointwise cases have no reduction over latent positions: their
-    pixel permutations reproduce one rounding draw. Independent initial
-    states and per-step noise draws enlarge their RMS comparison instead.
     CFG with rescaling reduces over pixels, so its 52 permutations do move
     rounding. Both its input and cotangent move, and its float64 VJP must
     commute with each permutation before a reference distance is recorded.
@@ -482,22 +529,7 @@ def rounding(destination: Path, copies: int) -> None:
     from residual_orders import orders
 
     torch.set_num_threads(2)
-    arrays: dict[str, np.ndarray] = {"copies": np.asarray(copies)}
-    shape = (SHAPE[0], SHAPE[1], SHAPE[2] * copies)
-    noises = step_noise(shape, STEPS, np.float64)
-    for name in STATE_CASES:
-        case, module = CASES[name], MODULES[CASES[name].scheduler]
-        generator = torch.Generator().manual_seed(SEED)
-        scheduler = getattr(module, case.scheduler)(**case.config)
-        scheduler.set_timesteps(case.steps)
-        initial = (torch.randn(shape, generator=generator, dtype=torch.float64)
-                   * float(scheduler.init_noise_sigma)).float()
-        cotangent = torch.randn(shape, generator=generator, dtype=torch.float64).float()
-        single = trajectory_gradient(module, case, initial, cotangent, torch.float32, noises)
-        with float64_scheduler(module):
-            truth = trajectory_gradient(module, case, initial, cotangent, torch.float64, noises)
-        arrays.update({f"{name}.x_T": initial.numpy(), f"{name}.cotangent": cotangent.numpy(),
-                       f"{name}.grad_float32": single, f"{name}.grad": truth})
+    arrays: dict[str, np.ndarray] = {}
     name = "cfg.epsilon"
     case, module = CASES[name], MODULES[CASES[name].scheduler]
     drawn = orders(int(np.prod(SHAPE[1:])), ORDERS, SEED)
@@ -521,7 +553,7 @@ def rounding(destination: Path, copies: int) -> None:
     arrays["orders"] = drawn.astype(np.uint8)
     arrays[f"{name}.distances"] = np.asarray(distances)
     np.savez_compressed(destination, **arrays)
-    print(f"{destination}: {copies} independent states per original entry, {ORDERS} pixel orders")
+    print(f"{destination}: {ORDERS} pixel orders")
 
 
 def run(name: str, case: Case) -> dict[str, np.ndarray]:
@@ -719,7 +751,7 @@ def main(only: Sequence[str] = ()) -> None:
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["rounding"]:
-        rounding(Path(sys.argv[2]), int(sys.argv[3]))
+        rounding(Path(sys.argv[2]))
     elif sys.argv[1:2] == ["seeds"]:
         seeds(Path(sys.argv[2]))
     elif sys.argv[1:2] == ["cases"]:

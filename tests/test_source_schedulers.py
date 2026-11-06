@@ -13,7 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from diffusion_support import SourceOracle, relative_gap, source_final, walk
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -89,20 +88,13 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     The VJP is held to the source's own rounding from its float64
     evaluation, which widens every scheduler table and keeps that gradient
     in float64, so its truth shares no float32 arithmetic with the reference
-    whose rounding it measures. In pointwise cases pixel permutations
-    reproduce one rounding draw. Exponential v-prediction with thresholding
-    is on par over the seeds its recording declares (check 1,
-    source_seeds.npz): its one draw's ratio was 1.70, 0.99 over 128 seeds.
-    Four others, whose few unclipped entries carry too heavy a tail for
-    seeds to resolve, average 32 independent copies (768 gradient entries)
-    in source_rounding.npz, held to twice the source's own distance; a
-    256-copy pilot's disjoint original-size subsets reached ratio 3.52,
-    while every 32-copy subset stayed below 1.40 on default/AVX/Ice Lake
-    CPU codegen. Thresholding's maximum is 1 in these cases, so the
-    quantile is clamped to a constant and the limit is a pointwise clip.
-    CFG epsilon instead averages 52 pixel orders of its per-sample variance
-    reductions; the rest are held to twice the source's own distance on
-    their one recorded draw.
+    whose rounding it measures. Every pointwise case is on par over the
+    seeds its recording declares (check 1, source_seeds.npz), each seed an
+    independent initial state and cotangent of 768 entries, a thresholding
+    case's draws clear of its clip, and DDIM's thresholding over its first
+    two steps (tools/diffusers_source_reference.py's `SEEDED_STEPS`). CFG
+    epsilon instead averages 52 pixel orders of its per-sample variance
+    reductions.
     """
     schedule, process, times, x_T = source_case(name)
     rescale = SOURCE["cases"][name]["guidance"]
@@ -126,21 +118,14 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
         assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
     if name == "cfg.epsilon":
         source_gradient_over_orders(final, x_T, cotangent)
-    elif f"{name}.seeds" in SOURCE_SEEDED:
+    else:
         seeds = declared_seeds(SOURCE_SEEDS)[name]
         draw, recorded, truth = indexed_recording(SOURCE_SEEDED, name, seeds)
-        gradient = jax.jit(lambda value, cot: {"grad": jax.vjp(final, value)[1](cot)[0]})
+        walked, grid = schedule.sampling(int(SOURCE_SEEDED[f"{name}.steps"]))
+        seeded = source_final(schedule, walked, grid, rescale, SOURCE["label"], SOURCE["guidance_scale"])
+        gradient = jax.jit(lambda value, cot: {"grad": jax.vjp(seeded, value)[1](cot)[0]})
         assert_as_exact(lambda index, inputs: gradient(inputs["x_T"], inputs["cotangent"]), recorded, draw,
                         name, seeds=seeds, truth_fn=truth)
-    elif f"{name}.x_T" in SOURCE_ROUNDING:
-        gradient = jax.jit(lambda value, cot: jax.vjp(final, value)[1](cot)[0])(
-            jnp.asarray(SOURCE_ROUNDING[f"{name}.x_T"]), jnp.asarray(SOURCE_ROUNDING[f"{name}.cotangent"]))
-        assert_as_exact_as_the_reference(
-            gradient, SOURCE_ROUNDING[f"{name}.grad_float32"], SOURCE_ROUNDING[f"{name}.grad"], name)
-    else:
-        (gradient,) = jax.vjp(final, x_T)[1](cotangent)
-        assert_as_exact_as_the_reference(
-            gradient, SOURCE_ARRAYS[f"{name}.grad_float32"], SOURCE_ARRAYS[f"{name}.grad"], name)
 
 
 @pytest.mark.parametrize("config", [

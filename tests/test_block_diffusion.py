@@ -109,18 +109,13 @@ def canvas_draw(prompt: np.ndarray, canvas: np.ndarray, vocab: int, *, previous:
 def transformers_canvas(network, prompt, canvas, *rest):
     """transformers' canvas logits after `prompt`, self-conditioned on the previous logits where given, or
     with the prompt's images where pixels are (the reference's patches and their positions)."""
-    import torch
-    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
+    from tools.diffusion_gemma_reference import media_inputs
 
     fields = {}
     if rest and rest[0].ndim == 3:
         fields["self_conditioning_logits"] = rest[0].to(next(network.parameters()).dtype)
     elif rest:
-        pixels = rest[0].to(next(network.parameters()).dtype)
-        patches = torch.stack([torch.as_tensor(convert_image_to_patches(image.numpy(), 2))
-                               for image in pixels[:, 0]])
-        positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(len(pixels), -1, -1)
-        fields = {"pixel_values": patches.to(pixels.dtype), "image_position_ids": positions}
+        fields = media_inputs(rest[0].to(next(network.parameters()).dtype))
     return {"logits": network(input_ids=prompt, decoder_input_ids=canvas, **fields).logits}
 
 

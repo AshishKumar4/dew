@@ -127,7 +127,13 @@ from dew.objectives.lm.chunked import (
 )
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.stacking import stacked_scores
-from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
+from dew.objectives.routing import (
+    ExpertBalance,
+    RoutedStatistics,
+    apply_routed,
+    reduce_routed,
+    refuse_fixed_router,
+)
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -568,6 +574,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         self.context = context if capacity is None else min(context, capacity)
         self.use_head(head_chunks, head_tile)
         self.samples = samples
+        refuse_fixed_router(model, balance, self.variables)
         self.balance = balance
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (self.context + 1,), variable_axes=(0,)))
         if samples is not None and samples.max_new_tokens > 0:
@@ -1437,13 +1444,12 @@ class LMObjective(TokenScorer):
                 progress=self.progress(step))
         statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
         reported = {"indexer_kl": kl}
-        qk = gathered.get("qk", {}) if step.qk_stats else None
+        qk, inspected = step.observed(gathered)
         if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return statistics, Aux(reported, qk_stats=qk, inspected=gathered.get(INSPECTED, {})
-                               if step.watched is not None else None)
+        return statistics, Aux(reported, qk_stats=qk, inspected=inspected)
 
     def _warmup_statistics(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[Ratio, jax.Array]:
         """The warm-up's loss, the indexer's weighted KL over the queries it

@@ -41,8 +41,8 @@ thresh's annotations), each the input of the files that read it alone; any other
 environment, a cache) is none."""
 READS = {"open", "os.listdir", "os.scandir"}
 LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
-"""The cgroup files that set a process's execution limits, by the input a run that read one keys: host.py's
-`LIMITS`, which this module cannot import (it runs inside every test process, before the checkout's tools)."""
+"""The cgroup files that set a process's execution limits, by the input a run that read one keys, which host.py's
+`limit` reads the binding value of."""
 """Audit events of a read: a file opened, a directory listed."""
 IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
 """The import system's frozen modules, which list the directories it imports from and read the modules it

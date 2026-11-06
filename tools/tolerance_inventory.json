@@ -610,7 +610,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_source_schedulers.py": {
-   "comparisons": 7,
+   "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_speculative.py": {
@@ -718,10 +718,6 @@
    "lane": "Training"
   },
   "tools/check_native_diffusion.py": {
-   "comparisons": 7,
-   "lane": "Models, Serving & RL"
-  },
-  "tools/check_native_diffusion_edges.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },

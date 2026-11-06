@@ -10,7 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
-from dew.interop.weights import in_params
+from dew.interop.layouts import Table
 from dew.nn.activations import HIDDEN_ACT
 from dew.nn.dense import Dense
 from dew.nn.norms import RMSNorm
@@ -26,8 +26,9 @@ from .common import (
     TowerLayout,
     _vision_section,
     activation_name,
-    block_tensor_path,
+    block_routes,
     rope_base,
+    tensor_routes,
 )
 from .vit import LearnedPositions, MergeProjector, VisionTransformer, ViTLayout
 
@@ -132,13 +133,8 @@ _BLOCK_MAPS = {("attn", "q_proj"): ("self_attn", "q_proj"), ("attn", "k_proj"): 
                ("mlp", "fc1"): ("mlp", "up_proj"), ("mlp", "fc2"): ("mlp", "down_proj")}
 
 
-def muse_glimmer_vision_path(hf_name: str) -> tuple[str, ...]:
-    """One Muse Glimmer trunk tensor name, its `vision_tower.` prefix off, into its path in the trunk
-    tree; anything else raises ValueError."""
-    path = _TENSORS.get(hf_name) or block_tensor_path(hf_name.split("."), _BLOCK_MAPS, prefix="layers")
-    if path is None:
-        raise ValueError(f"unknown tensor name {hf_name!r}")
-    return path
+_MUSE_ROUTES = Table(*tensor_routes(_TENSORS), block_routes(_BLOCK_MAPS, prefix="layers"))
+"""A Muse Glimmer trunk's tensor names past `vision_tower.`, both ways."""
 
 
 def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -192,7 +188,7 @@ def translate_muse_glimmer_projector_config(hf_config: Mapping[str, object]) -> 
     }}
 
 
-MuseGlimmerVision.checkpoint = TowerLayout("vision_tower.", in_params(muse_glimmer_vision_path))
+MuseGlimmerVision.checkpoint = TowerLayout("vision_tower.", _MUSE_ROUTES)
 # The adapter and the projection, each name its prefix off.
 MuseGlimmerProjector.checkpoint = ProjectorLayout(("vision_adapter.", "vision_projection."), {
     "fc1.weight": ("adapter", "fc1", "kernel"), "fc2.weight": ("adapter", "fc2", "kernel"),

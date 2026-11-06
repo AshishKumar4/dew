@@ -29,6 +29,7 @@ from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.distributed.host import evict
 from dew.interop.unread import Stored, valued
 from dew.interop.weights import swapped
+from dew.nn.backbones.layer_names import StoredRow
 
 
 @dataclass(frozen=True, eq=False)
@@ -131,8 +132,10 @@ def materialize(tree: LazyTree) -> LazyTree:
 
 @runtime_checkable
 class HostArray(Protocol):
-    """A leaf built on the host as it is read (`np.asarray`), its shape and dtype known before: a DEX
-    layer's folded output projection (`dew.nn.dex.FoldedKernel`), which an export folds as it writes it."""
+    """A leaf built on the host as it is read (`np.asarray`), its shape and dtype known before: a layer's
+    row of a bank (`dew.nn.backbones.layer_names.StoredRow`), read home as it is written, or what an export
+    makes of a leaf as it writes it (`Deferred`: a DEX layer's folded output projection, a packed row's
+    member, an adapter's merge)."""
 
     @property
     def shape(self) -> tuple[int, ...]: ...
@@ -210,7 +213,7 @@ class WeightLayout:
                 # Slice the expert where the leaf lives. One stacked leaf
                 # answers for E source tensors, so copying it to the host
                 # per tensor would move the whole stack E times.
-                if not isinstance(node, (np.ndarray, jax.Array)):
+                if not isinstance(node, (np.ndarray, jax.Array, StoredRow)):
                     node = np.asarray(node)  # a leaf built as it is read, sliced once built
                 if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
                     raise ValueError(

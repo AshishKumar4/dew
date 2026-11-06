@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from dew import _records
@@ -27,10 +28,13 @@ from dew.interop.decoder_parts import (
     PREDICTION_STEP_END,
     DecoderFamily,
     Packed,
-    prediction_path,
+    declared_depths,
+    in_trunk,
+    reads,
     record_bool,
     record_int,
 )
+from dew.interop.layouts import Condition, ConfigLayout, ConfigPart, Route, Slot, Table, When, one_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -68,7 +72,6 @@ _LAYER: Mapping[str, tuple[str, ...]] = {
 }
 PACKED = tuple(Packed(f'.experts.{name}', (f'.experts.{name}',), -1, (0, 2, 1))
                for name in ('up_proj', 'down_proj'))
-_LAYER_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _LAYER.items()}
 
 
 def matches(model: CausalTransformer) -> bool:
@@ -194,6 +197,41 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     return config
 
 
+def export_fields(model: CausalTransformer) -> Mapping[str, object]:
+    """`config_from_hf` backwards: the blocks' kinds as the pattern spells them (`_PATTERN`), the SSD's,
+    the MLP's and the routed experts' geometry, the attention's heads, the norms' epsilon and the
+    prediction steps' kinds; the shared decoder's fields the config declares none of cleared."""
+    letters = {kind: letter for letter, kind in _PATTERN.items()}
+    step = tuple(kind for kind in (model.mtp_layer_type, model.mtp_feedforward_type) if kind is not None)
+    mixers = {kind: model.kind_of(kind).mixer for kind in (*model.per_layer_types, *step)}
+    fields: dict[str, object] = {
+        'hybrid_override_pattern': ''.join(letters[kind] for kind in model.per_layer_types),
+        'layer_norm_epsilon': model.norm_eps, 'num_nextn_predict_layers': model.num_nextn_predict_layers,
+        **({'mtp_layers_block_type': list(step)} if step else {}),
+        'mlp_hidden_act': 'relu2', 'mamba_hidden_act': 'silu',
+        'rms_norm_eps': None, 'hidden_act': None, 'rope_theta': None, 'attention_bias': None,
+        'intermediate_size': None}
+    mamba = mixers.get('linear_attention')
+    if isinstance(mamba, Mamba2Mixer):
+        fields.update(mamba_num_heads=mamba.num_heads, mamba_head_dim=mamba.head_dim,
+                      ssm_state_size=mamba.state_size, n_groups=mamba.n_groups, conv_kernel=mamba.conv_kernel,
+                      chunk_size=mamba.chunk_size, use_bias=mamba.use_bias, use_conv_bias=mamba.use_conv_bias,
+                      time_step_min=mamba.time_step_limit[0])
+    mlp = mixers.get('mlp')
+    if isinstance(mlp, MLPMixer):
+        fields.update(intermediate_size=mlp.intermediate_size, mlp_bias=mlp.use_bias)
+    moe = mixers.get('moe')
+    mixture = moe.mixture if isinstance(moe, MLPMixer) else None
+    if mixture is not None:
+        fields.update(n_routed_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
+                      norm_topk_prob=mixture.norm_topk_prob, routed_scaling_factor=mixture.scaling,
+                      n_group=mixture.groups, topk_group=mixture.groups_per_token,
+                      moe_intermediate_size=mixture.expert_features,
+                      moe_shared_expert_intermediate_size=mixture.shared_features,
+                      moe_latent_size=mixture.latent_features)
+    return fields
+
+
 def _prediction_step(hf_config: Mapping[str, object]) -> tuple[str, ...]:
     """The kinds of one prediction step's blocks: the one whose mixer the step
     builds, then the MLP kind feeding forward, as `MTPBlock` holds them.
@@ -228,31 +266,6 @@ def _step_blocks(config: Mapping[str, object]) -> int:
     return 2 if config.get("mtp_feedforward_type") else 1
 
 
-def _prediction_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The path of one `mtp.layers.{i}.*` tensor: block i of the steps laid
-    end to end, its pre-norm and mixer read as a trunk layer's and moved to
-    the step block's slot."""
-    parts = name.split(".")
-    if len(parts) < 4 or parts[1] != "layers" or not parts[2].isdigit():
-        raise ValueError(f"{name!r} has no place in a Nemotron-H CausalTransformer")
-    blocks = _step_blocks(config)
-    index = int(parts[2])
-    norm, slot = _STEP_SLOTS[index % blocks]
-
-    def block(tail: str) -> tuple[str, ...] | None:
-        if tail == "norm.weight":
-            return ("params", "layers_0", norm, "scale")
-        path = weight_path("backbone.layers.0." + tail, config)
-        assert path is not None and path[2] == "self_attn", path
-        return (path[0], path[1], slot, *path[3:])
-
-    leaves = {**(_STEP_START if index % blocks == 0 else {}),
-              **(PREDICTION_STEP_END if index % blocks == blocks - 1 else {})}
-    return prediction_path(name, "mtp", step_depth(name, config), _records.integer(
-        config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"), ".".join(parts[3:]),
-        leaves, block)
-
-
 def step_depth(name: str, config: Mapping[str, object]) -> int | None:
     """The prediction step of an `mtp.layers.{i}.*` tensor, block i of the steps laid end to end
     (`_step_blocks` each), or None for the trunk's."""
@@ -262,58 +275,66 @@ def step_depth(name: str, config: Mapping[str, object]) -> int | None:
     return int(parts[2]) // _step_blocks(config)
 
 
-def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Map independent mixers, the prediction steps and the router's balancing buffer to their collections."""
-    if name.startswith("mtp."):
-        return _prediction_path(name, config)
-    parts = name.split(".")
-    if (len(parts) == 8 and parts[:2] == ["backbone", "layers"] and parts[2].isdigit()
-            and parts[3:5] == ["mixer", "experts"] and parts[5].isdigit()
-            and parts[6] in ("up_proj", "down_proj") and parts[7] == "weight"):
-        return ("params", f"layers_{parts[2]}", "self_attn", "experts", parts[5], parts[6], "kernel")
-    path = mamba2.weight_path(name, config, layer=_LAYER, family="Nemotron-H")
-    # The router's balancing bias is state a training step moves, which `Router` keeps in `moe`.
-    return path if path is None or path[-1] != "e_score_correction_bias" else ("moe", *path[1:])
+def _block_leaves(norm: str, slot: str) -> dict[str, tuple[str, ...]]:
+    """A block's leaves by their names past its stored layer, its pre-norm `norm` and its mixer in `slot`
+    (a trunk layer's: `input_layernorm` and `self_attn`; a prediction step's second block's: the MTP
+    block's `post_attention_layernorm` and `mlp`)."""
+    return {**{name: (slot, *path[1:]) for name, path in _LAYER.items() if path[0] == 'self_attn'},
+            'norm.weight': (norm, 'scale')}
 
 
-def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
-    """Invert the checkpoint's tensor names for source-layout exports."""
-    parts = dew_name.split(".")
-    if parts[0].startswith("mtp_"):
-        return _prediction_name(parts, config)
-    return mamba2.export_path(dew_name, config, layer_names=_LAYER_NAMES, family="Nemotron-H")
+def _block_routes(stored: str, leaf: str, norm: str, slot: str, slots: Mapping[str, Slot],
+                  when: Condition) -> tuple[Route, ...]:
+    """One block's routes under `stored` and its leaves under `leaf` (`_block_leaves`): its experts one
+    tensor each, and its router's balancing bias, state a training step moves, in `moe` where `Router`
+    keeps it."""
+    held = MappingProxyType(dict(slots))
+    return (
+        Route(stored + 'mixer.gate.e_score_correction_bias',
+              f'moe/{leaf}/{slot}/gate/e_score_correction_bias', held, when),
+        Route(stored + 'mixer.experts.{expert}.{projection}.weight',
+              f'params/{leaf}/{slot}/experts/{{expert}}/' + '{projection}/kernel',
+              MappingProxyType({**held, 'projection': one_of('up_proj', 'down_proj')}), when),
+        *(Route(stored + name, f'params/{leaf}/' + '/'.join(path), held, when)
+          for name, path in _block_leaves(norm, slot).items()))
 
 
-def _prediction_name(parts: list[str], config: Mapping[str, object]) -> str:
-    """`_prediction_path` backwards: the `mtp.layers.{i}.*` name of a step's leaf."""
-    blocks = _step_blocks(config)
-    first = int(parts[0].removeprefix("mtp_")) * blocks
-    own = tuple(parts[1:])
-    for position, leaves in ((0, _STEP_START), (blocks - 1, PREDICTION_STEP_END)):
-        named = {path: name for name, path in leaves.items()}
-        if own in named:
-            return f"mtp.layers.{first + position}.{named[own]}"
+def _step_routes(blocks: int) -> Table:
+    """A prediction step's `blocks` blocks laid end to end under `mtp.layers.{i}.` (step `d`'s block `p`
+    at `i = d * blocks + p`), each block's pre-norm and mixer read as a trunk layer's and moved to the
+    step block's slot (`_STEP_SLOTS`), and the step's own leaves at their block (its first's input maps,
+    its last's final norm: vLLM nemotron_h_mtp.py, has_start_projections and has_end_norm)."""
+    when = declared_depths()
+    routes: list[Route] = []
     for position, (norm, slot) in enumerate(_STEP_SLOTS[:blocks]):
-        if own == ("block", norm, "scale"):
-            return f"mtp.layers.{first + position}.norm.weight"
-        if own[:2] == ("block", slot):
-            trunk = mamba2.export_path(".".join(("layers_0", "self_attn", *own[2:])), config,
-                                       layer_names=_LAYER_NAMES, family="Nemotron-H")
-            assert trunk is not None
-            return f"mtp.layers.{first + position}." + trunk.removeprefix("backbone.layers.0.")
-    raise ValueError(f"{'.'.join(parts)!r} is not a Nemotron-H CausalTransformer parameter")
+        slots = {'depth': Slot(offset=lambda config, place=position: place,
+                               stride=lambda config, count=blocks: count)}
+        own = {**(_STEP_START if position == 0 else {}),
+               **(PREDICTION_STEP_END if position == blocks - 1 else {})}
+        routes += [Route('mtp.layers.{depth}.' + name, 'params/mtp_{depth}/' + '/'.join(path),
+                         MappingProxyType(slots), when) for name, path in own.items()]
+        routes += _block_routes('mtp.layers.{depth}.', 'mtp_{depth}/block', norm, slot, slots, when)
+    return Table(*routes)
+
+
+ROUTES = mamba2.backbone_routes(
+    _LAYER,
+    When(lambda config: _step_blocks(config) == 1, _step_routes(1)),
+    When(lambda config: _step_blocks(config) == 2, _step_routes(2)),
+    *_block_routes('backbone.layers.{layer}.', 'layers_{layer}', 'input_layernorm', 'self_attn', {},
+                   in_trunk))
+"""Nemotron-H's names: Mamba-2's `backbone` trunk with its attention, MLP and expert layers beside the
+SSD's, each expert one tensor, and the prediction steps' blocks (`_step_routes`)."""
 
 
 NEMOTRON_H = DecoderFamily(
     ("nemotron_h",),
-    config_from_hf,
+    ConfigLayout(ConfigPart(reads(config_from_hf), export_fields)),
     matches,
     "nemotron_h",
     "NemotronHForCausalLM",
-    lambda model: {},
-    weight_path=weight_path,
+    routes=ROUTES,
     prediction_depth=step_depth,
-    export_path=export_path,
     packed=PACKED,
     preserve_source_layout=True,
     tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),

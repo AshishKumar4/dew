@@ -15,12 +15,13 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew.batch import Variables
+from dew.interop.layouts import Table
 from dew.interop.unread import Stored, held
-from dew.interop.weights import checkpoint_array, in_params
+from dew.interop.weights import checkpoint_array
 from dew.nn.dense import Dense
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import float32_dot_general
-from dew.nn.text_encoders import TOWER_ACTIVATIONS, _encoder_layer_path, tower_activation
+from dew.nn.text_encoders import TOWER_ACTIVATIONS, encoder_layer_routes, tower_activation
 from dew.registry import Record
 
 from .common import (
@@ -33,7 +34,9 @@ from .common import (
     _vision_section,
     activation_name,
     head_width,
+    tensor_routes,
     trunk_geometry,
+    unplaced,
 )
 from .vit import LearnedPositions, VisionTransformer, ViTLayout
 
@@ -126,19 +129,11 @@ _SIGLIP_TENSORS = {
 }
 
 
-def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
-    """One SigLIP vision tensor name into its path in a trunk tree.
-
-    position_ids is an arange buffer, not a parameter. The attention pooling
-    head some checkpoints carry maps to nothing: the Gemma path reads the
-    trunk sequence alone. Anything else unknown raises ValueError.
-    """
-    if hf_name == "embeddings.position_ids" or hf_name.split(".")[0] == "head":
-        return None
-    path = _SIGLIP_TENSORS.get(hf_name) or _encoder_layer_path(hf_name.split("."), "encoder", block="blocks")
-    if path is None:
-        raise ValueError(f"unknown tensor name {hf_name!r}")
-    return path
+_SIGLIP_ROUTES = Table(unplaced(r"embeddings\.position_ids|head\..+"), *tensor_routes(_SIGLIP_TENSORS),
+                       encoder_layer_routes("encoder", block="blocks"))
+"""A SigLIP trunk's tensor names, both ways. position_ids is an arange buffer, not a parameter; the
+attention pooling head some checkpoints carry maps to nothing, the Gemma path reading the trunk
+sequence alone."""
 
 
 GEMMA_PROJECTOR_TENSORS = {
@@ -219,6 +214,7 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
     }}
 
 
-SiglipVision.checkpoint = TowerLayout("vision_tower.", in_params(siglip_vision_path))
+SiglipVision.checkpoint = TowerLayout("vision_tower.", _SIGLIP_ROUTES)
 GemmaProjector.checkpoint = ProjectorLayout("multi_modal_projector.", GEMMA_PROJECTOR_TENSORS,
+                                            kept=frozenset({"mm_input_projection_weight"}),
                                             read=translate_gemma_projector_weights)

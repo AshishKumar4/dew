@@ -1,5 +1,5 @@
 {
- "diffusers": "0.34.0",
+ "diffusers": "0.39.0",
  "shape": [
   2,
   3,
@@ -18,7 +18,7 @@
    "scheduler": "DDIMScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 2.275883436203003
+   "latent_scale": 2.275883197784424
   },
   "ddim.threshold": {
    "scheduler": "DDIMScheduler",
@@ -54,13 +54,13 @@
    "scheduler": "DDPMScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 2.579453229904175
+   "latent_scale": 2.579453468322754
   },
   "ddpm.small_log": {
    "scheduler": "DDPMScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 2.5898351669311523
+   "latent_scale": 2.5898354053497314
   },
   "ddpm.large_leading": {
    "scheduler": "DDPMScheduler",
@@ -91,6 +91,12 @@
    "steps": 5,
    "guidance": null,
    "latent_scale": 41.3980827331543
+  },
+  "euler.linspace_min": {
+   "scheduler": "EulerDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 41.39703369140625
   },
   "euler.beta_trailing_min": {
    "scheduler": "EulerDiscreteScheduler",
@@ -156,7 +162,7 @@
    "scheduler": "DPMSolverSDEScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 52.32470703125
+   "latent_scale": 52.324703216552734
   },
   "dpm_sde.karras_v": {
    "scheduler": "DPMSolverSDEScheduler",
@@ -168,7 +174,7 @@
    "scheduler": "DPMSolverMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 40.821441650390625
+   "latent_scale": 40.82143783569336
   },
   "dpm_multi.karras": {
    "scheduler": "DPMSolverMultistepScheduler",
@@ -192,13 +198,13 @@
    "scheduler": "DPMSolverMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 41.18785095214844
+   "latent_scale": 41.18785858154297
   },
   "dpm_multi.eps_threshold": {
    "scheduler": "DPMSolverMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 2.460270404815674
+   "latent_scale": 2.460270643234253
   },
   "dpm_multi.beta_leading": {
    "scheduler": "DPMSolverMultistepScheduler",
@@ -240,13 +246,13 @@
    "scheduler": "DEISMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 2.1706690788269043
+   "latent_scale": 2.1706693172454834
   },
   "unipc.default": {
    "scheduler": "UniPCMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 40.63655090332031
+   "latent_scale": 40.63654708862305
   },
   "unipc.beta_eps_bh1": {
    "scheduler": "UniPCMultistepScheduler",
@@ -258,7 +264,7 @@
    "scheduler": "UniPCMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 2.370527505874634
+   "latent_scale": 2.370527744293213
   },
   "dpm_multi.flow": {
    "scheduler": "DPMSolverMultistepScheduler",
@@ -276,13 +282,13 @@
    "scheduler": "UniPCMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 2.603177309036255
+   "latent_scale": 2.603900671005249
   },
   "unipc.flow_order3_sigma_min": {
    "scheduler": "UniPCMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 2.376939058303833
+   "latent_scale": 2.377120018005371
   },
   "edm.default": {
    "scheduler": "EDMDPMSolverMultistepScheduler",
@@ -294,7 +300,7 @@
    "scheduler": "EDMDPMSolverMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 9.801173210144043
+   "latent_scale": 9.80117416381836
   },
   "lcm.default": {
    "scheduler": "LCMScheduler",
@@ -312,37 +318,31 @@
    "scheduler": "TCDScheduler",
    "steps": 4,
    "guidance": null,
-   "latent_scale": 48.046661376953125
+   "latent_scale": 48.04664993286133
   },
   "tcd.original_20_v": {
    "scheduler": "TCDScheduler",
    "steps": 4,
    "guidance": null,
-   "latent_scale": 2.767688274383545
+   "latent_scale": 2.767688035964966
   },
   "cfg.epsilon": {
    "scheduler": "DPMSolverMultistepScheduler",
    "steps": 5,
    "guidance": 0.7,
-   "latent_scale": 2.1706702709198
+   "latent_scale": 2.170670509338379
   },
   "cfg.velocity": {
    "scheduler": "DPMSolverMultistepScheduler",
    "steps": 5,
    "guidance": 0.5,
-   "latent_scale": 2.1706702709198
+   "latent_scale": 2.170670509338379
   },
   "cfg.zero_rescale": {
    "scheduler": "DPMSolverMultistepScheduler",
    "steps": 5,
    "guidance": 0.0,
    "latent_scale": 71.86064910888672
-  },
-  "euler.linspace_min": {
-   "scheduler": "EulerDiscreteScheduler",
-   "steps": 5,
-   "guidance": null,
-   "latent_scale": 41.39703369140625
   }
  },
  "refused": [

@@ -160,7 +160,8 @@ def test_no_pragma_holds_a_text_copy(tmp_path):
         ("alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta")))
     silenced = "# pylint: disable=duplicate-code\n" + settings
     texts = tree(tmp_path, "silenced", {"first.py": silenced, "second.py": silenced})
-    assert gate(texts, "--reading=text").returncode == 1
+    # Its seven settings reported repeated, the pragma above them read as nothing.
+    assert duplicates.text_copies(sorted(texts.glob("*.py")), forked=False) >= 7
 
 
 def test_a_function_two_files_write_under_other_names_fails_and_one_owner_passes(tmp_path):

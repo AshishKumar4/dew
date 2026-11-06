@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
 from dew.interop.config_records import native_fields
@@ -17,6 +16,7 @@ from dew.interop.decoder_parts import (
     MOE_SHARED,
     DecoderFamily,
     DecoderFields,
+    ExportRefused,
     KindFields,
     Leaves,
     MixtureFields,
@@ -25,9 +25,11 @@ from dew.interop.decoder_parts import (
     RopeSpelling,
     base_config,
     read_rope,
+    reads,
     refuse,
-    renamed_path,
+    spelled,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -123,7 +125,7 @@ def _llama4_export(model: CausalTransformer) -> Mapping[str, object]:
     tunings, half-pair rotation) is refused by the export's round trip (`refuse_lossy_export`)."""
     chunks = {kind.chunk for kind in (model.kinds or {}).values() if kind.chunk is not None}
     if len(chunks) > 1:
-        raise ValueError(
+        raise ExportRefused(
             f"the kinds chunk at {sorted(chunks)}, and Llama 4's config carries one "
             "attention_chunk_size")
     types = model.per_layer_types
@@ -170,14 +172,13 @@ _LLAMA4_EXPERTS: Leaves = {f'mlp.experts.{projection}': ('mlp', 'experts', proje
 
 LLAMA4_TEXT = DecoderFamily(
     ('llama4_text',),
-    _llama4_config,
+    ConfigLayout(ConfigPart(reads(_llama4_config), _llama4_export)),
     # Llama 4 alone scales its routed experts' inputs by their routing weight, whatever its layers'
     # positions: a model of only NoPE layers is as much Llama 4 as one with rotated ones.
     lambda fields: bool(fields.mixture is not None and fields.mixture.scale_inputs),
     'llama4_text',
     'Llama4ForCausalLM',
-    _llama4_export,
-    weight_path=partial(renamed_path, _LLAMA4_NAMES, layer_leaves=_LLAMA4_EXPERTS),
+    routes=spelled(_LLAMA4_NAMES, layer_leaves=_LLAMA4_EXPERTS),
     packed=_LLAMA4_PACKED,
     preserve_source_layout=True,
     # Llama4TextConfig's defaults for the fields its decoder reads.

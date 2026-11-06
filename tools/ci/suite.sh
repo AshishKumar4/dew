@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # CI's test gate: the suite on armada and, beside it, tests/test_multihost.py's multi-host gangs, and the whole
-# suite's release checks after it, from the machine that sends them (a GitHub runner, or the land queue's PC: dew-ops
-# queue/gates.py). It sends the commit, waits, prints each red row's output, and fails on a failed test, a test
-# skipped on a missing import, a file left unreported or a gang that did not pass. A commit armada already graded
-# green is not run again, nor one PROVEN.
+# suite's release checks after it, from the machine that sends them (a GitHub runner). It sends the commit, waits,
+# prints each red row's output, and fails on a failed test, a test skipped on a missing import, a file left
+# unreported or a gang that did not pass. A commit armada already graded green is not run again, nor one PROVEN.
 #
 # The suite runs both Pythons as tasks of about five minutes each on Dew's armada deployment (.armada.json,
 # tools/armada/ci.py), on at most its pool, the gangs' containers beside it. A straggler at the end runs again

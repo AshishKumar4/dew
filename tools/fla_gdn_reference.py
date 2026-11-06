@@ -107,16 +107,11 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
 
 
 def serve() -> None:
-    """The torch side: each request a line naming a site's inputs (an npz), its dtype, rule, scale and leaves
-    ('all', or 'forward' for the output and final memory alone), and
-    where to write fla's outputs and the reference's (`<path>.reference.npz`, `<path>.truth.npz`),
-    answered with a line `done` on the process's own stdout, which the libraries' prints (stdout taken to
-    stderr) never reach: a line tilelang or fla printed was read as a request's answer, and the recorder
-    waited on a live process's exit for 4.5 hours (fla-record4-h100-6369564ae)."""
-    import os
-
-    answers = os.fdopen(os.dup(sys.stdout.fileno()), "w")
-    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    """The torch side (tools/reference_worker.py's protocol): each request a site's inputs with its `dtype`,
+    `kind` ('kda' or 'gdn'), `scale` and `leaves` ('all', or 'forward' for the output and final memory
+    alone), answered with fla's outputs and the reference's (`reference.<leaf>`, `truth.<leaf>`), after one
+    `ready` line of fla's and tilelang's versions and the device."""
+    import reference_worker
     import torch
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
@@ -131,81 +126,46 @@ def serve() -> None:
     # On Hopper fla-core 0.5.2 refuses its Triton backward under Triton below 3.7.1 (fla #640, wrong results
     # in chunk_bwd_dqkwg) and takes tilelang's there: the cohort's torch 2.8.0 carries Triton 3.4.
     found = f"fla-core-{version('fla-core')}+tilelang-{version('tilelang')}"
-    print(f"ready {found} {torch.cuda.get_device_name()}", file=answers, flush=True)
-    for line in sys.stdin:
-        path, dtype, kind, scale, leaves = line.split()
+
+    def answer(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        dtype, kind, leaves = (str(arrays.pop(name)) for name in ("dtype", "kind", "leaves"))
+        scale = float(arrays.pop("scale"))
         kda, gradients = kind == "kda", leaves == "all"
-        with np.load(path) as stored:
-            arrays = dict(stored)
         rule = chunk_kda if kda else chunk_gated_delta_rule
         began = time.perf_counter()
-        np.savez(f"{path}.reference.npz", **run(arrays, kda=kda, scale=float(scale), rule=rule,
-                                                dtype=getattr(torch, dtype), device="cuda",
-                                                per_sequence=False, gradients=gradients))
+        reference = run(arrays, kda=kda, scale=scale, rule=rule, dtype=getattr(torch, dtype), device="cuda",
+                        per_sequence=False, gradients=gradients)
         referenced = time.perf_counter()
         # The truth in float64 on the GPU: on the CPU its token loop and autograd took most of a site's
         # 1432 s for 320 draws (fla-record3-h100-f8fbb058d, the worker at a core's whole time).
         with float64():
             naive = naive_recurrent_kda if kda else naive_recurrent_gated_delta_rule
-            np.savez(f"{path}.truth.npz", **run(arrays, kda=kda, scale=float(scale), rule=naive,
-                                                dtype=torch.float64, device="cuda", per_sequence=True,
-                                                gradients=gradients))
+            truth = run(arrays, kda=kda, scale=scale, rule=naive, dtype=torch.float64, device="cuda",
+                        per_sequence=True, gradients=gradients)
         print(f"timed fla {referenced - began:.3f} s truth {time.perf_counter() - referenced:.3f} s",
               file=sys.stderr, flush=True)
-        print("done", file=answers, flush=True)
+        return reference_worker.paired(reference, truth)
+
+    reference_worker.serve(answer, f"{found} {torch.cuda.get_device_name()}")
 
 
-class Worker:
-    """`serve`'s torch process in the fla Python `python`: one request a line, answered `done` (`ask`); a
-    process that dies on a request fails the recording, its exit code and the request stated."""
-
-    def __init__(self, python: str):
-        self.python, self.process, self.started = python, None, None
-
-    def start(self) -> str:
-        """The process started, its `ready` line's words after the first: fla's version and the device."""
-        import subprocess
-
-        self.process = subprocess.Popen([self.python, __file__, "--serve"], stdin=subprocess.PIPE,
-                                        stdout=subprocess.PIPE, text=True)
-        self.started = self.process.stdout.readline().split(maxsplit=1)[1]
-        return self.started
-
-    def ask(self, line: str) -> None:
-        """`line` answered: any other line the process answers is printed, the request still waited on."""
-        self.process.stdin.write(f"{line}\n")
-        self.process.stdin.flush()
-        for answer in iter(self.process.stdout.readline, ""):
-            if answer.strip() == "done":
-                return
-            print(f"the torch process: {answer.rstrip()}", flush=True)
-        raise RuntimeError(f"the torch process died on {line!r} (exit {self.process.wait()})")
-
-    def close(self) -> None:
-        """The process ended and reaped, whether or not its requests were answered."""
-        if self.process is not None:
-            self.process.stdin.close()
-            self.process.wait()
-
-
-def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
+def write_seeded(worker, names: list[str], out: Path) -> None:
     """Each named site's seeded draws with fla's outputs and gradients and their float64 truth (`worker`,
-    `serve`'s process), recorded as a summary (`record_case`) into `out`, Dew's portable rule in the site's
+    `serve`'s `Session`), recorded as a summary (`record_case`) into `out`, Dew's portable rule in the site's
     dtype the sizing proxy and its float64 token recurrence held to fla's reference at every seed: a unit
     of the recording, whose units `merged` joins into the fixture."""
     import functools
-    import tempfile
 
     import jax
     from fla_sites import ruled, sites
     from recorded_references import held_to_the_oracle, provenance, record_case
     from reference_error import chain_roundings, widened
+    from reference_worker import arms
     from test_recurrence_chunk import chunk_on, token_by_token
 
     from dew.nn.kernels.selection import KernelRefused
 
-    version, device = worker.start().split(maxsplit=1)
-    requests = tempfile.mkdtemp(prefix="fla-")
+    version, device = worker.started.split(maxsplit=1)
     stored = {}
     for name in names:
         site, began = sites()[name], time.perf_counter()
@@ -215,12 +175,11 @@ def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
         leaves = "all" if set(site.leaves) - {"out", "final"} else "forward"
 
         def fla(arrays, dtype=dtype, kda=kda, scale=site.hooks.scale, leaves=leaves):
-            path = os.path.join(requests, "inputs.npz")
-            np.savez(path, **{key: np.asarray(value, np.float32) if key != "starts" else value
-                              for key, value in arrays.items()})
-            worker.ask(f"{path} {dtype} {'kda' if kda else 'gdn'} {scale!r} {leaves}")
-            with np.load(f"{path}.reference.npz") as reference, np.load(f"{path}.truth.npz") as truth:
-                return dict(reference), dict(truth)
+            request = {key: np.asarray(value, np.float32) if key != "starts" else value
+                       for key, value in arrays.items()}
+            options = {"dtype": dtype, "kind": "kda" if kda else "gdn", "scale": scale, "leaves": leaves}
+            request |= {name: np.asarray(value) for name, value in options.items()}
+            return arms(worker.ask(request))
 
         exact_run = jax.jit(functools.partial(lambda hooks, arrays, leaves: ruled(
             functools.partial(token_by_token, hooks), arrays, leaves), site.hooks, leaves=site.leaves))
@@ -308,11 +267,10 @@ def main() -> None:
         written = merged([Path(unit) for unit in sys.argv[2:]])
         print(f"wrote {FIXTURE.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
     else:
-        worker = Worker(sys.argv[1])
-        try:
+        from reference_worker import session
+
+        with session([sys.argv[1], __file__, "--serve"]) as worker:
             write_seeded(worker, sys.argv[3:], Path(sys.argv[2]))
-        finally:
-            worker.close()
 
 
 if __name__ == "__main__":
