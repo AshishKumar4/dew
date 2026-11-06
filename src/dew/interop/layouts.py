@@ -547,7 +547,7 @@ def unread[Model](*keys: str) -> ConfigPart[Model]:
              record: NativeFields[Model]) -> NativeFields[Model]:
         used.update(keys)
         return record
-    return ConfigPart(read, lambda model: {})
+    return ConfigPart(read, lambda model: {}, keys=keys)
 
 
 @dataclass(frozen=True, eq=False)

@@ -865,6 +865,10 @@ def translate_family_config(hf_config: Mapping[str, object],
                 refuse(f"{alias}={value!r} beside {canonical}={spelled[canonical]!r}", "they name one field")
             spelled[canonical] = value
             used.add(alias)
+    for legacy, canonical in (family.legacy if own else {}).items():
+        if legacy in spelled:
+            spelled[canonical] = spelled.pop(legacy)
+            used.add(legacy)
     for repeat, canonical in (family.repeated if own else {}).items():
         if repeat in spelled:
             # A rope field transformers 5 writes into rope_parameters is stated there.
@@ -2009,6 +2013,10 @@ class DecoderFamily:
     aliases: Mapping[str, str] = field(default_factory=dict)
     """The config class's `attribute_map`: another spelling of a field, read as that field before
     `defaults` fill what neither spells."""
+    legacy: Mapping[str, str] = field(default_factory=dict)
+    """The config class's legacy names of its fields, each read as its field over the field's own spelling
+    where a config states both (NemotronHConfig.__post_init__'s, configuration_nemotron_h.py:145-162);
+    written as the field."""
     prediction_counts: tuple[str, ...] = ('num_nextn_predict_layers',)
     """The fields the family's config counts its multi-token prediction depths by, as its config class
     names them; an alias that spells one (`aliases`) counts it too (`kept_depths`)."""

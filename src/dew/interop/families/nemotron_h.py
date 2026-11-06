@@ -351,10 +351,9 @@ NEMOTRON_H = DecoderFamily(
     packed=PACKED,
     preserve_source_layout=True,
     tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
-    # NemotronHConfig's legacy names for its fields, which it reads over them (configuration_nemotron_h.py:
-    # 145-155); the releases whose config is their own remote code's (Nemotron-H-4B/8B-Base-8K) name the
-    # attention head width so.
-    aliases={"mamba_n_groups": "n_groups", "mamba_d_conv": "conv_kernel", "mamba_conv_bias": "use_conv_bias",
-             "mamba_chunk_size": "chunk_size", "mamba_dt_min": "time_step_min",
-             "attention_head_dim": "head_dim"},
+    # NemotronHConfig's legacy names for its fields; the releases whose config is their own remote code's
+    # (Nemotron-H-4B/8B-Base-8K) name the attention head width so.
+    legacy={"mamba_n_groups": "n_groups", "mamba_d_conv": "conv_kernel", "mamba_conv_bias": "use_conv_bias",
+            "mamba_chunk_size": "chunk_size", "mamba_dt_min": "time_step_min",
+            "attention_head_dim": "head_dim"},
 )

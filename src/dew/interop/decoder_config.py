@@ -184,7 +184,7 @@ def inert[Model](key: str, why: str, *, neutral: Configured = None) -> ConfigPar
         if hf_config.get(key) not in (None, neutral):
             refuse(f"{key}={hf_config[key]!r}", why)
         return record
-    return ConfigPart(read, lambda model: {})
+    return ConfigPart(read, lambda model: {}, keys=(key,))
 
 
 def read_only(translate: Callable[[Mapping[str, object], set[str]], DecoderFields],
@@ -220,7 +220,7 @@ def expect[Model](key: str, why: str, *, value: Configured, written: bool = Fals
         if (required and key not in hf_config) or hf_config.get(key, value) != value:
             refuse(key, f'{why}; requires {value!r}')
         return record
-    return ConfigPart(read, lambda model: {key: value} if written else {})
+    return ConfigPart(read, lambda model: {key: value} if written else {}, keys=(key,))
 
 
 def remote_code(repo: str, module: str, name: str) -> ConfigPart[CausalTransformer]:
@@ -447,7 +447,7 @@ def biases(key: str, *, default: bool) -> ConfigPart[CausalTransformer]:
         biased = config_flag(hf_config, key, default=default)
         record.update(mlp_bias=biased, attention_bias=biased)
         return record
-    return ConfigPart(read, lambda model: {key: model.attention_bias})
+    return ConfigPart(read, lambda model: {key: model.attention_bias}, keys=(key,))
 
 
 def four_wide(key: str) -> ConfigPart[CausalTransformer]:
@@ -458,7 +458,7 @@ def four_wide(key: str) -> ConfigPart[CausalTransformer]:
         record['mlp_features'] = _records.integer(
             hf_config.get(key) or 4 * _records.integer(record['emb_features'], 'hidden_size'), key)
         return record
-    return ConfigPart(read, lambda model: {key: model.hidden_features})
+    return ConfigPart(read, lambda model: {key: model.hidden_features}, keys=(key,))
 
 
 def kind_mixer[Mixer](kind: str, name: str, mixer: type[Mixer], layout: ConfigLayout[Mixer], *,
