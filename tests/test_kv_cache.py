@@ -335,19 +335,20 @@ def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_in
 
 
 @INTERPRETS
+@pytest.mark.parametrize("page", [16, None], ids=["paged", "dense"])
 @pytest.mark.parametrize("stored", ["int8", "float8_e4m3fn"])
-def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpreted(stored):
-    """An int8 or FP8 pool (`KVCache.quantized`), decoded on an H100 by the attention template's decode over
-    its pages (`PAGED`'s template kernel), its codes dequantized in the walk by their scales
-    (`template_quantized`, ledger 3624): on par with the reference path over the keys and values the pool
-    dequantizes to, an int8 pool's keys and the query in its rotation (check 1)."""
+def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpreted(stored, page):
+    """An int8 or FP8 cache (`KVCache.quantized`), paged or dense, decoded on an H100 by the attention
+    template's decode (`PAGED`'s template kernel), its codes read as they lie and dequantized in the walk by
+    their scales (`template_quantized`, ledger 3624): on par with the reference path over the keys and
+    values the cache dequantizes to, an int8 cache's keys and the query in its rotation (check 1)."""
     from dew.nn.kernels import generation
     from dew.nn.kernels.templates import attention as template
     from dew.nn.kv_cache import dequantize, quantize, rotated
 
     rows, capacity, kv_heads, width = 4, 128, 2, 64
     lengths = jnp.asarray([128, 70, 9, 101], jnp.int32)
-    layout = KVCache(page_size=16, quantized=stored)
+    layout = KVCache(page_size=page, quantized=stored)
     decoder = Decoder(layout, capacity)
     positions = jnp.broadcast_to(jnp.arange(capacity), (rows, capacity))
     rotation = layout.key_rotation(width)
@@ -373,7 +374,8 @@ def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpret
                       for stream in streams[:2])
         return key, value, jax.random.normal(streams[2], (rows, 2 * kv_heads, width), jnp.bfloat16)
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"{stored} pool's template decode", seeds=8)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"{stored} {page} cache's template decode",
+                    seeds=8)
 
 @pytest.mark.parametrize("mixed", [False, True], ids=["rectangular", "mixed"])
 def test_a_paged_write_past_its_rows_pages_drops_and_leaves_their_slots(mixed):

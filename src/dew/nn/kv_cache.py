@@ -749,8 +749,8 @@ class KVStore:
             starts = extras[0] if given else None
             sinks = extras[len(given)] if sunk else None
             if kernel == 'template' and dequantizes:
-                return template_quantized(query, key, value, table, lengths, *extras[-2:], starts,
-                                          sinks if sunk else None, softcap=softcap)
+                return template_quantized(query, key, value, table if paged else None, lengths, *extras[-2:],
+                                          starts, sinks if sunk else None, softcap=softcap)
             if kernel == 'template':
                 return template_paged(softcap)(query, key, value, table, lengths, starts, sinks)
             if kernel == 'triton':
@@ -764,16 +764,21 @@ class KVStore:
         given = () if starts is None else (starts,)
         sunk = () if sinks is None else (sinks,)
         pools = [self._get(name) for name, _ in self.payloads]
-        # A quantized pool's codes and their scales `[KV, P, page]`, which the template reads as they are.
+        # A quantized pool's codes and their scales (`scale_shape`), which the template reads as they are.
         dequantizes = kernel == 'template' and self.layout.quantized is not None
         scales = (tuple(self._get(scale) for _, scale in self.payloads) * 2)[:2] if dequantizes else ()
-        arrays = (query, pools[0], pools[-1], lengths, self._absolute(self._get(TABLE)),
-                  *given, *sunk, *scales)
+        paged = self.layout.page_size is not None
+        # A dense cache's rows its own, no table: its row indices stand in for one (unread).
+        table = self._absolute(self._get(TABLE)) if paged else jnp.zeros((query.shape[0], 0), jnp.int32)
+        arrays = (query, pools[0], pools[-1], lengths, table, *given, *sunk, *scales)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
         rows, heads = (*queries, None, None)[:2]
-        specs = (queries, P(heads), P(heads), P(rows), P(rows), *(P(rows) for _ in given),
-                 *(P(heads) for _ in sunk), *(P(heads) for _ in scales))
+        # A pool's key heads lead, a dense cache's rows (`[rows, capacity, heads, D]`, scales `[rows, heads,
+        # capacity]`).
+        pooled, scaled = (P(heads), P(heads)) if paged else (P(rows, None, heads), P(rows, heads))
+        specs = (queries, pooled, pooled, P(rows), P(rows), *(P(rows) for _ in given),
+                 *(P(heads) for _ in sunk), *(scaled for _ in scales))
         return manual_map(local, specs, queries)(*arrays)
 
 
@@ -853,13 +858,14 @@ def _template_tiles(case: PagedCase) -> bool:
     family's key extents, `attention_mosaic_program.extents`)."""
     from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program
 
-    if backend() != "gpu" or case.page_size is None:
+    if backend() != "gpu":
         return False
     # One query a row: a key head's query heads its packed rows (`attention_decode.packed`).
     family = attention_mosaic_program.bundle(generation.gpu_target().generation, case.dtype,
                                              case.heads // case.kv_heads)
-    if family is None:
-        return False
+    if family is None or case.page_size is None:
+        # A dense cache's codes read as its rows lie (`template_quantized`).
+        return family is not None
     # Every key tile the family's copies move (a page's keys whole in it), else one of the page's.
     tiles = attention_mosaic_program.extents(family, case.dtype, family.copy_extent or case.page_size)
     return any(attention_mosaic._pages_hold(case.page_size, tile, family) for tile in tiles)
@@ -874,7 +880,8 @@ def _converts(stored: KVDtype) -> bool:
 
 
 TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
-    Requirement('pages', lambda case: case.page_size is not None, "the cache keeps no pages", row=INHERENT),
+    Requirement('pages', lambda case: case.page_size is not None or case.quantized is not None,
+                "the cache keeps no pages and no codes: the layer's attention reads it", row=INHERENT),
     Requirement('dtype', lambda case: case.dtype in (jnp.bfloat16, jnp.float16)
                 and (case.pool == case.dtype if case.quantized is None
                      else _converts(case.quantized)),
@@ -1014,8 +1021,8 @@ def _template_forward(query, key, value, table, lengths, starts=None, sinks=None
     from dew.nn.kernels.templates import attention as template, attention_decode
 
     rows = query.shape[0]
-    spans = template.spans(1, table.shape[1] * key.shape[2], rows, lengths=jnp.maximum(lengths, 1),
-                           starts=starts)
+    keys = key.shape[1] if table is None else table.shape[1] * key.shape[2]
+    spans = template.spans(1, keys, rows, lengths=jnp.maximum(lengths, 1), starts=starts)
     hooks = template.Hooks(None if softcap is None else template.Capped(softcap),
                            initial=None if sinks is None else template.sinks(sinks, rows, 1, value.shape[-1]))
     # Interpreted where the arrays lie off a GPU (Mosaic GPU compiles on one alone), whatever GPU the step
@@ -1027,9 +1034,14 @@ def _template_forward(query, key, value, table, lengths, starts=None, sinks=None
 
 def template_quantized(query, key, value, table, lengths, key_scale, value_scale, starts=None, sinks=None, *,
                        softcap=None):
-    """The attention template's decode over a quantized pool's pages (`_template_forward`'s): its codes `key`
-    and `value` `[KV, P, page, D]` read as they are and dequantized in the walk by their scales `[KV, P,
-    page]` (`attention_decode.attend`'s `scales`, each row's in its key order by its table, ledger 3624)."""
+    """The attention template's decode over a quantized pool (`_template_forward`'s): its codes `key` and
+    `value` read as they are and dequantized in the walk by their scales (`attention_decode.attend`'s
+    `scales`, ledger 3624): a paged pool's `[KV, P, page, D]` and `[KV, P, page]`, its scales put in each
+    row's key order by its `table`; a dense cache's `[rows, capacity, KV, D]` and head-major `[rows, KV,
+    capacity]`, as they lie (`table` None)."""
+    if table is None:
+        return _template_forward(query, key, value, None, lengths, starts, sinks, softcap=softcap,
+                                 scales=(key_scale, value_scale))[0]
     rows, (kv_heads, _, page) = table.shape[0], key_scale.shape
 
     def ordered(scale):
