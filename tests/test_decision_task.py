@@ -954,7 +954,8 @@ def test_a_tournaments_rounds_are_asked_from_the_whole_request(decide):
     question = Question.from_wire(request["questions"]["intent"])
     assert isinstance(question, Choice)
     asked = {"intent": question}
-    summary = RequestSummary(line="{index}. {name} ({kind}): {instructions}")
+    summary = RequestSummary(line="{index}. {name} ({kind}): {instructions}",
+                             current="{index}. {name} ({kind}), asked: {instructions}")
     summarized = replace(decide, layout=replace(decide.layout, segments=(summary, Text("\n"),
                                                                           *decide.layout.written)))
     described = dict(zip(question.options, question.descriptions, strict=True))
@@ -965,8 +966,9 @@ def test_a_tournaments_rounds_are_asked_from_the_whole_request(decide):
     played = {f"intent/{part}": Choice(question.instructions,
                                        {option: described[option] for option in group})
               for part, group in enumerate(groups)}
-    rounds = summarized(request["state"], played, request=asked)
-    winners = [rounds[f"intent/{part}"].choice for part in range(len(groups))]
+    # Each group asked as the request's own question, current in its summary.
+    winners = [summarized(request["state"], {"intent": group}, request=asked)["intent"].choice
+               for group in played.values()]
     finalists = Choice(question.instructions, {option: described[option] for option in winners})
     final = summarized(request["state"], {"intent": finalists}, request=asked)["intent"]
     answer = summarized.tournament(request["state"], asked, rounds=Knockout(group=4))["intent"]
@@ -980,4 +982,6 @@ def test_options_knocked_out_with_no_probability_share_the_residual_evenly():
     from dew.decision.task import _knocked_out
 
     combined = _knocked_out({"a": 0.75, "b": 0.25}, {"a": 0.5, "b": 0.5, "c": 0.0, "d": 0.0}, 0.01)
-    assert combined["a"] > combined["b"] > combined["c"] == combined["d"] > 0
+    shares = {"a": 0.75 * (1 - 0.01), "b": 0.25 * (1 - 0.01), "c": 0.01 / 2, "d": 0.01 / 2}
+    total = sum(shares.values())
+    assert combined == {option: share / total for option, share in shares.items()}
