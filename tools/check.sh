@@ -54,6 +54,7 @@ case "${1:-}" in
     # resolves every seam's contract against tests/test_contracts_*.py: a head that changes the inventory or
     # a contracts test, or deletes a Python file, has the whole tree read, as the full run reads it.
     if git diff --quiet "$since" -- tools/tolerance_inventory.json 'tests/test_contracts_*.py' &&
+      [ -z "$(git ls-files --others --exclude-standard -- 'tests/test_contracts_*.py')" ] &&
       [ -z "$(git diff --no-renames --name-only --diff-filter=D "$since" -- '*.py')" ]; then
       gate slop sh -c '. tools/lint_inputs.sh; python_changed "$1" $("$PYTHON" tools/lint_slop.py --print-roots) |
         JAX_PLATFORMS=cpu xargs -0r "$PYTHON" tools/lint_slop.py' _ "$since"

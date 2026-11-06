@@ -69,14 +69,22 @@ def derivative_seams(relative: str, tree: ast.Module) -> Iterator[tuple[str, str
     def made(call: ast.Call) -> str | None:
         """What the call `call` itself makes, a maker named by its function (a call of a call's result is
         the inner call's)."""
-        if isinstance(call.func, ast.Call) or id(call) in decorators:
+        holder = parents.get(call)
+        if (isinstance(call.func, ast.Call) or id(call) in decorators
+                or (isinstance(holder, ast.Call) and holder.args[:1] == [call]
+                    and _call_name(holder.func) == "partial")):
+            # A partial's maker is the partial's: the outer call is the one seam.
             return None
         return "linear_tangent" if _call_name(call.func) == "linear_tangent" else _maker_of(call)
 
     def named(call: ast.Call, scope: list[str], maker: str) -> str:
+        """`call`'s seam name: the name its result is assigned to, through a contract wrapping it or a call
+        of its result (a partial's), else its maker within `scope`."""
         holder = parents.get(call)
         if declared(call) is not None:
             holder = parents.get(holder)
+        while isinstance(holder, ast.Call) and holder.func is call:
+            call, holder = holder, parents.get(holder)
         target = (holder.targets[0] if isinstance(holder, ast.Assign) and len(holder.targets) == 1
                   else holder.target if isinstance(holder, ast.AnnAssign) else None)
         return ".".join([*scope, target.id if isinstance(target, ast.Name) else maker.split(":")[0]])

@@ -1977,14 +1977,18 @@ def test_each_form_of_a_custom_derivative_is_a_seam():
         "@functools.partial(declared_tangent, KernelGlue(), tangent=rule)\n"
         "def k(x): return x\n"
         "def returned(x):\n    return surrogate(f, g)(x)\n"
+        "nested = functools.partial(functools.partial(jax.custom_jvp, nondiff_argnums=(1,)))(f)\n"
         "def passed(p):\n    return wrap(jax.custom_jvp(p))\n"
         "def plain(x): return x\n")
+    found = [seam for seam, _, _, _ in rules.derivative_seams("m.py", ast.parse(text))]
+    assert len(found) == len(set(found)), f"a seam counted twice: {found}"
     assert {seam: maker for seam, maker, _, _ in rules.derivative_seams("m.py", ast.parse(text))} == {
         "m.py::a": "custom_jvp", "m.py::b": "custom_vjp", "m.py::c": "custom_jvp", "m.py::d": "custom_vjp",
         "m.py::outer.inner": "custom_vjp", "m.py::tangent.linear_tangent": "linear_tangent",
         "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "declared_derivative:Surrogate",
         "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue",
-        "m.py::returned.surrogate": "surrogate", "m.py::passed.custom_jvp": "custom_jvp"}
+        "m.py::returned.surrogate": "surrogate", "m.py::passed.custom_jvp": "custom_jvp",
+        "m.py::nested": "custom_jvp"}
 
 
 def test_a_custom_derivative_without_its_contract_is_reported(tmp_path):
