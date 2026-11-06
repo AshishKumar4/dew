@@ -452,3 +452,15 @@ def test_a_slot_release_reads_the_labels_its_layout_states_in_their_order(tmp_pa
                for each in (chosen, restored)]
     assert answers[0].options == answers[1].options
     assert answers[0].probabilities.tolist() == answers[1].probabilities.tolist()
+
+
+
+def test_a_slot_pointer_heads_release_of_labels_written_two_ways_is_refused(tmp_path):
+    """A pointer head (`SlotReadout`) reads one label id a slot: a release of it whose layout writes each
+    label two ways is refused where it is written, as no reader of it could answer (review of row 4484)."""
+    source, _ = slot_release(tmp_path, "head", n_slots=4)
+    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    labels = replace(bundle.layout.labels, variants=("{}", "{}"), names=("B", "A", "C", "D"))
+    chosen = replace(bundle, layout=replace(bundle.layout, labels=labels))
+    with pytest.raises(ValueError):
+        chosen.save(tmp_path / "saved")

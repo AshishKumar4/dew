@@ -45,17 +45,18 @@ def stated_release(directory: Path, layout: Layout | None = None, calibration: C
     replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated).write(directory)
 
 
-def released_decision(directory: Path, layout: Layout, calibration: Calibration, *,
-                      kind: type[Layout] = Layout) -> tuple[Layout, Calibration]:
+def released_decision[L: Layout](directory: Path, layout: L, calibration: Calibration, *,
+                                 kind: type[L]) -> tuple[L, Calibration]:
     """`layout` and `calibration`, the ones a decision format derives of its own files, as the release beside
     them states them over those (`stated_release`), the layout as a `kind` (a Laya head reads rows a
     `QuestionLayout` lays out, the joint head's a `JointLayout`'s)."""
     release = _loaded(directory)
     if release is not None and release.layout is not None:
-        layout = from_record(Layout, release.layout, dtypes=False)
-        if not isinstance(layout, kind):
-            raise ValueError(f"the release in {directory} states a {type(layout).__name__} layout, and its "
+        stated = from_record(Layout, release.layout, dtypes=False)
+        if not isinstance(stated, kind):
+            raise ValueError(f"the release in {directory} states a {type(stated).__name__} layout, and its "
                              f"format reads rows a {kind.__name__} lays out")
+        layout = stated
     if release is not None and release.calibration is not None:
         calibration = from_record(Calibration, release.calibration, dtypes=False)
     return layout, calibration
