@@ -109,13 +109,13 @@ def test_greedy_generation_and_decode_steps_match_the_reference(source):
 
 @pytest.mark.parametrize("param_dtype", ["bfloat16", "auto"])
 def test_a_narrow_storage_load_holds_the_float32_loads_weights_rounded_once(source, param_dtype):
-    """K3 nests its decoder under text_config and reads it whole, as a
-    registered family rather than a media wrapper, so its narrow load's
-    alias check reads it the same way: the MXFP4 experts decode in float32
-    and every leaf is the float32 load's, rounded once to the storage dtype
+    """K3 nests its decoder under text_config, which its language model alone reads whole as its
+    registered family (`text_only`), so its narrow load's alias check reads it the same way: the MXFP4
+    experts decode in float32 and every leaf is the float32 load's, rounded once to the storage dtype
     (bfloat16, the config's own for 'auto')."""
     loaded, _, _ = source
-    narrow = Pretrained.load(TINY, dtype="float32", param_dtype=param_dtype, attention_impl="reference")
+    narrow = Pretrained.load(TINY, dtype="float32", param_dtype=param_dtype, attention_impl="reference",
+                             text_only=True)
     assert jax.tree.structure(narrow.variables) == jax.tree.structure(loaded.variables)
     stored = set()
     for (path, ours), wide in zip(jax.tree_util.tree_leaves_with_path(narrow.variables),

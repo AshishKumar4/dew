@@ -971,9 +971,11 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, fixtur
     save_hf_layout(tensors, config, directory)
     if not same_values:
         with pytest.raises(ValueError):
-            Pretrained.load(directory, param_dtype="bfloat16")
+            Pretrained.load(directory, param_dtype="bfloat16", text_only=True)
     else:
-        loaded = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+        # The language model alone: Kimi K2.5's head and embedding are its decoder's.
+        loaded = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla",
+                                 text_only=True)
         values = loaded.variables["params"]["embed_tokens"]["embedding"]
         assert np.asarray(values).dtype == ml_dtypes.bfloat16
         np.testing.assert_array_equal(values, np.full(shape, decoded).astype(ml_dtypes.bfloat16))

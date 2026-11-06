@@ -25,8 +25,9 @@ from dew.sampling import Sampling, generate
 
 
 def kimi_source(directory: Path) -> tuple[Pretrained, ModelInputs, dict[str, np.ndarray]]:
-    """The fixture loaded in float32, its two rows (one left-padded) and its reference arrays."""
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    """The fixture's decoder loaded in float32, a K3 bundle's language model alone (`text_only`), its two
+    rows (one left-padded) and its reference arrays."""
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=True)
     reference = ieee_fixture(directory / "reference.npz") | ieee_fixture(directory / "numerics.npz")
     inputs = ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
                          {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
@@ -87,7 +88,7 @@ def recorded_dew(directory: Path, leaves: tuple[str, ...]):
             with jax.ensure_compile_time_eval():
                 if "float32" not in loaded:
                     narrow = Pretrained.load(directory, dtype="float32", param_dtype="float32",
-                                             attention_impl="reference")
+                                             attention_impl="reference", text_only=True)
                     loaded["float32"] = narrow.model, narrow.variables
                 model, variables = loaded["float32"]
                 widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, name)
@@ -144,7 +145,7 @@ def exported(source, directory: Path, written: Path) -> tuple[dict, dict, dict, 
     loaded.save(written, variables=variables)
     assert (json.loads((written / "config.json").read_text())
             == json.loads((directory / "config.json").read_text()))
-    restored = Pretrained.load(written, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(written, dtype="float32", attention_impl="reference", text_only=True)
     return (flatten_dict(dict(variables), sep="."), flatten_dict(dict(restored.variables), sep="."),
             load_file(str(written / "model.safetensors")), load_file(str(directory / "model.safetensors")))
 

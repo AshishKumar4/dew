@@ -79,6 +79,33 @@ def decoder(**kwargs):
                              head_dim=4, num_layers=3, mlp_features=16, **kwargs)
 
 
+@pytest.mark.parametrize("padding", ["VALID", "SAME", ((1, 2),), ((0, 0),), "CIRCULAR", "REFLECT", "CAUSAL"],
+                         ids=["valid", "same", "explicit", "explicit-none", "circular", "reflect", "causal"])
+@pytest.mark.parametrize("input_dilation, kernel_dilation, strides",
+                         [(1, 1, 1), (2, 1, 1), (2, 2, 2), (3, 1, 2)],
+                         ids=["plain", "dilated-input", "both-dilated-strided", "wide-input-strided"])
+def test_a_convolutions_counted_geometry_is_the_one_it_computes(padding, input_dilation, kernel_dilation,
+                                                                 strides):
+    """A convolution's analytical output geometry (`Conv.spatial_shape`), which its counted products read
+    (`SpatialCount.project`), is the one it computes over four positions, under every padding, its input
+    dilated or not (row 4399: a kernel of 3 over an input dilated by 2 and padded by none computes 5
+    positions, where the geometry counted 2); where it computes none, an input dilated and padded by a
+    rule's name (lax pads a dilated input by stated amounts alone), the geometry refuses it too."""
+    from dew.nn.conv import Conv
+
+    conv = Conv(features=2, kernel_size=(3,), strides=(strides,), padding=padding,
+                input_dilation=(input_dilation,), kernel_dilation=(kernel_dilation,))
+    x = jnp.zeros((1, 4, 1))
+    if input_dilation != 1 and isinstance(padding, str):
+        with pytest.raises(ValueError):
+            jax.eval_shape(lambda: conv.init_with_output(jax.random.key(0), x)[0])
+        with pytest.raises(ValueError):
+            conv.spatial_shape(x.shape[1:])
+        return
+    computed = jax.eval_shape(lambda: conv.init_with_output(jax.random.key(0), x)[0]).shape
+    assert conv.spatial_shape(x.shape[1:]) == computed[1:]
+
+
 def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
     """A traced count is two FLOPs a multiply-add of each product and convolution the program runs: a batched
     matrix product's, a strided convolution's of its output's elements by its kernel's taps and inputs, a
