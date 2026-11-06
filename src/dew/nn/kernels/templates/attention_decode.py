@@ -37,7 +37,6 @@ from dew.nn.kernels.templates.attention import (
     prescale,
     ungrouped_rows,
 )
-from dew.nn.kernels.templates.attention_mosaic_program import bundle_of
 
 
 def packable(hooks: Hooks | None) -> bool:
@@ -139,10 +138,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     programs = query.shape[0] * query.shape[2] * tiles
     if programs >= processors:
         return Plan(config, 1)
-    family = bundle_of(config, query.dtype)
-    resident = family.programs(config.consumers, op.registers(ba, config))
-    if target.shared_limit:
-        resident = min(resident, max(1, target.shared_limit // op.staged_bytes(ba, config, target)))
+    resident = op.resident(ba, config, target)
     longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
     # The most slices whose programs the device holds at once, none past it: one program past them waits a
     # whole walk for a slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a

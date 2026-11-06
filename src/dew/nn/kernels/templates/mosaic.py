@@ -1786,16 +1786,6 @@ class Transport[Allocated, Opened](abc.ABC):
         interpreted, where the programs' order stands in for them (`tail.ordered`)."""
         raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
 
-    def signalled(self, ready) -> None:
-        """The program's writes before it released to every program that awaits `ready` (one of
-        `partials_ready`'s semaphores; None interpreted, a no-op): a GPU-scope release."""
-        raise NotImplementedError(f"{self.name} signals no program (`fixes_up`)")
-
-    def awaited(self, ready) -> None:
-        """`ready`'s signal acquired (`signalled`), the signalling program's writes visible to this one's
-        reads after it; None interpreted, a no-op."""
-        raise NotImplementedError(f"{self.name} awaits no program (`fixes_up`)")
-
     def fixed_up(self, summed, partials, ready, program, start, gathered, store,
                  combine=operator.add) -> None:
         """A balanced tail's consumer's share of a tile (`tail.Tail`), `summed` from its program's steps:
@@ -2150,29 +2140,22 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def partials_ready(self, shape: tuple[int, ...], interpret: bool):
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
 
-    def signalled(self, ready) -> None:
-        # GPU-scope signals and waits, proven to lower and run on an H100 at the pinned JAX: TGHYBRID1-h100's
-        # SASS releases each partial with MEMBAR.GPU and a strong global add, and acquires it with a strong
-        # CAS.
-        if ready is not None:
-            plgpu.semaphore_signal(ready, memory_scope="gpu")
-
-    def awaited(self, ready) -> None:
-        if ready is not None:
-            plgpu.semaphore_wait(ready, memory_scope="gpu")
-
     def fixed_up(self, summed, partials, ready, program, start, gathered, store,
                  combine=operator.add) -> None:
-        # Interpreted, the partials are left before they are read (`tail.ordered`).
+        # GPU-scope signals and waits, proven to lower and run on an H100 at the pinned JAX: TGHYBRID1-h100's
+        # SASS releases each partial with MEMBAR.GPU and a strong global add, and acquires it with a strong
+        # CAS. Interpreted, the partials are left before they are read (`tail.ordered`).
         @pl.when(start > 0)
         def _():
             jax.tree.map(lambda leaf, ref: ref.__setitem__(program, leaf), summed, partials)
-            self.signalled(None if ready is None else ready.at[program])
+            if ready is not None:
+                plgpu.semaphore_signal(ready.at[program], memory_scope="gpu")
 
         @pl.when(start == 0)
         def _():
             def added(other, running):
-                self.awaited(None if ready is None else ready.at[other])
+                if ready is not None:
+                    plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
                 # The partials' structure read off the running value's: a ref may itself be a tree.
                 return combine(running, jax.tree.map(lambda _, ref: ref[other], running, partials))
 
