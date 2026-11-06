@@ -90,9 +90,10 @@ family without one (mma.sync's, until its thin mainloop) takes another mainloop 
 
 def values_deferred(family: mosaic.Family, form: str, splits: int, dtype, dropped: bool) -> bool:
     """Whether a forward's plain walk issues each tile's P·V a step late
-    (`attention_mosaic_forward._consumer`): FlashAttention 3's overlap within a consumer, its next `Q Kᵀ`
-    and the step before's P·V in flight together and its softmax under the P·V
-    (hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp's `fwd_step`), the weights carried a step in registers.
+    (`attention_mosaic_forward._consumer`): half of FlashAttention 3's overlap within a consumer, its next
+    `Q Kᵀ` and the step before's P·V in flight together (hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp's
+    `fwd_step`), the weights carried a step in registers; its softmax under the P·V, the other half, waits
+    on weights in registers the running P·V does not read.
     Where its family's products run asynchronously (`Issuer.products_overlap`) over a producer's loads (a
     loading consumer would wait on its own late release, `Transport.feeds_itself`), every program walks a key
     tile (a full or causal call's whole launch: no spans, no splits), and a tile's weights are one bf16
