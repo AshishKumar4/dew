@@ -1470,13 +1470,19 @@ TRUNK_ROUTES = Table(
 """The decoder's tensors outside its layers, and its routers' state."""
 
 
-LAYER_ROUTES = Table(
-    # Qwen3.5's delta net, the block's mixer, lands where self_attn does: a linear layer's before a
-    # hyper-connected one's Kimi Delta Attention, whose leaves share its names (Qwen4-Exp holds both).
+DELTA_NET_ROUTES = (
     in_layer('linear_attn.{projection}.weight', 'self_attn/{projection}/kernel',
              {'projection': one_of(*_LINEAR_PROJECTIONS)}, _linear_layer),
     *(in_layer('linear_attn.' + '.'.join(leaf), 'self_attn/' + '/'.join(leaf), when=_linear_layer)
       for leaf in sorted(_LINEAR_LEAVES)),
+)
+"""Qwen3.5's delta net, the block's mixer on a linear layer, under its own names, landing where self_attn
+does. A hyper-connected layer's Kimi Delta Attention holds leaves of the same names under self_attn's, which
+the shared table writes; a family whose hyper-connected layers hold a delta net instead (Qwen4-Exp) names
+these first."""
+
+
+LAYER_ROUTES = Table(
     # V4's stream mappings and its hyper-connected layers' attention leaves.
     in_layer('hc_{site}_{part}', '{site}_hc/{part}', {'site': one_of('attn', 'ffn'), 'part': one_of(*_V4_HC)},
              _hyper),
@@ -1513,6 +1519,8 @@ LAYER_ROUTES = Table(
              {'projection': one_of(*MOE_SHARED)}),
     in_layer('mlp.shared_experts.{projection}.weight', 'mlp/shared_experts/{projection}/kernel',
              {'projection': one_of(*MOE_SHARED)}),
+    # Qwen3.5's delta net, the block's mixer, lands where self_attn does.
+    *DELTA_NET_ROUTES,
     *(in_layer(f'{module}.weight', f'{module}/{leaf}') for module, leaf in _PER_LAYER_INPUTS.items()),
     *(route for theirs, ours in _PRE_NORMS.items()
       for route in (in_layer(f'{theirs}.weight', f'{ours}/scale', when=_plain),
