@@ -278,14 +278,14 @@ def shared(python: str) -> str:
     or a top-level package that shadows another), and of every data file under tests/ but its fixtures and
     under src/ (an existence probe before the recorder starts). A module within a package under src/ is its
     importers' input alone, with its package's other modules (`inputs`), a helper module under tests/ the
-    input of each run that imported a module of its name (followed.py's `IMPORTED`), a test module no other
+    input of each run that imported a module of its name (followed.py's `shadowing`), a test module no other
     file's, and a fixture is its openers', listers' and probers' (executed.py's `Opens`,
     followed.py's `PROBES`): so a train that loses a head runs again only what that head's files reached
     (owner, 2026-10-27: 8 fixtures changed reran all 485 tasks of train 222's second round)."""
     digest = hashlib.sha256(python.encode())
     # A conftest.py, which pytest loads by its path for every test beside and below it, and a package's
     # __init__.py; a helper module is the input of each run that imported a module of its name, which it
-    # would shadow (followed.py's `IMPORTED`, `contents`), so a helper of a new name reruns no file
+    # would shadow (followed.py's `shadowing`, `looked_up`), so a helper of a new name reruns no file
     # (owner, 2026-10-29: train 315's one new helper under tests/ reran all 2490 tasks).
     for path in sorted(Path("tests").rglob("*.py")):
         if "__pycache__" not in path.parts and path.name in ("conftest.py", "__init__.py"):
@@ -355,12 +355,6 @@ def contents(name: str) -> bytes:
         if not Path(path).is_file():
             return b"missing"
         return code_of(path) if executed == followed.WHOLE else unit(path, executed)
-    if name.startswith("import:"):
-        # A top-level module a run imported (followed.py's `IMPORTED`): whether a helper under tests/, which
-        # leads sys.path, would shadow it, a module or a package of that name.
-        module = name.removeprefix("import:")
-        return b"".join(b"1" if path.exists() else b"0"
-                        for path in (Path("tests", f"{module}.py"), Path("tests", module, "__init__.py")))
     path = Path(name)
     manifest = path.parent / (path.name + FETCHED)
     if path.name and manifest.is_file():
@@ -484,8 +478,10 @@ def lookups(path: str) -> tuple[str, ...]:
         return ()
     module = Path(path)
     found = module.parent if module.name == "__init__.py" else module.with_suffix("")
+    # src/'s own entries every key covers (`shared`); tools' own lookup, a namespace package's at the root, a
+    # row keys (train 672's review: a tools/__init__.py added re-keyed none of its 69 importers' rows).
     return tuple(f"{followed.LOOKUP}{step}" for step in (found, *found.parents)
-                 if len(step.parts) > 1 and step.parts[0] in ("src", "tools"))
+                 if step.parts and step.parts[0] in ("src", "tools") and step != Path("src"))
 
 
 @functools.cache

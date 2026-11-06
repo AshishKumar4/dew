@@ -1850,6 +1850,44 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
         assert run() == runs, path
 
 
+def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whose_imports_it_changes(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """tools/ is a namespace package, which a test imports from (`from tools import x`): an __init__.py added
+    to it, which runs on every such import and makes it a regular package, reruns each row that imported
+    from it, and its removal again (train 672's review: no row's key held tools' own lookup); a helper
+    under tests/ of a module's name, which shadows it as tests/ leads sys.path, reruns each row that imported
+    that name, and one of another name reruns none."""
+    (tmp_path / "tools").mkdir(exist_ok=True)
+    (tmp_path / "tools/helper.py").write_text("def value(): return 1\n")
+    written(tmp_path, {
+        "test_tooled.py": "import sys\nsys.path.insert(0, '.')\n\n\ndef test_tooled():\n"
+                          "    from tools.helper import value\n"
+                          "    import json\n"
+                          "    with open('runs', 'a') as runs: runs.write('x')\n"
+                          "    assert value() and json.dumps(1)\n"})
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    out = tmp_path / "verdict.json"
+
+    def run() -> int:
+        ci.task("3.12", ["tests/test_tooled.py"], "", out, 600.0)
+        assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0]
+        return len((tmp_path / "runs").read_text())
+
+    assert run() == 1
+    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 3),
+                               ("tests/unrelated_helper.py", "VALUE = 1\n", 3),
+                               ("tests/json.py", "def dumps(value): return str(value)\n", 4)):
+        if source is None:
+            (tmp_path / path).unlink()
+        else:
+            (tmp_path / path).write_text(source)
+        assert run() == runs, path
+        assert run() == runs, path
+
+
 def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
     """`ci.py gangs` reads the models from test_multihost.py: each gang's -k selects a part of the
     file's collected cases, the parts are disjoint and cover every case, and a model added to
