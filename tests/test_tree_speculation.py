@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import checkify
 from model_support import decoder
 from reference_error import as_given, assert_as_exact, widened
 
@@ -104,7 +105,6 @@ def _tree_generated(model, params, prompts, budget: int, sampling, shape: TreeSh
     ops = decode_ops(model, params, 0, 0)
     ops = dataclasses.replace(ops, draft_tree=drafting(ops))
 
-    @jax.jit
     def run(prompts, key):
         state, real = prefill_state(model, params, ModelInputs(prompts), ops)
         rows, width = prompts.shape
@@ -115,7 +115,10 @@ def _tree_generated(model, params, prompts, budget: int, sampling, shape: TreeSh
                           prompt_width=width, budget=jnp.full(rows, budget, jnp.int32))
         return strategy(state, start, ops, decoding.chain(transforms), decoding.finish(stopping), budget, 1)
 
-    return run(jnp.asarray(prompts), key)
+    # Its device checks discharged into a returned error, as `generate` discharges them.
+    error, drawn = jax.jit(checkify.checkify(run, errors=checkify.user_checks))(jnp.asarray(prompts), key)
+    error.throw()
+    return drawn
 
 
 def _ranked(ranks):
