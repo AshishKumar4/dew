@@ -139,6 +139,62 @@ def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mat
     np.testing.assert_array_equal(first(restored, ids), first(loaded, ids))
 
 
+def test_a_qwen35_wrapper_written_from_the_model_alone_is_its_release(tmp_path):
+    """A Qwen3.5 wrapper written from the model alone (`PretrainedDecoder.from_model`: a trained task's or a
+    scratch one, which holds no source config; row 4525) is its release: every tensor the release stores,
+    under its name, byte for byte, beside a config of its own (its text_config, its vision_config, the
+    placeholder ids its processor marks), which Dew reads back to the model, its tree and its logits, and
+    which transformers' Qwen3_5ForConditionalGeneration reads to the release's logits, bit for bit, over
+    prompts with an image each."""
+    import torch
+    from interop_support import assert_reloads, assert_same_stored_tensors
+    from PIL import Image
+    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+
+    from dew.interop import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
+    from dew.interop.sources import load_shards
+
+    source = FIXTURES / "qwen38-dense-tiny"
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    exported = tmp_path / "export"
+    PretrainedDecoder.from_model(loaded.model, loaded.variables, processor=loaded.processor).save(exported)
+    assert_same_stored_tensors(load_shards(exported), load_shards(source))
+    written, released = (json.loads((directory / "config.json").read_text())
+                         for directory in (exported, source))
+    assert {name: written[name] for name in ("model_type", "image_token_id", "video_token_id")} == {
+        name: released[name] for name in ("model_type", "image_token_id", "video_token_id")}
+    ids = np.random.default_rng(0).integers(0, loaded.model.language_model.vocab_size, (2, 8), np.int32)
+    assert_reloads(loaded, exported, ids)
+    processor = AutoProcessor.from_pretrained(source)
+    pictures = [Image.fromarray(array) for array in np.load(source / "images.npy")]
+    inputs = processor(text=json.loads((source / "prompts.json").read_text()), images=pictures,
+                       return_tensors="pt", padding=True)
+
+    def logits(directory):
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(directory, dtype=torch.float32,
+                                                                attn_implementation="eager").eval()
+        with torch.no_grad():
+            return model(**inputs).logits.numpy()
+
+    np.testing.assert_array_equal(logits(exported), logits(source))
+
+
+def test_a_qwen35_wrapper_holding_cross_attention_is_written_as_no_release():
+    """A Qwen3.5 wrapper whose layers hold cross-attention is no release's layout (`wrapper_writes`), so its
+    run's export is the run's native release (`source_publishes`), as a decoder's with them is; the wrapper
+    without them is its release's."""
+    from dew.interop import Pretrained
+    from dew.interop.pretrained import wrapper_writes
+    from dew.nn.cross_attention import CrossAttention
+
+    loaded = Pretrained.load(FIXTURES / "qwen38-dense-tiny", dtype="float32", attention_impl="reference")
+    crossed = loaded.model.with_cross_attention(CrossAttention(layer_ids=(3,), context_length=3,
+                                                               context_features=8))
+    assert wrapper_writes(loaded.model)
+    assert not wrapper_writes(crossed)
+
+
 def load_wrapper(name):
     directory = FIXTURES / name
     record = translate_wrapper_config(
