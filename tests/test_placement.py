@@ -145,7 +145,7 @@ def parity_arms(name: str):
     return sharded, alone, jax.jit(functools.partial(_lm_loss, wide)), draw
 
 
-PARITY_SEEDS = {"causal_transformer": 16, "causal_transformer+moe": 16}
+PARITY_SEEDS = {"causal_transformer": 32, "causal_transformer+moe": 64}
 """Each trained case's seeds, as `seeds_for` sized them on its paired arms."""
 
 
