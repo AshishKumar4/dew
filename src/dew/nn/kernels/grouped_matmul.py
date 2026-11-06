@@ -1167,7 +1167,7 @@ class MosaicTgmm(_Mosaic):
         steps = -(-tokens.shape[0] // tile.block_k)
         return mosaic_gpu.balanced_tail(tile, (depth // tile.block_m, width // tile.block_n), steps,
                                         (tokens.dtype.itemsize, cotangent.dtype.itemsize), target,
-                                        _multiprocessors(target)) is not None
+                                        _multiprocessors(target) * tile.programs) is not None
 
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
         depth, _, width = self._generated_extents(ba)

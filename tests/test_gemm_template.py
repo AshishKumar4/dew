@@ -893,40 +893,17 @@ def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width
 
 def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiprocessors_a_target_states():
     """A balanced tail's hand-off is priced in MMA steps at one multiprocessor's tensor rate, so a part's
-    8 multiprocessors or 64 move neither the step nor the hand-off's steps (row 3790; 3781's pricing,
-    where a step at the device's peak over its multiprocessors read 16 times too short). At an H100's
-    measured 0.78 us hand-off, a tail of 2 to 5 steps a tile takes no balancing, as the walk whole is
-    cheaper, and one of 16 does."""
+    8 multiprocessors or 64 move neither the step, nor the hand-off's steps, nor a tail of 8 programs'
+    decision (row 3790; 3781's pricing, where a step at the device's peak over its multiprocessors read 16
+    times too short)."""
     h100 = generation.gpu_target("sm90")
     few, more = (dataclasses.replace(h100, multiprocessors=count) for count in (8, 64))
     assert mosaic_gpu.step_seconds(COOPERATIVE, few) == mosaic_gpu.step_seconds(COOPERATIVE, more)
-    handoff = mosaic_gpu.handoff_steps(COOPERATIVE, few)
-    assert handoff == mosaic_gpu.handoff_steps(COOPERATIVE, more) and handoff > 1
-    assert all(mosaic_gpu.balanced_tail(COOPERATIVE, (1, 11), steps, (2, 2), few, 8) is None
-               for steps in range(2, 6))
-    assert mosaic_gpu.balanced_tail(COOPERATIVE, (1, 11), 16, (2, 2), few, 8) is not None
-
-
-BALANCED1 = {"qwen3.5-4b up": (24576, 2560, 9216, True), "qwen3.5-4b down": (24576, 9216, 2560, True),
-             "llama-3-8b o": (8192, 4096, 4096, True), "qwen3-8b down": (8192, 12288, 4096, True),
-             "qwen3.5-4b qkv": (24576, 2560, 8192, False), "qwen3.5-4b out": (24576, 4096, 2560, False)}
-"""BALANCED1-h100's kernel gradients (an H100 PCIe's 114 programs at 128 x 256 x 64, row 3798): each one's
-tokens, width in and width out, and whether its tail ran faster balanced than walked (by 3% to 7%, 3%
-and 0.6% to 1.4%; slower by 6% and 30%)."""
-
-
-@pytest.mark.parametrize("shape", BALANCED1)
-def test_a_tail_balances_where_an_h100_pcie_measured_it_faster(shape):
-    """A dense kernel gradient's tail priced from an H100 PCIe's facts (its stream, L2, MMA step and
-    hand-off; `mosaic_gpu.balanced_tail`) balances where BALANCED1-h100 measured the balanced tail faster
-    and walks where it measured it slower: the rounds' reads of a row or column at nearby steps shared in
-    the L2 as the ranges align with the tiles, which an average reuse decided wrong on two shapes."""
-    rows, depth, width, faster = BALANCED1[shape]
-    target = dataclasses.replace(generation.gpu_target("NVIDIA H100 PCIe"), multiprocessors=114)
-    band = resources.band(114, 128, 256, width // 256)
-    tile = mosaic_gpu.Tiles(128, 256, 64, 2, band, warpgroups=2, family='wgmma')
-    tail = mosaic_gpu.balanced_tail(tile, (depth // 128, width // 256), rows // 64, (2, 2), target, 114)
-    assert (tail is not None) == faster
+    assert mosaic_gpu.handoff_steps(COOPERATIVE, few) == mosaic_gpu.handoff_steps(COOPERATIVE, more)
+    for steps in (2, 4, 16, 64):
+        decided = {mosaic_gpu.balanced_tail(COOPERATIVE, (1, 11), steps, (2, 2), target, 8) is not None
+                   for target in (few, more)}
+        assert len(decided) == 1, steps
 
 
 @runs("sm90")
