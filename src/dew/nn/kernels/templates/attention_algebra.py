@@ -1832,7 +1832,7 @@ def value_parts(weights: jax.Array, dtype) -> Parts:
 
 
 def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first: bool = False,
-               held: bool = False, raw: float | None = None) -> jax.Array:
+               held: bool = False, raw: float | None = None, guarded: bool = True) -> jax.Array:
     """Attention's math on a template's formed tiles, whole (theme A's declaration, `declaration`): each
     query's softmax over its `logits` (scaled, in the exponent's base, -inf at each key it does not see, as
     `modify` forms them; `[rows, keys]`, or `[keys, rows]` where the tile holds its keys first, a decode
@@ -1843,7 +1843,9 @@ def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first:
     element, and the anchor grows with the walk (a walked correction `exp(k_carried - k_now)` at most 1). The
     accurate form's (`declaration`'s `natural`) holds its largest's weight to 1 (`held`, `weights`), or, over
     raw products (`Forward.raw`), scales each difference by their `raw` scale after the subtraction, its
-    exponential the one its declaration names."""
+    exponential the one its declaration names. A query's total held from 0 where one may see no key
+    (`guarded`: `Forward.guarded`, a state from an initial one), its weighted sums over it plainly elsewhere,
+    as the hand finish divides (`output_of`)."""
     exponent = jnp.exp2 if base2 else jnp.exp
     keys_axis = 0 if keys_first else 1
     m = jnp.max(logits, axis=keys_axis)
@@ -1854,14 +1856,14 @@ def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first:
         difference = difference * np.float32(raw)
     p = exponent(jnp.where(logits < anchor, difference, 0.0) if held else difference)
     total = jnp.sum(p, axis=keys_axis)
-    over = jnp.where(total == 0, 1.0, total)
+    over = jnp.where(total == 0, 1.0, total) if guarded else total
     subscripts, per_query = ("kq,kd->dq", over[None, :]) if keys_first else ("qk,kd->qd", over[:, None])
     summed = float32_einsum(subscripts, p.astype(values.dtype), values, preferred_element_type=jnp.float32)
     return summed / per_query
 
 
 def declaration(*, base2: bool, keys_first: bool = False, factor: float | None = None, natural: bool = False,
-                raw: float | None = None):
+                raw: float | None = None, guarded: bool = True):
     """Attention's forward as theme A's declaration (`dew.algebra.derive.Reduction`): `softmax_of` over the
     template's formed tiles, walked along the keys, its exponent the base the template folds (`folds`: 2
     where it folds `log2(e)` into its logits), its tile keys first where the mainloop holds it so; over the
@@ -1875,13 +1877,14 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
     (`natural_carried`, its exponent compensated), which the derivation evaluates as they are and rewrites
     none: over scaled logits its largest weight held to 1 (`softmax_of`'s `held`), over raw products
     (`Forward.raw`) each difference scaled by their `raw` scale, which the exponential carries and the
-    rescale compensates."""
+    rescale compensates. Its total is held from 0 where a query may see no key (`guarded`, `softmax_of`).
+    """
     tile = ("keys", "rows") if keys_first else ("rows", "keys")
 
     def walked(logits, values):
         scaled = logits if factor is None else logits * np.float32(factor)
         return softmax_of(scaled, values, base2=base2, keys_first=keys_first, held=natural and raw is None,
-                          raw=raw)
+                          raw=raw, guarded=guarded)
 
     if natural:
         stated = {"exponential": natural_exp,
@@ -1898,23 +1901,26 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
 
 @functools.cache
 def derived_forms(base2: bool, keys_first: bool = False, factor: float | None = None, natural: bool = False,
-                  raw: float | None = None) -> derive.Derived:
+                  raw: float | None = None, guarded: bool = True) -> derive.Derived:
     """The forward's derived forms (`declaration`'s), the template's behind the switch
     (`dew.algebra.forms.derived`): `plain_step`, `merge` and `finish` take them in place of their own; a
     step over raw products, their `factor` (`declaration`). The fast form's are the fast class's; the
     accurate form's (`natural`) the accurate class's, which admits no reordering past the error-free rules."""
     from dew.algebra import SATURATION
-    declared = declaration(base2=base2, keys_first=keys_first, factor=factor, natural=natural, raw=raw)
+    declared = declaration(base2=base2, keys_first=keys_first, factor=factor, natural=natural, raw=raw,
+                           guarded=guarded)
     return derive.derive(declared, accurate=natural, saturation=SATURATION)
 
 
 def _form_key(spec: Forward) -> tuple:
     """The derived forms' key's part past the fold and the products' factor (`derived_forms`): the accurate
     form's natural and a raw product's scale (`Forward.raw`), a raw fold's the factor its difference takes
-    (`Forward.subtracted`), the fast form's none."""
+    (`Forward.subtracted`), the fast form's none; and whether a query may see no key (`Forward.guarded`, or a
+    state from an initial one), whose finish holds its total from 0, as the hand finish's (`finish`)."""
+    guarded = spec.guarded or spec.initial
     if spec.natural:
-        return (True, spec.scale if spec.raw else None)
-    return (False, float(np.float32(spec.scale * LOG2E))) if spec.raw else ()
+        return (True, spec.scale if spec.raw else None, guarded)
+    return (False, float(np.float32(spec.scale * LOG2E)) if spec.raw else None, guarded)
 
 
 def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
