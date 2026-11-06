@@ -41,10 +41,6 @@
    "comparisons": 5,
    "lane": "Training"
   },
-  "tests/test_attention_algebra.py": {
-   "comparisons": 2,
-   "lane": "Kernels"
-  },
   "tests/test_attention_masked_rows.py": {
    "comparisons": 1,
    "lane": "Kernels"
@@ -55,10 +51,6 @@
   },
   "tests/test_attention_splash.py": {
    "comparisons": 3,
-   "lane": "Kernels"
-  },
-  "tests/test_attention_stability.py": {
-   "comparisons": 1,
    "lane": "Kernels"
   },
   "tests/test_audio.py": {
@@ -158,7 +150,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decode_attention.py": {
-   "comparisons": 9,
+   "comparisons": 1,
    "lane": "Kernels"
   },
   "tests/test_decode_cache.py": {
@@ -170,7 +162,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoding_components.py": {
-   "comparisons": 6,
+   "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_decoding_strategies.py": {
@@ -293,17 +285,9 @@
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_gguf.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_gpt_oss.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_grouped_gemm.py": {
-   "comparisons": 3,
-   "lane": "Kernels"
   },
   "tests/test_grpo.py": {
    "comparisons": 2,
@@ -330,11 +314,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 18,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_hf_modernbert.py": {
-   "comparisons": 1,
+   "comparisons": 17,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_qwen35_moe_wrapper.py": {
@@ -350,7 +330,7 @@
    "lane": "Training"
   },
   "tests/test_inference.py": {
-   "comparisons": 11,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_inference_media.py": {
@@ -382,7 +362,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kernels.py": {
-   "comparisons": 24,
+   "comparisons": 8,
    "lane": "Kernels"
   },
   "tests/test_kimi_k3.py": {
@@ -514,7 +494,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_norm_swiglu.py": {
-   "comparisons": 8,
+   "comparisons": 6,
    "lane": "Kernels"
   },
   "tests/test_ollama_interop.py": {
@@ -577,10 +557,6 @@
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_quantization_sites.py": {
-   "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_quantized.py": {
    "comparisons": 4,
    "lane": "Models, Serving & RL"
@@ -607,14 +583,6 @@
   },
   "tests/test_reference_runs.py": {
    "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_reference_trees.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_released_checkpoints.py": {
-   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_reporting.py": {
@@ -739,10 +707,6 @@
   },
   "tests/test_vision.py": {
    "comparisons": 21,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_vllm_interop.py": {
-   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_source.py": {

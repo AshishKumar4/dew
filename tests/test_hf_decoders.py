@@ -122,7 +122,6 @@ from interop_support import (
     transformers_model,
 )
 from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, declared_seeds, recording
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -268,34 +267,35 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
         reloaded = np.asarray(again.model.apply(again.variables, ids))
         np.testing.assert_array_equal(reloaded, ours)
 
+ACCURATE_SEEDS = 8
+"""The accurate-policy site's declared check-1 seeds, sized by `seeds_for` paired on a GPU."""
+
+
 def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu():
     """A float32 decoder under a run's ACCURATE precision policy (`generation.run_precision`, ledger
     2500) multiplies every product that states no precision in IEEE float32: its logits on a GPU are as
     exact as transformers' float32 ones, both from transformers' float64 ones, JAX's own default (TF32
     there, as JAX documents) cleared first. The policy sets the products' precision; the decoder's
-    float32 dtype keeps their operands float32."""
-    import contextlib
-
-    import torch
+    float32 dtype keeps their operands float32. Check 1 over drawn ids of the fixture's shape."""
+    from interop_support import token_draw, torch_logits
     from transformers import AutoModelForCausalLM
 
+    from dew.nn.kernels import generation
+    from dew.nn.precision import ACCURATE
     from tools.torch_precision import float64
 
     directory = FIXTURES / "qwen3-tiny"
     ids = np.load(directory / "input_ids.npy")
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
-    from dew.nn.kernels import generation
-    from dew.nn.precision import ACCURATE
-
     with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
-        ours = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, jnp.asarray(ids)), np.float64)
-
-    def theirs(dtype):
-        with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
-            model = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager")
-            return model.to(dtype).eval()(torch.from_numpy(ids).long()).logits.double().numpy()
-
-    assert_as_exact_as_the_reference(ours, theirs(torch.float32), theirs(torch.float64), "float32 logits")
+        forward = jax.jit(loaded.model.apply).trace(loaded.variables, jnp.asarray(ids)).lower().compile()
+    reference = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").eval()
+    with float64():
+        wide = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").double().eval()
+    # Compiled once under the policy, as a run under it compiles: the gate runs it as given.
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64)),
+                    torch_logits(reference), token_draw(0x0A3, reference.config.vocab_size, ids.shape),
+                    "float32 logits", seeds=ACCURATE_SEEDS, truth_fn=torch_logits(wide, float64))
 
 
 @pytest.mark.parametrize(("name", "stale"), [

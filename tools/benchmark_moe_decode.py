@@ -44,8 +44,8 @@ def routings(tokens: int, experts: int, top_k: int, seed: int) -> list[np.ndarra
 
 
 def timed(fn, arguments: list[tuple]) -> list[float]:
-    """Each call's device seconds (CUPTI, its kernels alone), one call an argument tuple, after one warm
-    call of each."""
+    """Each call's device seconds (CUPTI, its kernels alone), one call an argument tuple, warm: after one
+    call of each, and the untimed run CUPTI's reading makes of it (`dew.telemetry.benchmark.DeviceTime`)."""
     for args in arguments:
         jax.block_until_ready(fn(*args))
     with device_time() as device:

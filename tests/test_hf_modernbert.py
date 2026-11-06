@@ -6,7 +6,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_ids, transformers_arms, transformers_model
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact
 
 from dew.batch import field_coordinates
@@ -79,12 +78,22 @@ def test_modernbert_states_match_the_encoder_through_every_window_path(implement
                     seeds=STATES_SEEDS[implementation], truth_fn=truth)
 
 
+BF16_SEEDS = 8
+"""The bf16 states' declared draws of ids on a GPU's kernels (check 1), sized by `seeds_for` paired there."""
+
+
 def modernbert_states_in_bf16_on_the_gpu_kernels(without_deterministic_ops):
     """'auto' runs the global layers on cuDNN and keeps the local layers'
-    two-sided window off it, which cuDNN refuses; the bf16 states are held to
-    the reference's own bf16 run."""
+    two-sided window off it, which cuDNN refuses; the bf16 states are on par
+    with ModernBertModel's own bf16 run over drawn ids (check 1), from the
+    float64 twin of its float32 load."""
     loaded = Pretrained.load(DIRECTORY, dtype='bfloat16', attention_impl='auto')
-    states = loaded.model.apply(loaded.variables, _fixture('input_ids'),
-                                method=CausalTransformer.hidden_states)
-    assert_as_exact_as_the_reference(np.asarray(states, np.float32), _fixture('hidden_bf16'),
-                                     _fixture('hidden_f64'), 'ModernBERT bf16 states')
+    reference, truth = transformers_arms(
+        transformers_model(DIRECTORY, masked=True, dtype='bfloat16'),
+        lambda model, ids: model.model(ids).last_hidden_state,
+        source=transformers_model(DIRECTORY, masked=True))
+    def states(ids):
+        return loaded.model.apply(loaded.variables, ids, method=CausalTransformer.hidden_states)
+
+    assert_as_exact(lambda ids: states(ids).astype(jnp.float32), reference, fixture_ids(DIRECTORY),
+                    'ModernBERT bf16 states', seeds=BF16_SEEDS, truth_fn=truth)

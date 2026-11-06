@@ -19,6 +19,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import STUB_TEXT
+from reference_error import assert_computes_the_oracle
 from steady_state import steady_state
 
 import dew
@@ -141,12 +142,14 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
     every level's centre, every tie between two levels, the float32
     neighbours either side of each, and values past the range (both round
     half to even in float32, so both miss exact rounding on the same 191
-    near-tie inputs). `unit_range` holds the float64 rule against
-    `pil_to_numpy`'s division and `normalize` over all 256 bytes (3.7e-8
-    against 2.7e-8 rms)."""
+    near-tie inputs). `unit_range` is every byte's value in [-1, 1]
+    correctly rounded, one IEEE division of an exact difference (`divided`),
+    where `pil_to_numpy`'s division and `normalize` round twice."""
+    from fractions import Fraction
+
     import torch
     from diffusers.image_processor import VaeImageProcessor
-    from one_draw import assert_as_exact_as_the_reference
+    from op_certificates import FLOAT32, fraction_rounded
 
     processor = VaeImageProcessor()
     levels = np.arange(256, dtype=np.float64)
@@ -160,8 +163,12 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
     np.testing.assert_array_equal(ours, theirs)
 
     data = np.arange(256, dtype=np.uint8)
-    normalized = processor.normalize(torch.from_numpy(data.astype(np.float32) / 255.0)).numpy()
-    assert_as_exact_as_the_reference(np.asarray(unit_range(data)), normalized, data / 127.5 - 1, "unit_range")
+    exact = [Fraction(2 * int(byte) - 255, 255) for byte in data]
+    rounded = np.asarray([fraction_rounded(value, FLOAT32) for value in exact], np.float32)
+    np.testing.assert_array_equal(np.asarray(unit_range(data)), rounded)
+    # Diffusers' map is the same function: its float64 run within float64's rounding of the exact values.
+    normalized = processor.normalize(torch.from_numpy(data.astype(np.float64) / 255.0)).numpy()
+    assert_computes_the_oracle(normalized, np.asarray(list(map(float, exact))), "normalize", roundings=3)
 
     padded = np.concatenate([pixels, pixels, np.full_like(pixels, -1)], axis=0)
     pictures = Images(jnp.asarray(padded), rows=2).pil()
@@ -664,6 +671,12 @@ def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
         np.testing.assert_array_equal(there.tokens, here.tokens, err_msg=str(spec))
 
 
+LAYOUT_SEEDS = 128
+"""The layout sites' declared seeds, sized by `seeds_for` paired with each layout's draw on armada's CPUs:
+128 for every layout (fsdp-stage's on two machines, the others' on one), a sizing that took 17 to 55 s of
+each case's run when the case sized itself (row 4341)."""
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("spec", [{"sequence": 2}, {"fsdp": 2, "stage": 2}, {"tensor": 2, "sequence": 2}],
                          ids=["sequence", "fsdp-stage", "tensor-sequence"])
@@ -672,7 +685,7 @@ def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path,
     and their products, draws what it draws on one device, on par with that draw against its float64
     twin (check 1); a server on the layout serves what a call draws (ledger 1817)."""
     from arm_arithmetic import widened
-    from reference_error import as_given, assert_as_exact, seeds_for
+    from reference_error import as_given, assert_as_exact
 
     from dew.inference import Server
     from dew.sampling import Sampling
@@ -708,10 +721,10 @@ def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path,
         return tuple(ticket.result().host().raw_log_probs for ticket in tickets)
 
     label = f"sampled on {spec}"
-    count = seeds_for(drawn(alone), draw, label, truth_fn=drawn(wide, "float64"), dew_fn=drawn(placed))
-    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=LAYOUT_SEEDS,
+                    truth_fn=drawn(wide, "float64"))
     server = Server.from_task(dataclasses.replace(placed, sampling=sampling), slots=2, capacity=16)
-    assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=drawn(wide, "float64"))
+    assert_as_exact(served, drawn(alone), draw, label, seeds=LAYOUT_SEEDS, truth_fn=drawn(wide, "float64"))
 
 
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):

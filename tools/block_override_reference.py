@@ -4,7 +4,8 @@ Run in the reference environment (`TRANSFORMERS`'s pin), on armada. The
 release's pinned serve.patch supplies install_noncausal/blocks; no attention
 mask is transcribed here. The generator writes a native checkpoint, paired
 fp32/float64 logits and source.json with exact package/source provenance.
-`--seeds` and `--redraw` come from the accuracy gate's recording plan.
+`--seeds` comes from the accuracy gate's recording plan; the draws recorded are its staged units
+(`check1_wire.staged_units`), the seeds and their redraw.
 """
 
 import argparse
@@ -134,15 +135,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seeds", type=int)
-    parser.add_argument("--redraw", type=int)
     parser.add_argument("--calibrate", action="store_true",
                         help="size the recorded draws in the checkout's gate environment")
     args = parser.parse_args()
     if args.calibrate:
         calibrate(args.output)
         return
-    if args.seeds is None or args.redraw is None or args.seeds <= 0 or args.redraw < 0:
-        parser.error("seeds must be positive and redraw nonnegative")
+    if args.seeds is None or args.seeds <= 0:
+        parser.error("seeds must be positive")
     require_reference_transformers()
     torch.set_num_threads(1)
     torch.set_float32_matmul_precision("highest")
@@ -173,9 +173,12 @@ def main():
         exact.load_state_dict(weights)
     args.output.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(args.output)
-    arrays = {"blocks.redraw": np.asarray(args.redraw), "precision": np.asarray("ieee")}
+    sys.path.insert(0, str(ROOT / "tests"))
+    from check1_wire import REDRAW, staged_units
+
+    arrays = {"blocks.redraw": np.asarray(REDRAW), "precision": np.asarray("ieee")}
     draws, references, truths = [], [], []
-    for seed in range(args.seeds * (1 + args.redraw)):
+    for seed in range(staged_units(args.seeds)):
         draw = inputs(seed, config.text_config.vocab_size)
         ids = torch.from_numpy(draw["input_ids"])
         blocks = torch.from_numpy(draw["block_groups"])
@@ -197,7 +200,7 @@ def main():
                   "repo": REPO, "revision": REVISION, "patch_sha256": PATCH_SHA256,
                   "packages": {name: importlib.metadata.version(name)
                                for name in ("transformers", "torch", "numpy", "safetensors")},
-                  "seeds": args.seeds, "redraw": args.redraw, "parameter_seed": 43,
+                  "seeds": args.seeds, "redraw": REDRAW, "parameter_seed": 43,
                   "attention_impl": "eager", "device": "cpu", "precision": "ieee"}
     (args.output / "source.json").write_text(json.dumps(provenance, indent=2) + "\n")
 
@@ -206,14 +209,15 @@ def calibrate(directory: Path, sites: tuple[str, ...] = ("blocks",)):
     """Declare the recorded site's seeds with the gate's reference-vs-reference sizing, retaining
     enough recorded draws for its redraw policy. No candidate implementation is measured."""
     sys.path.insert(0, str(ROOT / "tests"))
-    from reference_error import REDRAW, indexed_recording, recording, seeds_for
+    from check1_wire import staged_units
+    from reference_error import indexed_recording, recording, seeds_for
 
     path = directory / "reference.npz"
     arrays = recording(path)
     counts, capacities = {}, {}
     for site in sites:
         values = next(value for name, value in arrays.items() if name.startswith(f"{site}.reference."))
-        capacity = len(values) // (1 + REDRAW)
+        capacity = len(values) // staged_units(1)
         draw, reference, truth = indexed_recording(arrays, site, capacity)
         count = seeds_for(reference, draw, site, most=capacity, truth_fn=truth)
         arrays[f"{site}.seeds"] = np.asarray(count, np.int64)

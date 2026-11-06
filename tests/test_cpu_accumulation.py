@@ -156,8 +156,8 @@ def test_a_bias_spread_over_a_sharded_axis_keeps_its_sharding():
 @pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
 def test_a_value_spread_over_a_size_one_explicit_axis_keeps_its_placement(wide, monkeypatch):
     """A value `[1, 4]` placed on a size-one Explicit axis along the axis it spreads over is broadcast to
-    `[3, 4]` under jit, in either setting, where the doubling and the outer product would each drop
-    that placement and the platform choice refuse their types (review of ledger 1698's bias sites).
+    `[3, 4]` under jit, in either setting, where the test setting's outer product would drop that
+    placement and the platform choice refuse its type (review of ledger 1698's bias sites).
     Its gradient JAX's own broadcast does not take (its transpose's cotangent keeps the spread shape),
     so the forward is what `spread` keeps."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
@@ -296,9 +296,8 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     """Each site of the wide CPU arithmetic, a float32 product and a bias's spread and a row's logsumexp
     (`widened_reduction`), traces a platform choice in a process running Dew's test setting
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
-    no float64 beside a float32 computation, and no platform choice but the bias's, whose gradient a
-    CPU sums pairwise in float32 (`spread`, ledger 1698's bias sites). Each is traced afresh, as a
-    process with either setting traces it."""
+    no float64 beside a float32 computation, and no platform choice (ledger 3197: a bias's gradient
+    included). Each is traced afresh, as a process with either setting traces it."""
     from dew.nn.precision import divided
     from dew.nn.protocols import OutputTable
     from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -332,7 +331,7 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
             states, OutputTable(table, vocab_major=True), targets, 1, tile=None)[0], states, table),
     }
     for name, found in sites.items():
-        assert chosen(found) == (wide or name == "bias"), name
+        assert chosen(found) == wide, name
         assert float64(found) == wide, name
     # A float64 division is the plain division under either setting.
     with jax.enable_x64(new_val=True):

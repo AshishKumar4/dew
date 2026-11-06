@@ -820,8 +820,15 @@ one-entry-booked-twice's at 512."""
       Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
     ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None, WIDE_HYBRID),
     ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, NARROW_HYBRID),
-    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID)],
-    ids=["by-default", "in-pieces", "every-page", "restores-past-admission"])
+    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID),
+    ((Served(12), Served(12, flipped=(0,)), Served(12)),
+     {"slots": 1, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 8, "prefix_states": 4},
+     (0, 0, 8), None, NARROW_HYBRID),
+    ((Served(9), Served(12, flipped=(0,)), Served(12, flipped=(0, 1)), Served(9)),
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
+      "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID)],
+    ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host",
+         "from-one-host-slot"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
@@ -857,7 +864,13 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     store of one entry evicts the first prompt's state for the next one's and its reuse with it. Two
     prompts admitted together into a store of one entry keep one state, the later booking's, which the
     next round's repeat of it reads; two repeats seated together each restore their state, past the
-    one prompt piece a call admits. Each request draws what it draws alone and scores it as a full
+    one prompt piece a call admits. A pool of six pages with a host tier spills the first prompt's pages
+    while another prompt runs, its state kept in a store of four entries, and its repeat reads its pages
+    back (a pool without the tier reads none: its other prompt takes the pages); in a pool of eight pages
+    two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
+    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back.
+    Each request
+    draws what it draws alone and scores it as a full
     forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
     # measure: at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
@@ -966,24 +979,20 @@ def test_a_pooled_servers_host_tier_reads_each_processs_prefix_back_from_its_own
     assert [report["shared"] for report in reports] == [8, 8]
 
 
-@pytest.mark.parametrize("stateful, host_pages, hits", [
-    (False, 0, 0), (False, 1, 4), (False, 8, 8), (True, 1, 0), (True, 8, 8),
-], ids=["device", "one-slot", "host", "hybrid-one-slot", "hybrid-host"])
-def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(stateful, host_pages, hits):
+@pytest.mark.parametrize("host_pages, hits", [(0, 0), (1, 4), (8, 8)], ids=["device", "one-slot", "host"])
+def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits):
     """A prefix cache of eight pages of four tokens, one slot: a prompt's two shared pages are cached as it
     ends, then two other prompts take the pool's pages and it reclaims them. With a host tier the reclaimed
     pages go to host memory and the prompt again reads its 8 tokens back from there, or its first 4 where
-    one host slot keeps the page reclaimed last; without one it prefills them again. A hybrid stack's rows
-    read a prefix with the recurrent state kept after its deepest page (four states kept), so one slot,
-    which keeps the first page alone, reads nothing back. Every request draws what its lone call draws
-    (ledger 874)."""
-    bound = hybrid_task() if stateful else task(Sampling(temperature=1.0))
+    one host slot keeps the page reclaimed last; without one it prefills them again. Every request draws
+    what its lone call draws (ledger 874); a hybrid stack's host tier is `assert_reads_a_shared_prefix`'s
+    `from-the-host` and `from-one-host-slot` sites, judged by check 1."""
+    bound = task(Sampling(temperature=1.0))
     shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
     requests = [shared, *others, shared]
     alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
     server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
-                              kv_cache=KVCache(page_size=4, pages=8), host_pages=host_pages,
-                              prefix_states=4 if stateful else None)
+                              kv_cache=KVCache(page_size=4, pages=8), host_pages=host_pages)
     drawn = []
     for index, held in enumerate(requests):
         ticket = server.submit(held, budget, key=index)

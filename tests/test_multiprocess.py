@@ -303,6 +303,19 @@ def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_pa
                                {name: np.asarray(value) for name, value in host.export().items()})
 
 
+@pytest.mark.distributed
+def test_a_pool_refuses_serving_from_one_processs_engine_before_it_compiles(tmp_path):
+    """Over two processes, an engine over a scoring server whose weights span both, and a served GRPO
+    rollout, whose engine steps one process's server, are each refused by name on every process before
+    any program compiles (rows 4361 and 4363; the served run's path is row 4279)."""
+    reports = run_pool("served_refusals", tmp_path, 2, timeout=120,
+                       script=Path(__file__).with_name("serving_pool_worker.py"))
+    for report in reports:
+        assert "an engine steps kinds of one process" in report["scoring"], report
+        assert "a served rollout's engine steps one process's server" in report["served"], report
+        assert report["compiled"] == 0, report
+
+
 def document_corpus(directory: Path, documents: int, length) -> Corpus:
     """A corpus whose documents each say which document they are.
 
