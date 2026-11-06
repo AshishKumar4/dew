@@ -93,7 +93,7 @@ _QWEN35_VISION_TENSORS = {
 }
 
 
-# A block's maps as `clip_layer`'s decoder block names them (`block_tensor_path`).
+# A block's maps as `clip_layer`'s decoder block names them (`block_routes`).
 _BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
                ("mlp", "linear_fc1"): ("mlp", "up_proj"), ("mlp", "linear_fc2"): ("mlp", "down_proj")}
 

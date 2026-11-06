@@ -136,13 +136,15 @@ def test_a_routed_or_hybrid_model_writes_its_release_from_its_own_fields_and_rea
 
 def test_a_model_its_layout_cannot_hold_is_unwritable_with_its_reason():
     """A model no family's layout holds is `Unwritable`, falsy and naming why, before any file is written:
-    a decoder with cross-attention, and a model of no decoder class."""
+    a decoder with cross-attention, one whose family's config cannot state its computation (GPT-J's
+    layout under a gated MLP, `hf_ungated`), and a model of no decoder class."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.cross_attention import CrossAttention
 
     decoder = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2,
                                 head_dim=8, mlp_features=32, max_seq_len=16)
     assert source_layout(decoder)
-    for model in (decoder.clone(cross_attention=CrossAttention((1,), 4)), object()):
+    gated_gptj = decoder.clone(shared_parallel_norm=True, head_bias=True, attention_bias=False, mlp="swiglu")
+    for model in (decoder.clone(cross_attention=CrossAttention((1,), 4)), gated_gptj, object()):
         layout = source_layout(model)
         assert not layout and layout.reason

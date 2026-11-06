@@ -132,7 +132,10 @@ def _gptj_order(head_dim: int, rotated: int) -> np.ndarray:
 def _gptj_rotary(config: Mapping[str, object]) -> np.ndarray:
     """A GPT-J head's rows as the shared rotate-half arithmetic reads them (`_gptj_order`), by the record."""
     head_dim = _records.integer(config['head_dim'], 'head_dim')
-    rotated = int(head_dim * _records.number(config['partial_rotary_factor'], 'partial_rotary_factor'))
+    # A model rotating every channel states no fraction (`_gptj_export` writes it as 1.0).
+    fraction = config.get('partial_rotary_factor')
+    rotated = int(head_dim * (1.0 if fraction is None
+                               else _records.number(fraction, 'partial_rotary_factor')))
     return _gptj_order(head_dim, rotated)
 
 

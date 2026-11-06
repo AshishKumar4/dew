@@ -242,28 +242,6 @@ _BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
 """A ViT block's two norms as `clip_layer`'s decoder block names them."""
 
 
-def block_tensor_path(parts: list[str], maps: Mapping[tuple[str, str], tuple[str, ...]], *,
-                      prefix: str = "blocks", norm_bias: bool = True, block: str = "blocks",
-                      norms: Mapping[str, str] = _BLOCK_NORMS) -> tuple[str, ...] | None:
-    """An indexed block's tensor, `{prefix}.N.<norm>.weight|bias` or
-    `{prefix}.N.<module>.<linear>.weight|bias`, its name split on dots, into its path under
-    `{block}_N`: `norms` names each norm's module (a shared-trunk ViT's `norm1` and `norm2` by
-    default), `maps` places each release's (module, linear) pair, and a release whose norms carry
-    no bias says so (`norm_bias`). `prefix` may hold dots (a text encoder's `encoder.layers`). None
-    for any other name, which the family reads or refuses."""
-    root = prefix.split(".")
-    depth = len(root)
-    if (len(parts) not in (depth + 3, depth + 4) or parts[:depth] != root or not parts[depth].isdigit()
-            or parts[-1] not in ("weight", "bias")):
-        return None
-    name, module, leaf = f"{block}_{parts[depth]}", parts[depth + 1], parts[-1]
-    if len(parts) == depth + 3 and module in norms and (norm_bias or leaf == "weight"):
-        return (name, norms[module], "scale" if leaf == "weight" else "bias")
-    if len(parts) == depth + 4 and (module, parts[depth + 2]) in maps:
-        return (name, *maps[module, parts[depth + 2]], "kernel" if leaf == "weight" else "bias")
-    return None
-
-
 def tensor_routes(tensors: Mapping[str, tuple[str, ...]], collection: str = "params") -> tuple[Route, ...]:
     """Each of `tensors`, a name and its leaf's path, as a route onto that leaf under `collection`."""
     return tuple(Route(name, "/".join((collection, *path))) for name, path in tensors.items())
@@ -272,7 +250,7 @@ def tensor_routes(tensors: Mapping[str, tuple[str, ...]], collection: str = "par
 def block_routes(maps: Mapping[tuple[str, str], tuple[str, ...]], *, prefix: str = "blocks",
                  norm_bias: bool = True, block: str = "blocks",
                  norms: Mapping[str, str] = _BLOCK_NORMS) -> Table:
-    """An indexed block's tensors, both ways (`block_tensor_path`'s names): `{prefix}.N.<norm>.weight|bias`
+    """An indexed block's tensors, both ways: `{prefix}.N.<norm>.weight|bias`
     onto `{block}_N`'s norm `norms` names (its scale and, where `norm_bias`, its bias), and
     `{prefix}.N.<module>.<linear>.weight|bias` onto the map `maps` places each (module, linear) pair at,
     its kernel and bias, under `params`."""

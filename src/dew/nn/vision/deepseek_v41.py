@@ -113,7 +113,7 @@ class DeepseekV41Projector(ProjectorBase):
                                 jnp.broadcast_to(end, (images, 1, self.out_width))], axis=1)
 
 
-# A block's maps as the decoder block names them (`block_tensor_path`).
+# A block's maps as the decoder block names them (`block_routes`).
 _BLOCK_MAPS = {("attn", "wqkv"): ("self_attn", "qkv_proj"), ("attn", "wo"): ("self_attn", "o_proj"),
                ("mlp", "w1"): ("mlp", "gate_up_proj"), ("mlp", "w2"): ("mlp", "down_proj")}
 _DEEPSEEK_V41_VISION_TENSORS = {

@@ -90,7 +90,7 @@ def hf_activation(activation: GatedActivation) -> str:
     """The `hidden_act` a family's config names an activation by; Kimi K3's
     SiTU carries its betas in fields of its own and has no such name."""
     if isinstance(activation, Situ):
-        refuse('mlp', "SiTU is named only by Kimi K3's own config fields")
+        refuse_export('mlp', "SiTU is named only by Kimi K3's own config fields")
     return _HF_ACTIVATIONS[activation]
 
 
@@ -128,7 +128,7 @@ def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new')
     by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
     if isinstance(mlp, str) and mlp in {ours for ours, _, _ in _UNGATED}:
         return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
-    return refuse('mlp', f'{family} writes only an ungated GELU or ReLU')
+    return refuse_export('mlp', f'{family} writes only an ungated GELU or ReLU')
 
 
 GEMMA3_MODEL_TYPE = 'gemma3_text'
