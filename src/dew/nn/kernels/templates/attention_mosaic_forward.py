@@ -856,7 +856,12 @@ def _empty(family: mosaic.Family, shape: tuple[int, int], live: jax.Array | None
     headroomed at the guard's `live` rows."""
     rows = shape[0]
     start = algebra.Partial(family.zeros(shape), family.full((rows,), algebra.LEAST), family.zeros((rows,)))
-    return start if live is None else algebra.headroomed(start, live)
+    if live is None:
+        return start
+    # No key weighed yet: no shift and no reach, `algebra.headroom_of`'s of an empty state, stated rather than
+    # reduced from its zero sums (Mosaic reduces no constant tile: a 16-row mma.sync walk's `[16, 32]`).
+    nothing = family.zeros((rows,))
+    return start._replace(guard=algebra.Guard(nothing, nothing, start.acc, start.total, live))
 
 
 def _value_tile(shape: tuple, dtype, turn, slots) -> algebra.Operand:
