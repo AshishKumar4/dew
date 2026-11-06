@@ -653,11 +653,8 @@ def attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
     lengths = jnp.asarray([1, 20, 64], jnp.int32)
     attended, folded = decode_step(lengths)
 
-    def draw(seed):
-        rng = np.random.default_rng([1, seed])
-        return tuple(jnp.asarray(rng.normal(size=shape), jnp.float32) for shape in (
-            (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64), (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64),
-            (3, 4, 2, 64)))
+    draw = normal_drawn(1, (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64), (3, 4, 2, 64), (3, 64, 2, 64),
+                        (3, 64, 2, 64), (3, 4, 2, 64))
 
     def derivatives(attend):
         def run(query, key, value, *rest):
