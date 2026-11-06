@@ -1208,8 +1208,8 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     # (`mainloop.Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast forms),
     # the skip is added after. Decided once: the selector judges the call the run makes (its skip's reverse
     # tile).
-    fast = fast_rounding()
     operand = jnp.dtype(jnp.result_type(query, key, value))
+    fast = fast_rounding(operand)
     fused = fast and hooks.skip and operand.itemsize == 2
     narrow = fused and hooks.output is None and jnp.dtype(dtype) == operand
 
@@ -1370,13 +1370,16 @@ def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | 
                     call=call, family=family, product=product)
 
 
-def fast_rounding() -> bool:
-    """Whether a call on the template takes the run's fast forms' numbers (`rounded`): the SSD's mamba_ssm's
-    16-bit ones, an fp32 call's products TF32 (JAX's default precision for an fp32 product, and fla's), where
-    the run's declaration lets a route round them (`dew.nn.precision.rounds_products`: its fast forms at no
-    more than the default precision; a run at 'highest' keeps an fp32 product whole, the template's accurate
-    parts), resolved at its route, so its launches and their caches key on it, never on the run's numerics
-    read inside them."""
+def fast_rounding(dtype) -> bool:
+    """Whether a call of `dtype` on the template takes the run's fast forms' numbers (`rounded`), resolved at
+    its route, so its launches and their caches key on it, never on the run's numerics read inside them: a
+    16-bit call's under the run's fast forms (`generation.numerics`), the 16-bit roundings of its
+    intermediates mamba_ssm's and fla's, its products whole at any precision; an fp32 call's products TF32
+    (JAX's default precision for an fp32 product, and fla's) where the run's declaration lets a route round
+    them (`dew.nn.precision.rounds_products`: its fast forms at no more than the default precision; a run at
+    'highest' keeps an fp32 product whole, the template's accurate parts)."""
+    if jnp.dtype(dtype).itemsize == 2:
+        return generation.numerics().forms == 'fast'
     return rounds_products()
 
 
@@ -1387,7 +1390,7 @@ def chunk_rounding(delta: bool, dtype) -> bool:
     (`_rated_scan`). Rounded there, a write gate without the delta rule passed its values between launches
     in bf16, its final memory 2.1e4 times the portable math's distance from float64 under aligned keys
     (interpreted at 2b595ff93, 9593 to 46978 times on an H100, gpuflow-a-abfff38d9)."""
-    return fast_rounding() and (delta or jnp.dtype(dtype) == jnp.float32)
+    return fast_rounding(dtype) and (delta or jnp.dtype(dtype) == jnp.float32)
 
 
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,
@@ -1401,7 +1404,8 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=1.0, delta=False, wide=wide, rounded=fast_rounding(),
+                     max_segments=max_segments, scale=1.0, delta=False, wide=wide,
+                     rounded=fast_rounding(jnp.result_type(query, key, value)),
                      skip=skip, recomputed=recomputed_memory())
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
     return select(SCAN, case).kernel
@@ -1463,7 +1467,8 @@ class SelectiveCase:
     """A selective scan (Mamba's, `dew.nn.mixers.mamba.selective_scan`) as its selector reads it
     (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype and
     its states' rows' narrower one (B's or C's, which stream each in its own: the narrower's rows are the
-    shorter), its tokens, channels and states, whether the run's forms are the fast ones (`fast_rounding`)
+    shorter), its tokens, channels and states, whether the run's forms are the fast ones (its template forms
+    its products whole in fp32 whatever the run's precision)
     and its device's instruction family (None off a GPU); the forward and the training step route alike."""
 
     varying: bool
@@ -1551,7 +1556,8 @@ def selective_kernel(x, A, B, C) -> str:
     case = SelectiveCase(varying=bool(jax.typeof(x).mat.varying), dtype=jnp.dtype(x.dtype),
                          state_dtype=min(jnp.dtype(jnp.result_type(B)), jnp.dtype(jnp.result_type(C)),
                                          key=lambda dtype: dtype.itemsize),
-                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], fast=fast_rounding(),
+                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1],
+                         fast=generation.numerics().forms == 'fast',
                          family=family)
     return select(SELECTIVE, case).kernel
 
