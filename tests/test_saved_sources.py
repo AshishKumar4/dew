@@ -66,13 +66,15 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
 def test_a_run_whose_mixture_no_family_writes_exports_and_loads_back_answering_as_its_run(tmp_path):
     """A language model run whose decoder routes one layer of two through a mixture of experts exports
     through `dew export`, in its family's source layout where one states the model and as its native
-    release where none does (export review #1), and `dew.pipeline` loads the release back answering as the
-    run's own task, where the export was refused."""
+    release, stating why, where none does (export review #1), and `dew.pipeline` loads the release back
+    answering as the run's own task, where the export was refused."""
     from option_witness import answered_alike, answers
 
     from dew._cli.main import main
     from dew.inference.loading import pipeline
-    from dew.inference.tasks import TextGeneration
+    from dew.inference.models import ReleasedRun
+    from dew.inference.tasks import SavedRun, TextGeneration, saved_model
+    from dew.interop.layouts import source_layout
 
     routed = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 2, "num_heads": 2,
                                                 "mlp_features": 32, "dtype": "float32",
@@ -81,6 +83,13 @@ def test_a_run_whose_mixture_no_family_writes_exports_and_loads_back_answering_a
             trainer={"checkpoint_final": True})
     run, release = tmp_path / "runs" / "routed", tmp_path / "release"
     assert main(["export", str(run), str(release)]) == 0
+    # The release is the one the family's layout answers for the model: its source layout, or the native
+    # release stating the layout's reason.
+    layout = source_layout(saved_model(SavedRun.pinned(str(run)).record, None).build())
+    if layout:
+        assert (release / "config.json").is_file()
+    else:
+        assert ReleasedRun.of(release).unstated == layout.reason
     assert answered_alike(answers(pipeline(str(release))), answers(TextGeneration.from_run(str(run))))
 
 

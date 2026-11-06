@@ -86,14 +86,13 @@ class Placed:
 
 @dataclasses.dataclass(frozen=True)
 class Native:
-    """A model no family's layout states (`why`, the layout's reason): its run's inference declaration
-    (`record`) at `step` beside its `variables`, named `<collection>/<path>`, and the files its task keeps
-    by the step (`records`, each copied to its place), which `dew.inference.models.ReleasedRun` reads back
-    as the run."""
+    """A model no family's layout states: its `variables`, named `<collection>/<path>`, and the files its
+    task keeps by the step (`records`, each copied to its place), beside its run's inference declaration
+    in the release's record (`native_plan`), which `dew.inference.models.ReleasedRun` reads back as the
+    run."""
 
     variables: Variables
     records: Sequence[tuple[epath.Path, PurePath]] = ()
-    why: str = ""
 
     def tensors(self) -> Mapping[str, np.ndarray]:
         return flatten(self.variables)
@@ -232,11 +231,14 @@ def native_plan(variables: Variables, record: Mapping[str, object], step: int, *
                 averaged: bool = False, records: Sequence[tuple[epath.Path, PurePath]] = ()) -> ReleasePlan:
     """The native release of a run's step (0 for a model released outside a run): its variables, the files
     its task keeps by the step, and in its record the run's declaration `record`, whether `variables` are
-    its average (`ReleasedRun.of` reads `run`, `step` and `averaged`)."""
+    its average and why no family's layout writes its model where one was asked (`why`, the layout's
+    reason): `ReleasedRun.of` reads `run`, `step`, `averaged` and `unstated`."""
     from dew._records import json_value
 
-    envelope = Release(task={"run": json_value(record, "run"), "step": step, "averaged": averaged})
-    return ReleasePlan(Native(variables, records, why), envelope=envelope)
+    task: dict[str, object] = {"run": json_value(record, "run"), "step": step, "averaged": averaged}
+    if why:
+        task["unstated"] = why
+    return ReleasePlan(Native(variables, records), envelope=Release(task=task))
 
 
 __all__ = ["Assets", "HeadFiles", "Native", "Placed", "ReleasePlan", "bundle_plan", "native_plan", "writable"]

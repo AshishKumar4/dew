@@ -112,10 +112,9 @@ def decision_plan(bundle: PretrainedDecision) -> ReleasePlan | Unwritable:
     assets = Assets(tokenizer=bundle.decision_tokenizer, folder=chosen.tokenizer_folder,
                     generation_config=backbone.assets.generation_config if chosen.generation else None)
     layout, max_length, calibration = chosen.stated(bundle)
-    # A task's bundle states the dtype it computes in, numerics or none; a release read from its files states
-    # what its record stated (its numerics), its files their own dtypes.
-    compute = (None if bundle.numerics is None and bundle.source is not None
-               else computed_in(bundle.numerics, bundle.model, bundle.variables))
+    # Every bundle states the dtype it computes in, a task's and one read from a release alike, so a load of
+    # what it writes computes as it does.
+    compute = computed_in(bundle.numerics, bundle.model, bundle.variables)
     envelope = decision_envelope(backbone.envelope, layout, calibration, max_length=max_length,
                                  numerics=bundle.numerics, compute=compute)
     return ReleasePlan(placed, chosen.head(bundle), assets, envelope)

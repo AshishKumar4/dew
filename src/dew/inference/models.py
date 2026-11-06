@@ -28,7 +28,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew._records import integer, record as named_fields
+from dew._records import integer, record as named_fields, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
 from dew.inference.tasks import SavedRun, SavedRunTask, saved_model, saved_settings
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, read_weights, unflatten
@@ -127,6 +127,9 @@ class ReleasedRun(SavedRun):
 
     average: bool = False
     """Whether its variables are the run's average (`SavedRun.averaged`)."""
+    unstated: str = ""
+    """Why no family's layout writes its model, as its export found (`dew.interop.layouts.source_layout`);
+    empty where its export asked none (a model's own native release)."""
 
     @classmethod
     def of(cls, directory: str | Path, trust: Sequence[str] = ()) -> Self:
@@ -149,7 +152,8 @@ class ReleasedRun(SavedRun):
                    **({} if task.get("numerics") is None else {"precision": task["numerics"]})})
         import_trusted(record, trust)
         held = cls.declared(str(directory), earlier_shapes(record), integer(task.get("step", 0), "step"))
-        return replace(held, average=task.get("averaged") is True)
+        return replace(held, average=task.get("averaged") is True,
+                       unstated=text(task.get("unstated", ""), "unstated"))
 
     def averaged(self, ema: bool | None) -> bool:
         """Whether its variables are the run's average, as its export wrote them; an `ema` asked is
