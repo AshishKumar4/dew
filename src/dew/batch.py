@@ -163,6 +163,49 @@ def token_ids(values: object, *, where: str) -> list[int]:
 
 
 @struct.dataclass
+class Entered:
+    """Packed documents of which some continue another (row 1506): `documents` `[B, S]` numbers each
+    token's document within its row from 1 (0 on padding), and `entered` `[B, D]` the document each enters,
+    by its number, 0 for none, each entered one whole before it. A document that enters another reads it
+    as if it were its own beginning, and no other: attention its keys (`runs`), a recurrence its final
+    memory and a conv its last tokens (`dew.nn.linear.entered_conv1d`). A request's questions over one
+    copy of its state (`dew.decision.shared_state`) are the documents that enter the state's."""
+
+    documents: jax.Array
+    entered: jax.Array
+
+    @property
+    def count(self) -> int:
+        """The documents a row may number, `D`."""
+        return self.entered.shape[1]
+
+    @property
+    def roots(self) -> jax.Array:
+        """`[B, S]` whether each token's document enters none (padding's 0 among them)."""
+        held = jnp.take_along_axis(self.entered, jnp.maximum(self.documents - 1, 0), axis=1)
+        return (self.documents > 0) & (held == 0)
+
+    def runs(self) -> jax.Array:
+        """Each token's key runs `[B, S, 2, 2]` (`AttentionMetadata.key_runs`): the document its document
+        enters, whole, and its own up to itself; an empty first run for one that enters none."""
+        batch, length = self.documents.shape
+        slots = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
+        rows = jnp.arange(batch)[:, None]
+        number = jnp.maximum(self.documents - 1, 0)
+        first = jnp.full((batch, self.count), length, jnp.int32).at[rows, number].min(
+            jnp.where(self.documents > 0, slots, length))
+        end = jnp.zeros((batch, self.count), jnp.int32).at[rows, number].max(
+            jnp.where(self.documents > 0, slots + 1, 0))
+        entered = jnp.take_along_axis(self.entered, number, axis=1)
+        before = jnp.maximum(entered - 1, 0)
+        reads = entered > 0
+        prior = jnp.stack([jnp.where(reads, jnp.take_along_axis(first, before, axis=1), 0),
+                           jnp.where(reads, jnp.take_along_axis(end, before, axis=1), 0)], axis=-1)
+        own = jnp.stack([jnp.take_along_axis(first, number, axis=1), slots + 1], axis=-1)
+        return jnp.stack([prior, own], axis=2)
+
+
+@struct.dataclass
 class Coordinates:
     """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
 
@@ -198,6 +241,8 @@ class Coordinates:
     valid: jax.Array | None = None
     starts: jax.Array | None = None
     firsts: jax.Array | None = None
+    entered: Entered | None = None
+    """Documents within its rows that continue another (`Entered`), None where none does."""
     max_segments: int = struct.field(pytree_node=False, default=1)
     right_padded: bool = struct.field(pytree_node=False, default=False)
 
@@ -213,6 +258,9 @@ class Coordinates:
         """`transform` applied along the tokens to each token-aligned field (`TOKEN_ALIGNED`): a slice or a
         rotation of the slots. The documents' firsts, which index the slots, are built again from the
         moved starts (`document_firsts`), as every `Coordinates` builds them."""
+        if self.entered is not None:
+            raise ValueError("documents that enter another are read whole in their rows; a call that slices "
+                             "or rotates the rows' slots runs none")
         moved = replace(self, **{name: transform(value) for name, value in self.tokens().items()})
         if moved.starts is None:
             return moved

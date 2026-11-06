@@ -23,6 +23,7 @@ from dew.batch import (
     TOKEN_LAYOUT_FIELDS,
     VALIDITY_FIELD,
     Coordinates,
+    Entered,
     coordinates,
     document_firsts,
     document_ranks,
@@ -625,6 +626,11 @@ class AttentionMetadata:
     def right_padded(self) -> bool:
         return self.coordinates is not None and self.coordinates.right_padded
 
+    @property
+    def entered(self) -> Entered | None:
+        """The documents that continue another (`Coordinates.entered`), None where none does."""
+        return None if self.coordinates is None else self.coordinates.entered
+
 
 def check_tree(parents: tuple[int, ...], length: int, *, decode: bool, positioned: bool,
                ordered: bool) -> None:
@@ -646,15 +652,17 @@ def check_tree(parents: tuple[int, ...], length: int, *, decode: bool, positione
                          "hashes or routing blocks read its tokens in their order")
 
 
-MIXING = ("pairwise_mask", "key_positions", "key_runs", "position_bias", "admitted", "tree_parents")
+MIXING = ("pairwise_mask", "key_positions", "key_runs", "position_bias", "admitted", "entered",
+          "tree_parents")
 """The `AttentionMetadata` fields that say which tokens a mixer lets each token
 read, or how much: a call's own mask, or its keys' runs, and the key positions
-it is read by, an additive bias, a server's mixed layout, a tree's parents. A
-mixer runs a call that sets one only where it reads it (`MixerCall`). The rest
-describe the tokens themselves, which a mixer reads as far as its form uses
-them: their coordinates, rotary positions, and image and block groups, which
-only attention that sees an image or a block whole reads, and the ids the block
-reads for its feed-forward and n-gram lookup."""
+it is read by, an additive bias, a server's mixed layout, the documents a
+call's documents enter, a tree's parents. A mixer runs a call that sets one
+only where it reads it (`MixerCall`). The rest describe the tokens themselves,
+which a mixer reads as far as its form uses them: their coordinates, rotary
+positions, and image and block groups, which only attention that sees an image
+or a block whole reads, and the ids the block reads for its feed-forward and
+n-gram lookup."""
 
 TOKENWISE = frozenset(MIXING)
 """The `MIXING` fields a mixer that reads no other token holds to: every one,
