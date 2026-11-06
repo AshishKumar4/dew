@@ -1048,8 +1048,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         tree = self.complete_variables(key, tree)
         # What a pass observes is that pass's own, never the state's: a module that sows its maxima or its
         # watched activations as it initializes leaves none for a step to read before its own (`OBSERVED`).
-        tree = {name: part for name, part in tree.items() if name not in OBSERVED}
-        return with_projected(tree, functools.partial(self.projected, updated=True))
+        tree = with_projected({name: part for name, part in tree.items() if name not in OBSERVED},
+                              functools.partial(self.projected, updated=True))
+        if not held:
+            # The draw `parameter_axes` reads, the names its boxes carry static under any trace.
+            self.__dict__.setdefault("_drawn_axes", boxed_axes(tree))
+        return tree
 
     @functools.cached_property
     def parameter_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
@@ -1060,12 +1064,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         held one alike. A held tree's leaves are held to the draw's shapes, a leaf of another shape
         refused by its path: its axes would name another parameter's dimensions. An objective that draws
         no fresh tree (`fresh_variables`' `NotImplementedError`, its documented answer) holds no draw to
-        read: its held tree is placed by its shapes (`dew.inference.place`), its towers by their tables."""
+        read: its held tree is placed by its shapes (`dew.inference.place`), its towers by their tables.
+        An objective that holds no tree reads the draw its `init` made first, which the trainer traces for
+        its state's shapes (`_drawn_axes`), where another trace of it was seconds of a Qwen3.5-4B step's
+        compile (row 4260)."""
+        held = self.held_variables()
+        if held is None and (drawn_axes := self.__dict__.get("_drawn_axes")) is not None:
+            return {**self.tower_axes(), **drawn_axes}
         try:
             drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
         except NotImplementedError:
             return self.tower_axes()
-        held = self.held_variables()
         if held is not None and "params" in held:
             shapes = {jax.tree_util.keystr(path): np.shape(leaf)
                       for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(drawn)))}

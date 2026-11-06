@@ -1,0 +1,9 @@
+{
+ "bytes": 1600654,
+ "license": "Apache-2.0",
+ "path": "recordings/9cb1100306fe554b38ee28b60804a1a9acc8d13aa8758ba8e440dc44c217b3af.npz",
+ "reference": "kuleshov-group/mdlm c112c526d193436838c98d81455ee51f90309470",
+ "repo": "dewml/fixtures",
+ "revision": "c962e2b364eedfe4bdec6ba71b5a9af84d90c082",
+ "sha256": "9cb1100306fe554b38ee28b60804a1a9acc8d13aa8758ba8e440dc44c217b3af"
+}
