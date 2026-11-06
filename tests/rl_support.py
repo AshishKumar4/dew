@@ -5,7 +5,9 @@ scripted source and publisher."""
 
 from concurrent.futures import Future
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from dew.nn.protocols import OutputTable
@@ -120,3 +122,36 @@ class Published:
 
     def load(self, variables, version):
         self.version = version
+
+
+def rollout_prompts() -> dict:
+    """Eight left-padded prompts whose lengths and EOS timing differ by rank.
+
+    Rows 0-3 belong to process zero and rows 4-7 to process one under the
+    trainer's halving. Process zero holds one real length, process one holds
+    three, so the ranks would run different bucket counts on their own, and
+    the ranks stop at different steps. Eight rows split over the eight-device
+    mesh.
+    """
+    prompts = np.array([[3, 4, 5, 6], [9, 10, 5, 6], [1, 2, 3, 4], [7, 8, 9, 1],
+                        [0, 0, 0, 2], [0, 0, 7, 8], [0, 6, 5, 4], [0, 3, 8, 1]], np.int32)
+    return {"prompt": prompts, "prompt_length": np.array([4, 4, 4, 4, 1, 2, 3, 3], np.int32),
+            "data_source": np.full((8, 1), 97, np.int32),
+            "ground_truth": np.full((8, 1), 49, np.int32),
+            "extra_info": np.zeros((8, 1), np.int32)}
+
+
+def pooled_rollout() -> tuple:
+    """The tiny decoder a pool's rollout tests draw from, its parameters, `rollout_prompts` whole and this
+    process's share of them, under the trainer's halving."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    rank, processes = jax.process_index(), jax.process_count()
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=12,
+                              dtype="float32", attention_impl="xla")
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    batch = rollout_prompts()
+    rows = len(batch["prompt"]) // processes
+    local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
+    return model, params, batch, local
