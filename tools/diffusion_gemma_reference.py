@@ -70,6 +70,25 @@ def tiny_model() -> DiffusionGemmaForBlockDiffusion:
     return model
 
 
+def diffusion_gemma_model(fields: dict, canvas_length: int):
+    """A tiny DiffusionGemma for block diffusion over the text config `fields` and one small vision tower, in
+    float32 and evaluation mode: `fields` as a saved text config holds them, its `model_type` and the flat
+    keys transformers writes beside its layer types' rope parameters dropped. Its weights are its
+    initialization's: tools/hf_reference.py's generator ties them (`diffusion_gemma_tiny`), a reader loads a
+    fixture's (tests/test_block_diffusion.py)."""
+    text = {key: value for key, value in fields.items() if key != "model_type"}
+    text["rope_parameters"] = {kind: value for kind, value in text["rope_parameters"].items()
+                               if isinstance(value, dict)}
+    vision = Gemma4VisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
+        pooling_kernel_size=2, position_embedding_size=64)
+    model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
+        text_config=DiffusionGemmaTextConfig(**text), vision_config=vision, canvas_length=canvas_length,
+        tie_word_embeddings=False))
+    return model.float().eval()
+
+
 def reference_generation(model, prompt, *, steps=4, confidence=0.005, stability=1, eos=None, model_kwargs=None):
     """The reference generate call with independent, matched random inputs."""
     from transformers.models.diffusion_gemma.generation_diffusion_gemma import DiffusionGemmaGenerationMixin
