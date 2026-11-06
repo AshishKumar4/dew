@@ -1194,7 +1194,8 @@ def test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_ed
         return _cast(family, family.draw)(seed)[:4]
 
     assert_as_exact(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
-                    f"template decode {family.dtype}", seeds=seeds, truth_fn=_reference(family, anchored=True))
+                    f"template decode {family.dtype}", seeds=seeds,
+                    truth_fn=_reference(family, anchored=True))
 
 def test_a_decode_steps_logits_past_the_folds_reach_weigh_as_the_references():
     """bf16, the default form: one query over two keys whose products are 2^30 and 2^30 + 128, an fp32 ulp
