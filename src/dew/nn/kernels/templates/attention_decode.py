@@ -92,9 +92,9 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
     if spans.query_ids is None and spans.start.ndim == 2:
         spans = KeySpans(spans.start, spans.end, None, spans.key_ids, spans.keys, "spans", group)
     else:
-        spans = KeySpans(*(None if x is None else jnp.repeat(x, group, axis=1)
-                           for x in (spans.start, spans.end, spans.query_ids)),
-                         spans.key_ids, spans.keys, "spans")
+        start, end = (jnp.repeat(x, group, axis=1) for x in (spans.start, spans.end))
+        query_ids = None if spans.query_ids is None else jnp.repeat(spans.query_ids, group, axis=1)
+        spans = KeySpans(start, end, query_ids, spans.key_ids, spans.keys, "spans")
     if initial is not None:
         def heads_rows(x):
             # [B, H, T, ...] as [B, KV, T·G, ...].

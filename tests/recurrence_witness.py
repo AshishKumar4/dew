@@ -17,6 +17,10 @@ chunk and head (`chunk_step`):
 5. `o` from the queries, keys, `h` and `c`: `scale ((q h) exp2(g) + tril(q k^T exp2(g_s - g_t)) c)`
    (`algebra.chunk_scores`, `chunk_output`).
 
+Under a decay a key dimension (Kimi delta attention's, a declared floor's, `key_enclosures`) the pairs are the
+intra launch's, each pair's decay factored over sub-chunks (`key_pairs`), the weights gated by each key's
+own decay, the keys gated to the chunk's end, and each key row of the memory decayed by its own.
+
 Each enclosure is outward interval arithmetic in float64, each end snapped to its op's own grid: products of
 16-bit values (or of an fp32 operand's three bf16 parts, six of them a pair, `product.formed`) exact, summed
 as the native-dot contract holds a tensor core's sum (gamma_n at a truncating add's unit, of the terms that
@@ -232,9 +236,14 @@ class Exponents:
 
     @classmethod
     def of(cls, g) -> "Exponents":
+        """A chunk's exponents of its log decays `g` `[C]` (a head's) or `[C, Dk]` (a key dimension's, each
+        column its own prefix: the intra launch's scan of the same exact terms, `algebra.scanned_prefix`,
+        its doubling's adds as many as the associative scan's)."""
         g = np.asarray(g, np.float64)
-        exact = np.array([math.fsum(g[:s + 1]) for s in range(len(g))]) * LOG2E
-        spanned = np.cumsum(np.abs(g)) * LOG2E * (1 + 2.0 ** -40)
+        columns = g.reshape(len(g), -1)
+        exact = np.array([[math.fsum(columns[:s + 1, j]) for j in range(columns.shape[1])]
+                          for s in range(len(g))]).reshape(g.shape) * LOG2E
+        spanned = np.cumsum(np.abs(g), axis=0) * LOG2E * (1 + 2.0 ** -40)
         return cls(exact, EXPONENT_BOUND * spanned + 2.0 ** -50 * np.abs(exact))
 
     def raised(self, lane: Lane) -> Iv:
@@ -250,15 +259,23 @@ class Exponents:
         return exp2(_outward(difference - spread, difference + spread), lane)
 
     def pairs(self, lane: Lane) -> Iv:
-        """`algebra.decayed(hi, lo, hi, lo)` `[C, C]`: each pair's decay `exp2(E_s - E_t)`, zero where its
-        integers' difference may pass `PAIR_FLOOR`, the upper triangle's left to the caller's mask."""
-        difference = self.exact[:, None] - self.exact[None, :]
-        spread = (self.bound[:, None] + self.bound[None, :]
-                  + 2.0 ** -46 * (np.abs(self.exact[:, None]) + np.abs(self.exact[None, :])) + PAIR_FRACTION)
-        found = exp2(_outward(difference - spread, np.minimum(difference + spread, 126.0)), lane)
-        # The integers' difference lies within two of the exponent's.
-        lo = np.where(difference - spread < PAIR_FLOOR + 2, 0.0, found.lo)
-        return Iv(lo, np.where(difference + spread < PAIR_FLOOR - 2, 0.0, found.hi))
+        """`algebra.decayed(hi, lo, hi, lo)` `[C, C]`: each pair's decay `exp2(E_s - E_t)` (`between`), the
+        upper triangle's left to the caller's mask."""
+        return between(self.exact[:, None], self.bound[:, None], self.exact[None, :], self.bound[None, :],
+                       lane)
+
+
+def between(later, later_bound, earlier, earlier_bound, lane: Lane) -> Iv:
+    """`algebra.between` of two separated prefixes, `exp2(later - earlier)` (broadcasting): each side's
+    exponent within its bound of exact, their fractions' difference rounded (`PAIR_FRACTION`), exp2 at the
+    lane's reach and scaled by the wholes' difference exactly, zero where the integers' difference may pass
+    `PAIR_FLOOR`."""
+    difference = later - earlier
+    spread = later_bound + earlier_bound + 2.0 ** -46 * (np.abs(later) + np.abs(earlier)) + PAIR_FRACTION
+    found = exp2(_outward(difference - spread, np.minimum(difference + spread, 126.0)), lane)
+    # The integers' difference lies within two of the exponent's.
+    lo = np.where(difference - spread < PAIR_FLOOR + 2, 0.0, found.lo)
+    return Iv(lo, np.where(difference + spread < PAIR_FLOOR - 2, 0.0, found.hi))
 
 
 def _lags() -> np.ndarray:
@@ -273,8 +290,12 @@ def inverse(k, beta, exponents: Exponents, lane: Lane) -> Iv:
     product = blocked(point(k), point(np.asarray(k).T), lane)
     decayed = fp32(mul(product, exponents.pairs(lane)), lane)
     system = fp32(mul(decayed, point(np.asarray(beta)[:, None])), lane)
-    lags = _lags()
-    system = where(lags > 0, system, point(np.zeros((CHUNK, CHUNK))))
+    return solved(where(_lags() > 0, system, point(np.zeros((CHUNK, CHUNK)))), lane)
+
+
+def solved(system: Iv, lane: Lane) -> Iv:
+    """`algebra.solved` of a chunk's strictly lower system `[C, C]`: `algebra.doubled` on `-system`, each
+    level's two merges staged in fp16 (a 16-bit call's), less the unit diagonal."""
     lower_a = neg(system)
     rows, cols = np.indices((CHUNK, CHUNK))
     identity = (rows == cols).astype(np.float64)
@@ -301,7 +322,9 @@ def weighted(lower, tile, beta, decay: Iv | None, lane: Lane) -> tuple[Iv, Iv]:
     product."""
     scaled = fp32(mul(point(tile), point(np.asarray(beta)[:, None])), lane)
     if decay is not None:
-        scaled = fp32(mul(scaled, Iv(decay.lo[:, None], decay.hi[:, None])), lane)
+        # A head's decay a row's, `[C]`; a key dimension's its own entry's, `[C, Dk]`.
+        scaled = fp32(mul(scaled, decay if decay.lo.ndim == 2 else Iv(decay.lo[:, None], decay.hi[:, None])),
+                      lane)
     value = fp32(add(scaled, dot(point(lower), staged(scaled), lane)), lane)
     return value, staged(value)
 
@@ -354,20 +377,103 @@ class Step(NamedTuple):
     carry: Iv
 
 
+def solved_step(step: Step, decay: Iv, lane: Lane) -> tuple[Iv, Iv, Iv]:
+    """A step's records past its solve, from its stored inverse: the weighted keys under `decay` (a head's
+    `[C]` or a key dimension's `[C, Dk]`) as stored, the corrected values as stored, and their fp32 values
+    the write takes (within their enclosure and rounding to the stored `c`)."""
+    _, w = weighted(step.a, step.k, step.beta, decay, lane)
+    _, u = weighted(step.a, step.v, step.beta, None, lane)
+    c = corrected(u, step.w, step.h, lane)
+    return w, staged(c), meet(c, cell(step.c, BFLOAT16))
+
+
 def enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     """Each record's enclosure in its stored values (`a`, `w`, `c`, `o`) and the memory leaving the chunk,
     fp32 (`h`, the next chunk's entering memory before its store's rounding), each from the native records
     its launch reads (the module's docstring)."""
+    if np.ndim(step.g) == 2:
+        return key_enclosures(step, scale, lane)
     exponents = Exponents.of(step.g)
-    _, w = weighted(step.a, step.k, step.beta, exponents.raised(lane), lane)
-    _, u = weighted(step.a, step.v, step.beta, None, lane)
-    c = corrected(u, step.w, step.h, lane)
-    # The corrected values the write takes: fp32, within their enclosure and rounding to the stored `c`.
-    values = meet(c, cell(step.c, BFLOAT16))
+    w, c, values = solved_step(step, exponents.raised(lane), lane)
     stored = staged(inverse(step.k, step.beta, exponents, lane))
-    return {"a": stored, "w": w, "c": staged(c),
+    return {"a": stored, "w": w, "c": c,
             "h": carried(step.carry, values, step.k, exponents, lane),
             "o": staged(output(step.q, step.k, step.h, step.c, exponents, scale, lane))}
+
+
+SUB = recurrence_algebra.SUB
+"""The sub-chunk a decay a key dimension's pairs factor over (`algebra.key_block_pairs`)."""
+
+
+def operand(iv: Iv) -> Iv:
+    """An fp32 value as the factored pairs' products take it (`mainloop._pairing_operand`): TF32 (10 bits
+    past the leading one, rounded or truncated) or two bf16 parts and their pairs' products of orders under
+    two (16 bits, the dropped term under 2^-16 of the product), both within 2^-10 of the value."""
+    widen = 2.0 ** -10 * np.maximum(np.abs(iv.lo), np.abs(iv.hi))
+    return _outward(iv.lo - widen, iv.hi + widen)
+
+
+def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
+    """`algebra.key_block_pairs` `[C, C]` under a decay a key dimension, the pairs of sub-chunks at or before
+    each row's (a declared floor's, `diagonal`): `sum_k r_ik k_jk exp2(E_ik - E_jk)` factored at row `i`'s
+    sub-chunk's first token `G_s` and key `j`'s last `E_t`, the rows gated down (`exp2(E_i - G_s)`) and by
+    the middle factor (`exp2(G_s - E_t)`), the keys up (`exp2(E_t - E_j)`), each an fp32 product taken as
+    its operand form (`operand`), the products' sum over every key block within one native sum's bound of
+    its terms (a key block's sum and its adds into the total, at most as many roundings as the width's
+    terms). The caller masks the lags."""
+    exact, bound = exponents.exact, exponents.bound
+    sub_of = np.arange(CHUNK) // SUB
+    firsts, lasts = sub_of * SUB, sub_of * SUB + SUB - 1
+    down = between(exact, bound, exact[firsts], bound[firsts], lane)
+    gated = fp32(mul(rows, down), lane)
+    up = operand(fp32(mul(point(k), between(exact[lasts], bound[lasts], exact, bound, lane)), lane))
+    found = point(np.zeros((CHUNK, CHUNK)))
+    for t in range(CHUNK // SUB):
+        reached = sub_of >= t
+        middle = between(exact[firsts], bound[firsts], exact[t * SUB + SUB - 1][None, :],
+                         bound[t * SUB + SUB - 1][None, :], lane)
+        middle = where(reached[:, None], middle, point(np.zeros(middle.lo.shape)))
+        left = operand(fp32(mul(gated, middle), lane))
+        columns = slice(t * SUB, (t + 1) * SUB)
+        product = dot(left, Iv(up.lo[columns].T, up.hi[columns].T), lane, FLOAT32)
+        found = Iv(np.concatenate([found.lo[:, :t * SUB], product.lo, found.lo[:, (t + 1) * SUB:]], 1),
+                   np.concatenate([found.hi[:, :t * SUB], product.hi, found.hi[:, (t + 1) * SUB:]], 1))
+    return found
+
+
+def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
+    """`enclosures` under a decay a key dimension (`g` `[C, Dk]`, Kimi delta attention's, a declared floor's
+    factored pairs): the intra launch's system (the write-gated keys' pairs, strict, fp32) and scores (the
+    queries' pairs, scaled, stored as held), the solve, the weights under each key's decay, the keys gated
+    to the chunk's end (`algebra.key_decayed_write`, stored), the memory each key row decays by its own,
+    and the output's one sum of the gated queries against the memory and the scores against the values
+    (`algebra.key_gated`, `key_decayed_output`)."""
+    exponents = Exponents.of(step.g)
+    raised = exponents.raised(lane)
+    zeros = point(np.zeros((CHUNK, CHUNK)))
+    writes = fp32(mul(point(step.k), point(np.asarray(step.beta)[:, None])), lane)
+    system = where(_lags() > 0, key_pairs(writes, step.k, exponents, lane), zeros)
+    w, c, values = solved_step(step, raised, lane)
+    exact, bound = exponents.exact, exponents.bound
+    # `range_decay`: the difference of the compensated prefixes, then `raised`'s fraction.
+    spread = bound[-1][None, :] + bound + 2.0 ** -46 * (np.abs(exact[-1])[None, :] + np.abs(exact)) + FRACTION
+    reach = exp2(_outward(exact[-1][None, :] - exact - spread, exact[-1][None, :] - exact + spread), lane)
+    written = staged(fp32(mul(point(step.k), reach), lane))
+    write = dot(Iv(written.lo.T, written.hi.T), staged(values), lane)
+    held = Iv(np.broadcast_to(raised.lo[-1][:, None], step.carry.lo.shape),
+              np.broadcast_to(raised.hi[-1][:, None], step.carry.lo.shape))
+    leaving = fp32(add(fused(mul(step.carry, held), lane), write), lane)
+    factor = point(np.float32(scale))
+    scores = fp32(mul(key_pairs(point(step.q), step.k, exponents, lane), factor), lane)
+    # Each key block's scores scaled before their sum: one rounding a block more, at most the width's.
+    width = np.asarray(step.k).shape[-1]
+    slack = width * 2.0 ** -24 * np.maximum(np.abs(scores.lo), np.abs(scores.hi))
+    scores = staged(where(_lags() >= 0, _outward(scores.lo - slack, scores.hi + slack), zeros))
+    queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane))
+    left = Iv(np.concatenate([queries.lo, scores.lo], 1), np.concatenate([queries.hi, scores.hi], 1))
+    right = point(np.concatenate([step.h, step.c], 0))
+    return {"a": staged(solved(system, lane)), "w": w, "c": c, "h": leaving,
+            "o": staged(dot(left, right, lane))}
 
 
 def stored_memory(iv: Iv, lane: Lane) -> Iv:
@@ -484,7 +590,7 @@ def laid_chunks(length: int, starts, max_segments: int | None) -> np.ndarray:
 
 
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
-             carried: bool = True) -> Run:
+             floor: float | None = None, carried: bool = True) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
     JAX's own default precision as a model trains it: `mainloop.kept_forward` at the tiles the route takes
     (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
@@ -500,6 +606,11 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     import jax.numpy as jnp
 
     from dew.nn.kernels import generation, recurrence_chunk, tuning
+
+    # Under a decay a key dimension the witness holds a declared floor's factored pairs (`key_pairs`): a
+    # call without one takes each sub-chunk's own pairs (`algebra.key_diagonal_pairs`), which it does not.
+    assert np.ndim(g) == 3 or (floor is not None and recurrence_algebra.factored_range(floor)), \
+        "the witness holds a decay a key dimension's factored pairs alone"
     from dew.nn.kernels.templates.recurrence import template
 
     operands = (q, k, v, g, beta, h0)
@@ -509,13 +620,15 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
             # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
             # The training forward: the primal of the route's VJP, as a training step runs it.
             o, final = jax.jit(lambda *x: jax.vjp(lambda *y: recurrence_chunk.chunk_gated_delta_rule(
-                *y, starts=starts, max_segments=max_segments, write_bound=1.0), *x)[0])(*operands)
+                *y, starts=starts, max_segments=max_segments, floor=floor, write_bound=1.0), *x)[0])(
+                *operands)
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
 
         def kept(*x, starts=starts):
             return jax.jit(lambda *x: mainloop.kept_forward(
-                *x, tiles=tiles, starts=starts, max_segments=max_segments, scale=k.shape[-1] ** -0.5,
+                *x, tiles=tiles, starts=starts, max_segments=max_segments, floor=floor,
+                scale=k.shape[-1] ** -0.5,
                 family=mainloop.family_of(dtype) or bundles.INTERPRETED,
                 interpret=generation.backend() != "gpu"))(*x)
 
@@ -650,9 +763,16 @@ sums within a chunk drift 1.5e-5 from the exact ones by its end (row 2066's defe
 enclosure is 7e-7 of it wide."""
 
 
-def draw(seed: int, regime: str, *, chunks: int = 3, heads: int = 1, width: int = 64):
+FLOOR = -5.0
+"""A decay a key dimension's declared least log decay a token (Kimi delta attention's), under which its pairs
+factor over sub-chunks (`algebra.factored_range`)."""
+
+
+def draw(seed: int, regime: str, *, chunks: int = 3, heads: int = 1, width: int = 64,
+         per_key: bool = False):
     """A bf16 call's operands `(q, k, v, g, beta, h0)` of one row of `chunks` chunks: unit queries and keys,
-    normal values, the regime's log decays (`REGIMES`), a write gate in (0, 1), an initial memory."""
+    normal values, the regime's log decays (`REGIMES`), a write gate in (0, 1), an initial memory; `per_key`,
+    a decay a key dimension in (`FLOOR`, 0) instead (Kimi delta attention's bounded gate)."""
     import jax.numpy as jnp
 
     rng = np.random.default_rng([2084, 3, seed, REGIMES.index(regime)])
@@ -668,6 +788,8 @@ def draw(seed: int, regime: str, *, chunks: int = 3, heads: int = 1, width: int 
     g = {"mild": lambda: -np.log1p(np.exp(rng.normal(size=shape) - 1.0)),
          "slow": lambda: -0.01 * rng.uniform(size=shape), "steep": lambda: -rng.uniform(1, 3, shape),
          "decay": lambda: np.full(shape, -0.4)}[regime]()
+    if per_key:
+        g = FLOOR / (1 + np.exp(1.0 - rng.normal(size=(*shape, width))))
     beta = 0.0 if regime == "decay" else 1 / (1 + np.exp(-rng.normal(size=shape)))
     h0 = 0.3 * rng.normal(size=(1, heads, width, width))
     return (jnp.asarray(q, jnp.bfloat16), jnp.asarray(k, jnp.bfloat16), jnp.asarray(v, jnp.bfloat16),
@@ -679,6 +801,18 @@ def shifted_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray,
     """An off-by-one chunk boundary (`refusals`): the call run on its tokens one later (`shifted`), each
     record held to the step on the call's own chunks' operands."""
     faulty = recorded(*shifted(operands))
+    return refusals(faulty, dataclasses.replace(faulty, **hosted(operands)), lane)
+
+
+def shared_decay_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """A decay a key dimension dropped for its head's mean (a kernel that reads one decay a head,
+    `refusals`): the call run on the mean of each token's decays over its key dimensions, each record held
+    to the step on the call's own per-key decays."""
+    import jax.numpy as jnp
+
+    q, k, v, g, beta, h0 = operands
+    shared = jnp.broadcast_to(jnp.mean(g, -1, keepdims=True), g.shape)
+    faulty = recorded(q, k, v, shared, beta, h0, floor=FLOOR)
     return refusals(faulty, dataclasses.replace(faulty, **hosted(operands)), lane)
 
 
@@ -766,3 +900,18 @@ def assert_step_faults_refused(lane: Lane, heads: int | None = None) -> None:
     assert_refusals(cumsum_refusals(draw(1, "decay", chunks=2, **sized), lane), CUMSUM_SHARES)
     assert_refusals(shifted_refusals(draw(1, "mild", chunks=2, **sized), lane), SHIFTED_SHARES)
 
+
+KEY_DECAY_SHARES = {"leaving": 0.5}
+"""The least share of each chunk's leaving fp32 memory at which a decay a key dimension read as its head's
+mean is refused."""
+
+
+def assert_key_decays_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness under a decay a key dimension (Kimi delta attention's, its floor's factored pairs): a
+    bf16 call of three chunks, every record inside its step's enclosure, and a kernel reading each token's
+    mean decay for all its keys refused (`shared_decay_refusals`, `KEY_DECAY_SHARES`)."""
+    operands = draw(0, "mild", heads=heads, per_key=True)
+    held = witness(recorded(*operands, floor=FLOOR), lane)
+    for name in RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
+    assert_refusals(shared_decay_refusals(operands, lane), KEY_DECAY_SHARES)

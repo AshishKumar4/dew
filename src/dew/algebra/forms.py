@@ -248,15 +248,16 @@ def _oriented(numbers, ranks: tuple[int, int]) -> tuple[bool, bool] | None:
     return left[0] == 0, right[0] == 1
 
 
-class Operand(NamedTuple):
+class Operand[T](NamedTuple):
     """A leaf's value given by its type and the call that acquires it (`load`), which an evaluation calls
     where a form first reads the leaf (`evaluator`): a mainloop's operand whose acquisition waits on its
     pipeline (a Mosaic step's value slot, its partner's turn) is acquired after what the form computes
-    before it (a step's weights)."""
+    before it (a step's weights). `T` the value as the mainloop's products take it: an array, a tile in
+    memory, or an fp32 tile's parts."""
 
     shape: tuple[int, ...]
     dtype: object
-    load: Callable[[], jax.Array]
+    load: Callable[[], T]
 
 
 def _scaled(operand: terms.Term, value: Callable[[terms.Term], jax.Array]) -> tuple:
