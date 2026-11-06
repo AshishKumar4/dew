@@ -18,6 +18,7 @@ import test_chunk_adaptation as t
 from dew.nn.categorical import label_terms
 from dew.nn.precision import compensated_sum
 from reference_error import with_gradients, widened
+from arm_arithmetic import summed_as_run, unrewritten
 
 
 def direct_loss(logits, targets, variant):
@@ -82,13 +83,16 @@ variants = ("literal", "token-categorical", "batch-categorical", "batch-logsoftm
 programs = {(variant, mode): jax.jit(make(kind, variant), compiler_options=(
     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))
     for variant in variants for mode in ("on", "off")}
-truth_program = jax.jit(make(kind, "truth"))
+programs = {name: unrewritten(program) if name[0] in ("literal", "equation") else program
+            for name, program in programs.items()}
+truth_program = unrewritten(jax.jit(make(kind, "truth")))
 totals = {}
 for seed in range(count):
     inputs = t.window_segments(kind, seed)
     with jax.enable_x64(True):
         truth = jax.device_get(truth_program(*widened(inputs)))
-    outputs = {name: jax.device_get(program(*inputs)) for name, program in programs.items()}
+    with summed_as_run():
+        outputs = {name: jax.device_get(program(*inputs)) for name, program in programs.items()}
     paths, _ = jax.tree.flatten_with_path(truth)
     for name, output in outputs.items():
         for (path, exact), actual in zip(paths, jax.tree.leaves(output)):
@@ -110,7 +114,8 @@ for seed in range(count):
             totals.setdefault(key, []).extend(worst.tolist())
     if seed == 0:
         for name, program in programs.items():
-            text = program.lower(*inputs).compile().as_text()
+            with summed_as_run():
+                text = program.lower(*inputs).compile().as_text()
             print("HLO", name, "ynn", text.lower().count("ynn"),
                   "bf16", text.count("bf16"), flush=True)
             Path("/tmp/4522-" + "-".join(name) + ".hlo").write_text(text)
@@ -125,3 +130,10 @@ for key, errors in totals.items():
                       "below4": int(np.sum(base > 4 * errors)),
                       "rms_ratio": float(np.sqrt(np.mean(errors ** 2) / np.mean(base ** 2))),
                       "max": float(np.max(errors))}), flush=True)
+    if path == "0" and variant != "literal" and mode == "on":
+        off = np.asarray(totals[path, variant, "off"])
+        off_base = np.asarray(totals[path, "literal", "off"])
+        red = np.flatnonzero((errors > 4 * base) & (off <= 4 * off_base))
+        print("RED_SEEDS", variant, [(int(seed), float(errors[seed]), float(base[seed]),
+                                     float(off[seed]), float(off_base[seed])) for seed in red[:10]],
+              flush=True)

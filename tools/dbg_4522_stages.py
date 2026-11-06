@@ -14,6 +14,7 @@ import numpy as np
 import test_chunk_adaptation as t
 from dew.nn.categorical import label_terms, partition
 from reference_error import widened
+from arm_arithmetic import summed_as_run, unrewritten
 
 
 def stages(variables, hidden, targets, weights, ids):
@@ -33,9 +34,10 @@ names = ("states", "logits", "peak", "shifted", "mass", "losses", "weighed")
 records = {name: {"different": 0, "total": 0, "on_error": 0.0, "off_error": 0.0} for name in names}
 for seed in range(64):
     inputs = t.window_segments("documents", seed)
-    outputs = {mode: jax.device_get(program(*inputs)) for mode, program in programs.items()}
+    with summed_as_run():
+        outputs = {mode: jax.device_get(program(*inputs)) for mode, program in programs.items()}
     with jax.enable_x64(True):
-        truth = jax.device_get(jax.jit(stages)(*widened(inputs)))
+        truth = jax.device_get(unrewritten(jax.jit(stages))(*widened(inputs)))
     for name, on, off, exact in zip(names, outputs["on"], outputs["off"], truth):
         record = records[name]
         record["different"] += int(np.sum(on != off))
