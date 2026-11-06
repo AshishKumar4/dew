@@ -588,7 +588,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 # empty grid).
                 continue
 
-            def body(indices, *refs, step=step, lo=lo, joins=None):
+            def body(indices, *refs, joins: dict, step=step, lo=lo):
                 (index,), (carried, accumulators) = indices, refs[-1]
                 landed, slots = iter(refs[:-1]), {}
                 for name in names:
@@ -622,8 +622,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 return pipeline(*operands)
 
             # The joined tiles staged as the stream's whole tiles are (`lifetimes`' walk scope).
-            joins = (mosaic.staged(*blocks[name], _join_swizzle(blocks[name], streams, name))
-                     for name in copies)
+            joins = (mosaic.staged(blocks[name][0], blocks[name][1],
+                                   _join_swizzle(blocks[name], streams, name)) for name in copies)
             carry = pl.run_scoped(piped, *joins) if copies else piped()
         return carry
 
