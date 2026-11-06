@@ -399,8 +399,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             progress=self.progress(step), opened=step.sown())
         loss, aux = self._charged(logits, inputs, batch)
-        # The backbone is applied apart from the head, its maxima nested under its parameters' name.
-        qk, inspected = step.observed(sown, "backbone")
+        qk, inspected = step.observed(sown)
         return loss, replace(aux, qk_stats=qk, inspected=inspected)
 
     def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
