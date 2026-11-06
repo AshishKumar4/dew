@@ -1444,11 +1444,17 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     """Whether each record of `back` lies within its launch's enclosure (`back_enclosures`), as stored (in
     its record's dtype): `[N, H, ...]` each, the gradient each chunk's memory enters with the record before
     it (the initial memory's, `dh0`, for the first)."""
-    def stored(iv: Iv, dtype) -> Iv:
-        return iv if dtype == np.float32 else cast(iv, {"bfloat16": BFLOAT16, "float16": FLOAT16}[str(dtype)])
-
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide)
+
+    def stored(iv: Iv, dtype) -> Iv:
+        """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
+        the call holds its values in parts (`Lane.held`), the parts' sum (`staged`)."""
+        if dtype == np.float32:
+            return iv
+        return staged(iv, lane) if run.held > 1 else cast(iv, {"bfloat16": BFLOAT16,
+                                                                  "float16": FLOAT16}[str(dtype)])
+
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -1521,7 +1527,7 @@ class KeyBackStep(NamedTuple):
     d_system: np.ndarray
 
 
-def key_pairs_back(d_pairs: Iv, rows: np.ndarray, k: np.ndarray, exponents: Exponents, lane: Lane) -> tuple:
+def key_pairs_back(d_pairs: Iv, rows, k: np.ndarray, exponents: Exponents, lane: Lane) -> tuple:
     """`algebra.key_decayed_pairs_back`'s gradients through a chunk's pairs `P[i, j] = sum_k r_ik k_jk
     exp2(E_ik - E_jk)` (`key_pairs`'), given their gradient `d_pairs` `[C, C]` (as stored, scaled as they
     were): the rows' `sum_j dP_ij k_j exp2(E_i - E_j)` and the keys' `sum_i dP_ij r_i exp2(E_i - E_j)`, each
@@ -1535,7 +1541,8 @@ def key_pairs_back(d_pairs: Iv, rows: np.ndarray, k: np.ndarray, exponents: Expo
     gradient = Iv(d_pairs.lo[:, :, None], d_pairs.hi[:, :, None])
     weighted = mul(gradient, decay)
     d_rows = mul(weighted, point(np.asarray(k)[None, :, :]))
-    d_keys = mul(weighted, point(np.asarray(rows)[:, None, :]))
+    held = held_iv(rows)
+    d_keys = mul(weighted, Iv(held.lo[:, None, :], held.hi[:, None, :]))
 
     def summed(terms: Iv, axis: int) -> Iv:
         magnitude = np.maximum(np.abs(terms.lo), np.abs(terms.hi)).sum(axis)
@@ -1587,10 +1594,12 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
     du = point(step.dv)
     values = fp32(mul(fp32(add(du, dot(lower_t, du, lane)), lane), point(beta)), lane)
     d_scores_scaled = fp32(mul(point(step.d_scores), factor), lane)
-    dq_pairs, _ = key_pairs_back(d_scores_scaled, step.q, step.k, exponents, lane)
-    keyed_rows = np.asarray(step.k) * beta
-    d_keyed, d_keys = key_pairs_back(point(step.d_system), keyed_rows, step.k, exponents, lane)
-    dk_pairs = fp32(add(fp32(mul(d_keyed, point(beta)), lane), d_keys), lane)
+    dq_pairs, scored_keys = key_pairs_back(d_scores_scaled, step.q, step.k, exponents, lane)
+    keyed_rows = fp32(mul(point(step.k), point(beta)), lane)
+    d_keyed, system_keys = key_pairs_back(point(step.d_system), keyed_rows, step.k, exponents, lane)
+    # The keys' gradient summed over both pairs (`algebra.key_decayed_pairs_back`'s 'keys').
+    keys = fp32(add(scored_keys, system_keys), lane)
+    dk_pairs = fp32(add(fp32(mul(d_keyed, point(beta)), lane), keys), lane)
     return {"d_scores": d_scores, "local": local, "dv": dv, "entering": entering, "dq_memory": d_query,
             "dk_memory": dk_memory, "values": values, "dq_pairs": dq_pairs, "dk_pairs": dk_pairs}
 
