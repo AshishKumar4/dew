@@ -719,9 +719,10 @@ def test_a_released_checkpoint_states_the_calibration_laya_cannot(decide, tmp_pa
     again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=gated.name)
     assert again.calibration.abstention == gated.calibration.abstention
     assert again.calibration.binning == gated.calibration.binning
-    answers = [again.systemone(request) for request in CASES.values()]
-    assert answers == [gated.systemone(request) for request in CASES.values()]
-    assert answers != [decide.systemone(request) for request in CASES.values()]
+    # With details, which report whether each answer abstained.
+    answers = [again.systemone(request, details=True) for request in CASES.values()]
+    assert answers == [gated.systemone(request, details=True) for request in CASES.values()]
+    assert answers != [decide.systemone(request, details=True) for request in CASES.values()]
 
 
 MESH_SEEDS = 8
