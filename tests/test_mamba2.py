@@ -530,3 +530,49 @@ def test_a_gated_norm_broadcasts_its_gate_in_either_order(scale_wide):
                     else normalized.astype(jnp.float64) * weight.astype(jnp.float64)).astype(jnp.float64)
         np.testing.assert_array_equal(np.asarray(first.apply({"params": {"weight": weight}}, x[:1], wide)),
                                       np.asarray(expected))
+
+
+def test_documents_that_enter_another_read_its_state_and_history_as_their_own_rows_do():
+    """The Mamba-2 layer over a row of shared parts and the documents that enter them (`dew.batch.Entered`,
+    the questions of rows over one state) gives each document's tokens what its own row of the part it
+    enters and itself gives them, over drawn inputs (check 1): the conv reads the entered part's last tokens
+    and the scan starts from its final state (`dew.nn.linear.entered_scan`); padding comes back zero (row
+    1506)."""
+    import dataclasses
+
+    from dew.batch import Entered, coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
+
+    module = mamba2_layer()
+    variables = mamba2_layer_params(mamba2_layer_draw(0))
+    width = mamba2_layer_draw(0)["hidden"].shape[-1]
+    lengths, enters = [5, 3, 2, 4, 3], [0, 1, 1, 0, 4]
+    documents = np.concatenate([*(np.full(length, number, np.int32)
+                                  for number, length in enumerate(lengths, 1)), np.zeros(2, np.int32)])
+    valid = documents > 0
+    tokens = coordinates(valid=jnp.asarray(valid[None]), segments=jnp.asarray(documents[None]))
+    entered = Entered(jnp.asarray(documents[None]), jnp.asarray([enters], jnp.int32))
+    call = MixerCall(AttentionMetadata(coordinates=dataclasses.replace(tokens, entered=entered)))
+    begins = np.cumsum([0, *lengths])
+
+    def draw(seed):
+        drawn = np.random.default_rng(seed).normal(size=(1, len(documents), width))
+        return (jnp.asarray(drawn, jnp.float32),)
+
+    @jax.jit
+    def entering(hidden):
+        return module.apply(variables, hidden, call)
+
+    @jax.jit
+    def apart(hidden):
+        out = jnp.zeros_like(hidden)
+        for number, (length, root) in enumerate(zip(lengths, enters, strict=True)):
+            own = hidden[:, begins[number]:begins[number] + length]
+            start = 0 if root == 0 else begins[root - 1]
+            shared = hidden[:, start:start + (0 if root == 0 else lengths[root - 1])]
+            row = module.apply(variables, jnp.concatenate([shared, own], axis=1))
+            out = out.at[:, begins[number]:begins[number] + length].set(row[:, shared.shape[1]:])
+        return out
+
+    assert_as_exact(entering, apart, draw, "Mamba-2 documents entering another's state and history", seeds=12)
+    assert not np.any(np.asarray(entering(*draw(0)))[:, ~valid])
