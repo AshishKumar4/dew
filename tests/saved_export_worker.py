@@ -63,7 +63,8 @@ def memory_detail():
     for line in Path("/proc/self/smaps_rollup").read_text().splitlines()[1:]:
         name, value = line.split(":", 1)
         result["rollup_" + name] = int(value.split()[0]) * 1024
-    return result
+    return {key: result[key] for key in ("VmRSS", "VmHWM", "RssAnon", "RssFile",
+                                        "rollup_Rss", "rollup_Anonymous")}
 
 
 def digests(directory: Path) -> dict[str, str]:
@@ -107,10 +108,11 @@ def resident_growth(into: list[int]) -> Iterator[None]:
     detail_after = memory_detail()
     record = {"before": detail_before, "after": detail_after,
               "new_modules": sorted(set(sys.modules) - modules_before),
-              "compiles": COMPILES[compiles_before:]}
+              "compile_count": len(COMPILES) - compiles_before,
+              "compiles": [line[:120] for line in COMPILES[compiles_before:]][:8]}
     if tracing:
         record["traced"] = tracemalloc.get_traced_memory()
-        record["top"] = [str(s) for s in tracemalloc.take_snapshot().statistics("lineno")[:12]]
+        record["top"] = [str(s) for s in tracemalloc.take_snapshot().statistics("lineno")[:4]]
         tracemalloc.stop()
     TRACE.append(record)
 
