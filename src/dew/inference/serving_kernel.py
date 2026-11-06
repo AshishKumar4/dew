@@ -845,15 +845,15 @@ def page_programs(formats: Formats, rows: NamedSharding | None) -> tuple[OuterPr
     host (`dew.inference.pages.Transfers`): reading pages out, and writing pages in, the pages handed in a
     row per group placed as the server's admitted rows are (`rows`), the resident matrices donated. JAX
     writes no slice into an array in host memory, so the host keeps the pages it reads."""
-    return _host_moves(_read_pages, _written_pages, split_donated(formats), rows)
+    resident, carried = split_donated(formats)
+    return _host_moves(_read_pages, _written_pages, (resident, carried), (resident, carried), rows)
 
 
-def _host_moves(read: Callable, write: Callable, placed: tuple[Placements, ...], rows: NamedSharding | None
-                ) -> tuple[OuterProgram, OuterProgram]:
+def _host_moves(read: Callable, write: Callable, placed: tuple[Placements, ...], out: Placements,
+                rows: NamedSharding | None) -> tuple[OuterProgram, OuterProgram]:
     """The pair of programs that move a device store's places, placed as `placed` (its arguments before the
     places), to the host and back (`read`, `write`): the write's places handed in a row per group placed as
-    `rows`, its store donated."""
-    out: Placements = placed if len(placed) > 1 else placed[0]
+    `rows`, its store donated and returned placed as `out`."""
     return (outer_program(read, in_shardings=(*placed, None)),
             outer_program(write, donate_argnums=(0,), in_shardings=(*placed, None, rows), out_shardings=out))
 
@@ -893,8 +893,8 @@ def entry_programs(states: Variables, rows: NamedSharding | None) -> tuple[Outer
     the host (`dew.inference.pages.States`' spills and uploads): reading entries out, and writing entries
     in, the entries handed in a row per group placed as the server's admitted rows are (`rows`), the store
     donated (`_host_moves`)."""
-    return _host_moves(_read_entries, _written_entries, (jax.tree.map(lambda leaf: leaf.sharding, states),),
-                       rows)
+    placed = jax.tree.map(lambda leaf: leaf.sharding, states)
+    return _host_moves(_read_entries, _written_entries, (placed,), placed, rows)
 
 
 def opened_in(formats: Formats) -> OuterProgram:
