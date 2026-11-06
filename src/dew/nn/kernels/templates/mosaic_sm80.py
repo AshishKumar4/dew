@@ -448,6 +448,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
 
+    # Its programs wait across programs through global-memory semaphores (`Family.fixed_up`), which sm_70 on
+    # issues: a balanced tail's and a decode's split partials merge in the launch.
+    fixes_up = True
+
     bounded_loads = False
 
     # A step loading ahead of the one consumed leaves cp.async's latency unhidden: two steps 64 deep stalled
@@ -663,6 +667,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def published(self) -> None:
         # Its products read shared memory through ldmatrix, the warpgroup's own loads, which the store's
         # automatic barriers order.
+        pass
+
+    def added_settled(self) -> None:
+        # Its adds go from registers (`added`'s `red.global`), none in flight past its issue; the ticket's
+        # GPU-scope release orders them before the next turn.
         pass
 
 
