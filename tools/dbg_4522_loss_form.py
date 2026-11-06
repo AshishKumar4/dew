@@ -1,9 +1,14 @@
 """Separate the local window's loss rule from its batched head."""
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+
+import lane_environment
+
+os.environ.update(lane_environment.configured(os.environ))
 
 import jax
 import jax.numpy as jnp
@@ -80,6 +85,8 @@ for key, errors in totals.items():
     path, variant, mode = key
     base = np.asarray(totals[path, "literal", mode])
     errors = np.asarray(errors)
+    if not np.any(base):
+        continue
     print(json.dumps({"leaf": path, "variant": variant, "mode": mode,
                       "above4": int(np.sum(errors > 4 * base)),
                       "below4": int(np.sum(base > 4 * errors)),
