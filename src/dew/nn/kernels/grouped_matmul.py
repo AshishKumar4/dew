@@ -999,9 +999,10 @@ class MosaicGmm(_Mosaic):
         # Its few output tiles leave a wave's programs idle: its depth splits where the busiest program then
         # walks shorter, its fp32 partials' passes and their sum's launch counted (`mosaic_gpu.split_count`,
         # the kernel gradient's rule; rows 1762 and 483), every run in the one launch (`mosaic_gpu.gmm`).
-        weight, padded = swapped.arguments['tokens'].shape, swapped.arguments['kernel'].shape
+        weight, padded = swapped.arguments['tokens'], swapped.arguments['kernel']
         splits = 1 if ba.arguments['exact_sums'] else mosaic_gpu.split_count(
-            tile, groups=1, rows=weight[1], depth=weight[0], width=padded[1],
+            tile, groups=1, rows=weight.shape[1], depth=weight.shape[0], width=padded.shape[1],
+            itemsizes=(weight.dtype.itemsize, padded.dtype.itemsize),
             multiprocessors=_multiprocessors(target), step_seconds=mosaic_gpu.step_seconds(tile, target),
             bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
         swapped_tile = dataclasses.replace(tile, swapped=True)
@@ -1186,8 +1187,10 @@ class MosaicTgmm(_Mosaic):
 
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
         depth, _, width = self._generated_extents(ba)
-        return mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0],
-                                      rows=ba.arguments['tokens'].shape[0], depth=depth, width=width,
+        tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
+        return mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0], rows=tokens.shape[0],
+                                      depth=depth, width=width,
+                                      itemsizes=(tokens.dtype.itemsize, cotangent.dtype.itemsize),
                                       multiprocessors=_multiprocessors(target),
                                       step_seconds=mosaic_gpu.step_seconds(tile, target),
                                       bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
