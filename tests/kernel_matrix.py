@@ -35,13 +35,13 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "dtype": ("bfloat16", "float16", "float32"),
     },
     "decode": {
-        "generation": ("sm90", "sm80"),
+        "generation": ("sm90", "sm80", "v5e"),
         "layout": ("dense", "paged"),
         "heads": ("gqa-16-8", "mha-8"),
         "hook": ("plain", "sinks", "softcap"),
         "dtype": ("bfloat16", "float16", "float32"),
         "width": ("64", "128"),
-        "kernel": ("decode", "cudnn", "triton", "template"),
+        "kernel": ("decode", "cudnn", "triton", "template", "tpu"),
     },
     "gemm": {
         "generation": ("sm90", "sm80", "v5e"),
@@ -201,6 +201,7 @@ FLOWS: tuple[str, ...] = (
 
 TPU_FLOWS: tuple[str, ...] = (
     "tests/test_attention_splash.py::test_the_attention_kernels_matrix_holds_on_this_tpu",
+    "tests/test_attention_splash.py::test_the_decode_matrix_holds_on_this_tpu",
 )
 """The flows that run the matrices' TPU cells on the TPU tier (`-m tpu`), by pytest node id."""
 
