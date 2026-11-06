@@ -307,10 +307,7 @@ def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool
     """Whether `precision` asks for no more than the default. With
     `configured`, an unset precision reads `jax_default_matmul_precision`,
     the default a product without one gets."""
-    names = precision_names(precision)
-    if not names and configured:
-        names = precision_names(jax.config.jax_default_matmul_precision)
-    return names <= {'DEFAULT'}
+    return precision_names(effective_precision(precision) if configured else precision) <= {'DEFAULT'}
 
 
 def effective_precision(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
@@ -811,10 +808,10 @@ def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = No
     algorithm at run time (`dew.nn.kernels.generation.BF16_GPU`). A configured dot algorithm preset is
     no level a run picks but how dots that state none sum (check 1's arms state F32_F32_F32), which the
     algorithm's fp32 sums already are, so it keeps the algorithm."""
-    configured = jax.config.jax_default_matmul_precision
+    asked = effective_precision(precision)
     presets = set(jax.lax.DotAlgorithmPreset.__members__)
-    level = None if configured is None or precision_names(configured) & presets else configured
-    asked = precision if precision_names(precision) else level
+    if not precision_names(precision) and precision_names(asked) & presets:
+        asked = None
     if dtype is None or jnp.dtype(dtype) != jnp.bfloat16 or not asks_default_precision(asked):
         return precision
     # Imported here: dew.nn.kernels imports this module.

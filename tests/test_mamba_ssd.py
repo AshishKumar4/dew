@@ -7,6 +7,7 @@ Triton kernels. The port's distance from float64 against mamba_ssm's own at trai
 gate (docs/performance.md, "The Mamba-2 SSD scan").
 """
 
+import contextlib
 from pathlib import Path
 
 import jax
@@ -40,9 +41,14 @@ INTERPRETED = jax.default_backend() != "gpu"
 SEEDED = FIXTURES / "ssd_mamba_ssm_seeded.npz"
 
 
+@contextlib.contextmanager
 def row_names_port(*, port: bool = True):
-    """Choose the port for the scan where `port`, else XLA; off a GPU the port's kernels interpret."""
-    return generation.chosen(ssd="pallas" if port else "xla")
+    """Choose the port for the scan where `port`, else XLA; off a GPU the port's kernels interpret. The
+    port runs at the default product precision its fp32 products are declared at (TF32,
+    `recurrence_chunk._port_precision`), which the suite's lanes' 'highest' hands to XLA."""
+    with (generation.chosen(ssd="pallas" if port else "xla"),
+          jax.default_matmul_precision("default") if port else contextlib.nullcontext()):
+        yield
 
 
 SHARDED_SEEDS = 256

@@ -555,9 +555,14 @@ def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs(kind):
     assert np.isfinite(np.asarray(got)).all()
 
 
+@contextlib.contextmanager
 def row_names_port(*, port: bool = True):
-    """Choose the port for the rule where `port`, else XLA; off a GPU the port's kernels interpret."""
-    return generation.chosen(gated_delta_rule="fla" if port else "xla")
+    """Choose the port for the rule where `port`, else XLA; off a GPU the port's kernels interpret. The
+    port runs at the default product precision its fp32 products are declared at (TF32,
+    `recurrence_chunk._port_precision`), which the suite's lanes' 'highest' hands to XLA."""
+    with (generation.chosen(gated_delta_rule="fla" if port else "xla"),
+          jax.default_matmul_precision("default") if port else contextlib.nullcontext()):
+        yield
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
@@ -750,7 +755,8 @@ def test_a_remat_policy_changes_no_gradient(policy):
     par with it by check 1 (`assert_as_exact`) over fresh parameters and inputs drawn from each seed
     (`REMAT_ROWS` rows of `REMAT_LENGTH` tokens), truth the float64 layer's gradient. A GPU compiles
     the remat step as another program, whose roundings differ: on an H100 even the XLA math's A_log
-    gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
+    gradient moved by 5.4e-5 relative between the two, the remat one nearer float64. The port runs at
+    the default product precision its fp32 products are declared at (`row_names_port`)."""
     from dew.nn.backbones.decoder_block import remat_policy
     from dew.nn.kernels.recurrence_chunk import recomputing
 
@@ -789,8 +795,9 @@ def test_a_remat_policy_changes_no_gradient(policy):
         with generation.chosen(gated_delta_rule="xla"):
             return with_gradients(lambda params, x: jnp.sum(wide.apply(params, x) ** 2))(params, x, one)[1]
 
-    assert_as_exact(remat_grad, reference_grad, draw, "remat policy gradient",
-                    seeds=REMAT_SEEDS, truth_fn=jax.jit(truth))
+    with jax.default_matmul_precision("default"):
+        assert_as_exact(remat_grad, reference_grad, draw, "remat policy gradient",
+                        seeds=REMAT_SEEDS, truth_fn=jax.jit(truth))
 
 
 @pytest.mark.parametrize("chunk_size", [32, 64])
@@ -798,15 +805,17 @@ def test_a_remat_policy_changes_no_gradient(policy):
 def test_the_rule_on_the_port_takes_any_chunk_size_and_mixed_dtypes_in_their_common_dtype(chunk_size):
     """`chunk_gated_delta_rule` where a GPU runs the port, at any chunk size the caller names, which
     reaches only the portable math (the rule's value does not depend on it), and with float32
-    queries over bf16 keys and values, which the port takes in their common dtype: it runs, its
-    results float32 and finite."""
+    queries over bf16 keys and values, which the port takes in their common dtype at the default
+    product precision its fp32 products are declared at (`row_names_port`): it runs, its results
+    float32 and finite."""
     keys = jax.random.split(jax.random.key(41), 5)
     q = l2norm(jax.random.normal(keys[0], (1, 96, 1, 64)))
     k = l2norm(jax.random.normal(keys[1], q.shape)).astype(jnp.bfloat16)
     v = jax.random.normal(keys[2], (1, 96, 2, 64)).astype(jnp.bfloat16)
     g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
-    got = recurrence_chunk.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
+    with jax.default_matmul_precision("default"):
+        got = recurrence_chunk.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
     for mine in got:
         assert mine.dtype == jnp.float32 and np.isfinite(np.asarray(mine)).all()
 

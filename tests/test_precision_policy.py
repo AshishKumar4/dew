@@ -781,13 +781,19 @@ def test_a_routes_declaration_is_the_runs_configured_precision_where_the_call_st
     # The suite's lanes configure 'highest' (lane_environment); the run here declares the default.
     with generation.run_precision(Numerics("32-true")), jax.default_matmul_precision("default"):
         assert not reference_only(query, None, None, force_fp32_for_softmax=True)
-        assert precision.rounds_products() and recurrence_chunk.fast_rounding()
+        assert precision.rounds_products() and recurrence_chunk.fast_rounding(jnp.float32)
         assert all(admits(supports, np.float32) for supports in (*ports, recurrence_chunk.TEMPLATE_SUPPORTS))
     with generation.run_precision(Numerics("32-true", matmul="highest")):
         assert not reference_only(query, None, None, force_fp32_for_softmax=True)
         assert not reference_only(query.astype(jnp.bfloat16), None, None, force_fp32_for_softmax=True)
         assert precision.effective_precision(None) == "highest"
-        assert not precision.rounds_products() and not recurrence_chunk.fast_rounding()
+        assert not precision.rounds_products() and not recurrence_chunk.fast_rounding(jnp.float32)
+        # A 16-bit call's rounded numbers are its intermediates', mamba_ssm's and fla's, its products whole
+        # at any precision: the run's fast forms take them at 'highest' too, and its accurate ones never.
+        assert recurrence_chunk.fast_rounding(jnp.bfloat16)
+        assert recurrence_chunk.chunk_rounding(delta=True, dtype=jnp.bfloat16)
+    with generation.run_precision(Numerics("32-true", forms="accurate", matmul="default")):
+        assert not recurrence_chunk.fast_rounding(jnp.bfloat16)
         assert not any(admits(supports, np.float32) for supports in ports)
         assert all(admits(supports, jnp.bfloat16) for supports in ports)
         assert admits(recurrence_chunk.TEMPLATE_SUPPORTS, np.float32)
