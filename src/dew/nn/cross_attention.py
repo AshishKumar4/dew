@@ -75,7 +75,7 @@ from .attention_masks import max_attention_logits, visibility_mask
 from .documents import CrossDocuments, holds_keys
 from .flops import counted_flops
 from .inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext
-from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
+from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, projection_role, sqrt_or_zero
 
 if TYPE_CHECKING:
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -540,7 +540,8 @@ class GatedCrossAttention(nn.Module):
                            ngpt=self.ngpt, precision=self.precision)
 
         stream = joined(stream, "alpha_cross_attn", output)
-        hidden = self.feedforward(name="mlp")(self._normed(self.norms[1], read(stream)))
+        with projection_role("mlp"):  # A feed-forward's projections, as a recipe takes them by role.
+            hidden = self.feedforward(name="mlp")(self._normed(self.norms[1], read(stream)))
         return joined(stream, "alpha_dense", hidden)
 
     def _normed(self, name: str, x: jax.Array) -> jax.Array:

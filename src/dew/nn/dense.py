@@ -32,7 +32,7 @@ from flax.typing import Array
 from dew._cache import INTERCEPTED
 
 from .kernels import gemm
-from .precision import accumulated, biased, float32_dot_general
+from .precision import accumulated, biased, float32_dot_general, recipe_role
 from .sharding import declared
 
 QWIX = importlib.util.find_spec("qwix") is not None
@@ -63,10 +63,23 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
     product with a policy of its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`)
     is the layer's own: the template reads no policy from a callable."""
     if layer.dot_general_cls is not None:
+        _refuse_recipe("a quantizer's product class")
         return layer.dot_general_cls()
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     plain = layer.dot_general in (None, float32_dot_general)
+    if intercepted():
+        _refuse_recipe("a wrapper's product (an adapter's, a quantizer's)")
     return gemm.dot_general(product) if plain and not intercepted() else product
+
+
+def _refuse_recipe(owner: str) -> None:
+    """Refuse a projection the run's low-precision recipe takes by its role (`recipe_role`) whose product
+    `owner` holds instead, which would train it unquantized, silently: the recipe and a product wrapper
+    compose nowhere yet."""
+    held = recipe_role()
+    if held is not None and held[1] in held[0].roles:
+        raise ValueError(f"the run's {held[0].recipe} recipe takes this {held[1]} projection, whose product "
+                         f"{owner} holds: train it in the recipe or under the wrapper, not both")
 
 
 def plain_product():

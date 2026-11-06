@@ -577,8 +577,9 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     """
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
     compute = canonicalize_dtype(x, stack, *(() if bias is None else (bias,)), dtype=dtype)
-    # The run's low-precision recipe takes the experts' product where their role takes it.
-    matrices = (stack if layer is None else stack[layer]).astype(compute)
+    # The run's low-precision recipe takes the experts' product where their role takes it, the matrices'
+    # values the compute dtype's held in the master's, so their gradient keeps the master dtype.
+    matrices = rounded_operand(stack if layer is None else stack[layer], compute)
     with projection_role("experts"):
         recipe = gemm.recipe_projection(jnp.asarray(x, compute), matrices, group_sizes, out_dtype=compute,
                                         bias=None if bias is None else rounded_operand(bias, compute))

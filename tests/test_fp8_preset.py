@@ -61,6 +61,67 @@ def test_the_routers_gates_and_head_never_reach_the_fp8_projection():
     assert len(taken) == 17, [route.site for route in taken]
 
 
+def test_a_grouped_output_projection_takes_the_recipe_group_by_group():
+    """A batched projection (DeepSeek V4's grouped `o_a_proj`, a `DenseGeneral` whose kernel holds a
+    matrix a group) under the 'fp8' numerics takes the recipe as its groups' matrices, each group's rows
+    against its own: bit for bit the recipe over each group apart."""
+    from dew.nn.dense import DenseGeneral
+    from dew.nn.precision import projection_role
+
+    layer = DenseGeneral(WIDTH, batch_dims=(0,), axis=-1, use_bias=False, dtype=jnp.float32)
+    x = jnp.asarray(np.random.default_rng(1).normal(size=(2, 3, 5, WIDTH)), jnp.float32)
+    x = jnp.moveaxis(x, 0, 1)  # [tokens, groups, ..., in] as V4's grouped output reads it
+    params = layer.init(jax.random.key(0), x)
+    with generation.run_precision(FP8), projection_role("mixer"), generation.routes() as found:
+        out = layer.apply(params, x)
+    assert [route.kernel != "unquantized" for route in found if route.choice == "blockwise_fp8"] == [True]
+    kernel = params["params"]["kernel"]
+    for group in range(x.shape[1]):
+        with generation.run_precision(FP8), projection_role("mixer"):
+            alone = gemm.recipe_projection(x[:, group].reshape(-1, WIDTH), kernel[group],
+                                           out_dtype=jnp.float32)
+        np.testing.assert_array_equal(np.asarray(jnp.moveaxis(out, 1, 0)[group]).reshape(-1, WIDTH),
+                                      np.asarray(alone))
+
+
+def test_a_projection_the_recipe_takes_under_a_product_wrapper_is_refused():
+    """A projection the 'fp8' numerics take by role whose product a wrapper holds (an adapter's or a
+    quantizer's interception) would train unquantized, silently: refused, and a role the recipe keeps is
+    not."""
+    from dew import _cache
+    from dew.nn.dense import Dense
+    from dew.nn.precision import projection_role
+
+    layer = Dense(WIDTH, dtype=jnp.float32)
+    x = jnp.ones((2, WIDTH), jnp.float32)
+    params = layer.init(jax.random.key(0), x)
+    with generation.run_precision(FP8), _cache.INTERCEPTED(new_value=True):
+        with projection_role("mlp"), pytest.raises(ValueError, match="recipe"):
+            layer.apply(params, x)
+        with projection_role("router"):
+            layer.apply(params, x)
+
+
+def test_the_experts_kernel_gradient_keeps_the_master_dtype():
+    """The experts' kernel gradient under the 'fp8' numerics keeps the master's float32, as
+    `expert_projection`'s contract says: 257 rows of ones through a matrix of ones, each kernel entry's
+    gradient 257, which a bfloat16 rounding would make 256."""
+    from dew.nn.moe import expert_projection
+
+    rows = jnp.ones((257, WIDTH), jnp.bfloat16)
+    stack = jnp.ones((1, WIDTH, WIDTH), jnp.float32)
+    sizes = jnp.asarray([257], jnp.int32)
+
+    def summed(stack):
+        with generation.run_precision(FP8):
+            projected = expert_projection(rows, stack, sizes, jnp.bfloat16, "auto", None)
+            return jnp.sum(projected.astype(jnp.float32))
+
+    gradient = jax.grad(summed)(stack)
+    assert gradient.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(gradient), np.full(stack.shape, 257.0, np.float32))
+
+
 def emulated(dtype):
     """`gemm.blockwise_fp8_projection` emulated in `dtype`: the recipe's quantizers
     (`gemm.rows_quantized`, `gemm.blocks_quantized`), each group's product of the dequantized values in
