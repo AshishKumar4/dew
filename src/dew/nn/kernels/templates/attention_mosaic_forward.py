@@ -1852,7 +1852,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         if column_blocks > 1:
             head, column = lax.div(axis, column_blocks), lax.rem(axis, column_blocks)
         else:
-            head, column = axis, None if read.block is None else read.block[0]
+            head, column = axis, None if read.block is None else family.scalar_of(read.block)
         named = {"keys": refs.k} if peaks else {"keys": refs.k, "values": refs.v}
         views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page,
                            block_k=block_k, column_block=column)
