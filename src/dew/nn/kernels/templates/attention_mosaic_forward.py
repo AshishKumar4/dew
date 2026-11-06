@@ -31,7 +31,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
@@ -149,20 +148,20 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     barrier each."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
     scoped = [mosaic.staged((consumers, parts * block_q, width), dtype, query_swizzle(family)),
-              plgpu.SMEM((consumers, block_q), jnp.float32)]
+              family.staged_memory((consumers, block_q), jnp.float32)]
     if residuals:
-        scoped.append(plgpu.SMEM((consumers, block_q, value_width), jnp.float32))
+        scoped.append(family.staged_memory((consumers, block_q, value_width), jnp.float32))
     elif not peaks and not _stores_through_query(family, width, value_width, dtype, out_dtype):
-        scoped.append(plgpu.SMEM((consumers, block_q, value_width), out_dtype or dtype))
+        scoped.append(family.staged_memory((consumers, block_q, value_width), out_dtype or dtype))
     if residuals or peaks:
-        scoped.append(plgpu.SMEM((consumers, block_q), jnp.int32))
+        scoped.append(family.staged_memory((consumers, block_q), jnp.int32))
     if certified:
-        scoped.append(plgpu.SMEM((consumers, block_q, value_width), jnp.float32))
+        scoped.append(family.staged_memory((consumers, block_q, value_width), jnp.float32))
     if codes is not None:
         # Quantized keys' and values' tiles as the products read them, a consumer's own (`Family.converted`).
         scoped.append(mosaic.staged((consumers, block_k, width), dtype,
                                     transposed_swizzles(tiles, "keys").get("keys")))
-        scoped.append(plgpu.SMEM((consumers, block_k, value_width), dtype))
+        scoped.append(family.staged_memory((consumers, block_k, value_width), dtype))
     if relays(family, tiles, peaks=peaks):
         # The weights' way to the values' product where the family's warps split them (`Family.relaying`).
         scoped.append(mosaic.plain((consumers, block_q, block_k), dtype))
