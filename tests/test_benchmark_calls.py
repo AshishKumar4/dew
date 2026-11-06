@@ -161,26 +161,30 @@ def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_n
 
 
 @pytest.mark.parametrize(("ratios", "alone", "level", "ratio", "interval", "noise", "differs"), [
-    # Six pairs at 0.95 hold their median between their least and greatest (rank 1).
-    ((1.31, 1.29, 1.30, 1.33, 1.28, 1.32), (0.99, 1.01, 1.00, 1.02, 0.98, 1.00), 0.95,
-     1.305, (1.28, 1.33), (0.98, 1.02), True),
-    # Ten pairs at 0.95 between their second least and second greatest (rank 2): the tenth's outlier at 0.97
-    # leaves the interval apart from 1.
-    ((1.10, 1.12, 1.11, 1.13, 0.97, 1.09, 1.12, 1.10, 1.11, 1.14),
-     (1.00, 0.99, 1.01, 1.00, 1.02, 0.98, 1.00, 1.01, 0.99, 1.00), 0.95, 1.11, (1.09, 1.13), (0.99, 1.01),
-     True),
-    # The same ten at 0.99 (rank 1): the outlier's 0.97 holds 1, so nothing differs.
-    ((1.10, 1.12, 1.11, 1.13, 0.97, 1.09, 1.12, 1.10, 1.11, 1.14),
-     (1.00, 0.99, 1.01, 1.00, 1.02, 0.98, 1.00, 1.01, 0.99, 1.00), 0.99, 1.11, (0.97, 1.14), (0.98, 1.02),
-     False),
-    # Apart from 1 but within the A/A's noise: the placement's own, not a difference, however far its median.
-    ((1.03, 1.04, 1.05, 1.03, 1.06, 1.04), (0.95, 1.07, 1.00, 0.97, 1.03, 1.01), 0.95, 1.04, (1.03, 1.06),
-     (0.95, 1.07), False),
+    # Six pairs at 0.95 hold their median between their least and greatest (rank 1). Every value a binary
+    # float holds exactly, so medians and ends are their literals.
+    ((1.3125, 1.28125, 1.296875, 1.34375, 1.265625, 1.328125),
+     (0.984375, 1.015625, 1.0, 1.03125, 0.96875, 1.0), 0.95, 1.3046875, (1.265625, 1.34375),
+     (0.96875, 1.03125), True),
+    # Ten pairs at 0.95 between their second least and second greatest (rank 2): the outlier at 0.96875 leaves
+    # the interval apart from 1.
+    ((1.09375, 1.125, 1.109375, 1.140625, 0.96875, 1.078125, 1.125, 1.09375, 1.109375, 1.15625),
+     (1.0, 0.984375, 1.015625, 1.0, 1.03125, 0.96875, 1.0, 1.015625, 0.984375, 1.0), 0.95, 1.109375,
+     (1.078125, 1.140625), (0.984375, 1.015625), True),
+    # The same ten at 0.99 (rank 1): the outlier holds 1, so nothing differs.
+    ((1.09375, 1.125, 1.109375, 1.140625, 0.96875, 1.078125, 1.125, 1.09375, 1.109375, 1.15625),
+     (1.0, 0.984375, 1.015625, 1.0, 1.03125, 0.96875, 1.0, 1.015625, 0.984375, 1.0), 0.99, 1.109375,
+     (0.96875, 1.15625), (0.96875, 1.03125), False),
+    # Apart from 1 but within the A/A's noise: the placement's own, not a difference.
+    ((1.03125, 1.046875, 1.0625, 1.03125, 1.078125, 1.046875),
+     (0.9375, 1.078125, 1.0, 0.96875, 1.03125, 1.015625), 0.95, 1.046875, (1.03125, 1.078125),
+     (0.9375, 1.078125), False),
     # Holding 1, though apart from the A/A's: chance accounts for it.
-    ((0.99, 1.02, 1.03, 1.04, 1.05, 1.03), (0.97, 0.98, 0.98, 0.97, 0.98, 0.98), 0.95, 1.03, (0.99, 1.05),
-     (0.97, 0.98), False),
+    ((0.984375, 1.015625, 1.03125, 1.046875, 1.0625, 1.03125),
+     (0.96875, 0.984375, 0.984375, 0.96875, 0.984375, 0.984375), 0.95, 1.03125, (0.984375, 1.0625),
+     (0.96875, 0.984375), False),
     # Ties at the ends.
-    ((1.2, 1.2, 1.2, 1.2, 1.2, 1.2), (1.0, 1.0, 1.0, 1.0, 1.0, 1.0), 0.95, 1.2, (1.2, 1.2), (1.0, 1.0), True),
+    ((1.25,) * 6, (1.0,) * 6, 0.95, 1.25, (1.25, 1.25), (1.0, 1.0), True),
 ])
 def test_paired_ratios_are_judged_against_their_a_a_by_one_rule(ratios, alone, level, ratio, interval,
                                                                   noise, differs):
@@ -191,7 +195,7 @@ def test_paired_ratios_are_judged_against_their_a_a_by_one_rule(ratios, alone, l
 
     judgment = judged(ratios, alone, level=level)
     assert (judgment.ratio, judgment.interval, judgment.alone, judgment.differs) == (
-        pytest.approx(ratio), pytest.approx(interval), pytest.approx(noise), differs)
+        ratio, interval, noise, differs)
 
 
 def test_ratios_too_few_for_an_interval_at_their_level_are_refused_and_six_are_not():
