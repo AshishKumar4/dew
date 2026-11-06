@@ -32,23 +32,26 @@ power iteration and keeps its `u`; the held, fake and R1 passes run one
 from that `u` and keep nothing. torch's own `spectral_norm` does each
 iteration, its `u` restored after the passes that keep nothing.
 
-The draws, each row's student time, its noise, its level's normal and its
-renoising noise, come from `jax.random.key(KEY)`: of the split's five keys
-the third, the fourth and the fifth split again. The test hands them to
-`AdversarialDistillationObjective.loss` by name (`Step.tape`), so both
-runs step on the same draws. The student and teacher networks
-are stand-ins with one token per sample. Both runs, float32 and float64,
-take their own precision wherever the published code names one (DiT's
-embedding computes in float32). What lands: the inputs, the draws, every
-weight in Flax's layout and the `u`s, and the loss, every gradient and the
-kept `u`s in float32 and float64.
+A seed's inputs are a seeded NumPy draw (`draw`) the test makes again: the
+pixels; the step's draws, each row's student time, its noise, its level's
+normal and its renoising noise, which the test hands to
+`AdversarialDistillationObjective.loss` by name (`Step.tape`), so both runs
+step on the same draws; the student and teacher stand-ins' weights, the
+networks one token per sample; and each head's weights and `u`s in the
+layout of Dew's `Head`. Both runs, float32 and float64, take their own
+precision wherever the published code names one (DiT's embedding computes
+in float32). What lands, over the seeds check 1 draws (`record_case`,
+tools/recorded_references.py): the loss, the student's gradient, each head's
+and the kept `u`s, each tree's leaves in one vector in their paths' order
+(`judged`), in float32 and float64, kept whole: Dew's objective computes its
+heads, their condition and their features in float32 whatever its inputs'
+precision, so its own float64 path is no truth for a summary to check.
 
-    PYTHONPATH=src python tools/ladd_reference.py
+    PYTHONPATH=src:tests python tools/ladd_reference.py
 """
 
 from __future__ import annotations
 
-import json
 import math
 import types
 from pathlib import Path
@@ -63,11 +66,12 @@ from torch_precision import float_as, replaced
 STYLEGAN_T = ("https://raw.githubusercontent.com/autonomousvision/stylegan-t/"
               "36ab80ce76237fefe03e65e9b3161c040ae888e3/")
 DIT = "https://raw.githubusercontent.com/facebookresearch/DiT/ed81ce2229091fd4ecc9a223645f95cf379d582b/models.py"
-FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "ladd" / "step.npz"
-SETTINGS = {"batch": 4, "side": 4, "channels": 3, "width": 6, "cmap_dim": 8, "time_features": 16,
+FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "ladd" / "seeds.npz"
+SETTINGS = {"batch": 64, "side": 4, "channels": 3, "width": 6, "cmap_dim": 8, "time_features": 16,
             "student_times": [1.0, 0.75, 0.5, 0.25], "renoise_times": [1.0, 1.0], "distillation_weight": 2.5,
-            "r1_weight": 0.5, "layers": ["layer_a", "layer_b"], "key": 5}
-"""R1's weight is far above ADD's 1e-5, so its term moves the loss."""
+            "r1_weight": 0.5, "layers": ["layer_a", "layer_b"]}
+"""R1's weight is far above ADD's 1e-5, so its term moves the loss. 64 rows a draw, eight of the local batch
+norms' groups of eight, as the loss, one number a draw, at 4 rows did not resolve paired within 512 seeds."""
 
 
 class Network(torch.nn.Module):
@@ -103,24 +107,38 @@ def restore(heads, held) -> None:
         module.weight_v.copy_(v)
 
 
-def flax_head(head) -> tuple[dict, dict]:
-    """A `DiscHead`'s weights and `u`s in the layout of Dew's `Head`."""
-    def conv(module):
-        return {"kernel": module.weight_orig.detach().double().numpy().transpose(2, 1, 0)[None],
-                "bias": module.bias.detach().double().numpy()}
+def us(head) -> dict:
+    """A `DiscHead`'s spectral `u`s in the layout of Dew's `Head`."""
+    return {"block_0": {"conv": {"u": head.main[0][0].weight_u.double().numpy()}},
+            "block_1": {"conv": {"u": head.main[1].fn[0].weight_u.double().numpy()}},
+            "cls": {"u": head.cls.weight_u.double().numpy()}}
 
-    def norm(module):
-        return {"weight": module.weight.detach().double().numpy(),
-                "bias": module.bias.detach().double().numpy()}
 
-    params = {"block_0": {"conv": conv(head.main[0][0]), "norm": norm(head.main[0][1])},
-              "block_1": {"conv": conv(head.main[1].fn[0]), "norm": norm(head.main[1].fn[1])},
-              "cls": conv(head.cls), "cmapper_weight": head.cmapper.weight.detach().double().numpy().T,
-              "cmapper_bias": head.cmapper.bias.detach().double().numpy()}
-    us = {"block_0": {"conv": {"u": head.main[0][0].weight_u.double().numpy()}},
-          "block_1": {"conv": {"u": head.main[1].fn[0].weight_u.double().numpy()}},
-          "cls": {"u": head.cls.weight_u.double().numpy()}}
-    return params, us
+def loaded(head, params: dict, initial: dict, dtype) -> None:
+    """`head` given weights and `u`s in the layout of Dew's `Head`, each `v` the one its `u` gives, which
+    the training-mode power iteration computes again before it reads it."""
+    def tensor(value):
+        return torch.as_tensor(np.asarray(value), dtype=dtype)
+
+    def conv(module, weights, u):
+        module.weight_orig.copy_(tensor(weights["kernel"][0].transpose(2, 1, 0)))
+        module.bias.copy_(tensor(weights["bias"]))
+        module.weight_u.copy_(tensor(u["u"]))
+        module.weight_v.copy_(torch.nn.functional.normalize(module.weight_orig.flatten(1).T @ module.weight_u,
+                                                            dim=0))
+
+    def norm(module, weights):
+        module.weight.copy_(tensor(weights["weight"]))
+        module.bias.copy_(tensor(weights["bias"]))
+
+    with torch.no_grad():
+        conv(head.main[0][0], params["block_0"]["conv"], initial["block_0"]["conv"])
+        norm(head.main[0][1], params["block_0"]["norm"])
+        conv(head.main[1].fn[0], params["block_1"]["conv"], initial["block_1"]["conv"])
+        norm(head.main[1].fn[1], params["block_1"]["norm"])
+        conv(head.cls, params["cls"], initial["cls"])
+        head.cmapper.weight.copy_(tensor(params["cmapper_weight"]).T)
+        head.cmapper.bias.copy_(tensor(params["cmapper_bias"]))
 
 
 def flax_gradient(head) -> dict:
@@ -147,6 +165,19 @@ def flatten(tree: dict, prefix: str) -> dict[str, np.ndarray]:
     return out
 
 
+def nested(arrays: dict[str, np.ndarray], prefix: str) -> dict:
+    """`flatten`'s inverse: the arrays under `prefix/` as a tree."""
+    tree: dict = {}
+    for key, value in arrays.items():
+        if key.startswith(prefix + "/"):
+            *path, leaf = key[len(prefix) + 1:].split("/")
+            node = tree
+            for name in path:
+                node = node.setdefault(name, {})
+            node[leaf] = value
+    return tree
+
+
 def published() -> dict:
     scope = {"torch": torch, "nn": torch.nn, "np": np, "SpectralNorm": SpectralNorm, "F": torch.nn.functional,
              "misc": None, "Callable": object, "Any": object}
@@ -165,26 +196,27 @@ def made(scope: dict, dtype):
     return head.to(dtype).train()
 
 
-def step(dtype, pixels, draws, student, teacher, heads_state) -> dict[str, np.ndarray]:
+def step(dtype, inputs: dict[str, np.ndarray], scope: dict) -> dict[str, np.ndarray]:
+    """One LADD step in `dtype` on a seed's inputs (`draw`): the loss, every gradient and the kept `u`s."""
     settings = SETTINGS
-    scope = published()
     narrowed = types.SimpleNamespace(**{**vars(torch), "float32": dtype})
     embedding = definitions(DIT, ("timestep_embedding",), {"torch": narrowed, "math": math},
                             within="TimestepEmbedder")["timestep_embedding"]
     heads = []
-    for state in heads_state:
+    for index in range(len(settings["layers"])):
         head = made(scope, dtype)
-        head.load_state_dict(state)
+        loaded(head, nested(inputs, f"heads/head_{index}"), nested(inputs, f"initial/head_{index}"), dtype)
         heads.append(head)
-    net = Network({name: torch.as_tensor(value, dtype=dtype) for name, value in student.items()})
-    teacher_net = Network({name: torch.as_tensor(value, dtype=dtype) for name, value in teacher.items()})
+    net, teacher_net = (Network({name: torch.as_tensor(value, dtype=dtype)
+                                 for name, value in nested(inputs, side).items()})
+                        for side in ("student", "teacher"))
     teacher_net.requires_grad_(requires_grad=False)
-    x = torch.as_tensor(pixels, dtype=dtype) / 127.5 - 1
-    chosen = np.asarray(settings["student_times"])[draws["indices"]]
+    x = torch.as_tensor(inputs["pixels"], dtype=dtype) / 127.5 - 1
+    chosen = np.asarray(settings["student_times"])[inputs["draws/indices"]]
     t = torch.as_tensor(chosen, dtype=dtype).reshape(-1, 1, 1, 1)
-    noise, renoise = (torch.as_tensor(draws[name], dtype=dtype) for name in ("noise", "renoise"))
+    noise, renoise = (torch.as_tensor(inputs[f"draws/{name}"], dtype=dtype) for name in ("noise", "renoise"))
     mean, std = settings["renoise_times"]
-    level = torch.sigmoid(mean + std * torch.as_tensor(draws["level"], dtype=dtype))
+    level = torch.sigmoid(mean + std * torch.as_tensor(inputs["draws/level"], dtype=dtype))
     s = level.reshape(-1, 1, 1, 1)
 
     with replaced(float_as(dtype)):
@@ -203,20 +235,10 @@ def step(dtype, pixels, draws, student, teacher, heads_state) -> dict[str, np.nd
         real = [f.detach().requires_grad_() for f in features(x)]
         fake, held = features(clean), [f.detach() for f in features(clean.detach())]
 
-        def scores(features):
-            return [head(f, condition).reshape(f.shape[0], -1)
-                    for head, f in zip(heads, features, strict=True)]
-
         def logits(features):
-            return torch.cat(scores(features), -1)
+            return torch.cat([head(f, condition).reshape(f.shape[0], -1)
+                              for head, f in zip(heads, features, strict=True)], -1)
 
-        # Each head's hinge has live terms, real and held, and dead ones: with
-        # every term live, a head's last bias enters real and held alike and
-        # its gradient cancels to zero.
-        for real_head, held_head in zip(scores(real), scores(held), strict=True):
-            live = torch.cat([real_head < 1, held_head > -1], -1)
-            assert bool((real_head < 1).any() and (held_head > -1).any() and not live.all()), \
-                "a head's hinge terms must be partly live"
         restore(heads, before)
         real_scores = logits(real)
         after = kept(heads)
@@ -249,61 +271,87 @@ def step(dtype, pixels, draws, student, teacher, heads_state) -> dict[str, np.nd
         out[f"grad/student/{name}"] = parameter.grad.double().numpy()
     for index, head in enumerate(heads):
         out.update(flatten(flax_gradient(head), f"grad/heads/head_{index}"))
-        out.update(flatten(flax_head(head)[1], f"spectral/head_{index}"))
+        out.update(flatten(us(head), f"spectral/head_{index}"))
     return out
 
 
-def main() -> None:
+def judged(out: dict, concatenate=np.concatenate) -> dict:
+    """What check 1 judges of a step's arrays by their paths (`step`'s, or Dew's under the same paths): the
+    loss, and the student's gradient, each head's and the kept `u`s, each tree's leaves in one vector in
+    their paths' order. A few entries' root mean square is no estimate of rounding, and the two biases a
+    batch norm follows have a gradient of exactly zero, rounding alone in both runs."""
+    def vector(prefix):
+        return concatenate([out[key].reshape(-1) for key in sorted(out) if key.startswith(prefix + "/")])
+
+    return {"loss": out["loss"].reshape(1), "student": vector("grad/student"),
+            **{f"head_{index}": vector(f"grad/heads/head_{index}")
+               for index in range(len(SETTINGS["layers"]))},
+            "spectral": vector("spectral")}
+
+
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's inputs: the pixels; the step's draws, each row's student time, its noise, its level's
+    normal and its renoising noise; the teacher stand-in and the student a little off it; and each head's
+    weights and `u`s as torch makes a `DiscHead`'s, its biases and its local batch norms' affine maps
+    off their identity and its condition mapper's weight five times its own, so its logits are of order
+    one or more and a hinge term can be dead, in the layout of Dew's `Head` (`heads/`, `initial/`).
+    Every input a float32 value, so both runs start from the same numbers."""
     settings = SETTINGS
     b, side, channels, width = settings["batch"], settings["side"], settings["channels"], settings["width"]
-    generator = np.random.default_rng(21)
-    pixels = generator.integers(0, 256, (b, side, side, channels), dtype=np.uint8)
+    rng = np.random.default_rng([2104, seed])
+    pixels = rng.integers(0, 256, (b, side, side, channels), dtype=np.uint8)
     flat = side * side * channels
-    teacher = {"embed": generator.standard_normal((flat, width)) * 0.2,
-               "time": generator.standard_normal(width),
-               "layer_a": generator.standard_normal((width, width)) * 0.6,
-               "layer_b": generator.standard_normal((width, width)) * 0.6,
-               "head": generator.standard_normal((width, flat)) * 0.3}
-    student = {name: value + generator.standard_normal(value.shape) * 0.05 for name, value in teacher.items()}
-    # Every input a float32 value, so both runs start from the same numbers.
-    teacher, student = ({name: value.astype(np.float32) for name, value in tree.items()}
-                        for tree in (teacher, student))
+    teacher = {"embed": rng.standard_normal((flat, width)) * 0.2, "time": rng.standard_normal(width),
+               "layer_a": rng.standard_normal((width, width)) * 0.6,
+               "layer_b": rng.standard_normal((width, width)) * 0.6,
+               "head": rng.standard_normal((width, flat)) * 0.3}
+    student = {name: value + rng.standard_normal(value.shape) * 0.05 for name, value in teacher.items()}
+
+    def conv(channels_in, channels_out):
+        # torch's Conv1d: weight and bias uniform within one over the root of the fan-in.
+        bound = 1 / math.sqrt(channels_in)
+        return {"kernel": rng.uniform(-bound, bound, (1, 1, channels_in, channels_out)),
+                "bias": rng.uniform(-bound, bound, channels_out) + rng.standard_normal(channels_out) * 0.2}
+
+    def norm():
+        return {"weight": 1 + rng.standard_normal(width) * 0.2, "bias": rng.standard_normal(width) * 0.2}
+
+    def unit(size):
+        u = rng.standard_normal(size)
+        return {"u": u / np.linalg.norm(u)}
+
+    arrays = {"pixels": pixels, "draws/indices": rng.integers(0, len(settings["student_times"]), b),
+              "draws/noise": rng.standard_normal(pixels.shape), "draws/level": rng.standard_normal(b),
+              "draws/renoise": rng.standard_normal(pixels.shape), **flatten(teacher, "teacher"),
+              **flatten(student, "student")}
+    for index in range(len(settings["layers"])):
+        heads = {"block_0": {"conv": conv(width, width), "norm": norm()},
+                 "block_1": {"conv": conv(width, width), "norm": norm()},
+                 "cls": conv(width, settings["cmap_dim"]),
+                 "cmapper_weight": rng.standard_normal((settings["time_features"], settings["cmap_dim"])) * 5,
+                 "cmapper_bias": rng.standard_normal(settings["cmap_dim"]) * 0.2}
+        initial = {"block_0": {"conv": unit(width)}, "block_1": {"conv": unit(width)},
+                   "cls": unit(settings["cmap_dim"])}
+        arrays.update(flatten(heads, f"heads/head_{index}") | flatten(initial, f"initial/head_{index}"))
+    kinds = {"pixels": np.uint8, "draws/indices": np.int32}
+    return {name: value.astype(kinds.get(name, np.float32)) for name, value in arrays.items()}
+
+
+def main() -> None:
+    from recorded_references import provenance, record_case, save
+    from test_adversarial import one_step
+
     scope = published()
-    torch.manual_seed(4)
-    heads = [made(scope, torch.float64) for _ in settings["layers"]]
-    with torch.no_grad():
-        for head in heads:
-            # Biases and the local batch norms' affine maps off their identity.
-            for name, parameter in head.named_parameters():
-                affine = "main" in name and name.endswith("weight") and parameter.ndim == 1
-                if name.endswith("bias") or affine:
-                    parameter.add_(torch.randn(parameter.shape, dtype=parameter.dtype) * 0.2)
-            # Logits of order one or more, so a hinge term can be dead.
-            head.cmapper.weight.mul_(5)
-            for value in head.state_dict().values():
-                value.copy_(value.float().double())
-    keys = jax.random.split(jax.random.key(settings["key"]), 5)
-    level_key, renoise_key = jax.random.split(keys[4])
-    draws = {"indices": np.array(jax.random.randint(keys[2], (b,), 0, len(settings["student_times"]))),
-             "noise": np.array(jax.random.normal(keys[3], pixels.shape)),
-             "level": np.array(jax.random.normal(level_key, (b,))),
-             "renoise": np.array(jax.random.normal(renoise_key, pixels.shape))}
-    arrays = {"pixels": pixels, "settings": np.asarray(json.dumps(settings)),
-              **{f"draws/{name}": value for name, value in draws.items()},
-              **{f"teacher/{name}": value for name, value in teacher.items()},
-              **{f"student/{name}": value for name, value in student.items()}}
-    for index, head in enumerate(heads):
-        params, us = flax_head(head)
-        arrays.update(flatten(params, f"heads/head_{index}"))
-        arrays.update(flatten(us, f"initial/head_{index}"))
-    states = [{name: value.clone() for name, value in head.state_dict().items()} for head in heads]
-    for dtype, suffix in ((torch.float64, "_f64"), (torch.float32, "")):
-        typed = [{name: value.to(dtype) for name, value in state.items()} for state in states]
-        out = step(dtype, pixels, draws, student, teacher, typed)
-        arrays.update({f"{name}{suffix}": value for name, value in out.items()})
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
-    print(f"{FIXTURE}: one LADD step over {b} rows, loss {float(arrays['loss_f64']):.6f}")
+    dew = jax.jit(lambda inputs: one_step(np.float32, inputs))
+    arrays = record_case("ladd", draw, lambda inputs: tuple(judged(step(dtype, inputs, scope))
+                                                            for dtype in (torch.float32, torch.float64)),
+                         store_inputs=False, dew=dew)
+    written = save(FIXTURE, {**arrays, "provenance": provenance(
+        "autonomousvision/stylegan-t, facebookresearch/DiT", f"{STYLEGAN_T}, {DIT}", "cpu",
+        "python tools/ladd_reference.py", torch=torch.__version__)},
+        reference="autonomousvision/stylegan-t, facebookresearch/DiT", license="StyleGAN-T: NVIDIA's own "
+        "terms; DiT: CC BY-NC 4.0; both fetched at record time, neither vendored")
+    print(f"{written}: {sorted(arrays)}")
 
 
 if __name__ == "__main__":

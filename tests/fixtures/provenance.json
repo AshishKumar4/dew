@@ -2761,7 +2761,7 @@
      "runs": "torch"
     }
    ],
-   "note": "An oracle of one LADD step from the papers' equations (no official training code), around StyleGAN-T's DiscHead and DiT's timestep_embedding executed as published; the draws are Dew's from jax.random.key(5)."
+   "note": "An oracle of one LADD step from the papers' equations (no official training code), around StyleGAN-T's DiscHead and DiT's timestep_embedding executed as published, recorded over seeded draws of its inputs, weights and step draws (seeds.npz, `draw`)."
   },
   "linear_attention": {
    "tool": "tools/qwen_linear_reference.py",
