@@ -315,3 +315,27 @@ def test_an_nvfp4_tile_packed_from_its_encode_decodes_to_its_rounded_values():
     decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32)
     rounded = np.clip(x, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)
     np.testing.assert_array_equal(decoded, rounded)
+
+
+def test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_its_rounding():
+    """An fp32 tile quantized to NVFP4 (`bits.nvfp4_quantized`), a block of zeros and a block whose values
+    span six decades among them: its tensor scale its largest magnitude over 6 * 448, each block's scale the
+    least e4m3 at or above the block's largest over 6 times it (at most e4m3's largest), and its decode
+    (`nvfp4_decoded`, times `NVFP4_OWED`) each value over its scales rounded to e2m1 times its block's
+    scale, exactly (row 4050)."""
+    rng = np.random.default_rng(4050)
+    x = (rng.standard_normal((64, 8)) * 10.0 ** rng.integers(-3, 3, (64, 8))).astype(np.float32)
+    x[16:32, 3] = 0
+    words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(x))
+    largest = np.float32(np.abs(x).max())
+    np.testing.assert_array_equal(np.asarray(tensor), largest / np.float32(6 * 448))
+    table = np.arange(0x7F, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+    ratio = np.abs(x).reshape(4, 16, 8).max(axis=1) / (np.float32(6) * np.asarray(tensor))
+    # The largest block's ratio is 448 up to its rounding, which may pass it: its scale is e4m3's largest.
+    least = table[np.minimum(np.searchsorted(table, ratio), table.size - 1)]
+    np.testing.assert_array_equal(np.asarray(scales, np.float32), least)
+    each = np.repeat(least, 16, axis=0) * np.asarray(tensor)
+    quotient = np.where(each > 0, x / np.where(each > 0, each, 1), 0).astype(np.float32)
+    rounded = np.clip(quotient, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)
+    decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32) * np.float32(bits.NVFP4_OWED)
+    np.testing.assert_array_equal(decoded, rounded * np.repeat(least, 16, axis=0))
