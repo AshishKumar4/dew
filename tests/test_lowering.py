@@ -1338,10 +1338,12 @@ def test_a_batchs_token_layout_split_over_its_tokens_compiles_no_loop_a_token():
     split = NamedSharding(mesh, PartitionSpec(None, "sequence"))
     shapes = (jax.ShapeDtypeStruct((4, 8192), jnp.int32, sharding=split),
               jax.ShapeDtypeStruct((4, 8192), jnp.bool_, sharding=split))
-    program = jax.jit(layout, in_shardings=(split, split)).lower(*shapes).compile().as_text()
-    assert not re.findall(r"\bwhile\(", program), re.findall(r"known_trip_count[^\n]*", program)[:4]
+    from dew.telemetry.instrumentation import hlo_instructions
 
-
+    compiled = jax.jit(layout, in_shardings=(split, split)).lower(*shapes).compile()
+    program = hlo_instructions(compiled.as_text())
+    loops = [name for name, instruction in program.items() if instruction.op == "while"]
+    assert not loops, loops
 
 
 # ------------------------------------------------------------------ a TPU topology, compiled ahead here

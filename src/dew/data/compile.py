@@ -1387,6 +1387,7 @@ def _training_reader(
             build.loading,
             resume=resume,
             endless=build.lowering.endless,
+            published=statistics.mirrored(),
         )
     else:
         if build.elastic:

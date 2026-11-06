@@ -123,14 +123,6 @@
    "tool": "tools/laya_reference.py",
    "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/diffusion-gemma-window-tiny/logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/diffusion-gemma-window-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -555,7 +547,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts: unet.npz in eval mode, train.npz in train mode under torch's SGD (--train)."
+   "note": "Executes fetched official networks_edm2 with pickling/constructor stubs and float64-retargeted casts over seeded draws of its weights and inputs (seeds.npz, `draw`; layout.json the state's names and shapes): the output in eval mode, and train mode under torch's SGD."
   },
   "edm_loss": {
    "tool": "tools/edm_loss_reference.py",
@@ -678,7 +670,7 @@
      "runs": "torch"
     }
    ],
-   "note": "Executes the Flux DreamBooth script's noising and loss statements (v0.34.0) with compute_loss_weighting_for_sd3, around a stand-in velocity network, on Dew's draws; FlowMatchEulerDiscreteScheduler(shift=3)'s sigma grid."
+   "note": "The Flux DreamBooth script's noising and loss statements (v0.34.0), which the test executes with compute_loss_weighting_for_sd3 around a stand-in velocity network on Dew's draws, with that network's pixels and weights; FlowMatchEulerDiscreteScheduler(shift=3)'s sigma grid."
   },
   "flow/resolution_shift.npz": {
    "tool": "tools/flux_shift_reference.py",
@@ -977,38 +969,6 @@
     }
    ],
    "note": "The release's own inference/kernel.py (tilelang 0.1.8, torch 2.10.0+cu128) run on an RTX 4080 by --kernels: act_quant and fp4_act_quant in place on bf16 rows, sparse_attn and hc_split_sinkhorn; inputs and outputs as bits."
-  },
-  "hf/diffusion-gemma-denoise-tiny/numerics.npz": {
-   "tool": "tools/numerics_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ]
-  },
-  "hf/diffusion-gemma-denoise-tiny/ref_bare.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "transformers 5.16.1 recomputes it bit for bit from the committed weights and inputs."
-  },
-  "hf/diffusion-gemma-denoise-tiny/ref_conditioned.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "transformers 5.16.1 recomputes it bit for bit from the committed weights and inputs."
   },
   "hf/diffusion-gemma-sc-tiny/ref.npy": {
    "tool": "tools/hf_reference.py",
@@ -2983,7 +2943,7 @@
      "runs": "torch"
     }
    ],
-   "note": "Diffusion._loss (SUBS, continuous time, antithetic times floored at 1e-3) and _ddpm_update's categorical, around a hidden @ head stand-in backbone; rows, weights and uniforms are inputs."
+   "note": "Diffusion._loss (SUBS, continuous time, antithetic times floored at 1e-3) and _ddpm_update's categorical, around a hidden @ head stand-in backbone; rows, weights and uniforms are inputs. The same loss over seeded draws of rows, weights and uniforms is seeds.npz (`draw`)."
   },
   "meanflow": {
    "tool": "tools/meanflow_reference.py",
@@ -3606,7 +3566,7 @@
      "runs": "torch"
     }
    ],
-   "note": "AutoencoderKL(...).encoder at tests/test_models.py's encoder geometry, parameters moved off init; moments and image/parameter VJPs at batch 1 and 4, float32 and float64 (widened)."
+   "note": "AutoencoderKL(...).encoder at tests/test_models.py's encoder geometry, parameters moved off init and rounded to bfloat16-representable values; the weights alone, which the test runs Diffusers' encoder on."
   },
   "vae/sd3-tiny": {
    "tool": "tools/vae_reference.py",
@@ -3944,7 +3904,6 @@
     "hf/deepseek-v32-tiny/model.safetensors",
     "hf/diffusion-gemma-denoise-tiny/canvas.npy",
     "hf/diffusion-gemma-denoise-tiny/model.safetensors",
-    "hf/diffusion-gemma-denoise-tiny/prev_logits.npy",
     "hf/diffusion-gemma-denoise-tiny/prompt.npy",
     "hf/diffusion-gemma-sc-tiny/inputs.npy",
     "hf/diffusion-gemma-sc-tiny/model.safetensors",

@@ -246,13 +246,26 @@ def test_one_slurm_task_joins_no_pool():
     so the process starts on its own."""
     env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"),
            "JAX_PLATFORMS": "cpu"}
-    program = ("from dew.training.runtime import prepare_process\n"
-               "prepare_process()\n"
-               "import jax\n"
-               "print('processes', jax.process_count())\n")
-    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+    done = subprocess.run([sys.executable, "-c", JOINED], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stdout + done.stderr
+    assert joined(done.stdout) == {"initialized": False, "processes": 1, "rank": 0}, done.stdout
+
+
+JOINED = ("import json\n"
+          "from dew.training.runtime import prepare_process\n"
+          "prepare_process()\n"
+          "import jax\n"
+          "print('JOINED', json.dumps({'initialized': jax.distributed.is_initialized(),\n"
+          "                            'processes': jax.process_count(), 'rank': jax.process_index()}))\n")
+"""A process that prepares itself and reports the pool it joined: whether it initialized JAX's distributed
+runtime, its pool's process count and its own rank (row 4497: an exit status alone said none of it)."""
+
+
+def joined(stdout: str) -> dict:
+    """The pool a `JOINED` program reported."""
+    (line,) = [line for line in stdout.splitlines() if line.startswith("JOINED ")]
+    return json.loads(line.removeprefix("JOINED "))
 
 
 @pytest.mark.mesh(devices=0)
@@ -286,13 +299,10 @@ def test_an_mpirun_inside_one_slurm_task_forms_its_pool():
            "OMPI_MCA_orte_hnp_uri": "1531576320.0;tcp://127.0.0.1:34911",
            "OMPI_COMM_WORLD_SIZE": "1", "OMPI_COMM_WORLD_RANK": "0",
            "OMPI_COMM_WORLD_LOCAL_RANK": "0", "JAX_COORDINATOR_PORT": str(port)}
-    program = ("from dew.training.runtime import prepare_process\n"
-               "prepare_process()\n"
-               "import jax\n"
-               "print('pool', jax.distributed.is_initialized())\n")
-    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+    done = subprocess.run([sys.executable, "-c", JOINED], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stdout + done.stderr
+    assert joined(done.stdout) == {"initialized": True, "processes": 1, "rank": 0}, done.stdout
 
 
 @pytest.mark.mesh(devices=0)

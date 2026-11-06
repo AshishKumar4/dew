@@ -8,5 +8,10 @@
 set -f
 . tools/lint_inputs.sh
 python_changed --cached $ruff_inputs | xargs -0r python -m ruff check --quiet || exit 1
-python_changed --cached $(python tools/lint_slop.py --print-roots) |
-    JAX_PLATFORMS=cpu xargs -0r python tools/lint_slop.py || exit 1
+# A staged contracts test can rename or duplicate a seam's contract (SLOP028): the whole tree is read then.
+if git diff --cached --quiet -- 'tests/test_contracts_*.py'; then
+    python_changed --cached $(python tools/lint_slop.py --print-roots) |
+        JAX_PLATFORMS=cpu xargs -0r python tools/lint_slop.py || exit 1
+else
+    JAX_PLATFORMS=cpu python tools/lint_slop.py || exit 1
+fi

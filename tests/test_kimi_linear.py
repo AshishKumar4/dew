@@ -17,7 +17,15 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from kimi_support import RECORDING, assert_greedy_as_exact, drawn_batch, exported, kimi_source, recorded_dew
+from kimi_support import (
+    RECORDING,
+    assert_greedy_as_exact,
+    assert_update_as_exact,
+    drawn_batch,
+    exported,
+    kimi_source,
+    recorded_dew,
+)
 from reference_runs import assert_as_exact_as_recorded
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
@@ -45,7 +53,7 @@ def test_forward_matches_the_reference_over_left_padding():
     assert_as_exact_as_recorded(FIXTURE, "kimi-linear", SEEDS, draw, dew, "Kimi Linear's logits")
 
 
-def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
+def test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference(source):
     """One all-parameter SGD step at the reference's learning rate (1e-2,
     which moves the logits by up to 3.8). The loss is within 1e-5 of the
     reference's (4.8e-7 apart). The step concentrates its rounding in a few
@@ -58,10 +66,15 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     `assert_as_exact_over_orders`. Dew's RMS over them is 0.95 of the
     reference's on CPU, 0.73 on an AVX-512 CPU (Intel SDE's Ice Lake server,
     the CI runners' ISA) and 0.56 on an RTX 4080. The gradient through the
-    KDA decays is where `recurrence_algebra.decays`' compensated sums matter.
+    KDA decays is where `recurrence_algebra.decays`' compensated sums matter."""
+    assert_update_as_exact(source, TINY)
 
-    The export writes every source name back at its stored shape, A_log as
-    [1, 1, heads, 1], and reloading restores the trained weights exactly."""
+
+def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
+    """The model stepped once (`sgd_step`, whose numerics the test above holds,
+    apart so each fits its group) and exported: the export writes every source
+    name back at its stored shape, A_log as [1, 1, heads, 1], and reloading
+    restores the trained weights exactly."""
     trained, restored, written, shipped = exported(source, TINY, tmp_path)
     assert {name: value.shape for name, value in written.items()} == {
         name: value.shape for name, value in shipped.items()
