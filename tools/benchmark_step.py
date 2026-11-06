@@ -221,7 +221,8 @@ class BenchmarkConfig:
     compile_ahead: str | None = None
     """Compile each case's step ahead of its run into this directory, for one compile-only GPU of
     `generation` holding `capacity_gib` (`benchmark_models.ahead_of`), and measure nothing: a GPU node's
-    prepare, on its CPU, for its run's `ahead`."""
+    prepare, on its CPU, for its run's `ahead`. A step that substituted a kernel this host cannot lower
+    is not saved: it is not the GPU's program."""
     generation: str | None = None
     """The CUDA generation `compile_ahead` compiles for (sm80, sm90)."""
     capacity_gib: int | None = None
@@ -403,8 +404,10 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
     if config.steps < 1:
         raise ValueError(f"--steps must be at least 1, got {config.steps}")
     found = None if config.ahead is None else Path(config.ahead) / ahead_name(case)
-    trainer = build_trainer(case, config.attention_impl,
-                            ahead=AheadOfTime.load(found) if found is not None and found.is_file() else None)
+    ahead = AheadOfTime.load(found) if found is not None and found.is_file() else None
+    # A step compiled for as many devices as this run's is its program; one for another count is not handed.
+    handed = ahead if ahead is not None and ahead.devices == jax.device_count() else None
+    trainer = build_trainer(case, config.attention_impl, ahead=handed)
 
     with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
         state, step, compile_seconds = compiled.state, compiled.step, compiled.compile_seconds
@@ -595,8 +598,14 @@ def main(config: BenchmarkConfig) -> list[Row]:
             raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and --capacity-gib")
         Path(config.compile_ahead).mkdir(parents=True, exist_ok=True)
         for case in build_cases(config):
-            ahead_of(case, config.generation, config.capacity_gib << 30, config.attention_impl).save(
-                Path(config.compile_ahead) / ahead_name(case))
+            ahead = ahead_of(case, config.generation, config.capacity_gib << 30, config.attention_impl)
+            # A step a kernel this host cannot lower ran in (`AheadOfTime.substituted`) is not the GPU's
+            # program: none is saved, and the run compiles its own on the GPU.
+            if ahead.substituted:
+                print(f"{ahead_name(case)} ({case.architecture}): not compiled ahead, as "
+                      f"{'; '.join(ahead.substituted)}", flush=True)
+            else:
+                ahead.save(Path(config.compile_ahead) / ahead_name(case))
         return []
     if not config.peak_run and not jax.config.jax_compilation_cache_dir:
         # Run alone, a step's compile seconds are a cold compile's, which no cached executable stands in for.
