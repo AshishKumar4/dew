@@ -1102,8 +1102,9 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         out_params = tuple(_param(family, ref, param.kind, row, head, first, state.acc)
                            for ref, param in zip(hooked.output, hooks.output_params, strict=True))
 
-        def store(state: algebra.Partial, form: algebra.Forward, *, initial: bool) -> None:
-            output, maximum, denominator = algebra.finish(form, state, initial=initial,
+        def store(state: algebra.Partial, form: algebra.Forward, *, initial: bool, normalized: bool = False
+                  ) -> None:
+            output, maximum, denominator = algebra.finish(form, state, initial=initial, normalized=normalized,
                                                           output_mod=hooks.output_mod,
                                                           output_params=out_params)
             family.stored((_kept_rows(family, keep, output, out_view),), (out_view,), smem=out_smem)
@@ -1128,7 +1129,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         def merged(running: algebra.Partial) -> None:
             if merge.initial is not None:
                 running = algebra.finished_merge(form, running, algebra.initial_state(form, merge.initial()))
-            store(running, form, initial=True)
+            store(running, form, initial=True, normalized=True)
 
         family.fixed_up(own, merge.slots, merge.ready, slot, slot, merge.splits, merged,
                         combine=functools.partial(algebra.finished_merge, form))
