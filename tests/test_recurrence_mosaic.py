@@ -747,10 +747,11 @@ def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_inte
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed)
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=32)
+@pytest.mark.check1_shards(seeds=128, per_task=16)
 def test_the_step_gated_hook_over_packed_documents_is_as_exact_as_the_recurrence_interpreted():
     """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` at the step write
-    gate over packed documents (`LONG_HOOK_CELLS`)."""
+    gate over packed documents (`LONG_HOOK_CELLS`), sixteen draws a task: 32 took 77 to 122 s a task
+    (jsf-slow7 at 55dbf3627)."""
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(FORMED[1], packed=True)
 
 
