@@ -103,7 +103,7 @@ def _temperature(value: object, key: str) -> tuple[float, ...] | float:
     return tuple(_records.number(each, key) for each in value)
 
 
-def _budget(value: object, key: str) -> int | None:
+def _budget(value: _records.JSON, key: str) -> int | None:
     """A question budget Laya's file states: a count of tokens, or null to keep that part whole."""
     return None if value is None else _records.integer(value, key)
 
@@ -140,7 +140,7 @@ class LayaConfig:
         stated = frozenset(record) & set(names)
         return cls(**{name: names[name].metadata["read"](record[name], name) for name in stated}), stated
 
-    def record(self) -> dict[str, object]:
+    def record(self) -> Mapping[str, object]:
         """The file this config writes: each key, the encoder where it names one."""
         values = {held.name: getattr(self, held.name) for held in fields(self)}
         if self.encoder is None:
@@ -178,10 +178,10 @@ class LayaConfig:
     def temperatures(self) -> Temperatures:
         """The temperatures this config states, by type (`TEMPERATURE_TYPES`) or one over every type, and
         by type and option count."""
-        listed = isinstance(self.temperature, tuple)
-        return Temperatures(dict(zip(TEMPERATURE_TYPES, self.temperature, strict=True)) if listed else {},
-                            dict(self.temperature_by_options),
-                            default=1.0 if listed else self.temperature)
+        if isinstance(self.temperature, tuple):
+            return Temperatures(dict(zip(TEMPERATURE_TYPES, self.temperature, strict=True)),
+                                dict(self.temperature_by_options))
+        return Temperatures({}, dict(self.temperature_by_options), default=self.temperature)
 
 
 def head_files(bundle: "PretrainedDecision") -> HeadFiles:
