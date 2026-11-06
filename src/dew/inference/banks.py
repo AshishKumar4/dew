@@ -937,7 +937,9 @@ def _bank_plan(model: BankedModel, source: LayerBanks, mesh: MeshSpec | Mesh | N
     )
 
     shapes = source.shapes()
-    sites = bank_sites(model, shapes)
+    # A source banks the stacks of the model it places; a nested model's (`DecoderBank.root`, a
+    # distillation's frozen teacher, which training's host execution banks) it reads as entries.
+    sites = tuple(site for site in bank_sites(model, shapes) if not site.root)
     for site in sites:
         _check_shapes(shapes, site)
     device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)
