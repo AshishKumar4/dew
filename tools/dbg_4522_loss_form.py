@@ -21,6 +21,21 @@ from dew.nn.precision import compensated_sum, float32_einsum, float64_sum
 from reference_error import with_gradients, widened
 from arm_arithmetic import summed_as_run, unrewritten
 
+from dew.objectives.lm.adaptation import _Chain
+
+_original_scored = _Chain.scored
+
+
+def token_scored(self, versions, chosen, states, targets, weights):
+    def score(slot):
+        at, state, target, weight = slot
+        return _original_scored(self, versions, [which[:, None] for which in at], state[:, None],
+                                target[:, None], weight[:, None])
+    slots = (tuple(which.swapaxes(0, 1) for which in chosen), states.swapaxes(0, 1),
+             targets.swapaxes(0, 1), weights.swapaxes(0, 1))
+    result = jax.lax.map(score, slots)
+    return jax.tree.map(lambda value: jnp.squeeze(value, axis=2).swapaxes(0, 1), result)
+
 
 def direct_loss(logits, targets, variant):
     if variant == "batch-compensated":
@@ -43,14 +58,16 @@ def direct_loss(logits, targets, variant):
 def make(kind, variant):
     def one(variables, hidden, targets, weights, ids):
         def loss(variables, hidden):
-            if variant in ("actual", "equation"):
+            if variant in ("actual", "equation", "actual-token"):
                 fields = {} if kind == "documents" else {"segment_ids": ids[None]}
                 adaptation = t.ChunkAdaptation(window=3, rate=0.5)
+                _Chain.scored = token_scored if variant == "actual-token" else _original_scored
                 scores = (t.adapted_scores(t.MODEL, variables, hidden[None], targets[None],
                                           weights[None], fields, adaptation, predict=False,
-                                          logits=False).losses if variant == "actual" else
+                                          logits=False).losses if variant != "equation" else
                           t.equation_71(t.MODEL, variables, hidden[None], targets[None], weights[None],
                                         fields, adaptation, truth=False))
+                _Chain.scored = _original_scored
                 return jnp.sum(weights * scores[0])
             def single(state, target):
                 logits = t.MODEL.apply(
@@ -107,6 +124,8 @@ if os.environ.get("DOT_SITES"):
 if os.environ.get("BARRIERS"):
     variants = ("literal", "batch-categorical", "manual", "manual-barrier-down",
                 "manual-barrier-up", "manual-barrier-head", "manual-barrier-silu")
+if os.environ.get("TOKEN_PROOF"):
+    variants = ("literal", "actual", "actual-token", "token-categorical", "equation")
 programs = {(variant, mode): jax.jit(make(kind, variant), compiler_options=(
     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))
     for variant in variants for mode in ("on", "off")}
