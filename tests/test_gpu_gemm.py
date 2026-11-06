@@ -10,6 +10,8 @@ one process (`gpu_flow`), each cell its own file's property:
   (test_gemm_blackwell).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
   H100 and an A100 (test_contracts_gemm).
+- The template's grouped product of 16-bit operands sums into fp32 as exactly as XLA's at depths 128 and
+  512, its sums promoted a step at a time (test_grouped_gemm; row 4331).
 - The toolkit's warpgroup scan walks a linear recurrence forward and reversed, each position's state or
   the one before it, as float64 does (test_warpgroup_scan).
 - GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the reference
@@ -117,6 +119,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(grouped_gemm.cutlass_runs_the_projection_as_exactly_as_xla_where_chosen,
                                  sizes))
           for sizes in grouped_gemm.SIZES if any(grouped_gemm.SIZES[sizes])),
+        *(Cell(f"the template sums 16-bit products into fp32 as exactly as XLA: depth {depth}",
+               functools.partial(grouped_gemm.the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla,
+                                 depth))
+          for depth in (128, 512)),
         *(Cell(f"CUTLASS runs a mapped projection as exactly as XLA where chosen: "
                f"{'shared' if shared else 'mapped'} matrices",
                functools.partial(grouped_gemm.cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen,

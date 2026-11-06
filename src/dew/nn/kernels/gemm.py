@@ -331,7 +331,8 @@ product (`gemm`)."""
 def nvfp4_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype, interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs · W` of an NVFP4 matrix `W` (`NvFp4`), its weights frozen (a quantized checkpoint's): `lhs`
     rounded to bfloat16, each value of `W` decoded exactly to bfloat16 (`NvFp4.decoded`, its block's
-    scale applied, 2^8 owed), the products summed in fp32, and the accumulator times the deferred factor
+    scale applied, 2^8 owed), the products summed in fp32, each step's apart (`templates.product.promoted`,
+    row 4331), and the accumulator times the deferred factor
     (`NvFp4.factor`) before the one rounding to `out_dtype`: the deferred factor is the epilogue's first
     operation, ahead of any output hook (PLAN piece 10). Its selector (`NVFP4`) runs the template's mainloop
     decoding each stage in place (`_packed`) where named, else decodes the matrix once a call (`gemm`)."""
@@ -341,7 +342,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype, interpret_on_cpu:
     bound = launch.bind(jax.ShapeDtypeStruct(rows.shape, rows.dtype),
                         jax.ShapeDtypeStruct((1, width, depth), jnp.bfloat16),
                         jax.ShapeDtypeStruct((1,), jnp.int32), out_dtype='float32', trans_rhs=True,
-                        interpret=interpret_on_cpu, dense=True)
+                        interpret=interpret_on_cpu, dense=True, exact_sums=True)
     target = generation.gpu_target()
     tile = launch.derived(bound, target) if launch.eligible(bound, target) else None
     if selection.select(NVFP4, PackedCase(tile)).kernel == 'packed':
@@ -368,7 +369,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, tile: mosaic_g
                              transpose_rhs=True, out_dtype=jnp.float32,
                              multiprocessors=launch._launched(tile, interpret),
                              interpret=grouped_matmul.INTERPRETED if interpret else False, dense=True,
-                             scales=scales[None])
+                             exact_sums=True, scales=scales[None])
         return out, ()
 
     def backward(saved, operands, cotangent, live):

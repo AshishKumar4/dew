@@ -598,14 +598,14 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A hooked or exactly summed call runs where its bundle's register model counts what they hold; a
         # paired product's epilogue over its two accumulators alone every family's counts (`registers`).
         family = self._family(ba, target)
-        special = ((ba.arguments['hooks'] != NO_HOOKS or ba.arguments.get('exact_sums'))
-                   and not (family is not None and _pair_alone(ba, family)))
+        hooked = ba.arguments['hooks'] != NO_HOOKS and not (family is not None and _pair_alone(ba, family))
+        summed = bool(ba.arguments.get('exact_sums'))
         # A prologue's side operand by group streams with no group's origin here; Triton's and the TPU's
         # launches read it at their tile's group (`axes.at_group`).
         grouped = any(GROUPS in axes for axes in ba.arguments['hooks'].prologue_axes)
         return (first == second and (jnp.dtype(first).itemsize == 2 or self._fp8(ba, first, family))
                 and family is not None and not grouped
-                and (family.counts_hooks or not special)
+                and (family.counts_hooks or not hooked) and (family.counts_sums or not summed)
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
                 and self.derived(ba, target) is not None)
@@ -651,10 +651,14 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         plain += accumulator if ba.arguments.get('paired') is not None else 0
         if ba.arguments.get('exact_sums'):
             # The running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is carried as a
-            # loop value beside each step's scoped product, awaited before its add: the two accumulators and
-            # the walk's control, no step's descriptors beside them (`resources.CONTROL_REGISTERS`), else the
-            # staged rows above them (FS-K01 model2: 144 at 64 a thread over stages 2-5, 208 at 96).
-            return max(2 * accumulator + resources.CONTROL_REGISTERS, plain + max(phases))
+            # loop value beside each step's product (`mosaic.Issuer.summed_apart`), awaited before its add:
+            # the two accumulators and the walk's control, no step's descriptors beside them
+            # (`resources.CONTROL_REGISTERS`), else the staged rows above them (FS-K01 model2: 144 at 64 a
+            # thread over stages 2-5, 208 at 96). A family whose products read registers holds each step's
+            # fragments beside both (mma.sync's, one step's product at a time: 201 at its 128 x 128 forward
+            # tile, NSDBG-5).
+            held = plain + (accumulator if family.operands_in_registers else 0)
+            return max(2 * accumulator + resources.CONTROL_REGISTERS, held + max(phases))
         return plain + max(phases)
 
     def _prologue_registers(self, ba, config: mosaic_gpu.Tiles) -> int:

@@ -236,6 +236,36 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
                     f"cutlass {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection("xla", jnp.float64)))
 
 
+def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
+    """On this GPU the template's grouped product of bfloat16 rows and matrices into an fp32 output (its
+    route named, `mosaic_gpu`), forward and both gradients, is as exact as XLA's ragged dot from float64 at a
+    `depth`-deep contraction: its sums promoted a step at a time (`templates.product.promoted`), where the
+    tensor cores' in-order fp32 accumulation was 1.661x XLA's error at depth 128 and 3.88x at 512 on an A100
+    (M-NS-1, NS4331-VALUE4-a100; row 4331)."""
+    group_sizes = jnp.asarray([70, 66], jnp.int32)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        return (jax.random.normal(keys[0], (136, depth)).astype(jnp.bfloat16),
+                (jax.random.normal(keys[1], (2, depth, 256)) / np.sqrt(depth)).astype(jnp.bfloat16),
+                jax.random.normal(keys[2], (136, 256)).astype(jnp.float32))
+
+    def product(dtype):
+        return lambda x, w: gemm.gemm(x.astype(dtype), w.astype(dtype), group_sizes, out_dtype=jnp.float32)
+
+    def through_template(x, w, dy):
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            return with_gradients(product(jnp.bfloat16))(x, w, dy)
+
+    def through_xla(x, w, dy):
+        with generation.chosen(grouped_matmul="xla"):
+            return with_gradients(product(jnp.bfloat16))(x, w, dy)
+
+    assert_as_exact(jax.jit(through_template), jax.jit(through_xla), draw,
+                    f"16-bit products into fp32 {depth}", seeds=SEEDS,
+                    truth_fn=with_gradients(product(jnp.float64)))
+
+
 def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
     """Where the installed dew-cutlass holds this GPU's kernels, a projection mapped over a batch of two
     (`jax.vmap`: each its rows and cotangent, and its matrices unless `shared`), its forward and both

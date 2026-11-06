@@ -511,7 +511,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     k2 = k2 if scales is None else 8 * k2
     if scales is not None:
         _packed_taken(rhs, scales, tiles, transpose_rhs=transpose_rhs, hooked=(prologue, epilogue, paired),
-                      exact_sums=exact_sums, transpose_lhs=transpose_lhs, depth=k2, width=n)
+                      transpose_lhs=transpose_lhs, depth=k2, width=n)
     if dense and matrices != 1:
         raise ValueError("a dense product takes one matrix")
     if first is not None and (dense or paired is not None):
@@ -590,17 +590,18 @@ NVFP4_STEP = 256
 each column's block scales are a 16-byte row, a copy's least."""
 
 
-def _packed_taken(rhs, scales, tiles: Tiles, *, transpose_rhs: bool, hooked: tuple, exact_sums: bool,
-                  transpose_lhs: bool, depth: int, width: int) -> None:
+def _packed_taken(rhs, scales, tiles: Tiles, *, transpose_rhs: bool, hooked: tuple, transpose_lhs: bool,
+                  depth: int, width: int) -> None:
     """Dew: refuses a packed matrix's call (`gmm`'s `scales`) its decode does not take: its words read
     transposed, its scales its blocks', in `NVFP4_STEP`-deep steps and 64-column tiles, with no hook, pair,
-    exact sums, transposed rows, cluster, split or swap."""
+    transposed rows, cluster, split or swap (its exact sums, each step's product apart, read the decoded
+    stage as any)."""
     if (not transpose_rhs or rhs.dtype != jnp.uint32 or scales.shape != (rhs.shape[0], width, depth // 16)
             or tiles.block_k % NVFP4_STEP or tiles.block_n % 64 or any(hook is not None for hook in hooked)
-            or exact_sums or transpose_lhs or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
+            or transpose_lhs or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
         raise ValueError(f"an NVFP4 matrix {rhs.shape} with scales {scales.shape} is read transposed in "
-                         f"256-deep steps and 64-column tiles with no hooks, pair, exact sums, cluster or "
-                         f"split, not by {tiles}")
+                         f"256-deep steps and 64-column tiles with no hooks, pair, cluster or split, not by "
+                         f"{tiles}")
 
 
 def _of_no_depth(shape: tuple, group_sizes, accumulators: int, epilogue, epilogue_operands: tuple,
@@ -901,8 +902,8 @@ def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int
         return accs
 
     def exact_step(index, slots, running, accumulators):
-        _, products = step.func(index, slots, None, None, **step.keywords, apart=shape)
-        return tuple(total + product for total, product in zip(running, products, strict=True)), accumulators
+        _, totals = step.func(index, slots, None, running, **step.keywords, summed=True)
+        return totals, accumulators
 
     running, _ = walk(exact_step, tuple(family.zeros(shape) for _ in range(count)), ())
     return running
@@ -910,13 +911,14 @@ def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int
 
 def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, prologue, prologue_axes: tuple,
               fixed_tiles: dict, read_tiles: dict, mine_rows, transpose_rhs: bool, matrices: tuple,
-              interpret: bool, first=0, apart: tuple | None = None, transpose_lhs: bool = False,
+              interpret: bool, first=0, summed: bool = False, transpose_lhs: bool = False,
               decoded=None):
     """Dew: a consumer's step of the cooperative `gmm` (`mosaic.Family.walk`): its half of the rows' slot,
     transformed by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`,
     a depth vector the family does not copy read at step `index` from global memory: `read_tiles`),
-    times each of `matrices`' slot into its accumulator (a paired product's two); with `apart`, each
-    product taken apart as an fp32 tile of that shape (`_walked_products`' exact sums). The prologue's
+    times each of `matrices`' slot into its accumulator (a paired product's two); with `summed`, each
+    product summed apart into its accumulator, the running sum (`_walked_products`' exact sums,
+    `mosaic.Issuer.summed_apart`). The prologue's
     value stays in registers, where the products take it as their left operand (warpgroup MMA's register
     operand A, mma.sync's fragments): rewritten into the stage and read back, the gated prologue of a
     Llama-3-8B gate_up ran at 8.3x its plain product on an H100 (row 1336). With `decoded` (this consumer's
@@ -939,13 +941,14 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
                     else read_tiles[i].at[pl.ds((first + index) * depth, depth)] if i in read_tiles
                     else slots[f'side_{i}'] for i in range(len(prologue_axes))}
         left = _transformed(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
-        if apart is not None:
-            return nothing, tuple(family.registers_product(left, oriented[name], interpret)
-                                  for name in matrices)
+        if summed:
+            return nothing, tuple(total + family.registers_product(left, oriented[name], interpret)
+                                  for total, name in zip(accumulators, matrices, strict=True))
         return nothing, tuple(family.register_products(acc, (left,), oriented[name], interpret)
                               for acc, name in zip(accumulators, matrices, strict=True))
-    if apart is not None:
-        return nothing, tuple(family.product(mine, oriented[name], apart) for name in matrices)
+    if summed:
+        return nothing, tuple(family.summed_apart(total, mine, oriented[name], interpret)
+                              for total, name in zip(accumulators, matrices, strict=True))
     return nothing, tuple(family.products(acc, mine, oriented[name], interpret)
                           for acc, name in zip(accumulators, matrices, strict=True))
 
@@ -1283,10 +1286,7 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
     if exact_sums:
         def exact_step(index, slots, running, accumulators):
             lhs, rhs = staged(index, slots)
-            if interpret:
-                # The in-place product's own arithmetic: the CPU's dots sum in IEEE fp32 either way.
-                return family.products(running, lhs, rhs, interpret=True), accumulators
-            return running + family.product(lhs, rhs, shape), accumulators
+            return family.summed_apart(running, lhs, rhs, interpret), accumulators
 
         running, _ = walk(exact_step, family.zeros(shape), ())
         return running
