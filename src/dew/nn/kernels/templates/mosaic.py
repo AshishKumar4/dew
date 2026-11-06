@@ -957,6 +957,11 @@ def synced(interpret: bool) -> None:
     plgpu.inline_mgpu()(lambda ctx: mgpu_utils.warpgroup_barrier())()
 
 
+MAGIC_INT, MAGIC_FLOAT = 0x4B400000, 12582912.0
+"""An integer below 2**22 in magnitude added to the first in integer arithmetic is the fp32 whose value less the
+second it is (2**23 + 2**22's exponent and mantissa: Family.converted's integer codes)."""
+
+
 def converts(dtype) -> bool:
     """Whether the current device converts quantized codes of `dtype` to 16 bits in registers
     (`Family.converted`): integer codes on any, FP8 codes where its tensor instructions take 8-bit operands
@@ -1945,12 +1950,16 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
                 value = value * row_scale[:, None]
         else:
             # Read in the accumulator's layout, whose rows a row vector broadcasts along (`as_row`); an 8-bit
-            # stage takes no ldmatrix. Integer codes by way of int32: Mosaic's packed int8-to-16-bit
-            # conversion assembles to sm_90's sub.bf16x2 (an A100's ptxas refused it, dd-quant4's q4).
+            # stage takes no ldmatrix. Integer codes to fp32 by the exponent's magic number in integer
+            # arithmetic (exact below 2**22), no integer-to-float conversion: an int-to-fp32 cast and the
+            # cast to 16 bits after it folded into Mosaic's packed int8-to-bf16 conversion, sm_90's
+            # sub.bf16x2, which an A100's ptxas refused (dd-q8).
             loaded = plgpu.load(codes, layout=self.layout, optimized=False)
             if jnp.issubdtype(codes.dtype, jnp.integer):
-                loaded = loaded.astype(jnp.int32)
-            value = loaded.astype(jnp.float32)
+                biased = loaded.astype(jnp.int32) + jnp.int32(MAGIC_INT)
+                value = lax.bitcast_convert_type(biased, jnp.float32) - jnp.float32(MAGIC_FLOAT)
+            else:
+                value = loaded.astype(jnp.float32)
             if row_scale is not None:
                 value = value * self.as_row(row_scale)[:, None]
         if interpret:
