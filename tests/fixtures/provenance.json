@@ -957,7 +957,7 @@
      "runs": "model"
     }
    ],
-   "note": "Downloaded release code with local kernel stand-ins and documented patches (tools/deepseek_v41_reference.py:60). orders.npz records 52 residual orders (rounding_orders.py, seed 0), the reference's plain-SGD distances, identity reproduction and float64 invariance under every order."
+   "note": "The release as released (release.npz, release_rows.npz, release.safetensors; --release, row 354): its inference/model.py unpatched over its own tilelang kernels in bf16 over the weights it holds, recorded over check 1's seeds on an H100 with its float64 truth (the same code over the kernel stand-ins, widened). reference.npz keeps the prompt rows and the quantizer calls the suite reads, from the documented patched forward (tools/deepseek_v41_reference.py)."
   },
   "hf/deepseek-v41-tiny/kernels.npz": {
    "tool": "tools/deepseek_v41_reference.py",

@@ -1,29 +1,17 @@
 """DeepSeek-V4.1-Flash against the release's own inference code.
 
-deepseek-v41-tiny comes from tools/deepseek_v41_reference.py: the release's
-inference/model.py at dba1be0a (DeepSeek-V4.1-Flash) run in fp32 over the
-torch stand-ins for its kernels. kernels.npz holds the release's own tilelang
-kernels' outputs (`--kernels`, on a GPU), which Dew's quantizers and the
-stand-ins are held to bit for bit on bf16 input. The architecture outputs are
-taken with the quantizers off and repeated with them on (`qat_*`), and every
-quantizer and top-k call of both forwards is recorded. reference_f64.npz is
-the same run widened to fp64 (`--fp64`), the truth Dew and the reference are
-both measured from by tests/reference_error.py's rule: Dew's RMS distance
-from it at most FACTOR times the reference's own, for every output and for
-the inputs of every quantizer and top-k call. Dew's quantizers are held bit
-for bit to each recorded call.
-
-A value within fp32 noise of where a rounding or a pick changes can go
-either way in two fp32 runs, and every seed leaves some (an L4 rounded one
-window key of the cached prefill the other way at the seed a CPU and an RTX
-4080 had passed). So each run compared here takes every rounding and pick
-from its own float64 twin (`decided`), the way the exact value goes, which
-is the way the reference went (`--fp64` refuses a fixture it did not):
-the rule then measures fp32 rounding alone, whatever the seed. Each twin is
-held within float64 rounding of the truth (`twin_close`), which a single
-rounding or pick taken otherwise than the truth's would move it far past.
-`tools/deepseek_v41_numerics.py residuals` reports every ratio and each
-twin's distance from the truth.
+deepseek-v41-tiny comes from tools/deepseek_v41_reference.py, the release's inference/model.py at
+dba1be0a (DeepSeek-V4.1-Flash). Its model-level claims are held to the release as released (row 354,
+`RELEASE`): nothing of its code replaced, over the weights it holds, in bf16 over its own tilelang kernels
+and activation quantizers on an H100, recorded over check 1's seeds with its float64 truth (the same code
+over the stand-ins for its kernels, widened), over drawn rows whose every selection both float64 runs clear
+`selection_margins.MARGIN` by: every position's logits, a cached walk's past its prompt, DSpark's drafts
+after a step that closes every compressed group, and an image prompt's. Dew's variants of a row (an interior
+gap, shifted positions, left padding, a shifted cached walk) are held to them, and a sensitivity (the
+candidate pool, the image bias) fails them. kernels.npz holds the release's tilelang kernels' outputs
+(`--kernels`, on a GPU), which Dew's quantizers and the stand-ins are held to bit for bit on bf16 input;
+reference.npz keeps the fixture's prompt rows and every quantizer call's input blocks, which Dew's
+quantizers are held to the stand-ins on.
 """
 
 import dataclasses
@@ -41,7 +29,7 @@ import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import decode_through
 from quantized_basis import dequantized_in_own_basis
-from reference_error import FACTOR, as_given, assert_as_exact, declared_seeds, distance
+from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact, declared_seeds
 
 from dew.batch import coordinates
 from dew.interop import Pretrained
@@ -57,12 +45,11 @@ from dew.nn.sharding import down_projection
 from dew.nn.visibility import visible
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
-from tools.deepseek_v41_numerics import QUANTIZERS, as_released, unquantized, vision_bundle, vision_run
+from tools.deepseek_v41_numerics import QUANTIZERS, as_released, unquantized, vision_bundle
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "deepseek-v41-tiny"
 RELEASED = ROOT / "deepseek-v41-flash"
-TRUTH = np.load(TINY / "reference_f64.npz")
 KERNELS = TINY / "kernels.npz"
 # kernels.npz's quantizer outputs by the Dew quantizer each is.
 KERNEL_QUANTIZERS = {
@@ -81,14 +68,6 @@ def fp32_matmuls():
 def source():
     loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
     return loaded, unquantized(loaded.model), np.load(TINY / "reference.npz")
-
-
-def rounding(name: str) -> float:
-    """The reference's own RMS distance from the float64 truth for `name`:
-    the fp32 rounding two runs of one computation may each carry FACTOR
-    times of."""
-    return distance(np.load(TINY / "vision.npz")[name] if name.startswith("vision_")
-                    else np.load(TINY / "reference.npz")[name], TRUTH[name])
 
 
 def kernel_outputs() -> dict[str, np.ndarray]:
@@ -210,30 +189,15 @@ def released():
     return config, record, model, shapes
 
 
-def test_the_candidate_pool_decides_the_logits(source):
-    """Dropping the pool's restriction on the Reindex layers moves the logits
-    further from the float64 truth than rounding can, so the fixture
-    exercises the hierarchical indexer."""
-    loaded, plain, reference = source
-    ids = jnp.asarray(reference["input_ids"])
-    kinds = dict(plain.kinds)
-    kinds["csa2_ratio_1_reindex"] = dataclasses.replace(
-        kinds["csa2_ratio_1_reindex"], mixer=dataclasses.replace(
-            kinds["csa2_ratio_1_reindex"].mixer, candidates=None, candidate_blocks=None,
-            candidate_block_size=None))
-    unpooled = plain.clone(kinds=flax.core.freeze(kinds))
-    assert distance(unpooled.apply(loaded.variables, ids), TRUTH["logits"]) > FACTOR * rounding("logits")
-
-
 def test_left_padding_changes_no_row(source):
     """Rows of different lengths in one batch, the shorter padded on the
     left: engram's look-back packs each row's valid tokens (its argsort
     path), and CSA2's windows, entries and index keys follow each row's own
-    positions. The full row still decodes the reference's greedy ids, and
-    the padded one what it decodes alone."""
+    positions. Each row decodes what it decodes alone, the full one and the
+    padded one."""
     loaded, plain, reference = source
     ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
-    steps, pad = reference["generated"].shape[1], 3
+    steps, pad = ids.shape[1] - prompt, 3
 
     def greedy(inputs):
         return np.asarray(generate(plain, loaded.variables, inputs, steps, key=jax.random.key(1),
@@ -242,24 +206,8 @@ def test_left_padding_changes_no_row(source):
     tokens = jnp.stack([ids[0, :prompt], jnp.pad(ids[1, :prompt - pad], (pad, 0))])
     valid = jnp.arange(prompt)[None] >= jnp.asarray([[0], [pad]])
     batched = greedy(ModelInputs(tokens, {"attention_mask": valid}))
-    np.testing.assert_array_equal(batched[0], reference["generated"][0])
+    np.testing.assert_array_equal(batched[0], greedy(ModelInputs(ids[:1, :prompt]))[0])
     np.testing.assert_array_equal(batched[1], greedy(ModelInputs(ids[1:, :prompt - pad]))[0])
-
-
-@pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
-def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(source, given):
-    """Uncached, rows padded on the left by three tokens, a count no compression rate divides,
-    pool their compressed windows (CSA2's entries and index keys, HCA's) and hash their n-grams
-    (Engram) over their real tokens at their ranks, as a cache appends them, whether the padding
-    comes as a raw mask or as the tokens' coordinates alone: the real tokens' logits lie within
-    FACTOR of the reference's rounding of the float64 truth of the rows unpadded."""
-    loaded, plain, reference = source
-    ids, pad = jnp.asarray(reference["input_ids"]), 3
-    valid = jnp.broadcast_to(jnp.arange(ids.shape[1] + pad) >= pad, (ids.shape[0], ids.shape[1] + pad))
-    padding = {"attention_mask": valid} if given == "attention_mask" else {
-        "coordinates": coordinates(valid=valid)}
-    logits = plain.apply(loaded.variables, jnp.pad(ids, ((0, 0), (pad, 0))), **padding)
-    assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
 
 
 RELEASE = TINY / "release.npz"
@@ -406,6 +354,45 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(as_run, recorded_row
                     recorded, draw, "a shifted cached walk", seeds=seeds, truth_fn=truth)
 
 
+def test_the_candidate_pool_decides_the_logits(as_run, recorded_rows):
+    """Dropping the pool's restriction on the Reindex layers fails the release's check (check 1, a decided
+    failure, not Inconclusive), so the fixture exercises the hierarchical indexer."""
+    model = as_run.model
+    kinds = dict(model.kinds)
+    kinds["csa2_ratio_1_reindex"] = dataclasses.replace(
+        kinds["csa2_ratio_1_reindex"], mixer=dataclasses.replace(
+            kinds["csa2_ratio_1_reindex"].mixer, candidates=None, candidate_blocks=None,
+            candidate_block_size=None))
+    unpooled = jax.jit(model.clone(kinds=flax.core.freeze(kinds)).apply)
+    draw, reference, truth, seeds = held_to_the_release(as_run, recorded_rows, "deepseek v41 release rows")
+    with pytest.raises(GateFailure) as failed:
+        assert_as_exact(as_given(lambda index, inputs: {"logits": unpooled(as_run.variables,
+                                                                           jnp.asarray(inputs["input_ids"]))}),
+                        reference, draw, "without the candidate pool", seeds=seeds, truth_fn=truth)
+    assert not isinstance(failed.value, Inconclusive)
+
+
+@pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
+def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(as_run, recorded_rows, given):
+    """Uncached, rows padded on the left by three tokens, a count no compression rate divides, pool their
+    compressed windows (CSA2's entries and index keys, HCA's) and hash their n-grams (Engram) over their
+    real tokens at their ranks, as a cache appends them, whether the padding comes as a raw mask or as the
+    tokens' coordinates alone: over drawn rows, the real tokens' logits are on par with the release's of
+    the rows unpadded from its float64 run's (check 1, the recording's)."""
+    pad = 3
+    draw, reference, truth, seeds = held_to_the_release(as_run, recorded_rows, "deepseek v41 release rows")
+
+    @jax.jit
+    def padded(ids):
+        valid = jnp.broadcast_to(jnp.arange(ids.shape[1] + pad) >= pad, (ids.shape[0], ids.shape[1] + pad))
+        padding = {"attention_mask": valid} if given == "attention_mask" else {
+            "coordinates": coordinates(valid=valid)}
+        return as_run.model.apply(as_run.variables, jnp.pad(ids, ((0, 0), (pad, 0))), **padding)[:, pad:]
+
+    assert_as_exact(as_given(lambda index, inputs: {"logits": padded(jnp.asarray(inputs["input_ids"]))}),
+                    reference, draw, f"left padded by {given}", seeds=seeds, truth_fn=truth)
+
+
 DRAFTED = (7, 9, 11, 13)
 """The prompts after whose cached step the release drafted (the tool's `DRAFTED`)."""
 
@@ -446,17 +433,12 @@ def test_dsparks_draft_is_the_releases(as_run, recorded_rows):
                     reference, draw, "dspark's draft", seeds=seeds, truth_fn=truth)
 
 
-def test_an_image_prompt_computes_the_releases_logits(tmp_path):
-    """The vision half as the release runs it (its ViT, aligner, span vectors and every router's image
-    bias, bf16 with its activation quantizers): over drawn image prompts, every position's logits from
-    the prompt's last on, one forward with the image, on par with the release's from its float64 run's
-    (check 1, the recording's: each a prefix's prefill with the image, row 354)."""
+def held_to_the_release_images(model, variables, label: str) -> None:
+    """`model` over `variables` (the vision bundle's) on par with the release's image prompts (check 1, the
+    recording's 'deepseek v41 release vision'): every position's logits from the prompt's last on, one
+    forward with the image, its float64 twin's the truth, held to the recording's sketch."""
     from model_support import float64_twin
     from reference_error import indexed_recording, recording
-
-    loaded = Pretrained.load(as_released(tmp_path, vision=True), dtype="bfloat16", param_dtype="auto",
-                             attention_impl="reference")
-    model, variables = loaded.model, loaded.variables
 
     with np.load(TINY / "release_rows.npz") as stored:
         prompts = {name: stored[f"vision_{name}"] for name in ("pixels", "input_ids", "token_types")}
@@ -483,8 +465,18 @@ def test_an_image_prompt_computes_the_releases_logits(tmp_path):
     draw, reference, truth = indexed_recording(
         recording(RELEASE), site, seeds, truth_fn=truth,
         inputs_of=lambda seed: {name: value[int(seed)] for name, value in prompts.items()})
-    assert_as_exact(as_given(lambda index, inputs: logits(model, variables, inputs)), reference, draw,
-                    "an image prompt", seeds=seeds, truth_fn=truth)
+    assert_as_exact(as_given(lambda index, inputs: logits(model, variables, inputs)), reference, draw, label,
+                    seeds=seeds, truth_fn=truth)
+
+
+def test_an_image_prompt_computes_the_releases_logits(tmp_path):
+    """The vision half as the release runs it (its ViT, aligner, span vectors and every router's image
+    bias, bf16 with its activation quantizers): over drawn image prompts, every position's logits from
+    the prompt's last on, one forward with the image, on par with the release's from its float64 run's
+    (check 1, the recording's: each a prefix's prefill with the image, row 354)."""
+    loaded = Pretrained.load(as_released(tmp_path, vision=True), dtype="bfloat16", param_dtype="auto",
+                             attention_impl="reference")
+    held_to_the_release_images(loaded.model, loaded.variables, "an image prompt")
 
 
 def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
@@ -530,32 +522,64 @@ def test_a_prefilled_decode_cache_holds_no_payload_twice(source):
     assert not twice(jax.device_get(state.cache))
 
 
-def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
+PADDED_DRAFT_SEEDS = 8
+"""Check 1's declared seeds for a padded context's draft against the unpadded one's, sized by `seeds_for`
+paired on armada."""
+
+
+def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(as_run, recorded_rows):
     """Uncached, DSpark drafts after a context whose padding `valid` marks, after it in one row and
     before it in the other, as after the context alone: its real positions keep their ranks, the
-    padding is no key, and the block follows the last real position. The two drafts' logits, each
-    within FACTOR of the reference's rounding, lie within twice that of each other. Padding a layout
-    marks as document 0 instead (`real_slots`) drafts as its validity does, bit for bit, and a context
-    of two documents a row is refused (review of ledger 1122)."""
-    loaded, plain, reference = source
-    ids, prompt, pad = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"]), 3
-    _, sown = plain.apply(loaded.variables, ids[:, :prompt], mutable=["prediction_inputs"])
-    context = plain.apply(loaded.variables, sown["prediction_inputs"], method="draft_context")
-    drawn = ids[:, prompt]
-    _, alone, _ = plain.apply(loaded.variables, context, drawn, decode=False, method="draft")
-    padded = jnp.stack([jnp.pad(context[0], ((0, pad), (0, 0))), jnp.pad(context[1], ((pad, 0), (0, 0)))])
+    padding is no key, and the block follows the last real position. Over drawn rows, the padded draft's
+    logits are on par with the unpadded one's from its float64 run's (check 1). Padding a layout marks as
+    document 0 instead (`real_slots`) drafts as its validity does, bit for bit, and a context of two
+    documents a row is refused (review of ledger 1122)."""
+    from model_support import float64_twin
+
+    model, variables = as_run.model, as_run.variables
+    prompt, pad = DRAFTED[0], 3
     places = jnp.arange(prompt + pad)
     valid = jnp.stack([places < prompt, places >= pad])
-    _, drafted, _ = plain.apply(loaded.variables, padded, drawn, decode=False,
-                                coordinates=coordinates(valid.shape, valid=valid), method="draft")
-    assert distance(drafted, alone) <= 2 * FACTOR * rounding("draft_logits")
+
+    def context(model, variables, ids):
+        _, sown = model.apply(variables, ids[:, :prompt], mutable=["prediction_inputs"])
+        return model.apply(variables, sown["prediction_inputs"], method="draft_context")
+
+    def padded(context):
+        return jnp.stack([jnp.pad(context[0], ((0, pad), (0, 0))), jnp.pad(context[1], ((pad, 0), (0, 0)))])
+
+    def alone(model, variables, ids):
+        return {"logits": model.apply(variables, context(model, variables, ids), ids[:, prompt], decode=False,
+                                      method="draft")[1]}
+
+    by_validity = coordinates(valid.shape, valid=valid)
+
+    @jax.jit
+    def drafted(ids, laid):
+        return model.apply(variables, padded(context(model, variables, ids)), ids[:, prompt], decode=False,
+                           coordinates=laid, method="draft")[1]
+
+    wide = jax.jit(functools.partial(alone, float64_twin(model)))
+
+    @as_given
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
+            return wide(held, jnp.asarray(ids))
+
+    def draw(seed):
+        return (recorded_rows[seed],)
+
+    assert_as_exact(as_given(lambda ids: {"logits": drafted(jnp.asarray(ids), by_validity)}),
+                    jax.jit(functools.partial(alone, model, variables)), draw, "a padded context's draft",
+                    seeds=PADDED_DRAFT_SEEDS, truth_fn=truth)
+    ids = jnp.asarray(recorded_rows[0])
     documents = coordinates(valid.shape, segments=valid.astype(jnp.int32), max_segments=1)
-    _, by_documents, _ = plain.apply(loaded.variables, padded, drawn, decode=False, coordinates=documents,
-                                     method="draft")
-    np.testing.assert_array_equal(by_documents, drafted)
+    np.testing.assert_array_equal(drafted(ids, documents), drafted(ids, by_validity))
     two = coordinates(valid.shape, segments=1 + jnp.broadcast_to(places >= prompt // 2, valid.shape))
     with pytest.raises(ValueError):
-        plain.apply(loaded.variables, padded, drawn, decode=False, coordinates=two, method="draft")
+        drafted(ids, two)
 
 
 def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(source):
@@ -853,30 +877,51 @@ def test_a_quantized_drafting_cache_drafts_what_dequantizing_in_the_own_basis_co
                                   np.asarray(own(variables, context, block)))
 
 
+SCANNED_SEEDS = 8
+"""Check 1's declared seeds for a stack scanned against itself unrolled, sized by `seeds_for` paired on
+armada."""
+
+
+def assert_scans_as_unrolled(fields: dict, label: str) -> None:
+    """A stack built from `fields` scanned (`scan_layers`) on par with it unrolled (check 1), over drawn
+    weights and ids whose every selection clears `selection_margins.MARGIN` in the unrolled float64 run (so
+    every run selects alike), the truth that run."""
+    import selection_margins
+    from model_support import float64_twin, model_draw
+
+    unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
+                         for scan in (False, True))
+    shape = np.load(TINY / "reference.npz")["input_ids"].shape
+    wide = float64_twin(unrolled)
+    capture = selection_margins.capture(wide)
+
+    def clears(inputs):
+        variables, ids = inputs
+        with jax.enable_x64(new_val=True):
+            captured = capture(jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables), ids)
+        return selection_margins.margin(fields, captured, label) > selection_margins.MARGIN
+
+    draw = selection_margins.clearing(model_draw(unrolled, shape, unrolled.vocab_size), clears)
+    assert_as_exact(scanned.apply, unrolled.apply, draw, label, seeds=SCANNED_SEEDS, truth_fn=wide.apply)
+
+
 def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():
     """Two Reindex layers of one kind in a row stay two runs of one under
     scan_layers, so the Reuse layer after them attends the second one's
-    selection, as it does unrolled, to within twice the fixture logits' fp32
-    rounding; scanned together, their publications would stay inside the
-    loop."""
+    selection, as it does unrolled (check 1, `assert_scans_as_unrolled`);
+    scanned together, their publications would stay inside the loop."""
     config = json.loads((TINY / "config.json").read_text())
     text = config["text_config"]
     config = {**config, "text_config": {**text, "index_source_layer_ids": [2, 4, 6, 7, 8, 10]}}
     fields = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
-    ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
-    unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
-                         for scan in (False, True))
-    variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
-        "logits"
-    )
+    assert_scans_as_unrolled(fields, "consecutive reindex layers scanned")
 
 
 def test_a_reindex_layer_reads_its_full_layers_publications_with_no_reuse_layer():
     """A stack whose CSA2 layers are a Full layer and the Reindex layers after it,
     with no Reuse layer and so no shared keys and values, still threads the store
     the Full layer publishes its entries in: the Reindex layers read them, unrolled
-    and scanned alike, to within twice the fixture logits' fp32 rounding."""
+    and scanned alike (check 1, `assert_scans_as_unrolled`)."""
     config = json.loads((TINY / "config.json").read_text())
     text = config["text_config"]
     ratios = text["compress_ratios"][:4] + [2] * 2 + text["compress_ratios"][text["num_hidden_layers"]:]
@@ -887,13 +932,7 @@ def test_a_reindex_layer_reads_its_full_layers_publications_with_no_reuse_layer(
         "dspark_target_layer_ids": [3, 4, 5]}}
     fields = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
     assert not fields.get("kv_shared_layers")
-    ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
-    unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
-                         for scan in (False, True))
-    variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
-        "logits"
-    )
+    assert_scans_as_unrolled(fields, "reindex layers with no reuse layer scanned")
 
 
 def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeypatch):
@@ -980,17 +1019,19 @@ def test_a_quantized_bundle_loaded_text_only_is_its_quantized_text_checkpoint(tm
 
 
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):
-    """Routing the image span by the text bias moves the prefill's logits
-    further from the float64 truth than rounding can, and the image
-    positions change the n-gram ids of the text after them, so the fixture
-    exercises both."""
+    """Routing the image span by the text bias fails the release's image prompts (check 1, a decided
+    failure, not Inconclusive), and the image positions change the n-gram ids of the text after them, so
+    the fixture exercises both."""
     reference = np.load(TINY / "vision.npz")
-    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(as_released(tmp_path, vision=True), dtype="bfloat16", param_dtype="auto",
+                             attention_impl="reference")
     routers = flatten_dict(loaded.variables["moe"])
     routers.update({path: routers[(*path[:-1], "e_score_correction_bias")]
                     for path in routers if path[-1] == "media_bias"})
-    _, moved, _ = vision_run(loaded.model, {**loaded.variables, "moe": unflatten_dict(routers)}, reference)
-    assert distance(moved, TRUTH["vision_prompt_logits"]) > FACTOR * rounding("vision_prompt_logits")
+    with pytest.raises(GateFailure) as failed:
+        held_to_the_release_images(loaded.model, {**loaded.variables, "moe": unflatten_dict(routers)},
+                                   "the image span routed by the text bias")
+    assert not isinstance(failed.value, Inconclusive)
     ids = jnp.asarray(reference["input_ids"])
     media = jnp.asarray(reference["token_types"] >= 0)
     language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}

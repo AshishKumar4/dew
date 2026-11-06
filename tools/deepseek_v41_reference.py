@@ -11,22 +11,25 @@ Run it in its own environment, never the project's:
     uv venv ~/.cache/dew/reference-venvs/deepseek-v41 --python 3.12
     VIRTUAL_ENV=... uv pip install torch==2.10.0 numpy ml_dtypes safetensors sympy \
         tokenizers transformers huggingface_hub tilelang==0.1.8
-    PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
-        tools/deepseek_v41_reference.py [--search N | --kernels | --vision | --fp64]
-
-    PYTHONPATH=src python tools/rounding_orders.py \
-        tests/fixtures/hf/deepseek-v41-tiny <drawn> 52 0
-    PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
-        tools/deepseek_v41_reference.py orders <drawn>
+    PYTHONPATH=.:tests:tools ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
+        tools/deepseek_v41_reference.py [--search N | --kernels | --vision | --padding | --release]
 
 `--kernels` runs the release's tilelang kernels on a CUDA GPU and writes
 kernels.npz beside the fixture (`write_kernels`), which the suite holds Dew's
 quantizers and the stand-ins to. `--search N` ranks N seeds from `--seed` by
 what fp32 noise can reach in them (`search`); SEED is the first of 119.
-`--vision` writes the vision half beside the fixture (`write_vision`), and
-`--fp64`, run after both, the float64 truth of everything they wrote
-(`write_truth`). `--padding` records the rows the release's token lookup leaves
-untrained, its pad id stated, left out and null (`write_padding`).
+`--vision` writes the vision half beside the fixture (`write_vision`).
+`--padding` records the rows the release's token lookup leaves untrained, its
+pad id stated, left out and null (`write_padding`). `--release`, on a CUDA GPU
+after the fixture and its vision half, records the release as released
+(`write_release_recording`, row 354): its model.py with nothing of it
+replaced over its own tilelang kernels, in bf16 over the weights it holds
+(release.safetensors), every position's logits, a cached walk's, DSpark's
+drafts after a step that closes every compressed group and an image prompt's,
+over check 1's seeds with their float64 truth (the same code over the
+stand-ins, widened), release.npz and release_rows.npz: what the suite holds
+Dew's model-level claims to. The patched forward below writes the prompt rows
+and the quantizer calls alone that the suite reads.
 
 It writes tests/fixtures/hf/deepseek-v41-tiny: the release's config.json
 spelling at toy width, a model.safetensors under the release's tensor names,
@@ -54,9 +57,7 @@ the tokenizer the engram hash reads, source.json and reference.npz with
                                every quantizer call of that forward in call
                                order: the blocks it read and wrote
 
-source.json records NOISE and what it can reach at the seed (`Record.assess`),
-and `--fp64` writes the fixture's float64 truth, reference_f64.npz
-(`write_truth`).
+source.json records NOISE and what it can reach at the seed (`Record.assess`).
 
 Where the reference departs from the release, it says so where it happens:
 the engram lookup keeps the model's dtype where the release casts to its
@@ -620,115 +621,6 @@ def widened(model_module):
         model_module.precompute_freqs_cis.cache_clear()
 
 
-def widened_outputs(seed: int) -> dict[str, np.ndarray]:
-    """The float64 truth of the fixture (tests/reference_error.py): `run`'s
-    outputs in fp64 (`widened`) over the fixture's fp32 weights, the plain
-    and quantization-aware forward, loss, update and cached run, every
-    quantizer input and top-k row of both forwards with their outputs and
-    picks, and the vision half's outputs (`vision_outputs`). The stand-in
-    quantizers round the fp64 values, so `--fp64` counts where a rounding or
-    a pick differs from the fixture's before it writes the truth."""
-    model_module, engram_module = import_reference()
-    install_selection_probe()
-    args = model_args(model_module, engram_module)
-    ids = torch.randint(3, args.vocab_size - 1, (2, LENGTH),
-                        generator=torch.Generator().manual_seed(seed + 1))
-    outputs: dict[str, np.ndarray] = {}
-    with widened(model_module):
-        net = build(model_module, engram_module, args, seed, widen=True)
-        gradients = {}
-        for prefix, quantized in (("qat_", True), ("", False)):
-            set_quantizers(model_module, enabled=quantized)
-            recorded = Record()
-            RECORDS[:] = [recorded]
-            logits, loss, gradients[prefix] = trained(net, ids)
-            RECORDS.clear()
-            outputs.update({name: value for name, value in recorded.arrays(prefix).items()
-                            if name.endswith(("_in", "_out", "_rows", "_picks"))})
-            outputs.update({f"{prefix}logits": logits.numpy(), f"{prefix}loss": np.float64(loss.item())})
-            with torch.no_grad():
-                outputs.update({f"{prefix}{name}": value for name, value in cached(net, ids).items()})
-        for prefix, gradient in gradients.items():
-            outputs[f"{prefix}updated_logits"] = stepped(net, gradient, ids)
-        vision = vision_outputs(model_module, engram_module, seed, widen=True)[2]
-    return {**outputs, **{name: vision[name] for name in ("vision_span", "vision_prompt_logits",
-                                                         "vision_decode_logits")}}
-
-
-def write_truth(seed: int):
-    """reference_f64.npz beside the fixture (`widened_outputs`), refused
-    where a recorded rounding, pick or draft differs from the fixture's: the
-    tests take every decision from Dew's own float64 run, which is the
-    reference's only where the fixture decided as float64 does."""
-    truth, fixture = widened_outputs(seed), np.load(FIXTURE / "reference.npz")
-    differ = {name: int(np.sum(truth[name].astype(np.float32) != fixture[name]) if name.endswith("_out")
-                        else np.sum(truth[name] != fixture[name]))
-              for name in truth if name.endswith(("_out", "_picks", "draft_ids"))}
-    print(json.dumps({"differing": differ}))
-    if any(differ.values()):
-        raise SystemExit(f"the float64 run decides otherwise than seed {seed}'s fixture")
-    np.savez(FIXTURE / "reference_f64.npz", **{name: value for name, value in truth.items()
-                                               if not name.endswith(("_out", "_picks", "draft_ids"))})
-
-
-def orders(drawn: Path, seed: int):
-    """The plain SGD step under every residual order from rounding_orders.py.
-
-    Order zero reproduces the shipped updated logits bit for bit. Every
-    float64 step must compute the identity's truth within 1e-12 of its RMS
-    scale before its fp32 distance counts. The release's discrete selections
-    must also agree with their float64 twins, as the fixture's own do.
-    """
-    from safetensors.torch import load_file
-
-    model_module, _, net, twin = released(seed)
-    stored = np.load(FIXTURE / "reference.npz")
-    truth = np.load(FIXTURE / "reference_f64.npz")["updated_logits"]
-    ids = torch.from_numpy(stored["input_ids"].astype(np.int64))
-    drawn_orders = np.load(drawn / "orders.npy")
-    distances = []
-
-    def step(model, weights):
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                if not name.endswith("engram.embed.scale"):
-                    parameter.copy_(weights[name].to(parameter))
-        captured = Record()
-        RECORDS[:] = [captured]
-        _, _, gradient = trained(model, ids)
-        logits = stepped(model, gradient, ids)
-        RECORDS.clear()
-        return logits, captured.arrays("")["selection_picks"]
-
-    for k in range(len(drawn_orders)):
-        weights = load_file(str(drawn / str(k) / "model.safetensors"))
-        logits, picks = step(net, weights)
-        with widened(model_module):
-            exact, exact_picks = step(twin, weights)
-        assert np.array_equal(picks, exact_picks), f"order {k} selects otherwise than float64"
-        error = np.sqrt(np.mean(np.square(exact - truth)))
-        assert error <= 1e-12 * np.sqrt(np.mean(np.square(truth))), f"order {k} changes float64"
-        if k == 0:
-            assert np.array_equal(logits, stored["updated_logits"]), "order 0 must reproduce the fixture"
-        distances.append(np.sqrt(np.mean(np.square(logits.astype(np.float64) - truth))))
-    np.savez(FIXTURE / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
-             updated_logits=np.asarray(distances))
-    print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
-
-
-def released(seed: int):
-    """The release's model at `seed`, quantizers off and its selections probed, and its float64 twin, with
-    the release's module and arguments."""
-    model_module, engram_module = import_reference()
-    install_selection_probe()
-    set_quantizers(model_module, enabled=False)
-    args = model_args(model_module, engram_module)
-    net = build(model_module, engram_module, args, seed)
-    with widened(model_module):
-        twin = build(model_module, engram_module, args, seed, widen=True)
-    return model_module, args, net, twin
-
-
 def official_kernels():
     """The release's tilelang kernels (inference/kernel.py at the pinned
     revision), under a name of their own beside the stand-in `kernel`."""
@@ -999,50 +891,6 @@ def clearing_rows(net, vocabulary: int, seed: int, clears=lambda ids: True) -> n
             return ids.numpy().astype(np.int32)
 
 
-def write_recording(seed: int):
-    """recording.npz beside the fixture: the release's plain logits in fp32 and fp64 over drawn rows its
-    selections clear (`clearing_rows`), every position's and a cached walk's past its prompt, summarized
-    over seeds for check 1, and the rows each seed drew (recording_rows.npz)
-    (`recorded_references.record_case`), the reference the suite's variants of a row (an interior gap,
-    shifted positions, a shifted cached walk) are held to (tests/test_deepseek_v41.py)."""
-    from recorded_references import provenance, record_case, save
-
-    model_module, args, net, wide = released(seed)
-
-    rows: dict[int, np.ndarray] = {}
-
-    def draw(index: int) -> dict[str, np.ndarray]:
-        if index not in rows:
-            rows[index] = clearing_rows(net, args.vocab_size, index)
-        return {"input_ids": rows[index]}
-
-    def evaluated(start: int):
-        """Each row's logits from position `start` on, in fp32 and in fp64."""
-        def evaluate(inputs):
-            ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
-            with torch.no_grad():
-                reset(net)
-                narrow = forward(net, ids)[1][:, start:].double().numpy()
-                with widened(model_module):
-                    reset(wide)
-                    truth = forward(wide, ids)[1][:, start:].numpy()
-            return {"logits": narrow}, {"logits": truth}
-        return evaluate
-
-    # Every position's, and those a cached walk computes after its prompt's prefill.
-    arrays = {**record_case("deepseek v41 plain rows", draw, evaluated(0), summary=True),
-              **record_case("deepseek v41 plain walk", draw, evaluated(PROMPT - 1), summary=True)}
-    written = save(FIXTURE / "recording.npz", {**arrays, "provenance": provenance(
-        "deepseek-ai/DeepSeek-V4.1-Flash", DEEPSEEK_V41_REVISION, "cpu",
-        "PYTHONPATH=.:tests:tools <release python> tools/deepseek_v41_reference.py --record",
-        torch=torch.__version__)}, reference=f"deepseek-ai/DeepSeek-V4.1-Flash@{DEEPSEEK_V41_REVISION}",
-        license="mit")
-    # The rows each seed drew, which the test reads its inputs from (`recorded_rows`): its own draw would
-    # rerun the release's selections to clear them.
-    np.savez(FIXTURE / "recording_rows.npz", rows=np.stack([rows[index] for index in range(len(rows))]))
-    print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
-
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 """Where the release runs: its tilelang kernels are CUDA's; the float64 truth beside them."""
 
@@ -1308,38 +1156,25 @@ def write_release_recording():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", nargs="?", choices=("orders",))
-    parser.add_argument("drawn", nargs="?", type=Path)
     parser.add_argument("--search", type=int, default=0, help="rank this many seeds")
     parser.add_argument("--seed", type=int, default=SEED, help="the fixture's seed, or the first searched")
     parser.add_argument("--kernels", action="store_true",
                         help="write the tilelang kernels' outputs (kernels.npz) on CUDA")
-    parser.add_argument("--fp64", action="store_true", help="write the fixture's float64 truth")
     parser.add_argument("--vision", action="store_true", help="write the vision half beside the fixture")
     parser.add_argument("--padding", action="store_true", help="record the rows the lookup leaves untrained")
     parser.add_argument("--release", action="store_true",
                         help="record the release as released, its tilelang kernels on CUDA, over seeds")
-    parser.add_argument("--record", action="store_true",
-                        help="record the plain logits over drawn rows its selections clear, over seeds")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
     # One thread keeps every reduction in one order, so a rerun writes the
     # same bits.
     torch.set_num_threads(1)
-    if options.mode == "orders":
-        if options.drawn is None:
-            parser.error("orders needs the directory written by tools/rounding_orders.py")
-        orders(options.drawn, options.seed)
-    elif options.kernels:
+    if options.kernels:
         write_kernels()
-    elif options.fp64:
-        write_truth(options.seed)
     elif options.vision:
         write_vision(options.seed)
     elif options.padding:
         write_padding()
-    elif options.record:
-        write_recording(options.seed)
     elif options.release:
         write_release_recording()
     elif options.search:
