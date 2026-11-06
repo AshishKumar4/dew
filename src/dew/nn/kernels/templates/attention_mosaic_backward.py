@@ -33,6 +33,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _spans_of,
     approximate,
+    backward_family,
     modelled,
     score_places,
     stated,
@@ -201,7 +202,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     # The dK/dV launch on its own layout (`BackwardTiles.dkv`).
     dkv_tiles = tiles.dkv
     dkv_walk = dataclasses.replace(walk, program=dataclasses.replace(
-        program, family=bundles.named(dkv_tiles.family, query.dtype), tiles=dkv_tiles),
+        program, family=backward_family(bundles.named(dkv_tiles.family, query.dtype), dkv_tiles),
+        tiles=dkv_tiles),
         consumers=dkv_tiles.consumers)
     if walk.fused:
         if tiles.shared_keys:
