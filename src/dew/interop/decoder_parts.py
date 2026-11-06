@@ -15,7 +15,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict, cast
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +29,8 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.layouts import (
     Condition,
     Config,
+    ConfigLayout,
+    ConfigRead,
     Copy,
     Rebased,
     Renames,
@@ -1262,6 +1264,14 @@ def spelled(renames: Renames, *, leaves: Leaves | None = None, layer_leaves: Lea
                                   DECODER_ROUTES if routes is None else routes))
 
 
+def reads(translate: Callable[[Mapping[str, object], set[str]], DecoderFields]) -> ConfigRead:
+    """A reader of a whole record (`translate`, the source config and the keys read) as a config part's
+    read (`ConfigPart`)."""
+    def read(hf_config: Mapping[str, object], used: set[str], record: dict[str, object]) -> None:
+        record.update(translate(hf_config, used))
+    return read
+
+
 def declared_depths(field: str = 'num_nextn_predict_layers') -> Condition:
     """A route's `depth` slot held to one of the depths the record declares in `field`, a model building
     no others."""
@@ -2047,11 +2057,13 @@ class DecoderFamily:
     """
 
     model_types: tuple[str, ...]
-    translate_config: Callable[[Mapping[str, object], set[str]], DecoderFields]
+    config: ConfigLayout
+    """The family's config, both ways (`dew.interop.layouts.ConfigLayout`): the record a source config
+    states (`translate_config`) and the keys a model's fields state in it (`export_fields`), read and
+    written by the same parts."""
     matches: Callable[[CausalTransformer], bool]
     export_model_type: str
     architecture: str
-    export_fields: Callable[[CausalTransformer], Mapping[str, object]]
     preserve_source_layout: bool = field(kw_only=True)
     """Bind source tensor names/config for export instead of deriving them from the model."""
     routes: Routes = DECODER_ROUTES
@@ -2200,6 +2212,18 @@ class DecoderFamily:
             prepared = {name: self.head_rows.read(name, tensor, config) for name, tensor in prepared.items()}
         return packed_readings(prepared, self.packed, config, stored=stored,
                                path=lambda part: self.source_path(part, config))
+
+    def translate_config(self, hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+        """The record `hf_config`, the family's own spelling of its fields (`translated` reads its aliases,
+        defaults and repeats first), states (`config`), each key read added to `used`."""
+        record: dict[str, object] = {}
+        self.config.read(hf_config, used, record)
+        return cast(DecoderFields, record)
+
+    def export_fields(self, model: CausalTransformer) -> Mapping[str, object]:
+        """The family's own keys `model`'s fields state (`config`), beside the shared ones
+        `hf_decoders.export_config` writes."""
+        return self.config.write(model)
 
     def weight_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
         """The leaf the stored tensor `name` fills (`routes`), None for one that fills none of its own (a

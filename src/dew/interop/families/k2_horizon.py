@@ -27,9 +27,10 @@ from dew.interop.decoder_parts import (
     base_config,
     in_layer,
     read_rope,
+    reads,
     refuse,
 )
-from dew.interop.layouts import Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, NormSpec
 from dew.nn.moe import EXPERT_BIAS, EXPERT_BIAS_COLLECTION
@@ -168,9 +169,9 @@ _ROUTES = Table(
 # orders its cast and weight otherwise, the same product in fp32 (`hf_decoders._RUNTIME_FIELDS`),
 # and whose rotary builds its YaRN.
 K2_HORIZON = DecoderFamily(
-    ('k2_horizon',), _k2_horizon_config,
+    ('k2_horizon',), ConfigLayout(ConfigPart(reads(_k2_horizon_config), _k2_horizon_export)),
     lambda fields: _groups(fields) != 1 or fields.value_experts is not None,
-    'k2_horizon', 'K2HorizonForCausalLM', _k2_horizon_export, preserve_source_layout=False,
+    'k2_horizon', 'K2HorizonForCausalLM', preserve_source_layout=False,
     routes=_ROUTES,
     # The remote K2HorizonConfig's context, which a YaRN record's omitted lengths read.
     defaults={'max_position_embeddings': 32768},

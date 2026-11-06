@@ -51,6 +51,7 @@ from dew import _records
 from dew._cache import package_digest
 from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn import precision
 from dew.nn.blocks import padded_row
 from dew.nn.sharding import abstract
@@ -67,9 +68,10 @@ CONVENTIONS: tuple[tuple[str, decoder_parts.DecoderFamily], ...] = (
     # included, where the registered Llama family reads only what
     # LlamaConfig declares; the probe, not the reference's declarations, is
     # what admits a type's reading.
-    ('llama', replace(decoders.families()['llama'], translate_config=lambda hf_config, used:
-                      decoder_parts.base_config(hf_config, used, rope=decoder_parts.read_rope(
-                          hf_config, used, decoder_parts.PLAIN_SPELLING)))),
+    ('llama', replace(decoders.families()['llama'], config=ConfigLayout(ConfigPart(
+        decoder_parts.reads(lambda hf_config, used: decoder_parts.base_config(
+            hf_config, used, rope=decoder_parts.read_rope(hf_config, used, decoder_parts.PLAIN_SPELLING))),
+        decoders.families()['llama'].export_fields)))),
     # A family whose tensors are rewritten or split before its path map
     # reads them (`prepare`, `packed`: GPT-2's buffers, fused experts) is
     # left out: its names cannot be checked before the weights are read.

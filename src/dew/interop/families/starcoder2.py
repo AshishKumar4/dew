@@ -12,9 +12,11 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     base_config,
     hf_ungated,
+    reads,
     spelled,
     ungated_mlp,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -74,7 +76,8 @@ def _matches(fields: CausalTransformer) -> bool:
 
 
 STARCODER2 = DecoderFamily(
-    ('starcoder2',), _starcoder2_config, _matches, 'starcoder2', 'Starcoder2ForCausalLM', _starcoder2_export,
+    ('starcoder2',), ConfigLayout(ConfigPart(reads(_starcoder2_config), _starcoder2_export)), _matches,
+    'starcoder2', 'Starcoder2ForCausalLM',
     routes=spelled(GPT_MLP),
     preserve_source_layout=False,
     padding_idx=True,

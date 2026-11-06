@@ -29,12 +29,13 @@ from dew.interop.decoder_parts import (
     hf_activation,
     hf_ungated,
     read_rope,
+    reads,
     refuse,
     specified_layer_types,
     spelled,
     ungated_mlp,
 )
-from dew.interop.layouts import Spelled, Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Spelled, Table
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -208,9 +209,9 @@ def _modernbert_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 MODERNBERT = DecoderFamily(
-    ('modernbert',), _modernbert_config,
+    ('modernbert',), ConfigLayout(ConfigPart(reads(_modernbert_config), _modernbert_export)),
     lambda fields: not fields.causal and fields.embedding_norm and not fields.first_attention_norm,
-    'modernbert', 'ModernBertForMaskedLM', _modernbert_export,
+    'modernbert', 'ModernBertForMaskedLM',
     routes=_MODERNBERT_ROUTES,
     prepare=_modernbert_prepare, spelling=_nested, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
     tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),

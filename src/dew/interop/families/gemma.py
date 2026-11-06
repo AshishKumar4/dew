@@ -40,11 +40,12 @@ from dew.interop.decoder_parts import (
     own_routes,
     read_rope,
     read_rope_theta,
+    reads,
     refuse,
     refuse_export,
     specified_layer_types,
 )
-from dew.interop.layouts import Condition, Config, Route, Table, one_of
+from dew.interop.layouts import Condition, Config, ConfigLayout, ConfigPart, Route, Table, one_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -547,11 +548,10 @@ keys, values and key norm land nowhere."""
 
 GEMMA3N_TEXT = DecoderFamily(
     ('gemma3n_text',),
-    _gemma3n_config,
+    ConfigLayout(ConfigPart(reads(_gemma3n_config), _gemma3_export)),
     lambda fields: fields.altup is not None,
     'gemma3n_text',
     'Gemma3nForCausalLM',
-    _gemma3_export,
     routes=GEMMA3N_ROUTES,
     preserve_source_layout=True,
     # Gemma3nTextConfig's window, which an omitted sliding_window means.
@@ -563,13 +563,12 @@ GEMMA3N_TEXT = DecoderFamily(
 
 GEMMA4_TEXT = DecoderFamily(
     ('gemma4_text',),
-    gemma4_config,
+    ConfigLayout(ConfigPart(reads(gemma4_config), _gemma4_export)),
     lambda fields: bool(
         fields.v_norm or fields.per_layer_input_dim or fields.kv_shared_layers
     ),
     'gemma4_text',
     'Gemma4ForCausalLM',
-    _gemma4_export,
     routes=GEMMA4_ROUTES,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
@@ -590,7 +589,7 @@ def gemma4_unified_config(hf_config: Mapping[str, object], used: set[str]) -> De
 
 GEMMA4_UNIFIED_TEXT = dataclasses.replace(
     GEMMA4_TEXT, model_types=('gemma4_unified_text',), export_model_type='gemma4_unified_text',
-    translate_config=gemma4_unified_config,
+    config=ConfigLayout(ConfigPart(reads(gemma4_unified_config), _gemma4_export)),
     architecture='Gemma4UnifiedForCausalLM',
     defaults={**GEMMA4_DEFAULTS, 'sliding_window': 1024, 'max_position_embeddings': 262144,
               'use_bidirectional_attention': 'vision'})
@@ -598,11 +597,10 @@ GEMMA4_UNIFIED_TEXT = dataclasses.replace(
 
 GEMMA3_TEXT = DecoderFamily(
     (GEMMA3_MODEL_TYPE,),
-    _gemma3_config,
+    ConfigLayout(ConfigPart(reads(_gemma3_config), _gemma3_export)),
     lambda fields: bool(fields.sandwich_norms and fields.qk_norm),
     GEMMA3_MODEL_TYPE,
     'Gemma3ForCausalLM',
-    _gemma3_export,
     preserve_source_layout=False,
     # Gemma3TextConfig's defaults for the fields its decoder reads.
     defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256, 'pad_token_id': 0,
@@ -612,11 +610,10 @@ GEMMA3_TEXT = DecoderFamily(
 
 GEMMA2 = DecoderFamily(
     ('gemma2',),
-    _gemma2_config,
+    ConfigLayout(ConfigPart(reads(_gemma2_config), _gemma2_export)),
     lambda fields: bool(fields.sandwich_norms),
     'gemma2',
     'Gemma2ForCausalLM',
-    _gemma2_export,
     preserve_source_layout=False,
     # Gemma2Config's defaults for the fields its decoder reads.
     defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256, 'pad_token_id': 0,
@@ -627,11 +624,10 @@ GEMMA2 = DecoderFamily(
 
 GEMMA = DecoderFamily(
     ('gemma',),
-    _gemma_config,
+    ConfigLayout(ConfigPart(reads(_gemma_config), lambda model: {})),
     lambda fields: bool(fields.embedding_scale),
     'gemma',
     'GemmaForCausalLM',
-    lambda model: {},
     preserve_source_layout=False,
     defaults={'max_position_embeddings': 8192, 'hidden_act': 'gelu_pytorch_tanh', 'pad_token_id': 0},
     padding_idx=True,

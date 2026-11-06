@@ -17,10 +17,11 @@ from dew.interop.decoder_parts import (
     grouped_qkv,
     hf_ungated,
     partial_rope,
+    reads,
     spelled,
     ungated_mlp,
 )
-from dew.interop.layouts import Route, Slot, Table, one_of
+from dew.interop.layouts import ConfigLayout, ConfigPart, Route, Slot, Table, one_of
 from dew.interop.unread import Stored, equal
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import inverse_frequencies
@@ -105,7 +106,7 @@ def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
 
 GPT_NEOX = DecoderFamily(
     ('gpt_neox',),
-    _gpt_neox_config,
+    ConfigLayout(ConfigPart(reads(_gpt_neox_config), _gpt_neox_export)),
     lambda fields: bool(
         fields.norm_type == 'layer'
         and fields.norm_bias
@@ -114,7 +115,6 @@ GPT_NEOX = DecoderFamily(
     ),
     'gpt_neox',
     'GPTNeoXForCausalLM',
-    _gpt_neox_export,
     routes=_GPT_NEOX_ROUTES,
     prepare=_gpt_neox_buffers,
     packed=grouped_qkv('.attention.query_key_value'),

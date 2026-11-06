@@ -27,6 +27,7 @@ from dew.interop.decoder_parts import (
     base_config,
     plain_partial_rope,
     qkv_widths,
+    reads,
     record_float,
     record_int,
     refuse,
@@ -36,7 +37,7 @@ from dew.interop.decoder_parts import (
 from dew.interop.families.deepseek import deepseek_mixture
 from dew.interop.families.gemma import GEMMA4_DEFAULTS, GEMMA4_ROUTES, gemma4_config, parallel_experts
 from dew.interop.families.qwen import qwen2_config
-from dew.interop.layouts import Table, When
+from dew.interop.layouts import ConfigLayout, ConfigPart, Table, When
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 
@@ -589,7 +590,7 @@ def _diffusion_gemma_export(model: CausalTransformer) -> Mapping[str, object]:
 
 DIFFUSION_GEMMA_TEXT = DecoderFamily(
     ('diffusion_gemma_text',),
-    _diffusion_gemma_text_config,
+    ConfigLayout(ConfigPart(reads(_diffusion_gemma_text_config), _diffusion_gemma_export)),
     lambda fields: bool(
         fields.causal is False
         and (
@@ -600,7 +601,6 @@ DIFFUSION_GEMMA_TEXT = DecoderFamily(
     ),
     'diffusion_gemma_text',
     'DiffusionGemmaForBlockDiffusion',
-    _diffusion_gemma_export,
     routes=GEMMA4_ROUTES,
     packed=FUSED_EXPERTS,
     preserve_source_layout=False,
@@ -611,7 +611,7 @@ DIFFUSION_GEMMA_TEXT = DecoderFamily(
 
 DREAM = DecoderFamily(
     ('dream', 'Dream'),
-    _dream_config,
+    ConfigLayout(ConfigPart(reads(_dream_config), _mask_token_export)),
     lambda fields: bool(
         fields.causal is False
         and fields.attention_bias
@@ -619,7 +619,6 @@ DREAM = DecoderFamily(
     ),
     'dream',
     'DreamModel',
-    _mask_token_export,
     preserve_source_layout=True,
     bidirectional=True,
     # DreamBaseModel's table pads config.pad_token_id (modeling_dream.py:602-605 at 6572adb), whose
@@ -631,7 +630,7 @@ DREAM = DecoderFamily(
 
 LLADA = DecoderFamily(
     ('llada',),
-    _llada_config,
+    ConfigLayout(ConfigPart(reads(_llada_config), _llada_moe_export)),
     lambda fields: bool(
         fields.causal is False
         and not fields.attention_bias
@@ -645,7 +644,6 @@ LLADA = DecoderFamily(
     ),
     'llada',
     'LLaDAModelLM',
-    _llada_moe_export,
     routes=_LLADA_ROUTES,
     export_nulls=_LLADA_MOE_NULLS,
     preserve_source_layout=True,
@@ -653,10 +651,10 @@ LLADA = DecoderFamily(
 )
 
 LLADA_MOE_V2 = DecoderFamily(
-    ('llada_moe_v2',), _llada_moe_v2_config,
+    ('llada_moe_v2',), ConfigLayout(ConfigPart(reads(_llada_moe_v2_config), _llada_moe_export)),
     lambda fields: bool(not fields.causal and (mixture := fields.mixture) is not None
                         and mixture.score_function == 'softmax' and mixture.norm_topk_prob),
-    'llada_moe_v2', 'LLaDAMoEv2ModelLM', _llada_moe_export,
+    'llada_moe_v2', 'LLaDAMoEv2ModelLM',
     routes=spelled(_LLADA_MOE_NAMES),
     export_nulls=_LLADA_MOE_NULLS,
     preserve_source_layout=True,
@@ -664,10 +662,10 @@ LLADA_MOE_V2 = DecoderFamily(
 )
 
 LLADA2_MOE = DecoderFamily(
-    ('llada2_moe',), _llada2_config,
+    ('llada2_moe',), ConfigLayout(ConfigPart(reads(_llada2_config), _llada2_export)),
     lambda fields: bool(not fields.causal and (mixture := fields.mixture) is not None
                         and mixture.score_function == 'sigmoid'),
-    'llada2_moe', 'LLaDA2MoeModelLM', _llada2_export,
+    'llada2_moe', 'LLaDA2MoeModelLM',
     routes=spelled(_LLADA2_NAMES),
     packed=_LLADA2_PACKED, tied_head_names=('lm_head.weight', 'model.word_embeddings.weight'),
     export_nulls=('num_shared_experts',),

@@ -26,9 +26,11 @@ from dew.interop.decoder_parts import (
     base_config,
     native_layer_types,
     read_rope,
+    reads,
     refuse,
     spelled,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 _NAMES: Renames = (('input_layernorm_2', 'post_attention_layernorm'),
@@ -78,7 +80,8 @@ def _ouro_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 OURO = DecoderFamily(
-    ('ouro',), _ouro_config, lambda fields: fields.loop is not None, 'ouro', 'OuroForCausalLM', _ouro_export,
+    ('ouro',), ConfigLayout(ConfigPart(reads(_ouro_config), _ouro_export)),
+    lambda fields: fields.loop is not None, 'ouro', 'OuroForCausalLM',
     routes=spelled(_NAMES, leaves=_GATE),
     preserve_source_layout=False,
     # OuroModel's table pads config.pad_token_id (modeling_ouro.py:496-500), which OuroConfig leaves

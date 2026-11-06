@@ -30,10 +30,11 @@ from dew.interop.decoder_parts import (
     Packed,
     declared_depths,
     in_trunk,
+    reads,
     record_bool,
     record_int,
 )
-from dew.interop.layouts import Condition, Route, Slot, Table, When, one_of
+from dew.interop.layouts import Condition, ConfigLayout, ConfigPart, Route, Slot, Table, When, one_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -293,11 +294,10 @@ SSD's, each expert one tensor, and the prediction steps' blocks (`_step_routes`)
 
 NEMOTRON_H = DecoderFamily(
     ("nemotron_h",),
-    config_from_hf,
+    ConfigLayout(ConfigPart(reads(config_from_hf), lambda model: {})),
     matches,
     "nemotron_h",
     "NemotronHForCausalLM",
-    lambda model: {},
     routes=ROUTES,
     prediction_depth=step_depth,
     packed=PACKED,

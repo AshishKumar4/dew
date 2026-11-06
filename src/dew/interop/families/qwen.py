@@ -34,13 +34,14 @@ from dew.interop.decoder_parts import (
     prediction_routes,
     read_partial_rope,
     read_rope,
+    reads,
     record_int,
     refuse,
     softmax_top_k,
     specified_layer_types,
     spelled,
 )
-from dew.interop.layouts import Routes, Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Routes, Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -412,13 +413,12 @@ def _qwen3_next_export(model: CausalTransformer) -> Mapping[str, object]:
 
 QWEN3_NEXT = DecoderFamily(
     ('qwen3_next',),
-    _qwen3_next_config,
+    ConfigLayout(ConfigPart(reads(_qwen3_next_config), _qwen3_next_export)),
     lambda fields: any(
         isinstance(mixer, GatedDeltaNetMixer) and mixer.fused_in_proj for mixer in kind_mixers(fields)
     ),
     'qwen3_next',
     'Qwen3NextForCausalLM',
-    _qwen3_next_export,
     routes=QWEN_MOE_ROUTES, prediction_depth=qwen_mtp_depth,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
@@ -434,11 +434,10 @@ def _qwen35_export(model: CausalTransformer) -> Mapping[str, object]:
 
 QWEN3_5_MOE_TEXT = DecoderFamily(
     ('qwen3_5_moe_text',),
-    _qwen35_moe_config,
+    ConfigLayout(ConfigPart(reads(_qwen35_moe_config), _qwen35_moe_export)),
     lambda fields: bool(fields.output_gate and fields.mixture is not None),
     'qwen3_5_moe_text',
     'Qwen3_5MoeForCausalLM',
-    _qwen35_moe_export,
     routes=QWEN_MOE_ROUTES, prediction_depth=qwen_mtp_depth,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
@@ -449,13 +448,12 @@ QWEN3_5_MOE_TEXT = DecoderFamily(
 
 QWEN3_5_TEXT = DecoderFamily(
     (QWEN35,),
-    _qwen35_config,
+    ConfigLayout(ConfigPart(reads(_qwen35_config), _qwen35_export)),
     lambda fields: bool(
         fields.output_gate or 'linear_attention' in (fields.layer_types or ())
     ),
     QWEN35,
     'Qwen3_5ForCausalLM',
-    _qwen35_export,
     routes=qwen_mtp_routes(DECODER_ROUTES), prediction_depth=qwen_mtp_depth,
     preserve_source_layout=True,
     padding_idx=True,
@@ -465,11 +463,10 @@ QWEN3_5_TEXT = DecoderFamily(
 
 QWEN3_MOE = DecoderFamily(
     ('qwen3_moe',),
-    _qwen3_moe_config,
+    ConfigLayout(ConfigPart(reads(_qwen3_moe_config), _qwen3_export)),
     lambda fields: bool(fields.qk_norm and fields.mixture is not None),
     'qwen3_moe',
     'Qwen3MoeForCausalLM',
-    _qwen3_export,
     preserve_source_layout=True,
     # Qwen3MoeConfig's defaults for the fields its decoder reads.
     defaults={'max_position_embeddings': 32768},
@@ -486,13 +483,12 @@ def _qwen3_vl_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
 
 QWEN3_VL_MOE_TEXT = DecoderFamily(
     ('qwen3_vl_moe_text',),
-    _qwen3_vl_moe_config,
+    ConfigLayout(ConfigPart(reads(_qwen3_vl_moe_config), _qwen3_export)),
     # A text decoder read from a Qwen3-VL-MoE release (`hf_decoders.TEXT_FAMILIES`), never the family a
     # model exports as: it exports as Qwen3-MoE.
     lambda fields: False,
     'qwen3_moe',
     'Qwen3MoeForCausalLM',
-    _qwen3_export,
     routes=spelled((), layer_leaves=_QWEN_MOE_LEAVES),
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
@@ -505,11 +501,10 @@ expert in one fused tensor (`FUSED_EXPERTS`)."""
 
 QWEN3 = DecoderFamily(
     ('qwen3',),
-    _qwen3_config,
+    ConfigLayout(ConfigPart(reads(_qwen3_config), _qwen3_export)),
     lambda fields: bool(fields.qk_norm),
     'qwen3',
     'Qwen3ForCausalLM',
-    _qwen3_export,
     preserve_source_layout=False,
     # Qwen3Config's defaults for the fields its decoder reads.
     defaults={'num_key_value_heads': 32, 'head_dim': 128, 'max_position_embeddings': 32768},
@@ -518,12 +513,11 @@ QWEN3 = DecoderFamily(
 
 QWEN2_MOE = DecoderFamily(
     ('qwen2_moe',),
-    _qwen2_moe_config,
+    ConfigLayout(ConfigPart(reads(_qwen2_moe_config), lambda model: {})),
     lambda fields: bool(not fields.qk_norm and fields.mixture is not None
                         and fields.mixture.shared_gate),
     'qwen2_moe',
     'Qwen2MoeForCausalLM',
-    lambda model: {},
     routes=QWEN_MOE_ROUTES, prediction_depth=qwen_mtp_depth,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
@@ -534,11 +528,10 @@ QWEN2_MOE = DecoderFamily(
 
 QWEN2 = DecoderFamily(
     ('qwen2',),
-    qwen2_config,
+    ConfigLayout(ConfigPart(reads(qwen2_config), _qwen3_export)),
     lambda fields: bool(fields.attention_bias and fields.o_proj_bias is False),
     'qwen2',
     'Qwen2ForCausalLM',
-    _qwen3_export,
     preserve_source_layout=False,
     # Qwen2Config's defaults for the fields its decoder reads.
     defaults={'num_key_value_heads': 32, 'max_position_embeddings': 32768},

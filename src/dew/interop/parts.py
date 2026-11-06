@@ -31,7 +31,7 @@ from dew.interop import decoder_parts, sources
 from dew.interop.code_identity import Renaming, matched_class, same_code
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import ACTIVATIONS, PLAIN_SPELLING, DecoderFields
-from dew.interop.layouts import Leaf, Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Leaf, Table
 from dew.interop.unread import Stored, held
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, NormSpec
@@ -1667,6 +1667,7 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         return prepared
 
     return decoder_parts.DecoderFamily(
-        (model_type,), translated, lambda fields: False, model_type, 'ForCausalLM', lambda model: {},
+        (model_type,), ConfigLayout(ConfigPart(decoder_parts.reads(translated), lambda model: {})),
+        lambda fields: False, model_type, 'ForCausalLM',
         preserve_source_layout=True, routes=_Assembled(weight_path), packed=assembly.packed,
         tied_head_names=assembly.tied, prediction_depth=decoder_parts.layer_depth, prepare=prepare)

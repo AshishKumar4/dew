@@ -24,12 +24,13 @@ from dew.interop.decoder_parts import (
     base_config,
     every_layer_windowed,
     read_rope,
+    reads,
     refuse,
     softmax_top_k,
     spelled,
 )
 from dew.interop.families.qwen import QWEN_MOE_ROUTES
-from dew.interop.layouts import Spelled
+from dew.interop.layouts import ConfigLayout, ConfigPart, Spelled
 from dew.nn.backbones.decoder_block import Mixture
 
 
@@ -116,13 +117,12 @@ _GRANITEMOE_PACKED = (
 
 GRANITEMOE = DecoderFamily(
     ('granitemoe',),
-    _granitemoe_config,
+    ConfigLayout(ConfigPart(reads(_granitemoe_config), lambda model: {})),
     lambda fields: bool(fields.mixture is not None and not fields.qk_norm
                         and (fields.embedding_multiplier != 1.0 or fields.residual_multiplier != 1.0
                              or fields.logits_scaling != 1.0 or fields.attention_scale is not None)),
     'granitemoe',
     'GraniteMoeForCausalLM',
-    lambda model: {},
     routes=Spelled(_GRANITEMOE_NAMES, QWEN_MOE_ROUTES),
     packed=_GRANITEMOE_PACKED,
     preserve_source_layout=True,
@@ -132,11 +132,10 @@ GRANITEMOE = DecoderFamily(
 
 MIXTRAL = DecoderFamily(
     ('mixtral',),
-    _mixtral_config,
+    ConfigLayout(ConfigPart(reads(_mixtral_config), lambda model: {})),
     lambda fields: fields.mixture is not None,
     'mixtral',
     'MixtralForCausalLM',
-    lambda model: {},
     routes=spelled(MOE_NAMES),
     preserve_source_layout=True,
     # MixtralConfig's defaults (its rope base is its spelling's).
@@ -149,11 +148,11 @@ MIXTRAL = DecoderFamily(
 # MistralConfig has no layer_types: its window is on every layer.
 MISTRAL = DecoderFamily(
     ('mistral',),
-    _mistral_config,
+    ConfigLayout(ConfigPart(reads(_mistral_config), lambda model: {
+        'layer_types': None, 'sliding_window': model.kind_of('sliding_attention').window})),
     every_layer_windowed,
     'mistral',
     'MistralForCausalLM',
-    lambda model: {'layer_types': None, 'sliding_window': model.kind_of('sliding_attention').window},
     preserve_source_layout=False,
     # MistralConfig's defaults: it attends a 4096-token window unless a config says otherwise, so
     # an export of a model without one says so with a null.
@@ -165,11 +164,10 @@ MISTRAL = DecoderFamily(
 
 MINISTRAL = DecoderFamily(
     ("ministral",),
-    ministral_config,
+    ConfigLayout(ConfigPart(reads(ministral_config), lambda model: {})),
     lambda fields: "sliding_attention" in (fields.layer_types or ()),
     "ministral",
     "MinistralForCausalLM",
-    lambda model: {},
     preserve_source_layout=False,
     # MinistralConfig's defaults for the fields its decoder reads.
     defaults={"sliding_window": 4096, "num_key_value_heads": 8, "max_position_embeddings": 131072},
@@ -178,12 +176,10 @@ MINISTRAL = DecoderFamily(
 
 LLAMA = DecoderFamily(
     ("llama",),
-    llama_config,
+    ConfigLayout(ConfigPart(reads(llama_config), lambda model: {"mlp_bias": True} if model.mlp_bias else {})),
     lambda fields: True,
     "llama",
     "LlamaForCausalLM",
-    # LlamaMLP's projections carry biases where mlp_bias says so.
-    lambda model: {"mlp_bias": True} if model.mlp_bias else {},
     preserve_source_layout=False,
     # LlamaConfig's context (configuration_llama.py:71), which a YaRN record's omitted lengths read.
     defaults={"max_position_embeddings": 2048},

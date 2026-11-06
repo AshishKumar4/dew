@@ -14,8 +14,10 @@ from dew.interop.decoder_parts import (
     RopeSpelling,
     base_config,
     read_rope,
+    reads,
     specified_layer_types,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 
 _SPELLING = RopeSpelling(theta=500000.0, per_kind=True, local_theta=500000.0)
 """Olmo3Config's rope: a record per layer type at its `default_theta`, which a
@@ -51,11 +53,10 @@ def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
 
 OLMO3 = DecoderFamily(
     ('olmo3',),
-    _olmo3_config,
+    ConfigLayout(ConfigPart(reads(_olmo3_config), lambda model: {})),
     lambda fields: not fields.pre_norms,
     'olmo3',
     'Olmo3ForCausalLM',
-    lambda model: {},
     preserve_source_layout=True,
     # Olmo3Config's norm epsilon, window and context.
     defaults={'rms_norm_eps': 1e-5, 'sliding_window': 4096, 'max_position_embeddings': 2048,

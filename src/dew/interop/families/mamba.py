@@ -20,11 +20,13 @@ from dew.interop import mamba2
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
+    reads,
     record_bool,
     record_int,
     refuse,
     refuse_export,
 )
+from dew.interop.layouts import ConfigLayout, ConfigPart
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba import MambaMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
@@ -101,11 +103,10 @@ def _export(model: CausalTransformer) -> Mapping[str, object]:
 
 MAMBA = DecoderFamily(
     ("mamba",),
-    config_from_hf,
+    ConfigLayout(ConfigPart(reads(config_from_hf), _export)),
     lambda fields: isinstance(fields.mixer, MambaMixer),
     "mamba",
     "MambaForCausalLM",
-    _export,
     routes=mamba2.backbone_routes(LAYER),
     # The path map names every leaf of the mixer, so the shared writer writes it whole.
     preserve_source_layout=True,
@@ -114,11 +115,10 @@ MAMBA = DecoderFamily(
 
 MAMBA2 = DecoderFamily(
     ("mamba2",),
-    mamba2.config_from_hf,
+    ConfigLayout(ConfigPart(reads(mamba2.config_from_hf), lambda model: {})),
     lambda fields: isinstance(fields.mixer, Mamba2Mixer),
     "mamba2",
     "Mamba2ForCausalLM",
-    lambda model: {},
     routes=mamba2.ROUTES,
     preserve_source_layout=True,
     tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),

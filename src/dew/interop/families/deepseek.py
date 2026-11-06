@@ -46,6 +46,7 @@ from dew.interop.decoder_parts import (
     prediction_routes,
     read_partial_rope,
     read_rope,
+    reads,
     record_float,
     record_int,
     refuse,
@@ -54,7 +55,19 @@ from dew.interop.decoder_parts import (
     translated,
     yarn_record,
 )
-from dew.interop.layouts import INDEX, Config, Prefixed, Route, Routes, Slot, Table, mapped, one_of
+from dew.interop.layouts import (
+    INDEX,
+    Config,
+    ConfigLayout,
+    ConfigPart,
+    Prefixed,
+    Route,
+    Routes,
+    Slot,
+    Table,
+    mapped,
+    one_of,
+)
 from dew.interop.unread import Stored, held, valued
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -1146,12 +1159,11 @@ def v4_prepare(routes: Routes) -> WeightPreparer:
 
 MINIMAX_M2 = DecoderFamily(
     ('minimax_m2',),
-    _minimax_m2_config,
+    ConfigLayout(ConfigPart(reads(_minimax_m2_config), lambda model: {})),
     lambda fields: bool(fields.qk_norm and fields.qk_norm_scope == 'projection'
                         and fields.pre_norms and fields.mixture is not None),
     'minimax_m2',
     'MiniMaxM2ForCausalLM',
-    lambda model: {},
     routes=spelled(_MINIMAX_M2_NAMES),
     preserve_source_layout=True,
     padding_idx=True,
@@ -1163,11 +1175,10 @@ MINIMAX_M2 = DecoderFamily(
 # window, its compressor and its grouped output projection at once.
 DEEPSEEK_V4 = DecoderFamily(
     ('deepseek_v4',),
-    _deepseek_v4_config,
+    ConfigLayout(ConfigPart(reads(_deepseek_v4_config), lambda model: {})),
     lambda fields: isinstance(fields.mixer, DeepseekV4Mixer),
     'deepseek_v4',
     'DeepseekV4ForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_V4_ROUTES, prediction_depth=v4_depth,
     prepare=v4_prepare(DEEPSEEK_V4_ROUTES), folded=('o_a_proj/kernel',),
     preserve_source_layout=True,
@@ -1178,11 +1189,10 @@ DEEPSEEK_V4 = DecoderFamily(
 
 DEEPSEEK_V32 = DecoderFamily(
     ('deepseek_v32',),
-    partial(deepseek_config, sparse=True),
+    ConfigLayout(ConfigPart(reads(partial(deepseek_config, sparse=True)), lambda model: {})),
     lambda fields: (isinstance(mixer := fields.mixer, MLAMixer) and mixer.index_topk is not None),
     'deepseek_v32',
     'DeepseekV32ForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     padding_idx=True,
@@ -1191,7 +1201,7 @@ DEEPSEEK_V32 = DecoderFamily(
 
 DEEPSEEK_V2 = DecoderFamily(
     ('deepseek_v2',),
-    partial(deepseek_config, mixture=_deepseek_v2_mixture),
+    ConfigLayout(ConfigPart(reads(partial(deepseek_config, mixture=_deepseek_v2_mixture)), lambda model: {})),
     lambda fields: (
         isinstance(fields.mixer, MLAMixer)
         and (mixture := fields.mixture) is not None
@@ -1199,7 +1209,6 @@ DEEPSEEK_V2 = DecoderFamily(
     ),
     'deepseek_v2',
     'DeepseekV2ForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     aliases={'num_experts': 'n_routed_experts'},
@@ -1217,11 +1226,10 @@ DEEPSEEK_V2 = DecoderFamily(
 # text_config (modeling_kimi_k25.py:586), and DeepSeek V3's reader reads it.
 KIMI_K25 = DecoderFamily(
     ('kimi_k25',),
-    _kimi_k25_config,
+    ConfigLayout(ConfigPart(reads(_kimi_k25_config), lambda model: {})),
     lambda fields: False,
     'kimi_k25',
     'Kimi_K25ForConditionalGeneration',
-    lambda model: {},
     routes=Table(Prefixed('language_model.', DECODER_ROUTES),
                  # The tower and the projector have no counterpart here: their tensors fill no leaf, and
                  # a save writes their source bytes back.
@@ -1236,11 +1244,10 @@ KIMI_K25 = DecoderFamily(
 # exports as DeepSeek V3, the name `export_model_type` gives either source.
 DEEPSEEK_V3 = DecoderFamily(
     ('deepseek_v3', 'kimi_k2'),
-    deepseek_config,
+    ConfigLayout(ConfigPart(reads(deepseek_config), lambda model: {})),
     lambda fields: isinstance(fields.mixer, MLAMixer),
     'deepseek_v3',
     'DeepseekV3ForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     aliases={'num_local_experts': 'n_routed_experts', 'num_mtp_layers': 'num_nextn_predict_layers'},

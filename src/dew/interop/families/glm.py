@@ -28,6 +28,7 @@ from dew.interop.decoder_parts import (
     kind_mixers,
     layer_depth,
     read_partial_rope,
+    reads,
     record_float,
     record_int,
     refuse,
@@ -36,7 +37,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.families.deepseek import LAYOUT_FIELDS, deepseek_config, deepseek_mixture
 from dew.interop.families.qwen import single_prediction_depth
-from dew.interop.layouts import Copy, Route, Table
+from dew.interop.layouts import ConfigLayout, ConfigPart, Copy, Route, Table
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
@@ -384,14 +385,13 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
 
 GLM5_NEXT_TEXT = DecoderFamily(
     ('glm5_next_text',),
-    _glm5_next_config,
+    ConfigLayout(ConfigPart(reads(_glm5_next_config), _glm5_next_export)),
     lambda fields: any(
         isinstance(mixer, (KimiDeltaAttentionMixer, KPoolSparseAttentionMixer))
         for mixer in kind_mixers(fields)
     ),
     'glm5_next_text',
     'Glm5NextTextForCausalLM',
-    _glm5_next_export,
     routes=GLM5_NEXT_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # The config class's norm epsilon.
@@ -401,7 +401,7 @@ GLM5_NEXT_TEXT = DecoderFamily(
 
 GLM4_MOE = DecoderFamily(
     ('glm4_moe',),
-    _glm4_moe_config,
+    ConfigLayout(ConfigPart(reads(_glm4_moe_config), lambda model: {})),
     lambda fields: (
         fields.partial_rotary_type == 'default'
         and (mixture := fields.mixture) is not None
@@ -409,7 +409,6 @@ GLM4_MOE = DecoderFamily(
     ),
     'glm4_moe',
     'Glm4MoeForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # Glm4MoeConfig's defaults for the fields its decoder reads.
@@ -423,7 +422,7 @@ GLM4_MOE = DecoderFamily(
 # pairs, which no DeepSeek release does, so that field names the family.
 GLM_MOE_DSA = DecoderFamily(
     ('glm_moe_dsa',),
-    _glm_moe_dsa_config,
+    ConfigLayout(ConfigPart(reads(_glm_moe_dsa_config), lambda model: {})),
     lambda fields: (
         isinstance(mixer := fields.mixer, MLAMixer)
         and mixer.index_topk is not None
@@ -431,7 +430,6 @@ GLM_MOE_DSA = DecoderFamily(
     ),
     'glm_moe_dsa',
     'GlmMoeDsaForCausalLM',
-    lambda model: {},
     routes=DEEPSEEK_ROUTES, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # The config class's norm epsilon.
