@@ -126,7 +126,7 @@
    "lane": "Training"
   },
   "tests/test_decision_laya.py": {
-   "comparisons": 4,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_decision_objective.py": {
@@ -146,7 +146,7 @@
    "lane": "Training"
   },
   "tests/test_decision_task.py": {
-   "comparisons": 7,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decode_attention.py": {
