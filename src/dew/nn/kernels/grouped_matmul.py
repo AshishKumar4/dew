@@ -830,7 +830,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         ba, config = self._ran(ba, config)
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         depth = self._generated_extents(ba)[1]
-        steps = None if depth is None else -(-depth // config.block_k)
+        # An exactly summed walk's steps are a traced count (`mosaic_gpu._gmm_scheduled`'s `traced`): its
+        # pipeline allocates its whole ring, however few steps the call has.
+        steps = None if depth is None or ba.arguments.get('exact_sums') else -(-depth // config.block_k)
 
         def scope(stages: int) -> resources.Scope:
             staged = dataclasses.replace(config, stages=stages)
