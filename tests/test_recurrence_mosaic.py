@@ -731,10 +731,11 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
 HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
 """The mainloop's hook cells, each hook combination over one sequence and packed documents."""
 
-LONG_HOOK_CELLS = {(FORMED[1], True), (FORMED[4], True)}
+LONG_HOOK_CELLS = {(FORMED[1], True), (FORMED[4], True), (FORMED[5], True)}
 """The hook cells past two minutes interpreted, each a check-1 site of its own in map tasks (`check1_shards`):
 the step write gate's packed documents (128 declared seeds, 384 s whole) and the rated scan's (64, 172 s),
-hooks-accurate at 136c07a5a."""
+hooks-accurate at 136c07a5a, and the rated scan's with its output norm (167.6 s in train 630's CI, main
+f424ab7d8)."""
 
 
 @pytest.mark.parametrize(('hooks', 'packed'), [cell for cell in HOOK_CELLS if cell not in LONG_HOOK_CELLS])
@@ -753,11 +754,12 @@ def test_the_step_gated_hook_over_packed_documents_is_as_exact_as_the_recurrence
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(FORMED[1], packed=True)
 
 
+@pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=['scan', 'with its output norm'])
 @pytest.mark.check1_shards(seeds=64, per_task=32)
-def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_interpreted():
-    """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` at the rated scan
-    over packed documents (`LONG_HOOK_CELLS`)."""
-    every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(FORMED[4], packed=True)
+def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_interpreted(hooks):
+    """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` at the rated scan,
+    and with its output norm, over packed documents (`LONG_HOOK_CELLS`)."""
+    every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed=True)
 
 
 RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
