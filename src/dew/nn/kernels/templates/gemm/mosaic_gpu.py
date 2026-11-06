@@ -729,9 +729,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         prologue_gmems, side_gmems, o_gmems = _split(refs, len(prologue_operands), len(epilogue_operands))
         o_gmems, workspace = (o_gmems, None) if tail is None else (o_gmems[:-1], o_gmems[-1])
         ready = None if tail is None else family.partials_ready((multiprocessors, consumers), bool(interpret))
-        # A met walk's counts, a round of its tiles and a consumer each (`_met`).
-        meetings = (family.partials_ready((-(-grid[0] * grid[1] // multiprocessors), consumers),
-                                          bool(interpret)) if tiles.raster else None)
+        # A met walk's counts, a round of its tiles and a consumer each (`_met`); none interpreted, its
+        # programs one after another.
+        meetings = (family.partials_ready((-(-grid[0] * grid[1] // multiprocessors), consumers), False)
+                    if tiles.raster and not interpret else None)
         blocks = allocations.blocks
 
         schedule = functools.partial(

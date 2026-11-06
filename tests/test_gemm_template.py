@@ -1082,7 +1082,7 @@ def test_a_met_dense_walk_lowers_for_cuda(generation_name):
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
         bound, target = launch.bind(*args, **options), generation.gpu_target()
         tile = launch.derived(bound, target)
-        met = dataclasses.replace(tile, raster=8)
+        met = dataclasses.replace(tile, raster=8, cluster=1)
         assert launch.legal(bound, met, target), met
         jax.jit(functools.partial(launch.replace(config=met), **options)).trace(*args).lower(
             lowering_platforms=("cuda",))
