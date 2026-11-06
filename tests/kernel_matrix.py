@@ -41,6 +41,12 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "hook": ("plain", "bias", "row-scale", "paired"),
         "dtype": ("bfloat16", "float16"),
     },
+    "fused_gemm": {
+        "generation": ("sm90", "sm80"),
+        "stage": ("epilogue", "prologue", "both"),
+        "consumer": ("bias-cast", "silu-residual"),
+        "dtype": ("bfloat16", "float16"),
+    },
 }
 """Each family's axes and their values. Attention's: the GPU; the head width; 8 query heads over 8 key heads,
 2, or 4; a causal, a full or a causal call over three documents and padding; no hook, two key or two tile
@@ -51,7 +57,10 @@ paged pool's; 16 query heads over 8 key heads, or 8 over 8; no hook, attention s
 operands' dtype; the head width. GEMM's: the GPU; a dense product or one over three groups (one of them
 empty); the matrix stored N-major (`[depth, width]`) or K-major (`transpose_rhs`, `[width, depth]`); no hook,
 a bias (a group's under a grouped call), a scale a row, or a paired gate and up product under SwiGLU; the
-operands' dtype."""
+operands' dtype. The fused GEMM's (the choices `gemm_epilogue` and `gemm_prologue`): the GPU; the stage a
+region fuses, its consumers into the epilogue, its producer (an RMS norm) into the prologue (its consumers
+after the product in XLA), or both; the consumers, a bias then a cast, or a SiLU of twice the product plus a
+residual; the operands' dtype."""
 
 SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (
@@ -65,6 +74,7 @@ CELLS: dict[str, tuple[str, str]] = {
     "attention": ("attention_matrix", "a_routes_training_step_is_on_par"),
     "decode": ("decode_matrix", "a_decode_step_is_on_par"),
     "gemm": ("gemm_matrix", "a_gemm_training_step_is_on_par"),
+    "fused_gemm": ("fused_gemm_matrix", "a_fused_gemm_training_step_is_on_par"),
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
 
@@ -72,6 +82,7 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_attention.py::test_the_attention_matrix_holds_on_this_gpu",
     "tests/test_gpu_attention.py::test_the_decode_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
 )
 """The flows that run the matrices' cells, by pytest node id."""
 

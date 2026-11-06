@@ -12,10 +12,13 @@ one process (`gpu_flow`), each cell its own file's property:
   the one before it, as float64 does (test_warpgroup_scan).
 - GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the reference
   path's, dense and grouped, each matrix layout, hook and dtype its served pairs name (gemm_matrix).
+- The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step through the fuser's
+  prologue and epilogue on par with the same region's stages in XLA (fused_gemm_matrix).
 """
 
 import functools
 
+import fused_gemm_matrix as fused_matrix
 import gemm_matrix as matrix
 import jax
 import jax.numpy as jnp
@@ -133,3 +136,10 @@ def test_the_gemm_matrix_holds_on_this_gpu():
     reference path's (XLA's ragged dot) at every pair of axis values the route serves, each cell on its own
     GPU."""
     run_cells(cells_of(matrix.a_gemm_training_step_is_on_par))
+
+
+def test_the_fused_gemm_matrix_holds_on_this_gpu():
+    """The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step with its producer
+    and consumers fused into the template's stages on par with the same region's stages and product in XLA at
+    every pair of axis values the fusion serves, each cell on its own GPU."""
+    run_cells(cells_of(fused_matrix.a_fused_gemm_training_step_is_on_par))
