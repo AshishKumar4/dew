@@ -923,7 +923,8 @@ def _codes(dtype):
     """Codes of `dtype` and per-row power-of-two scales, so each converted value is exact in bf16."""
     keys = jax.random.split(jax.random.key(6), 2)
     codes = jax.random.randint(keys[0], CODES, -8, 8).astype(dtype)
-    return codes, jnp.exp2(jax.random.randint(keys[1], (CODES[0],), -3, 4).astype(jnp.float32))
+    # ldexp is exact where a GPU's exp2 is not (0.12499999 for 2 ** -3 on an A100).
+    return codes, jnp.ldexp(jnp.ones((CODES[0],), jnp.float32), jax.random.randint(keys[1], (CODES[0],), -3, 4))
 
 
 @pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
