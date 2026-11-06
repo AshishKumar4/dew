@@ -19,7 +19,8 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Hashable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import overload
 
@@ -378,17 +379,99 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
-             relower: Callable[[], jax.stages.Lowered]) -> jax.stages.Compiled:
+             relower: Callable[[], jax.stages.Lowered], first: "Attempt | None" = None
+             ) -> jax.stages.Compiled:
     """`lowered` compiled (`kept`), its communicators admitted against the room the process's pool left
-    them before it runs (`dew.communicators.admit`): every program Dew compiles passes here."""
-    executable = kept(lowered, options, relower=relower)
+    them before it runs (`dew.communicators.admit`): every program Dew compiles passes here. `first` is
+    its first compile where another thread made it (`attempts`)."""
+    executable = kept(lowered, options, relower=relower, first=first)
     communicators.admit(executable)
     return executable
 
 
+def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None,
+                                             Callable[[], jax.stages.Lowered]]]) -> list[jax.stages.Compiled]:
+    """Each of `programs`, a lowering, its options and its `relower`, compiled as `compiled` compiles it,
+    their first compiles at once, each in a thread of its own (`attempted`): XLA's compile releases the
+    GIL and runs one program on about one and a half cores, so two compiled at once took 1.94 times the
+    programs a second of two compiled in turn, four 2.2 times, on an 8-core host (a Qwen3.5-4B step for a
+    compile-only H100, FS-2440-CONCURRENT2). Each is then kept (`settled`) and admitted in turn, in this
+    thread, in the order given, as `compiled` keeps them one after another: a spill's refusal commits,
+    and its program relowers, under this thread's contexts, so the programs kept are the ones compiled in
+    turn keep: a program lowered before an earlier one's refusals committed is lowered again past them and
+    compiled in turn, as it would have been lowered after them. At most `COMPILE_THREADS` compile at once."""
+    firsts = attempts([(lowered, options) for lowered, options, _ in programs])
+    held = refused_launches()
+    kept_programs = []
+    for (lowered, options, relower), first in zip(programs, firsts, strict=True):
+        if refused_launches() != held:
+            lowered, first = relower(), None
+        kept_programs.append(compiled(lowered, options, relower=relower, first=first))
+    return kept_programs
+
+
+COMPILE_THREADS = 4
+"""The most programs `compiled_at_once` compiles at once: four took 2.2 times the programs a second of one
+on an 8-core host, each 1.8 times slower than alone, where two took 1.94 times (FS-2440-CONCURRENT2), so
+more would share the host's cores among more compiles without finishing more."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Attempt:
+    """A program's first compile (`attempted`): its executable, or the error XLA raised of it, which its
+    settlement raises in its caller's turn (`settled`) where it is no refusal of a Triton kernel asking
+    shared bytes past a block (`shared_asked`)."""
+
+    executable: jax.stages.Compiled | None
+    error: Exception | None = None
+    """A `jax.errors.JaxRuntimeError`, which JAX names as a value, no type."""
+
+
+def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> Attempt:
+    """`lowered` compiled once under `options`: XLA's compile alone, which reads and writes nothing of this
+    process's but the executable it makes and the persistent compilation cache, so a thread of its own
+    runs it (`compiled_at_once`); its kernels' binaries are read where it is kept (`settled`), in its
+    caller's thread, as reading them walks the executable's MLIR (`binaries`), which two threads at once
+    failed in (a Qwen3.5-4B step and its sampled step for a compile-only H100: `MLIRError: Failure while
+    executing pass pipeline`)."""
+    try:
+        return Attempt(lowered.compile(options))
+    except jax.errors.JaxRuntimeError as error:
+        return Attempt(None, error)
+
+
+def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]
+             ) -> list[Attempt]:
+    """Each of `programs` compiled once (`attempted`), in order, all at once, at most `COMPILE_THREADS`
+    at a time; one alone in this thread. JAX's cache key reads a module's context without writing it from
+    0.12.0.1.post54 (pyproject's pin), so programs one thread lowered in one context compile together."""
+    if len(programs) < 2:
+        return [attempted(*program) for program in programs]
+    with ThreadPoolExecutor(min(len(programs), COMPILE_THREADS), thread_name_prefix="dew-compile") as pool:
+        return [each.result() for each in [pool.submit(attempted, *program) for program in programs]]
+
+
+def reads_binaries(lowered: jax.stages.Lowered) -> bool:
+    """Whether a compile of `lowered` reads its kernels' binaries: where it runs a Mosaic GPU or a
+    Pallas-Triton launch. A program of Pallas-Triton launches alone spills as a Mosaic one does: both
+    kinds' binaries are read (`binaries`, a Triton launch's by its custom kernel's tag), so a launch's
+    feedback is the same whatever kernels share its program (row 3960: a Triton-only program's
+    15,752-byte frame went unread)."""
+    from dew.training._lowering import kernel_calls
+
+    return any(call.kind in ("mosaic_gpu", "triton") for call in kernel_calls(lowered))
+
+
 def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
-         relower: Callable[[], jax.stages.Lowered]) -> jax.stages.Compiled:
-    """`lowered` compiled, read through its kernels' binaries (`binaries`): where a kernel of a template's
+         relower: Callable[[], jax.stages.Lowered], first: Attempt | None = None) -> jax.stages.Compiled:
+    """`lowered` compiled and kept (`settled`), its first compile `first` or one in this thread."""
+    return settled(lowered, options, relower, attempted(lowered, options) if first is None else first)
+
+
+def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
+            relower: Callable[[], jax.stages.Lowered], first: Attempt) -> jax.stages.Compiled:
+    """The program kept of `lowered`'s first compile (`first`), read through its kernels' binaries
+    (`binaries`): where a kernel of a template's
     launch spills, that launch's config is refused (`refused`), the miss recorded (`misses`, logged), and the
     program `relower`ed once and compiled; `relower` traces afresh, so each refused launch's derivation
     takes the next config by its own rule. A kernel spilling again is recorded, neither refused nor stepped
@@ -397,14 +480,14 @@ def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
     only when a replacement compiles, so a later process derives the program kept here. A program loaded
     from the persistent compilation cache carries its kernels' binaries as one compiled here does. A
     program whose block XLA refuses steps its asking Triton launches down (`_unblocked`)."""
-    try:
-        executable, spilling = _compiled_reported(lowered, options)
-    except jax.errors.JaxRuntimeError as error:
-        asked = shared_asked(error)
+    if first.error is not None:
+        asked = shared_asked(first.error)
         if asked is None:
-            raise
-        return _unblocked(lowered, options, relower, asked, error)
-    found = _misses_of(spilling)
+            raise first.error
+        return _unblocked(lowered, options, relower, asked, first.error)
+    executable = first.executable
+    assert executable is not None
+    found = _misses_of(_spilling(lowered, executable))
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
     if not refusals:
         _recorded(found, stepped=False)
@@ -495,15 +578,16 @@ def _recorded(found: list, *, stepped: bool) -> None:
 
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
                        ) -> tuple[jax.stages.Compiled, list["Binary"]]:
-    from dew.nn.kernels.lowered import kernel_calls
-
     executable = lowered.compile(options)
-    # A program of Pallas-Triton launches alone spills as a Mosaic one does: both kinds' binaries are read
-    # (`binaries`, a Triton launch's by its custom kernel's tag), so a launch's feedback is the same whatever
-    # kernels share its program (row 3960: a Triton-only program's 15,752-byte frame went unread).
-    if not any(call.kind in ("mosaic_gpu", "triton") for call in kernel_calls(lowered)):
-        return executable, []
-    return executable, [found for found in binaries(executable) if found.frame]
+    return executable, _spilling(lowered, executable)
+
+
+def _spilling(lowered: jax.stages.Lowered, executable: jax.stages.Compiled) -> list["Binary"]:
+    """The kernels of `executable`, `lowered` compiled, that spill, where it runs a template's
+    (`reads_binaries`)."""
+    if not reads_binaries(lowered):
+        return []
+    return [found for found in binaries(executable) if found.frame]
 
 
 @dataclasses.dataclass(frozen=True)

@@ -1413,7 +1413,10 @@ models: Aliases[type[nn.Module], nn.Module] = Aliases("model", {
 }, base="flax.linen:Module")
 presets: Aliases[type[Preset], Preset] = Aliases("preset", {
     "cosine": "dew.diffusion.presets:Cosine",
+    "cosine_continuous": "dew.diffusion.presets:CosineContinuous",
+    "cosine_general": "dew.diffusion.presets:CosineGeneral",
     "edm": "dew.diffusion.presets:EDM",
+    "exp": "dew.diffusion.presets:Exp",
     "flow": "dew.diffusion.presets:Flow",
     "jit": "dew.diffusion.presets:JiT",
     "karras": "dew.diffusion.presets:Karras",

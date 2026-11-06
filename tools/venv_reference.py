@@ -16,7 +16,6 @@ import importlib
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -49,12 +48,14 @@ distribution and version its environment must hold, where the reference is one, 
 worker's float32 run takes, the CPU unless named."""
 
 
-def main() -> None:
+def recording(site: str, python: str, source: str | None) -> dict[str, np.ndarray]:
+    """`site`'s recording: each seed's draw run by the site's worker under `python` (`session`), its float32
+    run and its float64 truth, sized paired against Dew's float32 run (`record_case`)."""
     import jax
     import jax.numpy as jnp
-    from recorded_references import provenance, record_case, save
+    from recorded_references import record_case
+    from reference_worker import arms, session
 
-    site, python = sys.argv[1], sys.argv[2]
     known = SITES[site]
     test = importlib.import_module(known["test"])
     if "distribution" in known:
@@ -64,29 +65,27 @@ def main() -> None:
         if held != wanted:
             raise SystemExit(f"the recording is of {name} {wanted}; {python} holds {held}")
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-    environment |= {"JAX_PLATFORMS": "cpu", **({"PYTHONPATH": sys.argv[3]} if len(sys.argv) > 3 else {})}
-    worker = subprocess.Popen([python, str(ROOT / "tools" / known["worker"]), site], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, text=True, env=environment)
-    scratch = Path(tempfile.mkdtemp())
+    environment |= {"JAX_PLATFORMS": "cpu", **({} if source is None else {"PYTHONPATH": source})}
+    with session([python, str(ROOT / "tools" / known["worker"]), site], env=environment) as worker:
+        def evaluate(inputs):
+            answer = worker.ask({f"case.{key}": value for key, value in inputs.items()})
+            reference, truth = arms(answer, "case.")
+            return tuple({leaf: arm[leaf] for leaf in test.OUTPUTS} for arm in (reference, truth))
 
-    def evaluate(inputs):
-        given, out = scratch / "in.npz", scratch / "out.npz"
-        np.savez(given, **{f"case.{key}": value for key, value in inputs.items()})
-        worker.stdin.write(f"{given} {out}\n")
-        worker.stdin.flush()
-        if worker.stdout.readline().strip() != "done":
-            raise RuntimeError(f"{site}'s worker stopped")
-        with np.load(out) as answered:
-            return tuple({leaf: answered[f"case.{kind}.{leaf}"] for leaf in test.OUTPUTS}
-                         for kind in ("reference", "truth"))
+        dew = jax.jit(lambda inputs: test.dew(jnp.float32, inputs))
+        return record_case(site, test.draw, evaluate, store_inputs=False, summary=True, dew=dew)
 
-    dew = jax.jit(lambda inputs: test.dew(jnp.float32, inputs))
-    arrays = record_case(site, test.draw, evaluate, store_inputs=False, summary=True, dew=dew)
-    worker.stdin.close()
-    worker.wait()
-    written = save(test.FIXTURE, {**arrays, "provenance": provenance(
+
+def main() -> None:
+    from recorded_references import provenance, save
+
+    site, python = sys.argv[1], sys.argv[2]
+    source = sys.argv[3] if len(sys.argv) > 3 else None
+    known = SITES[site]
+    arrays = recording(site, python, source)
+    written = save(importlib.import_module(known["test"]).FIXTURE, {**arrays, "provenance": provenance(
         known["reference"], "", known.get("device", "cpu"),
-        f"python tools/venv_reference.py {site} PYTHON{' SOURCE' if len(sys.argv) > 3 else ''}")},
+        f"python tools/venv_reference.py {site} PYTHON{' SOURCE' if source is not None else ''}")},
         reference=known["reference"], license=known["license"])
     print(f"{written}: {sorted(arrays)}")
 

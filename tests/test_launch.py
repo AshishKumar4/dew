@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 from lane_environment import outside_any_cluster
-from process_support import running
+from process_support import owned, running
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # The launches below stand in for Slurm, Open MPI or a plain host with
@@ -45,10 +45,10 @@ def test_a_launch_avoids_an_occupied_coordinator_port():
     assert done.returncode == 0, done.stdout + done.stderr
 
 
-def launcher(*arguments: str, env: dict[str, str] = ENV) -> subprocess.Popen:
-    return subprocess.Popen([sys.executable, "-m", "dew._cli.main", "launch", *arguments],
-                            cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, start_new_session=True)
+def launcher(*arguments: str, env: dict[str, str] = ENV) -> subprocess.Popen[str]:
+    """`dew launch` as a group the test holds (`process_support.owned`), so a test killed while a launch
+    runs takes the launch with it."""
+    return owned([sys.executable, "-m", "dew._cli.main", "launch", *arguments], env)
 
 
 def alive(pid: int) -> bool:
@@ -103,7 +103,7 @@ def test_a_ranks_lines_reach_the_launch_while_the_rank_runs():
     shell = {name: value for name, value in ENV.items() if name != "PYTHONUNBUFFERED"}
     launch = launcher("--port", "1", "--", sys.executable, "-c", program, env=shell)
     lines: queue.Queue[str] = queue.Queue()
-    threading.Thread(target=lambda: [lines.put(line.decode()) for line in launch.stdout or ()],
+    threading.Thread(target=lambda: [lines.put(line) for line in launch.stdout or ()],
                      daemon=True).start()
     seen = []
     deadline = time.monotonic() + 30
@@ -325,6 +325,15 @@ def test_a_rank_over_ssh_stopped_through_its_terminal_exits_with_its_own_code(tm
     ssh.stdin.flush()
     assert ssh.wait(timeout=60) == 7
 
+
+
+def test_a_launch_on_a_cloud_tpu_worker_runs_the_program_there_once():
+    """On a Cloud TPU worker `dew launch -- python ...` runs the program in place, once, as every worker of
+    the TPU does, for JAX to join them as it reads the TPU's own sources; it starts no pool of its own."""
+    env = {**ENV, "JAX_FORCE_TPU_INIT": "1", "TPU_WORKER_HOSTNAMES": "w-0,w-1", "TPU_WORKER_ID": "0"}
+    done = launched("--", sys.executable, "-c", "import os; print('ran', os.getpid())", env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len([line for line in done.stdout.splitlines() if line.startswith("ran ")]) == 1
 
 def launched(*arguments: str, env: dict) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-m", "dew._cli.main", "launch", *arguments],
