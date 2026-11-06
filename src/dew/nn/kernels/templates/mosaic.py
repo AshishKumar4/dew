@@ -356,13 +356,26 @@ def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, issue
 
 class Pieces(tuple):
     """A step's tile loaded as several copies (`viewed`, `Ring.load`): its block's rows in as many equal
-    parts, each a view of its own, in order; a paged pool's key tile across the pages it spans."""
+    parts, each a view of its own, in order (a `Rows` step's runs)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Rows:
+    """A block's rows in runs at a table's entries, the toolkit's one table-indexed row form: its run `i`,
+    `rows` rows, at run `table[start + i]` of the array's rows (`table` an int32 ref, its entries in runs),
+    its other block indices `rest`, each run a copy of its own (`viewed`'s `Pieces`). A paged pool's key
+    tile across the pages it spans takes a run a page."""
+
+    table: Any
+    start: Any
+    rest: tuple
+    rows: int
 
 
 def viewed(view: tuple, block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
     `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
-    `Pieces` of block indices, each the indices of its part of the block's rows, those parts' views."""
+    `Rows`, each run's view at its table's entry."""
     ref, index_map = view
     indices = index_map(step)
 
@@ -370,9 +383,10 @@ def viewed(view: tuple, block: tuple, step):
         return ref.at[tuple(pl.ds(index * extent, extent)
                             for index, extent in zip(indices, block, strict=True))]
 
-    if isinstance(indices, Pieces):
-        part = (block[0] // len(indices), *block[1:])
-        return Pieces(at(piece, part) for piece in indices)
+    if isinstance(indices, Rows):
+        run = (indices.rows, *block[1:])
+        return Pieces(at((indices.table[indices.start + each], *indices.rest), run)
+                      for each in range(block[0] // indices.rows))
     return at(indices, block)
 
 
