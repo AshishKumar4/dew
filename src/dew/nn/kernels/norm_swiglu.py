@@ -306,8 +306,12 @@ def _per_shard(local, axes, operands, replicated):
     gradient sums over the shards. Every output takes the first operand's place."""
     if not automatic_axes():
         return local(*operands)
+    spec = _shard_spec(axes, operands[0])
+    if spec is None:
+        raise ValueError("an automatic mesh axis no caller names splits the operands, which the kernel's "
+                         "selector refuses (`_placed`)")
     whole = {index for index, replicated in enumerate(replicated) if replicated}
-    return on_shards(local, _shard_spec(axes, operands[0]), operands, whole)
+    return on_shards(local, spec, operands, whole)
 
 
 @dataclasses.dataclass(frozen=True)
