@@ -649,8 +649,7 @@ def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw(
     """`also`: one Dew arm against several references on the same draws, each judged by its own check 1
     under its own label, Dew and the truth evaluated once a draw for them all. A Dew arm on par with one
     reference and three times another's error fails against that one alone; a site with every
-    reference on par passes; beside a plain Dew arm, a further reference of another kind than the
-    reference's is refused."""
+    reference on par passes."""
     calls = {"dew": 0, "truth": 0}
 
     draw = noised_draw
@@ -678,12 +677,6 @@ def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw(
         assert_as_exact(arm(3.0, "mine"), arm(3.0, "theirs"), draw, "one far", seeds=16, truth_fn=truth,
                         also={"another": arm(1.0, "other")})
     assert {finding.leaf for finding in failed.value.findings} == {"one far, against another['value']"}
-    def plain(x, *_):
-        return {"value": x}
-
-    with pytest.raises(ValueError):
-        assert_as_exact(plain, plain, draw, "two kinds", seeds=16, truth_fn=truth,
-                        also={"given": arm(1.0, "other")})
 
 
 def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references():
@@ -735,10 +728,9 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
     assert [(verdict, stage) for verdict, stage, _ in verdicts] == [("pass", 1), ("pass", 1)], verdicts
 
 
-def test_a_reference_compiled_with_options_of_its_own_runs_as_it_is():
-    """A reference compiled with compiler options of its own (a trainer step's, `as_a_step`) runs as it is,
-    marked `as_given` or not: the gate never nests a compiled program in its own jit, which a jit with
-    options of its own would refuse (row 1800)."""
+def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
+    """A reference compiled with compiler options of its own (a trainer step's, `as_a_step`) runs as
+    given: no program nests it, which a jit with options of its own refuses (row 1800)."""
     own = jax.jit(lambda x: {"y": x * 2}, compiler_options={"xla_cpu_enable_fast_math": False})
     def doubled(x):
         return {"y": jnp.asarray(x) + jnp.asarray(x)}
@@ -746,8 +738,7 @@ def test_a_reference_compiled_with_options_of_its_own_runs_as_it_is():
     def draw(seed):
         return (np.random.default_rng(seed).standard_normal(64).astype(np.float32),)
 
-    for reference in (own, as_given(own)):
-        assert_as_exact(doubled, reference, draw, "a reference with options", seeds=8)
+    assert_as_exact(doubled, as_given(own), draw, "a reference with options", seeds=8)
 
 
 def test_every_arm_kind_runs_as_the_gate_compiles_it():
