@@ -633,6 +633,8 @@ dew.decision.config.DecisionRunConfig
   segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
   reads: Annotated[Reads, record_argument(Reads)] | None = None
   parallel: bool | None = None
+  shared_state: int | None = None
+  siblings: bool | None = None
   unit: Unit | None = None
   order: RowOrder | None = None
   split: Literal['part', 'question', 'whole'] | None = None
