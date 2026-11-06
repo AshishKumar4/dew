@@ -384,29 +384,35 @@ class KernelBug(Exception):
     """A kernel's own failure, which no GPU limit explains."""
 
 
+class KernelRefusal(ValueError):
+    """A kernel's own failure raised as a ValueError, as a product refusing the tiles it was given does."""
+
+
 def a_config_failing_for_more_than_its_shared_memory_stops_the_measurement():
     """A launch one of whose configs raises as it lowers, a kernel's bug and not its GPU's shared
     memory: measuring the launch propagates the error, where the tuner had counted it one more
-    failed config and kept the others' fastest."""
+    failed config and kept the others' fastest; a ValueError too, which the tuner refuses only where
+    CUPTI read none of a config's kernels (row 4446)."""
     with tuning.launches():
         found = tokamax.autotuning.get_bound_args(step(), *operands(15))
     [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
     broken_config = sorted(norm.autotuning_configs, key=repr)[0]
-
-    class Broken(norm_swiglu.RmsForward):
-        """The norm's forward, raising for one of its variants. Its signature is the norm's, which
-        tokamax reads to bind the launch's operands."""
-
-        @functools.wraps(norm_swiglu.RmsForward._fwd)
-        def _fwd(self, *args, config, **kwargs):
-            if config == broken_config:
-                raise KernelBug
-            return super()._fwd(*args, config=config, **kwargs)
-
     fields = {field.name: getattr(norm.op, field.name) for field in dataclasses.fields(norm.op) if field.init}
-    broken = tokamax.BoundArguments(Broken(**fields), norm.arguments)
-    with pytest.raises(KernelBug):
-        tuning._measured(broken.op, broken)
+    for failure in (KernelBug, KernelRefusal):
+
+        class Broken(norm_swiglu.RmsForward):
+            """The norm's forward, raising for one of its variants. Its signature is the norm's, which
+            tokamax reads to bind the launch's operands."""
+
+            @functools.wraps(norm_swiglu.RmsForward._fwd)
+            def _fwd(self, *args, config, failure=failure, **kwargs):
+                if config == broken_config:
+                    raise failure
+                return super()._fwd(*args, config=config, **kwargs)
+
+        broken = tokamax.BoundArguments(Broken(**fields), norm.arguments)
+        with pytest.raises(failure):
+            tuning._measured(broken.op, broken)
 
 
 def a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
