@@ -362,8 +362,10 @@ class RegisterModel:
     GPU's compile to (tests/kernel_compile.py `decisions`): a consumer thread's registers (None where a case
     states only its budget), the family's budget for them at its consumers (`Family.registers`), its
     consumer warpgroups, the most programs its family runs a multiprocessor (`Family.programs`), the
-    allocator's step (`Family.register_step`), a producer warpgroup's registers a thread (0 without one) and
-    the scratch its planner sized (`scratch_bytes`, None where unstated)."""
+    allocator's step (`Family.register_step`), a producer warpgroup's registers a thread (0 without one),
+    the scratch its planner sized (`scratch_bytes`, None where unstated) and the registers of the
+    multiprocessor it runs on (`file`, `Multiprocessor.registers`), its own fact: no residency it states
+    reads another device's."""
     registers: int | None
     budget: int
     consumers: int
@@ -372,12 +374,13 @@ class RegisterModel:
     producer: int
     shared: int | None = None
     family: "Family | None" = dataclasses.field(default=None, compare=False, repr=False)
+    file: int = dataclasses.field(kw_only=True)
 
     def resident(self, registers: int, *, honored: bool = RAISES_HONORED) -> int:
         """Residency at this consumer allocation, bounded by the launch's other resources."""
         producer = self.producer if honored or not self.producer else registers
         allocated = _register_allocation(registers, self.consumers, producer, self.step)
-        return min(self.most, facts().registers // allocated) if allocated else self.most
+        return min(self.most, self.file // allocated) if allocated else self.most
 
     def cap(self, programs: int, *, honored: bool = RAISES_HONORED) -> int:
         """The consumer cap that leaves room for `programs` copies of this launch: the registers the launch
@@ -412,7 +415,8 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
         if tmem:
             most = min(most, (target.tmem_columns or 0) // tmem)
     return RegisterModel(registers, family.registers(consumers), consumers, most, family.register_step,
-                         producer_registers(consumers) if warpgroups > consumers else 0, shared, family)
+                         producer_registers(consumers) if warpgroups > consumers else 0, shared, family,
+                         file=facts().registers)
 
 
 @dataclasses.dataclass(frozen=True)
