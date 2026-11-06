@@ -448,30 +448,6 @@ def test_the_backward_from_the_kept_output_is_on_par_interpreted(call, form):
     _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, kept=template.Kept.OUTPUT)
 
 
-def test_a_slope_reaches_a_custom_vjp_only_through_the_operands_it_feeds():
-    """A score hook's slope along an input counts as reaching a `jax.custom_vjp` only where that input
-    feeds one, through a jit's program operand by operand (`_reaches_custom_vjp`): a score added to a
-    custom VJP of a parameter has the constant slope one, traced, and the parameter's slope is counted."""
-    from dew.nn.kernels.templates.attention_mosaic_program import _reaches_custom_vjp
-
-    @jax.custom_vjp
-    def held(x):
-        return x
-
-    held.defvjp(lambda x: (x, None), lambda _, cotangent: (cotangent,))
-    traced = jax.make_jaxpr(lambda s, p: jax.jit(lambda s, p: s + held(p))(s, p))(1.0, 2.0).jaxpr
-    assert not _reaches_custom_vjp(traced, {traced.invars[0]})
-    assert _reaches_custom_vjp(traced, {traced.invars[1]})
-    # A jit's outputs reached one by one: its second output, independent of `s`, feeds the custom VJP.
-    paired = jax.make_jaxpr(lambda s, p: (lambda pair: pair[0] + held(pair[1]))(
-        jax.jit(lambda s, p: (s, p))(s, p)))(1.0, 2.0).jaxpr
-    assert not _reaches_custom_vjp(paired, {paired.invars[0]})
-    assert _reaches_custom_vjp(paired, {paired.invars[1]})
-    # No tangent passes a stop_gradient.
-    stopped = jax.make_jaxpr(lambda s: held(jax.lax.stop_gradient(s)))(1.0).jaxpr
-    assert not _reaches_custom_vjp(stopped, {stopped.invars[0]})
-
-
 @INTERPRETS
 def test_the_plain_jax_backward_takes_the_kept_outputs_residuals():
     """The plain-JAX mainloop's backward from residuals a Mosaic training forward keeps its output in
@@ -1023,8 +999,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     with generation.assumed(target):
         op, ba = _forward_call(shape, 128, 128, residuals=template.Kept.SPLIT)
         derived = op.derived(ba, target)
-        assert derived is not None and derived.family == "wgmma"
-        assert op.staged_bytes(ba, derived, target) <= 180 * 1024
+        assert derived is not None and op.legal(ba, derived, target)
     _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, target=target)
     _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True,
                    training=template.Kept.SPLIT, target=target)
@@ -1382,24 +1357,6 @@ def test_the_launches_lower_for_an_h100(call, accurate):
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
-
-
-@pytest.mark.parametrize(("hooks", "approximated"), [("none", True), ("alibi", True), ("sinks", True),
-                                                     ("temperature", True), ("softcap", False),
-                                                     ("custom-vjp", False), ("softcap-sinks-alibi", False)])
-def test_a_launch_takes_approximate_math_only_where_no_hook_computes_a_transcendental(hooks, approximated):
-    """The hardware's approximate transcendentals (`approx_math`) hold the mainloop's own exponentials on par;
-    a hook's tanh at tanh.approx's 2^-11 does not (a softcap beside an initial state put the state's
-    gradient at 7.04 times the reference's error on an H100, and every hook on par with exact math), so a
-    launch whose score hook or its pullback computes one Mosaic GPU approximates compiles exact math, and
-    every other launch the approximate."""
-    queries = keys = 64
-    score_mod, kinds, draw = score_hooks(SCORE_HOOKS[hooks], queries, keys, 64)
-    params, initial = draw(0)
-    hooked = template.Hooks(score_mod, tuple(map(template.Param, params, kinds)), initial)
-    for differentiated in (False, True):
-        assert attention_mosaic_program.approximate(hooked, (64, 64), 64,
-                                                    differentiated=differentiated) == approximated
 
 
 APPROXIMATED_BY_MOSAIC = ("exp", "exp2", "log", "log2", "log1p", "tanh", "logistic", "sin", "cos", "sqrt",

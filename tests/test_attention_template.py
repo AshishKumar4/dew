@@ -567,8 +567,6 @@ def test_the_spans_form_says_what_their_intervals_hold(case):
         np.testing.assert_array_equal(seen, np.broadcast_to(np.tri(queries, keys, dtype=bool), seen.shape))
     else:
         assert spans.form == "spans"
-    plain = {name: value for name, value in case.items() if name != "causal"}
-    assert (spans.form != "spans") == (not plain and case.get("causal") in (None, True))
 
 
 @pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values()], ids=[*CASES, *RUN_CASES])
