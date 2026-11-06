@@ -81,7 +81,7 @@ from dew.nn.kernels.templates.cost import estimate
 
 
 def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype, *, splits: int, peaks: bool,
-               training: bool, finishes: bool) -> tuple:
+               training: bool, finishes: bool, certified: int = 0) -> tuple:
     """`_launch`'s outputs' types: a peak walk's maxima and anchor keys; a training walk's status, residual
     rows, anchor keys and split sums; else its status and output `[B, S·Qp, H, Dv]` (a split launch's slices
     along its query axis), and its finished rows where it `finishes`."""
@@ -97,6 +97,10 @@ def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype
     out_type = (status_type, jax.ShapeDtypeStruct((batch, rows_out, heads, value_width), out_dtype))
     if finishes:
         out_type += (jax.ShapeDtypeStruct((2, batch, heads, rows_out), jnp.float32),)
+    if certified:
+        # The certify form's state after each of its `certified` key tiles (`certified_walk`).
+        out_type += (jax.ShapeDtypeStruct((2, batch, heads, certified, rows_out), jnp.float32),
+                     jax.ShapeDtypeStruct((batch, heads, certified, rows_out, value_width), jnp.float32))
     return out_type
 
 
@@ -110,7 +114,7 @@ def _stores_through_query(family: mosaic.Family, width: int, value_width: int, d
 
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
-                         pieces: int = 1) -> tuple[list, dict]:
+                         pieces: int = 1, certified: bool = False) -> tuple[list, dict]:
     """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order: its consumers'
     query stages and their rows' status; each one's output stage where the value is not as wide as the query
     and as narrow, `out_dtype`, the query's by default (the output stores through the query's stage where it
@@ -118,7 +122,8 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     anchor keys' stage; the query loads' barriers and
     the consumers' turns' barrier; and its key and value streams in `stages` slots (`Family.streams`), a
     peak walk's keys alone, each slot loaded in `pieces` copies (a paged call's tile of several pages); the
-    query's stage at its swizzle (`query_swizzle`)."""
+    query's stage at its swizzle (`query_swizzle`); a certify form's fp32 stage of a step's sums last
+    (`certified_walk`)."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
     scoped = [mosaic.staged((consumers, block_q, width), dtype, query_swizzle(family)),
               plgpu.SMEM((consumers, block_q), jnp.float32)]
@@ -128,6 +133,8 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), out_dtype or dtype))
     if residuals or peaks:
         scoped.append(plgpu.SMEM((consumers, block_q), jnp.int32))
+    if certified:
+        scoped.append(plgpu.SMEM((consumers, block_q, value_width), jnp.float32))
     scoped += [family.load_barriers(consumers), family.schedule(consumers)]
     blocks = {"keys": ((block_k, width), dtype)}
     if not peaks:
@@ -606,6 +613,14 @@ class _Block(NamedTuple):
         rows = tuple(finished[0].at[place, *self.state] for place in range(2)) if finishes else None
         return self.status(status_ref), out_ref.at[self.rows], rows
 
+    def certified(self, written: tuple) -> tuple:
+        """Its views of a certify form's state after each key tile (`_out_types`' last two): the rows'
+        maxima's and denominators' `[tiles, block_q]` and the sums' `[tiles, block_q, Dv]`."""
+        rows_ref, sums_ref = written[-2:]
+        row, head, queries = self.state
+        return (tuple(rows_ref.at[place, row, head, :, queries] for place in range(2)),
+                sums_ref.at[row, head, :, queries])
+
 
 def _walked_program(program: _Program, walks, row, queries: int) -> jax.Array:
     """Whether a masked launch's program walks (`_launch`'s `walks`): any of its consumers' query blocks
@@ -681,7 +696,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
               q_loaded, out_smem, row_smem, streams, views: dict, turn, streamed: tuple, first,
               spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
               residuals: _Residuals | None, anchors: tuple | None = None, interpret: bool,
-              finished: tuple | None = None):
+              finished: tuple | None = None, certified: tuple | None = None):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -692,7 +707,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     (`algebra.stepped`). With `residuals` the walk is the training step's at the `anchors` a peak walk found
     (`algebra.anchored_step`): the accumulator holds the split sums, every key's weighted values but the
     anchor's, which it stores with the rows' sums and status, no output (the output's anchor term joins in
-    XLA, `_trained_forward`)."""
+    XLA, `_trained_forward`). With `certified` (its views and an fp32 stage, `_Block.certified`), the plain
+    walk stores its state after each key tile (`certified_walk`)."""
     row, head, _ = place
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, row)
@@ -745,6 +761,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         state = algebra.Partial(accumulators[0], *carry)
         keys = algebra.Keys(coords, logits, tile, dot, _accumulated(family, interpret), products)
         state = algebra.plain_step(spec, state, keys)
+        if certified is not None:
+            _certified_step(family, certified, index, state, row_smem)
         return (state.m, state.total), (state.acc,)
 
     def inference(walk):
@@ -756,7 +774,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                             initial=(start.acc,))
         return algebra.Partial(acc, *rows), None
 
-    deferred = tiles.deferred and guard is None and residuals is None
+    deferred = tiles.deferred and guard is None and residuals is None and certified is None
 
     def walked(streams, lo, hi, counted):
         if deferred:
@@ -785,6 +803,43 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     family.stored((family.as_row(state.m), family.as_row(overflowed)), status_views, smem=row_smem)
     _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks, residuals=residuals,
                  out=(out_view, out_smem), rows=(finished, row_smem))
+
+
+def _certified_step(family: mosaic.Family, certified: tuple, index, state: algebra.Partial, row_smem
+                    ) -> None:
+    """The certify form's state after key tile `index` stored to its views (`_Block.certified`): the rows'
+    maxima and denominators through `row_smem`, the sums read from the accumulator once its products are
+    done (`Issuer.read`) through the certify stage."""
+    (maxima, totals), sums, stage = certified
+    family.stored((family.as_row(state.m), family.as_row(state.total)),
+                  (maxima.at[index], totals.at[index]), smem=row_smem)
+    family.stored((family.read(state.acc),), (sums.at[index],), smem=stage)
+
+
+def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+                   scale: float, natural: bool, tiles: Tiles, interpret: bool, subtracted: bool = False):
+    """The forward's certify form (off in production; row 2084's native step witness): its plain launch at
+    `tiles` alone, no guard's rewalk, whose walk stores its online-softmax state after each key tile j
+    (`algebra.Partial`: the rows' running maxima and denominators in the walk's units, the sums before the
+    finish's divide). Returns the launch's output `[B, Q, H, Dv]` (the production launch's to the bit, a row
+    its guards keep), the maxima and denominators `[2, B, H, tiles, Q]` and the sums `[B, H, tiles, Q, Dv]`
+    fp32, a query block's entries past the key tiles it walks unwritten (a causal call's past its diagonal:
+    `_Program.reach`). The logits are in the walk's log2 units (`algebra.exponent`: the scale folded, or the
+    raw products scaled after the subtraction where `subtracted`), their exponentials `ex2.approx` where the
+    launch approximates (`approximate`). A call of one block of the value columns (`Tiles.columns` None), one
+    slice, no output hook."""
+    if tiles.columns is not None or hooks.output_mod is not None:
+        raise ValueError("the certify form walks one block of the value columns, no output hook")
+    family = bundle_of(tiles, query.dtype)
+    call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
+        query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
+        inference=True, subtracted=subtracted)
+    q, form = _rewalked(spec, spec, raw, taken)
+    at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
+    _, out, rows, sums = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
+                                 family=family, training=False, interpret=interpret, certified=True)
+    queries, width = call.queries, value.shape[3]
+    return out[:, :queries, :, :width], rows[..., :queries], sums[:, :, :, :queries, :width]
 
 
 def _deferred_walk(spec: algebra.Forward, family: mosaic.Family, tiles: Tiles, q, start: algebra.Partial,
@@ -1036,7 +1091,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             kept: bool = False, finishes: bool = False, splits: int = 1,
             table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
             walks: jax.Array | None = None, sources: jax.Array | None = None, shared_by: int = 1,
-            column_blocks: int = 1):
+            column_blocks: int = 1, certified: bool = False):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -1062,7 +1117,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     walks), a program none of whose query blocks it names loads and writes nothing, its outputs there
     unread. With `column_blocks`, a launch walks that many blocks of `column_width` columns from the first,
     a program a block (its heads' grid axis the heads by the blocks), its output every block's columns; its
-    per-row outputs each block's alike, as its logits are the row's whole.
+    per-row outputs each block's alike, as its logits are the row's whole. With `certified`, the certify
+    form's (`certified_walk`): its plain walk's state after each key tile beside its outputs.
     """
     if splits > 1 and (training or peaks or hooked.initial is not None):
         raise ValueError("a split launch walks an inference call with no initial state")
@@ -1072,7 +1128,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     kind = "peaks" if peaks else "training" if training else "forward"
     block_width = column_width or value.shape[-1]
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
-            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{block_width}'}")
+            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{block_width}'}"
+            f"{'_certified' if certified else ''}")
     # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
     # A block of the values' columns its index a scalar the programs read, so every block's launch is one
     # kernel (`_key_views`): a static index compiled a kernel a block, four at width 256 (the forward's
@@ -1089,17 +1146,19 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                      counted=counted, finishes=finishes, target=target,
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
-                     column_width=column_width, shared_by=shared_by, column_blocks=column_blocks)
+                     column_width=column_width, shared_by=shared_by, column_blocks=column_blocks,
+                     certified=certified)
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
                       "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
-                      "column_blocks"))
+                      "column_blocks", "certified"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
-              column_width: int | None = None, shared_by: int = 1, column_blocks: int = 1):
+              column_width: int | None = None, shared_by: int = 1, column_blocks: int = 1,
+              certified: bool = False):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
@@ -1129,9 +1188,11 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     # A paged call's key tile of several pages loaded a page at a time (`_paged_views`).
     pieces = block_k // page if page is not None and page < block_k else 1
     scoped, rings = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
-                                         program.stages, peaks=peaks, out_dtype=out_dtype, pieces=pieces)
+                                         program.stages, peaks=peaks, out_dtype=out_dtype, pieces=pieces,
+                                         certified=certified)
     out_type = _out_types(batch, queries, heads, value_width * column_blocks, out_dtype, splits=splits,
-                          peaks=peaks, training=training, finishes=finishes)
+                          peaks=peaks, training=training, finishes=finishes,
+                          certified=steps if certified else 0)
     layout = _Layout(treedef, len(out_type), len(scoped) - 2, peaks or (reuse and not training))
 
     def body(*refs, streams):
@@ -1162,7 +1223,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                streamed, block.first, read.spans, read.hooked, (row, head), hooks=hooks,
                                interpret=interpret)
                 return
-            out_view = finished = residuals = None
+            out_view = finished = residuals = certify = None
             if training:
                 status_ref, rows_ref, keys_ref, others_ref = refs.written
                 status = block.status(status_ref)
@@ -1171,6 +1232,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                        refs.stages[0].at[index])
             else:
                 status, out_view, finished = block.inference(refs.written, finishes)
+                if certified:
+                    certify = (*block.certified(refs.written), refs.stages[-1].at[index])
                 if column_blocks > 1:
                     assert column is not None  # a launch of several column blocks reads its own
                     out_view = out_view.at[:, pl.ds(column * value_width, value_width)]
@@ -1178,7 +1241,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                       status, *stages, refs.out_smem.at[index], refs.row_smem.at[index], streams, views, turn,
                       streamed, block.first, read.spans, read.hooked, read.guard,
                       (row, head, lax.div(head, group)), hooks=hooks, residuals=residuals,
-                      anchors=read.anchors, interpret=interpret, finished=finished)
+                      anchors=read.anchors, interpret=interpret, finished=finished, certified=certify)
 
         def producer():
             family.stream(streams, views, *streamed)
