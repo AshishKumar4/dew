@@ -1694,7 +1694,8 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert first[event]["scores"] == second[event]["scores"]
     assert first["normal"]["scores"]["val/mean"] == first["repeat"]["scores"]["val/mean"]
     assert first["normal"]["scores"]["val/mean"] == first["untracked"]["scores"]["val/mean"]
-    for report in reports:
+    # Reports come in rank order (`run_pool`).
+    for rank, report in enumerate(reports):
         events = report["results"]["normal"]["events"]
         scoring = [key for kind, key in events if kind == "score"]
         preview = [key for kind, key in events if kind == "preview"]
@@ -1707,11 +1708,17 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         # Process 0 holds one batch and process 1 two: process 0 covers the
         # second with its first's rows marked repeats, so the pass reads all 12.
         assert report["results"]["uneven"]["scores"]["evaluation/counts/val/coordinated_batches"] == 2
-        for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
-            assert "error" in report["results"][phase], (phase, report)
+        # Each injected failure keeps its category on the rank it was injected on, which raises it noted;
+        # its peer raises the agreement's own refusal of it (row 4506).
+        for phase, injected, at in (("metric", "InjectedValueError", 0), ("preview", "InjectedValueError", 0),
+                                    ("finalize", "InjectedValueError", 0), ("log", "InjectedValueError", 0),
+                                    ("render", "InjectedValueError", 0), ("construct", "InjectedOSError", 1),
+                                    ("next", "InjectedOSError", 1)):
+            failed = report["results"][phase]
+            expected = (injected, True) if rank == at else ("RuntimeError", False)
+            assert (failed["error"], failed["own"]) in (expected, ("PeerFailure", False)), (phase, report)
             if phase != "construct":
                 assert phase in report["closed"]
-        assert "iterator next failed" in report["results"]["next"]["error"]
         assert report["results"]["empty"] == {"scores": {}, "events": []}
         assert report["results"]["no_consumer"] == {"scores": {}, "events": []}
         assert "no_consumer" not in report["closed"]
@@ -1720,10 +1727,15 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         for invalid in ("mismatch", "duplicates"):
             assert "error" in report["results"][invalid]
             assert report["results"][invalid]["events"] == []
+        # A resource rank 0 deleted fails there, as the deleted array's own error, and its peer by the
+        # agreement; a gather plan the ranks differ on is refused on every rank, each its own refusal.
         for failure in ("deleted_first", "deleted_later", "deleted_batch", "deleted_preview"):
-            assert "deleted" in report["results"][failure]["error"]
+            failed = report["results"][failure]
+            allowed = ((("RuntimeError", True),) if rank == 0
+                       else (("RuntimeError", False), ("PeerFailure", False)))
+            assert (failed["error"], failed["own"]) in allowed, (failure, report)
             assert failure in report["closed"]
-        assert "gather plan differs between the processes" in report["results"]["mismatched_plan"]["error"]
+        assert report["results"]["mismatched_plan"]["error"] == "ValueError", report
 
 
 @pytest.mark.distributed
