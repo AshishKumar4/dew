@@ -203,7 +203,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         return Walk(decay, leaving, transfer)
 
     def mapped(prepared, state, issue=None):
-        (outputs,) = prepared.split.emit(prepared.values[1], state[1], issue)
+        # Dew's products where no mainloop issues them (`_issued`): a readout's the portable math's.
+        (outputs,) = prepared.split.emit(prepared.values[1], state[1], issue or _issued)
         return outputs
 
     def merge(a, b, operands, issue=None):
@@ -662,9 +663,16 @@ def _adjoined(issue: Callable) -> Callable:
 
 def _issued(name: str, left, right):
     """A derived scan's products as Dew's (`float32_matmul`), the doubling's among them
-    (`recurrence_algebra.doubled`'s issuer); `transfer_decay` a transfer's columns scaled, `right * left`."""
+    (`recurrence_algebra.doubled`'s issuer); `transfer_decay` a transfer's columns scaled, `right * left`;
+    a readout (`carry.EMIT_ROLES`) the portable math's (`recurrence_algebra.remembered` by its issuer), its
+    gradient in what it reads summed from the chunk's last token (row 4466: from the first, the entering
+    memory's gradient 1.9 times the portable math's distance from float64)."""
     if name == "transfer_decay":
         return right * left[None, :]
+    if name in carry.EMIT_ROLES:
+        from dew.nn.kernels import recurrence_algebra
+
+        return recurrence_algebra.remembered(left, right, recurrence_algebra.portable, name)
     return float32_matmul(left, right)
 
 
