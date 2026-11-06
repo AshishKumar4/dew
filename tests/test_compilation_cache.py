@@ -110,23 +110,29 @@ def test_a_cache_directory_named_after_the_first_compile_holds_the_programs_comp
 
 
 def test_a_rebuilt_cuda_plugin_reads_no_picks_its_earlier_build_measured(tmp_path):
-    """Dew builds its CUDA PJRT plugin again under one jaxlib, and the plugin is the GPU compiler
+    """Dew builds its CUDA PJRT plugins again under one jaxlib, and a plugin is the GPU compiler
     the autotuner's picks were measured with, so each build keeps its picks apart: a process
-    beside one build of the plugin names another directory than a process beside another, and
-    the same build names the same one (row 3560)."""
+    beside one build of a plugin names another directory than a process beside another, and the
+    same builds name the same one. With both CUDA builds installed, each build is in the name, in
+    order of the builds' names, which any reader of the installed wheels can derive (row 3560)."""
     from process_support import fresh
 
-    def picks_beside(version):
-        site = tmp_path / version
-        (site / "jax_plugins" / "xla_cuda12").mkdir(parents=True, exist_ok=True)
-        (site / "jax_plugins" / "xla_cuda12" / "__init__.py").write_text("")
-        info = site / f"jax_cuda12_pjrt-{version}.dist-info"
-        info.mkdir(exist_ok=True)
-        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: jax-cuda12-pjrt\nVersion: {version}\n")
+    def picks_beside(**builds):
+        site = tmp_path / "-".join(f"{build}-{version}" for build, version in builds.items())
+        for build, version in builds.items():
+            (site / "jax_plugins" / f"xla_{build}").mkdir(parents=True, exist_ok=True)
+            (site / "jax_plugins" / f"xla_{build}" / "__init__.py").write_text("")
+            info = site / f"jax_{build}_pjrt-{version}.dist-info"
+            info.mkdir(exist_ok=True)
+            (info / "METADATA").write_text(
+                f"Metadata-Version: 2.1\nName: jax-{build}-pjrt\nVersion: {version}\n")
         return fresh(f"import json, sys; sys.path.insert(0, {str(site)!r}); "
                      "from dew._cache import autotune_dir; print(json.dumps(autotune_dir('/c')))",
                      platforms="cpu")
 
-    earlier = picks_beside("0.12.0.1.post45")
-    assert picks_beside("0.12.0.1.post61") != earlier
-    assert picks_beside("0.12.0.1.post45") == earlier
+    earlier = picks_beside(cuda12="0.12.0.1.post45")
+    assert picks_beside(cuda12="0.12.0.1.post61") != earlier
+    assert picks_beside(cuda12="0.12.0.1.post45") == earlier
+    both = picks_beside(cuda13="0.12.0.1.post45", cuda12="0.12.0.1.post61")
+    assert both.endswith("-cuda12-0.12.0.1.post61-cuda13-0.12.0.1.post45")
+    assert picks_beside(cuda13="0.12.0.1.post62", cuda12="0.12.0.1.post61") != both
