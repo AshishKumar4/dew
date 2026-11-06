@@ -10,7 +10,7 @@ which branch a platform runs and which bodies XLA sees.
 from __future__ import annotations
 
 import functools
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TypeGuard
 
 import jax
@@ -54,6 +54,23 @@ REDUCTIONS = frozenset({"argmax", "argmin", "reduce_and", "reduce_max", "reduce_
 
 CUMULATIVE = frozenset({"cumlogsumexp", "cummax", "cummin", "cumprod", "cumsum"})
 """The operations that scan along the axis their `axis` parameter names."""
+
+def holes(tree, selected: Callable[[object], bool], is_leaf: Callable[[object], bool] | None = None
+          ) -> tuple[list, Callable[[Sequence], object]]:
+    """The leaves of `tree` (a call's arguments, `(args, kwargs)`) that `selected` keeps, in order, and
+    `fill(values)`, `tree` with those leaves replaced by `values` in their order and every other as it is:
+    what a trace of a function of some of its arguments (its arrays) binds and what it rebuilds."""
+    leaves, structure = jax.tree.flatten(tree, is_leaf=is_leaf)
+    places = [index for index, leaf in enumerate(leaves) if selected(leaf)]
+
+    def fill(values: Sequence):
+        filled = list(leaves)
+        for index, value in zip(places, values, strict=True):
+            filled[index] = value
+        return jax.tree.unflatten(structure, filled)
+
+    return [leaves[index] for index in places], fill
+
 
 def platform_branch(platforms: Sequence[Sequence[str] | None], lowering: str) -> int:
     """The index of the branch of a platform choice that a program lowered for `lowering` runs: of a
