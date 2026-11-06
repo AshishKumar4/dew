@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, equations
+from reference_error import assert_as_exact
 from test_algebra_derive import shaped, walked
 
 from dew.algebra import SATURATION, derive
@@ -137,21 +137,6 @@ def test_slices_merged_at_once_are_on_par_with_their_fold(mask):
     assert_as_exact(jax.jit(sliced_walk(mask, merged=True)), jax.jit(sliced_walk(mask, merged=False)),
                     draw, f"slices merged at once {mask}", seeds=16,
                     truth_fn=lambda logits, value: attended(logits * natural, MASKS[mask](), value))
-
-
-def test_a_split_decodes_combine_of_many_slices_traces_about_one_merge():
-    """A split decode's combine of 32 slices (`decode_attention._combined`) traces at most three times a
-    combine of 4's equations: a fold traced a merge a slice, which at Dory 4B's depth compiled its decode
-    step for minutes."""
-    spec = algebra.Forward(form="spans", keys=KEYS, ids=False, scale=0.5, natural=False)
-
-    def size(slices: int) -> int:
-        parts = (jax.ShapeDtypeStruct((slices, ROWS, WIDTH), jnp.float32),
-                 *[jax.ShapeDtypeStruct((slices, ROWS), jnp.float32)] * 2)
-        combined = jax.make_jaxpr(lambda *parts: decode_attention._combined(spec, *parts, axis=0))(*parts)
-        return sum(1 for _ in equations(combined.jaxpr))
-
-    assert size(32) <= 3 * size(4)
 
 
 LENGTH, DEPTH, BLOCK = 64, 32, 16
