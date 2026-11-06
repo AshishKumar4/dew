@@ -300,6 +300,25 @@ class Table:
 
 
 @dataclass(frozen=True, eq=False)
+class Unwritten:
+    """Names read by `path` alone (a name and the record into its leaf, None for one that fills none),
+    which no route writes: a layout read but not yet declared both ways (a type verified from parts,
+    MiMo-V2.6's audio tower), so a model of it is `Unwritable` where it would be written. A registered
+    family's routes hold none (`tests/test_layouts.py`)."""
+
+    path: Callable[[str, Config], tuple[str, ...] | None]
+
+    def read(self, name: str, config: Config) -> Leaf | None:
+        return Leaf(self.path(name, config))
+
+    def write(self, path: Path, config: Config) -> str | None:
+        return None
+
+    def copies(self, config: Config) -> Iterator[tuple[str, Path]]:
+        return iter(())
+
+
+@dataclass(frozen=True, eq=False)
 class When:
     """`routes` where `holds` holds of the record: a family's names that differ with its config (LFM3's
     norms with sandwich norms or without)."""
