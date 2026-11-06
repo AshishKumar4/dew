@@ -92,9 +92,9 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_reads_by_e
 
     config = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
                        trainer=TrainerConfig(steps=1))
-    assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 9
+    assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 10
     saved = config.resumed().record()
-    assert RunConfig.read(saved).data_plan_version == 9
+    assert RunConfig.read(saved).data_plan_version == 10
     earlier = {**saved, "fields": {name: value for name, value in saved["fields"].items()
                                    if name != "data_plan_version"}}
     directory = tmp_path / "planned"
