@@ -4,7 +4,7 @@ flights a validation scores (docs/design/post-training.md §14).
 
 The run's record is `dew.config.env.EnvRunConfig`, a declaration; the reinforcement-learning packages build
 from it here, so the configuration layer names an environment by its registered name and fields and never
-imports one (tests/test_imports.py, row 4267).
+imports one (tools/lint_layers.py, row 4267).
 """
 
 from __future__ import annotations
