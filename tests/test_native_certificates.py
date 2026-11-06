@@ -1,24 +1,23 @@
 """Check 2's native certificates for the fused template kernels (ledger row 2084, kernel-templates.md §9):
-each native kernel's output held element by element to the exact products of its operands, on the GPU
-that compiles it, never to another implementation's error. Link 1: the grouped GEMM template's plain
-forward and input gradient, each a sum of exact 16-bit products a tensor core accumulates in fp32 by
-truncating adds and rounds once to its output (`native_dot_holds`). Link 2: the rest of the
-template's native launches, Mosaic GPU's and Triton's, and the vendored CUTLASS grouped GEMM's products
-on Hopper (the dew-cutlass wheel's, row 2084 (a)): the kernel gradient; fp32 operands at the default
-precision, whose products are of their TF32 values (`tf32_operand`); and the exact sums a precision above
-the default declares for an fp32 output, held a depth step at a time (`promoted_step_holds`), each step's
-output the launch's own on its operands zeroed from the next step on. The rule's validation: its nulls (Gaussian and same-sign
-draws certify) and its faults, each refused where it lands: a lost block of products, a row read under the
-wrong group, a partial sum rounded to bf16 mid-depth; bf16 products where TF32 is declared and the
-reverse, and operands truncated to TF32 where the tensor cores round them; and a step's partial added by
-the tensor cores' truncating adds where IEEE sums are declared. Link 3: the recurrence template's gated
-delta rule with a decay a head, each record its launches store between them held inside its launch step's
-enclosure on the native records the step reads (`recurrence_witness`), its faults a dropped carry, a state
-rounded to bf16 where fp32 is held, the decay from rounded cumulative sums and an off-by-one chunk
-boundary. Link 4: the attention template's Mosaic forward, each online-softmax state its certify launch
-stores after a key tile and its output held inside one plain step's enclosure on the state before it
-(`attention_witness`), its faults a dropped rescale, a maximum from the wrong tile, sums rounded to bf16
-and a mask off by one key."""
+each native kernel's output held element by element to the exact products of its operands, on the GPU that
+compiles it, never to another implementation's error. Link 1: the grouped GEMM template's plain forward and
+input gradient, each a sum of exact 16-bit products a tensor core accumulates in fp32 by truncating adds and
+rounds once to its output (`native_dot_holds`). Link 2: the rest of the template's native launches, Mosaic
+GPU's and Triton's, and the vendored CUTLASS grouped GEMM's products on Hopper (the dew-cutlass wheel's, row
+2084 (a)): the kernel gradient; fp32 operands at the default precision, whose products are of their TF32
+values (`tf32_operand`); and the exact sums a precision above the default declares for an fp32 output, held a
+depth step at a time (`promoted_step_holds`), each step's output the launch's own on its operands zeroed from
+the next step on. The rule's validation: its nulls (Gaussian and same-sign draws certify) and its faults, each
+refused where it lands: a lost block of products, a row read under the wrong group, a partial sum rounded to
+bf16 mid-depth; bf16 products where TF32 is declared and the reverse, and operands truncated to TF32 where the
+tensor cores round them; and a step's partial added by the tensor cores' truncating adds where IEEE sums are
+declared. Link 3: the recurrence template's gated delta rule with a decay a head, each record its launches
+store between them held inside its launch step's enclosure on the native records the step reads
+(`recurrence_witness`), its faults a dropped carry, a state rounded to bf16 where fp32 is held, the decay from
+rounded cumulative sums and an off-by-one chunk boundary. Link 4: the attention template's Mosaic forward,
+each online-softmax state its certify launch stores after a key tile and its output held inside one plain
+step's enclosure on the state before it (`attention_witness`), its faults a dropped rescale, a maximum from
+the wrong tile, sums rounded to bf16 and a mask off by one key."""
 
 import functools
 
