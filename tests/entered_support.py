@@ -26,6 +26,11 @@ ENTERED_SEEDS = 32
 """Check 1's declared seeds for documents entering another's memory and history against each one's row: at
 12, the one-token layout's parameter gradients, sums over a few tokens, were left unresolved over 60."""
 
+ENTERED_ROWS = 8
+"""The rows a draw lays its layout out in, each its own draw: a parameter's gradient sums over every row's
+tokens, where over the one-token layout's six alone Mamba-2's `A_log` was left unresolved over 160 seeds,
+its draws' log ratios spread 0.71 (check 1 asks for larger inputs there, not more seeds)."""
+
 
 def assert_entered_as_own_rows(module, variables, width: int, layout: str, label: str) -> None:
     """`module` over the row `LAYOUTS[layout]` lays out gives each document's tokens, and the gradients of
@@ -35,8 +40,9 @@ def assert_entered_as_own_rows(module, variables, width: int, layout: str, label
     documents = np.concatenate([*(np.full(length, number, np.int32) for number, length in placed),
                                 np.zeros(padding, np.int32)])
     valid = documents > 0
-    tokens = coordinates(valid=jnp.asarray(valid[None]), segments=jnp.asarray(documents[None]))
-    entered = Entered(jnp.asarray(documents[None]), jnp.asarray([enters], jnp.int32))
+    rows = np.tile(documents, (ENTERED_ROWS, 1))
+    tokens = coordinates(valid=jnp.asarray(rows > 0), segments=jnp.asarray(rows))
+    entered = Entered(jnp.asarray(rows), jnp.asarray([enters] * ENTERED_ROWS, jnp.int32))
     call = MixerCall(AttentionMetadata(coordinates=dataclasses.replace(tokens, entered=entered)))
     begins = dict(zip((number for number, _ in placed), np.cumsum([0, *(length for _, length in placed)]),
                       strict=False))
@@ -44,7 +50,7 @@ def assert_entered_as_own_rows(module, variables, width: int, layout: str, label
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        hidden = rng.normal(size=(1, len(documents), width))
+        hidden = rng.normal(size=(ENTERED_ROWS, len(documents), width))
         return (jnp.asarray(hidden, jnp.float32), jnp.asarray(rng.normal(size=hidden.shape), jnp.float32))
 
     def entering(params, hidden):
