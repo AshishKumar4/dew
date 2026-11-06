@@ -2394,3 +2394,31 @@ def test_a_declared_cell_compiles_nothing_for_the_template_it_prefers(monkeypatc
     with generation.assumed("sm80"):
         jax.jit(lambda x, dy: gemm.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16)).trace(x, dy)
     assert not (tmp_path / "dew" / "kernel-reports").exists()
+
+
+def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
+    """On an H100, interpreted, a grouped product whose rows are gathered from the tokens by a table (`gmm`'s
+    `gather`: a MoE's sort fused into the rows' loads, row 1376), each row a copy at its slot's swizzled row,
+    on par with XLA's ragged dot of the gathered rows (check 1), from float64."""
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+    sizes = jnp.asarray([70, 0, 129, 57], jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        tokens = jnp.asarray(rng.normal(size=(200, 128)), jnp.bfloat16)
+        table = jnp.asarray(rng.permutation(np.concatenate([np.arange(200), rng.integers(0, 200, 56)])),
+                            jnp.int32)
+        matrices = jnp.asarray(rng.normal(size=(4, 128, 256)) / np.sqrt(128), jnp.bfloat16)
+        return tokens, table, matrices
+
+    def dew(tokens, table, matrices):
+        return mosaic_gpu.gmm(tokens, matrices, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.float32,
+                              multiprocessors=4, interpret=grouped_matmul.INTERPRETED, gather=table)
+
+    def plain(tokens, table, matrices, wide=jnp.float32):
+        return jax.lax.ragged_dot(tokens[table].astype(wide), matrices.astype(wide), sizes,
+                                  preferred_element_type=wide)
+
+    with generation.assumed("sm90"):
+        assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "a gathered grouped product", seeds=SEEDS,
+                        truth_fn=functools.partial(plain, wide=jnp.float64))
