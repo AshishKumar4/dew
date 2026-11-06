@@ -7,7 +7,7 @@ and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parame
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import NamedTuple
 
 import jax
@@ -284,6 +284,18 @@ def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
     issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
     right = operands.Parts((rhs,), rhs.dtype)
     return issuer.summed((("part", part, right) for part in parts), into=acc)
+
+
+def issued_pairs(family: mosaic.Family, acc, pairs: Iterable, interpret: bool, *,
+                 shape: tuple[int, int] | None = None):
+    """`acc`, or a fresh fp32 accumulator of `shape` where None, with each of `pairs`' products (a left
+    operand in registers and a tile in shared memory, each formed as it is taken) issued into it in place,
+    in order, none read before the last (`operands.Issuer.summed`): an fp32 call's parts' products
+    (`attention_mosaic_forward._parted_products`), one accumulator where a product apiece copied each in and
+    out (et-fp32regs2: the guarded launch 248 registers and 24 bytes spilled where its bf16 one held 168)."""
+    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
+    products = (("part", lhs, operands.Parts((rhs,), rhs.dtype)) for lhs, rhs in pairs)
+    return issuer.summed(products, shape) if acc is None else issuer.summed(products, into=acc)
 
 
 def _block(config: Tiles | BackwardTiles) -> int:
