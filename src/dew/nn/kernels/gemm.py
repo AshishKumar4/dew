@@ -38,6 +38,7 @@ from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
 
+from dew import _cache
 from dew.nn.derivatives import KernelGlue, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import mosaic
@@ -101,7 +102,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         return _portable_gemm(lhs if straight else lhs.astype(compute), rhs, group_sizes, prologue,
                               prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes,
                               dtypes, several, transpose_rhs, precision, compute if straight else None,
-                              paired=paired)
+                              paired=paired, dense=dense)
 
     def forward(*operands):
         return value(*operands), ()
@@ -334,9 +335,32 @@ def dot_general(xla):
 def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:
     """Whether a launch takes any of the dense product `rows @ matrix`'s products on the call's target
     (`grouped_matmul.GROUPED`): its forward, its input gradient or its kernel gradient, as `gemm` and
-    its reverse mode make them. Where none does, each one's route is reported, as XLA runs them."""
+    its reverse mode make them. Where none does, each one's route is reported, as XLA runs them. Decided
+    once a key (`_DECIDED`: the operands' shapes and dtypes, the product, the target and the kernels a
+    block names or pins), its routes reported again at every call: a model's projections ask the same
+    question at every layer's trace (row 3213: a warm start spent 10.9 of its 75.6 seconds selecting)."""
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
     whole = seen_whole(rows) and seen_whole(matrix)
+    key = (rows.shape, jnp.dtype(rows.dtype), matrix.shape, jnp.dtype(matrix.dtype), jnp.dtype(out_dtype),
+           repr(precision), whole, product, generation.gpu_target(), _cache.KERNEL_CHOICES.value,
+           _cache.KERNEL_PINS.value)
+    if (decided := _DECIDED.get(key)) is None:
+        with generation.routes() as found:
+            taken = _launched_once(rows, matrix, out_dtype, product, whole)
+        decided = _DECIDED[key] = (taken, tuple(found))
+    else:
+        for route in decided[1]:
+            generation.route(route.choice, kernel=route.kernel, preferred=route.preferred,
+                             refusal=route.refusal, ran=route.ran, forced=route.forced)
+    return decided[0]
+
+
+_DECIDED: dict[tuple, tuple[bool, tuple]] = {}
+"""`_launched`'s decisions by their key, and the routes each reported."""
+
+
+def _launched_once(rows: jax.Array, matrix: jax.Array, out_dtype, product, whole: bool) -> bool:
+    """`_launched`'s decision, its routes reported."""
     width = matrix.shape[1]
     abstract = functools.partial(jax.ShapeDtypeStruct, dtype=rows.dtype)
     matrices, sizes = abstract((1, *matrix.shape)), jax.ShapeDtypeStruct((1,), jnp.int32)
@@ -405,7 +429,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired):
         return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
                               epilogue_arrays, epilogue_axes, dtypes, several, transpose_rhs, precision,
-                              paired=paired)
+                              paired=paired, dense=dense)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
                        epilogue_arrays, paired)
@@ -506,9 +530,10 @@ def _apart(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologu
 
 def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                    epilogue_axes, dtypes, several: bool, transpose_rhs: bool, precision: PrecisionLike,
-                   compute=None, paired: jax.Array | None = None):
+                   compute=None, paired: jax.Array | None = None, dense: bool = False):
     """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype summed in at least fp32 (an fp64
-    product's in fp64, which no kernel takes), one rounding;
+    product's in fp64, which no kernel takes), one rounding, a `dense` call's as XLA's own dot
+    (`grouped_matmul.xla_dot`: one group of every row, nothing to mask, no ragged dot to trace);
     with `compute`, the products of the operands rounded to it, its tangent the MoE projection's
     (`grouped_matmul.portable_projection`, whose sum, at least fp32, it reads); with `paired`, both matrices'
     products, the epilogue's two accumulators."""
@@ -524,8 +549,10 @@ def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_ax
     else:
         product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         wide = at_least_fp32(lhs.dtype)
-        accs = tuple(grouped_matmul.xla_ragged_dot(product, each.astype(lhs.dtype), group_sizes,
-                                                   precision=precision, preferred_element_type=wide)
+        accs = tuple(grouped_matmul.xla_dot(product, each[0].astype(lhs.dtype), precision=precision,
+                                            preferred_element_type=wide) if dense
+                     else grouped_matmul.xla_ragged_dot(product, each.astype(lhs.dtype), group_sizes,
+                                                        precision=precision, preferred_element_type=wide)
                      for each in matrices)
     outs = accs if epilogue is None else _as_tuple(epilogue(*accs, *epilogue_arrays))
     outs = tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
