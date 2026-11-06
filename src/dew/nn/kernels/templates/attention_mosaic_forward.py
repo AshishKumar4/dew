@@ -165,7 +165,8 @@ each row's shift, reach, unshifted denominator and liveness), each held by the f
 row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`guarded_tiles`)."""
 
 
-def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int) -> Tiles | None:
+def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int, *,
+                  held_only: bool = True) -> Tiles | None:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): the largest of the
     family's row extents that divides the plain launch's query blocks (the guarded walk is a rare one's of
     its overflowed rows alone, so it takes smaller blocks where the plain launch's hold no guarded state: at
@@ -180,7 +181,8 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     the guarded launch at 64 x 64, width 128, spilled 132 bytes on an A100, its IR live set 274, 144 of it
     fragments). Uncounted, the statistics left 64 x 64 on two consumers spilling 20 bytes a thread at heads
     128 and 256 wide (ptxas, sm90a). None where none fits: the plain launch is then illegal at `tiles`
-    (`MosaicForward.legal`)."""
+    (`MosaicForward.legal`); unless `held_only`, its least candidate then, which a launch pinned at `tiles`
+    walks whatever its legality (a resource witness lowers as pinned)."""
     def held(candidate: Tiles) -> bool:
         rows, block = candidate.block_q, candidate.block_k
         carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
@@ -208,7 +210,8 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     candidates = (dataclasses.replace(tiles, block_q=rows, block_k=block, consumers=consumers, narrow=narrow)
                   for rows in queries for consumers in range(tiles.consumers, 0, -1) for block in blocks
                   for narrow in stagings(family))
-    return next((candidate for candidate in candidates if held(candidate)), None)
+    ranked = list(candidates)
+    return next((candidate for candidate in ranked if held(candidate)), None if held_only else ranked[-1])
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -321,9 +324,10 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
             overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
             return (out, *finished), status[0], overflowed
         unit = guarded_columns(family, v.shape[-1], v.dtype)
-        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1])
+        # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`); a launch
+        # pinned past it walks the least.
+        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1], held_only=False)
         hooked_blocks = hooks.output_mod is not None
-        # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
         assert guarded is not None, at
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
         # A merging walk's guarded rewalk walks each of its rows' keys whole, one program a query block (its
