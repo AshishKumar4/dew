@@ -186,12 +186,35 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
 def _on_par_with_the_plain_update(optimizer, label: str, **options):
     """`_trained`'s run through copies on par with the same run without them, its parameters, optimizer
     state (the last gradient, `_keeping_gradients`) and losses, over the starts and batches the seeds draw
-    (check 1), the truth the run without copies in float64: the two compile two programs."""
+    (check 1), the truth the run without copies in float64: the two compile two programs. A mixture's draws
+    clear its routing margin (`selection_margins.clearing`, testing.md's selection rule)."""
     def run(copies, seed):
         state, losses, _ = _trained(optimizer(), copies=copies, seed=int(seed), **options)
         return {"state": (state.variables, state.opt_state), "losses": losses}
 
-    layouts_agree(run, lambda seed: (np.int32(seed),), label, layout=True, reference=False)
+    def drawn(seed):
+        return (np.int32(seed),)
+
+    def clears(inputs):
+        """Whether a mixture's start routes the seed's batch with a margin (`selection_margins.MARGIN`): a
+        top-2 flip between the arms and the float64 truth decides by rounding, which no precision bounds."""
+        import selection_margins
+
+        from dew.batch import TEXT_KEY
+        from dew.training import Trainer
+
+        seed = int(inputs[0])
+        objective, batch = _decoder(mixture=True, rows=options.get("rows", 8), seed=seed)
+        variables = Trainer(objective, optimizer(), key=jax.random.key(seed)).initial_state().variables
+        routed = jax.jit(lambda tree, tokens: objective.token_scores(tree, tokens, routing=True).routing)
+        sown = jax.device_get(routed(variables, batch[TEXT_KEY]))
+        return selection_margins.routing_margin(sown, variables.get("moe", {}), 2) >= selection_margins.MARGIN
+
+    if options.get("mixture"):
+        import selection_margins
+
+        drawn = selection_margins.clearing(drawn, clears)
+    layouts_agree(run, drawn, label, layout=True, reference=False)
 
 
 def _copies_of(narrow):
