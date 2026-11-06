@@ -65,16 +65,20 @@ def archived(recorded: str, kind: str) -> tarfile.TarFile:
     return tarfile.open(fileobj=io.BytesIO(stored.tobytes()), mode="r:xz")
 
 
-def test_every_task_a_registered_objective_saves_its_runs_as_is_a_saved_kinds(tmp_path):
-    """Every task a registered objective saves its runs as (`dew.registry.objectives`' `saved_task`) is the
-    task of a kind the corpus saves a run of (`SAVED_KINDS`), so a run of it a main saved exports and loads
-    back as its run (`test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run`); a
-    masked-diffusion run's task had no kind."""
+def test_every_task_a_registered_objective_saves_its_runs_as_is_a_recorded_kinds(tmp_path):
+    """Every kind the corpus's writer saves (`SAVED_KINDS`) has a run a main recorded (`SAVED`), and every
+    task a registered objective saves its runs as (`dew.registry.objectives`' `saved_task`) is the task of
+    one of them, so a run of it a main saved loads back and answers
+    (`test_a_run_an_earlier_main_saved_loads_and_answers`); a masked-diffusion run's task had no kind, and
+    a kind the writer saves with no recording would pass a gate that read the writer's list (train 669's
+    review, row 4674)."""
     def built(kind: str):
         # Each kind's run built in a directory of its own, as the corpus's writer builds it.
         (tmp_path / kind).mkdir()
         return SAVED_KINDS[kind](tmp_path / kind, drawn=False)
 
+    recorded = {kind for _, kind in SAVED}
+    assert set(SAVED_KINDS) <= recorded, sorted(set(SAVED_KINDS) - recorded)
     declared = {objectives[name].saved_task for name in objectives} - {None}
     saved = {objectives[built(kind).objective.name].saved_task for kind in SAVED_KINDS}
     assert declared <= saved, sorted(task.__name__ for task in declared - saved)

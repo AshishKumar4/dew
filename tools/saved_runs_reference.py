@@ -101,16 +101,24 @@ def main() -> None:
     configure_lane(os.environ)
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout the corpus is written into")
+    parser.add_argument("--kinds", nargs="+", help="the kinds to record (every kind the corpus saves by "
+                        "default): a kind new to the corpus recorded at the commit that adds it")
     args = parser.parse_args()
 
     import numpy as np
     from fetched_fixtures import save
     from saved_run_kinds import SAVED_KINDS
 
+    kinds = sorted(SAVED_KINDS) if args.kinds is None else args.kinds
+    unknown = sorted(set(kinds) - set(SAVED_KINDS))
+    if unknown:
+        parser.error(f"no saved kind named {', '.join(unknown)}; the corpus saves "
+                     f"{', '.join(sorted(SAVED_KINDS))}")
     commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], check=True, capture_output=True,
                             text=True).stdout.strip()
     written = Path(CORPUS) / commit[:12]
-    for kind, build in SAVED_KINDS.items():
+    for kind in kinds:
+        build = SAVED_KINDS[kind]
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             # The run keeps its last step alone: a later main pins and resumes from the latest. Its own
@@ -132,7 +140,7 @@ def main() -> None:
             save(written / f"{kind}.npz", {"run": np.frombuffer(packed, np.uint8)},
                  reference=f"Dew {commit[:12]}, tools/saved_runs_reference.py", license="MIT", root=args.root)
             (args.root / written / f"{kind}.evidence.json").write_text(json.dumps(seen, indent=1) + "\n")
-    source = {"commit": commit, "kinds": sorted(SAVED_KINDS), "evidence": EVIDENCE}
+    source = {"commit": commit, "kinds": sorted(kinds), "evidence": EVIDENCE}
     (args.root / written / "source.json").write_text(json.dumps(source, indent=1) + "\n")
 
 
