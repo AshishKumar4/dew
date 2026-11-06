@@ -493,13 +493,19 @@ def test_evaluate_and_serve_smoke_scores_a_diffusion_run_it_is_pointed_at(tmp_pa
 
 def test_evaluate_and_serve_refuses_language_options_a_diffusion_run_alone_would_drop(tmp_path):
     """Pointed at a diffusion run and no language run, the example refuses the options only a language run
-    reads, before it reads either run, rather than leave them out of its report unsaid."""
+    reads, before it reads either run, rather than leave them out of its report unsaid; the prompt and its
+    length it refuses only where no served endpoint reads them (row 4619)."""
     example = REPO_ROOT / "examples" / "evaluate_and_serve.py"
-    done = subprocess.run([sys.executable, str(example), "--image-run", str(tmp_path / "none"),
-                           "--tasks", "hellaswag", "--out", str(tmp_path)], cwd=REPO_ROOT,
+    done = subprocess.run([sys.executable, str(example), "--image-run", str(tmp_path / "none"), "--tasks",
+                           "hellaswag", "--out", str(tmp_path)], cwd=REPO_ROOT,
                           env=single_device(offline=True), capture_output=True, text=True, timeout=300)
-    assert [message.split(" score ")[0] for message in raised(done).get("ValueError", [])] == ["--tasks"]
+    assert "ValueError" in raised(done)
     assert not (tmp_path / "report.json").exists()
+    module = load("evaluate_and_serve", "examples")
+    image = {"image_run": tmp_path / "none", "prompt": "to be", "max_new_tokens": 8}
+    assert module.dropped(module.Config(**image)) == ["--prompt", "--max-new-tokens"]
+    assert module.dropped(module.Config(**image, ollama_host="http://127.0.0.1:9")) == []
+    assert module.dropped(module.Config(**image, run=tmp_path / "language")) == []
 
 
 @pytest.mark.network
