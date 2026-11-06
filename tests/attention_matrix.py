@@ -21,7 +21,7 @@ from attention_oracle import attention_terms, kept
 from gpu_flow import cell
 from kernel_matrix import AXES
 from reference_error import assert_as_exact
-from test_attention_mosaic import FED, _residuals
+from test_attention_mosaic import FED, WGMMA, _residuals
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
@@ -139,7 +139,8 @@ def _route(call: tuple[tuple[str, str], ...]):
         op, ba, target = _backward_op(case)
         if op.declined(ba, target) is not None:
             return True, None, None
-        two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1, **FED)
+        two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1,
+                                             family=WGMMA, **FED)
         return False, op.derived(ba, target), two if op.legal(ba, two, target) else None
 
 

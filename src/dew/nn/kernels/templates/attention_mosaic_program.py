@@ -190,7 +190,7 @@ class Tiles:
     block_k: int
     stages: int
     consumers: int
-    family: str = mosaic_sm90.WGMMA.name
+    family: str = dataclasses.field(kw_only=True)
     relaunch_k: int | None = None
     relaunch_consumers: int | None = None
     relaunch_columns: int | None = None
@@ -234,7 +234,7 @@ class BackwardTiles:
     stages: int
     consumers: int
     fused: bool = False
-    family: str = mosaic_sm90.WGMMA.name
+    family: str = dataclasses.field(kw_only=True)
     columns: int = 1
     dkv_family: str | None = None
     dkv_consumers: int | None = None
