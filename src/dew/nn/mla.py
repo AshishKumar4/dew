@@ -805,7 +805,7 @@ class MultiHeadLatentAttention(LinearProducts):
         if own is None and not (groups or window is not None or self.attention_chunk is not None):
             return None, False
         if own is not None:
-            mask, runs, window, key_places = own
+            mask, runs, window, key_places = own.mask, own.runs, own.window, own.key_places
             causal, segment_ids, groups, valid = False, None, {}, None
         else:
             mask = runs = None
@@ -938,7 +938,7 @@ class MultiHeadLatentAttention(LinearProducts):
                               sliding_window=self.sliding_window)
         if own is None:
             return None
-        mask, runs, window, key_places = own
+        mask, runs, window, key_places = own.mask, own.runs, own.window, own.key_places
         # The runs index the cache's slots; the queries' and keys' places count a window and a chunk.
         return visibility_mask(length, total, causal=False, sliding_window=window, mask=mask,
                                key_valid=cached_validity(self, total), key_runs=runs,

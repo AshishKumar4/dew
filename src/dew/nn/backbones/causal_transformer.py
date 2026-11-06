@@ -1169,7 +1169,7 @@ class CausalTransformer(LinearProducts):
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
-                 attention_tree: tuple[int, ...] | None = None,
+                 attention_key_valid=None, attention_tree: tuple[int, ...] | None = None,
                  right_padded: bool = False, coordinates: Coordinates | None = None,
                  conditioning: Mapping[str, jax.Array] | None = None, progress: Progress | None = None):
         # The call's token layout, converted once (`token_coordinates`): the trunk and the
@@ -1180,7 +1180,8 @@ class CausalTransformer(LinearProducts):
             tokens, train=train, decode=decode, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
             attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
-            attention_key_runs=attention_key_runs, attention_tree=attention_tree, coordinates=coordinates,
+            attention_key_runs=attention_key_runs, attention_key_valid=attention_key_valid,
+            attention_tree=attention_tree, coordinates=coordinates,
             conditioning=conditioning, progress=progress)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
@@ -1566,7 +1567,7 @@ class CausalTransformer(LinearProducts):
                               input_embeddings=None, image_groups=None, block_groups=None,
                               rotary_positions=None, attention_pairwise_mask=None,
                               attention_key_positions=None, attention_key_runs=None,
-                              attention_tree: tuple[int, ...] | None = None,
+                              attention_key_valid=None, attention_tree: tuple[int, ...] | None = None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
                               coordinates: Coordinates | None = None,
                               conditioning: Mapping[str, jax.Array] | None = None,
@@ -1592,7 +1593,9 @@ class CausalTransformer(LinearProducts):
           `attention_key_runs` [B, queries, R, 2] replaces the mask with each
           query's key intervals, whose union it reads, R of them, static, its
           key positions windowed within each run alone (the template's spans,
-          `dew.nn.attention.scaled_dot_product_attention`'s `key_runs`).
+          `dew.nn.attention.scaled_dot_product_attention`'s `key_runs`), and
+          `attention_key_valid` [B, keys] hides the keys it marks out from
+          every query (`AttentionMetadata.key_valid`).
         - `attention_tree`, static: a cached call's tree of candidates (`AttentionMetadata.tree_parents`).
         - `routed_experts` `[B, S, layers, top_k]` (or one such a routed site, keyed by
           it, `LayerInputs.experts`, where a layer routes at several) replays a rollout engine's
@@ -1620,6 +1623,7 @@ class CausalTransformer(LinearProducts):
         attention_metadata = self._attention_metadata(
             tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
             attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
+            key_valid=attention_key_valid,
             whole_blocks=whole_blocks, progress=progress, tree=attention_tree)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
@@ -1684,7 +1688,7 @@ class CausalTransformer(LinearProducts):
                             coordinates: Coordinates | None = None,
                             conditioning: Mapping[str, jax.Array] | None = None, *,
                             whole_blocks: bool = False, progress: Progress | None = None,
-                            tree: tuple[int, ...] | None = None) -> AttentionMetadata | None:
+                            tree: tuple[int, ...] | None = None, key_valid=None) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
         carries none of it: the tokens' layout `hidden_and_mtp_inputs`
         converted (`coordinates`), the token ids a hash router selects by,
@@ -1734,7 +1738,8 @@ class CausalTransformer(LinearProducts):
             coordinates_of(None, *tokens.shape[:2]) if coordinates is None else coordinates, tokens.shape[:2],
             block)
         if (coordinates is None and image_groups is None and block_groups is None and rotary_positions is None
-                and pairwise_mask is None and key_positions is None and key_runs is None and tree is None
+                and pairwise_mask is None and key_positions is None and key_runs is None and key_valid is None
+                and tree is None
                 and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None and blocks is None
                 and context is None and (progress is None or progress.updates is None)):
@@ -1742,7 +1747,8 @@ class CausalTransformer(LinearProducts):
         return AttentionMetadata(
             coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
             rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
-            key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
+            key_runs=key_runs, key_valid=key_valid, token_ids=tokens if self.hash_layers else None,
+            engram_ids=engram_ids,
             media=media_mask,
             admitted=admitted, blocks=blocks, context=context,
             # One row's progress apiece, as the metadata's other inputs are held by row, which a
