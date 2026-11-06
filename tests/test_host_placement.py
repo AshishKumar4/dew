@@ -232,8 +232,8 @@ def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     """A prefill and greedy steps through a fetched stack: the same
-    continuation as the resident banks wherever every step's choice is
-    decided, its top logit clearing the next by the selection margin
+    continuation as the resident banks on each row whose every step's choice
+    is decided, at least one, its top logit clearing the next by the selection margin
     (`selection_margins.MARGIN`; the two compile two programs, whose
     rounding may pick another token at a near tie), out of a cache the
     fetched run allocated and wrote itself.
@@ -252,8 +252,9 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     # Each step's logits: the resident run's prompt and continuation read back whole, its last token aside.
     decisions = np.asarray(scanned.apply(resident, jnp.asarray(held.tokens[:, :-1])),
                            np.float64)[:, held.prompt_width - 1:]
-    if np.all(top_margin(decisions, 1) > MARGIN):
-        np.testing.assert_array_equal(fetched.tokens, held.tokens)
+    decided = np.all(top_margin(decisions, 1) > MARGIN, axis=-1)
+    assert decided.any(), f"{shape}: no row's continuation is decided at every step"
+    np.testing.assert_array_equal(fetched.tokens[decided], held.tokens[decided])
 
     cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
     assert sorted(cache) == sorted(name for name in on_host["params"] if name.startswith("layers_"))
