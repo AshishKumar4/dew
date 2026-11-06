@@ -961,6 +961,29 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     assert set(row["tests"]) == {f"tests/test_resumed.py::test_first{end}" for end in ("", "_again")}
     assert [json.loads(line)["node"] for line in progress.read_text().splitlines()] == kept
     assert stored == {}
+    # A split group resumed sets its tests aside after split.py cuts its file, as every group's container
+    # cuts it whole: a cut of the rest alone would run another group's tests and none of some (train 674's
+    # review: weights 1, 3, 1, 3 cut in three, the second group's first test passed, its second never ran).
+    (tmp_path / "tests/test_cut.py").write_text("from pathlib import Path\n" + "".join(
+        f"def test_{index}():\n    with Path('ran').open('a') as ran: ran.write('{index}')\n"
+        for index in range(4)))
+    nodes = [f"tests/test_cut.py::test_{index}" for index in range(4)]
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes, [1.0, 3.0, 1.0, 3.0],
+                                                                           strict=True))))
+    monkeypatch.delenv("ARMADA_RESUME")
+    (tmp_path / "ran").unlink()
+    progress.unlink()
+    assert ci.task("3.12", ["tests/test_cut.py"], "2/3", out, 600.0) == 0
+    assert (tmp_path / "ran").read_text() == "23"
+    (tmp_path / "resume" / "progress.jsonl").write_text(progress.read_text().splitlines()[0] + "\n")
+    (tmp_path / "ran").unlink()
+    monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
+    # The group's green record of the whole run gone, as a recalled attempt wrote none.
+    stored.clear()
+    assert ci.task("3.12", ["tests/test_cut.py"], "2/3", out, 600.0) == 0
+    assert (tmp_path / "ran").read_text() == "3"
+    [row] = json.loads(out.read_text())["rows"]
+    assert set(row["tests"]) == set(nodes[2:])
 
 
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,
