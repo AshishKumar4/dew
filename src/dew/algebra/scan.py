@@ -46,7 +46,7 @@ from jax.extend import core as jcore
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
-from dew.nn.derivatives import KernelGlue, Protected, declared_derivative
+from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_derivative
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum, vanishing
 
 Axes = tuple[str, ...]
@@ -667,7 +667,8 @@ def _adjoined(issue: Callable) -> Callable:
                 return (jnp.sum(d * right, axis=0), d * left[None, :])
             return issue(role + "_dlhs", d, right.T), issue(role + "_drhs", left.T, d)
 
-        return declared_derivative(KernelGlue(), functools.partial(issue, role), forward, backward)
+        return contracted("test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders")(
+            declared_derivative(KernelGlue(), functools.partial(issue, role), forward, backward))
 
     def issued(role: str, left, right):
         return rule(role)(left, right)
@@ -713,7 +714,8 @@ def _kept_rule() -> Callable:
     def backward(lower, d_lower):
         return _inverse_cotangent(lower, d_lower), jnp.zeros_like(lower)
 
-    return declared_derivative(Protected(), lambda overlaps, lower: lower, forward, backward)
+    return contracted("test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders")(
+        declared_derivative(Protected(), lambda overlaps, lower: lower, forward, backward))
 
 
 def _applied(lower, given):
@@ -741,7 +743,8 @@ def _lowered_rule() -> Callable:
         del operands
         return (_inverse_cotangent(lower, d_lower),)
 
-    return generation.linear_tangent(forward, backward, _doubled, kind=Protected())
+    return contracted("test_the_derived_delta_rule_chunks_hold_their_orders")(
+        generation.linear_tangent(forward, backward, _doubled, kind=Protected()))
 
 
 def _compensated(values, *, reverse: bool = False, restarts=None) -> tuple[jax.Array, jax.Array]:
@@ -845,8 +848,9 @@ def _decays_rule(base2: bool) -> Callable:
         del operands
         return _decays_backward(base2, decays, cotangents)
 
-    return generation.linear_tangent(forward, backward, functools.partial(_decays_value, base2=base2),
-                                     kind=Protected())
+    return contracted("test_the_derived_delta_rule_chunks_hold_their_orders")(
+        generation.linear_tangent(forward, backward, functools.partial(_decays_value, base2=base2),
+                                  kind=Protected()))
 
 
 def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):

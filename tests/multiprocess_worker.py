@@ -1123,6 +1123,16 @@ def mode_pipeline(args) -> dict:
     }
 
 
+class InjectedValueError(ValueError):
+    """A failure mode_evaluation_contract injects into a host consumer (a metric, a preview, a tracker), its
+    category its class's name, which the report carries in place of its words (row 4506)."""
+
+
+class InjectedOSError(OSError):
+    """A failure mode_evaluation_contract injects into its validation iterator, named as
+    `InjectedValueError` is."""
+
+
 class _EvaluationCase:
     """What mode_evaluation_contract's objective, metric, tracker and data
     read: this rank, the failure the current round injects, and what the
@@ -1179,7 +1189,7 @@ def _evaluation_parts(case: _EvaluationCase):
                 batch["x"], step.key)
             preview = Representations(features=features, labels=batch["x"][:, 0])
             if case.rank == 0 and case.failure == "preview":
-                raise ValueError("preview decoding failed")
+                raise InjectedValueError("preview decoding failed")
             return preview
 
     class Ratio:
@@ -1189,7 +1199,7 @@ def _evaluation_parts(case: _EvaluationCase):
             if case.rank != 0:
                 raise AssertionError("host metric executed off root")
             if case.failure == "metric":
-                raise ValueError("host metric failed")
+                raise InjectedValueError("host metric failed")
             values = np.asarray(artifact.features)
             # The real rows alone, in global order: a share that ran out
             # scores none of its copy's rows.
@@ -1202,18 +1212,18 @@ def _evaluation_parts(case: _EvaluationCase):
 
         def finalize(self, accumulated):
             if case.failure == "finalize":
-                raise ValueError("metric finalization failed")
+                raise InjectedValueError("metric finalization failed")
             return accumulated[0] / accumulated[1]
 
     class Drawing:
         def log(self, scalars, step):
             if case.failure == "log":
-                raise ValueError("tracker logging failed")
+                raise InjectedValueError("tracker logging failed")
 
         def artifact(self, artifact, step):
             assert case.rank == 0
             if case.failure == "render":
-                raise ValueError("tracker rendering failed")
+                raise InjectedValueError("tracker rendering failed")
             assert np.shape(artifact.features) == (8, 1)
 
     batches, validation = _evaluation_data(case)
@@ -1232,7 +1242,7 @@ def _evaluation_data(case: _EvaluationCase):
                 yield {"a_metadata": np.asarray(7), "a_python": 9,
                        "x": np.arange(case.rank * 4, (case.rank + 1) * 4, dtype=np.float32)[:, None]}
             if case.failure == "next" and case.rank == 1:
-                raise OSError("iterator next failed")
+                raise InjectedOSError("iterator next failed")
         finally:
             case.closed.append(case.failure)
 
@@ -1240,7 +1250,7 @@ def _evaluation_data(case: _EvaluationCase):
         if case.failure == "no_consumer":
             raise OSError("validation opened without a consumer")
         if case.failure == "construct" and case.rank == 1:
-            raise OSError("iterator construction failed")
+            raise InjectedOSError("iterator construction failed")
         return batches()
 
     return batches, validation
@@ -1285,7 +1295,10 @@ def mode_evaluation_contract(args) -> dict:
             result._report(trainer._display, trainer.tracker)
             results[failure] = {"scores": result.scalars, "events": list(events)}
         except (ValueError, RuntimeError, OSError) as error:
-            results[failure] = {"error": str(error), "events": list(events)}
+            # Its category, and whether this rank raised it itself, which a phase agreement notes
+            # (`dew._coordination._agree`), where a peer raises the agreement's own (row 4506).
+            results[failure] = {"error": type(error).__name__, "own": bool(getattr(error, "__notes__", ())),
+                                "events": list(events)}
     return {"results": results, "closed": closed}
 
 
@@ -1529,7 +1542,8 @@ def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -
             else:
                 rollout(state, broken, key)
         except (ValueError, RuntimeError) as error:
-            invalid_errors[fault] = str(error)
+            # The refusal's category, which the test reads, not its wording.
+            invalid_errors[fault] = type(error).__name__
         else:
             raise AssertionError("rank-local invalid input was accepted")
         reached = multihost_utils.process_allgather(np.asarray(rank, np.int32))
@@ -1552,7 +1566,7 @@ def _meshless_rollout(state, local, rollout, rank) -> dict:
     try:
         outcome["rows"] = len(rollout(state, broken, jax.random.key(29))["input_ids"])
     except (ValueError, RuntimeError) as error:
-        outcome["refused"] = str(error)
+        outcome["refused"] = type(error).__name__
     reached = multihost_utils.process_allgather(np.asarray(rank, np.int32))
     if reached.tolist() != [0, 1]:
         raise AssertionError("a rank did not return from its own rollout")

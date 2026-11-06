@@ -1058,7 +1058,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     import jax
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
-    from dew.nn.derivatives import declared_tangent
+    from dew.nn.derivatives import contracted, declared_tangent
 
     def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
@@ -1068,7 +1068,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     def producing(*operands):
         return forward(*operands)
 
-    produced = declared_tangent(kind, producing, produced_jvp)
+    produced = contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, producing, produced_jvp))
 
     def pulled_by(saved, operands, cotangent, live):
         arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
@@ -1085,7 +1086,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
 
-    pulled = declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,))
+    pulled = contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,)))
 
     def bounded_jvp(primals, tangents):
         output, saved = produced(*primals) if nested else forward(*jax.lax.stop_gradient(primals))
@@ -1120,7 +1122,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     def bounding(*operands):
         return forward(*operands)[0] if primal is None else primal(*operands)
 
-    return declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True)
+    return contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True))
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None):

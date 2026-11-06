@@ -912,13 +912,21 @@ def _codes(dtype):
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype):
     """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
-    `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host."""
+    `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host;
+    FP8 codes refused where the device converts none (an A100)."""
     codes, scale = _codes(dtype)
     expected = np.asarray(codes, np.float32) * np.asarray(scale)[:, None]
+    with generation.assumed(generation_name):
+        converts = mosaic.converts(dtype)
+    if not converts:
+        # An A100 converts no FP8 in registers: the conversion is refused, never assembled.
+        with pytest.raises(ValueError, match="converts no"), generation.assumed(generation_name):
+            _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
+        return
     if jax.default_backend() == "cpu":
-        np.testing.assert_array_equal(
-            np.asarray(_converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED),
-                       np.float32), expected)
+        with generation.assumed(generation_name):
+            converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
+        np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
         shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (codes, scale)]
         mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
         with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):

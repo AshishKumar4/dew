@@ -271,10 +271,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         rows = tokens.shape[0]
         # MDLM's antithetic times: each example a point in its own stratum of the update's examples.
         places, count = step.places(rows)
-        uniforms = step.sample("time uniforms", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
+        uniforms = step.sample("time uniforms", jax.random.uniform, (), rows=rows)
         t = step.boundary("times", self.process.stratified(uniforms, places, count))
-        draws = step.sample("mask uniforms", jax.random.uniform, tokens.shape[1:], dtype=jnp.float32,
-                            rows=rows)
+        draws = step.sample("mask uniforms", jax.random.uniform, tokens.shape[1:], rows=rows)
         _, is_masked = self.process.masked(draws, tokens, t)
         is_masked = step.boundary("mask", is_masked & real)
         dropout_key = jax.random.fold_in(step.key, 2)

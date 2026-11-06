@@ -342,9 +342,6 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
         # release's tokenizer at 56 ids.
         Family("causal_transformer+dory", "causal_transformer", DECODER_LM | {TEXT}, 64,
                released("dory-tiny")),
-        # Kimi K2.5's language model; Dew reads no Kimi vision tower.
-        Family("causal_transformer+kimi_k25", "causal_transformer", DECODER_LM, 256,
-               released("kimi-k25-tiny")),
         Family("causal_transformer+bidirectional", "causal_transformer", BIDIRECTIONAL_LM | {TEXT}, 256,
                built("causal_transformer", **DECODER, causal=False)),
         Family("causal_transformer+modernbert", "causal_transformer", BIDIRECTIONAL_LM, 64,
@@ -375,6 +372,9 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
                released("gemma4-tiny-mm")),
         Family("multimodal_transformer+llama4", "multimodal_transformer", DECODER_LM, 96,
                released("llama4-tiny-mm")),
+        # Kimi K2.5 whole: MoonViT, its patch merger and Kimi K2's decoder.
+        Family("multimodal_transformer+kimi_k25", "multimodal_transformer", DECODER_LM, 256,
+               released("kimi-k25-tiny")),
     ),
     "diffusion_gemma": (
         # The clean encoder reads the committed prefix causally and packs as

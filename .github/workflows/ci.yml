@@ -86,8 +86,21 @@ jobs:
       with:
         # The merge-base with main, which the gates that hold a checkout to main read (tools/base_history.sh).
         fetch-depth: 0
-    - uses: oven-sh/setup-bun@v2
-    - name: Install the armada CLI
+    # A pull request's gates run here, all of them (tools/check.sh): a fork's holds no armada credentials.
+    - if: github.event_name == 'pull_request'
+      uses: astral-sh/setup-uv@v6
+    - if: github.event_name == 'pull_request'
+      name: Every gate (tools/check.sh), on this runner
+      run: |
+        python=$(tr -d '\n' < .python-version)
+        uv venv -q -p "$python" ".venv-$python"
+        VIRTUAL_ENV=$PWD/.venv-$python sh tools/install_environment.sh cpu
+        PYTHON=$PWD/.venv-$python/bin/python PATH=$PWD/.venv-$python/bin:$PATH \
+          BASE="$(git merge-base HEAD origin/main)" sh tools/check.sh
+    - if: github.event_name != 'pull_request'
+      uses: oven-sh/setup-bun@v2
+    - if: github.event_name != 'pull_request'
+      name: Install the armada CLI
       run: bun install --global "$ARMADA"
     # tools/check_gates, each on an armada container of its own in the commit's environment, all failures
     # reported, so the job lasts as long as its slowest gate, not their sum on this runner's 4 vCPUs (the
@@ -95,7 +108,8 @@ jobs:
     # the tolerance inventory to main's at the merge-base (BASE) and to every parent in the history, which the
     # container's checkout carries (.armada.json's history), and the site's model list and examples to the
     # code.
-    - name: Every cheap gate (tools/check.sh), each on armada
+    - if: github.event_name != 'pull_request'
+      name: Every cheap gate (tools/check.sh), each on armada
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
@@ -109,10 +123,7 @@ jobs:
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
           sh "$base" '{item}'
 
-  # What a release attaches and Dew's index serves, installed the way a user
-  # installs it: the sdist and wheel build, pass twine, and name no requirement
-  # by URL, which an index refuses and twine passes; the wheel installs into an
-  # empty environment and runs; and the accelerator extras resolve.
+  # What a release attaches and Dew's index serves, installed the way a user installs it (tools/ci/package.sh).
   package:
     needs: proven
     if: needs.proven.outputs.run == ''
@@ -122,39 +133,15 @@ jobs:
     - uses: actions/setup-python@v5
       with:
         python-version-file: .python-version
-    - name: Build and check the sdist and wheel
-      run: |
-        python -m pip install --quiet -r tools/pip.txt
-        python -m pip install --upgrade build twine uv
-        python -m build
-        python -m twine check --strict dist/*
-        python tools/check_distribution.py dist/*
-    - name: Install the wheel into an empty environment, compile it, run `dew --help` and train
-      run: python tools/smoke_wheel.py dist/*.whl
+    - uses: astral-sh/setup-uv@v6
+    - name: Build, check, install and run the sdist and wheel; resolve the accelerator extras
+      run: sh tools/ci/package.sh dist
     # A release publishes this sdist and wheel, the ones built and smoked here (python-publish.yml).
     - if: github.event_name == 'release'
       uses: actions/upload-artifact@v4
       with:
         name: dist
         path: dist/
-    # Every environment's pip is tools/pip.txt's before it installs anything: older pips trust the
-    # roots of eMudhra's compromised CAs (2026-10-20).
-    - name: Without Dew's package index, an install stops at resolving jax
-      run: |
-        python -m venv "$RUNNER_TEMP/plain"
-        "$RUNNER_TEMP/plain/bin/python" -m pip install --quiet -r tools/pip.txt
-        if "$RUNNER_TEMP/plain/bin/pip" install --index-url https://pypi.org/simple dist/*.whl > plain.txt 2>&1; then
-          cat plain.txt; echo "dewml installed from PyPI alone, on a jax without Dew's fixes"; exit 1
-        fi
-        grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
-    - name: Resolve the accelerator extras
-      run: |
-        index=$(python -c "import runpy; print(runpy.run_path('src/dew/_builds.py')['PACKAGE_INDEX'])")
-        for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
-          echo "dewml[$extras] @ file://$(realpath dist/*.whl)" \
-            | uv pip compile - --extra-index-url "$index" \
-              --python-version "$(tr -d '\n' < .python-version)" --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
-        done
 
   # What the run's suite covers (tools/armada/ci.py policy), read before the test job starts, as its armada
   # group depends on it: the whole suite, daily or dispatched, runs every file with the cache off; any other
@@ -163,6 +150,9 @@ jobs:
   # (ci/base-<sha>-*) from the producer branch's tip it merges onto, <sha>, and for a push to base/kernels from
   # the last push whose run went green (the tip it moved from before any did; main where it is new).
   scope:
+    # A pull request's CI is its lint and package, on hosted runners: a fork's holds no armada credentials, and its
+    # suite runs when a lane's head of it reaches the land queue.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # Reads the last green run on base/kernels, which its pushes are scoped from.
     permissions:
@@ -291,115 +281,29 @@ jobs:
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
           ${{ ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '48') || '' }}
+      # tools/ci/suite.sh, which this step reads from the ref, holds what the run takes. A base/<producer>
+      # promote and a push to base/kernels run no gangs: main's trains run them. A train's jobs (ci/batch-*,
+      # ci/fix-*), its gangs and its suite alike, start before any other while the fleet is full, and lanes'
+      # runs at a head (verdict.sh, at -10) end their newest containers to let them in (owner, bible §4); one
+      # priority for both, so the suite never recalls its own gangs' containers. A push to base/kernels and a
+      # base/<producer> promote run at a lane's whole-suite priority (-10) within their pool of 48, so they
+      # never take containers from a train, a precheck or a lane's targeted run (the maintainer, 2026-10-28).
+      # A train staged on the testing train's tip (ci/stage-*) runs beside it, at 5, on the pool its branch
+      # names (its lease's suite share, the land queue's promote.sh); a push to main the queue did not grade
+      # (a direct push) is its tip's only test, at 5 too, in a concurrency group of its own (the maintainer,
+      # 2026-10-29, 2026-10-31).
       run: |
-        armada=armada
-        # The test cache's policy, as the scope job read it.
-        echo "the test cache's policy: $DEW_TEST_CACHE"
-        # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
-        # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
-        trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
-        # A base/<producer> promote and a push to base/kernels run no gangs: main's trains run them.
         case "$GITHUB_REF_NAME" in ci/base-*|base/kernels) gangless=1 ;; *) gangless= ;; esac
-        # A train's jobs (ci/batch-*, ci/fix-*), its gangs and its suite alike, start before any other while the
-        # fleet is full, and lanes' runs at a head (verdict.sh, at -10) end their newest containers to let them in
-        # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers. A push to
-        # base/kernels and a base/<producer> promote run at a lane's whole-suite priority
-        # (-10, verdict.sh's) within their pool of 48, so they never take containers from a train, a precheck or a
-        # lane's targeted run (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease
-        # ledger). A train staged on the testing train's tip (ci/stage-*, its own concurrency group above)
-        # runs beside it, at 5: it publishes only after that train, so it takes what that train leaves (owner
-        # and the maintainer, 2026-10-28). A push to main the queue did not grade (a direct push: a train's
-        # tip is proven and runs neither) is its tip's only test: it runs beside the trains in a concurrency
-        # group of its own, never holding theirs, at a staged train's 5, so a train's jobs start first and it
-        # takes what they leave, above a lane's run (the maintainer, 2026-10-29: 4893fcdd3's, at 0 on a full
-        # fleet, left a gang's fourth rank unplaced past its deadline; 2026-10-31: a direct push's run held
-        # the trains' group, and a nine-head train's test job waited 14 minutes for it).
         case "$GITHUB_REF_NAME" in
-          ci/batch-*|ci/fix-*) priority=--priority=10 ;;
-          ci/stage-*|main) priority=--priority=5 ;;
-          ci/base-*|base/kernels) priority=--priority=-10 ;;
+          ci/batch-*|ci/fix-*) priority=10 ;;
+          ci/stage-*|main) priority=5 ;;
+          ci/base-*|base/kernels) priority=-10 ;;
           *) priority= ;;
         esac
-        if [ -z "$PROVEN" ] && [ -z "$gangless" ]; then
-          # A gang member lost before the start fails it within 300 s (armada#22).
-          items=$(python3 tools/armada/ci.py gangs)
-          echo "$items" | setsid $armada map --commit=${{ github.sha }} --items=- --size=medium \
-            --pool="$(echo "$items" | python3 -c 'import json, sys; print(sum(gang["gang"] for gang in json.load(sys.stdin)))')" \
-            --deadline=1800 --gang-start-timeout=300 $priority \
-            --label="$GITHUB_REF_NAME" -- python3 tools/armada/ci.py pytest \
-            --python="$(tr -d '\n' < .python-version)" --report=/tmp/dew-gang.xml \
-            -- -k "{select}" --basetemp=/tmp/dew-gang tests/test_multihost.py \
-            > "$RUNNER_TEMP/gangs.log" 2>&1 &
-          gangs=$!
-        fi
-        # Its own deadline sits below this job's timeout, so a hang is armada's named error, and
-        # above what every file takes on its containers when no row is cached (a change to a module
-        # most tests import, and the daily run, which proves the commit again with every file): 160,
-        # or a background run's share.
-        # A cold suite (the cache's policy off: a lock, JAX's build or the recorder changed) compiles everything
-        # anew, so its deadline is 5400 s (the maintainer, 2026-10-28: train 254's cold suite left 780 tasks
-        # unstarted at 2,698 s).
-        if [ -n "$BACKGROUND_POOL" ]; then bound="--pool=$BACKGROUND_POOL --deadline=6000"
-        elif [ "$DEW_TEST_CACHE" = off ]; then bound="--deadline=5400"
-        else bound="--deadline=2700"; fi
-        # A train staged on the testing train's tip runs on the pool its branch names (ci/stage-...-p<N>: its lease's
-        # suite share, the land queue's promote.sh), so it asks no more than it leased (the maintainer,
-        # 2026-10-28).
-        case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) bound="$bound --pool=${GITHUB_REF_NAME##*-p}" ;; esac
-        # A commit the proven job found proved (a run that passed, or, on main, the land queue's proof of the tip it
-        # graded green, red rows its regrade passed included) runs no suite again, whatever its stored verdict or the
-        # cache's policy; the whole suite, daily or dispatched, reads no proof (the proven job runs on a push alone), so
-        # it proves main's tip anew.
-        if [ -z "$PROVEN" ] && { [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; }; then
-          setsid $armada run ${{ github.sha }} $bound $priority --label="$GITHUB_REF_NAME" \
-            > >(tee "$RUNNER_TEMP/suite.log") 2> >(tee "$RUNNER_TEMP/suite.err" >&2) &
-          suite=$!
-        fi
-        failed=0
-        if [ -n "${suite:-}" ]; then wait "$suite" || failed=1; fi
-        # The whole suite's second job: its release checks, which its own tasks set aside, a task each requirement
-        # (ci.py release-plan, from the rows naming them as pytest resolved their marks), each pytest under uv's
-        # overlay of the requirement on the suite's environment, on the suite's CPU (2173).
-        # A verdict that cannot be read (armada's 2: none, or no answer) or a plan that fails fails the job: no
-        # release check is skipped unseen; none planned is the plan's own empty answer.
-        if [ -n "$DEW_WHOLE_SUITE" ]; then
-          read=0
-          $armada verdict ${{ github.sha }} --json > "$RUNNER_TEMP/verdict.json" || read=$?
-          if [ "$read" -gt 1 ]; then
-            echo "the suite's verdict could not be read (armada verdict exit $read): its release checks are unplanned"
-            failed=1
-          elif ! checks=$(python3 tools/armada/ci.py release-plan "$RUNNER_TEMP/verdict.json"); then
-            echo "the suite's release checks could not be planned (ci.py release-plan)"
-            failed=1
-          elif [ "$checks" != "[]" ]; then
-            echo "$checks" | $armada map --commit=${{ github.sha }} --items=- --size=medium \
-              --pool="$(echo "$checks" | jq length)" --deadline=1800 $priority --label="$GITHUB_REF_NAME" \
-              --cpu="$(jq -r '[.task.cpu] | flatten | map("\(.vendor)/\(.family)/\(.model)") | join(",")' .armada.json)" \
-              -- python3 tools/armada/ci.py release --python={python} --tests={tests} --requirement={release} \
-              --out=/tmp/dew-release.json || failed=1
-          fi
-        fi
-        if [ -n "${gangs:-}" ]; then
-          wait "$gangs" || failed=1
-          echo "--- the multi-host gangs"
-          cat "$RUNNER_TEMP/gangs.log"
-          # A red gang's logs, every rank's and attempt's with each one's relay (armada's GET
-          # /jobs/<id>/tasks/<i>/runs, and each run's log): the map's summary names no cause, and a gang's
-          # cause can sit on a rank other than the one that failed first.
-          job=$(grep -oE '\bjob [0-9]{14}-[0-9a-f]{8}' "$RUNNER_TEMP/gangs.log" | head -1 | cut -d' ' -f2)
-          # A task row: its index, then "exit <code>" or what else ended it (TIMEOUT, LOST, CANCELLED).
-          for task in $(awk '$1 ~ /^[0-9]+$/ && (($2 == "exit" && $3 != 0) || $2 ~ /^(TIMEOUT|LOST|CANCELLED)$/) { print $1 }' \
-                          "$RUNNER_TEMP/gangs.log"); do
-            runs=$(curl -sS --compressed --fail-with-body "${ARMADA_URL%/}/jobs/$job/tasks/$task/runs" \
-              -H "authorization: Bearer $ARMADA_TOKEN" -H "armada-protocol: 10") || runs='{"runs": []}'
-            for run in $(echo "$runs" | jq -r '.runs[] | "\(.vessel).\(.attempt):\(.rank)"'); do
-              echo "--- gang $task of job $job, rank ${run#*:} (${run%:*})"
-              curl -sS --compressed --fail-with-body "${ARMADA_URL%/}/jobs/$job/tasks/$task/runs/${run%:*}/log" \
-                -H "authorization: Bearer $ARMADA_TOKEN" -H "armada-protocol: 10" || echo "(armada stored no log for it)"
-            done
-          done
-        fi
-        exit $failed
+        pool=$BACKGROUND_POOL
+        case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) pool=${GITHUB_REF_NAME##*-p} ;; esac
+        ARMADA=armada LABEL="$GITHUB_REF_NAME" PRIORITY="$priority" GANGLESS="$gangless" POOL="$pool" \
+          BACKGROUND="${BACKGROUND_POOL:+1}" OUT="$RUNNER_TEMP/ci" bash tools/ci/suite.sh ${{ github.sha }}
     - name: Cancel the armada jobs of a cancelled run
       # A client killed before it cancelled leaves its job running to its deadline, on the fleet the
       # next run needs: each job the clients named is cancelled (armada's POST /jobs/<id>/cancel, at
@@ -409,7 +313,7 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        for id in $(cat "$RUNNER_TEMP"/gangs.log "$RUNNER_TEMP"/suite.log "$RUNNER_TEMP"/suite.err 2>/dev/null \
+        for id in $(cat "$RUNNER_TEMP"/ci/*.log "$RUNNER_TEMP"/ci/suite.err 2>/dev/null \
                     | grep -oE '\bjob [0-9]{14}-[0-9a-f]{8}' | cut -d' ' -f2 | sort -u); do
           curl -sS -X POST "${ARMADA_URL%/}/jobs/$id/cancel" -H "authorization: Bearer $ARMADA_TOKEN" \
             -H "armada-protocol: 10" || true

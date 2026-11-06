@@ -1,12 +1,15 @@
-"""The tools of tests/test_armada_ci.py and tests/test_armada_recorder.py: Dew's CI on armada
-(tools/armada/ci.py) run on small test files written into a checkout of their own."""
+"""The tools of tests/test_armada_ci.py, tests/test_armada_reuse.py and tests/test_armada_recorder.py: Dew's
+CI on armada (tools/armada/ci.py) run on small test files written into a checkout of their own."""
 
 import json
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
 from tool_support import git, load
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def loaded(tmp_path: Path, monkeypatch):
@@ -76,3 +79,34 @@ def commit(root: Path, message: str) -> str:
         git(root, "add", "-A")
     git(root, "commit", "-qm" if first else "-qam", message)
     return git(root, "rev-parse", "HEAD").strip()
+
+
+def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 300.0) -> list[dict]:
+    """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy` for tasks of `target` seconds, each run as
+    armada starts it: .armada.json's command filled from its plan entry, in .armada.json's environment, which
+    the plan's DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
+    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
+    monkeypatch.setenv("DEW_TEST_CACHE", policy)
+    entries = [entry for entry in ci.plan(target, {}) if entry["python"] == "3.12"]
+    monkeypatch.delenv("DEW_TEST_CACHE")
+    rows = []
+    for entry in entries:
+        values = {**entry, "out": out}
+        filled = [re.sub(r"\{(\w+)\}", lambda field, values=values: str(values[field[1]]), word)
+                  for word in command]
+        monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+        assert ci.main() == 0
+        rows += json.loads(out.read_text())["rows"]
+    return rows
+
+
+def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
+    """Checkout `root` run by 3.12 tasks on one CPU class against the shared test cache, and where their
+    verdict is written: beside the checkout's entries, not among them (the checkout's own directory is an
+    input)."""
+    interpreter(root, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    (root / ".verdict").mkdir()
+    return root / ".verdict/verdict.json"

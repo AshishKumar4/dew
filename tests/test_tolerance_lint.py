@@ -286,7 +286,7 @@ def test_the_inventory_holds_a_file_at_its_count_and_only_shrinks(lint, tmp_path
     [lower] = findings(3)
     assert lower.line == 1
     [remove] = findings(2, "x = 1\n")
-    assert "remove its entry" in remove.message
+    assert (remove.ratchet, remove.file) == (lint.Ratchet.STALE, "tests/test_case.py")
 
 
 def _commit(repo, inventory, message, files=None):
@@ -298,6 +298,12 @@ def _commit(repo, inventory, message, files=None):
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message], cwd=repo,
                    check=True)
+
+
+def _held(findings) -> set[tuple]:
+    """Each ratchet finding as why it holds, the commit it holds (`HEAD` against its base) and the file."""
+    return {(finding.ratchet, "HEAD" if finding.commit == "HEAD" else "commit", finding.file)
+            for finding in findings}
 
 
 def _inventory(counts: dict):
@@ -334,13 +340,13 @@ def test_no_commit_loosens_the_inventory_its_parents_kept(lint, tmp_path):
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-commit", "main"],
                    cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_b.py": 9}), "merge raises past both")
-    assert any("raises tests/test_b.py" in finding.message for finding in lint.ratchet(repo))
+    assert (lint.Ratchet.RAISES, "commit", "tests/test_b.py") in _held(lint.ratchet(repo))
     # Removing the inventory, then making it again looser, is reported at the removal.
     subprocess.run(["git", "rm", "-q", "tools/tolerance_inventory.json"], cwd=repo, check=True)
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "removed"], cwd=repo,
                    check=True)
     _commit(repo, _inventory({"tests/test_b.py": 20}), "made again")
-    assert any("removes the inventory" in finding.message for finding in lint.ratchet(repo))
+    assert (lint.Ratchet.REMOVES, "commit", "") in _held(lint.ratchet(repo))
 
 
 def test_a_change_of_the_rules_reading_grows_the_inventory_only_for_files_it_leaves_unchanged(lint, tmp_path):
@@ -363,10 +369,9 @@ def test_a_change_of_the_rules_reading_grows_the_inventory_only_for_files_it_lea
     _commit(repo, _inventory({"tests/test_a.py": 3, "tests/test_b.py": 1, "tests/test_c.py": 1}),
             "the rule and the files change", {lint.RULE: "reading = 3\n", "tests/test_a.py": "a = 2\n",
                                                "tests/test_c.py": "c = 1\n"})
-    messages = [finding.message for finding in lint.ratchet(repo, "main")]
-    assert any("raises tests/test_a.py" in message for message in messages)
-    assert any("adds tests/test_c.py" in message for message in messages)
-    assert not any("tests/test_b.py" in message for message in messages)
+    held = _held(lint.ratchet(repo, "main"))
+    assert {(why, file) for why, _, file in held} == {(lint.Ratchet.RAISES, "tests/test_a.py"),
+                                                      (lint.Ratchet.ADDS, "tests/test_c.py")}
 
 
 def test_a_merge_bringing_a_count_its_other_parent_raised_by_rereading_is_no_loosening(lint, tmp_path):
@@ -421,7 +426,7 @@ def test_a_merge_keeps_an_entry_its_parents_renamed_apart_only_once(lint, tmp_pa
                 {f"tests/{name}": f"a = 1  # one comparison\n{branch * 40}\n" * 8})
     _merged(repo, "main", "lane", _inventory({"tests/test_b.py": 1, "tests/test_c.py": 1}),
             "the merge keeps both")
-    assert any("renamed it apart" in finding.message for finding in lint.ratchet(repo))
+    assert (lint.Ratchet.RENAMED_APART, "commit", "tests/test_a.py") in _held(lint.ratchet(repo))
     # Kept under a third name the merge itself gives, the copy is the same entry still.
     subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=repo, check=True)
     _merged(repo, "main", "lane", _inventory({"tests/test_d.py": 1, "tests/test_c.py": 1}),
@@ -429,7 +434,7 @@ def test_a_merge_keeps_an_entry_its_parents_renamed_apart_only_once(lint, tmp_pa
     subprocess.run(["git", "mv", "-f", "tests/test_b.py", "tests/test_d.py"], cwd=repo, check=True)
     amend = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--amend", "--no-edit"]
     subprocess.run(amend, cwd=repo, check=True)
-    assert any("renamed it apart" in finding.message for finding in lint.ratchet(repo))
+    assert (lint.Ratchet.RENAMED_APART, "commit", "tests/test_a.py") in _held(lint.ratchet(repo))
 
 
 def test_only_the_heads_own_rereadings_authorize_a_count_against_its_base(lint, tmp_path):
@@ -449,7 +454,7 @@ def test_only_the_heads_own_rereadings_authorize_a_count_against_its_base(lint, 
     subprocess.run(["git", "checkout", "-q", "lane"], cwd=repo, check=True)
     _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 3}), "the lane keeps its 3",
             {"tests/test_a.py": "a = 1\n"})
-    assert any("test_a.py's count" in finding.message for finding in lint.ratchet(repo, "main"))
+    assert (lint.Ratchet.RAISES, "HEAD", "tests/test_a.py") in _held(lint.ratchet(repo, "main"))
 
 
 def test_the_ratchet_holds_a_branch_to_its_base_and_refuses_a_shallow_history(lint, tmp_path):
@@ -462,7 +467,7 @@ def test_the_ratchet_holds_a_branch_to_its_base_and_refuses_a_shallow_history(li
     _commit(repo, _inventory({"tests/test_a.py": 3}), "lowered")
     subprocess.run(["git", "checkout", "-q", "-b", "head", "HEAD~1"], cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_a.py": 5}), "a raised count")
-    assert any("against main's" in finding.message for finding in lint.ratchet(repo, "main"))
+    assert (lint.Ratchet.RAISES, "HEAD", "tests/test_a.py") in _held(lint.ratchet(repo, "main"))
     # Two readings in one process, a commit between them, see each HEAD as it is.
     subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
     assert list(lint.ratchet(repo, "main")) == []
@@ -471,4 +476,4 @@ def test_the_ratchet_holds_a_branch_to_its_base_and_refuses_a_shallow_history(li
     shallow = tmp_path / "shallow"
     subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{repo}", str(shallow)], check=True)
     [refused] = list(lint.ratchet(shallow))
-    assert "shallow" in refused.message
+    assert refused.ratchet == lint.Ratchet.SHALLOW

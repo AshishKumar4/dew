@@ -229,21 +229,21 @@ def named_choice[ChoiceT: str](value: object, name: str, allowed: tuple[ChoiceT,
                      f"this class supports {', '.join(allowed)}")
 
 
-def _published_linspace(start: float, end: float, count: int) -> np.ndarray:
-    """The source's float32 endpoints and step, spaced from each end.
+def _published_linspace(start: float, end: float, count: int, dtype: type = np.float32) -> np.ndarray:
+    """The source's `dtype` endpoints and step, spaced from each end.
 
     NumPy spaces the original double endpoints. Those different roundings
     change the beta table and accumulate in alpha-bar. Widen the rounded
-    operands so the position's multiply-add is rounded only once to float32,
+    operands so the position's multiply-add is rounded only once to `dtype`,
     rather than introducing another rounding at its intermediate product.
     """
-    first, last = float(np.float32(start)), float(np.float32(end))
+    first, last = float(dtype(start)), float(dtype(end))
     if count == 1:
-        return np.asarray([first], np.float32)
-    step = float(np.float32((last - first) / (count - 1)))
+        return np.asarray([first], dtype)
+    step = float(dtype((last - first) / (count - 1)))
     index = np.arange(count, dtype=np.float64)
     return np.where(index < count // 2, first + index * step,
-                    last - (count - 1 - index) * step).astype(np.float32)
+                    last - (count - 1 - index) * step).astype(dtype)
 
 
 def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
@@ -258,38 +258,44 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
     the class implements. Every class accepts the three common ones, DDPM
     adds GeoDiff's sigmoid, and Heun adds the exponential alpha-bar. A table
     that does not have `count` finite entries in [0, 1] raises `ValueError`.
+
+    The source rescales in float32, where `1 - bars[t] / bars[t - 1]` cancels
+    and leaves alpha-bar about 1e-6 off its float64 value, by roundings no
+    port can repeat (torch's CPU float32 sqrt is not correctly rounded). A
+    rescaled table is instead evaluated in float64, base table included, and
+    rounded once; every other table is the source's float32 one to the bit.
     """
     length = _records.integer(count, "num_train_timesteps")
     if length < 1:
         raise ValueError("num_train_timesteps must be positive")
+    precision = np.float64 if zero_snr else np.float32
     if trained is not None:
         if not isinstance(trained, (list, tuple, np.ndarray)):
             raise ValueError("trained_betas must be a numeric sequence")
-        betas = np.asarray(trained, np.float32)
+        betas = np.asarray(trained, precision)
     else:
         first = _records.number(start, "beta_start")
         final = _records.number(end, "beta_end")
         kind = named_choice(schedule, "beta_schedule", schedules)
         if kind == "linear":
-            betas = _published_linspace(first, final, length)
+            betas = _published_linspace(first, final, length, precision)
         elif kind == "scaled_linear":
-            betas = _published_linspace(first ** 0.5, final ** 0.5, length) ** 2
+            betas = _published_linspace(first ** 0.5, final ** 0.5, length, precision) ** 2
         elif kind == "sigmoid":
-            ramp = _published_linspace(-6, 6, length)
+            ramp = _published_linspace(-6, 6, length, precision)
             betas = 1 / (1 + np.exp(-ramp)) * (final - first) + first
         elif kind == "exp":
             steps = np.arange(length + 1, dtype=np.float64) / length
             bars = np.exp(steps * -12.0)
-            betas = np.minimum(1 - bars[1:] / bars[:-1], 0.999).astype(np.float32)
+            betas = np.minimum(1 - bars[1:] / bars[:-1], 0.999).astype(precision)
         else:
             # squaredcos_cap_v2 is Nichol and Dhariwal's table, which Diffusers casts to float32.
-            betas = cosine_beta_schedule(length).astype(np.float32)
+            betas = cosine_beta_schedule(length).astype(precision)
     if betas.shape != (length,) or not np.all(np.isfinite(betas)) or np.any((betas < 0) | (betas > 1)):
         raise ValueError("The beta table must have num_train_timesteps finite entries in [0,1]")
     if zero_snr:
-        bars = np.cumprod(1 - betas, dtype=np.float64).astype(np.float32)
-        signal = np.sqrt(bars)
-        head, tail = signal[0].copy(), signal[-1].copy()
+        signal = np.sqrt(np.cumprod(1 - betas))
+        head, tail = signal[0], signal[-1]
         if head <= tail:
             raise ValueError("Zero-terminal-SNR rescaling needs a decreasing signal schedule")
         signal = (signal - tail) * (head / (head - tail))

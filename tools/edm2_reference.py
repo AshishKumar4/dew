@@ -1,4 +1,4 @@
-"""EDM2's U-Net and its magnitude-preserving layers, for tests/fixtures/edm2.
+"""EDM2's U-Net and its magnitude-preserving layers over seeds, for tests/fixtures/edm2/seeds.npz.
 
 The reference is `UNet` in NVlabs/edm2's `training/networks_edm2.py`, read at
 a pinned commit and executed as published, with its two `torch_utils`
@@ -6,33 +6,34 @@ imports stubbed: `persistence.persistent_class` is only pickling metadata
 and `misc.const_like` a tensor constructor. Its code is not vendored here
 (the repository's licence is CC BY-NC-SA 4.0).
 
-A tiny network (8x8 input, two levels, attention at 4x4, a 4-wide label)
-draws its weights, and every scalar gain the reference initializes to zero is
-drawn too, so no branch is switched off. What lands: every weight and buffer
-under its reference name, the inputs, the class labels as the reference
-reads them, and the output computed in float64 and in float32.
+A tiny network (8x8 input, two levels, attention at 4x4, a 4-wide label):
+a seed draws its weights as the reference initializes them, and every scalar
+gain the reference initializes to zero too, so no branch is switched off,
+with its inputs and a probe (`draw`, which the test draws again; the names
+and shapes from layout.json, which this writes). Over the seeds check 1 draws
+(`record_case`, tools/recorded_references.py), two sites, each in float32 and
+in the float64 twin, summarized (each leaf's error from its truth and its
+truth's sketch): `unet`, the output in eval mode; and `train`, the same
+network trained in train mode, where `MPConv.forward` writes the normalized
+weight back into the parameter before using it (forced weight normalization,
+Equation 66), for STEPS steps of torch's SGD on `sum(output * probe)`: each
+step's output, and after the first every stored weight and gain in the
+test's layout (`converted`), in one vector. SGD rather than EDM2's Adam: the
+normalization does not depend on the optimizer, and Adam's first steps are
+near sign(gradient) steps, which turn a near-zero gradient's float32 rounding
+into a whole step's difference.
 
-`--train` writes train.npz beside it: the same network trained in train
-mode, where `MPConv.forward` writes the normalized weight back into the
-parameter before using it (forced weight normalization, Equation 66), for
-STEPS steps of torch's SGD on `sum(output * probe)`. Each step records the
-output and every stored weight and gain after its forward, in float32 and
-in the float64 twin, from one initial state. SGD rather than EDM2's Adam:
-the normalization does not depend on the optimizer, and Adam's first steps
-are near sign(gradient) steps, which turn a near-zero gradient's float32
-rounding into a whole step's difference.
-
-    PYTHONPATH=src python tools/edm2_reference.py [--train]
+    PYTHONPATH=src:tests python tools/edm2_reference.py
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
-import sys
 import types
 from pathlib import Path
 
+import jax
 import numpy as np
 import torch
 from reference_source import fetched, stub_torch_utils
@@ -40,8 +41,9 @@ from torch_precision import float64
 
 COMMIT = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
 SOURCE = f"https://raw.githubusercontent.com/NVlabs/edm2/{COMMIT}/training/networks_edm2.py"
-FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm2" / "unet.npz"
-TRAIN = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm2" / "train.npz"
+FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm2" / "seeds.npz"
+LAYOUT = FIXTURE.with_name("layout.json")
+"""The reference's state, each name's shape, in its order: what `draw` draws."""
 STEPS = 3
 # A rate that moves the weights and the output visibly in STEPS steps.
 SGD = {"lr": 0.002}
@@ -65,71 +67,106 @@ def networks(dtype: str) -> types.ModuleType:
     return module
 
 
-def main() -> None:
-    published, twin = networks("float32"), networks("float64")
-    torch.manual_seed(0)
-    net = published.UNet(**CONFIG).eval()
-    with torch.no_grad():
-        for value in net.parameters():
-            if value.ndim == 0:
-                value.copy_(torch.randn(()) * 0.5 + 1.0)
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's weights under their reference names (`weights/`), as `UNet` initializes them: each
+    `MPConv` weight standard normal, each `MPFourier` frequency 2 pi times a standard normal and phase 2 pi
+    times a uniform, and each scalar gain normal about 1 at 0.5, where the reference's zero would switch
+    its branch off; and the inputs, the noise labels, a 4-wide text vector and the probe, all float32."""
+    rng = np.random.default_rng([1572, seed])
+    arrays = {}
+    for name, shape in json.loads(LAYOUT.read_text()).items():
+        if name.endswith(".freqs"):
+            value = 2 * np.pi * rng.standard_normal(shape)
+        elif name.endswith(".phases"):
+            value = 2 * np.pi * rng.uniform(size=shape)
+        elif not shape:
+            value = rng.normal(1.0, 0.5, shape)
+        else:
+            value = rng.standard_normal(shape)
+        arrays[f"weights/{name}"] = value
+    arrays |= {"x": rng.standard_normal((2, 3, 8, 8)), "noise_labels": rng.standard_normal(2),
+               "text": rng.standard_normal((2, 4)), "probe": rng.standard_normal((2, 3, 8, 8))}
+    return {name: np.asarray(value, np.float32) for name, value in arrays.items()}
+
+
+def built(published, twin, inputs: dict[str, np.ndarray], mode: str):
+    """The reference in float32 and its float64 twin, each holding the draw's weights, in `mode`."""
+    state = {name.removeprefix("weights/"): torch.as_tensor(value) for name, value in inputs.items()
+             if name.startswith("weights/")}
+    net = getattr(published.UNet(**CONFIG), mode)()
+    net.load_state_dict(state)
     with float64():
-        exact = twin.UNet(**CONFIG).eval()
-    exact.load_state_dict({name: value.double() for name, value in net.state_dict().items()})
-    generator = torch.Generator().manual_seed(1)
-    x, noise_labels, text = (torch.randn(*shape, generator=generator)
-                             for shape in ((2, 3, 8, 8), (2,), (2, 4)))
-    # The model normalizes a text vector to unit magnitude where the reference
-    # multiplies its one-hot by sqrt(label_dim), so this is the label that
-    # reaches the same embedding.
-    labels = twin.normalize(text.double()) / np.sqrt(CONFIG["label_dim"])
-    arrays = {"x": x.numpy(), "noise_labels": noise_labels.numpy(), "text": text.numpy(),
-              "config": np.asarray(json.dumps(CONFIG))}
-    for name, value in net.state_dict().items():
-        arrays[f"weights/{name}"] = value.numpy()
-    with torch.no_grad():
-        arrays["output"] = exact(x.double(), noise_labels.double(), labels).numpy()
-        arrays["output32"] = net(x, noise_labels, labels.float()).double().numpy()
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
-    print(f"{FIXTURE}: output |max| {np.abs(arrays['output']).max():.3f}")
+        exact = getattr(twin.UNet(**CONFIG), mode)().double()
+    exact.load_state_dict({name: value.double() for name, value in state.items()})
+    return net, exact
 
 
-def train() -> None:
-    published, twin = networks("float32"), networks("float64")
-    torch.manual_seed(0)
-    initial = published.UNet(**CONFIG)
+def labels(twin, inputs: dict[str, np.ndarray]) -> torch.Tensor:
+    """The class labels that reach the embedding a text vector does: the model normalizes a text vector
+    to unit magnitude where the reference multiplies its one-hot by sqrt(label_dim)."""
+    return twin.normalize(torch.as_tensor(inputs["text"]).double()) / np.sqrt(CONFIG["label_dim"])
+
+
+def unet(published, twin, inputs: dict[str, np.ndarray]) -> tuple[dict, dict]:
+    """The `unet` site's output in float32 and float64, in eval mode."""
+    net, exact = built(published, twin, inputs, "eval")
+    x, noise = (torch.as_tensor(inputs[name]) for name in ("x", "noise_labels"))
+    label = labels(twin, inputs)
     with torch.no_grad():
-        for value in initial.parameters():
-            if value.ndim == 0:
-                value.copy_(torch.randn(()) * 0.5 + 1.0)
-    generator = torch.Generator().manual_seed(2)
-    x, noise_labels, text = (torch.randn(*shape, generator=generator)
-                             for shape in ((2, 3, 8, 8), (2,), (2, 4)))
-    probe = torch.randn((2, 3, 8, 8), generator=generator)
-    arrays = {"x": x.numpy(), "noise_labels": noise_labels.numpy(), "text": text.numpy(),
-              "probe": probe.numpy(), "config": np.asarray(json.dumps(CONFIG)),
-              "sgd": np.asarray(json.dumps(SGD)), "steps": np.asarray(STEPS)}
-    for name, value in initial.state_dict().items():
-        arrays[f"weights/{name}"] = value.numpy()
-    for precision, module, dtype in (("fp32", published, torch.float32), ("fp64", twin, torch.float64)):
-        with float64() if dtype == torch.float64 else contextlib.nullcontext():
-            net = module.UNet(**CONFIG).train().to(dtype)
-        net.load_state_dict({name: value.to(dtype) for name, value in initial.state_dict().items()})
+        single = net(x, noise, label.float()).numpy()
+    with float64(), torch.no_grad():
+        wide = exact(x.double(), noise.double(), label).numpy()
+    return {"output": single}, {"output": wide}
+
+
+def train(published, twin, inputs: dict[str, np.ndarray]) -> tuple[dict, dict]:
+    """The `train` site in float32 and float64: STEPS SGD steps in train mode, each step's output and,
+    after the first, the stored weights and gains in the test's layout (`converted`) in one vector."""
+    from test_edm2 import converted
+
+    nets = built(published, twin, inputs, "train")
+    runs = []
+    for net, dtype in zip(nets, (torch.float32, torch.float64), strict=True):
         optimizer = torch.optim.SGD(net.parameters(), **SGD)
-        labels = twin.normalize(text.double()).to(dtype) / np.sqrt(CONFIG["label_dim"])
-        for step in range(STEPS):
-            output = net(x.to(dtype), noise_labels.to(dtype), labels)
-            arrays[f"{precision}/{step}/output"] = output.detach().numpy()
-            for name, value in net.state_dict().items():
-                arrays[f"{precision}/{step}/weights/{name}"] = value.numpy().copy()
-            optimizer.zero_grad()
-            (output * probe.to(dtype)).sum().backward()
-            optimizer.step()
-    TRAIN.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(TRAIN, **arrays)
-    print(f"{TRAIN}: {TRAIN.stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
+        x, noise, probe = (torch.as_tensor(inputs[name]).to(dtype) for name in ("x", "noise_labels", "probe"))
+        label = labels(twin, inputs).to(dtype)
+        out = {}
+        with float64() if dtype == torch.float64 else contextlib.nullcontext():
+            for step in range(STEPS):
+                output = net(x, noise, label)
+                out[f"output_{step}"] = output.detach().numpy().copy()
+                if step:
+                    # In float64 where the run is: `converted` holds its arrays as JAX does.
+                    with jax.enable_x64(dtype == torch.float64):
+                        stored = converted({f"weights/{name}": value.numpy().copy()
+                                            for name, value in net.state_dict().items()})["params"]
+                        out[f"stored_{step}"] = np.concatenate([np.ravel(leaf) for leaf in
+                                                                jax.tree_util.tree_leaves(stored)])
+                optimizer.zero_grad()
+                (output * probe).sum().backward()
+                optimizer.step()
+        runs.append(out)
+    return runs[0], runs[1]
+
+
+def main() -> None:
+    from recorded_references import provenance, record_case, save
+    from test_edm2 import trained, unet_output
+
+    published, twin = networks("float32"), networks("float64")
+    LAYOUT.write_text(json.dumps({name: list(value.shape) for name, value in
+                                  published.UNet(**CONFIG).state_dict().items()}, indent=1) + "\n")
+    arrays = {}
+    for site, evaluate, dew in (("unet", unet, unet_output), ("train", train, trained)):
+        compiled = jax.jit(lambda inputs, dew=dew: dew(jax.numpy.float32, inputs))
+        arrays.update(record_case(site, draw,
+                                  lambda inputs, evaluate=evaluate: evaluate(published, twin, inputs),
+                                  store_inputs=False, summary=True, dew=compiled))
+    written = save(FIXTURE, {**arrays, "provenance": provenance(
+        "NVlabs/edm2", COMMIT, "cpu", "python tools/edm2_reference.py", torch=torch.__version__)},
+        reference=f"NVlabs/edm2 {COMMIT}", license="CC BY-NC-SA 4.0 (results only)")
+    print(f"{written}: {sorted(arrays)}")
 
 
 if __name__ == "__main__":
-    train() if sys.argv[1:] == ["--train"] else main()
+    main()

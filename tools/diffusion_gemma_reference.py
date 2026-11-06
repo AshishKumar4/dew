@@ -70,6 +70,39 @@ def tiny_model() -> DiffusionGemmaForBlockDiffusion:
     return model
 
 
+def diffusion_gemma_model(fields: dict, canvas_length: int):
+    """A tiny DiffusionGemma for block diffusion over the text config `fields` and one small vision tower, in
+    float32 and evaluation mode: `fields` as a saved text config holds them, its `model_type` and the flat
+    keys transformers writes beside its layer types' rope parameters dropped. Its weights are its
+    initialization's: tools/hf_reference.py's generator ties them (`diffusion_gemma_tiny`), a reader loads a
+    fixture's (tests/test_block_diffusion.py)."""
+    text = {key: value for key, value in fields.items() if key != "model_type"}
+    text["rope_parameters"] = {kind: value for kind, value in text["rope_parameters"].items()
+                               if isinstance(value, dict)}
+    vision = Gemma4VisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
+        pooling_kernel_size=2, position_embedding_size=64)
+    model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
+        text_config=DiffusionGemmaTextConfig(**text), vision_config=vision, canvas_length=canvas_length,
+        tie_word_embeddings=False))
+    return model.float().eval()
+
+
+def media_inputs(pixels) -> dict[str, torch.Tensor]:
+    """The image inputs DiffusionGemma's forward reads for a prompt's `pixels` ([batch, 1, 3, 4, 4], torch or
+    NumPy): each image's Gemma 4 patches at patch size 2 (`convert_image_to_patches`), in the pixels' dtype,
+    and the patches' places on their 2 by 2 grid."""
+    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
+
+    pixels = torch.as_tensor(pixels)
+    # Patched in float64, which holds every narrower float exactly (NumPy holds no bfloat16), then cast back.
+    patches = torch.stack([torch.as_tensor(convert_image_to_patches(image.to(torch.float64).numpy(), 2))
+                           for image in pixels[:, 0]])
+    positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(len(pixels), -1, -1)
+    return {"pixel_values": patches.to(pixels.dtype), "image_position_ids": positions}
+
+
 def reference_generation(model, prompt, *, steps=4, confidence=0.005, stability=1, eos=None, model_kwargs=None):
     """The reference generate call with independent, matched random inputs."""
     from transformers.models.diffusion_gemma.generation_diffusion_gemma import DiffusionGemmaGenerationMixin
@@ -168,11 +201,8 @@ def main():
     eos_id = int(generated.sequences[0, prompt.shape[1]])
     eos_result, _, eos_counts = reference_generation(model, prompt, eos=[eos_id])
     pixels = torch.rand((2, 1, 3, 4, 4), generator=torch.Generator().manual_seed(91))
-    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
-    patches = torch.from_numpy(np.stack([convert_image_to_patches(image.numpy(), 2) for image in pixels[:, 0]]))
-    image_positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(2, -1, -1)
     image_prompt = torch.tensor([[2, 5, 60, 9, 11], [2, 6, 8, 60, 12]])
-    media = {"pixel_values": patches, "image_position_ids": image_positions}
+    media = media_inputs(pixels)
     with torch.no_grad():
         image_logits = model(input_ids=image_prompt, decoder_input_ids=canvas, **media).logits.numpy()
     image_result, _, image_counts = reference_generation(model, image_prompt, model_kwargs=media)
