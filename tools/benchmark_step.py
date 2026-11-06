@@ -56,6 +56,7 @@ Usage:
 
 import contextlib
 import dataclasses
+import hashlib
 import importlib
 import io
 import json
@@ -63,6 +64,7 @@ import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import jax
@@ -79,6 +81,7 @@ from dew.telemetry.benchmark import carried
 from dew.telemetry.profile import Profiler
 from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
+from dew.training.ahead import AheadOfTime
 from dew.training.interval import throughput
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
@@ -94,7 +97,7 @@ from benchmark_cases import (
     mesh_label,
     small_cases,
 )
-from benchmark_models import build_trainer, compiled_step, global_batch, timed_steps, trainer_mesh
+from benchmark_models import ahead_of, build_trainer, compiled_step, global_batch, timed_steps, trainer_mesh
 from trace_window import kernel_category, kernel_totals
 
 Row = dict[str, object]
@@ -212,6 +215,17 @@ class BenchmarkConfig:
     peak_run: bool = False
     """A case run in a process of its own for its measured peak (`measured_peak`), its compiles taken
     from the cache that run names, measuring no peak of its own."""
+    ahead: str | None = None
+    """A directory of steps compiled ahead (`compile_ahead`, a case's file named by `ahead_name`): a case
+    that has one runs it as its first step where it is that program, so its GPU compiles none of it."""
+    compile_ahead: str | None = None
+    """Compile each case's step ahead of its run into this directory, for one compile-only GPU of
+    `generation` holding `capacity_gib` (`benchmark_models.ahead_of`), and measure nothing: a GPU node's
+    prepare, on its CPU, for its run's `ahead`."""
+    generation: str | None = None
+    """The CUDA generation `compile_ahead` compiles for (sm80, sm90)."""
+    capacity_gib: int | None = None
+    """The GPU memory `compile_ahead` plans for, in GiB."""
 
 
 def build_cases(config: BenchmarkConfig) -> list[Case]:
@@ -377,12 +391,20 @@ def measured_peak(case: Case, config: BenchmarkConfig) -> list[int | None]:
             str(config.profile_steps)] if config.profile_dir else []), "--peak-run"])
 
 
+def ahead_name(case: Case) -> str:
+    """The file of `case`'s step compiled ahead in a directory of them (`compile_ahead`, `ahead`): its
+    case's own JSON's digest, so the run reads the step its prepare compiled for exactly that case."""
+    return f"{hashlib.sha256(cases_to_json([case]).encode()).hexdigest()[:16]}.dew-aot"
+
+
 def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps. `peaks` is each device's
     measured high-water (`measured_peak`), None in a pool."""
     if config.steps < 1:
         raise ValueError(f"--steps must be at least 1, got {config.steps}")
-    trainer = build_trainer(case, config.attention_impl)
+    found = None if config.ahead is None else Path(config.ahead) / ahead_name(case)
+    trainer = build_trainer(case, config.attention_impl,
+                            ahead=AheadOfTime.load(found) if found is not None and found.is_file() else None)
 
     with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
         state, step, compile_seconds = compiled.state, compiled.step, compiled.compile_seconds
@@ -568,6 +590,14 @@ def entered(within: str | None) -> contextlib.AbstractContextManager:
 
 
 def main(config: BenchmarkConfig) -> list[Row]:
+    if config.compile_ahead is not None:
+        if config.generation is None or config.capacity_gib is None:
+            raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and --capacity-gib")
+        Path(config.compile_ahead).mkdir(parents=True, exist_ok=True)
+        for case in build_cases(config):
+            ahead_of(case, config.generation, config.capacity_gib << 30, config.attention_impl).save(
+                Path(config.compile_ahead) / ahead_name(case))
+        return []
     if not config.peak_run and not jax.config.jax_compilation_cache_dir:
         # Run alone, a step's compile seconds are a cold compile's, which no cached executable stands in for.
         # A caller that names its cache (JAX_COMPILATION_CACHE_DIR: perf_gate's per-tree cache, whose later
