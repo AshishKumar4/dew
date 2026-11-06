@@ -1365,6 +1365,20 @@ def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
     assert raised.type is GateFailure
 
 
+@pytest.mark.parametrize("shape", [(), (3,), (2, 3)], ids=["scalar", "vector", "matrix"])
+def test_check_one_holds_dew_exact_where_the_reference_is_exact_below_squares_float64_holds(shape):
+    """A float64 reference exact on a truth of 1e-200, and a Dew arm that returns zero there: Dew's error
+    squares to zero in float64 and was read as exact (row 4498); it misses the exact reference, so the
+    site fails, at a leaf of every rank."""
+    def draw(seed):
+        return (np.full(shape, 1e-200 * (1 + seed)),)
+
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(as_given(lambda x: {"y": np.zeros_like(x)}), as_given(lambda x: {"y": x}), draw,
+                        "below squares", seeds=8, truth_fn=as_given(lambda x: {"y": x}))
+    assert raised.type is GateFailure
+
+
 @pytest.mark.parametrize("rank", [1, 2])
 def test_check_one_fails_a_value_that_is_not_finite(rank):
     """A NaN in Dew's leaf fails, whatever the pooled errors would read, a vector's (which has no rows
