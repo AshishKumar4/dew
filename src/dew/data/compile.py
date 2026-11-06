@@ -136,7 +136,7 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, unplaced
+from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import (
     Read,
@@ -729,9 +729,7 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise, and
     the data plan `version` it reads by, and the branch's own key where it is named (`_own_key`): every read
     builds here, so a version this Dew reads by none of is refused here, whichever read asks it."""
-    if version not in PLAN_VERSIONS:
-        raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
-                         f"{version}: resume a run saved under another with the Dew that wrote it")
+    read_by(version)
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
     return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic,
                   version=version, named=_own_key(branch))
