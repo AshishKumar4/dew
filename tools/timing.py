@@ -15,9 +15,9 @@ warm-up (`WARMUP`): timed and kept as every round is, marked, and left out of th
 still holds an arm's first work (autotuning, allocation, clocks rising) decides nothing. Each round also times
 the case's reference arm against itself (`<reference>~aa`, its own build in its own place in the order), so a
 row carries the window's own noise. Time is the device's (dew.telemetry.benchmark.device_time: CUPTI, each
-kernel and their sum, an eviction's own left out where the case evicts), with each call's wall clock beside it;
-a case whose question is host-bound latency asks for the wall clock alone (`"clock": "wall"`). Profiles (Nsight
-Compute) run after every round, each arm's in a process of its own, never in a timed one.
+kernel and their sum, an eviction's own left out where the case evicts), with each call's wall clock beside
+it; a case whose question is host-bound latency asks for the wall clock alone (`"clock": "wall"`). Profiles
+(Nsight Compute) run after every round, each arm's in a process of its own, never in a timed one.
 
     python tools/timing.py run MANIFEST.json --out DIR    # DIR/timing.jsonl's rows, DIR/profiles' reports
     python tools/timing.py jobs --ref SHA KIND=MANIFEST.json ... > JOBS.json   # a window a GPU kind
