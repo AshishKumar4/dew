@@ -139,11 +139,8 @@ def _read_context(hf_config: Mapping[str, object], used: set[str], record: Decod
 
 def _read_widths(hf_config: Mapping[str, object], used: set[str], record: DecoderFields
                  ) -> DecoderFields:
-    """The feed-forward's width where the config states one; a class whose width is its own key's (Falcon's
-    `ffn_hidden_size`, four times the model's where unstated) sets it in a part of its own."""
     used.add('intermediate_size')
-    if 'intermediate_size' in hf_config:
-        record['mlp_features'] = _mlp_features(hf_config)
+    record['mlp_features'] = _mlp_features(hf_config)
     return record
 
 
@@ -153,18 +150,21 @@ def _widths_written(model: CausalTransformer) -> Mapping[str, object]:
     return {'intermediate_size': list(widths) if isinstance(widths, tuple) else model.hidden_features}
 
 
-DECODER_FIELDS: ConfigLayout[CausalTransformer] = ConfigLayout(
+_GEOMETRY: tuple[ConfigEntry[CausalTransformer], ...] = (
     ConfigField('vocab_size', 'vocab_size', parse=_records.integer),
     ConfigField('hidden_size', 'emb_features', parse=_records.integer),
     ConfigField('num_hidden_layers', 'num_layers', parse=_records.integer),
     ConfigField('num_attention_heads', 'num_heads', parse=_records.integer),
     ConfigPart(_read_heads, lambda model: {'num_key_value_heads': model.kv_heads,
                                            'head_dim': model.features_per_head}),
-    ConfigPart(_read_widths, _widths_written),
     ConfigPart(_read_context,
                lambda model: {'max_position_embeddings': model.context_length or model.max_seq_len}),
-    ConfigField('rms_norm_eps', 'norm_eps', 1e-6, parse=_records.number),
-)
+    ConfigField('rms_norm_eps', 'norm_eps', 1e-6, parse=_records.number))
+
+WIDTH: ConfigPart[CausalTransformer] = ConfigPart(_read_widths, _widths_written)
+"""The feed-forward's width under transformers' shared `intermediate_size`, both ways."""
+
+DECODER_FIELDS: ConfigLayout[CausalTransformer] = ConfigLayout(*_GEOMETRY, WIDTH)
 """The decoder's geometry every family's config states under transformers' shared names, both ways
 (`decoder_layout`)."""
 
@@ -502,17 +502,22 @@ PLAIN_DECODER = DecoderSpelling()
 
 
 def decoder_layout(spelling: DecoderSpelling = PLAIN_DECODER, *,
-                   rope: ConfigPart[CausalTransformer] | None = None) -> ConfigLayout[CausalTransformer]:
+                   rope: ConfigEntry[CausalTransformer] | None = None,
+                   width: ConfigPart[CausalTransformer] = WIDTH) -> ConfigLayout[CausalTransformer]:
     """The decoder every family shares, both ways, as `spelling` states it: its geometry
-    (`DECODER_FIELDS`), its layers' kinds and window (`_layer_kinds`), its rotary (`rope`, the spelling's
-    `rope_part` where None: a family that reads its rotary otherwise, a partial one, declares its own),
-    the biases and tying its class declares, and what its reference fixes."""
+    (`DECODER_FIELDS`), its feed-forward's width (`width`: a class that states it under its own key with
+    a default of its own, Falcon's `ffn_hidden_size`, declares its own), its layers' kinds and window
+    (`_layer_kinds`), its rotary (`rope`, the spelling's `rope_part` where None: a family that reads its
+    rotary otherwise, a partial one, declares its own), the biases and tying its class declares, and what
+    its reference fixes."""
     reads = spelling.reads
+    fields = DECODER_FIELDS if width is WIDTH else ConfigLayout(*_GEOMETRY)
     restated = spelling.keys or spelling.fixed or spelling.defaults or spelling.undeclared
-    geometry = (Restated(DECODER_FIELDS, spelling.keys, spelling.fixed, spelling.defaults,
-                         spelling.undeclared) if restated else DECODER_FIELDS)
+    geometry = (Restated(fields, spelling.keys, spelling.fixed, spelling.defaults, spelling.undeclared)
+                if restated else fields)
     return ConfigLayout(
-        geometry, *(() if spelling.activation is None else (activation_part(spelling.activation),)),
+        geometry, *(() if width is WIDTH else (width,)),
+        *(() if spelling.activation is None else (activation_part(spelling.activation),)),
         _layer_kinds(spelling),
         rope_part(spelling.rope, ramps=spelling.ramps) if rope is None else rope,
         *(flag(name, name, default=False) if name in reads else constant(name, value=False)

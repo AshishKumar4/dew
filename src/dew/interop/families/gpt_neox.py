@@ -6,10 +6,9 @@ from types import MappingProxyType
 import numpy as np
 
 from dew import _records
-from dew.interop.decoder_config import DecoderSpelling, decoder_layout, flag, plain_rope_part, ungated
+from dew.interop.decoder_config import DecoderSpelling, decoder_layout, flag, partial_rope_part, ungated
 from dew.interop.decoder_parts import (
     MEGATRON_MLP,
-    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Renames,
@@ -21,6 +20,7 @@ from dew.interop.layouts import (
     ConfigField,
     ConfigLayout,
     ConfigPart,
+    Restated,
     Route,
     Slot,
     Table,
@@ -43,8 +43,11 @@ GPT_NEOX_CONFIG = ConfigLayout(
     decoder_layout(DecoderSpelling(reads=frozenset(), scale_after_cast=False, activation=None,
                                    keys={'rms_norm_eps': 'layer_norm_eps'}, defaults={'layer_norm_eps': 1e-5},
                                    undeclared=frozenset({'num_key_value_heads', 'head_dim'})),
-                   rope=plain_rope_part(PLAIN_SPELLING, default_factor=.25, reference='GPT-NeoX rotary',
-                                        factor_field='rotary_pct', theta_field='rotary_emb_base')),
+                   # GPTNeoXRotaryEmbedding builds any rope_type over the rotated quarter, YaRN among them;
+                   # its releases spell the base and the fraction flat (rotary_emb_base, rotary_pct).
+                   rope=Restated(ConfigLayout(partial_rope_part(default_factor=.25)),
+                                 own={'partial_rotary_factor': 'rotary_pct',
+                                      'rope_theta': 'rotary_emb_base'})),
     ungated('hidden_act', ('gelu', 'gelu_new', 'gelu_pytorch_tanh', 'relu'), 'GPT-NeoX', default='gelu'),
     flag('attention_bias', 'attention_bias', default=True), flag('use_parallel_residual', 'parallel_residual',
                                                                  default=True),

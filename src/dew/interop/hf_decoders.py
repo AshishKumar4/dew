@@ -559,17 +559,12 @@ def _qwen35_mrope(text: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def _qwen35_rope(held: Mapping[str, object], text: Mapping[str, object]) -> Mapping[str, object]:
-    """The text_config's rope_parameters with the mrope sections, interleaved as the reference always
-    reads them, beside the base, the rotated fraction and any scaling its text family writes."""
-    text = dict(text)
-    scaling = text.pop("rope_scaling", None) or {"rope_type": "default"}
-    text["rope_parameters"] = {**_records.record(scaling, "rope_scaling"),
-                               "rope_theta": text.pop("rope_theta"),
-                               "partial_rotary_factor": text.pop("partial_rotary_factor", 1.0),
-                               "mrope_section": list(_records.integers(held["mrope_section"],
-                                                                       "mrope_section")),
-                               "mrope_interleaved": True}
-    return text
+    """The text_config's rope_parameters, the one record its text family writes (its base, rotated
+    fraction and any scaling), with the mrope sections, interleaved as the reference always reads them."""
+    return {**text, "rope_parameters": {
+        **_records.record(text["rope_parameters"], "rope_parameters"),
+        "mrope_section": list(_records.integers(held["mrope_section"], "mrope_section")),
+        "mrope_interleaved": True}}
 
 
 def _bidirectional(fields: Mapping[str, object], *, default: str | None = None

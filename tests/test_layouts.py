@@ -150,7 +150,8 @@ def test_a_model_its_layout_cannot_hold_is_unwritable_with_its_reason():
     decoder = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2,
                                 head_dim=8, mlp_features=32, max_seq_len=16)
     assert source_layout(decoder)
-    gated_gptj = decoder.clone(shared_parallel_norm=True, head_bias=True, attention_bias=False, mlp="swiglu")
+    gated_gptj = decoder.clone(parallel_residual=True, shared_parallel_norm=True, head_bias=True,
+                               attention_bias=False, mlp="swiglu")
     for model in (decoder.clone(cross_attention=CrossAttention((1,), 4)), gated_gptj, nn.Dense(4)):
         layout = source_layout(model)
         assert not layout and layout.reason

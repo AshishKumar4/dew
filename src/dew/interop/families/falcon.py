@@ -28,9 +28,9 @@ FALCON_CONFIG = ConfigLayout(
     decoder_layout(DecoderSpelling(
         reads=frozenset(), tie_embeddings=True, scale_after_cast=False, activation=None,
         defaults={'hidden_size': 4544, 'num_attention_heads': 71},
-        undeclared=frozenset({'num_key_value_heads', 'head_dim', 'intermediate_size', 'rms_norm_eps'}))),
+        undeclared=frozenset({'num_key_value_heads', 'head_dim', 'rms_norm_eps'})),
+        width=four_wide('ffn_hidden_size')),
     ConfigPart(_multi_query, lambda model: {'multi_query': model.kv_heads == 1}),
-    four_wide('ffn_hidden_size'),
     ungated('activation', ('gelu', 'gelu_new', 'relu'), 'Falcon', default='gelu'),
     biases('bias', default=False),
     ConfigField('layer_norm_epsilon', 'norm_eps', 1e-5,
