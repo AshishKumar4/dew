@@ -21,6 +21,7 @@ from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Example
 from dew.decision.head import JointSchemaHead, LabelReadout
 from dew.decision.layout import (
+    HOWS,
     AnswerCue,
     DecisionInputs,
     Instructions,
@@ -106,7 +107,7 @@ def test_each_question_reads_the_shared_part_and_itself_and_with_siblings_those_
         layout = dataclasses.replace(SHARED, siblings=siblings)
         _, [row] = own_and_shared(layout)
         inputs = DecisionInputs.collate([row], SPECIALS.pad, attention=layout.attention)
-        assert inputs.reads is not None and entering(inputs.reads) is not siblings
+        assert inputs.reads is not None and entering(inputs.reads, inputs.fragments) is not siblings
         runs = (entered_documents(inputs.streams, inputs.segments, len(inputs.reads)).runs() if not siblings
                 else stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments))
         length = inputs.tokens.shape[1]
@@ -121,6 +122,21 @@ def test_each_question_reads_the_shared_part_and_itself_and_with_siblings_those_
                 read |= (streams > 0) & (streams < stream)
             assert list(seen[query, :len(streams)]) == list(read), (siblings, query)
 
+
+
+def test_a_layout_of_its_own_reads_that_writes_a_stream_twice_reads_by_its_streams():
+    """A row whose streams read as a row over one state's do, its questions entering its shared part, is
+    read as entered documents only where it writes each stream as one run: a layout of its own reads that
+    writes a stream in several runs (`fragment_count`) keeps its streams' runs, which read every run of the
+    shared part (review of the entered documents)."""
+    reads = SHARED.attention[0]
+    assert entering(reads, len(reads))
+    assert not entering(reads, len(reads) + 1)
+    streams = jnp.asarray([[0, 0, 1, 1, 0]], jnp.int32)
+    segments = jnp.ones((1, 5), jnp.int32)
+    runs = stream_runs(streams, segments, ((HOWS["causal"], 0, 0), (HOWS["causal"], HOWS["whole"], 0)), 3)
+    seen = np.asarray(visibility_mask(5, 5, causal=False, sliding_window=None, key_runs=runs))[0, 0]
+    assert list(seen[3]) == [True, True, True, True, True]
 
 def examples() -> list[Example]:
     """Each state asked every question, answered with its first option."""

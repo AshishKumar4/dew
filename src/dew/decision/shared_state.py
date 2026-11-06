@@ -72,12 +72,14 @@ def over_one_state_row(row: Encoded) -> bool:
     return row.streams is not None and row.positions is not None and len(row.questions) > 1
 
 
-def entering(reads: Sequence[Sequence[int]]) -> bool:
+def entering(reads: Sequence[Sequence[int]], fragments: int) -> bool:
     """Whether a row's reads table (`QuestionLayout.attention`) is that of a row over one state whose
-    questions read none of each other: its shared part, stream 0, itself up to each token, and each other
-    stream itself up to each token and the shared part whole; the documents `entered_documents` states."""
+    questions read none of each other: one run a stream (`fragments`, a layout of its own reads may write a
+    stream in several), its shared part, stream 0, reading itself up to each token, and each other stream
+    itself up to each token and the shared part whole; the documents `entered_documents` states."""
     causal, whole = HOWS["causal"], HOWS["whole"]
-    return len(reads) > 1 and tuple(reads[0]) == (causal, *[0] * len(reads)) and all(
+    one_run = len(reads) > 1 and fragments == len(reads)
+    return one_run and tuple(reads[0]) == (causal, *[0] * len(reads)) and all(
         tuple(row) == (causal, whole, *[0] * (len(reads) - 1)) for row in reads[1:])
 
 

@@ -332,7 +332,7 @@ def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
                           f"conv split over {axis}", seeds=SHARDED_SEEDS, truth_fn=exact)
 
 
-@pytest.mark.parametrize("taps", [2, 4])
+@pytest.mark.parametrize("taps", [1, 2, 4])
 def test_a_document_that_enters_a_history_convolves_as_if_it_followed_it(taps):
     """`entered_conv1d` of packed documents, each entering one of the histories `held` holds or none, gives
     each document's tokens what `xla_conv1d` gives them where the history stands right before the document

@@ -140,7 +140,7 @@ class DecisionModel(HeadedModel):
             if blocked or inputs.slots is not None or inputs.reads is None:
                 raise ValueError("a row in streams reads as its layout's reads say, which blocks and "
                                  "parallel options say otherwise")
-            if entering(inputs.reads):
+            if entering(inputs.reads, inputs.fragments):
                 # A row over one state whose questions each enter its shared part: documents every layer
                 # reads so, a recurrence from the shared part's memory too (`Entered`).
                 count = inputs.max_segments * len(inputs.reads)
