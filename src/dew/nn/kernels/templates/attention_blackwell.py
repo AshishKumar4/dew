@@ -281,6 +281,8 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     places = (block.row, block.head, pl.ds(block.first, rows))
     # The rows' maxima, and the overflows of their sums, through the denominator's stage.
     over = algebra.overflowed(acc).astype(jnp.float32)
+    # A row that saw no key -inf (`algebra.reached`'s convention).
+    m = jnp.where(algebra.no_keys(total), -jnp.inf, m)
     mosaic.stored((m, over), (maxima_ref.at[places], over_ref.at[places]), smem=scratch.l_smem)
 
 

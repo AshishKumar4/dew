@@ -878,7 +878,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                       smem=out_smem)
     pl.when(consumer == 0)(turn)
     overflowed = jnp.where(algebra.overflowed(state.acc), 1.0, 0.0)
-    family.stored((family.as_row(state.m), family.as_row(overflowed)), status_views, smem=row_smem)
+    # A row that saw no key -inf (`algebra.reached`'s convention), every other its maximum, `LEAST` included.
+    maximum = jnp.where(algebra.no_keys(state.total), -jnp.inf, state.m)
+    family.stored((family.as_row(maximum), family.as_row(overflowed)), status_views, smem=row_smem)
     merge = None
     if merging is not None:
         slots, ready = merging
