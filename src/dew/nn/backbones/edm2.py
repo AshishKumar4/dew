@@ -25,6 +25,7 @@ from dew.nn.dit import TextContext, masked_mean
 from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, attention_flops, patch_lengths
 from dew.nn.mp import MPConv, MPFourier, mp_cat, mp_silu, mp_sum, normalize
+from dew.nn.precision import output_dtype
 
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
@@ -238,7 +239,9 @@ class EDM2UNet(nn.Module):
         if self.dtype is not None:
             x = x.astype(self.dtype)
 
-        emb = MPConv(width, name="emb_noise")(MPFourier(noise, name="emb_fourier")(time))
+        # The time's embedding in the compute dtype, as every block it conditions reads it.
+        fourier = MPFourier(noise, name="emb_fourier")(time)
+        emb = MPConv(width, name="emb_noise")(fourier if self.dtype is None else fourier.astype(self.dtype))
         if textcontext is not None:
             label = normalize(masked_mean(textcontext.hidden, textcontext.mask).astype(emb.dtype),
                               axes=(-1,))
@@ -248,7 +251,10 @@ class EDM2UNet(nn.Module):
         x = jnp.concatenate([x, jnp.ones_like(x[..., :1])], axis=-1)
         x = self.spatial_walk(x, emb, train, _EDMForward(self.concat_balance))
         gain = self.param("out_gain", nn.initializers.zeros, ())
-        return self._convolution(self.output_channels, name="out_conv")(x, gain=gain)
+        # The output head sums and returns in the run's output dtype (`output_dtype`), never narrower than
+        # the dtype it computes in.
+        return self._convolution(self.output_channels, name="out_conv")(x, gain=gain,
+                                                                        out_dtype=output_dtype(x.dtype))
 
 
 __all__ = ["Block", "EDM2UNet"]

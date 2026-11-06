@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
+from jax.typing import DTypeLike
 
 from dew.nn.activations import silu
 from dew.nn.conv import convolution
@@ -148,15 +149,18 @@ class MPConv(nn.Module):
         return conv_flops(lengths, input_features, self.features, math.prod(self.kernel_size))
 
     @nn.compact
-    def __call__(self, x: jax.Array, gain: jax.Array | float = 1.0) -> jax.Array:
+    def __call__(self, x: jax.Array, gain: jax.Array | float = 1.0,
+                 out_dtype: DTypeLike | None = None) -> jax.Array:
+        """`x` through the normalized kernel, multiplied in `x`'s dtype and summed and returned in `out_dtype`
+        (a model's output head's `output_dtype`), `x`'s where None."""
         shape = (*self.kernel_size, x.shape[-1], self.features)
         weight = self.param(MP_KERNEL, lambda key: drawn_kernel(key, shape))
         weight = normalize(weight.astype(at_least_fp32(x.dtype)), compensated=True)
         weight = weight * (gain / math.sqrt(math.prod(shape[:-1])))
         weight = weight.astype(x.dtype)
         if not self.kernel_size:
-            return float32_matmul(x, weight)
-        return convolution(x, weight, [(size // 2, size // 2) for size in self.kernel_size])
+            return float32_matmul(x, weight, preferred_element_type=out_dtype)
+        return convolution(x, weight, [(size // 2, size // 2) for size in self.kernel_size], out_dtype)
 
 
 class Uncertainty(nn.Module):
