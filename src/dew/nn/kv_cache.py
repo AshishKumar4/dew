@@ -71,7 +71,9 @@ PLACES = "cached_places"
 GROUPS = {"image_groups": "cached_image_groups", "block_groups": "cached_block_groups"}
 """Each cached key's image or block group (`dew.nn.inputs.AttentionMetadata`), kept beside the key where a
 layer reads it (`Append.groups`), by the field's name."""
-POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale", PLACES, *GROUPS.values()})
+SCALES = frozenset({"key_scale", "value_scale"})
+"""A quantized pool's scale leaves (`scale_shape`)."""
+POOLED = frozenset({"cached_key", "cached_value", *SCALES, PLACES, *GROUPS.values()})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
 ROUNDING_KEYS = "rounding_keys"
 """A per-row cache leaf, each row's key data of its stochastic-rounding stream `[rows, words]`, which a
@@ -222,6 +224,16 @@ def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
     product = float32_einsum("...d,de->...e", values.astype(jnp.float32), rotation,
                              precision=jax.lax.Precision.HIGHEST)
     return product.astype(values.dtype)
+
+
+def scale_shape(shape: tuple[int, ...], layout: KVCache) -> tuple[int, ...]:
+    """A quantized pool's scales' shape for codes of `shape` (`KVStore.open`): a scale a token and head, each
+    head's tokens contiguous, `[heads, pages, page_size]` for a paged pool's `[heads, pages, page_size, D]`,
+    `[rows, heads, capacity]` for a dense cache's `[rows, capacity, heads, D]`."""
+    if layout.page_size is not None:
+        return shape[:-1]
+    rows, capacity, heads, _ = shape
+    return rows, heads, capacity
 
 
 def write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array,
@@ -443,10 +455,12 @@ class KVStore:
             shape = (kv_heads, pages, layout.page_size, head_dim)
             module.variable("cache", TABLE, default_page_table, rows, per_row, pages, layout.groups)
         values = (*shape[:-1], head_dim if value_dim is None else value_dim)
+        # A quantized pool's scales head-major, as a paged pool keeps its codes: each key head's run of a
+        # row's slots contiguous, which a kernel reads as a stream beside the codes (`scale_shape`).
         for (name, scale), stored in zip(store.payloads, (shape, values), strict=False):
             module.variable("cache", name, jnp.zeros, stored, storage)
             if layout.quantized is not None:
-                module.variable("cache", scale, jnp.ones, shape[:-1], jnp.float32)
+                module.variable("cache", scale, jnp.ones, scale_shape(shape, layout), jnp.float32)
         # A scale's storage with one head: every key head of a token sits at its place and in its group.
         held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
         if places:
@@ -495,7 +509,23 @@ class KVStore:
                 stored, scale = quantize(incoming, self.layout.quantized)
             self._write(name, functools.partial(self._written, values=stored, positions=positions))
             if scale is not None:
-                self._write(scale_name, functools.partial(self._written, values=scale, positions=positions))
+                self._write(scale_name, functools.partial(self._scales_written, values=scale,
+                                                          positions=positions))
+
+    def _scales_written(self, buffer: jax.Array, layer: jax.Array | int | None, *, values: jax.Array,
+                        positions: jax.Array) -> jax.Array:
+        """Scales `values` `[rows, tokens, heads]` stored at `positions` in their leaf's layout
+        (`scale_shape`); -1 drops: a dense cache's `[rows, heads, capacity]` takes each row's tokens at their slots along its
+        last axis, at `layer` of a run's bank (`_written`)."""
+        if self.layout.page_size is not None:
+            return self._written(buffer, layer, values=values, positions=positions)
+        slots = jnp.where(positions >= 0, positions, DROPPED)
+
+        def put(held):
+            return jax.vmap(lambda row, incoming, at: row.at[:, at].set(incoming.T, mode="drop"))(
+                held, values.astype(held.dtype), slots)
+
+        return put(buffer) if layer is None else buffer.at[layer].set(put(buffer[layer]))
 
     def _written(self, buffer: jax.Array, layer: jax.Array | int | None, *, values: jax.Array,
                  positions: jax.Array) -> jax.Array:
@@ -613,6 +643,9 @@ class KVStore:
         if self.layout.page_size is not None:
             stored = self._gathered(stored)
             scale = None if scale is None else self._gathered(scale)
+        elif scale is not None:
+            # Head-major, `[rows, heads, capacity]` (`scale_shape`): the codes' `[rows, capacity, heads]`.
+            scale = jnp.swapaxes(scale, 1, 2)
         return stored.astype(self.dtype) if scale is None else dequantize(stored, scale, self.dtype)
 
     def attends_rows(self, query: jax.Array, softcap: float | None) -> bool:
