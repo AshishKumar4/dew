@@ -1353,19 +1353,21 @@ DEPTH = after(_trunk_layers)
 
 def prediction_copies(stored: str, slots: Mapping[str, Slot] | None = None,
                       count: Callable[[Config], int] = _depths, *,
-                      written: bool = True) -> tuple[Routes, ...]:
+                      written: bool = True, declared: bool = True) -> tuple[Routes, ...]:
     """A declared prediction depth's copies of the trunk's table and head, by their names past `stored`
     (`embed_tokens.weight`, `shared_head.head.weight`), which a load checks against the trunk's leaf and,
     where the release stores them (`written`), an export writes from it: a tied trunk keeps the head in
     the embedding, which stores the same [vocab, features] the copy does, an untied one the head's own
-    kernel. A copy of a depth the record does not declare is no tensor of it."""
+    kernel. A copy of a depth the record does not declare is no tensor of it, but where the depths are
+    read apart (`declared` False: a type verified from parts reads a released depth's copies as the
+    trunk's, leaving the depth itself unread)."""
     held = MappingProxyType(dict(slots or {}))
-    declared = declared_depths()
-    routes = (Route(stored + 'embed_tokens.weight', 'params/embed_tokens/embedding', held, declared),
+    within = declared_depths() if declared else None
+    routes = (Route(stored + 'embed_tokens.weight', 'params/embed_tokens/embedding', held, within),
               Route(stored + 'shared_head.head.weight', 'params/embed_tokens/embedding', held,
-                    both(declared, _tied)),
+                    both(within, _tied)),
               Route(stored + 'shared_head.head.weight', 'params/lm_head/kernel', held,
-                    both(declared, _untied)))
+                    both(within, _untied)))
     return tuple(Copy(route, 'depth', count) for route in routes) if written else routes
 
 
@@ -2098,7 +2100,7 @@ class DecoderFamily:
     """
 
     model_types: tuple[str, ...]
-    config: ConfigLayout
+    config: ConfigLayout[CausalTransformer]
     """The family's config, both ways (`dew.interop.layouts.ConfigLayout`): the record a source config
     states (`translate_config`) and the keys a model's fields state in it (`export_fields`), read and
     written by the same parts."""
