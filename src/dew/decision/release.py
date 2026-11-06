@@ -39,9 +39,9 @@ def stated_release(directory: Path, layout: Layout | None = None, calibration: C
     held = Release.load(directory) or Release()
     stated = None if layout is None else _record(to_record(layout, Layout))
     calibrated = None if calibration is None else _record(to_record(calibration, Calibration))
-    task = held.task if held.task is not None or compute is None else {
-        "numerics": None if numerics is None else to_record(numerics, Numerics),
-        "dtypes": {"compute": compute}}
+    # Stated of a run's task alone (its numerics): a bundle no run trained has its source's own dtype.
+    task = held.task if held.task is not None or numerics is None or compute is None else {
+        "numerics": to_record(numerics, Numerics), "dtypes": {"compute": compute}}
     replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated).write(directory)
 
 
