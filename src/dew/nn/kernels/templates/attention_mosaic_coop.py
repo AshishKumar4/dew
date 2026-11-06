@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic
@@ -43,9 +42,9 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     chunk = mosaic.staged_columns(width // consumers, (jnp.float32,))
     swizzle = mosaic.swizzle_for(dtype, block_k // consumers, block_q, block_k)
-    scoped = [plgpu.SMEM((block_k, width), dtype), plgpu.SMEM((block_k, width), dtype),
-              mosaic.staged((2, block_q, block_k), dtype, swizzle),
-              plgpu.SMEM((consumers, max(block_q, block_k), chunk), jnp.float32),
+    scoped = [family.staged_memory((block_k, width), dtype), family.staged_memory((block_k, width), dtype),
+              family.staged_memory((2, block_q, block_k), dtype, swizzle),
+              family.staged_memory((consumers, max(block_q, block_k), chunk), jnp.float32),
               family.load_barriers(2), *family.exchange(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
     return scoped, family.streams(blocks, stages, consumers)
@@ -113,11 +112,11 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         dq_ref, dkv_ref, k_smem, v_smem, exchanged, out_smem, loads, staged_turn, read_turn = refs
         dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
-        row, head = lax.axis_index("batch"), lax.axis_index("heads")
+        row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, heads // kv_heads)
         views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
         streams = family.opened(streams, views)
-        k_first = lax.axis_index("k_tiles") * block_k
+        k_first = family.program_index("k_tiles") * block_k
         lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
         streamed = _streamed([(lo, hi)] * consumers)
         run = program.whole_run(k_first, q_steps, spans_of)

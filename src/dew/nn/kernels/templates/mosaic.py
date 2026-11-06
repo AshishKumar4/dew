@@ -1496,6 +1496,11 @@ class Issuer[Accumulator](abc.ABC):
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
         return plgpu.load(ref, layout=self.layout, optimized=False)
 
+    def scalar_of(self, ref) -> jax.Array:
+        """The scalar at `ref[0]` (a block's index a launch reads from global memory): a GPU thread's load, a
+        TPU core's copy into its scalar memory."""
+        return ref[0]
+
     def key_magnitudes(self, tile) -> jax.Array:
         """Each key's largest value magnitude, fp32, from a values tile `tile` `[keys, columns]` in shared
         memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,
@@ -1622,15 +1627,25 @@ class Transport[Allocated, Opened](abc.ABC):
     consumer walks every step, so a template may split a step's work between them (attention's dK and dV:
     a key block shared, each slot's queries split) where with a producer each takes steps of its own."""
 
+    budgets_registers: bool = True
+    """Whether a kernel budgets its threads' registers (`registers`): a GPU's families; a TPU core's does
+    not (`mosaic_tpu.VmemRings`: its compiler spills values to VMEM), so a launch on it states no registers
+    (`base.TemplateOp.registers` None) and a core runs one program of it (`resources.register_programs`)."""
+
     @abc.abstractmethod
     def registers(self, consumers: int, programs: int = 1) -> int:
         """The registers a thread of each of `consumers` consumer roles may hold, `programs` programs a
-        multiprocessor at once."""
+        multiprocessor at once; asked of a family that budgets them alone (`budgets_registers`)."""
 
     def warpgroups(self, consumers: int) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
         family streams from a role of its own (`roles`)."""
         return consumers
+
+    def program_index(self, name: str) -> jax.Array:
+        """The program's coordinate on its launch grid's axis `name` (`kernel`'s `grid_names`): Mosaic GPU
+        names a grid's axes as a mesh's, read by `lax.axis_index`."""
+        return lax.axis_index(name)
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
@@ -1821,10 +1836,11 @@ class Transport[Allocated, Opened](abc.ABC):
         return {f'{name}_smems': [self.staged_memory((2, *shape), gmem.dtype) for shape, gmem in shaped],
                 f'{name}_barriers': [self.load_barriers(2) for _ in shaped]}
 
-    def staged_memory(self, shape: tuple[int, ...], dtype):
-        """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory (a
-        TPU's VMEM)."""
-        return plgpu.SMEM(shape, dtype)
+    def staged_memory(self, shape: tuple[int, ...], dtype, swizzle: int | None = None):
+        """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory, its
+        rows at `swizzle` bytes (`staged`: the widest that fits where None, plain where `UNSWIZZLED`); a
+        TPU's VMEM, which its compiler tiles."""
+        return staged(shape, dtype, swizzle)
 
     def meeting(self, consumers: int) -> plgpu.Barrier:
         """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""
