@@ -548,6 +548,23 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
     assert not hub.exists(), "the network lane reuses its own green run on the same inputs"
 
 
+def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, tmp_path, monkeypatch,
+                                                                            cache_worker):
+    """A job holding a whole GPU, to which a node sets no XLA_PYTHON_CLIENT_MEM_FRACTION (dew-ops' session
+    gives one only to a part of a GPU), runs its lane: a file no run measured is given the lane's whole share,
+    JAX's own default for a process (`WHOLE_GPU`), rather than the lane failing before any file runs (row
+    2570)."""
+    url, _, _ = cache_worker
+    [name] = gpu_lane_at(tmp_path, monkeypatch, url, 1)
+    monkeypatch.delenv("XLA_PYTHON_CLIENT_MEM_FRACTION")
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", [name], out, cache="on", processes=1, deadline=600.0) == 0
+    [[share, *_]] = lane_runs(tmp_path, Path(name).stem)
+    assert float(share) == float(ci.WHOLE_GPU)
+
+
 def test_a_gpu_lane_names_its_files_but_with_network(ci, monkeypatch):
     """`gpu-lane` without --tests is the network lane's alone, which runs every file holding a network-marked
     test: a CUDA lane names its files, and one that names none is refused, not run over the network files'

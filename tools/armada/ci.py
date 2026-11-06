@@ -233,6 +233,9 @@ plan's own code (this file) runs outside the tests, so a change to it reruns non
 the durations record (`session.DURATIONS`), which only a split file's groups are cut from, so a
 group's key covers its own file's entries alone (`cache_key`); nor does a fixture or a package's data,
 which is the input of the files whose runs opened it, however they opened it (executed.py's `Opens`)."""
+WHOLE_GPU = "0.75"
+"""The share of a GPU a lane given the whole of it hands its files (`gpu_lane`): what JAX's client
+preallocates where no XLA_PYTHON_CLIENT_MEM_FRACTION is set."""
 ARMADA_SEEN = ("environment", "environments", "env")
 """.armada.json's parts a test process runs in, beside its task's command and secrets (`armada_seen`):
 its pool, size, target, plan and the task's deadline and mode decide where and when tasks run, never
@@ -2079,7 +2082,9 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
-    budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
+    # A job holding the whole GPU is given no fraction (a node sets one for a part of a GPU alone, dew-ops'
+    # session `settings`): its processes may take what one process takes by JAX's own default (row 2570).
+    budget = float(os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", WHOLE_GPU)) * total
     held = device_class(network)
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
