@@ -342,6 +342,34 @@ def test_the_accurate_backward_declaration_derives_on_par(walked, how):
                     f"accurate attention backward {walked}", seeds=16, truth_fn=xla_backward("causal"))
 
 
+def test_a_fast_tiles_cotangents_hold_each_anchor_keys_own_term_at_zero_where_its_mainloop_does():
+    """The fast backward tile's derived cotangents (`derived_cotangents`) where a mainloop marks each query's
+    anchor key (`anchored`, portable's and Triton's hand forms): each anchor key's dP less the anchor's own
+    held to exactly 0, so its cotangent is its weight times minus its query's D (0 where a query sees one
+    key), and every other key's the plain fast form's, bit for bit."""
+    rng = np.random.default_rng(4228)
+    logits = jnp.asarray(rng.standard_normal((16, 16)) * 3, jnp.float32)
+    products = jnp.asarray(rng.standard_normal((16, 16)), jnp.float32)
+    peak = jnp.max(logits, axis=1)
+    total = jnp.sum(jnp.exp(logits - peak[:, None]), axis=1)
+    at_anchor = jnp.arange(16)[None, :] == jnp.argmax(logits, axis=1)[:, None]
+    anchor = jnp.sum(jnp.where(at_anchor, products, 0.0), axis=1)
+    delta = jnp.asarray(rng.standard_normal(16), jnp.float32)
+    tiles = {"logits": logits, "products": products, "peak": peak, "total": total, "anchor": anchor,
+             "delta": delta}
+    def cotangents(anchored: bool, tiles: dict):
+        forms = attention_backward_algebra.derived_cotangents(keys_first=False, dropped=False, masked=False,
+                                                             anchored=anchored)
+        _, weights, made = forms.mapped(tiles)
+        return np.asarray(weights), np.asarray(made)
+
+    _, plain = cotangents(anchored=False, tiles=tiles)
+    weights, anchored = cotangents(anchored=True, tiles={**tiles, "at_anchor": at_anchor})
+    held = np.asarray(at_anchor)
+    np.testing.assert_array_equal(anchored[held], (weights * (0.0 - np.asarray(delta)[:, None]))[held])
+    np.testing.assert_array_equal(anchored[~held], plain[~held])
+
+
 @contextlib.contextmanager
 def fast(derived: bool, forms: str = "fast"):
     """Within the block, the run's `forms` (the fast ones' base-2 fold, or the accurate ones' natural logits,
