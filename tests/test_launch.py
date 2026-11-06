@@ -326,6 +326,15 @@ def test_a_rank_over_ssh_stopped_through_its_terminal_exits_with_its_own_code(tm
     assert ssh.wait(timeout=60) == 7
 
 
+
+def test_a_launch_on_a_cloud_tpu_worker_runs_the_program_there_once():
+    """On a Cloud TPU worker `dew launch -- python ...` runs the program in place, once, as every worker of
+    the TPU does, for JAX to join them as it reads the TPU's own sources; it starts no pool of its own."""
+    env = {**ENV, "JAX_FORCE_TPU_INIT": "1", "TPU_WORKER_HOSTNAMES": "w-0,w-1", "TPU_WORKER_ID": "0"}
+    done = launched("--", sys.executable, "-c", "import os; print('ran', os.getpid())", env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len([line for line in done.stdout.splitlines() if line.startswith("ran ")]) == 1
+
 def launched(*arguments: str, env: dict) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-m", "dew._cli.main", "launch", *arguments],
                           cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120)
