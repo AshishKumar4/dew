@@ -567,9 +567,10 @@ def test_an_adapted_products_fused_form_holds_check_1(generation_name, frozen):
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_name, transpose_rhs):
     """A dense product of fewer rows than a role's (a decode step's 4 rows by 256 by 384) derives a swapped
-    tile on each family (its matrix the MMA's rows, the rows its narrow columns, row 1762), and the Mosaic
-    product interpreted at it holds check 1 against the plain program over the draws, the matrix stored
-    either way (read transposed where it lies `[depth, width]`)."""
+    tile on mma.sync (its matrix the MMA's rows, the rows its narrow columns, row 1762) and its own on
+    warpgroup MMA, whose swapped tile ran slower (NS-SWAP2-h100), and the Mosaic product interpreted at it
+    holds check 1 against the plain program over the draws, the matrix stored either way (read transposed
+    where it lies `[depth, width]`)."""
     rows, depth, width = 4, 256, 384
 
     def draw(seed):
@@ -593,7 +594,7 @@ def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_
                         out_dtype="bfloat16", trans_rhs=transpose_rhs, interpret=True, dense=True)
     with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
         tile = launch.derived(bound, generation.gpu_target())
-        assert tile is not None and tile.swapped, tile
+        assert tile is not None and tile.swapped == (generation_name == "sm80"), tile
         assert launch.legal(bound, tile, generation.gpu_target())
         assert_as_exact(dew, jax.jit(plain), draw, f"swapped {rows}x{depth}x{width}", seeds=SEEDS,
                         truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
@@ -602,9 +603,9 @@ def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs):
-    """The swapped tile of a one-row dense product (an M=1 decode dot over a 2048 x 2048 matrix, row 483)
-    lowers for CUDA on the CPU on each family, the matrix stored either way; on mma.sync, its 16 output
-    tiles a fraction of a wave, it splits its depth (`mosaic_gpu.split_count`)."""
+    """A one-row dense product's tile (an M=1 decode dot over a 2048 x 2048 matrix, row 483) lowers for CUDA
+    on the CPU on each family, the matrix stored either way: on mma.sync swapped, its 16 output tiles a
+    fraction of a wave, its depth split (`mosaic_gpu.split_count`); on warpgroup MMA its own."""
     rows, depth, width = 1, 2048, 2048
     launch = grouped_matmul.MosaicGmm()
     matrix = (1, width, depth) if transpose_rhs else (1, depth, width)
@@ -614,7 +615,7 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
         tile = launch.derived(launch.bind(*args, **options), generation.gpu_target())
-        assert tile is not None and tile.swapped and (tile.splits > 1 or generation_name != "sm80"), tile
+        assert tile is not None and tile.swapped == (tile.splits > 1) == (generation_name == "sm80"), tile
         jax.jit(functools.partial(launch.replace(config=tile), **options)).trace(*args).lower(
             lowering_platforms=("cuda",))
 
