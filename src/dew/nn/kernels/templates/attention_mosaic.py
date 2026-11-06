@@ -77,6 +77,17 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 from dew.nn.kernels.templates.base import Template, Unfitted
 
 
+def _column_blocks_of(family: mosaic.Family, dtype, value_width: int) -> list[int | None]:
+    """The value columns a forward launch walks at once, widest first: the whole (None), then halved while a
+    block stays whole swizzled columns (`Family.column_unit`), each block a launch (`Tiles.columns`), for a
+    call no tile holds whole (an fp32 call's parts at width 128 on an H100: 64 x 64 staged 283,744 bytes of
+    its 232,448, one consumer, et-fp32derive)."""
+    whole, unit = _width(value_width, family, dtype), family.column_unit(dtype)
+    blocks = [whole // 2 ** halved for halved in range(1, whole.bit_length())
+              if whole % 2 ** halved == 0 and (whole // 2 ** halved) % unit == 0]
+    return [None, *blocks]
+
+
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                                 tiles: Callable[[int, int, int], Config],
                                                 fits: Callable[[Config], bool], *,
@@ -353,11 +364,14 @@ class MosaicForward(_Mainloop[Tiles]):
             if self.refusal(ba, family) is not None:
                 continue
 
-            def tiles(rows: int, walked: int, consumers: int, family=family) -> Tiles:
-                return Tiles(rows, walked, 2, consumers, family.name)
+            for columns in _column_blocks_of(family, query.dtype, ba.arguments["value"].shape[3]):
+                def tiles(rows: int, walked: int, consumers: int, family=family, columns=columns) -> Tiles:
+                    return Tiles(rows, walked, 2, consumers, family.name, columns=columns)
 
-            config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
-                              lambda config: self._launch_legal(ba, config, target), overlapped=True)
+                config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
+                                  lambda config: self._launch_legal(ba, config, target), overlapped=True)
+                if config is not None:
+                    break
             if config is not None:
                 chosen = family
                 break
@@ -507,6 +521,11 @@ class MosaicForward(_Mainloop[Tiles]):
                                or ba.arguments["residuals"] is Kept.SPLIT or hooks.drop is not None):
             return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
                            "operands, no dropout")
+        if self.parts > 1 and family.feeds_itself:
+            # Its parts a copy each into a slot's rows (`mosaic.Pieces`), which a producer's loads take and
+            # a consumer's own pipeline does not (`mosaic_sm80.Mma.streams`).
+            return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
+                           "pipeline does not")
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
 

@@ -820,10 +820,12 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     if product is not None:
         s = product()
     elif program.parts > 1:
-        # An fp32 call's logits its parts' products (`product.terms`), each its own accumulator summed
-        # smallest first (`Family.apart`), the partner's turn once they are in.
+        # An fp32 call's logits its parts' products (`product.terms`), smallest first, into one fresh
+        # accumulator in place (`Family.issued`: a term's own accumulator read before the next serializes
+        # wgmma's, ptxas C7512), the partner's turn once they are in.
         keys = program.parted(slots["keys"], tiles.block_k)
-        s = family.apart(shape, q.refs, keys.T.refs, interpret=False)
+        s = family.summed(shape, lambda acc: family.issued(acc, q.refs, keys.T.refs, interpret=False),
+                          interpret=False)
         if turn is not None:
             turn()
     else:
