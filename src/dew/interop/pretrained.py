@@ -408,8 +408,9 @@ class Pretrained:
         # A run over a source's own processor records its source, and the bundle writes its files.
         processor = None if task is None or task.processor is None else load_processor(task.processor, model)
         trained = models[model_config.name]
-        if trained is CausalTransformer:
-            decoder = from_record(CausalTransformer, model)
+        if trained is CausalTransformer or isinstance(model, MediaWrapper):
+            # A wrapper's bundle is its family's release layout (`PretrainedDecoder.from_model`).
+            decoder = model if isinstance(model, MediaWrapper) else from_record(CausalTransformer, model)
             generation = (masked_generation_config(budget, None, held.eos_token_ids)
                           if isinstance(held, MaskedSettings) else
                           generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
