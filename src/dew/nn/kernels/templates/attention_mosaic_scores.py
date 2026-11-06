@@ -97,8 +97,8 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
     `rows` (read before its products, which their loads run under: ET-A05AB5/6-h100, 2.05 against 2.32 ms
     read past them at Qwen3-8B causal) and `coords`, masked where `masked`, or where it is None chosen at run
     time, unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
-    (`algebra.value_weights`) and its score cotangents through the hook (`gradient.pulled`), one part in the
-    operands' dtype (dK's and dQ's)."""
+    (`algebra.value_weights`), a dropping call's dropped (`algebra.drawn`), and its score cotangents through
+    the hook (`gradient.pulled`), one part in the operands' dtype (dK's and dQ's)."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held = keys.transpose((1, 0))
@@ -110,6 +110,9 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
         exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, (), s, dp, *rows,
                                                                   masked=masked)
+        multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
+        if multiplier is not None:
+            exponentials, weights = exponentials * multiplier, weights * multiplier
         return exponentials, weights, gradient.pulled(cotangents, slopes, seen, ())[0]
 
     if masked is None:
@@ -119,7 +122,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
         exponentials, weights, cotangents = scores(masked=masked)
     part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
                                                          accurate=False))
-    return algebra.value_weights(exponentials, weights, do_slot.dtype), part
+    return algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped), part
 
 
 def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak, total, anchor, delta,

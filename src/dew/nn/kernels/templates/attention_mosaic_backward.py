@@ -214,7 +214,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                                      spans, score_params, drop, scaled, walk=dkv_walk)
         else:
             dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                       spans, walk=walk)
+                                       spans, drop, walk=walk)
         mass = gradient.split_mass(own, others_total, forward_total, shift)
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])

@@ -76,7 +76,8 @@ BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys",
 """The backward's forms (`_backward_form`): the fast in two launches and in one each way, the raised ones
 where raises hold (`RAISED_FORMS`), and the accurate."""
 HOOKED_FORMS = ("default", "accurate")
-"""The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
+"""The forms every hooked call takes: its fast form's one launch takes a hook of no parameters, an initial
+state or a draw alone."""
 
 
 FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128, "fused-shared-dq": 128,
@@ -568,10 +569,11 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("form", HOOKED_FORMS)
+@pytest.mark.parametrize("form", [*HOOKED_FORMS, "fused"])
 def test_the_backward_is_on_par_dropping_interpreted(form):
-    """The backward in each form under probability dropout over a causal call, its D the dropped products'
-    own pass (`attention_mosaic_backward._centre_launch`), under the interpreter."""
+    """The backward in each form under probability dropout over a causal call, the fast form's one launch
+    too (each consumer's tile its own draw), its D the dropped products' own pass
+    (`attention_mosaic_backward._centre_launch`), under the interpreter."""
     _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True)
 
 
