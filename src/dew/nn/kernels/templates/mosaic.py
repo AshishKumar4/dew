@@ -1567,9 +1567,10 @@ class Transport[Allocated, Opened](abc.ABC):
     (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
 
     copies_in_pieces: bool = True
-    """Whether a step's block may arrive in several copies, each into its own rows of the slot (`streams`'
-    `copies`, `Pieces`: TMA's, each awaited at the slot's one barrier), where cp.async's pipeline copies a
-    step's block whole from one view: a paged call's key tile of several pages takes a copy a page."""
+    """Whether a step's block may arrive in several copies (`streams`' `copies`, `Pieces`): TMA's each into
+    its own rows of the slot, awaited at the slot's one barrier; cp.async's each a block of its pipeline's
+    own, joined into one tile through registers (`mosaic_sm80.CpAsync.walk`): a paged call's key tile of
+    several pages takes a copy a page."""
 
     copies_vectors: bool = True
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
