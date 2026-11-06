@@ -27,7 +27,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl, kernel_for_materialized_mask, scaled_dot_product_attention
-from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits
+from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits, visibility_mask
 from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
@@ -330,11 +330,12 @@ class MultiHeadLatentAttention(LinearProducts):
     """
 
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
-                                                 "position_bias"})
+                                                 "position_bias", "tree_parents"})
     """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a dense layer's pairwise mask or key
     runs, the key positions they are read at and a position bias, on an uncached call, as the standard
-    attention reads them; an indexed layer narrows its keys by the documents, the rows' validity and
-    its own selection alone, and refuses them (`_check_call`)."""
+    attention reads them, and its pairwise mask or key runs over its cache on a cached one, a tree call's
+    among them (`AttentionMetadata.tree_parents`, `_cached_visibility`); an indexed layer narrows its keys
+    by the documents, the rows' validity and its own selection alone, and refuses them (`_check_call`)."""
 
     emb_features: int
     num_heads: int
@@ -689,14 +690,18 @@ class MultiHeadLatentAttention(LinearProducts):
         valid = None if attention_metadata is None else attention_metadata.valid
         row_valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
         logical_positions = positions
+        # The call's own rotary positions, where it states them, turn its rope heads (`_check_call`).
+        rotary = (None if attention_metadata is None or attention_metadata.rotary_positions is None
+                  else jnp.asarray(attention_metadata.rotary_positions))
         # jnp splits at indices where torch splits into sizes: one cut point,
         # since the widths add up exactly.
         q_pass, q_rot = jnp.split(
             queries, [self.qk_nope_head_dim], axis=-1)
         query_basis, own = None, False
         if decode:
-            q_rot, key, value, mask, query_basis = self._decode_step(
-                x, q_rot, rot, latent, q_resid, logical_positions, valid, call, prediction_phase)
+            q_rot, key, value, mask, query_basis, own = self._decode_step(
+                x, q_rot, rot, latent, q_resid, logical_positions if rotary is None else rotary, valid, call,
+                prediction_phase)
             if self.sparse:
                 unselected = self._empty_selection(mask[:, 0], row_valid)
             causal = False
@@ -706,12 +711,13 @@ class MultiHeadLatentAttention(LinearProducts):
             # (`document_reach`), so it rotates as it does alone.
             reach = (document_reach(segment_ids, valid, positions)
                      if isinstance(self.rope_scaling, LongRopeScaling) and segment_ids is not None else None)
-            q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions, reach)
+            turned = positions if rotary is None else rotary
+            q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, turned, reach)
             # Windows, chunks and groups count each document's real tokens from its first place
             # (`counted_places`); rotation reads the places as given.
             counted = (jnp.broadcast_to(positions, (batch, length)) if logical_positions is None
                        else counted_places(segment_ids, valid, logical_positions))
-            visible, own = self._dense_visibility(attention_metadata, positions, counted, segment_ids, valid,
+            visible, own = self._dense_visibility(attention_metadata, turned, counted, segment_ids, valid,
                                                   causal, batch, length)
             if visible is not None:
                 mask, causal = visible, False
@@ -808,8 +814,10 @@ class MultiHeadLatentAttention(LinearProducts):
 
     def _check_call(self, call: MixerCall, batch: int, length: int) -> None:
         metadata = call.metadata
-        if metadata is not None and metadata.rotary_positions is not None:
-            raise ValueError("MLA does not implement multi-axis rotary positions")
+        if metadata is not None and metadata.rotary_positions is not None and (
+                jnp.ndim(metadata.rotary_positions) != 2):
+            raise ValueError("MLA rotates each token at one position, [B, S] rotary positions, not "
+                             "multi-axis ones")
         selecting = self.indexed or self.index_shared
         if selecting and (self.sliding_window is not None or self.attention_chunk is not None):
             raise ValueError("an indexed mla layer selects its candidates among every key before it; "
@@ -817,11 +825,16 @@ class MultiHeadLatentAttention(LinearProducts):
         own = None if metadata is None else [
             name for name, given in (("pairwise_mask", metadata.pairwise_mask),
                                      ("key_runs", metadata.key_runs),
+                                     ("tree_parents", metadata.tree_parents),
                                      ("key_positions", metadata.key_positions),
                                      ("position_bias", metadata.position_bias)) if given is not None]
-        if own and (selecting or call.decode):
-            raise ValueError(f"an mla layer reads {', '.join(own)} on a dense layer's uncached call, its "
-                             "keys the call's own")
+        if own and selecting:
+            raise ValueError(f"an indexed mla layer selects among every key before each query, and reads "
+                             f"none of {', '.join(own)}")
+        uncached = [name for name in own or () if name == "position_bias"]
+        if uncached and call.decode:
+            raise ValueError(f"an mla layer reads {', '.join(uncached)} on a dense layer's uncached call, "
+                             "its keys the call's own")
         grouped = [name for name in self._group_fields()
                    if metadata is not None and getattr(metadata, name) is not None]
         if grouped and (selecting or call.decode):
@@ -856,8 +869,10 @@ class MultiHeadLatentAttention(LinearProducts):
     def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, call,
                       prediction_phase: PredictionPhase):
         """One decode step's rotated query heads, its keys and values with the
-        cache's joined, the mask over them, and what puts the scaled query in the
-        basis the cached keys are in (None for none): the expanded keys and the
+        cache's joined, the mask over them, what puts the scaled query in the
+        basis the cached keys are in (None for none), and whether the call's own
+        pairwise mask or key runs gave the mask (`_cached_visibility`), which then
+        replaces its queries' validity: the expanded keys and the
         indexer's selection under the sparse layout, or the latents expanded
         after the append under the dense one. `kv_cache`, the cache's layout,
         stores either form paged or quantized."""
@@ -888,7 +903,7 @@ class MultiHeadLatentAttention(LinearProducts):
                 x, q_resid, index_full, keep, freqs_cos, freqs_sin, call, row_valid, slots=positions,
                 allocated=allocated, committed=committed, prediction_phase=prediction_phase)
             mask = selection_mask(selection, key.shape[1])[:, None]
-            query_basis = basis.query
+            query_basis, own = basis.query, None
         else:
             # The latent and its rotary part, one head each, as the attention cache's keys and values,
             # the latents read back in their own basis, which the expansion reads.
@@ -900,9 +915,32 @@ class MultiHeadLatentAttention(LinearProducts):
             latent, rot = append(latent[:, :, None], rot[:, :, None])
             latent, rot = append.store.plain(latent)[:, :, 0], rot[:, :, 0]
             key, value = self._expand(latent, rot)
-            mask = self._visible(positions, key.shape[1])
+            own = self._cached_visibility(call.metadata, positions if logical_positions is None
+                                          else logical_positions, x.shape[:2], key.shape[1])
+            mask = self._visible(positions, key.shape[1]) if own is None else own
             query_basis = None
-        return q_rot, key, value, mask, query_basis
+        return q_rot, key, value, mask, query_basis, own is not None
+
+    def _cached_visibility(self, metadata, turned, shape: tuple[int, int], total: int) -> jax.Array | None:
+        """A dense layer's cached call's own visibility `[B, 1, T, total]` over the cache's `total` slots
+        (`call_visibility`, `visibility_mask`), None where it states none: its pairwise mask or key runs,
+        a tree call's each token's cache and ancestors, over the slots that hold a token, each key at its
+        slot unless the call places it (`attention_key_positions`), each query at its rotary position
+        `turned`, which the window and the chunk read."""
+        if metadata is None:
+            return None
+        batch, length = shape
+        turned = jnp.broadcast_to(turned, shape)
+        slots = jnp.broadcast_to(jnp.arange(total), (batch, total))
+        own = call_visibility(metadata, turned, batch=batch, queries=length, keys=total, key_places=slots,
+                              sliding_window=self.sliding_window)
+        if own is None:
+            return None
+        mask, runs, window, key_places = own
+        # The runs index the cache's slots; the queries' and keys' places count a window and a chunk.
+        return visibility_mask(length, total, causal=False, sliding_window=window, mask=mask,
+                               key_valid=cached_validity(self, total), key_runs=runs,
+                               places=(turned, key_places), chunk=self.attention_chunk)
 
     def _visible(self, slots, total: int):
         """`[B, 1, T, total]`: which of the cache's `total` slots each query at `slots` sees, those up
