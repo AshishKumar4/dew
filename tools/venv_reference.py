@@ -78,7 +78,7 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
             for case in importlib.import_module("flaxdiff_family_cases").CASES},
          "mimo-mel": {"test": "test_mimo_audio", "arms": "mel", "worker": "torchaudio_mel_worker.py",
                       "reference": "pytorch/audio 2.11.0 MelSpectrogram", "license": "BSD-2-Clause",
-                      "distribution": ("torchaudio", "2.11.0"), "host": True},
+                      "distribution": ("torchaudio", "2.11.0+cpu"), "host": True},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",
