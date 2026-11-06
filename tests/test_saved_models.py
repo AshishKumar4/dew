@@ -52,11 +52,9 @@ def test_a_jepa_run_exports_and_loads_as_its_encoder(tmp_path):
                                    stored(tmp_path / "runs" / "encoder", ema=True).items()
                                    if "context_encoder" in tree})
     export_run(run, tmp_path / "release", ema=True)
-    release = Release.load(tmp_path / "release")
-    assert release is not None and release.task is not None
-    assert release.task["objective"].endswith("JepaObjective") and release.task["settings"] == {}
     again = pipeline(str(tmp_path / "release"))
     assert isinstance(again, SavedModel) and again.model == loaded.model
+    assert again.objective is loaded.objective and again.settings == loaded.settings
     assert_same(again.variables, loaded.variables)
     sample = jnp.ones((2, 16, 16, 3))
     indices = jnp.arange(4, dtype=jnp.int32)[None].repeat(2, 0)
@@ -80,8 +78,6 @@ def test_a_control_policy_run_exports_with_the_observation_policy_it_acts_by(tmp
     assert loaded.settings == ControlSettings(observation_size=TEACHER, reads=("teacher",))
     assert_same(loaded.variables, stored(directory, ema=False))
     export_run(run, tmp_path / "policy", ema=False)
-    assert json.loads((tmp_path / "policy" / RELEASE_FILE).read_text())["task"]["settings"] == {
-        "observation_size": TEACHER, "reads": ["teacher"]}
     again = pipeline(str(tmp_path / "policy"), param_dtype="auto")
     assert isinstance(again, SavedModel) and again.settings == loaded.settings
     observation = jnp.linspace(-1.0, 1.0, 3 * again.settings.observation_size).reshape(3, -1)
@@ -120,7 +116,7 @@ def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_no
     """A native release stores its weights in the `param_dtype` a load asks, as every task's load does,
     and computes in the `dtype` it asks where its model declares one: a control policy, which declares
     none (its rollouts' actions are float32 throughout), is refused a bfloat16 compute. A record that
-    names no objective (a source's own files) is no native release: `SavedModel.from_pretrained` of it is
+    states no run (a source's own files) is no native release: `SavedModel.from_pretrained` of it is
     refused."""
     from dew.inference.models import SavedModel
 
@@ -131,10 +127,9 @@ def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_no
             if jnp.issubdtype(leaf.dtype, jnp.floating)} == {jnp.dtype(jnp.bfloat16)}
     with pytest.raises(ValueError):
         pipeline(str(tmp_path / "policy"), dtype="bfloat16")
-    # Its parameters' storage is no compute of its: exported again, it states none, and reloaded it acts
-    # on float32 observations in float32.
+    # Its parameters' storage is no compute of its: exported again and reloaded, it acts on float32
+    # observations in float32.
     half.save_pretrained(tmp_path / "again")
-    assert json.loads((tmp_path / "again" / RELEASE_FILE).read_text())["task"]["dtypes"] == {}
     again = pipeline(str(tmp_path / "again"))
     observation = jnp.ones((2, again.settings.observation_size), jnp.float32)
     assert {leaf.dtype for leaf in jax.tree.leaves(again.model.apply(again.variables, observation))
@@ -143,3 +138,40 @@ def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_no
     Release(max_length=64).write(tmp_path / "source")
     with pytest.raises(ValueError):
         SavedModel.from_pretrained(tmp_path / "source")
+
+
+
+def test_a_model_release_written_before_it_stated_its_run_loads_as_it_did(tmp_path):
+    """A native model release written before the release stated its run (`task` holding the objective, the
+    model's record, its settings and numerics) loads as the release of today writes it: the same model and
+    weights, the same settings (review of the run release)."""
+    from dew.inference.models import SavedModel
+
+    teacher_run(tmp_path).prepare().train("teacher")
+    run = SavedRun.pinned(str(tmp_path / "teacher"))
+    export_run(run, tmp_path / "policy", ema=False)
+    today = pipeline(str(tmp_path / "policy"))
+    release = Release.load(tmp_path / "policy")
+    assert release is not None and release.task is not None
+    record = dict(release.task["run"])
+    settings = {name: record.pop(name) for name in list(record)
+                if name not in ("objective", "model", "precision")}
+    earlier = {"objective": record["objective"], "model": record["model"], "settings": settings,
+               "numerics": record.get("precision"), "dtypes": {}}
+    (tmp_path / "policy" / RELEASE_FILE).write_text(json.dumps({"task": earlier}))
+    before = pipeline(str(tmp_path / "policy"))
+    assert isinstance(before, SavedModel) and before.model == today.model
+    assert before.settings == today.settings
+    assert_same(before.variables, today.variables)
+
+
+def test_a_run_whose_average_is_its_reference_never_reads_as_averaged():
+    """An objective whose average is its frozen reference (DPO's) releases its live weights whatever `ema`
+    asks (`SavedRun.variables`), so its run's `averaged` says so: never the average, asked or stored, which a
+    release records of the weights it holds (review of the run release)."""
+    from dew.objectives.rl.preference import DPOObjective
+    from dew.registry import import_path
+
+    run = SavedRun("a run its objective alone answers for", {"objective": import_path(DPOObjective)}, 0)
+    assert run.averaged(ema=True) is False
+    assert run.averaged(ema=None) is False

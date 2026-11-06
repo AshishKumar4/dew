@@ -26,21 +26,22 @@ if TYPE_CHECKING:
 
 
 def stated_release(directory: Path, layout: Layout | None = None, calibration: Calibration | None = None, *,
-                   max_length: int | None = None, numerics: Numerics | None = None) -> None:
+                   max_length: int | None = None, numerics: Numerics | None = None,
+                   compute: str | None = None) -> None:
     """Write the export in `directory`'s release (`dew.config.Release`) with the decision facts its format
     cannot state: the `layout` whole, its `max_length` alone where its format derives the rest of it, the
     `calibration` where it holds more than the format's own files (None states none), and the `numerics`
-    the task traces under, with the dtype they compute in, which its loader builds the task under
-    (`dew.interop.release.released`). A task declaration its backbone's writer wrote (`Pretrained.save`)
-    stays as it wrote it."""
+    the task traces under and the dtype its model `compute`s in (`dew.interop.release.computed_in`), which
+    its loader builds the task in (`dew.interop.release.released`). A task declaration its backbone's
+    writer wrote (`Pretrained.save`) stays as it wrote it."""
     from dew.config.release import Release
-    from dew.registry import dtype_name
 
     held = Release.load(directory) or Release()
     stated = None if layout is None else _record(to_record(layout, Layout))
     calibrated = None if calibration is None else _record(to_record(calibration, Calibration))
-    task = held.task if held.task is not None or numerics is None else {
-        "numerics": to_record(numerics, Numerics), "dtypes": {"compute": dtype_name(numerics.dtypes.compute)}}
+    task = held.task if held.task is not None or compute is None else {
+        "numerics": None if numerics is None else to_record(numerics, Numerics),
+        "dtypes": {"compute": compute}}
     replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated).write(directory)
 
 

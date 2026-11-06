@@ -26,6 +26,7 @@ from dew.decision.calibration import Calibration
 from dew.decision.laya import IN_PROJ
 from dew.decision.layout import DecisionInputs
 from dew.decision.release import stated_release
+from dew.interop.release import computed_in
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, write_file
 from dew.nn.sharding import abstract
 
@@ -174,5 +175,6 @@ def save(bundle: "PretrainedDecision", directory: str | Path, *,
     write_file(head_tensors(bundle.head_variables["params"]), root / HEAD_WEIGHTS, {"format": "pt"})
     # The release's own: the layout the rows are laid out by, which the head's files state none of, and a
     # calibration, which they hold none of.
+    compute = computed_in(bundle.numerics, bundle.model, bundle.variables)
     stated_release(root, bundle.layout, bundle.calibration if bundle.calibration != Calibration() else None,
-                   numerics=bundle.numerics)
+                   numerics=bundle.numerics, compute=compute)

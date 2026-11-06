@@ -123,6 +123,29 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
 
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
+def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run(tmp_path, recorded, kind):
+    """A kind's run saved at an earlier main, exported by `dew export` where its checkpoint declared its task,
+    loads back through `dew.pipeline` as the task its run loads (`from_run`) and answers one request as that
+    task does, leaf for leaf (MF01). A run that declared none (the corpus's JEPA runs, saved before a JEPA
+    encoder had a release) is refused by the export, as `SavedRun.pinned` refuses it."""
+    from option_witness import answered_alike, answers
+
+    from dew._cli.main import main
+    from dew.inference.loading import pipeline
+
+    run = extracted(tmp_path, recorded, kind)
+    task = objectives[RunConfig.load(str(run)).objective.name].saved_task
+    with Checkpoints(str(run)) as checkpoints:
+        declared = checkpoints.artifact(checkpoints.latest) is not None
+    release = tmp_path / "release"
+    if not declared:
+        with pytest.raises(ValueError):
+            main(["export", str(run), str(release)])
+        return
+    assert main(["export", str(run), str(release)]) == 0
+    assert answered_alike(answers(pipeline(str(release))), answers(task.from_run(str(run))))
+
+@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monkeypatch, recorded, kind):
     """A kind's run saved at an earlier main resumes from its last checkpoint for one step more, in the
     compute it trained in (a main that recorded no evidence: every corpus run's model draws fresh or loads
@@ -465,3 +488,22 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
     # A branch read from two collections, its trunk held frozen, is the branch its root reads.
     assert read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)}, frozen=True) == read(
         {"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)})
+
+
+
+@pytest.mark.parametrize(("recorded", "kind"),
+                         [(recorded, kind) for recorded, kind in SAVED if kind == "diffusion"],
+                         ids=lambda part: str(part))
+def test_a_diffusion_runs_release_stores_its_encoders_parameters_in_the_dtype_a_load_asks(tmp_path, recorded,
+                                                                                            kind):
+    """A diffusion run's native release loaded with a storage dtype stores every parameter its run's load does
+    in it, its condition encoders' among them, and the rest as written: leaf for leaf the dtypes of the run
+    loaded so (review of the run release)."""
+    from dew._cli.main import main
+    from dew.inference.loading import pipeline
+
+    run = extracted(tmp_path, recorded, kind)
+    assert main(["export", str(run), str(tmp_path / "release")]) == 0
+    loaded, released = (pipeline(str(path), param_dtype="bfloat16") for path in (run, tmp_path / "release"))
+    assert (jax.tree.map(lambda leaf: leaf.dtype, released.variables)
+            == jax.tree.map(lambda leaf: leaf.dtype, loaded.variables))

@@ -26,8 +26,10 @@ from dew.decision.layout import QuestionLayout, Specials
 from dew.decision.model import DecisionModel
 from dew.decision.release import stated_release
 from dew.interop.decoder_parts import Packed, layout_tensors, packed_layouts
+from dew.interop.release import computed_in
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, save_sharded, tensor_specs
 from dew.lora import FACTORS
+from dew.nn.precision import Numerics
 from dew.registry import from_record
 
 # Laya's head, as nn.TransformerEncoderLayer and its nn.Sequential scorer name it.
@@ -87,6 +89,9 @@ class LayaCheckpoint:
     tokenizer: HFTokenizer
     specials: Specials
     calibration: Calibration = field(default_factory=Calibration)
+    numerics: Numerics | None = None
+    """The numerics its task traces under, which its release states beside Laya's files
+    (`dew.decision.release.stated_release`)."""
 
     def save(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write this checkpoint in Laya's layout, which `Pretrained.load` and llama.cpp's converter read.
@@ -121,7 +126,9 @@ class LayaCheckpoint:
         }, indent=2) + "\n")
         # Laya's file holds the temperatures and no more of a calibration (its own, binning and abstention).
         beyond = self.calibration.binning is not None or self.calibration.abstention is not None
-        stated_release(root, self.layout, self.calibration if beyond else None)
+        compute = computed_in(self.numerics, self.model.backbone, part(self.variables, "backbone"))
+        stated_release(root, self.layout, self.calibration if beyond else None, numerics=self.numerics,
+                       compute=compute)
 
 
 def laya_tensors(model: DecisionModel, variables: Variables

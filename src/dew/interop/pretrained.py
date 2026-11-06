@@ -63,7 +63,7 @@ from dew.interop.pipeline_assembly import (
     text_components,
 )
 from dew.interop.processors import Processor, hosts
-from dew.interop.release import load_settings, release_record
+from dew.interop.release import load_settings, release_record, with_rounding
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
 from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
 from dew.interop.streaming import WeightLayout
@@ -206,6 +206,14 @@ def _extension_drawn(model: nn.Module, selected: Callable[[tuple[str, ...]], boo
         return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))), selected)
 
     return jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
+
+
+def source_states(model: nn.Module) -> bool:
+    """Whether a source's format states `model`'s layers: none holds cross-attention layers, which a run's
+    own checkpoint and its native release keep (`dew.inference.models.write_run_release`)."""
+    from dew.nn.protocols import CrossAttending
+
+    return not (isinstance(model, CrossAttending) and model.cross_attention is not None)
 
 
 @dataclass(frozen=True)
@@ -461,10 +469,9 @@ class Pretrained:
              step: int | str | None = None, ema: bool | None = None) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
-        `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
-        projector weights keep their usual internal paths, and a wrapper's variables
-        join under its existing component names. Processor files are loaded only when
-        the source has them.
+        `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and projector weights keep
+        their usual internal paths, and a wrapper's variables join under its existing component names.
+        Processor files are loaded only when the source has them.
 
         `dtype` sets the compute dtype, and `param_dtype` separately sets the storage
         dtype of floating parameters: BF16 over FP32 master weights unless stated, or an exported
@@ -563,6 +570,7 @@ class Pretrained:
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
+        loaded = replace(loaded, model=with_rounding(loaded.model, loading.rounds))
         extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
                                         or reference.subfolder is not None), dex, placed, scan_layers)
         return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
@@ -690,9 +698,9 @@ class Pretrained:
         from dew.batch import thaw
         from dew.inference.projections import unpacked
         from dew.nn.backbones.layer_names import stored_layers
-        from dew.nn.protocols import CrossAttending, Differential
+        from dew.nn.protocols import Differential
 
-        if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
+        if not source_states(self.model):
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local

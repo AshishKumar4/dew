@@ -644,9 +644,15 @@ class SettingsTask(SavedTask, Protocol):
 @runtime_checkable
 class ReleasedTask(SavedTask, Protocol):
     """A saved task that publishes its run as a released checkpoint of its own layout
-    (`Decide.save_pretrained`), which `dew export` writes in place of its model's source layout."""
+    (`Decide.save_pretrained`), which `dew export` writes in place of its model's source layout where its
+    layout states the run (`publishes`), and its run's native release where it does not."""
 
     def save_pretrained(self, directory: str) -> None: ...
+
+    @classmethod
+    def publishes(cls, run: SavedRun) -> bool:
+        """Whether its layout states `run`'s model."""
+        ...
 
 
 class Omitted(enum.Enum):

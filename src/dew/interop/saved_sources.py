@@ -52,27 +52,59 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                publishes: bool = True) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release, its EMA
-    weights where `ema`: a task's own released layout (`ReleasedTask`), or the model in its family's
-    source layout (`Pretrained.from_saved`). Its weights restore where `mesh` and `layout` place them,
+    weights where `ema`: a task's own released layout (`ReleasedTask`), the model in its family's
+    source layout where one states it (`source_publishes`), or else the run's native release, its
+    step's declaration and variables, which `dew.pipeline` loads as the run (`write_run_release`). Its
+    weights restore where `mesh` and `layout` place them,
     so no device holds more of them than a load does, and the writer reads them home a tensor at a time
     as it writes them, one shard of the release at a time (`save_sharded`). On a pool every process
     runs this same writer, reading each tensor that spans the pool's processes home together
     (`reading_home`), so each host holds a shard of the release, not the model (ledger 2874). One that
     does not `publish` reads every tensor as the one that does and writes no weights to `destination`,
     only the release's small files."""
+    from dew.inference.models import write_run_release
     from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
 
     task = run.objective.saved_task
-    if task is not None and issubclass(task, ReleasedTask):
-        released = task.from_saved(run, ema=ema, mesh=mesh, layout=layout)
+    released_task = task is not None and issubclass(task, ReleasedTask)
+    if task is not None and issubclass(task, ReleasedTask) and task.publishes(run):
+        # Under the numerics its step trained in, as every load of the run builds it (`SavedRun.formed`).
+        released = run.formed(task.from_saved(run, ema=ema, mesh=mesh, layout=layout))
         with reading_home("saved run export", writes=publishes):
             released.save_pretrained(str(destination))
-    else:
+    elif not released_task and source_publishes(run):
         bundle = Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout)
         with reading_home("saved run export", writes=publishes):
             bundle.save(destination)
+    else:
+        with reading_home("saved run export", writes=publishes):
+            write_run_release(run, destination, ema=ema, mesh=mesh, layout=layout)
 
+
+
+def source_publishes(run: SavedRun) -> bool:
+    """Whether a family's source layout states `run`'s model (`Pretrained.from_saved`): a causal decoder's
+    with no cross-attention layers (`source_states`), or a block decoder's that transformers' class builds
+    (`diffusion_gemma.publishable`). The export of any other run is its native release
+    (`dew.inference.models.write_run_release`)."""
+    from dew.inference.tasks import saved_model
+    from dew.interop import diffusion_gemma
+    from dew.interop.pretrained import source_states
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.registry import from_record, models
+
+    if "model" not in run.record:
+        # A package's run that records no model of Dew's (its task rebuilds its own) has no source layout.
+        return False
+    model_config = saved_model(run.record, None)
+    trained = models[model_config.name]
+    if trained is CausalTransformer:
+        return source_states(model_config.build())
+    if trained is models["diffusion_gemma"]:
+        return diffusion_gemma.publishable(from_record(DiffusionGemma, model_config.fields))
+    return False
 
 def is_saved_run(name_or_dir: str | Path) -> bool:
     """Whether `name_or_dir` is a saved Dew run's directory, on this host or remote storage
