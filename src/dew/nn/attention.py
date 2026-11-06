@@ -855,11 +855,12 @@ def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits:
 
     The four are what every fused kernel's requirements refuse
     (`attention_kernels`' arithmetic requirement): a matmul precision other
-    than DEFAULT (a higher one, a dot algorithm or a preset of one), a
+    than DEFAULT, stated or the run's configured one (a higher one, a dot
+    algorithm or a preset of one; `asks_default_precision`), a
     softmax outside fp32, a compute dtype other than the inputs', and logits
     formed from queries and keys widened to at least fp32 (`wide_logits`).
     """
-    return (not asks_default_precision(precision)
+    return (not asks_default_precision(precision, configured=True)
             or not force_fp32_for_softmax
             or (dtype is not None and jnp.dtype(dtype) != query.dtype)
             or wide_logits)
