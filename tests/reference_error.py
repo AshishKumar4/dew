@@ -225,10 +225,13 @@ def _varies(fn) -> bool:
 def run_to_run(fn, why: str):
     """`fn`, an arm declared to vary from run to run on a GPU on the same inputs, for `why`: an
     accumulation in arrival order (atomic adds), which a deterministic form would make 2-2.7 times as slow
-    (row 4448, M-JS-5). Check 1 pairs it with the other arm within each draw's one run, as it pairs every
+    (row 4448). Check 1 pairs it with the other arm within each draw's one run, as it pairs every
     arm, and never holds it to a run of itself again (`_of_its_inputs`) but on a CPU, where its interpreted
     program is a function of its inputs: a draw's evidence is one run's, and the redraw and every further
-    seed are runs of their own, so its spread across runs is the spread across draws check 1 weighs."""
+    seed are runs of their own, so its spread across runs is the spread across draws check 1 weighs. A
+    window loop's arm (`over_windows`) is declared inside its loop, which the gate reads outermost."""
+    if isinstance(fn, _Windowed):
+        return _Windowed(_RunToRun(fn.fn, why))
     return _RunToRun(fn, why)
 
 
@@ -983,7 +986,11 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
     seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842), and
     of an arm declared to vary from run to run (`run_to_run`) only on a CPU; the CPU lane runs every
     check-1 site, so each arm is held to it there."""
-    if not _repeat_promised() or (_varies(fn) and jax.default_backend() != "cpu"):
+    if not _repeat_promised():
+        return
+    if _varies(fn) and jax.default_backend() != "cpu":
+        why = next(layer.why for layer in _layers(fn) if isinstance(layer, _RunToRun))
+        _logged(label, 0, f"{name} not repeated: declared to vary from run to run ({why})", [])
         return
     if (where := _same_bits(first, fn(*inputs))) is not None:
         raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "
