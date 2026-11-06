@@ -71,11 +71,15 @@ def make(kind, variant):
                         if variant == "manual-wide-" + site:
                             return float64_sum(functools.partial(jnp.einsum, spec), lhs, rhs,
                                                dtype=lhs.dtype)
-                        return float32_einsum(spec, lhs, rhs)
+                        result = float32_einsum(spec, lhs, rhs)
+                        return (jax.lax.optimization_barrier(result)
+                                if variant == "manual-barrier-" + site else result)
                     level = variables["params"]["continuum"]
                     fed = dot("td,df->tf", hidden, level["down"]["kernel"], "down")
                     fed = (fed * jax.lax.logistic(fed, accuracy=jax.lax.AccuracyMode.HIGHEST)
                            if variant == "batch-high-silu" else jax.nn.silu(fed))
+                    if variant == "manual-barrier-silu":
+                        fed = jax.lax.optimization_barrier(fed)
                     passed = hidden + dot("tf,fd->td", fed, level["up"]["kernel"], "up")
                     logits = dot("td,vd->tv", passed, variables["params"]["embed_tokens"]["embedding"],
                                  "head")
@@ -98,6 +102,9 @@ variants = ("literal", "token-categorical", "batch-categorical", "batch-logsoftm
 if os.environ.get("DOT_SITES"):
     variants = ("literal", "batch-categorical", "batch-high-silu", "manual", "manual-wide-down",
                 "manual-wide-up", "manual-wide-head")
+if os.environ.get("BARRIERS"):
+    variants = ("literal", "batch-categorical", "manual", "manual-barrier-down",
+                "manual-barrier-up", "manual-barrier-head", "manual-barrier-silu")
 programs = {(variant, mode): jax.jit(make(kind, variant), compiler_options=(
     {} if mode == "on" else {"xla_cpu_experimental_ynn_fusion_type": ""}))
     for variant in variants for mode in ("on", "off")}
