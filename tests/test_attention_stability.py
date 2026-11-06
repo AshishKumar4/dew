@@ -804,7 +804,7 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     Mosaic one's default form in both schedules, its derived one (one launch where the call is hookless) and
     deterministic mode's two launches (`TWO_LAUNCHES`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
-    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    tiles = attention_portable.Tiles(32, 32, attention_triton.BLOCK)
     mainloop = functools.partial(_differentiable, family)
 
     def triton_forward(*operands):
@@ -826,8 +826,8 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
         return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                          **options)
 
-    portable = mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
-                        functools.partial(attention_portable.backward, **tiles, **options))
+    portable = mainloop(functools.partial(attention_portable.xla_mainloop, tiles, **forward_options),
+                        functools.partial(attention_portable.backward, tiles, **options))
     mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
     def two_launch_backward(*operands):
         with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
@@ -1284,8 +1284,8 @@ def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
                                             interpret=INTERPRETED)
 
     def portable(query, key, value, *_):
-        return attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
-                                         pad=attention_triton.BLOCK, residuals=True, natural=True)
+        return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
+                                               query, key, value, spans, residuals=True, natural=True)
 
     for name, attend in (("triton", triton), ("portable", portable)):
         query, key, _, _, _ = draw(0)

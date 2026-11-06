@@ -137,9 +137,9 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
 
     def ours(query, key, value):
         if mainloop == "portable":
-            out = attention_portable.attend(query, key, value, spans, hooks, block_q=config.block_q,
-                                            block_k=config.block_k, pad=attention_triton.BLOCK,
-                                            residuals=residuals, natural=natural)
+            tiles = attention_portable.Tiles(config.block_q, config.block_k, attention_triton.BLOCK)
+            out = attention_portable.xla_mainloop(tiles, query, key, value, spans, hooks, residuals=residuals,
+                                                  natural=natural)
         else:
             with tuning.pinned(pin):
                 out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
@@ -377,10 +377,9 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
 
     def ours(query, key, value, dout, params, initial):
         if mainloop == "portable":
-            grads = attention_portable.backward(query, key, value, spans, hooked(params, initial), dout,
-                                                block_q=config.block_q, block_k=config.block_k,
-                                                pad=attention_triton.BLOCK, natural=natural,
-                                                accurate=accurate)
+            tiles = attention_portable.Tiles(config.block_q, config.block_k, attention_triton.BLOCK)
+            grads = attention_portable.backward(tiles, query, key, value, spans, hooked(params, initial),
+                                                dout, natural=natural, accurate=accurate)
         else:
             with tuning.pinned(pins):
                 grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,

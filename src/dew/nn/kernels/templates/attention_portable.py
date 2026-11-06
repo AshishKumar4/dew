@@ -4,6 +4,7 @@ mainloop, in XLA ops, so it runs on any backend and is the boundary test's secon
 (tests/test_attention_algebra.py: the Triton mainloop, interpreted, and this one agree to the bit at the
 same tiles). It takes a call at its launches' padded shapes, as `TritonForward` does."""
 
+import dataclasses
 import functools
 from collections.abc import Callable
 from typing import Literal, overload
@@ -194,32 +195,43 @@ def _unmapped(mapped, shape: tuple[int, ...], *, residuals: bool):
     return out, (rowwise(m), rowwise(denominator), rowwise(anchors), split)
 
 
+@dataclasses.dataclass(frozen=True)
+class Tiles:
+    """The plain-JAX mainloop's config (`xla_mainloop`, `backward`): its walk's `block_q` by `block_k` tiles
+    over a call padded as a backend whose largest tile is `pad` pads it (`padded_call`)."""
+
+    block_q: int
+    block_k: int
+    pad: int
+
+
 @overload
-def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-           *, block_q: int, block_k: int, pad: int, scale: float | None = None,
-           residuals: Literal[False] = False, natural: bool = NATURAL) -> jax.Array:
+def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                 hooks: Hooks | None = None, *, scale: float | None = None, residuals: Literal[False] = False,
+                 natural: bool = NATURAL) -> jax.Array:
     ...
 
 
 @overload
-def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-           *, block_q: int, block_k: int, pad: int, scale: float | None = None, residuals: Literal[True],
-           natural: bool = NATURAL) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                 hooks: Hooks | None = None, *, scale: float | None = None, residuals: Literal[True],
+                 natural: bool = NATURAL) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
-def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-           *, block_q: int, block_k: int, pad: int, scale: float | None = None, residuals: bool = False,
-           natural: bool = NATURAL):
-    """The template's forward on this mainloop: `query` `[B, Q, H, D]` over `key` and `value`
-    `[B, K, Hk, D]` and `[B, K, Hk, Dv]` and the keys `spans` leaves each query, padded as a backend
-    whose largest tile is `pad` pads it (`padded_call`) and walked in `block_q` by `block_k` tiles; with
-    `residuals`, the running maxima and denominators `[B, H, Q]`, the anchor keys and the split sums too;
-    `natural` keeps the logits natural (`algebra.Forward.base2`)."""
+def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                 hooks: Hooks | None = None, *, scale: float | None = None, residuals: bool = False,
+                 natural: bool = NATURAL):
+    """The template's forward on this mainloop at `config` (docs/design/kernel-templates.md's
+    `xla_mainloop`): `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and `[B, K, Hk, Dv]` and
+    the keys `spans` leaves each query, padded and walked at the config's tiles; with `residuals`, the
+    running maxima and denominators `[B, H, Q]`, the anchor keys and the split sums too; `natural` keeps
+    the logits natural (`algebra.Forward.base2`)."""
     hooks = Hooks() if hooks is None else hooks
+    block_q, block_k = config.block_q, config.block_k
     # The query taken by its scale's power of two before its products (`prescale`).
     query, scale, power = prescaled(query, scale)
-    call = padded_call(query, key, value, spans, hooks, pad)
+    call = padded_call(query, key, value, spans, hooks, config.pad)
     queries, value_width = call.queries, value.shape[-1]
     # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
     # fold its logits' reach (`algebra.walked`).
@@ -251,9 +263,9 @@ def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_
 
 def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_q: int, block_k: int,
                 residuals: bool):
-    """`attend`'s walk of a padded call (`padded_call`) in `spec`'s form, which a caller holding a form of its
-    own walks too (another mainloop's guarded rows, `attention_mosaic`): the output `[B, Qp, H, Dvp]` and,
-    with `residuals`, the maxima, denominators, anchor keys and split sums at the padded shapes (else
+    """`xla_mainloop`'s walk of a padded call (`padded_call`) in `spec`'s form, which a caller holding a form
+    of its own walks too (another mainloop's guarded rows, `attention_mosaic`): the output `[B, Qp, H, Dvp]`
+    and, with `residuals`, the maxima, denominators, anchor keys and split sums at the padded shapes (else
     None)."""
     initial = None
     if hooks.initial is not None:
@@ -607,22 +619,21 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
     return (dq, *softmax, chosen, *dq_grads, dk, dv, *key_grads)
 
 
-def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
-             dout: jax.Array, *, block_q: int, block_k: int, pad: int,
+def backward(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+             hooks: Hooks | None, dout: jax.Array, *,
              residuals: tuple[jax.Array, jax.Array, jax.Array, Split] | None = None, split: bool = True,
              scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE,
              rounded: bool = True) -> Gradients:
-    """The template's backward on this mainloop (`gradients`) at `block_q` by `block_k` tiles, the call
-    padded as a backend whose largest tile is `pad` pads it, from the forward's `residuals` (this
-    mainloop's `attend`'s where None); with `split`, D from the forward's split sums, as the Triton
-    mainloop's `backward`, `natural` keeping the forward's logits natural and `accurate` taking the
+    """The template's backward on this mainloop (`gradients`) at `config`, from the forward's `residuals`
+    (this mainloop's `xla_mainloop`'s where None); with `split`, D from the forward's split sums, as the
+    Triton mainloop's `backward`, `natural` keeping the forward's logits natural and `accurate` taking the
     backward's accurate form (`ACCURATE`)."""
+    block_q, block_k, pad = config.block_q, config.block_k, config.pad
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial,
                                                     drop=hooks.drop)
-        _, maxima, totals, anchors, sums = attend(query, key, value, spans, plain, block_q=block_q,
-                                                  block_k=block_k, pad=pad, scale=scale, residuals=True,
-                                                  natural=natural)
+        _, maxima, totals, anchors, sums = xla_mainloop(config, query, key, value, spans, plain, scale=scale,
+                                                        residuals=True, natural=natural)
         residuals = maxima, totals, anchors, sums
     initial = hooks is not None and hooks.initial is not None
     if hooks is not None and hooks.drop is not None and not split:

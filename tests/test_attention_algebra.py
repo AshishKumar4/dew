@@ -111,8 +111,8 @@ def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
         def run(query, key, value, dout, params, initial):
             given = tuple(template.Param(value, kind) for value, kind in zip(params, kinds, strict=True))
             hooked = template.Hooks(score_mod, given, initial)
-            found = attention_portable.backward(query, key, value, spans, hooked, dout, block_q=32,
-                                                block_k=32, pad=attention_triton.BLOCK, split=split)
+            found = attention_portable.backward(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
+                                                query, key, value, spans, hooked, dout, split=split)
             return found.query, found.key, found.value, found.score_params, found.initial
 
         return jax.jit(run)
@@ -174,8 +174,9 @@ def forwards(query, key, value, spans, hooks=None, *, residuals=False, scale=Non
     with tuning.pinned({attention_triton.TritonForward: tiles}):
         triton = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
                                           interpret=True, scale=scale)
-    portable = attention_portable.attend(query, key, value, spans, hooks, block_q=32, block_k=32,
-                                         pad=attention_triton.BLOCK, residuals=residuals, scale=scale)
+    portable = attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
+                                               query, key, value, spans, hooks, residuals=residuals,
+                                               scale=scale)
     return triton, portable
 
 
@@ -239,8 +240,8 @@ def test_an_fp16_backward_keeps_a_gradient_whose_scores_are_large_but_cancel(key
     with tuning.pinned({attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
                         attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}):
         triton = attention_triton.backward(query, key, value, spans, None, dout, interpret=True)
-    portable = attention_portable.backward(query, key, value, spans, None, dout, block_q=32, block_k=32,
-                                           pad=attention_triton.BLOCK)
+    portable = attention_portable.backward(attention_portable.Tiles(32, 32, attention_triton.BLOCK), query,
+                                           key, value, spans, None, dout)
     for found in (triton, portable):
         np.testing.assert_array_equal(np.asarray(found.query, np.float32), 0)
 
@@ -276,8 +277,8 @@ def test_an_extreme_fp32_backward_is_as_exact_as_the_reference(peak0, scale, key
                                              interpret=True).query
 
     def portable_dq(query, key, value, dout):
-        return attention_portable.backward(query, key, value, spans, hooks, dout, block_q=32, block_k=32,
-                                           pad=attention_triton.BLOCK, scale=scale).query
+        return attention_portable.backward(attention_portable.Tiles(32, 32, attention_triton.BLOCK), query,
+                                           key, value, spans, hooks, dout, scale=scale).query
 
     for name, run in (("triton", triton_dq), ("portable", portable_dq)):
         assert np.isfinite(np.asarray(run(*draw(0)))).all(), name
@@ -296,8 +297,8 @@ def test_a_logit_past_the_forwards_rounded_maximum_weighs_one_in_the_backward():
             attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
     with tuning.pinned(pins):
         triton = attention_triton.backward(query, key, value, spans, None, dout, scale=1.0, interpret=True)
-    portable = attention_portable.backward(query, key, value, spans, None, dout, block_q=32, block_k=32,
-                                           pad=attention_triton.BLOCK, scale=1.0)
+    portable = attention_portable.backward(attention_portable.Tiles(32, 32, attention_triton.BLOCK), query,
+                                           key, value, spans, None, dout, scale=1.0)
     for found in (triton, portable):
         np.testing.assert_array_equal(np.asarray(found.query), 0)
         np.testing.assert_array_equal(np.asarray(found.key), 0)
@@ -333,9 +334,9 @@ def test_a_resumed_state_carried_far_is_as_exact_as_the_references(natural):
                                             interpret=jax.default_backend() != "gpu")
 
     def portable(distance, value, acc):
-        return attention_portable.attend(distance, jnp.ones_like(distance), value, spans, state(acc),
-                                         block_q=32, block_k=32, pad=attention_triton.BLOCK, scale=1.0,
-                                         natural=natural)
+        return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
+                                               distance, jnp.ones_like(distance), value, spans, state(acc),
+                                               scale=1.0, natural=natural)
 
     def reference(distance, value, acc):
         return template.reference(distance, jnp.ones_like(distance), value, spans, state(acc), scale=1.0)
@@ -360,8 +361,8 @@ def test_a_large_initial_maximum_gives_the_references_state_gradients():
             attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
     with tuning.pinned(pins):
         triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=1.0, interpret=True)
-    portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=32, block_k=32,
-                                           pad=attention_triton.BLOCK, scale=1.0)
+    portable = attention_portable.backward(attention_portable.Tiles(32, 32, attention_triton.BLOCK), query,
+                                           key, value, spans, hooks, dout, scale=1.0)
 
     def attend(q, k, v, initial):
         return template.reference(q, k, v, spans, template.Hooks(initial=initial), scale=1.0)
@@ -394,8 +395,8 @@ def test_a_logit_the_reference_keeps_stays_finite_and_apart(keys, query_size, ke
             attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
     with tuning.pinned(pins):
         triton = attention_triton.backward(query, key, value, spans, None, dout, scale=1.0, interpret=True)
-    portable = attention_portable.backward(query, key, value, spans, None, dout, block_q=32, block_k=32,
-                                           pad=attention_triton.BLOCK, scale=1.0)
+    portable = attention_portable.backward(attention_portable.Tiles(32, 32, attention_triton.BLOCK), query,
+                                           key, value, spans, None, dout, scale=1.0)
     for found in (triton, portable):
         for leaf in (found.query, found.key, found.value):
             assert np.isfinite(np.asarray(leaf)).all()
@@ -410,7 +411,8 @@ def test_an_fp32_cpu_arm_is_as_exact_as_the_reference_at_aligned_tiles(causal):
     spans = template.spans(200, 300, ROWS, causal=causal)
 
     def ours(query, key, value):
-        return attention_portable.attend(query, key, value, spans, block_q=128, block_k=128, pad=128)
+        return attention_portable.xla_mainloop(attention_portable.Tiles(128, 128, 128), query, key, value,
+                                               spans)
 
     def reference(query, key, value):
         return template.reference(query, key, value, spans)
@@ -581,8 +583,8 @@ def test_the_accurate_form_is_as_exact_as_the_reference_at_its_raw_domains_edges
         return jnp.ones((32, 1, 1, 1), jnp.float32), key, value
 
     def ours(query, key, value):
-        return attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
-                                         pad=attention_triton.BLOCK, scale=scale, natural=True)
+        return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
+                                               query, key, value, spans, scale=scale, natural=True)
 
     def reference(query, key, value):
         return template.reference(query, key, value, spans, scale=scale)
@@ -702,7 +704,8 @@ def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
                                              **form).query
 
     def portable(query, key, value, dout):
-        return attention_portable.backward(query, key, value, spans, hooks, dout, **tiles, **form).query
+        return attention_portable.backward(attention_portable.Tiles(**tiles), query, key, value, spans, hooks,
+                                           dout, **form).query
 
     draw, reference = _scaled_draw(query, key, value, dout), _reference_dq(spans, hooks, scale)
     found = np.asarray(triton(*draw(0)))
@@ -791,7 +794,8 @@ def test_a_querys_gradient_at_a_subnormal_scale_is_finite():
     options = {"scale": 2.0 ** -128, "natural": True, "accurate": True}
     with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
         triton = attention_triton.backward(query, key, value, spans, None, dout, interpret=True, **options)
-    portable = attention_portable.backward(query, key, value, spans, None, dout, **options, **tiles)
+    portable = attention_portable.backward(attention_portable.Tiles(**tiles), query, key, value, spans, None,
+                                           dout, **options)
     for name, grads in (("triton", triton), ("portable", portable)):
         np.testing.assert_array_equal(np.asarray(grads.query), 0.0, err_msg=name)
 
@@ -825,7 +829,8 @@ def test_a_bf16_querys_gradient_over_a_large_key_with_small_cotangents_is_exact(
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
         triton = attention_triton.backward(query, key, value, spans, None, dout, natural=True, interpret=True)
-    portable = attention_portable.backward(query, key, value, spans, None, dout, natural=True, **tiles)
+    portable = attention_portable.backward(attention_portable.Tiles(**tiles), query, key, value, spans, None,
+                                           dout, natural=True)
     for name, grads in (("triton", triton), ("portable", portable)):
         assert float(grads.query[0, 0, 0, 0]) == -(2.0 ** 116), name
 
@@ -847,7 +852,8 @@ def test_an_fp16_querys_gradient_over_equal_large_keys_whose_cotangents_cancel_i
     with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
         triton = attention_triton.backward(query, key, value, spans, None, dout, accurate=accurate,
                                            interpret=True)
-    portable = attention_portable.backward(query, key, value, spans, None, dout, accurate=accurate, **tiles)
+    portable = attention_portable.backward(attention_portable.Tiles(**tiles), query, key, value, spans, None,
+                                           dout, accurate=accurate)
     _, pull = jax.vjp(lambda query: template.reference(query, key, value, spans), query)
     [theirs] = pull(dout)
     assert np.isfinite(np.asarray(theirs, np.float32)).all()
