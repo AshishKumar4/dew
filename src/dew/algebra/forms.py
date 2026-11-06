@@ -18,6 +18,7 @@ from jax.extend import core as jcore
 
 from dew._cache import DERIVED
 from dew.algebra import program, terms
+from dew.nn import programs
 from dew.nn.precision import float32_dot_general
 
 
@@ -160,17 +161,13 @@ def rewritten(derived: Derived, *, accurate: bool, saturation: program.Saturatio
 
         def call(*arguments, **keywords):
             # Its arrays traced, its other arguments (a mainloop's issuer, a flag) bound as they are.
-            flat, tree = jax.tree.flatten((arguments, keywords))
-            places = [index for index, leaf in enumerate(flat) if isinstance(leaf, (jax.Array, np.ndarray))]
+            arrays, fill = programs.holes((arguments, keywords),
+                                          lambda leaf: isinstance(leaf, (jax.Array, np.ndarray)))
 
             def traced(*values):
-                filled = list(flat)
-                for index, value in zip(places, values, strict=True):
-                    filled[index] = value
-                given, named = jax.tree.unflatten(tree, filled)
+                given, named = fill(values)
                 return form(*given, **named)
 
-            arrays = [flat[index] for index in places]
             closed, shapes = jax.make_jaxpr(traced, return_shape=True)(*arrays)
             outputs = program.rewrite(closed, arrays, accurate=accurate, saturation=saturation)
             return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
