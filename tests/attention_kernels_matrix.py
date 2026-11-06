@@ -10,7 +10,9 @@ the template's route, whose launch forms that family pins.
 
 What the op serves is read from its own selector (`attention_kernels.ATTENTION`): the step traced for its
 shapes as the case's generation (a GPU's within an abstract mesh of one of its devices), a call the kernel's
-requirements refuse raising `selection.KernelRefused`, and the route the selector reports the kernel named.
+requirements refuse raising `selection.KernelRefused`, and the route the selector reports the kernel named,
+on the device its backend requirement names (`native`: a named `tpu` runs interpreted off a TPU, which is no
+cell of this matrix).
 """
 
 import jax
@@ -23,7 +25,7 @@ from jax.sharding import Mesh
 from kernel_matrix import AXES
 from reference_error import assert_as_exact
 
-from dew.nn import attention
+from dew.nn import attention, attention_kernels
 from dew.nn.kernels import generation, selection
 
 CHOICE = "attention"
@@ -70,10 +72,22 @@ def _spec(case: dict[str, str]) -> tuple:
     return query, key, key, query
 
 
+def native(kernel: str) -> bool:
+    """Whether `kernel` runs on the device a generation is assumed for: its requirement of a backend
+    (`attention_kernels.ATTENTION`'s, code 'backend', which reads the platform alone) holds, or it states
+    none. A named kernel skips a measured requirement, so splash named off a TPU runs interpreted."""
+    backend = [need for need in attention_kernels.ATTENTION.kernel(kernel).supports if need.code == "backend"]
+    return all(need.check(None) is None for need in backend)
+
+
 def supported(case: dict[str, str]) -> bool:
-    """Whether the op serves `case` on its kernel (tests/kernel_matrix.py): its training step, traced for its
-    shapes as its generation (a GPU's within an abstract mesh of one of its devices) with the kernel named,
-    is not refused by the kernel's requirements (`selection.KernelRefused`) and reports that kernel."""
+    """Whether the op serves `case` on its kernel (tests/kernel_matrix.py): on its generation's device
+    (`native`), its training step, traced for its shapes as that generation (a GPU's within an abstract mesh
+    of one of its devices) with the kernel named, is not refused by the kernel's requirements
+    (`selection.KernelRefused`) and reports that kernel."""
+    with generation.assumed(case["generation"]):
+        if not native(case["kernel"]):
+            return False
     mesh = (generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), case["generation"])
             if case["generation"].startswith("sm") else None)
     refused = None
