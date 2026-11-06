@@ -76,7 +76,7 @@ def supported(case: dict[str, str]) -> bool:
         else:
             op = PAGED
             called = PagedCase(heads=heads, kv_heads=kv_heads, head_dim=width, value_dim=width, dtype=dtype,
-                               pool=dtype, page_size=PAGE, quantized=False, groups=1, head_shards=1,
+                               pool=dtype, page_size=PAGE, quantized=None, groups=1, head_shards=1,
                                softcap=CAP if case["hook"] == "softcap" else None, arithmetic=False,
                                named="auto", sinks=case["hook"] == "sinks")
         if called is None or case["kernel"] not in KERNELS[_choice(case)]:

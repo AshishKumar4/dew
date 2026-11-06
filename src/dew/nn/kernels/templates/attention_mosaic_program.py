@@ -717,6 +717,9 @@ class _Hooked(NamedTuple):
     output: tuple[jax.Array, ...]
     initial: tuple[jax.Array, jax.Array, jax.Array] | None
     drop: Dropout | None = None
+    scales: tuple[jax.Array, jax.Array] | None = None
+    """A call over quantized keys and values' scales, the keys' and the values' `[B, Hk, Kp]` fp32, one a key
+    and key head in its row's key order (`attention_decode.attend`'s `scales`); None for 16-bit keys."""
 
 
 def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:

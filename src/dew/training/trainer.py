@@ -599,8 +599,10 @@ class Trainer(Generic[Loss, Effects]):
             from dew.training.execution import frozen_trees, stack_sites
             for path, tree, _ in tuple(frozen_trees(variables, stack_sites(self.objective, variables))):
                 variables = placed_at(variables, path, spread(tree, shape_rows))
+                placed = at_path(placement, path)
+                assert isinstance(placed, Mapping), path
                 placement = placed_at(placement, path, spread(
-                    at_path(placement, path), lambda sharding, count: [row_sharding(sharding)] * count))
+                    placed, lambda sharding, count: [row_sharding(sharding)] * count))
         with self._declared():
             self._staging.check(self.layout, variables, placement, self.device_mesh)
         self.validation = self._validation(placed_shapes(dataclasses.replace(state, variables=variables),

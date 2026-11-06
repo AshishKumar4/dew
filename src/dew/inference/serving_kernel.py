@@ -35,6 +35,7 @@ from dew.nn.kv_cache import (
     GROUPS,
     POOLED,
     ROW_CURSORS,
+    SCALES,
     TABLE,
     as_words,
     from_words,
@@ -629,6 +630,9 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
             return placed(leaf, *layers, "activation_batch")
         if paged:
             return placed(leaf, *layers, "activation_kv", "pages")
+        if leaf_name(path) in SCALES:
+            # A dense cache's scales head-major, `[rows, heads, capacity]` (`dew.nn.kv_cache.scale_shape`).
+            return placed(leaf, *layers, "activation_batch", "activation_kv")
         return placed(leaf, *layers, "activation_batch", None, "activation_kv")
 
     rows = jax.tree.map(lambda leaf: placed(leaf, "activation_batch"), state)
