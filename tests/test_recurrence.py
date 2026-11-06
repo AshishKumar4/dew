@@ -75,22 +75,22 @@ ONE_TAP_SEEDS = {jnp.float32: 256, jnp.bfloat16: 256}
 
 
 def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32,
-             value_width: int = VALUE_WIDTH) -> recurrence.Step:
-    """A decode token's operands for `hooks`, `value_width` values a head, every third row from the second
-    idle."""
+             value_width: int = VALUE_WIDTH, key_width: int = KEY_WIDTH) -> recurrence.Step:
+    """A decode token's operands for `hooks`, `value_width` values and `key_width` keys a head, every third
+    row from the second idle."""
     rng = np.random.default_rng(seed)
 
     def normal(*shape, scale=1.0):
         return jnp.asarray(rng.standard_normal(shape) * scale, jnp.float32)
 
-    channels = 2 * KEY_HEADS * KEY_WIDTH + VALUE_HEADS * value_width
-    given = {'state': normal(ROWS, VALUE_HEADS, KEY_WIDTH, value_width, scale=0.3).astype(state_dtype),
+    channels = 2 * KEY_HEADS * key_width + VALUE_HEADS * value_width
+    given = {'state': normal(ROWS, VALUE_HEADS, key_width, value_width, scale=0.3).astype(state_dtype),
              'active': jnp.asarray(np.arange(ROWS) % 3 != 1)}
     if hooks.conv is not None:
         given |= {'token': normal(ROWS, channels), 'held': normal(ROWS, TAPS - 1, channels),
                   'taps': normal(channels, TAPS, scale=0.5)}
     else:
-        given |= {'query': normal(ROWS, KEY_HEADS, KEY_WIDTH), 'key': normal(ROWS, KEY_HEADS, KEY_WIDTH) / 4,
+        given |= {'query': normal(ROWS, KEY_HEADS, key_width), 'key': normal(ROWS, KEY_HEADS, key_width) / 4,
                   'value': normal(ROWS, VALUE_HEADS, value_width)}
     if hooks.gates is not None:
         given['gate'] = normal(ROWS, VALUE_HEADS)
@@ -105,7 +105,7 @@ def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32,
         if hooks.decay == 'scalar':
             given['log_decay'] = -jnp.abs(normal(ROWS, VALUE_HEADS, scale=0.2))
         elif hooks.decay == 'vector':
-            given['log_decay'] = -jnp.abs(normal(ROWS, VALUE_HEADS, KEY_WIDTH, scale=0.2))
+            given['log_decay'] = -jnp.abs(normal(ROWS, VALUE_HEADS, key_width, scale=0.2))
         if hooks.gated_write:
             given['beta'] = jax.nn.sigmoid(normal(ROWS, VALUE_HEADS))
     if hooks.skip:
@@ -147,10 +147,10 @@ def orbit(given: recurrence.Step, seed: int) -> recurrence.Step:
 
 
 def draw(hooks: recurrence.Hooks, seed: int, state_dtype=jnp.float32,
-         value_width: int = VALUE_WIDTH) -> tuple[recurrence.Step]:
+         value_width: int = VALUE_WIDTH, key_width: int = KEY_WIDTH) -> tuple[recurrence.Step]:
     """Fresh operands and an independent exact orbit, deterministically keyed by the draw's seed."""
     operand_seed, orbit_seed = (int(value) for value in np.random.SeedSequence(seed).generate_state(2))
-    return (orbit(operands(hooks, operand_seed, state_dtype, value_width), orbit_seed),)
+    return (orbit(operands(hooks, operand_seed, state_dtype, value_width, key_width), orbit_seed),)
 
 
 def one_tap_operands(dtype, seed: int) -> recurrence.Step:
@@ -231,6 +231,27 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
         if hooks.conv is not None:
             np.testing.assert_array_equal(np.asarray(history), np.asarray(reference[1]))
             np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
+
+
+@pytest.mark.parametrize('hooks', [hooks for hooks in HOOKS + FORMED if hooks.conv is None], ids=str)
+def test_every_hook_steps_on_the_template_as_its_float64_form(hooks):
+    """A decode token through the recurrence template's step on Mosaic GPU (`templates.recurrence.step`,
+    interpreted off a GPU) at a model's widths, 128 keys and values a head (Qwen3.5's, Kimi Linear's,
+    Mamba2's state): its output and state within tests/reference_error.py's rule of the XLA form's fp32 run
+    against its float64 run; an idle row's output zeros and its state its own bits."""
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.recurrence import step as template
+
+    widths = {"key_width": 128, "value_width": 128}
+    stepped = jax.jit(functools.partial(template.step, hooks, dtype=None, family=bundles.INTERPRETED,
+                                        interpret=True))
+    assert_as_exact(stepped, summed(hooks), functools.partial(draw, hooks, **widths),
+                    f'{hooks} on the template', seeds={**SEEDS, **FORMED_SEEDS}[hooks],
+                    truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
+    given = operands(hooks, **widths)
+    out, _, state = stepped(given)
+    np.testing.assert_array_equal(np.asarray(out)[1], 0.0)
+    np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
 
 
 UNEVEN = {recurrence.Hooks(decay='scalar'): 8,
