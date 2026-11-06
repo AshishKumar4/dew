@@ -32,16 +32,17 @@ def stated_release(directory: Path, layout: Layout | None = None, calibration: C
     cannot state: the `layout` whole, its `max_length` alone where its format derives the rest of it, the
     `calibration` where it holds more than the format's own files (None states none), and the `numerics`
     the task traces under and the dtype its model `compute`s in (`dew.interop.release.computed_in`), which
-    its loader builds the task in (`dew.interop.release.released`). A task declaration its backbone's
-    writer wrote (`Pretrained.save`) stays as it wrote it."""
+    its loader builds the task in (`dew.interop.release.released`): a task's, which a writer states where
+    it writes one (None for a source's own bundle, whose files state its dtype). A task declaration its
+    backbone's writer wrote (`Pretrained.save`) stays as it wrote it."""
     from dew.config.release import Release
 
     held = Release.load(directory) or Release()
     stated = None if layout is None else _record(to_record(layout, Layout))
     calibrated = None if calibration is None else _record(to_record(calibration, Calibration))
-    # Stated of a run's task alone (its numerics): a bundle no run trained has its source's own dtype.
-    task = held.task if held.task is not None or numerics is None or compute is None else {
-        "numerics": to_record(numerics, Numerics), "dtypes": {"compute": compute}}
+    task = held.task if held.task is not None or compute is None else {
+        "numerics": None if numerics is None else to_record(numerics, Numerics),
+        "dtypes": {"compute": compute}}
     replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated).write(directory)
 
 

@@ -190,7 +190,8 @@ class SlotSource(SourceKind):
         stated_release(root, None if layout == prompt else layout,
                        bundle.calibration if bundle.calibration != Calibration() else None,
                        max_length=layout.max_len, numerics=bundle.numerics,
-                       compute=computed_in(bundle.numerics, bundle.model, bundle.variables))
+                       compute=None if bundle.numerics is None
+                       else computed_in(bundle.numerics, bundle.model, bundle.variables))
 
     @staticmethod
     def readout(bundle: PretrainedDecision) -> Mapping[str, np.ndarray]:
