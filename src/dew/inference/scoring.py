@@ -146,8 +146,10 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         """The requests waiting for a pass, or for the rest of their rows."""
         self.arrived: Callable[[], None] = _nothing
         """Called after each submission: an `Engine` serving this kind wakes to it."""
-        self.pooled = False
-        """A scoring server's passes run on its own process (`Kind.pooled`)."""
+        self.pooled = self.mesh is not None and not jax.sharding.NamedSharding(
+            self.mesh, jax.sharding.PartitionSpec()).is_fully_addressable
+        """Whether its weights' mesh spans several processes (`Kind.pooled`), which an `Engine`, stepping a
+        kind of one process, refuses."""
         self.programs: tuple[object, ...] = ()
         """The shapes of the programs compiled up front (`from_task`), one each."""
 
