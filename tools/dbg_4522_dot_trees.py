@@ -56,6 +56,8 @@ for name, lhs, rhs in (
     lhs = hidden if name == "down" else fed if name == "up" else passed
     precision = (jax.lax.Precision.HIGHEST if name == "head" or os.environ.get("HIGHEST_DIRECT")
                  else FP32_SUMS)
+    if os.environ.get("DEFAULT_DIRECT"):
+        precision = jax.lax.Precision.DEFAULT
 
     def batch(a, b):
         return jnp.einsum("btd,bdf->btf", a, b, precision=precision)

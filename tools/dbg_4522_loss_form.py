@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import functools
+import contextlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
@@ -27,6 +28,9 @@ if os.environ.get("POLICY_HIGHEST"):
     import dew.nn.precision
     arm_arithmetic.FP32_SUMS = "highest"
     dew.nn.precision.FP32_SUMS = "highest"
+if os.environ.get("POLICY_USER_DEFAULT"):
+    os.environ["DEW_WIDE_CPU_ARITHMETIC"] = "0"
+    summed_as_run = contextlib.nullcontext
 
 _original_scored = _Chain.scored
 
@@ -169,7 +173,7 @@ for seed in range(count):
             with summed_as_run():
                 text = program.lower(*inputs).compile().as_text()
             print("HLO", name, "ynn", text.lower().count("ynn"),
-                  "bf16", text.count("bf16"), flush=True)
+                  "bf16", text.count("bf16"), "f64", text.count("f64"), flush=True)
             Path("/tmp/4522-" + "-".join(name) + ".hlo").write_text(text)
 for key, errors in totals.items():
     path, variant, mode = key
