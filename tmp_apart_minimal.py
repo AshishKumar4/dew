@@ -19,10 +19,19 @@ for label, scope in [("bare", contextlib.nullcontext), ("summed", summed_as_run)
             p = trainer.plan["probes"][0]
             print("K footprint", label, copies, rows, "used", free - p["headroom"],
                   "temp", p["temp"], "argument", p["argument"], flush=True)
-for label, scope in [("original", contextlib.nullcontext), ("same-arithmetic-calibration", summed_as_run)]:
+for label in ["original", "same-arithmetic-calibration"]:
     os.environ["DEW_RUNG_RECORDS"] = tempfile.mkdtemp()
     try:
-        with pytest.MonkeyPatch.context() as patch, scope():
+        with pytest.MonkeyPatch.context() as patch:
+            if label != "original":
+                original, calls = t._trained, [0]
+                def calibrated(*args, **kwargs):
+                    calls[0] += 1
+                    # Only the three sizing calls and direct plan-apart run.
+                    # Leave the gate's float64 truth outside FP32_SUMS.
+                    with summed_as_run() if calls[0] <= 4 else contextlib.nullcontext():
+                        return original(*args, **kwargs)
+                patch.setattr(t, "_trained", calibrated)
             t.test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(patch)
         print("K TEST PASS", label, flush=True)
     except Exception as error:
