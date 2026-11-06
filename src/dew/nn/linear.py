@@ -466,8 +466,18 @@ def entered_scan(mixed, taps, bias, rule, coordinates: Coordinates, state_shape:
     held = document_tails(mixed, roots, documents, width, count)
     convolved = entered_conv1d(mixed, taps, branches, documents, held, entered.entered, bias=bias,
                                parts=parts, dtype=dtype)
-    second, _ = rule(convolved, valid=branches, starts=begins & branches, state=finals,
-                     entered=entered.entered)
+    # A call numbers its documents by their starts, in order: the first call's finals are its roots' in
+    # theirs, and the second's documents its branches in theirs, each entering its root's rank.
+    exists = jnp.zeros(entered.entered.shape, bool).at[jnp.arange(documents.shape[0])[:, None],
+                                                       jnp.maximum(documents - 1, 0)].max(documents > 0)
+    rooted = exists & (entered.entered == 0)
+    rank = jnp.cumsum(rooted, axis=1)
+    branched = exists & ~rooted
+    order = jnp.where(branched, jnp.cumsum(branched, axis=1) - 1, count)
+    root_rank = jnp.take_along_axis(rank, jnp.maximum(entered.entered - 1, 0), axis=1)
+    slots = jnp.zeros_like(entered.entered).at[jnp.arange(documents.shape[0])[:, None], order].set(
+        jnp.where(branched, root_rank, 0), mode="drop")
+    second, _ = rule(convolved, valid=branches, starts=begins & branches, state=finals, entered=slots)
     out = jnp.where(roots[:, :, *([None] * (first.ndim - 2))], first, second)
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
