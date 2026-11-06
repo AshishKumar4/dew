@@ -27,6 +27,7 @@ one process (`gpu_flow`), each cell its own file's property:
 
 import functools
 
+import blockwise_matrix
 import fused_gemm_matrix as fused_matrix
 import gemm_matrix as matrix
 import jax
@@ -174,6 +175,13 @@ def test_the_nvfp4_matrix_holds_on_this_gpu():
     in the mainloop on par with it decoded once a call, at every pair of axis values the packed kernel
     serves, each cell on its own GPU."""
     run_cells(cells_of(nvfp4_matrix.an_nvfp4_products_training_step_is_on_par))
+
+
+def test_the_blockwise_matrix_holds_on_this_gpu():
+    """The blockwise-scaled FP8 product's check-1 matrix (tests/kernel_matrix.py): its forward through the
+    template's step-scaled walk on par with the scaled blocks summed in XLA, at every pair of axis values the
+    template serves, each cell on its own GPU."""
+    run_cells(cells_of(blockwise_matrix.a_blockwise_fp8_product_is_on_par))
 
 
 def test_the_low_rank_matrix_holds_on_this_gpu():

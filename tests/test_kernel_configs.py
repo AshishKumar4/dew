@@ -888,6 +888,34 @@ def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 
+def _blockwise_projected():
+    """A blockwise-scaled FP8 MoE projection (`gemm.blockwise_fp8_product`, DeepSeek-V3's 1 x 128 rows and
+    128 x 128 weight blocks, eight experts) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def product(rows, matrices, sizes, row_scales, column_scales):
+        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+            return gemm.blockwise_fp8_product(rows, matrices, sizes, row_scales, column_scales,
+                                              out_dtype=jnp.bfloat16)
+
+    fp8 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float8_e4m3fn)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return product, (fp8((4096, 2048)), fp8((8, 768, 2048)), jax.ShapeDtypeStruct((8,), jnp.int32),
+                     f32((16, 4096)), f32((8, 16, 6)))
+
+
+def test_an_hoppers_blockwise_fp8_product_runs_the_template_named_for_it():
+    """A blockwise-scaled FP8 MoE projection, the template named, compiled for a compile-only H100: its
+    program launches the template's grouped product, reading the experts' FP8 matrices whole
+    (`kernel_compile.Expected`, its route evidence; row 4518)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,) * 5, launches=frozenset({"dew_gmm"}),
+                        shards={"dew_gmm": (8, 768, 2048)})
+    cases = [support.KernelCase("blockwise fp8", _blockwise_projected, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
+
+
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
     A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two

@@ -1367,10 +1367,14 @@ class Issuer[Accumulator](abc.ABC):
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
 
-    def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool) -> jax.Array:
+    def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool, scale: Callable | None = None
+                     ) -> jax.Array:
         """`running` plus `lhs @ rhs` summed apart (exact sums, `templates.product.promoted`): the step's own
-        fp32 sum of its products, added into `running` by an IEEE add."""
-        return running + self.product(lhs, rhs, running.shape, interpret=interpret)
+        fp32 sum of its products, times `scale(start, columns)` where given (its columns' multiplier from
+        `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`), added into `running`
+        by an IEEE add."""
+        fresh = self.product(lhs, rhs, running.shape, interpret=interpret)
+        return running + (fresh if scale is None else fresh * scale(0, running.shape[1]))
 
     @abc.abstractmethod
     def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
