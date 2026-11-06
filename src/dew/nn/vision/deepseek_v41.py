@@ -11,7 +11,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
-from dew.interop.weights import in_params
+from dew.interop.layouts import Table
 from dew.nn.activations import gelu_exact
 from dew.nn.mlp import GatedMLP
 from dew.registry import Record
@@ -23,8 +23,9 @@ from .common import (
     TowerGeometry,
     TowerLayout,
     _vision_section,
-    block_tensor_path,
+    block_routes,
     rope_base,
+    tensor_routes,
 )
 from .vit import VisionTransformer, ViTLayout
 
@@ -112,7 +113,7 @@ class DeepseekV41Projector(ProjectorBase):
                                 jnp.broadcast_to(end, (images, 1, self.out_width))], axis=1)
 
 
-# A block's maps as the decoder block names them (`block_tensor_path`).
+# A block's maps as the decoder block names them (`block_routes`).
 _BLOCK_MAPS = {("attn", "wqkv"): ("self_attn", "qkv_proj"), ("attn", "wo"): ("self_attn", "o_proj"),
                ("mlp", "w1"): ("mlp", "gate_up_proj"), ("mlp", "w2"): ("mlp", "down_proj")}
 _DEEPSEEK_V41_VISION_TENSORS = {
@@ -122,14 +123,9 @@ _DEEPSEEK_V41_VISION_TENSORS = {
 }
 
 
-def deepseek_v41_vision_path(hf_name: str) -> tuple[str, ...]:
-    """One DeepSeek-V4.1 ViT tensor name, its `vision.` prefix off, into its
-    path in the trunk tree; anything else raises ValueError."""
-    path = (_DEEPSEEK_V41_VISION_TENSORS.get(hf_name)
-            or block_tensor_path(hf_name.split("."), _BLOCK_MAPS, norm_bias=False))
-    if path is None:
-        raise ValueError(f"unknown tensor name {hf_name!r}")
-    return path
+_DEEPSEEK_V41_ROUTES = Table(*tensor_routes(_DEEPSEEK_V41_VISION_TENSORS),
+                             block_routes(_BLOCK_MAPS, norm_bias=False))
+"""A DeepSeek-V4.1 ViT's tensor names past `vision.`, both ways."""
 
 
 def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -171,7 +167,7 @@ def translate_deepseek_v41_projector_config(hf_config: Mapping[str, object],
     }}
 
 
-DeepseekV41Vision.checkpoint = TowerLayout("vision.", in_params(deepseek_v41_vision_path))
+DeepseekV41Vision.checkpoint = TowerLayout("vision.", _DEEPSEEK_V41_ROUTES)
 # The aligner's maps under its `aligner.` prefix, and the span's learned vectors, which the release
 # keeps at its top level (model.py:1215-1222).
 DeepseekV41Projector.checkpoint = ProjectorLayout("aligner.", {
