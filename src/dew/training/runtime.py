@@ -36,7 +36,7 @@ from dew._devices import (
 )
 from dew._logging import configure as configure_logging
 from dew._pool import PREEMPTED_EXIT, joins_pool, refuse_idle_gpus, runs_on_gpu, slurm_tasks_here
-from dew.clusters import ClusterEnvironment, detected_environment
+from dew.clusters import ClusterEnvironment, Joining, detected_environment
 
 _log = logging.getLogger(__name__)
 
@@ -212,7 +212,13 @@ def _join_process_pool(environment: ClusterEnvironment | None, joins: bool) -> N
         refuse_idle_gpus(tasks, None if gpus is None else len(gpus), "this slurm step")
     if not joins:
         return
-    jax.distributed.initialize(**({} if joining is None else joining.arguments()))
+    joining = joining or Joining()
+    jax.distributed.initialize(
+        coordinator_address=joining.coordinator_address, num_processes=joining.process_count,
+        process_id=joining.process_id,
+        local_device_ids=None if joining.local_device_ids is None else list(joining.local_device_ids),
+        # JAX's detection fills what the environment leaves None, or detects nothing where it states all.
+        cluster_detection_method=None if joining.fills else "deactivate")
     _joined()
 
 

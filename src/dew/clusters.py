@@ -61,15 +61,6 @@ class Joining:
     local_device_ids: tuple[int, ...] | None = None
     fills: bool = True
 
-    def arguments(self) -> dict[str, object]:
-        """`jax.distributed.initialize`'s arguments: the facts it holds, and JAX's detection turned off
-        where it fills none (`fills`)."""
-        stated = {"coordinator_address": self.coordinator_address, "num_processes": self.process_count,
-                  "process_id": self.process_id,
-                  "local_device_ids": None if self.local_device_ids is None else list(self.local_device_ids)}
-        return {**{name: value for name, value in stated.items() if value is not None},
-                **({} if self.fills else {"cluster_detection_method": "deactivate"})}
-
 
 @runtime_checkable
 class ClusterEnvironment(Protocol):
