@@ -1068,7 +1068,7 @@ def test_a_deep_dense_walk_meets_along_its_depth_past_the_l2s_reach():
     assert steps(64, 51200) == 0
 
 
-@pytest.mark.parametrize("generation_name", ["sm90"])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 def test_a_met_dense_walk_lowers_for_cuda(generation_name):
     """A dense product's derived tile made met (`Tiles.raster`: its programs signalling and waiting on a
     GPU-scope semaphore a round each chunk of steps, `mosaic_gpu._met`) lowers for CUDA on the CPU on a family
