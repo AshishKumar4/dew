@@ -235,9 +235,10 @@ def autotune_dir(path: str) -> str:
     per fusion, and Dew's kernels' beside them (`kernel_picks_path`). The GPU
     compile each pick's speed depends on, XLA's, Triton's and Mosaic GPU's,
     runs in the plugin, and Dew builds its plugins again under one jaxlib, a
-    version each (row 3560)."""
+    version each (row 3560). The builds go in order of their names, an order
+    any other reader of the installed wheels can take without this list."""
     plugins = "".join(f"-{build}-{importlib.metadata.version(f'jax-{build}-pjrt')}"
-                      for build in cuda_builds())
+                      for build in sorted(cuda_builds()))
     return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}{plugins}")
 
 
