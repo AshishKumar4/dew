@@ -20,6 +20,13 @@ PROGRAMS = {"jax.make_jaxpr", "lower", "compile", "trace"}
 """The calls whose value is a program, whose str or repr prints its IR: a jaxpr, a lowering, a compilation."""
 FILE_READERS = {"read_text", "read_bytes", "read", "readlines"}
 """How a test reads a file's text."""
+STRING_METHODS = {"splitlines", "split", "strip", "lstrip", "rstrip", "lower", "upper", "count", "find",
+                  "index", "startswith", "endswith", "partition", "rpartition", "replace", "join", "decode",
+                  "encode"}
+"""A string's methods, whose result is the text matched or reshaped."""
+TEXT_CALLS = {"re.search", "re.match", "re.fullmatch", "re.findall", "re.finditer", "re.sub", "re.split",
+              "len", "str", "repr", "sorted", "set", "list", "tuple", "any", "all", "sum", "max", "min"}
+"""The library calls whose result is still the text, or a measure of it, that they are handed."""
 
 
 def _resolved(node: ast.expr, tables: Mapping[int, Mapping[str, str]]) -> str:
@@ -80,11 +87,18 @@ class _Taint:
                 or (called in ("str", "repr") and bool(node.args) and self.program(node.args[0])))
 
     def text(self, node: ast.AST) -> bool:
-        """Whether `node` reads source or IR as text, past no first-party call: what one returns is the
-        behaviour under test, whatever it was handed."""
+        """Whether `node` is source or IR text, or text matched, searched, split or compared from it: through
+        operators, comprehensions, a string's own methods and `TEXT_CALLS`, never another call, whose result
+        is a parse (Dew's own, `dew.telemetry.instrumentation.hlo_instructions`, or a helper's) and not the
+        text."""
         if self.read(node):
             return True
-        if isinstance(node, ast.Call) and self.first_party(node.func):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if _resolved(func, self.tables) in TEXT_CALLS:
+                return any(self.text(argument) for argument in node.args)
+            return isinstance(func, ast.Attribute) and func.attr in STRING_METHODS and self.text(func.value)
+        if isinstance(node, ast.Lambda | ast.Dict | ast.DictComp):
             return False
         return any(self.text(child) for child in ast.iter_child_nodes(node))
 
