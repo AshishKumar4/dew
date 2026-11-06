@@ -101,24 +101,62 @@ def encoded(directory: Path, conditioner: str, rows: list, placement: dict, *, w
     return {"conditioning": jax.jit(encoder.encode)(encoder.params, encoder.tokenize(rows))}
 
 
+def assert_encoded_as_the_task(directory: Path, family: str, task, placement: dict, rows: int) -> None:
+    """The pipeline's conditioner loaded alone encodes as `task` encodes: its masks equal, and over drawn
+    prompts its encodings as exact as the task's against the same conditioner's float64 encoding (check 1):
+    the two compile two programs, the task's encoding its rows padded and placed as it walks them."""
+    def leaves(tree, kind) -> dict[str, np.ndarray]:
+        """An encoding's leaves of `kind`, the masks (bool) or the values (float), by their place."""
+        held = [np.asarray(leaf)[:rows] for leaf in jax.tree.leaves(tree)]
+        return {str(index): leaf for index, leaf in enumerate(held)
+                if (leaf.dtype == bool) == (kind == "masks")}
+
+    def alone(prompts, kind="values"):
+        return leaves(encoded(directory, ENCODED[family], list(prompts), placement)["conditioning"], kind)
+
+    def task_own(prompts, kind="values"):
+        return leaves(task.prepare(list(prompts), key=3, steps=2).conditions["conditioning"], kind)
+
+    def truth(prompts):
+        with jax.enable_x64(new_val=True):
+            wide = encoded(directory, ENCODED[family], list(prompts), {}, widened=True)["conditioning"]
+            wide = leaves(wide, "values")
+        assert all(leaf.dtype == np.float64 for leaf in wide.values())
+        return wide
+
+    masks = zip(alone(PROMPTS, "masks").values(), task_own(PROMPTS, "masks").values(), strict=True)
+    for got, want in masks:
+        np.testing.assert_array_equal(got, want)
+
+    def drawn(seed):
+        return list(drawn_prompts(2190, seed, rows))
+
+    assert_as_exact(as_given(lambda seed: alone(drawn(seed))), as_given(lambda seed: task_own(drawn(seed))),
+                    lambda seed: (np.int32(seed),), f"{family} conditioner alone",
+                    seeds=CONDITIONER_SEEDS, truth_fn=as_given(lambda seed: truth(drawn(seed))))
+
+
 @pytest.mark.parametrize("family", sorted(ENCODED))
 def test_an_encoded_call_without_the_text_encoder_draws_the_prompted_images(extracted, family):
-    """The prompts and the blank negative encoded by the conditioner alone,
-    walked by the pipeline loaded without it, guided at its own scale: the
-    prompted call's images, bit for bit, from the same per-row noise."""
+    """The pipeline loaded without its text encoder, given the prompted call's encodings and its blank
+    negative, walks to the prompted call's images bit for bit from the same per-row noise: one walk
+    program over the same values (its lowered HLO differs by a source line's metadata alone, row 3177).
+    The conditioner loaded alone encodes as the task does (`assert_encoded_as_the_task`): two programs,
+    on par from float64."""
     directory = extracted[family]
     whole = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
     task = whole.text_to_image()
-    prompted = task(task.prepare(PROMPTS, key=3, steps=2), key=3).host().images
+    request = task.prepare(PROMPTS, key=3, steps=2)
+    prompted = task(request, key=3).host().images
     lean = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", text=False)
     assert "conditioning" not in lean.variables["encoders"]
-    blank = whole.inputs.conditions["conditioning"].unconditional
     lean_task = lean.text_to_image()
-    conditioner = ENCODED[family]
-    prepared = lean_task.prepare(conditions=encoded(directory, conditioner, PROMPTS, {}),
-                                 unconditional=encoded(directory, conditioner, [blank], {}), key=3, steps=2)
+    rows = len(PROMPTS)
+    prepared = lean_task.prepare(conditions=jax.tree.map(lambda leaf: leaf[:rows], request.conditions),
+                                 unconditional=request.unconditional, key=3, steps=2)
     walked = lean_task(prepared, key=3).host().images
     assert_same_bits(walked, prompted)
+    assert_encoded_as_the_task(directory, family, task, {}, rows)
 
 
 @pytest.mark.mesh
@@ -174,37 +212,12 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
     rows = len(PROMPTS)
     own = lean_task.prepare(conditions=jax.tree.map(lambda leaf: leaf[:rows], prompted.conditions),
                             unconditional=prompted.unconditional, key=3, steps=2)
+    # The noise is one draw from one key, and the lean walk is the whole one's program: its lowered HLO
+    # differs by a source line's metadata alone (row 3177), so the images hold one program's bits.
     assert_same_bits(own.noise, prompted.noise)
     walked = lean_task(own, key=3).host().images
     assert_same_bits(walked, task(prompted, key=3).host().images)
-    def leaves(tree, kind) -> dict[str, np.ndarray]:
-        """An encoding's leaves of `kind`, the masks (bool) or the values (float), by their place."""
-        held = [np.asarray(leaf)[:rows] for leaf in jax.tree.leaves(tree)]
-        return {str(index): leaf for index, leaf in enumerate(held)
-                if (leaf.dtype == bool) == (kind == "masks")}
-
-    def alone(prompts, kind="values"):
-        return leaves(encoded(directory, ENCODED[family], list(prompts), placement)["conditioning"], kind)
-
-    def task_own(prompts, kind="values"):
-        return leaves(task.prepare(list(prompts), key=3, steps=2).conditions["conditioning"], kind)
-
-    def truth(prompts):
-        with jax.enable_x64(new_val=True):
-            wide = encoded(directory, ENCODED[family], list(prompts), {}, widened=True)["conditioning"]
-            wide = leaves(wide, "values")
-        assert all(leaf.dtype == np.float64 for leaf in wide.values())
-        return wide
-
-    masks = zip(alone(PROMPTS, "masks").values(), task_own(PROMPTS, "masks").values(), strict=True)
-    for got, want in masks:
-        np.testing.assert_array_equal(got, want)
-    def drawn(seed):
-        return list(drawn_prompts(2190, seed, rows))
-
-    assert_as_exact(as_given(lambda seed: alone(drawn(seed))), as_given(lambda seed: task_own(drawn(seed))),
-                    lambda seed: (np.int32(seed),), f"{family} conditioner alone",
-                    seeds=CONDITIONER_SEEDS, truth_fn=as_given(lambda seed: truth(drawn(seed))))
+    assert_encoded_as_the_task(directory, family, task, placement, rows)
 
 
 WIDER_FLUX = """

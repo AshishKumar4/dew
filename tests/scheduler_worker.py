@@ -28,6 +28,12 @@ TASKS = 8
 PACKED = ("input_ids", "response_mask", "old_log_probs", "behavior_log_probs", "advantages")
 
 
+def reward(task: int, sample: int, estimator: str) -> float:
+    """A session's reward: under `global` its sample's index times its task's id, so the shares'
+    returns spread apart; else its sample's index."""
+    return float(sample) * (task if estimator == "global" else 1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
@@ -72,8 +78,8 @@ def main() -> None:
         call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), sampled,
                     (-0.5 - 0.01 * sample, -0.25), "stop", version, **recorded)
         status = Status.TRUNCATED if args.records and int(task.id) > TASKS // 2 else Status.COMPLETED
-        reward = float(sample) * (int(task.id) if args.estimator == "global" else 1)
-        return Session(str(task.id), "", 0, 0, (call,), status, reward, {}, "")
+        return Session(str(task.id), "", 0, 0, (call,), status, reward(int(task.id), sample, args.estimator),
+                       {}, "")
 
     def share(partition):
         rows = partition.rows(TASKS)
