@@ -434,9 +434,13 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 for shape, dtype in outputs]
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
-        # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps.
+        # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps,
+        # and where two consumers run it together the two barriers they meet at in turn (its thread axis).
         slots = streams.stages if steps is None else min(streams.stages, steps)
-        return (), (tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in streams.blocks.values()),)
+        meet = (() if streams.consumers == 1
+                else (plgpu.Barrier(num_arrivals=streams.consumers, num_barriers=2),))
+        tiles = tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in streams.blocks.values())
+        return (), ((*tiles, *meet),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
