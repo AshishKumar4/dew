@@ -177,7 +177,7 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     recurrent layers read no key runs (Qwen3.5's gated delta net), the run is refused, as its rows' streams
     would be read as one sequence (until a document enters from a given memory, row 1506)."""
     from run_kinds import QWEN_TINY, lettered, trained
-    from test_decision_streams import LLAMA
+    from test_decision_streams import GEMMA
 
     from dew.data import Memory
     from dew.decision import Decide, decisions
@@ -187,7 +187,7 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     assert run.pretrained == str(QWEN_TINY)
     with pytest.raises(ValueError):
         trained(run, tmp_path, "hybrid")
-    run = dataclasses.replace(run, pretrained=str(LLAMA))
+    run = dataclasses.replace(run, pretrained=str(GEMMA))
     trained(run, tmp_path, "shared")
     decide = Decide.from_run(str(tmp_path / "runs" / "shared"))
     assert decide.layout.shared_state == 3
