@@ -89,6 +89,7 @@ from ..inputs import (
     CrossContext,
     LayerInputs,
     PredictionPhase,
+    check_tree,
     coordinates_of,
     numbered_blocks,
 )
@@ -1592,9 +1593,7 @@ class CausalTransformer(LinearProducts):
           query's key intervals, whose union it reads, R of them, static, its
           key positions windowed within each run alone (the template's spans,
           `dew.nn.attention.scaled_dot_product_attention`'s `key_runs`).
-        - `attention_tree`, static, makes a cached call a tree of candidate tokens: each token's parent
-          among the call's, -1 for the row's last cached token (`dew.nn.inputs.AttentionMetadata.tree`);
-          its attention mask comes as `attention_key_runs`.
+        - `attention_tree`, static: a cached call's tree of candidates (`AttentionMetadata.tree_parents`).
         - `routed_experts` `[B, S, layers, top_k]` (or one such a routed site, keyed by
           it, `LayerInputs.experts`, where a layer routes at several) replays a rollout engine's
           routing (vLLM's `routed_experts`, SGLang's
@@ -1680,25 +1679,6 @@ class CausalTransformer(LinearProducts):
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction
 
-    def _check_tree(self, tree: tuple[int, ...], length: int, *, decode: bool, key_runs, positioned: bool
-                    ) -> None:
-        """Refuse a tree call (`AttentionMetadata.tree`) the model cannot read as its paths: outside a cached
-        call, without the key runs that mask its attention, of another length than its tokens, with a parent
-        not before its child; a branching tree whose tokens' positions the call does not state
-        (coordinates or rotary positions: each token's is its depth, which its index is on a chain alone);
-        and a model whose layers read the call's tokens in their order before any mixer sees the tree, its
-        n-gram hashes and per-layer convolution (`engram`) or its routing blocks."""
-        if not decode or key_runs is None or len(tree) != length or any(
-                not -1 <= parent < index for index, parent in enumerate(tree)):
-            raise ValueError(f"a tree is a cached call's, its attention masked by its key runs, each of its "
-                             f"{length} tokens' parent an earlier one or -1 for the row's cache, got {tree}")
-        if not positioned and any(parent != index - 1 for index, parent in enumerate(tree)):
-            raise ValueError("a branching tree states its tokens' positions, each its depth on its path "
-                             "(coordinates or attention_rotary_positions)")
-        if self.engram is not None or (self.mixture is not None and self.mixture.routing_block is not None):
-            raise ValueError("a tree call is read along its paths by the mixers alone: this model's n-gram "
-                             "hashes, per-layer convolution or routing blocks read its tokens in their order")
-
     def _attention_metadata(self, tokens, decode: bool, image_groups, block_groups, rotary_positions,
                             pairwise_mask, key_positions, key_runs, media_mask, admitted=None,
                             coordinates: Coordinates | None = None,
@@ -1729,9 +1709,10 @@ class CausalTransformer(LinearProducts):
         if pairwise_mask is not None and key_runs is not None:
             raise ValueError("attention_key_runs and attention_pairwise_mask each name a call's whole "
                              "visibility; pass one")
-        if tree is not None:
-            self._check_tree(tree, tokens.shape[1], decode=decode, key_runs=key_runs,
-                             positioned=coordinates is not None or rotary_positions is not None)
+        if tree is not None:  # N-gram hashes and routing blocks read the tokens in their order.
+            routed = self.mixture is not None and self.mixture.routing_block is not None
+            check_tree(tree, tokens.shape[1], decode=decode, ordered=self.engram is not None or routed,
+                       positioned=coordinates is not None or rotary_positions is not None)
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
         if decode and coordinates is not None and coordinates.max_segments > 1:
@@ -1767,7 +1748,7 @@ class CausalTransformer(LinearProducts):
             # pipeline's microbatches slice (`run_pipeline`).
             progress=None if progress is None or progress.updates is None else jnp.broadcast_to(
                 jnp.asarray(progress.updates, jnp.int32), tokens.shape[:1]),
-            routing_block=block, tree=tree,
+            routing_block=block, tree_parents=tree,
             whole_blocks=whole_blocks and block_groups is not None)
 
     def looped(self, x, **stack):

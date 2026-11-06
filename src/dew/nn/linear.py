@@ -399,10 +399,10 @@ def tree_windows(tree: tuple[int, ...], width: int) -> np.ndarray:
 
 
 def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, parts=None, dtype=None):
-    """A tree call's causal conv (`dew.nn.inputs.AttentionMetadata.tree`): each token of `mixed` `[B, S, D]`
-    convolved over the `K-1` tokens before it on its path, its ancestors, and past the root the held
-    `history` `[B, K-1, D]`, as `causal_conv1d` convolves the window it ends (`tree_windows`); its
-    `parts` and `dtype` are `causal_conv1d`'s."""
+    """A tree call's causal conv (`dew.nn.inputs.AttentionMetadata.tree_parents`): each token of `mixed`
+    `[B, S, D]` convolved over the `K-1` tokens before it on its path, its ancestors, and past the root
+    the held `history` `[B, K-1, D]`, as `causal_conv1d` convolves the window it ends (`tree_windows`);
+    its `parts` and `dtype` are `causal_conv1d`'s."""
     batch, length, features = mixed.shape
     width = taps.shape[1] - 1
     windows = jnp.concatenate([history.astype(mixed.dtype), mixed], axis=1)[:, tree_windows(tree, width)]
@@ -783,7 +783,7 @@ class GatedDeltaNet(nn.Module):
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree", "key_runs"})
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs"})
     """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's alone, and the key runs that
     mask its attention beside it: a recurrence reads every earlier token of its document, with no mask
     or bias to narrow it, and on a tree its path's (`tree_conv`, `tree_rule`). Key runs without a tree
@@ -1062,7 +1062,7 @@ class GatedDeltaNet(nn.Module):
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
-        tree = None if attention_metadata is None else attention_metadata.tree
+        tree = None if attention_metadata is None else attention_metadata.tree_parents
         if tree is None and attention_metadata is not None and attention_metadata.key_runs is not None:
             raise ValueError("a gated delta net reads key runs only as a tree call's attention mask, and "
                              "would run them as if unset")
