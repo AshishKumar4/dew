@@ -36,12 +36,18 @@ CONTRACTED = {
         ("test_a_wide_cpu_sum_of_products_holds_every_order", NUMERICS),
     "src/dew/nn/kernels/gemm.py::gemm.linear_tangent":
         ("test_a_grouped_gemm_holds_every_order", KERNEL),
+    "src/dew/nn/kernels/gemm.py::_low_rank":
+        ("test_an_adapted_product_holds_every_reverse_order", KERNEL),
     "src/dew/nn/kernels/templates/recurrence/selective.py::_scan":
         ("test_the_selective_scan_holds_its_orders", KERNEL),
     "src/dew/algebra/scan.py::_decays_rule.linear_tangent":
         ("test_the_derived_delta_rule_chunks_hold_their_orders", NUMERICS),
     "src/dew/algebra/scan.py::_lowered_rule.linear_tangent":
         ("test_the_derived_delta_rule_chunks_hold_their_orders", NUMERICS),
+    "src/dew/algebra/scan.py::_adjoined.rule":
+        ("test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders", KERNEL),
+    "src/dew/algebra/scan.py::_kept_rule":
+        ("test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders", NUMERICS),
     "src/dew/nn/kernels/recurrence_chunk.py::_portable_rule.linear_tangent":
         ("test_the_chunked_delta_rule_holds_every_order", NUMERICS),
     "src/dew/nn/kernels/recurrence_algebra.py::decays":
