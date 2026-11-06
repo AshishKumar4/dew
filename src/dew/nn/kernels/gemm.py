@@ -470,6 +470,7 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
                                 multiprocessors=launch._launched(tile, interpret_on_cpu),
                                 interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
                                 exact_sums=True, step_scales=(row_scales, column_scales))
+        assert isinstance(summed, jax.Array), "an unpaired product has one output"
     else:
         # Each product of two FP8 values is exact in bfloat16's range and in fp32.
         matrices = jnp.swapaxes(kernel, 1, 2).astype(jnp.bfloat16)
