@@ -748,7 +748,7 @@ class KVStore:
             # pool's scales.
             starts = extras[0] if given else None
             sinks = extras[len(given)] if sunk else None
-            if kernel == 'template' and scaled:
+            if kernel == 'template' and dequantizes:
                 return template_quantized(query, key, value, table, lengths, *extras[-2:], starts,
                                           sinks if sunk else None, softcap=softcap)
             if kernel == 'template':
@@ -765,8 +765,8 @@ class KVStore:
         sunk = () if sinks is None else (sinks,)
         pools = [self._get(name) for name, _ in self.payloads]
         # A quantized pool's codes and their scales `[KV, P, page]`, which the template reads as they are.
-        scaled = kernel == 'template' and self.layout.quantized is not None
-        scales = (tuple(self._get(scale) for _, scale in self.payloads) * 2)[:2] if scaled else ()
+        dequantizes = kernel == 'template' and self.layout.quantized is not None
+        scales = (tuple(self._get(scale) for _, scale in self.payloads) * 2)[:2] if dequantizes else ()
         arrays = (query, pools[0], pools[-1], lengths, self._absolute(self._get(TABLE)),
                   *given, *sunk, *scales)
         queries = logical_spec(DECODE_QUERY, query.shape)
