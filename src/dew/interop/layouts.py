@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path as FilePath
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from dew.interop.decoder_parts import SourceCode
@@ -442,27 +442,27 @@ type ConfigRead = Callable[[Mapping[str, object], set[str], dict[str, object]], 
 record its earlier parts filled, which it returns filled further (a reader of a whole record its own,
 typed as it builds it: `NativeFields`)."""
 
-type ConfigWrite = Callable[[Any], Mapping[str, object]]
+type ConfigWrite[Model] = Callable[[Model], Mapping[str, object]]
 """A config part's write: a model's keys in the family's config, refusing a model it cannot spell
 (`decoder_parts.ExportRefused`)."""
 
 
 @dataclass(frozen=True, eq=False)
-class ConfigPart:
+class ConfigPart[Model]:
     """Config keys a family reads and writes together (`read`, `write`), declared side by side so neither
     changes alone: the shared decoder's geometry, a family's routed experts and their schedule, its rotary
     records, its layer kinds. A family composes its parts (`ConfigLayout`), and its reader and its writer
     are theirs (`DecoderFamily.translate_config`, `export_fields`)."""
 
     read: ConfigRead
-    write: ConfigWrite
+    write: ConfigWrite[Model]
 
 
 _MISSING = object()
 
 
 @dataclass(frozen=True, eq=False)
-class ConfigField:
+class ConfigField[Model]:
     """One config key (`key`) and the record field it states (`field`), both ways: read as `parse` reads
     the value stated, or `default` where the config omits it (the config class's own), and written as
     `value` gives it of the model (the field itself where None), spelled by `spell` (as stated where
@@ -472,32 +472,36 @@ class ConfigField:
     field: str
     default: object = _MISSING
     parse: Callable[[object, str], object] | None = None
-    value: Callable[[object], object] | None = None
+    value: Callable[[Model], object] | None = None
     spell: Callable[[object], object] | None = None
+    aliases: tuple[str, ...] = ()
+    """Other keys a config may state it under, read where `key` is absent, in order; written as `key`."""
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
              record: dict[str, object]) -> dict[str, object]:
-        used.add(self.key)
-        if self.key not in hf_config and self.default is _MISSING:
+        keys = (self.key, *self.aliases)
+        used.update(keys)
+        key = next((key for key in keys if key in hf_config), None)
+        if key is None and self.default is _MISSING:
             raise KeyError(self.key)
-        stated = hf_config.get(self.key, self.default)
-        record[self.field] = stated if self.parse is None else self.parse(stated, self.key)
+        stated = self.default if key is None else hf_config[key]
+        record[self.field] = stated if self.parse is None else self.parse(stated, key or self.key)
         return record
 
-    def write(self, model: object) -> Mapping[str, object]:
+    def write(self, model: Model) -> Mapping[str, object]:
         held = getattr(model, self.field) if self.value is None else self.value(model)
         return {self.key: held if self.spell is None else self.spell(held)}
 
 
 @dataclass(frozen=True, eq=False)
-class ConfigLayout:
+class ConfigLayout[Model]:
     """A family's config, its parts in order (`ConfigPart`, `ConfigField`, or another layout): read, each
     filling the record (`read`), and written, each stating its keys (`write`, a later part's keys over an
     earlier's)."""
 
-    parts: tuple[ConfigPart | ConfigField | ConfigLayout, ...]
+    parts: tuple[ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model], ...]
 
-    def __init__(self, *parts: ConfigPart | ConfigField | ConfigLayout) -> None:
+    def __init__(self, *parts: ConfigPart[Model] | ConfigField[Model] | ConfigLayout[Model]) -> None:
         object.__setattr__(self, 'parts', parts)
 
     def read(self, hf_config: Mapping[str, object], used: set[str],
@@ -506,7 +510,7 @@ class ConfigLayout:
             record = part.read(hf_config, used, record)
         return record
 
-    def write(self, model: object) -> Mapping[str, object]:
+    def write(self, model: Model) -> Mapping[str, object]:
         written: dict[str, object] = {}
         for part in self.parts:
             written.update(part.write(model))

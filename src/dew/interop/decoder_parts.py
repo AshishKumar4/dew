@@ -2098,7 +2098,7 @@ class DecoderFamily:
     """
 
     model_types: tuple[str, ...]
-    config: ConfigLayout
+    config: ConfigLayout[CausalTransformer]
     """The family's config, both ways (`dew.interop.layouts.ConfigLayout`): the record a source config
     states (`translate_config`) and the keys a model's fields state in it (`export_fields`), read and
     written by the same parts."""
