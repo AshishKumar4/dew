@@ -211,6 +211,8 @@ def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
                if name in stored and used in ((), (FSDP_AXIS,)) and size % mesh.shape.get(FSDP_AXIS, 1) == 0]
     if (FSDP_AXIS,) in assigned and assigned.index((FSDP_AXIS,)) in leading:
         assigned[assigned.index((FSDP_AXIS,))], assigned[leading[0]] = (), (FSDP_AXIS,)
+    if (FSDP_AXIS,) in assigned:
+        assigned = [() if used == (TENSOR_AXIS,) else used for used in assigned]
     entries = [used[0] if len(used) == 1 else used or None for used in assigned]
     while entries and entries[-1] is None:
         entries.pop()
