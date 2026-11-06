@@ -103,8 +103,10 @@ for case, implementation, finish_on_close in (
         try:
             target(Path(tempfile.mkdtemp()))
         except AssertionError as error:
-            assert case != "correct_bound_and_finish_complete_shard"
-            print("TARGET_TEST", case, "RED", error.__traceback__.tb_next.tb_lineno, flush=True)
+            frame = error.__traceback__.tb_next.tb_frame
+            print("TARGET_TEST", case, "RED", error.__traceback__.tb_next.tb_lineno,
+                  "filled.calls", frame.f_locals["filled"].calls,
+                  "reading.calls", frame.f_locals["reading"].calls, flush=True)
         else:
             assert case == "correct_bound_and_finish_complete_shard"
             print("TARGET_TEST", case, "GREEN", flush=True)
