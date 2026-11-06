@@ -102,8 +102,8 @@ class TreeBlock(NamedTuple):
         starts = jnp.where(held >= 0, cursor + held, 0)
         ends = jnp.where(held >= 0, cursor + held + 1, 0)
         rows = self.cursor.shape[0]
-        prefix = jnp.broadcast_to(jnp.stack([jnp.zeros_like(self.cursor), self.cursor + 1], -1)[:, None, None],
-                                  (rows, shape.nodes + 1, 1, 2))
+        prefix = jnp.stack([jnp.zeros_like(self.cursor), self.cursor + 1], -1)[:, None, None]
+        prefix = jnp.broadcast_to(prefix, (rows, shape.nodes + 1, 1, 2))
         return jnp.concatenate([prefix, jnp.stack([starts, ends], -1)], axis=2).astype(jnp.int32)
 
 
