@@ -181,7 +181,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             if len(splits) > splits_held:
                 splits.popitem(last=False)
         splits.move_to_end(key)
-        prepared = Prepared((natural, split.prepare(*given)), split, corrected, inverse=solved)
+        prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected,
+                            inverse=solved)
         if not (corrected and transition):
             return prepared
         return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
@@ -415,8 +416,17 @@ def _chunk(form: linear_scan.Form, held: tuple, h, entering, to_last, whole, bet
     decays = _Decays(entering=entering, to_last=to_last, whole=whole, between=between)
     tokens = dict(zip(TOKENS, values[:len(TOKENS)], strict=True))
     known = {terms.key(node): value for node, value in zip(held, values[len(TOKENS):], strict=True)}
-    return (_evaluated(form.outputs, tokens, decays, h, known),
-            _evaluated(form.state, tokens, decays, h, known))
+    # The language's own products (`_plain`), which the split's forms name and issue themselves
+    # (`carry.split`'s roles): a declared product's tangent in this trace reads the state opaquely.
+    return (_evaluated(form.outputs, tokens, decays, h, known, _plain),
+            _evaluated(form.state, tokens, decays, h, known, _plain))
+
+
+def _plain(name: str, left, right):
+    """A chunk's products as the language's plain ones (`float32_matmul`), as the trace `carry.split`
+    derives from takes them (`_chunk`)."""
+    del name
+    return float32_matmul(left, right)
 
 
 def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: Callable,
@@ -477,7 +487,11 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     elif (args := get_callable_args(node, Chunk.times)) is not None:
         value = of(args[0]) * of(args[1])
     elif (args := get_callable_args(node, Chunk.matmul)) is not None:
-        value = issue("apply", of(args[0]), of(args[1]))
+        # The chunk's scores (a pairing of its tokens through their decays, not the solve's) applied to its
+        # tokens' values is its local readout, `readout_local` (`carry.EMIT_ROLES`), as the hand form's.
+        pairing = get_callable_args(args[0], Chunk.gram)
+        local = pairing is not None and not terms.integer(pairing[2])
+        value = issue("readout_local" if local else "apply", of(args[0]), of(args[1]))
     elif (args := get_callable_args(node, Chunk.plus)) is not None:
         value = of(args[0]) + of(args[1])
     elif (args := get_callable_args(node, Chunk.minus)) is not None:
