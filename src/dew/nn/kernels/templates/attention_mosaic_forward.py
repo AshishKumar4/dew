@@ -69,7 +69,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle_of,
     extents,
     issued_into,
-    key_extents,
     modelled,
     query_swizzle,
     reducing,
@@ -78,6 +77,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     stagings,
     stated,
     transposed_swizzles,
+    walked_extents,
 )
 from dew.nn.kernels.templates.cost import estimate
 
@@ -174,7 +174,7 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): the largest of the
     family's row extents that divides the plain launch's query blocks (the guarded walk is a rare one's of
     its overflowed rows alone, so it takes smaller blocks where the plain launch's hold no guarded state: at
-    128 rows on an A100, FS-4324-CENSUS7), the widest of the family's key extents (`key_extents`) that
+    128 rows on an A100, FS-4324-CENSUS7), the widest of the family's key extents (`walked_extents`) that
     divides the plain key tile, so the plain launch's padded keys are whole tiles of it, and the most of the
     plain launch's consumers, whose live set a consumer's registers hold (`resources.live_registers`): its
     shifted and unshifted sums of `columns` value columns fp32 and its rows' statistics (`GUARD_ROWS`)
@@ -211,7 +211,7 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
                                for phase in fragments))
         return live <= arranged.registers(candidate.consumers)
 
-    blocks = [block for block in key_extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
+    blocks = [block for block in walked_extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
     queries = [rows for rows in extents(family, dtype, tiles.block_q) if tiles.block_q % rows == 0]
     # Its key blocks copied by its consumers together where its family's copies split them
     # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts).
