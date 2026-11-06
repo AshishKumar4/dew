@@ -236,17 +236,21 @@ def partials_of(rows: int, channels: int, states: int, target: generation.GpuTar
     return min((p for p in divisors if p >= max(PARTIALS, wave)), default=max(divisors))
 
 
-BACKWARD_VECTORS = 12
-"""The token vectors a backward thread holds live at its state loop's peak, each its tokens' fp32 values: the
-channel's sums over the states (dx, ddt), the block's operands (x, dt, dy), and the state's (B, C, its decay,
-its write, the states before each token, C dy and the cotangent after each token), counted from `backward`."""
+BACKWARD_CARRIED = ("dx", "ddt", "x", "dt", "dy")
+"""The token vectors a backward thread carries across its state loop, each its tokens' fp32 values: the
+channel's sums over the states and the block's operands."""
 
-BACKWARD_FIXED = 56
-"""The registers a backward thread holds apart from its token vectors: its refs' 64-bit addresses (20), the
-block scan's running pair, lane and warp terms (8), the state loop's scalars (its rate, entering state,
-carried cotangent, rate gradient so far and indices, 12) and a thread's control
-(`resources.CONTROL_REGISTERS`). With `BACKWARD_VECTORS` it states ptxas's least spill-free cap on an H100 at
-4, 8 and 16 tokens a thread, 96, 152 and 232, as 104, 152 and 248 (sel-need at f3040b154)."""
+BACKWARD_STATE = ("B", "C", "decay", "write", "states before", "C dy", "cotangent after")
+"""The token vectors a state's turn of the backward's state loop holds beside `BACKWARD_CARRIED` at its peak:
+the state's operands, its decay and write, the states before each token, C dy and the cotangent after each
+token, counted from `backward`."""
+
+BACKWARD_SCALARS = {"addresses": 20, "block scan": 8, "state loop": 12}
+"""The registers a backward thread holds apart from its token vectors and a thread's control
+(`resources.CONTROL_REGISTERS`): its refs' 64-bit addresses, the block scan's running pair, lane and warp
+terms, the state loop's scalars (its rate, entering state, carried cotangent, rate gradient so far and
+indices). With the vectors they state ptxas's least spill-free cap on an H100 at 4, 8 and 16 tokens a
+thread, 96, 152 and 232, as 104, 152 and 248 (sel-need at f3040b154)."""
 
 SCAN_STEPS = 16
 """The dependent steps of one block scan past its tokens' own (`templates.scan.linear_scan`): six shuffles
@@ -255,8 +259,11 @@ them, and the apply to the thread's tokens. The backward runs two a state, forwa
 
 
 def backward_registers(positions: int) -> int:
-    """The registers a backward thread holds at `positions` tokens (`BACKWARD_VECTORS`, `BACKWARD_FIXED`)."""
-    return BACKWARD_VECTORS * positions + BACKWARD_FIXED
+    """The registers a backward thread holds at `positions` tokens: its token vectors (`BACKWARD_CARRIED`,
+    `BACKWARD_STATE`), each `positions` fp32 words, its scalars (`BACKWARD_SCALARS`) and a thread's control
+    (`resources.CONTROL_REGISTERS`)."""
+    vectors = len(BACKWARD_CARRIED) + len(BACKWARD_STATE)
+    return vectors * positions + sum(BACKWARD_SCALARS.values()) + resources.CONTROL_REGISTERS
 
 
 def backward_programs(registers: int, target: generation.GpuTarget) -> int:
