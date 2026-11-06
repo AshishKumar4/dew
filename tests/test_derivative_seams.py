@@ -36,6 +36,8 @@ CONTRACTED = {
         ("test_a_wide_cpu_sum_of_products_holds_every_order", NUMERICS),
     "src/dew/nn/kernels/gemm.py::gemm.linear_tangent":
         ("test_a_grouped_gemm_holds_every_order", KERNEL),
+    "src/dew/nn/kernels/gemm.py::_low_rank":
+        ("test_an_adapted_product_holds_every_reverse_order", KERNEL),
     "src/dew/nn/kernels/templates/recurrence/selective.py::_scan":
         ("test_the_selective_scan_holds_its_orders", KERNEL),
     "src/dew/algebra/scan.py::_decays_rule.linear_tangent":
