@@ -251,7 +251,7 @@ COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma')
 """A tile two consumer warpgroups compute, on one multiprocessor."""
 
 FED = dataclasses.replace(COOPERATIVE, family=mosaic_sm90.FED.name)
-"""`COOPERATIVE` without a producer: its first consumer issues the rings' loads (`mosaic.ConsumerFed`)."""
+"""`COOPERATIVE` without a producer: its first consumer issues the rings' loads (`fed.ConsumerFed`)."""
 
 PAIRED = dataclasses.replace(COOPERATIVE, cluster=2)
 """`COOPERATIVE` on a pair of multiprocessors a cluster, the forward's two row tiles of a group sharing its
