@@ -129,9 +129,11 @@ def parity_arms(name: str):
     device, and in float64, and the draw of one seed's parameters and tokens they take."""
     from tiny_models import build_model
 
-    mesh, _, args, _, placement = placed_case(name)
+    mesh, _, _, _, placement = placed_case(name)
     module, wide = build_model(name, "float32"), build_model(name, "float64")
-    shape = args[0].shape
+    # Eight rows of 64 tokens, which every split of the layout divides: enough positions that each
+    # gradient's error resolves, the norms' scales among them.
+    shape = (8, 64)
 
     def draw(seed):
         tokens = jax.random.randint(jax.random.key(seed + 1), shape, 0, 32, jnp.int32)
