@@ -60,9 +60,9 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
     host holds a shard of the release, not the model (ledger 2874). One that does not `publish` reads
     every tensor as the one that does and writes no weights to `destination`, only the release's small
     files."""
-    plan = run_plan(run, ema=ema, mesh=mesh, layout=layout)
+    # Planned where it is written: its tensors are read home as the writer reaches them.
     with reading_home("saved run export", writes=publishes):
-        plan.write(destination)
+        run_plan(run, ema=ema, mesh=mesh, layout=layout).write(destination)
 
 
 def run_plan(run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
