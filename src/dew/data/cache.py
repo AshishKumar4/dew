@@ -13,7 +13,6 @@ import threading
 import time
 import uuid
 import weakref
-from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
@@ -940,22 +939,15 @@ class _CachedReader:
                            self.held_parts)
 
     def held_parts(self) -> Mapping[str, tuple[Shard, ...]]:
-        """The store's finer shards a read by them fills (`ShardManifest.parts`), by the file each is of,
-        derived once for every shard this reader opens; none for a file two of its shards read (a store
-        concatenated with itself), whose parts are no one shard's."""
+        """Each of its store's shards' finer shards a read by them fills (`ShardManifest.parted`), by the
+        shard's id, derived once for every shard this reader opens."""
         return self._parts
 
     @cached_property
     def _parts(self) -> Mapping[str, tuple[Shard, ...]]:
         if self.source is None:
             return {}
-        manifest = self.source.manifest(filled_version(self.key.fill))
-        files = Counter(shard.uri for shard in manifest.shards)
-        held: dict[str, list[Shard]] = {}
-        for part in manifest.parts():
-            if files[part.uri] == 1:
-                held.setdefault(part.uri, []).append(part)
-        return {uri: tuple(parts) for uri, parts in held.items()}
+        return self.source.manifest(filled_version(self.key.fill)).parted(1)
 
 
 class _CachedIter(grain.IterDataset):
@@ -1001,7 +993,7 @@ class _CachedIter(grain.IterDataset):
     def _parted(self, published: _Published) -> _Parted | None:
         """Its shard's records as the generation holds them in its store's finer shards, every one of
         its parts held (`ShardManifest.parts`, each stating its rows); None where they are not."""
-        parts = self.parts().get(self.shard.uri, ())
+        parts = self.parts().get(self.shard.id, ())
         if not parts or any(part.rows is None or (part.rows and not published.generation.holds((part.id, 0)))
                             for part in parts):
             return None

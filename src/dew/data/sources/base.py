@@ -150,6 +150,29 @@ class ShardManifest:
             return ()
         return self.subdivide(len(self.shards) + 1)
 
+    def parted(self, reads: int) -> dict[str, tuple[Shard, ...]]:
+        """Each shard's parts (`parts`), in order, by the shard's id: the run of parts whose rows make its
+        own (`sized`, `reads` at once), every shard's in turn; none where a shard or a part states no rows
+        (a filtered store's), or the parts make no shard's rows."""
+        parts = self.parts()
+        if not parts:
+            return {}
+        shards = self.sized(reads).shards
+        if any(shard.rows is None for shard in (*shards, *parts)):
+            return {}
+        held: dict[str, tuple[Shard, ...]] = {}
+        at = 0
+        for shard in shards:
+            taken = 0
+            first = at
+            while at < len(parts) and taken < (shard.rows or 0):
+                taken += parts[at].rows or 0
+                at += 1
+            if taken != shard.rows:
+                return {}
+            held[shard.id] = parts[first:at]
+        return held if at == len(parts) else {}
+
     def sized(self, reads: int) -> ShardManifest:
         """The manifest with each shard's rows its store counts (`counted`), `reads` at once (its reading's
         `Loading.threads`), as a read that needs them reads them (a bound in examples dealt by its shards'
