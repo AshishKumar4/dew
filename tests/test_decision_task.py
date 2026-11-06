@@ -31,7 +31,7 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.metrics import Answered
-from dew.decision.task import decoded_images, trained_tree
+from dew.decision.task import Finalists, Knockout, decoded_images, trained_tree
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 TINY = FIXTURES / "tiny"
@@ -254,7 +254,7 @@ def test_a_tournament_takes_each_group_winner_to_the_final(decide):
     request = CASES["many_options"]
     question = Question.from_wire(request["questions"]["intent"])
     assert isinstance(question, Choice)
-    final = decide.tournament(request["state"], {"intent": question}, group=4)["intent"]
+    final = decide.tournament(request["state"], {"intent": question}, rounds=Knockout(4))["intent"]
     options = list(question.options)
     groups = [options[part * 14 // 4:(part + 1) * 14 // 4] for part in range(4)]
     described = dict(zip(question.options, question.descriptions, strict=True))
@@ -275,12 +275,47 @@ def test_a_questions_tournament_is_its_own_beside_a_longer_one(decide):
     assert isinstance(question, Choice)
     described = dict(zip(question.options, question.descriptions, strict=True))
     short = Choice(question.instructions, {option: described[option] for option in question.options[:5]})
-    alone = decide.tournament(request["state"], {"short": short}, group=3)["short"]
-    beside = decide.tournament(request["state"], {"short": short, "intent": question}, group=3)
+    alone = decide.tournament(request["state"], {"short": short}, rounds=Knockout(3))["short"]
+    beside = decide.tournament(request["state"], {"short": short, "intent": question}, rounds=Knockout(3))
     assert len(alone.options) == 2
     assert beside["short"].options == alone.options
     assert len(beside["short"].probabilities) == len(alone.options)
     assert len(beside["intent"].options) <= 3
+
+
+def test_finalists_play_one_round_keep_each_groups_best_and_answer_over_every_option(decide):
+    """A released engine's knock-out (`Finalists`, StartLux-Decision a99977d93): fourteen options in groups
+    of at most four, the first ones longer (4, 4, 3, 3); each group's two best, in group order; the five
+    best of those eight by their group round; the final over them; and the answer over every option, the
+    finalists sharing 0.99 as the final gave it them and the knocked-out 0.01 by their group rounds."""
+    request = CASES["many_options"]
+    question = Question.from_wire(request["questions"]["intent"])
+    assert isinstance(question, Choice)
+    options, described = list(question.options), dict(zip(question.options, question.descriptions,
+                                                           strict=True))
+
+    def asked(chosen):
+        return decide(request["state"], {"g": Choice(question.instructions,
+                                                     {option: described[option] for option in chosen})})["g"]
+
+    groups = [options[0:4], options[4:8], options[8:11], options[11:14]]
+    first, kept = {}, []
+    for group in groups:
+        answer = asked(group)
+        seen = dict(zip(answer.options, map(float, answer.probabilities), strict=True))
+        first |= seen
+        kept += sorted(group, key=lambda option: -seen[option])[:2]
+    finalists = sorted(kept, key=lambda option: -first[option])[:5]
+    final = asked(finalists)
+    rest = [option for option in options if option not in finalists]
+    expected = {option: 0.99 * float(value) for option, value in zip(final.options, final.probabilities,
+                                                                     strict=True)}
+    expected |= {option: 0.01 * first[option] / sum(first[each] for each in rest) for option in rest}
+    answer = decide.tournament(request["state"], {"intent": question},
+                               rounds=Finalists(group=4, keep=2, final=5, residual=0.01))["intent"]
+    assert answer.options == question.options
+    np.testing.assert_allclose(answer.probabilities, [expected[option] for option in options], rtol=1e-6)
+    assert answer.choice == final.choice
 
 
 def synthetic(temperature: float, count: int, options: int, seed: int) -> list[Scored]:
