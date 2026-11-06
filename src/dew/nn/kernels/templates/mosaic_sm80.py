@@ -397,7 +397,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         return self.products(self.zeros((lhs.shape[0], rhs.shape[1])), lhs, rhs, interpret)
 
-    def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool) -> jax.Array:
+    def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool, scale: Callable | None = None
+                     ) -> jax.Array:
         # A step's fresh accumulator starts from zeros tied to the running sum (an optimization barrier),
         # so no step's products issue before the last step's add. Its products are values, independent of
         # the running sum, so the compiler otherwise issued an unrolled walk's steps at once
@@ -405,7 +406,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # sum, 616 bytes spilled at the A100 forward's 128 x 128 tile; a traced grid's walk, its drain not
         # unrolled, spilled none (NSDBG-5).
         running, fresh = lax.optimization_barrier((running, self.zeros(running.shape)))
-        return running + self.products(fresh, lhs, rhs, interpret)
+        fresh = self.products(fresh, lhs, rhs, interpret)
+        return running + (fresh if scale is None else fresh * scale(0, running.shape[1]))
 
     def register_products(self, acc, parts, rhs, interpret: bool):
         for formed in parts:
