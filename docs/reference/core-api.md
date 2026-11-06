@@ -656,6 +656,16 @@ A run's `RunConfig.kernels` (`--kernels attention xla`) is the block it enters a
 its steps', evaluations' and samples' (`RunConfig.traced`, beside its recorded precision). Its record keeps
 the choice, so a resume runs the kernels the run ran.
 
+## Compiling a plain JAX program
+
+`dew.jit(function, **jit_args)` compiles a plain JAX or Flax function as `jax.jit` does (static arguments,
+donation, placements) through Dew's compile point: its matrix products, alone or with the elementwise work
+after them (`x @ w`, `dy @ w.T`, `x.T @ dy`, and `jax.lax.ragged_dot`'s grouped forms), run Dew's kernel
+templates where their selectors give them on the device, and everything else stays XLA's. A choice named by
+`dew.kernels.use` holds here as in a layer. `jax.grad(dew.jit(f))` and `dew.jit(jax.grad(f))` reach the same
+kernels: the first rewrites `f` as it traces, the second rewrites the joint program. The caller holds the
+returned program; call it, or read `.lower(...)` and `.trace(...)` as on a jit.
+
 ## Configuration and registries
 
 Code builds every model, preset, solver, dataset and metric from its class. A record names a class by its import path, `{"class": "dew.nn.backbones.dit:SimpleDiT", "fields": {...}}`, and a function as `{"function": "optax:adamw"}`; `RunConfig.from_dict` and `ModelConfig.build` import what a record names. Where a person writes a record or a flag, `dew.registry` maps short aliases (`simple_dit`) to those paths.

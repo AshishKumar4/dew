@@ -250,7 +250,10 @@ fitted to them, and a rule set ships only with measured receipts.
 - **Fusion:** a search over algebraic forms, fusion boundaries and template compositions for a region of a step
   (a norm, a projection and an activation, for example), built from the toolkit's composed primitives and its work
   scheduler. Applied to a whole decoder layer, its output is a generated megakernel, checked in as a dev-time
-  output.
+  output. Built today (`dew.algebra.fusion`): each product the GEMM template takes (x @ W, dy @ Wᵀ, xᵀ @ dy, and
+  `ragged_dot_general`'s grouped forms), alone or with its elementwise consumers, is substituted at the compile
+  point where its selector gives the template the launch, its consumers into the epilogue where fused prices
+  less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450).
 
 ## 3. Verification
 

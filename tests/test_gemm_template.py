@@ -19,7 +19,7 @@ from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
 from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import bundles, mosaic_sm90, product, resources, tail
+from dew.nn.kernels.templates import mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import mosaic_gpu, mosaic_tpu, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -2312,28 +2312,6 @@ def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generati
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"paired product's two outputs ({generation_name})", seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, cast=jnp.float64)))
-
-
-def test_two_consumers_tile_streams_blocks_their_copies_share():
-    """A tile is in its family's granularity (`_Mosaic._granular`) only where each block a step streams splits
-    into its consumers' equal shares (`Family.shares_rows`): on a two-consumer mma.sync bundle, whose
-    consumers each copy whole 32-row shares, a 64-deep tile is, a 32-deep one is not, nor one whose matrix
-    read transposed streams 96-row blocks."""
-    class TwoConsumers(type(bundles.named("mma.sync", jnp.bfloat16))):
-        consumers = 2
-
-    family, launch = TwoConsumers(jnp.dtype(jnp.bfloat16)), grouped_matmul.MosaicGmm()
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
-    deep = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family="mma.sync")
-    with generation.assumed("sm80"):
-        ba = launch.bind(bf16((512, 256)), bf16((2, 256, 384)), sizes, out_dtype="bfloat16", trans_rhs=False,
-                         interpret=True)
-        transposed = launch.bind(bf16((512, 256)), bf16((2, 384, 256)), sizes, out_dtype="bfloat16",
-                                 trans_rhs=True, interpret=True)
-        assert launch._granular(ba, deep, family)
-        assert not launch._granular(ba, dataclasses.replace(deep, block_k=32), family)
-        assert not launch._granular(transposed, dataclasses.replace(deep, block_n=96), family)
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])

@@ -330,6 +330,7 @@ class WandbTracker(project: str, name: str | None = None, *, entity: str | None 
   .run: property
 __version__: str
 def gpu_facts(part: str | None = None) -> GpuFacts  [dew.nn.kernels.generation]
+def jit(function: Callable[P, R], **arguments: Unpack[JitArguments]) -> OuterProgram  [dew.nn.kernels.options]
 module kernels  [dew.kernels]
   class KernelRefused(choice: str, kernel: str, refusals: list[Refusal]) -> None  [dew.nn.kernels.selection]
   choices = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'low_rank', 'narrow_copies', 'nvfp4', 'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})

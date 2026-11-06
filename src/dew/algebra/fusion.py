@@ -1,16 +1,21 @@
 """Fusion search (docs/design/algebra.md §2 "Fusion"): a program's products fused with their elementwise
 consumers into the GEMM template's epilogue, where the template takes them and fusing is the cheaper.
 
-The compile-time pass (`program._rewritten`) hands each body here after its algebra. Each matrix product of
-the body (a `dot_general` of a rows-by-depth operand and a matrix, no batch) and the elementwise equations
-that follow it, up to the first equation outside them that reads one of their values, with the broadcasts
-only they read of their captured operands (a bias's), are one region (`_regions`): its inputs the values it
-reads from before it, its outputs the values read after it. A region is fused where the template takes it
-and its price says fused wins (`_takes`), its equations replaced by one nested program of
-`fused_gemm.fused` over the region as the program wrote it, its dot `fused_gemm.product` (the dot's own
-precision and result dtype, so the fused region computes what the region did), written where its first
-reader stood (`_spliced`). Every other region, and every body with none, is kept as traced: the body itself,
-so an unchanged body keeps its identity (`program._within`'s). A region's decision is held by its structure
+The compile-time pass (`program._rewritten`) hands each body here after its algebra: the compile point at
+which a plain JAX program gets the template (row 3450). Each matrix product of the body the template takes
+(`Form`: a `dot_general` of rank-2 operands, x @ W, dy @ Wᵀ or a kernel gradient's xᵀ @ dy; a
+`ragged_dot_general` of each group's rows, an MoE's; floating operands, no batch) and the elementwise
+equations that follow it, up to the first equation outside them that reads one of their values, with the
+broadcasts only they read of their captured operands (a bias's), are one region (`_regions`), a product
+alone among them: its inputs the values it reads from before it, its outputs the values read after it. A
+region is substituted where its launch is the template's, its selector's choice (`grouped_matmul.DECLARED`,
+or a call's, `generation.chosen`), and where it has an epilogue, where the template takes it and its price
+says fused wins (`_takes`): its equations replaced by one nested program of `fused_gemm.fused` over the
+region as the program wrote it, its product the template's (`_product`: `fused_gemm.product` at the dot's
+own precision and result dtype, so the fused region computes what the region did; a kernel gradient's
+`gemm.gemm_t`, its consumers after it in XLA), written where its first reader stood (`_spliced`). Every
+other region, and every body with none, is kept as traced: the body itself, so an unchanged body keeps its
+identity (`program._within`'s). A region's decision is held by its structure
 and the context it was weighed in (`_decided`), so every layer of a stack, and every retrace, weighs it once.
 """
 
@@ -62,16 +67,56 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     return _spliced(jaxpr, taken, fused_gemm) if taken else jaxpr
 
 
-def _transposed(equation: jcore.JaxprEqn) -> bool | None:
-    """Whether `equation`, a product the template's epilogue follows, holds its right operand columns by
-    depth (its transpose): a `dot_general` of a rows-by-depth left operand and a depth-by-columns right one
-    (False) or a columns-by-depth one (True), no batch axes; None for any other equation."""
-    if jax_name(equation.primitive) != "dot_general":
+class Form(NamedTuple):
+    """A product the template takes (`_form`): its right operand held columns by depth (`transpose_rhs`),
+    its left one contracted over its rows (`transpose_lhs`: a kernel gradient's xᵀ @ dy), and its groups
+    (`grouped`: a `ragged_dot_general`'s, its group sizes its third operand)."""
+
+    transpose_rhs: bool
+    transpose_lhs: bool
+    grouped: bool
+
+
+FORWARD = Form(transpose_rhs=False, transpose_lhs=False, grouped=False)
+"""x @ W: rows by depth times depth by columns."""
+
+DENSE_FORMS = {((1,), (0,)): FORWARD, ((1,), (1,)): FORWARD._replace(transpose_rhs=True),
+               ((0,), (0,)): FORWARD._replace(transpose_lhs=True)}
+"""A rank-2 `dot_general`'s contracted axes, no batch axes, to its form: x @ W, dy @ Wᵀ and xᵀ @ dy."""
+
+GROUPED_FORMS = {((1,), (1,), 3): FORWARD._replace(grouped=True),
+                 ((1,), (2,), 3): FORWARD._replace(transpose_rhs=True, grouped=True),
+                 ((0,), (0,), 2): FORWARD._replace(transpose_lhs=True, grouped=True)}
+"""A `ragged_dot_general`'s contracted axes and its right operand's rank, its left operand's rows ragged and
+no batch axes, to its form: rows times their group's matrix (`[groups, depth, columns]`, or columns by
+depth), and the kernel gradient's rows contracted within each group (`[groups, depth, columns]` out)."""
+
+
+def _form(equation: jcore.JaxprEqn) -> Form | None:
+    """`equation`'s form as a product the template takes (`Form`): a `dot_general` of rank-2 operands (x @ W,
+    dy @ Wᵀ, xᵀ @ dy) or a `ragged_dot_general` of rows ragged by group (`GROUPED_FORMS`), each of floating
+    operands, no batch axes; None for any other equation (an integer product is XLA's own,
+    `fused_gemm.product`)."""
+    name = jax_name(equation.primitive)
+    if name not in ("dot_general", "ragged_dot_general"):
         return None
-    (left, right), batch = equation.params["dimension_numbers"]
-    if batch != ((), ()) or tuple(left) != (1,) or any(len(_shape(var)) != 2 for var in equation.invars):
+    if not all(jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.invars[:2]
+               if isinstance(var.aval, ShapedArray)):
         return None
-    return {(0,): False, (1,): True}.get(tuple(right))
+    if name == "dot_general":
+        (left, right), batch = equation.params["dimension_numbers"]
+        if batch != ((), ()) or any(len(_shape(var)) != 2 for var in equation.invars):
+            return None
+        return DENSE_FORMS.get((tuple(left), tuple(right)))
+    numbers = equation.params["ragged_dot_dimension_numbers"]
+    # Its axes as lists (`lax.ragged_dot`'s), a dot_general's as tuples.
+    (left, right), batch = numbers.dot_dimension_numbers
+    if (any(batch) or tuple(numbers.lhs_ragged_dimensions) != (0,)
+            or len(_shape(equation.invars[0])) != 2):
+        return None
+    form = GROUPED_FORMS.get((tuple(left), tuple(right), len(_shape(equation.invars[1]))))
+    groups = tuple(numbers.rhs_group_dimensions)
+    return form if form is not None and groups == ((0,) if not form.transpose_lhs else ()) else None
 
 
 def _shape(atom) -> tuple[int, ...]:
@@ -87,7 +132,7 @@ def _follows(operand: tuple[int, ...], shape: tuple[int, ...]) -> bool:
 
 
 def _regions(jaxpr: jcore.Jaxpr) -> list[Region]:
-    """Each product of `jaxpr` (`_transposed`) and the elementwise equations after it that read its values,
+    """Each product of `jaxpr` (`_form`) and the elementwise equations after it that read its values,
     each of the product's shape over operands that follow its tiles (`_follows`, `CONSUMERS`), up to the
     first equation outside them that reads one of their values, with the layout equations of its captured
     operands that no other equation reads (`CAPTURED`)."""
@@ -101,7 +146,7 @@ def _regions(jaxpr: jcore.Jaxpr) -> list[Region]:
     found: list[Region] = []
     claimed: set[int] = set()
     for start, equation in enumerate(jaxpr.eqns):
-        if _transposed(equation) is None or start in claimed:
+        if _form(equation) is None or start in claimed:
             continue
         shape = _shape(equation.outvars[0])
         places, made, at = [start], set(equation.outvars), len(jaxpr.eqns)
@@ -131,7 +176,7 @@ def _regions(jaxpr: jcore.Jaxpr) -> list[Region]:
         outputs = tuple(var for place in places for var in jaxpr.eqns[place].outvars if var in read_after)
         inputs = tuple(dict.fromkeys(var for place in places for var in jaxpr.eqns[place].invars
                                      if isinstance(var, jcore.Var) and var not in made))
-        if len(places) > 1 and outputs:
+        if outputs:
             found.append(Region(tuple(places), inputs, outputs, min(at, places[-1] + 1)))
             claimed.update(places)
     return found
@@ -149,13 +194,11 @@ def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
         for place in region.places:
             equation = jaxpr.eqns[place]
             operands = [read(atom) for atom in equation.invars]
-            transposed = _transposed(equation)
-            if transposed is not None:
-                made = [fused_gemm.product(*operands, transpose_rhs=transposed,
-                                           precision=equation.params["precision"],
-                                           out_dtype=(equation.params["preferred_element_type"]
-                                                      or jnp.result_type(*operands)),
-                                           interpret_on_cpu=generation.assumption() is not None)]
+            form = _form(equation)
+            if form is not None:
+                made = [_product(form, operands, equation.params["precision"],
+                                 equation.params["preferred_element_type"] or jnp.result_type(*operands[:2]),
+                                 fused_gemm)]
             else:
                 bound = equation.primitive.bind(*operands, **equation.params)
                 made = list(bound) if equation.primitive.multiple_results else [bound]
@@ -163,6 +206,23 @@ def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
         return tuple(values[var] for var in region.outputs)
 
     return replay
+
+
+def _product(form: Form, operands: list, precision, out_dtype, fused_gemm) -> jax.Array:
+    """A product of `form` over its equation's `operands` as the template computes it, at the dot's own
+    precision and result dtype: `fused_gemm.product` where its consumers may be the launch's epilogue (x @
+    W and dy @ Wᵀ, each group's rows times its matrix where grouped), `gemm.gemm_t` for a kernel gradient
+    (its consumers after it in XLA), whose dense product is its one group's."""
+    from dew.nn.kernels import gemm
+
+    interpret_on_cpu = generation.assumption() is not None
+    lhs, rhs, *sizes = operands
+    if form.transpose_lhs:
+        made = gemm.gemm_t(lhs, rhs, sizes[0] if form.grouped else None, out_dtype=out_dtype,
+                           precision=precision, interpret_on_cpu=interpret_on_cpu)
+        return made if form.grouped else made[0]
+    return fused_gemm.product(lhs, rhs, *sizes, transpose_rhs=form.transpose_rhs, precision=precision,
+                              out_dtype=out_dtype, interpret_on_cpu=interpret_on_cpu)
 
 
 def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
@@ -201,6 +261,9 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
     times XLA's) they favour fusion more than measurement does, so a region whose launch the selector gives
     XLA is never fused by price alone; a call naming the template (an A/B's arm) fuses it."""
     found = fused_gemm.analysis(_replayed(jaxpr, region, fused_gemm), *_shapes(region.inputs))
+    if found.epilogue is None:
+        # No epilogue to weigh (a bare product, a kernel gradient's): its launch's selector decides alone.
+        return found.launch is not None and found.launch.refusal is None and found.launch.kernel != "xla"
     taken = all(route is not None and route.refusal is None and route.kernel != "xla"
                 for route in (found.launch, found.epilogue))
     return (taken and found.fused_seconds is not None and found.unfused_seconds is not None
