@@ -10,14 +10,11 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pytest
+from data_support import LATEST
 from hub_support import native_builder, stated_shards
 
 from dew.data.dataset import DataPartition, Loading
-from dew.data.plan import PLAN_VERSIONS
 from dew.data.sources import Files, Memory
-
-LATEST = PLAN_VERSIONS[-1]
-"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monkeypatch):
