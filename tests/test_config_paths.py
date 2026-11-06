@@ -2,9 +2,9 @@
 (`dataclasses.replace`), on the command line (`dew train --set path=value`, `RunConfig.assigned`), read back
 from the run's JSON record (`RunConfig.read`) and from the run.json it saves (`RunConfig.save`,
 `RunConfig.load`), each value an alternative its field's type declares (`option_witness.alternatives`): each
-path holds the value and writes the record the others write, and a value one path refuses, the command
-line refuses as well. The fields every run holds are swept on a language model's run, each kind's own on
-its own."""
+path holds the value as Python's does and writes the record the others write, and a value Python refuses,
+the command line refuses as well. The fields every run holds are swept on a language model's run, each
+kind's own on its own."""
 
 import dataclasses
 import json
@@ -77,8 +77,10 @@ def test_each_path_that_sets_an_option_sets_the_same_run(kind, path, index, tmp_
     python.save(str(tmp_path / "saved"))
     paths = {"command line": base.assigned([given]), "record": RunConfig.read(record),
              "run.json": RunConfig.load(str(tmp_path / "saved"))}
-    assert held_at(python, path) == value
+    # The value as the run holds it: a field may read a value as its own form (a tuple of one id, a rate
+    # its default resolves).
+    held = held_at(python, path)
     for name, run in paths.items():
         assert type(run) is type(python), name
-        assert held_at(run, path) == value, name
+        assert held_at(run, path) == held, name
         assert run.record() == record, name
