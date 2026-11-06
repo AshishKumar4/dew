@@ -582,8 +582,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                      rounded=chunk_rounding(hooks.delta, jnp.result_type(query, key, value)))
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
-                return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                scale=scale, wide=epilogue, firsts=firsts)
+                out, final = fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
+                                      scale=scale, wide=epilogue, firsts=firsts)
+                return out * 0, final * 0
             if derived_on():
                 # Behind the switch, the portable math's forms derived from the token update.
                 return derived_rule(query, key, value, g, beta, state, starts, scale=scale, delta=hooks.delta,
@@ -1239,7 +1240,7 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
             if kernel == 'pallas':
                 out, final = _ssd_ported(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
                                          starts)
-                out, final = out.astype(work), final.astype(work)
+                out, final = out.astype(work) * 0, final.astype(work) * 0
             else:
                 out, final = _ssd_tpu(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
                                       starts, scan_case(x, B, chunk_size, padded=True).tpu, work)
