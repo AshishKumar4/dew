@@ -1080,28 +1080,34 @@ def release_net(model_module, engram_module, stored: dict, dtype: torch.dtype | 
     return net
 
 
-def release_outputs(net, ids: torch.Tensor) -> dict[str, np.ndarray]:
-    """The release's logits over `ids` `[2, LENGTH]` as its own entry points compute them: each prefix's
-    prefill's (`Transformer.forward` from position zero, its last position's logits), and the step after
-    each prompt of CLOSING (that prompt's prefill, then one cached `forward` at its next position)."""
+def release_rows(net, ids: torch.Tensor) -> np.ndarray:
+    """The release's logits over `ids` `[2, LENGTH]` at every position as its own entry point computes them:
+    each prefix's prefill (`Transformer.forward` from position zero), its last position's logits."""
+    found = []
     with torch.no_grad():
-        prefixes, steps = [], []
         for length in range(1, LENGTH + 1):
             reset(net)
-            prefixes.append(forward(net, ids[:, :length])[1])
+            found.append(forward(net, ids[:, :length])[1])
+    return torch.stack(found, 1).double().cpu().numpy()
+
+
+def release_walk(net, ids: torch.Tensor) -> np.ndarray:
+    """The release's cached step after each prompt of CLOSING: that prompt's prefill, then one cached
+    `Transformer.forward` at its next position, its logits."""
+    found = []
+    with torch.no_grad():
         for prompt in CLOSING:
             reset(net)
             forward(net, ids[:, :prompt])
-            steps.append(forward(net, ids[:, prompt:prompt + 1], prompt)[1])
-    return {"rows": torch.stack(prefixes, 1).double().cpu().numpy(),
-            "walk": torch.stack(steps, 1).double().cpu().numpy()}
+            found.append(forward(net, ids[:, prompt:prompt + 1], prompt)[1])
+    return torch.stack(found, 1).double().cpu().numpy()
 
 
 def write_release_recording():
-    """release.npz beside the fixture, on a CUDA GPU: the release's logits (`release_outputs`) as released,
-    bf16 over its own tilelang kernels and its activation quantizers, and their float64 truth (the same code
-    over the stand-ins, widened), over drawn rows whose every selection the truth's forward clears by the
-    gate's MARGIN (`clearing_rows`, on the twin), summarized over check 1's seeds
+    """release.npz beside the fixture, on a CUDA GPU: the release's logits (`release_rows`, `release_walk`)
+    as released, bf16 over its own tilelang kernels and its activation quantizers, and their float64 truth
+    (the same code over the stand-ins, widened), over drawn rows whose every selection the truth's forward
+    clears by the gate's MARGIN (`clearing_rows`, on the twin), summarized over check 1's seeds
     (`recorded_references.record_case`), and the rows each seed drew (release_rows.npz): the reference
     tests/test_deepseek_v41.py holds Dew's forward, its variants and its cached walk to (row 354)."""
     from recorded_references import provenance, record_case, save
@@ -1126,14 +1132,17 @@ def write_release_recording():
                 rows[index] = clearing_rows(twin, TINY["vocab_size"], index)
         return {"input_ids": rows[index]}
 
-    def evaluate(inputs):
-        ids = torch.from_numpy(inputs["input_ids"].astype(np.int64)).cuda()
-        found = release_outputs(net, ids)
-        with widened(twin_module):
-            truth = release_outputs(twin, ids)
-        return found, truth
+    def evaluated(outputs):
+        def evaluate(inputs):
+            ids = torch.from_numpy(inputs["input_ids"].astype(np.int64)).cuda()
+            found = outputs(net, ids)
+            with widened(twin_module):
+                truth = outputs(twin, ids)
+            return {"logits": found}, {"logits": truth}
+        return evaluate
 
-    arrays = record_case("deepseek v41 release", draw, evaluate, summary=True)
+    arrays = {**record_case("deepseek v41 release rows", draw, evaluated(release_rows), summary=True),
+              **record_case("deepseek v41 release walk", draw, evaluated(release_walk), summary=True)}
     import tilelang
 
     written = save(FIXTURE / "release.npz", {**arrays, "provenance": provenance(
