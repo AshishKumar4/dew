@@ -127,6 +127,43 @@ def test_expert_biases_are_added_before_the_products_one_rounding():
                     truth_fn=functools.partial(plain, down=jnp.float64))
 
 
+def test_gpt_oss_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
+    """GPT-OSS's experts whose fused gate-up and down matrices are packed NVFP4 banks in the module's
+    `QUANTIZATION` collection, no parameter beside them (a served 4-bit checkpoint's, row 4516:
+    `quantization.expert_matrix`), their biases parameters: on par with the layer holding the banks' values
+    as dense parameters in the same compute dtype, bf16 (check 1, truth the values in float64), the
+    interleaved gate and up read off the packed bank's product as off the dense one's."""
+    from packed_experts import packed_banks
+
+    from dew.quantization import QUANTIZATION
+
+    # An NVFP4 matrix's depth is whole stages (`gemm.NVFP4_STAGE`, 256).
+    hidden, intermediate, experts, tokens = 256, 256, 4, 16
+    (gate_up, gate_up_values), (down, down_values) = (
+        packed_banks(experts, *shape, seed) for seed, shape in enumerate(((hidden, 2 * intermediate),
+                                                                          (intermediate, hidden))))
+    rng = np.random.default_rng(5)
+    biases = {"gate_up_proj_bias": jnp.asarray(rng.normal(size=(experts, 2 * intermediate)), jnp.float32),
+              "down_proj_bias": jnp.asarray(rng.normal(size=(experts, hidden)), jnp.float32)}
+    dense = {"params": {"gate_up_proj": jnp.asarray(gate_up_values), "down_proj": jnp.asarray(down_values),
+                        **biases}}
+    packed = {"params": biases, QUANTIZATION: {"gate_up_proj": gate_up, "down_proj": down}}
+    module = GptOssExperts(hidden, intermediate, experts, dtype=jnp.bfloat16)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        x = jax.random.normal(streams[0], (tokens, hidden), jnp.bfloat16)
+        indices = jax.random.randint(streams[1], (tokens, 2), 0, experts)
+        return x, jnp.full((tokens, 2), 0.5, jnp.bfloat16), indices
+
+    def wide(*inputs):
+        return GptOssExperts(hidden, intermediate, experts).apply(dense, *inputs)
+
+    assert_as_exact(jax.jit(lambda *inputs: module.apply(packed, *inputs)),
+                    jax.jit(lambda *inputs: module.apply(dense, *inputs)), draw, "packed GPT-OSS experts",
+                    seeds=8, truth_fn=wide)
+
+
 def test_a_mixture_builds_gpt_oss_experts_wherever_a_layer_routes():
     """A mixture owns which routed feed-forward it builds (`Mixture.build`), which a decoder's
     feed-forward slot and a layer kind's mixer slot (`MLPMixer`) both take: under swigluoai,
