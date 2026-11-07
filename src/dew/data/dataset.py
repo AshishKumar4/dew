@@ -1724,7 +1724,7 @@ class RampedStream(Forwarding):
             if self._elastic:
                 # The records handed over before this read's first: those handed so far, less the ones a
                 # restore skips of it, and the buffer's, which this step hands over first.
-                self._mark = self._source.get_state()
+                self._mark = self._elastic_state()
                 self._marked = self._records - self._skip + (0 if self._held is None else
                                                              rows_of(self._held) * self._partition.count)
             read = next(self._source, None)
@@ -1751,11 +1751,18 @@ class RampedStream(Forwarding):
         self._records += stage.batch
         return step
 
+    def _elastic_state(self) -> bytes:
+        """The elastic read's own position, the bytes its envelope is (`ramped` takes no other)."""
+        state = self._source.get_state()
+        if not isinstance(state, bytes):
+            raise TypeError(f"an elastic read's position is bytes, not {type(state).__name__}")
+        return state
+
     def get_state(self) -> bytes:
         if self._elastic:
             if self._mark is None or not self._held or not rows_of(self._held):
                 # Every record read is handed over: the read resumes where it stands.
-                return _position.encode_ramped(_position.Ramped(self._source.get_state(), self._skip,
+                return _position.encode_ramped(_position.Ramped(self._elastic_state(), self._skip,
                                                                 self._records))
             return _position.encode_ramped(_position.Ramped(self._mark, self._records - self._marked,
                                                             self._records))
