@@ -252,16 +252,29 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
     broadcast is the outer product of ones and the value, whose transpose is a product. Everywhere
     else, and where `accumulated` leaves a product its own sum (`FP32_SUMS`, a quantized model's
-    trace), it is the broadcast, whose transpose JAX sums in the value's dtype, as a user's process
-    sums it on every platform (ledger 3197). A value an Explicit axis places along an axis it spreads
+    trace), it is the broadcast, whose transpose keeps the sum's dropped roundings with
+    `compensated_sum`. A value an Explicit axis places along an axis it spreads
     over (never a bias, whose leading axes `biased` adds) is broadcast: the outer product does not keep
     that placement on a dropped size-one axis."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
     placed = explicit_spec(value)
-    if (not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes))
-            or not _sums_in_float64(value)):
+    if not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes)):
         return jnp.broadcast_to(value, shape)
+    if not _sums_in_float64(value):
+        from dew.nn.kernels.generation import linear_map
+
+        input_shape = value.shape
+
+        def broadcast(_, operand):
+            return jnp.broadcast_to(operand, shape)
+
+        def summed(_, cotangent):
+            return compensated_sum(cotangent, axes).reshape(input_shape)
+
+        # The CPU's plain reduction of a broadcast's transpose can exceed reference parity.
+        # Keep the dropped roundings in the shared compensated reduction.
+        return linear_map(broadcast, summed, (), value)
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
