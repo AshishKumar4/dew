@@ -1262,8 +1262,32 @@ def file_of(case: ET.Element) -> str:
 def red_as(kind: str, nodes: list[str]) -> dict:
     """What turned a red row red, for grading it again (`land.sh`, `suspect.sh`): `kind` "nodes", its
     `failed` tests alone, by node id; "collect", its file's collection; "deadline", its task's; or
-    "whole", its file otherwise (a test that did not collect, a missing import, pytest's own exit)."""
+    "whole", its file otherwise (a test that did not collect, a missing import, pytest's own exit); or
+    `STALE`, a kept row its task did not run (`stale_row`)."""
     return {"kind": kind, "failed": nodes}
+
+
+STALE = "stale"
+"""The outcome of a row its plan kept on a green record its task did not find and did not run (`stale_row`):
+no verdict of its tests, which the queue runs again as a row of its own (land.sh), never red and never a flaky
+row of its owner's."""
+
+
+def stale_row(python: str, name: str, group: str, why: str) -> dict:
+    """Kept row `name` (in `group`'s group) said stale, not run (`STALE`), with `why`: a row armada reads as
+    not passed, so its run is graded, and the queue runs it again."""
+    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
+            "output": f"stale, not run: the plan kept it on a record this task did not find, {why}",
+            "tests": {}, "ynn_switched": [], "cells": {}, "timings": {row(python, name, ""): 0.0},
+            **red_as(STALE, [])}
+
+
+def recorded_seconds(name: str, group: str) -> float:
+    """Test file `name`'s recorded seconds (the durations record), its group `group`'s tests' alone where it
+    has one (`members`)."""
+    record = durations_record()
+    nodes = members(name, group) if group else [node for node in record if node.split("::", 1)[0] == name]
+    return sum(record.get(node, 0.0) for node in nodes)
 
 
 def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
@@ -1370,12 +1394,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     for index, (name, group, at) in enumerate(groups, start=1):
         left = deadline - (time.monotonic() - began)
         if left <= 0:
-            # The task's deadline spent on the rows before it: this group is neither read nor run, and is red
-            # as a row its task's deadline cut off is (review).
-            rows.append({"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
-                         "output": f"{INTERRUPTED} of {deadline:.0f} s before this group was read or run",
-                         "tests": {}, "ynn_switched": [], "cells": {},
-                         "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
+            # The task's deadline spent on the rows before it: this group is neither read nor run, stale as a
+            # kept row the task could not run is (`tested`).
+            rows.append(stale_row(python, name, group,
+                                  f"the task's {deadline:.0f} s spent before it was read"))
             continue
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, [name], group, part, left, cache, grace, common, environ, coverage,
@@ -1556,6 +1578,20 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     rows = ([] if cache == "off" or release or (site is not None and site["start"] is not None)
             else reused_rows(python, tests, group, common, network, kept))
     tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
+    if kept:
+        # A row its plan kept that this task did not find (its record replaced since) runs here only where
+        # its recorded seconds fit what is left of the task's deadline, in turn; any other is said stale, not
+        # run (`STALE`), which the queue runs again as a row of its own, neither red nor flaky (Main,
+        # 2026-11-07; row 4468: 163 of a kept task's 165 rows ran out its deadline one after another).
+        left, fitting = deadline - (time.monotonic() - began), []
+        for name in tests:
+            cost = recorded_seconds(name, group)
+            if name in kept and cost > left:
+                rows.append(stale_row(python, name, group, f"its {cost:.0f} s past the {left:.0f} s left"))
+                continue
+            fitting.append(name)
+            left -= cost
+        tests = fitting
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
