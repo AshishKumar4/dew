@@ -143,8 +143,9 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
 @dataclasses.dataclass(frozen=True)
 class _Halves:
     """A program's warpgroups each walking `count`'s share of the keys, this one the `index`-th
-    (`_halves`): the sums over its keys joined through `partials` `[3, halves, heads, columns]`, each a turn
-    of its own barrier of `joined` (a pass's sums, `_joined`)."""
+    (`_halves`): the sums over its keys joined through `partials` `[3, halves, heads, columns]`, each a slot
+    and a barrier of `joined` of its own (`_stepped`'s three: the query's and key's reads before the update,
+    the query's read of the write in it)."""
 
     count: int
     index: object
@@ -426,13 +427,13 @@ def _softplus(x):
 def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, halves: _Halves, *,
              interpret: bool):
     """`recurrence.update` over the block's column of the state, read from `state_ref` and written to
-    `state_out` as it is held (`recurrence._held`): its sums over the keys (the decayed query's and key's
-    reads of the state and the query's product with the written key) one pass over the state, its update
-    another, the output `(g q)^T S + (q . (beta k)) c`. Each key dimension's vectors are read from `vectors`
-    as each head's scalars (`_key_entry`) and each sum over the keys a pairwise tree (`_summed_keys`), the
-    program's warpgroups each walking a share of the keys, their sums joined (`_Halves`). Every key's entry
-    held at once, a 128-key column spilled 1260 to 1276 bytes a thread (sm80, sm90; the fused step's
-    compile, jsf-r06j)."""
+    `state_out` as it is held (`recurrence._held`): its sums over the keys before the update (the decayed
+    query's and key's reads of the state) one pass over the state, its update another, which sums the
+    query's read of the write, the output `(g q)^T S + q^T ((beta k) c^T)`. Each key dimension's vectors
+    are read from `vectors` as each head's scalars (`_key_entry`) and each sum over the keys a pairwise tree
+    (`_summed_keys`), the program's warpgroups each walking a share of the keys, their sums joined
+    (`_Halves`). Every key's entry held at once, a 128-key column spilled 1260 to 1276 bytes a thread
+    (sm80, sm90; the fused step's compile, jsf-r06j)."""
     start, span = halves.keys(state_ref.shape[2])
     layout = token.block.layout
 
@@ -443,28 +444,26 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, 
         return token.tile(state_ref, start + k)
 
     def terms(k, tile):
-        # The query's product with the written key a head's scalar, laid over the block as the sums' others
-        # are (warpgroup semantics broadcast no scalar implicitly).
-        found = ((entry(0, k) * entry(2, k)) * tile,
-                 jnp.zeros_like(tile) + entry(0, k) * (entry(1, k) * write))
-        return (*found, (entry(1, k) * entry(2, k)) * tile) if hooks.delta else found
+        read = (entry(0, k) * entry(2, k)) * tile
+        return (read, (entry(1, k) * entry(2, k)) * tile) if hooks.delta else read
 
-    sums = _summed_keys(span, row, terms, value, count=3 if hooks.delta else 2)
-    read, aligned, *keyed = (halves.joined_sums(part, slot, layout, interpret)
-                             for slot, part in enumerate(sums))
+    sums = _summed_keys(span, row, terms, value, count=2 if hooks.delta else 1)
+    read, *keyed = (halves.joined_sums(part, slot, layout, interpret)
+                    for slot, part in enumerate(sums if hooks.delta else (sums,)))
     corrected = value - keyed[0] if hooks.delta else value
 
     def updated(k, tile):
-        entry_k = tile * entry(2, k) + (entry(1, k) * write) * corrected
+        written = (entry(1, k) * write) * corrected
+        entry_k = tile * entry(2, k) + written
         # Held as `recurrence._held` holds it: bf16 rounded stochastically, salted by its key and value, the
         # key's entry laid over the block as the entry is (a scalar's bit cast lowers to no vector).
         keyed_k = jnp.zeros_like(entry_k) + entry(1, k)
         kept = (recurrence.salted_bf16(entry_k, keyed_k, value) if state_out.dtype == jnp.bfloat16
                 else entry_k)
         token.stored(state_out, kept, start + k)
+        return entry(0, k) * written
 
-    _walked_keys(span, row, updated)
-    return read + aligned * corrected
+    return read + halves.joined_sums(_summed_keys(span, row, updated, value), 2, layout, interpret)
 
 
 UNROLLED = 16
