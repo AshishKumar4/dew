@@ -90,6 +90,10 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                                    "huggingface/transformers 5.16.1", "license": "Apache-2.0",
                                       "distribution": ("compressed-tensors", "0.17.1")}
             for kind in ("fp8", "nvfp4")},
+         "lm-steps": {"test": "test_reference_runs", "arms": "qwen3-tiny", "worker": "lm_steps_worker.py",
+                      "reference": "huggingface/transformers 5.16.1 with pytorch/pytorch 2.14.0",
+                      "license": "Apache-2.0", "distribution": ("transformers", "5.16.1"), "host": True,
+                      "outputs": True},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",

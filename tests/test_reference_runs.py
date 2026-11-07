@@ -1,22 +1,14 @@
 """Dew's language-model fine-tune step against transformers + torch's.
 
-The reference runs in tools/reference_runs compare whole fine-tunes on real
-weights and GPUs. This is their loop at a size the suite replays: the
-committed qwen3-tiny checkpoint, eight steps of fixed token rows, cross
-entropy over every shifted target, global-norm clipping at 1.0 and AdamW
-(0.9/0.95, eps 1e-8, decoupled decay 0.1 on all parameters) on optax's warmup-cosine
-schedule. tools/reference_runs/lm_steps_fixture.py ran it under transformers 5.16.1
-and torch 2.14 on CPU in float64, the truth, and in float32, the reference.
-Dew runs the trainer's own compiled step at fp32 and is held to the rule of
-tests/reference_error.py over the steps: its RMS distance from float64 at
-most twice torch's. A different decay, clip, schedule or loss normalisation
-moves every step after the first by far more than fp32 rounding does.
-
-Observed RMS distance from float64 over the eight steps against torch's
-4.8e-07 (loss) and 2.2e-07 (gradient norm): Dew on one CPU device 3.3e-07
-and 2.0e-07, on an RTX 3090 (JAX_PLATFORMS=cuda) 4.0e-07 and 3.0e-07. On
-either, Dew without the decay lands at 1.1e-02 (ratio 22,000) and Dew
-without the clip at 1.9e-03 (ratio 4,000).
+The reference runs in tools/reference_runs compare whole fine-tunes on real weights and GPUs. This is their
+loop at a size the suite replays: the committed qwen3-tiny checkpoint, eight steps of drawn token rows,
+cross entropy over every shifted target, global-norm clipping at 1.0 and AdamW (0.9/0.95, eps 1e-8,
+decoupled decay 0.1 on all parameters) on optax's warmup-cosine schedule. tools/lm_steps_worker.py runs it
+under transformers 5.16.1 and torch 2.14 on CPU in float64, the truth, and in float32, the reference, over
+each seed's rows. Dew runs the trainer's own compiled step at fp32 and is held to check 1 over the seeds,
+each step's loss, gradient norm and learning rate a leaf's row. A different decay, clip, schedule or loss
+normalisation moves every step after the first by far more than fp32 rounding does: on one draw Dew
+without the decay landed 22,000 times torch's distance from float64, without the clip 4,000 times.
 """
 
 import dataclasses
@@ -30,7 +22,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from one_draw import assert_as_exact_as_the_reference
+from reference_runs import assert_arms_as_recorded
 from tool_support import REPO_ROOT, load
 
 from dew.batch import TEXT_KEY
@@ -42,38 +34,54 @@ from dew.training import MeshSpec, Trainer
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
-def test_lm_fine_tune_steps_are_as_exact_as_torch():
-    fixture = np.load(FIXTURES / "reference_runs" / "qwen3-tiny-steps.npz")
-    tokens = fixture["tokens"]
-    steps, _, width = tokens.shape
-    options = {"lr_peak": 1e-2, "lr_init": 1e-3, "lr_end": 1e-3, "warmup": 2}
-    pretrained = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float32",
-                                 attention_impl="xla")
-    objective = LMObjective(pretrained, width - 1, ema_decay=None)
-    schedule = Cosine(peak_value=options["lr_peak"], warmup_steps=options["warmup"],
-                      end_value=options["lr_end"],
-                      init_value=options["lr_init"])
+STEPS_FIXTURE = FIXTURES / "reference_runs" / "qwen3-tiny-steps.npz"
+"""tools/venv_reference.py's `lm-steps` recording (tools/lm_steps_worker.py), its outputs whole."""
+STEPS_SEEDS = 8
+"""Its declared seeds, sized by `seeds_for` paired as the recording confirmed them."""
+STEPS, BATCH, WIDTH, VOCAB = 8, 8, 33, 256
+OPTIONS = {"lr_peak": 1e-2, "lr_init": 1e-3, "lr_end": 1e-3, "warmup": 2}
+
+
+def steps_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's token rows, STEPS batches of BATCH rows over qwen3-tiny's vocabulary (VOCAB)."""
+    rows = np.random.default_rng([45, seed]).integers(0, VOCAB, (STEPS, BATCH, WIDTH))
+    return {"tokens": rows.astype(np.int32)}
+
+
+def fine_tuned(_, inputs) -> dict:
+    """Dew's trainer over a draw's rows: each step's loss, the global norm of the gradient it handed the
+    solver (the value torch's `clip_grad_norm_` returns) and the learning rate it stepped with."""
+    tokens = inputs["tokens"]
+    pretrained = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float32", attention_impl="xla")
+    objective = LMObjective(pretrained, WIDTH - 1, ema_decay=None)
+    schedule = Cosine(peak_value=OPTIONS["lr_peak"], warmup_steps=OPTIONS["warmup"],
+                      end_value=OPTIONS["lr_end"], init_value=OPTIONS["lr_init"])
     solver = OptimConfig(
         optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, learning_rate=schedule,
-        weight_decay=0.1, clip_grads=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(steps)
-    trainer = Trainer(objective, solver, key=jax.random.key(0),
-                      mesh=MeshSpec(), checkpoints=None, tracker=None)
+        weight_decay=0.1, clip_grads=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(STEPS)
+    trainer = Trainer(objective, solver, key=jax.random.key(0), mesh=MeshSpec(), checkpoints=None,
+                      tracker=None)
     state, _, _ = trainer.place()
     step = trainer.compile(state, {TEXT_KEY: tokens[0]})
     losses, norms = [], []
     for rows in tokens:
         state, loss, _, _, _, committed = step(state, {TEXT_KEY: rows})
         losses.append(float(loss))
-        # The trainer's commit telemetry: the global norm of the gradient it handed the solver, the
-        # value torch's `clip_grad_norm_` returns.
-        assert int(committed.count) == 1
         norms.append(float(committed.norm))
+    rates = [float(schedule.schedule(STEPS)(index)) for index in range(STEPS)]
+    return {"loss": np.asarray(losses, np.float32), "grad_norm": np.asarray(norms, np.float32),
+            "lr": np.asarray(rates, np.float32)}
 
-    np.testing.assert_allclose([schedule.schedule(steps)(index) for index in range(steps)],
-                               fixture["lr"], rtol=1e-6)
-    assert_as_exact_as_the_reference(losses, fixture["f32_loss"], fixture["f64_loss"], "loss")
-    assert_as_exact_as_the_reference(norms, fixture["f32_grad_norm"], fixture["f64_grad_norm"],
-                                     "gradient norm")
+
+def pipeline_arms(_):
+    """tools/venv_reference.py's `lm-steps` site: its recording, draw, Dew run and leaves."""
+    return STEPS_FIXTURE, steps_draw, fine_tuned, ("loss", "grad_norm", "lr")
+
+
+def test_lm_fine_tune_steps_are_as_exact_as_torch():
+    """Eight AdamW steps of the trainer, each step's loss, gradient norm and rate on par with torch's over
+    drawn rows (check 1), the truth torch's float64 run."""
+    assert_arms_as_recorded(pipeline_arms(None), "lm-steps", STEPS_SEEDS, "LM fine-tune steps", host=True)
 
 
 @pytest.mark.parametrize("family", ["qwen3-tiny", "mamba2-tiny", "mixtral-tiny", "qwen3-moe-tiny",
