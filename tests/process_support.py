@@ -135,19 +135,24 @@ class Relayed(NamedTuple):
     output: str
 
 
-def relayed(command: Sequence[str], environment: Mapping[str, str], *, timeout: float) -> Relayed:
-    """`command` as an owned group (`owned`), every line it writes passed to this process's stdout as it comes
-    and kept, its exit and output once it ends: a rank of a gang that runs with -s logs how far its child got
-    though the gang's deadline kill it (row 4686: trains 670 and 671's lost gangs logged nothing of their
-    children). One that runs past `timeout` is aborted for its faulthandler stacks, which pass through too,
-    its group ended, and the test failed with its output's tail."""
+def said(line: str) -> None:
+    """`line` on this process's stdout at once: a rank's log, where its gang runs with -s."""
+    print(line, end="", flush=True)
+
+
+def relayed(command: Sequence[str], environment: Mapping[str, str], *, timeout: float,
+            sink: Callable[[str], None] = said) -> Relayed:
+    """`command` as an owned group (`owned`), every line it writes passed to `sink` as it comes and kept, its
+    exit and output once it ends: a rank of a gang that runs with -s logs how far its child got though the
+    gang's deadline kill it (row 4686: trains 670 and 671's lost gangs logged nothing of their children). One
+    that runs past `timeout` is aborted for its faulthandler stacks, which pass through too, its group ended,
+    and the test failed with its output's tail."""
     process = owned(command, environment)
     kept: list[str] = []
 
     def relay() -> None:
         for line in process.stdout or ():
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            sink(line)
             kept.append(line)
 
     reader = threading.Thread(target=relay, daemon=True)
