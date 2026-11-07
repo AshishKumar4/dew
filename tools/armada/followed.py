@@ -80,10 +80,6 @@ VISIT = "visit"
 """A switch of the owner of what runs (`switch`): a file's tests begin, or the session's end does."""
 UNOPENED = "unopened:"
 """What a process whose GPU backend never opened logs instead of its peak: why, as jax said."""
-BOTH = "readwrite:"
-"""What an open of a checkout file to read and write ('r+', O_RDWR) is logged as: the file is its run's input,
-which the run may have changed in place where no stamp of it shows (a mapped page on a filesystem that stamps
-none), so its record keeps no key (`recorded`, row 2559)."""
 EVIDENCE = (READ, STARTED, PEAK, CLOSED, VISIT, UNOPENED)
 """What a log holds beside the record's inputs."""
 decided: dict[types.CodeType, bool] = {}
@@ -173,13 +169,11 @@ def read(event: str, args: tuple, root: str) -> str | None:
     path = args[0]
     if isinstance(path, int):
         return None
-    both = False
     if event == "open":
-        # An open that reads, whether or not it writes too ('r+', O_RDWR): one only to write is no read.
         mode, flags = args[1], args[2]
-        reads = ("r" in mode or "+" in mode) if mode is not None else flags & os.O_ACCMODE != os.O_WRONLY
-        both = ("+" in mode) if mode is not None else flags & os.O_ACCMODE == os.O_RDWR
-        if not reads or (mode is None and getattr(placing, "relative", False)):
+        written = any(letter in mode for letter in "wax+") if mode is not None else (
+            flags & os.O_ACCMODE != os.O_RDONLY)
+        if written or (mode is None and getattr(placing, "relative", False)):
             return None
         # The source loader's read of the module's text on its way to compiling it (its get_code beneath
         # get_data), not a caller's get_source or get_data, nor a sourceless loader's bytecode, nor
@@ -199,8 +193,7 @@ def read(event: str, args: tuple, root: str) -> str | None:
     cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
     if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
         return LIMITS[os.path.basename(name)]
-    place = placed(name, root)
-    return f"{BOTH}{place}" if both and place is not None else place
+    return placed(name, root)
 
 
 def placed(name: str, root: str) -> str | None:
@@ -274,9 +267,9 @@ def opening(recorded: Callable[[str], None], root: str) -> None:
             descriptor = plain(path, flags, mode, dir_fd=dir_fd)
         finally:
             placing.relative = False
-        if flags & os.O_ACCMODE != os.O_WRONLY and (name := placed(
+        if flags & os.O_ACCMODE == os.O_RDONLY and (name := placed(
                 os.readlink(f"/proc/self/fd/{descriptor}"), root)) is not None:
-            recorded(f"{BOTH}{name}" if flags & os.O_ACCMODE == os.O_RDWR else name)
+            recorded(name)
         return descriptor
 
     os.open = opened
@@ -656,10 +649,7 @@ def recorded(path: Path) -> dict[str, dict]:
             item for item in shared if not item.startswith(EVIDENCE)}
         held = [each for each in (*peaks, child["peak"], shared_child["peak"]) if each is not None]
         out[file] = {
-            "depends": (sorted(inputs | child["files"] | shared_child["files"])
-                        if whole and not any(item.startswith(BOTH)
-                                             for item in inputs | child["files"] | shared_child["files"])
-                        else None),
+            "depends": sorted(inputs | child["files"] | shared_child["files"]) if whole else None,
             "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
             "peak": max(held) if len(files) == 1 and whole and held else None,
