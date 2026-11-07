@@ -30,6 +30,7 @@ The workflow's fp32 rows are tests/test_block_diffusion.py's.
 """
 
 import contextlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -38,14 +39,20 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from canvas_support import (
+    CANVAS_SEEDS,
+    WORKFLOW,
+    canvas_draw,
+    dew_canvas,
+    transformers_canvas,
+    transformers_model as canvas_model,
+)
 from interop_support import clearing_selections, fixture_ids, transformers_arms, transformers_model
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 from selection_margins import NARROW_MARGIN
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
-from dew.nn.inputs import ModelInputs
 from dew.nn.kernels import generation
 from dew.nn.precision import ACCURATE
 
@@ -165,44 +172,35 @@ def assert_biases_sum_as_torch(name):
                     seeds=BIAS_SEEDS[name], truth_fn=torch_gradients(wide, float64))
 
 
-def denoise(model, variables, prompt, canvas, **conditioning):
-    """One canvas scored over the prompt's cache: the prefill writes it, the
-    canvas reads it."""
-    media = conditioning.pop("media", None)
-    inputs = ModelInputs(jnp.asarray(prompt), *(media or ()))
-    cache = model.apply(variables, prompt.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
-    cache = model.apply({**variables, "cache": cache}, inputs,
-                        method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
-                        mutable=["cache"])[1]["cache"]
-    logits = model.apply({**variables, "cache": cache}, canvas, **conditioning)
-    return logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
-
-
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
-    """DiffusionGemma's shared text tree with routed experts, a sliding and a
-    full layer, self-conditioning and the vision conditioner, each forward
-    the fp32 test in tests/test_block_diffusion.py makes, now in bf16."""
-    directory = FIXTURES / "diffusion-gemma-workflow"
-    config = json.loads((directory / "config.json").read_text())
-    tensors = load_file(str(directory / "model.safetensors"))
-    reference = {}
-    for name in ("reference.npz", "numerics.npz"):
-        with np.load(directory / name) as stored:
-            reference.update({key: stored[key] for key in stored.files})
+    """DiffusionGemma's shared text tree with routed experts, a sliding and a full layer, self-conditioning
+    and the vision conditioner in bfloat16: each canvas forward tests/test_block_diffusion.py holds in
+    float32 (bare, self-conditioned, image-conditioned), Dew's bfloat16 canvas logits on par with
+    transformers' own bfloat16 forward over drawn prompts, canvases, previous logits and pixels
+    (`canvas_draw`), both measured from the float64 twin of the stored float32 weights (check 1)."""
+    import torch
+
+    config = json.loads((WORKFLOW / "config.json").read_text())
     model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
-    variables, _ = adapter.translate_weights(tensors, config)
-    image = (reference["image_prompt"],
-             ({"image_indices": jnp.where(reference["image_prompt"] == 60, 0, -1)},
-              {"pixel_values": jnp.asarray(reference["pixels"])}))
-    runs = {
-        "bare": (reference["prompt"], {}),
-        "conditioned": (reference["prompt"], {"self_conditioning_logits": reference["previous"]}),
-        "image_logits": (image[0], {"media": image[1]}),
-    }
-    for name, (prompt, conditioning) in runs.items():
-        logits = denoise(model, variables, prompt, reference["canvas"], **conditioning)
-        assert_as_exact_as_the_reference(logits, reference[f"{name}_bf16"], reference[f"{name}_f64"],
-                                         f"workflow {name}")
+    variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
+    with np.load(WORKFLOW / "reference.npz") as stored:
+        reference = {key: stored[key] for key in stored.files}
+    stored = canvas_model(WORKFLOW)
+    narrow = copy.deepcopy(stored).to(torch.bfloat16)
+    reference_arm, truth = transformers_arms(narrow, transformers_canvas, source=stored)
+    canvas = dew_canvas(model, variables)
+
+    @as_given
+    def dew(*inputs):
+        return {"logits": jnp.asarray(canvas(*inputs)["logits"], jnp.float32)}
+
+    draws = {"bare": canvas_draw(reference["prompt"], reference["canvas"], 64),
+             "conditioned": canvas_draw(reference["prompt"], reference["canvas"], 64, previous=True),
+             "image_logits": canvas_draw(reference["image_prompt"], reference["canvas"], 64,
+                                         pixels=reference["pixels"])}
+    for name, draw in draws.items():
+        assert_as_exact(dew, reference_arm, draw, f"workflow {name} bfloat16", seeds=CANVAS_SEEDS,
+                        truth_fn=truth)
 
 
 def bfloat16(bits: np.ndarray) -> jax.Array:
