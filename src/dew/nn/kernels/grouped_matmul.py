@@ -1329,8 +1329,9 @@ class MosaicStepScaledGmm(MosaicGmm):
 
 @dataclasses.dataclass(frozen=True)
 class MosaicMxGmm(MosaicGmm):
-    """`MosaicGmm` of an MX product (`gemm.mxfp8_product`, row 4519), planned on the call it is: FP8 rows
-    times a K-major FP8 matrix, each 32 depths of each scaled by its E8M0 scale in the products
+    """`MosaicGmm` of a block-scaled product (`gemm.mxfp8_product`, `gemm.nvfp4_block_product`, row 4519),
+    planned on the call it is: FP8 or E2M1 rows times a K-major matrix of theirs, each block of each scaled
+    by its scale in the products (`mosaic_gpu.block_format`)
     (`mosaic_gpu.gmm`'s `mx_scales`, `mosaic.Issuer.scaled_products`), its block scales streamed beside its
     rings (`gmm_allocations`' `block_scaled`) on a family whose products take them (tcgen05's), its tiles
     whole 128s of rows, columns and depth, and no split, swap, hook or exact sums."""
@@ -1338,8 +1339,9 @@ class MosaicMxGmm(MosaicGmm):
     BLOCK_SCALED: ClassVar[bool] = True
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
-        # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted.
-        return (jnp.dtype(dtype) in EIGHT and family.takes_block_scales
+        # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted. Its
+        # operands FP8 (MXFP8) or E2M1 (NVFP4), `mosaic_gpu.block_format`'s.
+        return (jnp.dtype(dtype) in (*EIGHT, jnp.dtype(jnp.float4_e2m1fn)) and family.takes_block_scales
                 and ba.arguments['trans_rhs'] and ba.arguments['hooks'] == NO_HOOKS
                 and ba.arguments.get('paired') is None and not ba.arguments.get('exact_sums'))
 
