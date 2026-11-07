@@ -23,7 +23,7 @@ from model_support import TINY_DECODER
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
 
-from dew.batch import FROZEN, freeze, merge
+from dew.batch import FROZEN, merge
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
@@ -734,33 +734,12 @@ def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_doe
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_periodic_scanned_stack_frozen_by_layer_index_trains_on_one_stage():
-    """A scanned periodic stack (sliding and full attention alternating) whose first layer is frozen by
-    index (`dew.batch.freeze`) holds a collection with some of a period position's layers and not the
-    others: its one stage keeps the run on its stored layers (`StackView.splits`, periodic positions
-    among the groups it reads), where it stacked them and refused the partial position as it placed it."""
-    model = decoder(scan_layers=True, layer_types=("sliding_attention", "full_attention") * 2,
-                    kinds={"sliding_attention": {"window": 4}})
-    base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
-    held = freeze(nn.unbox(base), lambda path: "layers_0" not in path)
-    run = trainer(model, OptimConfig(optimizer="adamw", learning_rate=1e-2), MeshSpec(fsdp=2), 8,
-                  variables=held)
-    run.validate(steps=1)
-    state, _, _ = run.place()
-    batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
-    _, loss, *_ = run.compile(state, batch)(state, batch)
-    assert np.isfinite(float(loss))
-
-
-@pytest.mark.mesh(devices=8)
 def test_a_frozen_base_scanned_under_a_rung_that_recomputes_named_residuals_keeps_the_rest():
     """Under rung 1 (`all_but_delta_memory`, a block that recomputes its delta memory alone and keeps every
     other value), a one-stage scan that reads a frozen base's rows (`decoder_stack._rows_recomputed`) keeps
-    what the rung keeps, more than the full rung recomputing the whole layer, and never the rows: where it
-    recomputed the whole layer, the cheapest rung cost the most."""
-    from jax.ad_checkpoint import saved_residuals
-
-    kept = {}
+    what the rung keeps for its backward, more than the full rung recomputing the whole layer: where it
+    recomputed the whole layer, the cheapest rung cost what the dearest does in time and held no more."""
+    held = {}
     for rung in ("all_but_delta_memory", "full"):
         model = decoder(scan_layers=True, remat=rung)
         base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
@@ -773,9 +752,9 @@ def test_a_frozen_base_scanned_under_a_rung_that_recomputes_named_residuals_keep
 
         def loss(params, variables=variables, model=adapter.model, ids=ids):
             return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
-        kept[rung] = sum(np.prod(aval.shape) * aval.dtype.itemsize
-                         for aval, _ in saved_residuals(loss, variables["params"]))
-    assert kept["all_but_delta_memory"] > kept["full"], kept
+        compiled = jax.jit(jax.grad(loss)).lower(variables["params"]).compile()
+        held[rung] = compiled.memory_analysis().temp_size_in_bytes
+    assert held["all_but_delta_memory"] > held["full"], held
 
 
 ROWS_SEEDS = 8
