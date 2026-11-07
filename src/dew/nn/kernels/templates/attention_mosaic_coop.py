@@ -1,9 +1,9 @@
 """The attention template's Mosaic GPU fused backward over shared keys (`attention_mosaic_backward`): the fast
-form's one launch of a hookless call whose consumers share one key block, each forming the logits and score
-cotangents of its share of the keys, the weights and cotangents exchanged through shared memory, and each
-holding its share of the head's columns of dK, dV and dQ (FlashAttention 3's sm90 backward at width 256,
-hopper/flash_bwd_launch_template.h's run_mha_bwd_hdim256: two MMA warpgroups splitting dK's, dV's and dQ's
-columns, one stage of dO and dS)."""
+form's one launch of a call whose score hook takes no parameters and whose consumers share one key block,
+each forming the logits and score cotangents of its share of the keys, the weights and cotangents exchanged
+through shared memory, and each holding its share of the head's columns of dK, dV and dQ (FlashAttention
+3's sm90 backward at width 256, hopper/flash_bwd_launch_template.h's run_mha_bwd_hdim256: two MMA
+warpgroups splitting dK's, dV's and dQ's columns, one stage of dO and dS)."""
 
 import functools
 
@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic
@@ -25,6 +24,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     modelled,
     part_count,
+    reducing,
     stated,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _tile_scores
@@ -42,9 +42,9 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     chunk = mosaic.staged_columns(width // consumers, (jnp.float32,))
     swizzle = mosaic.swizzle_for(dtype, block_k // consumers, block_q, block_k)
-    scoped = [plgpu.SMEM((block_k, width), dtype), plgpu.SMEM((block_k, width), dtype),
-              mosaic.staged((2, block_q, block_k), dtype, swizzle),
-              plgpu.SMEM((consumers, max(block_q, block_k), chunk), jnp.float32),
+    scoped = [family.staged_memory((block_k, width), dtype), family.staged_memory((block_k, width), dtype),
+              family.staged_memory((2, block_q, block_k), dtype, swizzle),
+              family.staged_memory((consumers, max(block_q, block_k), chunk), jnp.float32),
               family.load_barriers(2), *family.exchange(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
     return scoped, family.streams(blocks, stages, consumers)
@@ -112,11 +112,11 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         dq_ref, dkv_ref, k_smem, v_smem, exchanged, out_smem, loads, staged_turn, read_turn = refs
         dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
-        row, head = lax.axis_index("batch"), lax.axis_index("heads")
+        row, head = family.program_index("batch"), family.program_index("heads")
         key_head = lax.div(head, heads // kv_heads)
         views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
         streams = family.opened(streams, views)
-        k_first = lax.axis_index("k_tiles") * block_k
+        k_first = family.program_index("k_tiles") * block_k
         lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
         streamed = _streamed([(lo, hi)] * consumers)
         run = program.whole_run(k_first, q_steps, spans_of)
@@ -171,6 +171,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         entry, out_type=(), grid=(heads, keys_padded // block_k, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_shared",
+        # A score hook's warpgroups reserve their reduction scratch (`reducing`).
+        reducing_warpgroups=reducing(family, consumers, walk.reduces),
         # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
         # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads,

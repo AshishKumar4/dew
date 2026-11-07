@@ -23,6 +23,8 @@ import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
 from typing_extensions import TypeIs
 
+from dew.nn import programs
+
 if TYPE_CHECKING:
     from dew.interop.safetensors_io import LazyTensors
 
@@ -47,20 +49,18 @@ type Abstract = Unread | tuple[Abstract, ...] | list[Abstract]
 def evaluated(function: Callable[..., Traced], *args: Operand, **kwargs: Operand) -> Abstract:
     """`function`'s result on `args` and `kwargs` with every `Unread` among them abstract: `Unread`
     arrays of the shapes and dtypes it would return."""
-    leaves, tree = jax.tree.flatten((args, kwargs), is_leaf=lambda leaf: isinstance(leaf, Unread))
-    unread_at = [index for index, leaf in enumerate(leaves) if isinstance(leaf, Unread)]
+    def unread(leaf) -> bool:
+        return isinstance(leaf, Unread)
+
+    unreads, fill = programs.holes((args, kwargs), unread, is_leaf=unread)
 
     def run(*abstract: jax.Array) -> Traced:
-        filled = list(leaves)
-        for index, value in zip(unread_at, abstract, strict=True):
-            filled[index] = value
-        given, named = jax.tree.unflatten(tree, filled)
+        given, named = fill(abstract)
         return function(*given, **named)
 
     # The stored dtypes as NumPy holds them: float64 and int64 stay so.
     with jax.enable_x64(new_val=True):
-        shapes = jax.eval_shape(run, *(jax.ShapeDtypeStruct(leaves[index].shape, leaves[index].dtype)
-                                       for index in unread_at))
+        shapes = jax.eval_shape(run, *(jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) for leaf in unreads))
     return jax.tree.map(lambda leaf: Unread(leaf.shape, leaf.dtype), shapes)
 
 

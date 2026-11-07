@@ -207,6 +207,47 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
+@pytest.mark.parametrize("scale_dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("offset", [False, True])
+def test_a_weight_folded_into_the_inverse_associates_as_flax_and_takes_every_gradient(dtype, scale_dtype,
+                                                                                       offset):
+    """`rms_normalized(..., weight_first=True)`: the weight folded into the inverse RMS before the rows,
+    Flax's `nn.RMSNorm` (`x * (rsqrt(mean + eps) * w)`, every step in fp32, cast once). XLA's path computes
+    exactly that, Flax's module's own output bitwise; the fused norm takes it (interpreted on this CPU),
+    its output and every gradient on par with XLA's by check 1. A cast between the weight and the rows
+    (`scale_after_cast`) has no fold to make, and is refused."""
+    from flax import linen as nn
+
+    def xla(output_dtype, x, scale):
+        return rms_normalized(x, scale, 1e-5, output_dtype, scale_offset=offset, scale_after_cast=False,
+                              fp32_statistics=True, implementation="xla", weight_first=True)
+
+    def portable(x, branch, scale):
+        return stream_rms_normalized(x, branch, scale, 1e-5, dtype, scale_offset=offset,
+                                     scale_after_cast=False, fp32_statistics=True, implementation="xla",
+                                     weight_first=True)
+
+    def fused(x, scale):
+        return norm_swiglu.stream_rms_norm(x, None, scale, 1e-5, dtype, offset=offset, after_cast=False,
+                                           portable=portable, weight_first=True)[1]
+
+    (x, scale), _ = norm_operands((3, 5, 64), dtype, scale_dtype)
+    # The offset adds in the stored weight's dtype, as Dew's norm adds it.
+    weight = scale + 1.0 if offset else scale
+    flax = nn.RMSNorm(epsilon=1e-5, dtype=jnp.float32, param_dtype=weight.dtype)
+    expected = flax.apply({"params": {"scale": weight}}, x.astype(jnp.float32)).astype(dtype)
+    np.testing.assert_array_equal(np.asarray(jax.jit(functools.partial(xla, dtype))(x, scale), np.float32),
+                                  np.asarray(expected, np.float32))
+    compare((functools.partial(xla, dtype), fused, functools.partial(xla, jnp.float64)),
+            lambda draw: norm_operands((2, 3, 31), dtype, scale_dtype, draw), ("y", "x", "scale"),
+            SEEDS[(2, 3, 31)],
+            coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=False))
+    with pytest.raises(ValueError):
+        rms_normalized(x, scale, 1e-5, dtype, scale_offset=offset, scale_after_cast=True,
+                       fp32_statistics=True, weight_first=True)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("case", ["random-2x3x31", "random-3x257x17", "random-5x2x128", "aligned-1x128",
                                   "large-1x128", "small-1x128"])
 def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(dtype, case):
@@ -242,6 +283,24 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
             SEEDS["unweighted" if edge is None else "unweighted, one value"])
 
 
+@pytest.mark.parametrize("exponent", [7, 14])
+def test_the_fused_unweighted_norms_fp16_gradient_meets_fp16s_edge_where_xlas_does(exponent):
+    """The fused unweighted norm's fp16 input gradient at a cotangent of 2**7 (the parity case's edge) and
+    2**14 (its edge before row 823 narrowed it, workaround audit group 45), rows of one value: finite where
+    XLA's program's is and not where it is not (each gradient term grows by up to 2**8 within the model's
+    fp16 cast sites, which the kernel keeps, so past 2**8 below fp16's largest both overflow: a boundary of
+    the format the model computes in, not of the kernel)."""
+    x = jnp.full((4, 128), 1.5, jnp.float16)
+    cotangent = jnp.full((4, 128), 1.25 * 2.0 ** exponent, jnp.float16)
+
+    def unweighted(x):
+        return norms.unweighted_rmsnorm(x, 1e-6, implementation="xla")
+
+    finite = [np.isfinite(np.asarray(jax.vjp(f, x)[1](cotangent)[0], np.float64))
+              for f in (fused_unweighted(1e-6), unweighted)]
+    np.testing.assert_array_equal(*finite)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
@@ -250,21 +309,27 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
             coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=True))
 
 
+@pytest.mark.parametrize("rows", ["repeated", "distinct"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
-def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
+def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype, rows):
     """Repeated tokens hold the row arithmetic fixed while the column sum grows to Qwen3.5-0.8B's size,
     isolating partial-sum error from bf16 midpoint flips: the weight gradient holds check 1 over the
     step's draws. Repeated rows give the output and input gradient one row's evidence a draw, so the same
-    launch holds all three over a step of distinct rows too."""
+    launch holds all three over a third of a step of distinct rows too (8192, its weight gradient's sum
+    thousands of rows long; the full step's sum is the repeated case's to hold). Each is its own case, so
+    each fits its group's 120 s: both in one ran 129 s, and the full step of distinct rows alone 121-162 s
+    (row 4458, NS4458-1)."""
     functions = norm_functions(dtype, offset=True, after_cast=True)
 
     def coefficient(operands):
         return scale_coefficient(operands[0], dtype, after_cast=True)
 
-    compare(functions, lambda draw: full_step(dtype, draw), ("y", "x", "scale"), SEEDS[(24576, 1000)],
-            coefficient=coefficient, judged=("scale",))
-    compare(functions, functools.partial(norm_operands, (24576, 1000), dtype, jnp.float32),
-            ("y", "x", "scale"), SEEDS["step of distinct rows"], coefficient=coefficient)
+    if rows == "repeated":
+        compare(functions, lambda draw: full_step(dtype, draw), ("y", "x", "scale"), SEEDS[(24576, 1000)],
+                coefficient=coefficient, judged=("scale",))
+    else:
+        compare(functions, functools.partial(norm_operands, (8192, 1000), dtype, jnp.float32),
+                ("y", "x", "scale"), SEEDS["step of distinct rows"], coefficient=coefficient)
 
 
 def test_a_weight_gradient_past_fp32s_range_is_an_infinity_as_xlas():
@@ -580,8 +645,85 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
         graph = traced(functools.partial(run, RESIDUAL, MLP_HIDDEN))
         assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
         meshed = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
+    assert_as_alone(meshed, alone)
+
+
+@pytest.mark.mesh(devices=2)
+def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_operands():
+    """On an explicit mesh splitting the rows, no logical axes named: the operands' own types place the
+    kernels per shard (`norm_swiglu._shard_spec`; row 822), the weight whole, its gradient summed over the
+    shards, their outputs and gradients on par with one device's."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    operands = _checked_shard_operands()
+    scale = operands[2]  # the weight, placed whole
+    alone = jax.jit(_checked_shard_run)(*operands)
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(operand, NamedSharding(mesh, P() if operand is scale else P("data")))
+                  for operand in operands]
+        graph = traced(_checked_shard_run, *placed)
+        assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
+        meshed = jax.jit(_checked_shard_run)(*placed)
+    assert_as_alone(meshed, alone)
+
+
+def assert_as_alone(meshed, alone):
+    """Each of `meshed`'s leaves within 1e-6 of one device's (`alone`): a shard's rows are its own, and the
+    weight's gradient sums the shards' partials in another order."""
     for mine, theirs in zip(jax.tree.leaves(meshed), jax.tree.leaves(alone), strict=True):
         assert relative(mine, theirs) < 1e-6
+
+
+def _checked_shard_operands():
+    """The per-shard tests' operands (`_checked_shard_run`'s): the seam's and SwiGLU's, and their
+    cotangents."""
+    (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32)
+    branch, ds = (jax.random.normal(jax.random.key(index), x.shape) for index in (28, 29))
+    gate, up, dout = (jax.random.normal(jax.random.key(index), (4, 8, 24)) for index in (30, 31, 32))
+    return x, branch, scale, ds, dy, gate, up, dout
+
+
+def _checked_shard_run(x, branch, scale, ds, dy, gate, up, dout):
+    """The fused seam's and SwiGLU's outputs and gradients (`evaluated`)."""
+    seam = evaluated(fused_seam(1e-5, x.dtype, offset=True, after_cast=True), (x, branch, scale), (ds, dy))
+    return seam, evaluated(fused_swiglu(), (gate, up), dout)
+
+
+def _checked_shard_specs(scale_shape, outputs):
+    """Each operand's and output's placement: rows split over `data`, the weight and its gradient whole."""
+    from jax.sharding import PartitionSpec as P
+
+    rows = P("data")
+    in_specs = (rows, rows, P(), rows, rows, rows, rows, rows)
+    return in_specs, jax.tree.map(lambda leaf: P() if leaf.shape == scale_shape else rows, outputs)
+
+
+def test_seam_and_product_launch_their_kernels_inside_a_checked_shard_map():
+    """Inside a `shard_map` that checks varying axes over a compile-only pair of H100s, each its rows, the
+    weight replicated: the fused seam's and SwiGLU's forward and backward launch their kernels, their
+    outputs' varying type stated (`norm_swiglu._varying`) and the weight's gradient summed over the shards
+    to its own type (`_typed`), the program's one collective (route evidence, row 822)."""
+    import fla_gdn_support as support
+    from kernel_compile import Expected, compile_kernels, route_failures
+
+    operands = _checked_shard_operands()
+    outputs = jax.eval_shape(_checked_shard_run, *operands)
+    in_specs, out_specs = _checked_shard_specs(operands[2].shape, outputs)
+
+    def program(*operands):
+        return jax.shard_map(_checked_shard_run, in_specs=in_specs, out_specs=out_specs,
+                             check_vma=True)(*operands)
+
+    def case():
+        return program, tuple(jax.ShapeDtypeStruct(operand.shape, operand.dtype) for operand in operands)
+
+    expected = Expected(axes=(("data", 2),), specs=in_specs,
+                        launches=frozenset({"rms_norm_forward", "rms_norm_backward", "swiglu_forward",
+                                            "swiglu_backward"}),
+                        collectives=frozenset({("all-reduce", frozenset({"data"}))}))
+    cases = [support.KernelCase("checked shard_map", case, expected=expected)]
+    assert route_failures(cases, compile_kernels(cases, "sm90")) == []
 
 
 def fused_function(name, fused: bool):

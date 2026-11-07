@@ -251,7 +251,7 @@ def test_residency_charges_whole_register_allocation_units():
 
     # Two 384-thread blocks at 85 live registers would fit without allocation rounding. At the
     # hardware's 88-register allocation they need 67,584 registers, beyond the 64K file.
-    model = resources.RegisterModel(85, 168, 3, 2, 8, 0)
+    model = resources.RegisterModel(85, 168, 3, 2, 8, 0, file=65536)
     assert model.resident(85) == 1
 
 

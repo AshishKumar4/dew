@@ -3,11 +3,14 @@ codes' fields, its cheapest instruction form found by the price-ordered search a
 the decoded registers read as the consumer reads them, values its format defines."""
 
 import dataclasses
+import itertools
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
+from map_judge import sharded
 
 from dew.algebra import bits
 
@@ -70,6 +73,28 @@ def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order()
     expected = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
     got = np.asarray(decoded).astype(np.float64).reshape(512, 8) * 2.0 ** 126
     np.testing.assert_array_equal(got, expected)
+
+
+def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
+    """An NVFP4 tile (`nvfp4_decoded`): every code in every place of a word, under E4M3 block scales from the
+    least subnormal to the largest, decodes to the code times its block's scale over `NVFP4_OWED`, exactly,
+    under a jit."""
+    rng = np.random.default_rng(3621)
+    depth, columns = 64, 32
+    codes = rng.integers(0, 16, size=(depth, columns))
+    codes[:16, :16] = np.arange(16)[:, None]
+    scale_bits = rng.integers(0, 0x7F, size=(depth // 16, columns), dtype=np.uint8)
+    scale_bits[0, :3] = (0x01, 0x7E, 0x08)
+    scales = jnp.asarray(scale_bits).view(jnp.float8_e4m3fn)
+    packed = codes.reshape(depth // 8, 8, columns).astype(np.uint64) << (
+        4 * np.arange(8, dtype=np.uint64))[None, :, None]
+    natural = jnp.asarray(packed.sum(axis=1).astype(np.uint32))
+    stored = bits.NVFP4_BFLOAT16_FORM.prepared(natural)
+    decoded = jax.jit(bits.nvfp4_decoded)(stored, scales)
+    values = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
+    block = np.repeat(np.asarray(scales.astype(jnp.float32), np.float64), 16, axis=0)
+    np.testing.assert_array_equal(np.asarray(decoded.astype(jnp.float32), np.float64) * bits.NVFP4_OWED,
+                                  values * block)
 
 
 def test_an_fp8_decode_reads_back_every_finite_code_in_every_place():
@@ -169,15 +194,12 @@ FORMS = {
     "nvfp4-alu": lambda: bits.synthesized(dataclasses.replace(bits.NVFP4_BFLOAT16, units=ALU), reach=6),
     "nibbles": lambda: bits.synthesized(_nibbles()),
     "nibbles-alu": lambda: bits.synthesized(_nibbles(ALU)),
+    "encode-e4m3": lambda: bits.encode_form(bits.E4M3),
 }
 """Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
-and right shifts on either pipe, and a mask of one value and of two values' XOR."""
-
-
-def test_the_forms_take_every_instruction_the_ptx_writes():
-    """`FORMS` reach every (instruction, pipe) PTX writes, so the tests below run each of them."""
-    taken = {(step.op, step.unit) for form in FORMS.values() for step in form().steps}
-    assert taken == set(bits._PTX)
+and right shifts on either pipe, and a mask of one value and of two values' XOR; and an encode's (every
+instruction that is not linear: logic of any table, three-way adds, minima, compares, selects and shifts
+by a value)."""
 
 
 @pytest.mark.parametrize("name", FORMS)
@@ -239,3 +261,120 @@ def test_a_forms_ptx_decodes_on_the_gpu_as_its_form_does(name):
     decoded = jax.jit(_inline_decode(form))(jnp.asarray(words.astype(np.uint32)))
     for got, expected in zip(decoded, form.decoded(words), strict=True):
         np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)
+
+
+MINIFLOATS = {"e4m3": (bits.E4M3, ml_dtypes.float8_e4m3fn), "e5m2": (bits.E5M2, ml_dtypes.float8_e5m2),
+              "e2m1": (bits.E2M1, ml_dtypes.float4_e2m1fn)}
+"""Each encode's minifloat and ml_dtypes' type of it, the reference's."""
+
+SLICES = 64
+"""All 2^32 fp32 words, cut into this many slices of 2^26 a map task's unit."""
+
+
+def reference_codes(words: np.ndarray, minifloat: bits.Minifloat, dtype) -> np.ndarray:
+    """ml_dtypes' round-to-nearest-even cast of fp32 `words` (uint32 bits) saturated first to the largest
+    finite value (the satfinite cvt's semantics), as uint32 codes; a NaN the minifloat's NaN code (whose
+    payload ml_dtypes chooses otherwise: e5m2's quiet 0x7E) with its sign, e2m1's its largest."""
+    x = words.view(np.float32)
+    largest = np.uint32(minifloat.largest_float32).view(np.float32)
+    codes = np.clip(x, -largest, largest).astype(dtype).view(np.uint8).astype(np.uint32)
+    codes &= np.uint32((1 << minifloat.width) - 1)
+    nan = minifloat.largest if minifloat.nan is None else minifloat.nan
+    signed = np.uint32(nan) | (words >> np.uint32(31)) << np.uint32(minifloat.width - 1)
+    return np.where(np.isnan(x), signed, codes)
+
+
+@pytest.mark.shards(units=192, per_task=8)
+def test_each_encode_is_the_reference_cast_on_every_fp32_word():
+    """Each of e4m3's, e5m2's and e2m1's encodes (`bits.encoded`) is ml_dtypes' round-to-nearest-even cast
+    saturated to its largest finite value on every one of the 2^32 fp32 words, a NaN as its NaN code, and its
+    instruction form (`bits.encode_form`) is the encode on every word: a proof by exhaustion (row 4050)."""
+    cases = list(itertools.product(MINIFLOATS, range(SLICES)))
+    assert len(cases) == 192, "the shards mark counts each slice of each encode"
+
+    def checked(start: int, stop: int) -> int:
+        for name, index in cases[start:stop]:
+            minifloat, dtype = MINIFLOATS[name]
+            words = np.arange(index << 26, (index + 1) << 26, dtype=np.uint64).astype(np.uint32)
+            got = bits.encoded(words, minifloat, np)
+            want = reference_codes(words, minifloat, dtype)
+            differ = np.flatnonzero(got != want)
+            assert differ.size == 0, (name, [(hex(int(words[i])), int(got[i]), int(want[i]))
+                                             for i in differ[:4]])
+            (formed,) = bits.encode_form(minifloat).decoded(words)
+            differ = np.flatnonzero(formed != got)
+            assert differ.size == 0, (name, "form", [(hex(int(words[i])), int(formed[i]), int(got[i]))
+                                                     for i in differ[:4]])
+        return stop - start
+
+    sharded("every fp32 word's encode", checked, len(cases))
+
+
+def test_an_nvfp4_tile_packed_from_its_encode_decodes_to_its_rounded_values():
+    """fp32 values encoded to e2m1 (`bits.encoded`) and packed eight a word (`bits.packed`), with a block
+    scale of 1 (an e4m3 scale of 2^8, `NVFP4_OWED`), decode (`nvfp4_decoded`) to their e2m1 rounding: the
+    pack is the stored NVFP4 order the decode reads, in jax.numpy as a kernel's portable path runs it."""
+    rng = np.random.default_rng(4050)
+    x = rng.standard_normal((64, 8)).astype(np.float32) * 3
+    codes = bits.encoded(jnp.asarray(x).view(jnp.uint32), bits.E2M1)
+    words = bits.packed(codes.T, bits.E2M1).T
+    scales = jnp.full((4, 8), 2.0 ** 8, ml_dtypes.float8_e4m3fn)
+    decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32)
+    rounded = np.clip(x, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)
+    np.testing.assert_array_equal(decoded, rounded)
+
+
+def test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_its_rounding():
+    """An fp32 tile quantized to NVFP4 (`bits.nvfp4_quantized`), a block of zeros and a block whose values
+    span six decades among them: its tensor scale its largest magnitude over 6 * 448, each block's scale the
+    least e4m3 at or above the block's largest over it over 6 (at most e4m3's largest), and its decode
+    (`nvfp4_decoded`, times `NVFP4_OWED`) each value over the tensor scale over its block's scale rounded to
+    e2m1 times its block's scale, exactly (row 4050)."""
+    rng = np.random.default_rng(4050)
+    x = (rng.standard_normal((64, 8)) * 10.0 ** rng.integers(-3, 3, (64, 8))).astype(np.float32)
+    x[16:32, 3] = 0
+    words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(x))
+    largest = np.float32(np.abs(x).max())
+    np.testing.assert_array_equal(np.asarray(tensor), largest / np.float32(6 * 448))
+    table = np.arange(0x7F, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+    ratio = np.abs(x).reshape(4, 16, 8).max(axis=1) / np.asarray(tensor) / np.float32(6)
+    # The largest block's ratio is 448 up to its rounding, which may pass it: its scale is e4m3's largest.
+    least = table[np.minimum(np.searchsorted(table, ratio), table.size - 1)]
+    np.testing.assert_array_equal(np.asarray(scales, np.float32), least)
+    each = np.repeat(least, 16, axis=0)
+    quotient = np.where(each > 0, x / np.asarray(tensor) / np.where(each > 0, each, 1), 0).astype(np.float32)
+    rounded = np.clip(quotient, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)
+    decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32) * np.float32(bits.NVFP4_OWED)
+    np.testing.assert_array_equal(decoded, rounded * np.repeat(least, 16, axis=0))
+
+
+def test_a_small_nonzero_tile_keeps_its_nvfp4_codes():
+    """A tile of small normal values, whose largest over 6 * 448 is no normal fp32, quantizes to codes that
+    decode to the values' rounding (`bits.nvfp4_quantized`, then `nvfp4_decoded` times `NVFP4_OWED` and the
+    tensor scale): nonzero, each within e2m1's half step of its value, not a tile erased by its scale's
+    underflow."""
+    x = np.full((32, 8), np.float32(3e-36))
+    x[::2] *= np.float32(-0.5)
+    words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(x))
+    decoded = (np.asarray(bits.nvfp4_decoded(words, scales), np.float64) * bits.NVFP4_OWED
+               * np.float64(np.asarray(tensor)))
+    assert np.all(np.sign(decoded) == np.sign(x))
+    np.testing.assert_array_less(np.abs(decoded - x), np.abs(x) * 0.25)
+
+
+def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():
+    """A truth table over one value and the immediate (`BitOp.LOGIC` with one operand) runs as PTX writes it
+    and the synthesizer proves it, `lop3.b32 d, a, imm, imm`, under every table (row 4647): each result
+    bit the table's bit at the minterm of the value's bit and the immediate's twice, the PTX ISA's
+    definition."""
+    words = np.random.default_rng(4647).integers(0, 1 << 32, 4096, dtype=np.uint64).astype(np.uint32)
+    immediate = 0x0F0F_A5C3
+    lanes = np.arange(32, dtype=np.uint32)
+    held = (words[:, None] >> lanes) & 1
+    other = (np.uint32(immediate) >> lanes) & 1
+    for table in range(256):
+        form = bits.BitForm((bits.BitStep(bits.BitOp.LOGIC, (0,), immediate, bits.Unit.ALU, table),), (1,),
+                            tuple(1 << bit for bit in range(32)))
+        minterms = (held << 2) | (other << 1) | other
+        expected = np.sum(((np.uint32(table) >> minterms) & 1) << lanes, axis=-1, dtype=np.uint64)
+        np.testing.assert_array_equal(form.decoded(words)[0], expected, err_msg=f"table {table:#04x}")

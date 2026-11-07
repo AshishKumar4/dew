@@ -112,8 +112,9 @@ argv[3] `refused`, another from the refusals that one carries."""
 @lowers("sm90")
 def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_path, nonce):
     """A step compiled ahead for a compile-only H100 on this CPU, its launch's derived tile spilling at
-    ptxas, is refused that tile and lowered once more at the next, the miss recorded (`report.misses`)
-    and its plan holding the spill and the refusal, as its telemetry reports them; the step it saves
+    ptxas, is refused that tile and lowered again at the next until one spills nothing, the miss recorded
+    (`report.misses`) and its plan holding the spill and the refusal, as its telemetry reports them; the
+    step it saves
     carries the refusal (`AheadOfTime.refusals`), and another process that starts from it derives past the
     refused tile, which it never compiles, its plan recording its own refusals alone (train 329's review)."""
     step = str(tmp_path / "step.dew-aot")
@@ -661,12 +662,28 @@ WATERFALL_LISTING = """
 """A copy whose operand ptxas could not prove uniform, issued lane by lane in an elect waterfall (BRA.U.ANY)
 around its R2UR (notes/ptxas-re.md §2: a divergent copy operand)."""
 
-def test_the_sass_rules_find_an_elect_waterfall_around_a_conversion():
-    """The compile gate's SASS rules (row 4071, the kernel challenge's harness/ptxas checks) read nvdisasm's
-    listing of a kernel: an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
-    operand ptxas could not prove uniform; a loop's conversion without a waterfall is none."""
-    (waterfall,) = report.sass_findings_of(WATERFALL_LISTING)
-    assert "waterfall" in waterfall
+DEAD_MMA_LISTING = """
+.text.negated_mosaic_gpu_kernel:
+        /*0570*/                   WARPGROUP.ARRIVE ;
+        /*0580*/                   HGMMA.64x8x16.F16 RZ, gdesc[URZ], RZ, !UPT, gsb0 ;
+        /*0590*/                   WARPGROUP.DEPBAR.LE gsb0, 0x0 ;
+        /*05b0*/                   STS.64 [R3+0x4000], R16 ;
+        /*05c0*/                   EXIT ;
+"""
+"""ptxas 12.9's listing of a negated warpgroup product (row 4346's minimal kernel at base): its four MMAs
+dropped for one writing no register, the stored tile a constant."""
+
+
+@pytest.mark.parametrize(("listing", "found"), [(WATERFALL_LISTING, "waterfall"),
+                                               (DEAD_MMA_LISTING, "warpgroup MMA writing no register")])
+def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
+    """The compile gate's SASS rules read nvdisasm's listing of a kernel (row 4071, the kernel challenge's
+    harness/ptxas checks): an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
+    operand ptxas could not prove uniform, and a warpgroup MMA writing no register (`HGMMA ... RZ`) is what
+    ptxas leaves of products it found never read (row 4346); each is one finding the gate fails, and a loop's
+    conversion with neither is none."""
+    (finding,) = report.sass_findings_of(listing)
+    assert found in finding
     assert report.sass_findings_of(CONVERTING_LISTING) == ()
 
 

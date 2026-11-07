@@ -65,7 +65,6 @@ from dew.nn.kernels.generation import (
     built_target,
     capability,
     device_target,
-    gpu_mesh,
     gpu_target,
     routes,
     tpu,
@@ -541,7 +540,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
 
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
             """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
-            with (assumed(target), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
+            with (assumed(target), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
                   routes() as routed):
                 program = owned_program(function, out_shardings=placed).lower(*shapes)
             taken[name] = routed

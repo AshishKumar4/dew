@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.precision import asks_default_precision
+from dew.nn.precision import asks_default_precision, exact_products
 
 HALF = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 """The 16-bit dtypes the kernels multiply exactly."""
@@ -36,28 +36,46 @@ class Product:
     refusal: str | None
 
 
+SUMMED_DEPTH = 128
+"""The depth an exactly summed partial covers on a family whose accumulator carries across steps
+(`mosaic.Issuer.summed_window`): DeepSeek-V3's promotion interval for FP8 sums, 128."""
+
+
 def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
              operands: tuple = ()) -> Product:
     """The product a caller asks for with `precision` (explicitly or through
     `jax_default_matmul_precision`), multiplying in `compute` into `outputs`' dtypes from operands (or
     masters) of `operands`' dtypes. The kernels sum in fp32 and offset groups in int32, so x64 is
     refused, and an operand fp32 does not hold (a complex master), whose gradient they cannot write;
-    their fp32 products are TF32, which only the default precision asks for."""
+    their fp32 products are TF32, which only the default precision asks for. A declared dot algorithm
+    whose products are not `compute`'s whole ones (TF32's, bf16 parts of an fp32 product, F64's:
+    `precision.exact_products`) is refused too, forward and gradient alike: the kernels multiply
+    `compute` whole and sum in fp32, so a portable route computes it."""
     compute = jnp.dtype(compute)
     above = not asks_default_precision(precision, configured=True)
-    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs),
-                   _refusal(compute, operands, above))
+    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs, compute=compute),
+                   _refusal(compute, operands, above, precision))
 
 
-def promoted(*, above: bool, outputs: tuple) -> bool:
-    """Whether a product asked for above the default precision (`above`) promotes each depth step's
-    partial apart: where an output is fp32, whose IEEE sums a 16-bit output's one rounding hides."""
-    return above and jnp.dtype(jnp.float32) in {jnp.dtype(dtype) for dtype in outputs}
+def promoted(*, above: bool, outputs: tuple, compute: Dtype | None = None) -> bool:
+    """Whether a product promotes each depth step's partial apart (`exact_sums`): where an output is fp32,
+    whose sums a 16-bit output's one rounding hides, and the product is asked above the default precision
+    (`above`) or multiplies 16-bit operands (`compute`). A tensor core adds each instruction's products
+    into one fp32 accumulator in order, and its error grows with the depth: every Dew launch's fp32 sum of
+    bf16 products, Triton's and the template's at four tiles alike, was 1.661x XLA's RMS error from
+    float64 at a depth of 128 and 3.88x at 512 on an A100 (M-NS-1, NS4331-VALUE4-a100; row 4331)."""
+    if jnp.dtype(jnp.float32) not in {jnp.dtype(dtype) for dtype in outputs}:
+        return False
+    return above or (compute is not None and jnp.dtype(compute) in HALF)
 
 
-def _refusal(compute: jnp.dtype, operands: tuple, above: bool) -> str | None:
+def _refusal(compute: jnp.dtype, operands: tuple, above: bool, precision: PrecisionLike = None
+             ) -> str | None:
     if jax.config.jax_enable_x64:
         return "x64 widens the kernels' int32 group offsets"
+    if compute not in EIGHT and not exact_products(precision, compute):
+        return ("a declared dot algorithm narrows or widens the products, which the kernels multiply whole "
+                "with fp32 sums")
     # An operand fp32 holds is no complex one and none wider (8-bit floats promote implicitly to nothing).
     if any(jnp.issubdtype(dtype, jnp.complexfloating) or jnp.dtype(dtype).itemsize > 4
            for dtype in (compute, *operands)):
@@ -95,6 +113,9 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
 
 BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
 """bf16's largest finite value, `(2 - 2^-7) 2^127`, an fp32 value."""
+
+EXACT_PARTS = -(-(jnp.finfo(jnp.float32).nmant + 1) // (jnp.finfo(jnp.bfloat16).nmant + 1))
+"""The bf16 parts that hold an fp32 value's whole significand (`formed`): three, 8 bits each of its 24."""
 
 
 def bf16_parts(x: jax.Array, count: int, *, saturating: int) -> Iterator[jax.Array]:

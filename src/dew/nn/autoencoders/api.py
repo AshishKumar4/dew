@@ -43,6 +43,22 @@ def published_source(name_or_dir, revision, subfolder: str, names: tuple[str, ..
     return directory, config
 
 
+def bound_autoencoder(directory, config, model, path_of, wrap, *, params: Variables | None, param_dtype: str,
+                      lazy: bool, shapes, inputs: tuple | None = None, tensors=None):
+    """A published autoencoder bound (`dew.interop.components.bind_component`, the `vae` component under
+    the `autoencoder` prefix): its module's parameters read from `directory` by `path_of` (or `params` as
+    given), checked against the module traced on `inputs` (one frame at its downscale factor where None),
+    and wrapped by `wrap`. Every published autoencoder's loader binds through here."""
+    from dew.interop.components import bind_component
+
+    if inputs is None:
+        inputs = (jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor,
+                                        model.image_channels), jnp.float32),)
+    return bind_component(directory, "vae", config, model, path_of, wrap, prefix=("autoencoder",),
+                          params=params, param_dtype=param_dtype, lazy=lazy, inputs=inputs, shapes=shapes,
+                          tensors=tensors)
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class LatentNormalization:
     """A latent normalization, one description: the source values an autoencoder's record keeps

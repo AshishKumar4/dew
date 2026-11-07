@@ -23,6 +23,7 @@ from dew.batch import (
     TOKEN_LAYOUT_FIELDS,
     VALIDITY_FIELD,
     Coordinates,
+    Entered,
     coordinates,
     document_firsts,
     document_ranks,
@@ -628,15 +629,22 @@ class AttentionMetadata:
     def right_padded(self) -> bool:
         return self.coordinates is not None and self.coordinates.right_padded
 
+    @property
+    def entered(self) -> Entered | None:
+        """The documents that continue another (`Coordinates.entered`), None where none does."""
+        return None if self.coordinates is None else self.coordinates.entered
 
 def check_tree(parents: tuple[int, ...], length: int, *, decode: bool, positioned: bool,
-               ordered: bool) -> None:
+               ordered: bool, entered: bool) -> None:
     """Refuse a tree call (`AttentionMetadata.tree_parents`) no layer could read as its paths: outside a
     cached call, of another length than its `length` tokens, with a parent not before its child,
     branching where the call does not state its tokens' positions (`positioned`: coordinates or rotary
     positions, each token's its depth, which its index is on a chain alone), or in a model that reads the
     call's tokens in their order before its mixers see the tree (`ordered`: n-gram hashes, routing
-    blocks)."""
+    blocks), or beside documents that enter another (`entered`: a tree verify reads the cache as held,
+    and an entered document reads another's memory, which no mixer reads along a tree's paths)."""
+    if entered:
+        raise ValueError("a tree call reads the row's cache as held; its documents enter no other")
     if not decode or len(parents) != length or any(not -1 <= parent < index
                                                    for index, parent in enumerate(parents)):
         raise ValueError(f"a tree is a cached call's, each of its {length} tokens' parent an earlier one "
@@ -649,8 +657,9 @@ def check_tree(parents: tuple[int, ...], length: int, *, decode: bool, positione
                          "hashes or routing blocks read its tokens in their order")
 
 
+
 MIXING = ("pairwise_mask", "key_positions", "key_runs", "key_valid", "position_bias", "admitted",
-          "tree_parents")
+          "entered", "tree_parents")
 """The `AttentionMetadata` fields that say which tokens a mixer lets each token
 read, or how much: a call's own mask, or its keys' runs, and the key positions
 it is read by, an additive bias, a server's mixed layout, a tree's parents. A

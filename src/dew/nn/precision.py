@@ -27,6 +27,7 @@ scope and contracted with the taps as one 2D product (stride 1 train 3.9 times, 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import math
@@ -56,14 +57,19 @@ from dew.nn.sharding import explicit_spec
 __all__ = [
     "ACCURATE",
     "DTYPE_PRESETS",
+    "FP8",
     "FP32_SUMS",
     "L2NORM_EPS",
+    "LOW_PRECISION_RECIPES",
     "MATMUL_PRECISIONS",
     "NUMERICS_PRESETS",
+    "PROJECTION_ROLES",
     "ROUNDING_STREAM",
     "WIDE_CPU_ARITHMETIC",
     "Dtypes",
+    "LowPrecision",
     "Numerics",
+    "RecipeRefused",
     "accumulated",
     "activation_and_slope",
     "added_to",
@@ -102,6 +108,9 @@ __all__ = [
     "paired_sum",
     "precision_names",
     "products_dtype",
+    "projection_role",
+    "recipe_role",
+    "refuse_recipe",
     "rms_statistics",
     "rms_weighted",
     "rounded_operand",
@@ -179,17 +188,25 @@ def activation_and_slope(gate, activation: str) -> tuple[jax.Array, jax.Array]:
 
 def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None = None,
                  gate: jax.Array | None = None, activation: str = 'silu',
-                 rounded: Callable[[jax.Array], jax.Array] | None = None) -> jax.Array:
+                 rounded: Callable[[jax.Array], jax.Array] | None = None, weight_first: bool = False
+                 ) -> jax.Array:
     """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s,
     or a kernel's own), times `weight`, times `activation(gate)` (`activation_and_slope`: Qwen3-Next's gated
-    norm), in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after.
-    `rounded` rounds the normalized rows, before any weight multiplies them (Llama's and Qwen3's cast first,
-    `RMSNorm.scale_after_cast`; a norm computing in its input's dtype). The fused norm kernel, the
-    recurrence's gated output norm, the portable norm and the portable gated norm compute it alike, each
-    keeping its own statistics, memory schedule and derivative."""
-    y = x * inverse if rounded is None else rounded(x * inverse)
-    if weight is not None:
-        y = y * weight
+    norm), in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after;
+    with `weight_first`, the weight folded into the inverse before the rows (Flax's `nn.RMSNorm`,
+    `x * (inverse * weight)`). `rounded` rounds the normalized rows, before any weight multiplies them
+    (Llama's and Qwen3's cast first, `RMSNorm.scale_after_cast`; a norm computing in its input's dtype),
+    which a weight folded first has none of. The fused norm kernel, the recurrence's gated output norm, the
+    portable norm and the portable gated norm compute it alike, each keeping its own statistics, memory
+    schedule and derivative."""
+    if weight is not None and weight_first:
+        if rounded is not None:
+            raise ValueError("a weight folded into the inverse leaves no normalized rows to round first")
+        y = x * (inverse * weight)
+    else:
+        y = x * inverse if rounded is None else rounded(x * inverse)
+        if weight is not None:
+            y = y * weight
     return y if gate is None else y * activation_and_slope(gate, activation)[0]
 
 
@@ -209,9 +226,12 @@ def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Arr
 def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     """`product` plus `bias` broadcast over its leading axes, in the dtype their addition promotes
     to, as flax's layer adds them.
-    Rounding the product and the bias once together, as torch's addmm does, wrote an fp32 product
-    and a pass of its own on every biased layer (a DiT-B step 17.5% slower on an A100), for a bf16
-    output 1.37 times torch's rounding, which the parity rule holds already.
+    Rounding a 16-bit product and a bias converted inside the step once together, as torch's addmm
+    does, wrote an fp32 product and a pass of its own on every biased layer (a DiT-B step 17.5% slower
+    on an A100), for a bf16 output 1.37 times torch's rounding, which the parity rule holds already:
+    XLA fuses an fp32 product's epilogue into its GEMM only where the bias is a parameter (row 634), so
+    a layer whose bias is stored at fp32 adds it to its fp32 product and rounds once
+    (`dew.nn.dense._rounds_once`), and a 16-bit bias adds here as flax adds it.
 
     JAX transposes a broadcast into a sum in the broadcast operand's dtype (jax-ml/jax#30310), so
     a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
@@ -577,7 +597,8 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
     wide = contracted("test_a_wide_cpu_sum_of_products_holds_every_order")(
-        linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True))
+        linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True,
+                       kind=Protected()))
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
@@ -704,6 +725,80 @@ MATMUL_PRECISIONS = ("default", "high", "highest")
 on a GPU and one bf16 pass on a TPU, "highest" IEEE float32."""
 
 
+PROJECTION_ROLES = ("mixer", "mlp", "experts", "router", "shared_gate")
+"""The roles a model's projections play, which a low-precision recipe chooses among (`LowPrecision`): a
+token mixer's (attention's queries, keys, values and output, a linear mixer's), a dense feed-forward's, the
+routed experts', a router's scores, a shared expert's gate. A projection that plays none of them, a head's
+or an embedding's, keeps the run's dtypes under every recipe."""
+
+LOW_PRECISION_RECIPES = ("blockwise_fp8",)
+"""The low-precision recipes a run's projections train in: DeepSeek-V3's blockwise FP8, each product's
+operands E4M3 by 1 x 128 activation tiles and 128 x 128 weight blocks, power-of-two scales, fp32 sums, and
+its gradients FP8 products of requantized operands (`dew.nn.kernels.gemm.blockwise_fp8_projection`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class LowPrecision:
+    """A low-precision training recipe for a run's projections by role (row 2513): `recipe`
+    (`LOW_PRECISION_RECIPES`) multiplies the projections whose role is among `roles` (`PROJECTION_ROLES`),
+    each where its widths take the recipe's blocks; every other product keeps the run's dtypes, the routers,
+    norms, embeddings and heads among them, as every published low-precision recipe keeps them."""
+
+    recipe: str = "blockwise_fp8"
+    roles: tuple[str, ...] = ("mixer", "mlp", "experts")
+
+    def __post_init__(self):
+        if self.recipe not in LOW_PRECISION_RECIPES:
+            raise ValueError(f"a low-precision recipe is one of {LOW_PRECISION_RECIPES}, not {self.recipe!r}")
+        object.__setattr__(self, "roles", tuple(self.roles))
+        unknown = sorted(set(self.roles) - set(PROJECTION_ROLES))
+        if unknown:
+            raise ValueError(f"a recipe's roles are among {PROJECTION_ROLES}, not {unknown}")
+
+
+_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar("dew_projection_role", default=None)
+"""The role of the projections a trace is in (`projection_role`), None outside any."""
+
+
+@contextlib.contextmanager
+def projection_role(role: str):
+    """Within the block, the projections a model traces play `role` (`PROJECTION_ROLES`), which the run's
+    low-precision recipe reads (`recipe_role`): a block sets its mixer's and its feed-forward's, a mixture
+    its router's and its experts', the innermost holding."""
+    if role not in PROJECTION_ROLES:
+        raise ValueError(f"a projection's role is one of {PROJECTION_ROLES}, not {role!r}")
+    token = _ROLE.set(role)
+    try:
+        yield
+    finally:
+        _ROLE.reset(token)
+
+
+def recipe_role() -> tuple[LowPrecision, str | None] | None:
+    """The run's low-precision recipe and the role of the projection being traced (None for a projection of
+    no role), or None where the run trains in no recipe (`Numerics.low_precision`)."""
+    from dew.nn.kernels.generation import numerics
+
+    recipe = numerics().low_precision
+    return None if recipe is None else (recipe, _ROLE.get())
+
+
+class RecipeRefused(ValueError):
+    """A projection the run's low-precision recipe takes by its role holds another owner's product
+    (`refuse_recipe`)."""
+
+
+def refuse_recipe(owner: str) -> None:
+    """Refuse a projection the run's low-precision recipe takes by its role (`recipe_role`) whose product
+    `owner` holds instead (a quantizer's product class, a wrapper's interception, an adapter's fused
+    product), which would train it unquantized, silently: the recipe and a product wrapper compose nowhere
+    yet."""
+    held = recipe_role()
+    if held is not None and held[1] in held[0].roles:
+        raise RecipeRefused(f"the run's {held[0].recipe} recipe takes this {held[1]} projection, whose "
+                            f"product {owner} holds: train it in the recipe or under the wrapper, not both")
+
+
 @dataclasses.dataclass(frozen=True)
 class Numerics:
     """A run's numerics, set once and recorded with it, which its model, optimizer and trainer read: its
@@ -719,6 +814,8 @@ class Numerics:
     dtypes: Dtypes = dataclasses.field(default_factory=Dtypes)
     matmul: str | jax.lax.DotAlgorithmPreset = "default"
     forms: Literal["fast", "accurate"] = "fast"
+    low_precision: LowPrecision | None = None
+    """The recipe the run's projections train in by role (`LowPrecision`), None for none."""
 
     def __post_init__(self):
         if isinstance(self.dtypes, str):
@@ -741,7 +838,12 @@ ACCURATE = Numerics(DTYPE_PRESETS["32-true"], matmul="highest", forms="accurate"
 """Accurate, scientific work at its cost: float32 throughout, every product that states no precision in
 IEEE float32 and each op's accurate form."""
 
-NUMERICS_PRESETS = {"accurate": ACCURATE}
+FP8 = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision())
+"""DeepSeek-V3's FP8 training on Hopper: bf16-mixed, the token mixers', dense feed-forwards' and routed
+experts' projections in blockwise FP8 (`LowPrecision`), the routers, norms, embeddings and head in the run's
+dtypes."""
+
+NUMERICS_PRESETS = {"accurate": ACCURATE, "fp8": FP8}
 """The named run numerics beside the default (`Numerics()`)."""
 
 
@@ -1043,7 +1145,7 @@ def vanishing(dtype, base2: bool = False) -> float:
     exponents join it (each at most zero): below the base's logarithm of its least subnormal (`exp(-105)` and
     `exp2(-151)` are zero in fp32). A prefix summing one with the others loses them (two of -2**127 are
     -inf; one of -2**70 loses a later -1 to its rounding), so a chunk's decays restart past it
-    (`recurrence_algebra.decays`, `dew.algebra.scan`)."""
+    (`dew.algebra.scan`'s decays)."""
     least = math.log(float(jnp.finfo(dtype).smallest_subnormal))
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
 
@@ -1347,7 +1449,8 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
         return typed(lhs, rhs, numbers)
 
     return contracted("test_a_bf16_dot_holds_every_order")(
-        linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward))(lhs, rhs)
+        linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward,
+                       kind=Protected()))(lhs, rhs)
 
 
 def _transposed(cotangent, operands, numbers, side: int, product) -> jax.Array:

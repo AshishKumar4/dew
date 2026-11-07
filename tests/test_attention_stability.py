@@ -38,6 +38,7 @@ from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_decode,
     attention_mosaic,
     attention_portable,
     attention_triton,
@@ -803,7 +804,7 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     Mosaic one's default form in both schedules, its derived one (one launch where the call is hookless) and
     deterministic mode's two launches (`TWO_LAUNCHES`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
-    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    tiles = attention_portable.Tiles(32, 32, attention_triton.BLOCK)
     mainloop = functools.partial(_differentiable, family)
 
     def triton_forward(*operands):
@@ -825,8 +826,8 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
         return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                          **options)
 
-    portable = mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
-                        functools.partial(attention_portable.backward, **tiles, **options))
+    portable = mainloop(functools.partial(attention_portable.xla_mainloop, tiles, **forward_options),
+                        functools.partial(attention_portable.backward, tiles, **options))
     mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
     def two_launch_backward(*operands):
         with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
@@ -960,21 +961,19 @@ HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].dr
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",
                        "a small column beside an overflowing one",
                        "a cotangent on a small column beside an overflowing one",
-                       "a column near fp32's least normal beside an overflowing one")
+                       "a column near fp32's least normal beside an overflowing one",
+                       "a resumed state beside an overflowing column")
 """The families whose Pallas-Triton default-form check runs on a GPU alone, compiled as its route runs it
-(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (137 to 257
-s, rows 1849, 2193; `GPU_ONLY`)."""
+(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (123 to 257
+s, rows 1849, 2193, 4344; `GPU_ONLY`)."""
 
 
-@pytest.mark.parametrize("family", [
-    family for family in TEMPLATE_FAMILIES
-    if (FAMILIES[family].folded or FAMILIES[family].overflows) and family not in GPU_TRITON_FAMILIES])
+@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
+                                    if family not in GPU_TRITON_FAMILIES])
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges(family):
-    """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
-    fp32's largest (`default_is_finite`): it guards its sums' headroom in either form, as the template's
-    production route runs it on an sm80 or later GPU. It
-    walks without the fold's reach (`algebra.walked`), so the fold's other divergences remain an open
-    defect (ledger 1637)."""
+    """The Triton mainloop's default form finite over every family (`default_is_finite`): its launches take
+    the default's guards as the Mosaic mainloop's do (`algebra.walked_launches`: its sums' headroom, the
+    fold's reach), as the template's production route runs it on an sm80 or later GPU (ledger 1637)."""
     default_is_finite(family, "triton")
 
 
@@ -1160,6 +1159,72 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
                     f"decode {form} {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
 
+
+TEMPLATE_DECODED = list(dict.fromkeys(family for family, _ in DECODED
+                                     if jnp.dtype(FAMILIES[family].dtype).itemsize == 2
+                                     and not FAMILIES[family].decode_only))
+"""The decode steps the template's decode takes (`attention_decode.attend`), in its one form, the raw fold
+(no fold's reach, as the decode kernel's): 16-bit operands; a decode step's alone (`Family.decode_only`) too
+long for its interpreted mainloop."""
+
+
+@pytest.mark.skipif(not INTERPRETED and generation.device_generation() != "sm90",
+                    reason="the template's decode runs on warpgroup MMA's Mosaic mainloop")
+@pytest.mark.parametrize("family", TEMPLATE_DECODED)
+def test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family):
+    """The template's decode (`attention_decode.attend`: packed rows, sliced keys, merged), interpreted on a
+    CPU as an H100 runs it and compiled on an H100, each row's keys its first `K`: check 1 over the family's
+    draws, as the decode kernel it replaces is held (testing.md: decode holds the default's claims)."""
+    seeds, family = SEEDS[family], FAMILIES[family]
+    lengths = family.spans.get("lengths")
+
+    def decoded(query, key, value, sinks):
+        count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
+        spans = template.spans(1, key.shape[1], query.shape[0], lengths=jnp.asarray(count, jnp.int32))
+        hooks = (None if sinks is None
+                 else template.Hooks(initial=template.sinks(sinks, query.shape[0], 1, value.shape[-1])))
+        target = generation.assumed("sm90") if INTERPRETED else contextlib.nullcontext()
+        with target:
+            return attention_decode.attend(query, key, value, spans, hooks, interpret=INTERPRETED)
+
+    def forward(seed):
+        return _cast(family, family.draw)(seed)[:4]
+
+    assert_as_exact(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
+                    f"template decode {family.dtype}", seeds=seeds,
+                    truth_fn=_reference(family, anchored=True))
+
+def test_a_decode_steps_logits_past_the_folds_reach_weigh_as_the_references():
+    """bf16, the default form: one query over two keys whose products are 2^30 and 2^30 + 128, an fp32 ulp
+    apart (logits 2^28 and 2^28 + 32), their values the first two unit vectors: the reference weighs the
+    first exp(-32). A fold that scales each logit before the difference (`algebra.Forward.base2`) rounds it
+    at log2(e) times its size, 32 here, and weighed the first exp2(-32), 2.3e-10 against 1.27e-14; the decode
+    kernel's raw fold (`algebra.Forward.subtracted`) scales the raw products' difference after it is taken,
+    so its output is the float64 truth's in bf16, one slice or two, with no natural rewalk (row 1955)."""
+    width = 16
+
+    def first(rows, *fills):
+        array = np.zeros((1, rows, 1, width), np.float32)
+        for at, fill in fills:
+            array[(0, *at)] = fill
+        return jnp.asarray(array, jnp.bfloat16)
+
+    query = first(1, ((0, 0, 0), 2.0 ** 15), ((0, 0, 1), 1.0))
+    key = first(2, ((0, 0, 0), 2.0 ** 15), ((1, 0, 0), 2.0 ** 15), ((1, 0, 1), 128.0))
+    value = first(2, ((0, 0, 0), 1.0), ((1, 0, 1), 1.0))
+    logits = np.asarray([2.0 ** 28, 2.0 ** 28 + 32])
+    weights = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
+    truth = np.zeros(width, np.float64)
+    truth[:2] = weights
+    for splits in (1, 2):
+        target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
+        with target, tuning.pinned({decode_attention.DecodeAttention: decode_attention.Split(splits)}):
+            out = decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray([2], jnp.int32),
+                                          interpret=INTERPRETED)
+        np.testing.assert_array_equal(np.asarray(out[0, 0, 0]), np.asarray(truth.astype(jnp.bfloat16)),
+                                      err_msg=f"{splits} slices")
+
+
 DECODED_OVERFLOWS = list(dict.fromkeys(family for family, _ in DECODED if FAMILIES[family].overflows))
 """The decode steps (`DECODED`) whose one divergence in the default form is their sums passing fp32's
 largest."""
@@ -1216,13 +1281,12 @@ def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
                                             interpret=INTERPRETED)
 
     def portable(query, key, value, *_):
-        return attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
-                                         pad=attention_triton.BLOCK, residuals=True, natural=True)
+        return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
+                                               query, key, value, spans, residuals=True, natural=True)
 
     for name, attend in (("triton", triton), ("portable", portable)):
         query, key, _, _, _ = draw(0)
-        _, _, _, anchors, split = attend(*draw(0))
-        np.testing.assert_array_equal(np.asarray(split.shift), -1.0, err_msg=name)
+        _, _, _, anchors, _ = attend(*draw(0))
         np.testing.assert_array_equal(np.asarray(anchors), logits_of(query, key, np.float64).argmax(axis=-1),
                                       err_msg=name)
         @as_given

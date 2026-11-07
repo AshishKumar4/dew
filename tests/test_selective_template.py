@@ -12,6 +12,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from generation_support import lowers
 from reference_error import (
@@ -21,6 +22,7 @@ from reference_error import (
     declared_seeds,
     indexed_recording,
     recording,
+    run_to_run,
     with_gradients,
 )
 from selective_support import selective_draw, selective_xla
@@ -42,6 +44,12 @@ SHAPES = {"interpreted": (1, 70, 256, 16), "falcon-mamba-7b": (2, 2048, 8192, 16
 7B's widths."""
 
 
+ATOMIC = "the selective scan's B and C gradients sum by atomic adds (4448)"
+"""Why the template's arms vary run to run on a GPU (`reference_error.run_to_run`): its backward adds B's and
+C's gradients atomically by default, each run within check 1 (row 4448's declared contract: a fixed order
+2 to 2.2 times the step), and in their programs' order where a run asks its reductions ordered."""
+
+
 def draw(dtype, seed: int, rows: int, length: int, channels: int, states: int, packed: bool):
     """A draw's inputs, their outputs' cotangents last: steps after a softplus, decays `-exp(N(0, 1/4))`,
     input and readout gates normal, `x`, `dt`, `B`, `C` and the cotangents in `dtype`, documents starting at a
@@ -59,24 +67,43 @@ def draw(dtype, seed: int, rows: int, length: int, channels: int, states: int, p
     return (x, dt, a, b, c, skip), starts, dy
 
 
+REGIMES = ("decays near zero", "a document at every chunk")
+"""The regimes the template's backward fixes were measured in (`selective.PARTIALS`, its pairwise sums):
+steps of softplus(N(3, 1)), so each channel's state decays to near zero within a few tokens; and a document
+starting at every chunk's first token, so every chunk's carried gradient is cut."""
+
+
+def regime_draw(regime: str, dtype, seed: int, rows: int, length: int, channels: int, states: int):
+    """`draw`'s inputs in `regime` (`REGIMES`), with their documents' starts."""
+    (x, dt, a, b, c, skip), _, dy = draw(dtype, seed, rows, length, channels, states, packed=False)
+    starts = None
+    if regime == "decays near zero":
+        dt = jax.nn.softplus(jax.random.normal(jax.random.key(seed + 1), dt.shape) + 3.0).astype(dtype)
+    else:
+        starts = jnp.zeros((rows, length), bool).at[:, ::selective.CHUNK].set(True)
+    return (x, dt, a, b, c, skip), starts, dy
+
+
 def scanned(fn, starts):
     """`fn`'s output alone, its documents' starts `starts`."""
     return lambda *inputs: fn(*inputs, starts=starts)[0]
 
 
-def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype=jnp.bfloat16):
-    """`case`'s output and every input's gradient through the template on par from float64 with the portable
-    scan's, over check 1's fewest draws."""
+def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype=jnp.bfloat16,
+                                                  tiles: selective.Tiles | None = None):
+    """`case`'s output and every input's gradient through the template, at `tiles` where given (else the
+    device's plan), on par from float64 with the portable scan's, over check 1's fewest draws."""
     shape = SHAPES[case]
     family = mosaic_sm90.WGMMA if INTERPRETED else bundles.of(generation.device_generation(), dtype)
-    template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED)
+    planned = {} if tiles is None else {"chunk": tiles.chunk, "plan": (tiles.positions, tiles.resident)}
+    template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED, **planned)
 
     def draws(seed):
         inputs, _, dy = draw(dtype, seed, *shape, packed)
         return (*inputs, dy)
 
     starts = draw(dtype, 0, *shape, packed)[1]
-    assert_as_exact(jax.jit(with_gradients(scanned(template, starts))),
+    assert_as_exact(run_to_run(jax.jit(with_gradients(scanned(template, starts))), ATOMIC),
                     jax.jit(with_gradients(scanned(portable, starts))), draws,
                     f"the selective template, {case}{', packed' if packed else ''}", seeds=FEWEST_SEEDS,
                     truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
@@ -95,6 +122,59 @@ def test_the_template_is_as_exact_as_the_portable_scan_interpreted():
 def test_the_template_is_as_exact_as_the_portable_scan_over_packed_documents_interpreted():
     """`the_template_is_as_exact_as_the_portable_scan` over packed documents."""
     the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
+
+
+@pytest.mark.parametrize("regime", REGIMES)
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_template_holds_its_hardest_regimes_interpreted(regime):
+    """The template's output and every input's gradient on par from float64 with the portable scan's in each
+    regime its backward's fixes were measured in (`REGIMES`), over check 1's fewest draws of fp32 operands,
+    whose rounding a bf16 draw's hides, one row of a ragged chunk over two channel blocks: a backward adding
+    B's and C's gradients through one buffer put B's 1.95 times the portable scan's distance with a document
+    at every chunk (`selective.PARTIALS`), which no CPU test held once the regime cases went to the GPU flow
+    alone (row 3133)."""
+    shape = SHAPES["interpreted"]
+    family = mosaic_sm90.WGMMA if INTERPRETED else bundles.of(generation.device_generation(), jnp.float32)
+    template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED)
+
+    def draws(seed):
+        inputs, _, dy = regime_draw(regime, jnp.float32, seed, *shape)
+        return (*inputs, dy)
+
+    starts = regime_draw(regime, jnp.float32, 0, *shape)[1]
+    assert_as_exact(run_to_run(jax.jit(with_gradients(scanned(template, starts))), ATOMIC),
+                    jax.jit(with_gradients(scanned(portable, starts))), draws,
+                    f"the selective template under {regime}", seeds=FEWEST_SEEDS,
+                    truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_template_with_owned_partials_is_as_exact_as_the_portable_scan_interpreted(
+        with_deterministic_ops):
+    """`the_template_is_as_exact_as_the_portable_scan` over packed documents where the backward's programs
+    own their partial sums and walk their channels in turn (`Scan.owned`, a run asking its reductions
+    ordered)."""
+    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
+
+
+@pytest.mark.gpu(reason="the backward's atomic adds land in a GPU's order, which an interpreter fixes")
+def test_the_backward_repeats_its_state_gradients_bit_for_bit_where_reductions_are_ordered(
+        with_deterministic_ops):
+    """The template's backward over 512 channels, 16 of them to each partial buffer (`selective.PARTIALS`),
+    under a run asking its reductions ordered (`--xla_gpu_deterministic_ops`): every gradient bit for bit
+    the same over repeated runs of one compiled step, B's and C's too, which the default's atomic adds sum
+    in whatever order their programs run (row 4448's declared contract)."""
+    shape = (1, 256, 512, 16)
+    family = bundles.of(generation.device_generation(), jnp.float32)
+    template = functools.partial(selective.selective_scan, family=family)
+    inputs, starts, dy = draw(jnp.float32, 0, *shape, packed=False)
+    step = jax.jit(with_gradients(scanned(template, starts)))
+    first = jax.block_until_ready(step(*inputs, dy))
+    for _ in range(4):
+        again = jax.block_until_ready(step(*inputs, dy))
+        pairs = zip(jax.tree.leaves(first), jax.tree.leaves(again), strict=True)
+        for leaf, (one, other) in enumerate(pairs):
+            assert np.array_equal(np.asarray(one), np.asarray(other)), leaf
 
 
 SEEDED = Path(__file__).resolve().parent / "fixtures" / "mamba" / "selective_mamba_ssm_seeded.npz"
@@ -120,7 +200,8 @@ def the_template_is_as_exact_as_mamba_ssm(case: str):
         with generation.chosen(selective_scan="mosaic_gpu"):
             return selective_xla(arrays, dtype, scan=scan)
 
-    assert_as_exact(jax.jit(run), as_given(reference), draw, f"the selective template against mamba_ssm, "
+    assert_as_exact(run_to_run(jax.jit(run), ATOMIC), as_given(reference), draw,
+                    f"the selective template against mamba_ssm, "
                     f"{case}", seeds=seeds, truth_fn=as_given(truth))
 
 
@@ -202,7 +283,7 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: str | None, *, 
         return variables, x, jax.random.normal(keys[1], out).astype(dtype)
 
     truth = layer.clone(dtype=jnp.float64)
-    assert_as_exact(jax.jit(with_gradients(run(layer, template=True))),
+    assert_as_exact(run_to_run(jax.jit(with_gradients(run(layer, template=True))), ATOMIC),
                     jax.jit(with_gradients(run(layer, template=False))), draws,
                     f"a Mamba layer under the template{', packed' if packed else ''}"
                     f"{f', a held state {held}' if held else ''}",
@@ -275,7 +356,8 @@ def test_the_selective_scan_through_its_dispatch_is_as_exact_as_the_portable_sca
     def reference(x, dt, a, b, c, skip):
         return portable(x, dt, a, b, c.astype(jnp.float32), skip, None, None)[0]
 
-    assert_as_exact(jax.jit(with_gradients(dispatched(forms, named=True, c_dtype=c_dtype))),
+    assert_as_exact(run_to_run(jax.jit(with_gradients(dispatched(forms, named=True, c_dtype=c_dtype))),
+                               ATOMIC),
                     jax.jit(with_gradients(reference)), draws,
                     f"the selective scan's dispatch, the template named, under the {forms} forms, C in "
                     f"{jnp.dtype(c_dtype).name}",
@@ -287,11 +369,12 @@ def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
     """fp32 `x` and `B` with a bf16 `C` at `states` states, whose B rows a bulk copy's 16 bytes divide and
     whose C rows (8 or 24 bytes) they do not: the template's streams copy each unpadded in its own dtype, so a
     call naming the template is refused for C's rows, typed (row 2975), at the trust boundary of its operands'
-    layout."""
+    layout, where the same call with an fp32 C (16 or 48 bytes) is taken (row 4304)."""
     from dew.nn.kernels.selection import KernelRefused
 
     shape = (1, selective.CHUNK, selective.block_scan.THREADS, states)
     inputs, _, _ = draw(jnp.float32, 0, *shape, packed=False)
+    jax.eval_shape(dispatched("fast", named=True, c_dtype=jnp.float32, target="sm90"), *inputs)
     with pytest.raises(KernelRefused) as refused:
         jax.eval_shape(dispatched("fast", named=True, c_dtype=jnp.bfloat16, target="sm90"), *inputs)
     assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]
@@ -347,7 +430,7 @@ def test_a_launchs_backward_kernel_carries_its_launch():
     backward's tokens down (row 3851)."""
     from kernel_compile import lowered_for
 
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     rows, length, channels, states = 1, 2048, 256, 16
     operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
@@ -377,12 +460,13 @@ def _bound(length: int):
     return selective.SELECTIVE.bind(*operands, interpret=True)
 
 
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_a_spill_steps_the_kernel_that_spilled():
     """`Selective.derived` past a compile's spill (`report.refuse`, a refusals scope): a backward kernel that
-    spilled halves the backward's tokens, its residency the planner's at their registers, the forward's
-    chunk kept; a forward kernel's spill, whose registers no tile sets, leaves the call no config (rows 3851,
-    3861)."""
-    bound = _bound(2048)
+    spilled gives the call another config, legal and not the one refused, under which its output and every
+    input's gradient are on par from float64 with the portable scan's (check 1); a forward kernel's spill,
+    whose registers no tile sets, leaves the call no config (rows 3851, 3861)."""
+    bound = _bound(SHAPES["interpreted"][1])
     target = generation.gpu_target('sm90')
     with generation.assumed(target):
         derived = selective.SELECTIVE.derived(bound, target)
@@ -393,10 +477,9 @@ def test_a_spill_steps_the_kernel_that_spilled():
         with report.refusals():
             report.refuse([(identity, derived, {'selective_scan'})])
             assert selective.SELECTIVE.derived(bound, target) is None
-    facts = generation.gpu_target(generation.INTERPRETED_GENERATION)
-    fewer = derived.positions // 2
-    assert stepped == selective.Tiles(derived.chunk, fewer,
-                                      selective.backward_programs(selective.backward_registers(fewer), facts))
+        assert stepped is not None and stepped != derived
+        assert selective.SELECTIVE.legal(bound, stepped, target)
+    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=False, tiles=stepped)
 
 
 @pytest.mark.parametrize('length', [129, 2048], ids=['129 tokens', '2048 tokens'])
@@ -421,8 +504,8 @@ def test_the_forwards_shared_memory_is_what_mosaic_allocates(packed):
     counted for an A100's family, whose walks scope their streams (row 3854, 3859)."""
     from kernel_compile import SHARED, _estimates, _printed, lowered_for
 
+    from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.templates import resources
-    from dew.training._lowering import kernel_calls
 
     length, states = 2048, 16
     operands = (jax.ShapeDtypeStruct((1, length, 256), jnp.bfloat16),) * 2 + (

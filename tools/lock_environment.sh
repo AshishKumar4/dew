@@ -11,9 +11,9 @@
 set -eu
 # Every lock resolves for the oldest supported Python, so the interpreter running this changes nothing.
 RESOLVED=2026-10-12T00:00:00Z
-# Dew's own FlashAttention wheels resolve as they stood when 0.3.7 was published, past the pins the
+# Dew's own FlashAttention wheels resolve as they stood when 0.3.8 was published, past the pins the
 # locks hold (-P); nothing else moves.
-FLASH=2026-11-04T01:32:28Z
+FLASH=2026-11-06T20:53:00Z
 # jaxlib and its CUDA plugins resolve as they stood when 0.12.0.1 was published, which the jax build Dew
 # carries its patches on pins exactly; nothing else moves.
 JAXLIB=2026-10-21T22:00:00Z

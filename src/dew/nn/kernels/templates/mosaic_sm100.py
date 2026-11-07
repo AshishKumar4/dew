@@ -1,10 +1,10 @@
 """Blackwell's bundle (Mosaic GPU, sm100 and sm103): tcgen05's products, issued by one thread into
 accumulators in tensor memory, and the warpgroups a mainloop runs them in, which the GEMM template's
-(`gemm.mosaic_blackwell`) and the attention template's Blackwell mainloops share.
+(the GEMM template's, on `RINGS`) and the attention template's Blackwell mainloops share.
 
-A program runs two warpgroups (`roles`). The first issues: one warp's TMA loads fill a ring of operand
-stages (`Stages`), one warp issues each step's products once its stage is there, the products releasing
-the stage when they have read it (a tensor-core-ordered barrier, `tcgen05_mma`'s). The second reads
+A program runs two warpgroups (`roles`). The first issues: one warp's TMA loads fill the TMA rings' operand
+stages (`RINGS`, `CommittedRing`), one warp issues each step's products once its stage is there, the products
+releasing the stage when they have read it (a tensor-core-ordered barrier, `tcgen05_mma`'s). The second reads
 finished accumulators out of tensor memory (`read`, in column chunks of tcgen05's register layout) and
 releases them for the products after next (`Accumulators`, two or more in tensor memory's columns). A
 barrier's completions no later turn waited for are observed before the program ends (`drain`).
@@ -14,19 +14,23 @@ registers a program takes are its warpgroups' entry share alone (`registers`), t
 (addresses and counters) left to a per-launch rule once a liveness model prices its branch
 (`resources.producer_floor`)."""
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, resources
+from dew.nn.kernels.templates import mosaic, mosaic_sm90, resources
 from dew.nn.kernels.templates.mosaic import Ref
 
 ISSUE, READ = 0, 1
@@ -104,11 +108,13 @@ class Tcgen05:
 
     @staticmethod
     def kernel(entry: Callable, *, out_type, grid: tuple, grid_names: tuple, scratch: tuple,
-               interpret, name: str | None = None, topology: Topology = SINGLE) -> Callable:
-        """`entry` as a program of `WARPGROUPS` warpgroups (axis 'wg'), its kernel named `name`, `grid` the
-        clusters of `topology`'s CTAs (one each without a pair)."""
+               interpret, name: str | None = None, topology: Topology = SINGLE,
+               warpgroups: int = WARPGROUPS) -> Callable:
+        """`entry` as a program of `warpgroups` warpgroups (axis 'wg', `WARPGROUPS` by default: a template
+        whose roles are more, `mosaic.tabled`'s), its kernel named `name`, `grid` the clusters of
+        `topology`'s CTAs (one each without a pair)."""
         return mosaic.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
-                             warpgroups=WARPGROUPS, family=Tcgen05.name, scratch=scratch,
+                             warpgroups=warpgroups, family=Tcgen05.name, scratch=scratch,
                              interpret=interpret, name=name, cluster=topology.ctas)
 
     @staticmethod
@@ -160,12 +166,13 @@ class Tcgen05:
     def issued(load: Callable[[], None], products: Callable[[], None]) -> None:
         """The issuing warpgroup's warps alone (a program's end, `drain`'s, and each tile's in `roles`): its
         load warp runs `load`, its product warp `products`."""
-        @pl.when(lax.axis_index("wg") == ISSUE)
-        def _():
-            @plgpu.warp_map
-            def _(warp):
-                pl.when(warp == LOAD_WARP)(load)
-                pl.when(warp == MMA_WARP)(products)
+        pl.when(lax.axis_index("wg") == ISSUE)(lambda: _issuing(load, products))
+
+    @staticmethod
+    def issuing(load: Callable[[], None], products: Callable[[], None]) -> None:
+        """The issuing warpgroup's warps where a role table places it (`mosaic.tabled`'s producer, after the
+        template's rows): its load warp runs `load`, its product warp `products`."""
+        _issuing(load, products)
 
 
 TCGEN05 = Tcgen05()
@@ -244,66 +251,6 @@ class Signal:
 
 
 @dataclasses.dataclass(frozen=True)
-class Stages:
-    """A ring of `stages` operand stages in shared memory, one buffer an operand (`blocks`, each its
-    block's shape, dtype and transforms), a load barrier an operand and stage, and a release barrier a
-    stage the products arrive at once they have read it (tensor-core ordered). A turn is a step's index
-    over the program's walk; its stage is the turn's remainder. Over a pair of CTAs (`topology`), each
-    operand's block splits along its `partitions` dimension between them."""
-    stages: int
-    blocks: tuple
-    topology: Topology = SINGLE
-    partitions: tuple[int, ...] = ()
-
-    def scratch(self) -> tuple:
-        """The ring's shared memory and barriers, in `opened`'s order."""
-        buffers = tuple(plgpu.SMEM((self.stages, *shape), dtype, transforms=transforms)
-                        for shape, dtype, transforms in self.blocks)
-        loaded = tuple(plgpu.Barrier(num_barriers=self.stages) for _ in self.blocks)
-        return (buffers, loaded, plgpu.Barrier(num_barriers=self.stages, orders_tensor_core=True))
-
-    def opened(self, buffers, loaded, consumed) -> "Ring":
-        return Ring(self.stages, buffers, loaded, consumed, self.topology, self.partitions)
-
-
-@dataclasses.dataclass(frozen=True)
-class Ring:
-    """An opened ring (`Stages.opened`)."""
-    stages: int
-    buffers: tuple[Ref, ...]
-    loaded: tuple[state_types.AbstractRef, ...]
-    consumed: state_types.AbstractRef
-    topology: Topology = SINGLE
-    partitions: tuple[int, ...] = ()
-
-    def turn(self, counter) -> mosaic.Turn:
-        """Step `counter`'s turn of the ring."""
-        return mosaic.Turn.of(counter, self.stages)
-
-    def load(self, turn: mosaic.Turn, views: tuple) -> None:
-        """The load warp's turn: each operand's `views` entry into the turn's stage, once the products
-        have read the stage's last ones (the rotation before, of the other parity)."""
-        pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
-            self.consumed.at[turn.slot], parity=turn.freed))
-        partitions = self.partitions or (0,) * len(views)
-        for view, buffer, barrier, along in zip(views, self.buffers, self.loaded, partitions, strict=True):
-            plgpu.copy_gmem_to_smem(view, buffer.at[turn.slot], barrier.at[turn.slot],
-                                    **self.topology.copied(along))
-
-    def acquire(self, turn: mosaic.Turn) -> tuple:
-        """The product warp's turn: each operand's stage once loaded, and the barrier its products
-        release it at."""
-        for barrier in self.loaded:
-            plgpu.barrier_wait(barrier.at[turn.slot], parity=turn.parity)
-        return tuple(buffer.at[turn.slot] for buffer in self.buffers), self.consumed.at[turn.slot]
-
-    def drain(self, tiles, steps: int | jax.Array) -> None:
-        """The load warp's last releases, which no later load waited for (`mosaic.drained`), after `tiles`
-        tiles of `steps` turns each."""
-        mosaic.drained(self.consumed, tiles * steps, self.stages)
-
-
-@dataclasses.dataclass(frozen=True)
 class Accumulators:
     """`count` fp32 accumulators of `rows` x `columns` in tensor memory side by side, a product barrier
     each the product warp commits to once a tile's products are issued and a read barrier each the reading
@@ -375,3 +322,660 @@ class Tensor:
 def columns(tmem, first, count: int):
     """Columns `first` to `first + count` of tensor memory `tmem`, every row."""
     return tmem.at[:, pl.ds(first, count)]
+
+
+@dataclasses.dataclass(frozen=True)
+class Accumulator:
+    """A tile in tensor memory, the tcgen05 bundle's walk's and `products`' value: an fp32 accumulator, or a
+    product's left operand a role wrote there (`Tcgen05Issuer.write`: FlashAttention 4's narrowed weights,
+    16-bit, two to a column); its columns (`ref`; None for a tile that multiplies nothing, whose chunks are
+    zeros), its shape and dtype, and whether a product adds onto it (not at a tile's first step: tensor
+    memory starts unset)."""
+    ref: Ref | None
+    shape: tuple[int, int]
+    accumulate: jax.Array | bool = False
+    dtype: Any = jnp.float32
+
+
+class CommittedRing(mosaic.Ring):
+    """A ring whose slots tcgen05's products give back: the product warp's commit arrives at a slot's release
+    once every product it issued has read the slot (`tcgen05_commit_arrive`), where a register family's
+    consumers arrive themselves (`mosaic.ring`'s `released_by_products`)."""
+
+    def release(self, turn: mosaic.Turn) -> None:
+        plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)])
+
+
+BLOCK_SCALED_COLUMNS = 128
+"""The columns of one block-scale tile's rows (`SCALE_TILE`): a block-scaled product's tile is whole 128s."""
+
+SCALE_TILE = (32, 16)
+"""A block-scale stream's tile (`Tcgen05Rings.streams`): a block-scaled product's scales (an MX product's
+E8M0, an NVFP4 one's E4M3), tiled in shared memory as `tcgen05.scales_layout` lays them out, `[rows / 128,
+scale tiles, 32, 16]` a step's block, four scales of each of 128 rows a tile."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ScaleRing(CommittedRing):
+    """A block-scale stream's ring (`SCALE_TILE`): each slot's shared-memory tiles paired with the tensor
+    memory its products read them from (`Tcgen05Issuer.scaled_products`), a slot's columns of `tmem`. A slot's
+    scales are copied to its tensor memory by the product warp before its products (tcgen05.cp then
+    tcgen05.mma, pipelined in issue order: PTX ISA 9.7.18.6.2), and again only once its products' commit has
+    released the slot and the producer refilled it, so no copy overwrites scales a product still reads."""
+
+    tmem: Any = None
+
+    def acquire(self, turn: mosaic.Turn):
+        return super().acquire(turn), self._scales(turn)
+
+    def _scales(self, turn: mosaic.Turn):
+        """`turn`'s slot's tensor memory: its columns of `tmem`."""
+        columns = self.tmem.shape[1] // self.smem.shape[0]
+        return self.tmem.at[:, pl.ds(mosaic.opaque(turn.slot) * columns, columns)]
+
+
+CHUNK_COLUMNS = 64
+"""The accumulator columns an epilogue reads out of tensor memory at once: 64 fp32 registers a thread of its
+warpgroup, the GEMM epilogue's chunk (`chunk_columns`)."""
+
+
+class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
+    """tcgen05's issuer and home: products issued by one warp into fp32 accumulators in tensor memory
+    (`Accumulator`), read from shared memory, asynchronous; an epilogue reads the accumulators out in column
+    chunks (`chunks`, in an epilogue's register layout, `STORED`)."""
+
+    name = "tcgen05"
+
+    rows = 128  # a product's rows on one CTA (tcgen05's M without a CTA pair)
+
+    role_rows = 128
+
+    accumulator_rows = rows
+
+    issues_in_consumers = False
+
+    counts_hooks = False  # its model is an epilogue chunk's accumulator alone (`chunk_columns`)
+
+    takes_pairs = False
+
+    takes_register_left = False
+
+    takes_block_scales = True
+
+    operands_in_registers = False
+
+    products_overlap = True
+
+    _HOME = "tcgen05's accumulators live in tensor memory, issued into by a walk's persist (`Tcgen05Rings`)"
+
+    @property
+    def layout(self):
+        return STORED
+
+    @property
+    def row(self):
+        return STORED.reduce(1)
+
+    @property
+    def column(self):
+        return STORED.reduce(0)
+
+    @property
+    def lane_columns(self) -> int:
+        raise NotImplementedError(f"{self._HOME}, read out in chunks; no lane holds a column of one")
+
+    def chunk_columns(self, columns: int) -> int:
+        return min(columns, CHUNK_COLUMNS)
+
+    def chunks(self, accumulators: tuple) -> tuple:
+        # Each chunk's columns read from each accumulator's tensor memory (`read`).
+        width = accumulators[0].shape[1]
+        columns = self.chunk_columns(width)
+        return tuple((first, tuple(self.read(acc, first=first, columns=columns) for acc in accumulators))
+                     for first in range(0, width, columns))
+
+    def read(self, acc: Accumulator, *, first: int = 0, columns: int | None = None, pending: int = 0
+             ) -> jax.Array:
+        # Its columns out of tensor memory in an epilogue's layout (`STORED`), the load in flight until the
+        # value is read or `Signal.published`; zeros for a tile that multiplies nothing. Its products are
+        # awaited by a signal their commit arrives at (`signals`), not by `pending`.
+        del pending
+        rows, width = acc.shape
+        columns = width - first if columns is None else columns
+        if acc.ref is None:
+            return self.zeros((rows, columns))
+        return plgpu.async_load_tmem(_columns(acc.ref, first, columns), layout=STORED)
+
+    def write(self, acc: Accumulator, value: jax.Array, *, first: int = 0) -> None:
+        """`value` into the tile's columns from `first` in tensor memory, in its dtype, visible to a product
+        once a signal publishes it (`Signal.published`): a softmax's narrowed weights for P·V, a state
+        rescaled in place."""
+        plgpu.async_store_tmem(_columns(_tensor_memory(acc), first, value.shape[-1]),
+                               value.astype(jnp.dtype(acc.dtype)))
+
+    def tensor_memory(self, shape: tuple[int, int], dtype=jnp.float32):
+        """A scoped allocation of a tile of `shape` in tensor memory (`pl.run_scoped`'s), 16-bit elements two
+        to a column; `Accumulator(ref, shape, dtype=dtype)` once scoped."""
+        return plgpu.TMEM(shape, dtype, packed=jnp.dtype(dtype).itemsize < 4)
+
+    def signals(self, count: int = 1, *, by_products: bool = True) -> "Signals":
+        """`count` barriers between a program's roles, one a turn, each arrived at once a turn by the product
+        warp's commit (`by_products`: tensor-core ordered, as a role's tensor-memory writes before its
+        arrival are) or by a role's threads (`Signals`; `.scratch()` scoped, `.opened(refs)` a `Signal`)."""
+        return Signals(count, tensor_core=by_products)
+
+    def started(self, shapes: tuple, initial: tuple | None = None) -> tuple:
+        # A walk's accumulators are the tensor memory its persist gives it (`initial`, each an `Accumulator`);
+        # a tile that walks no step has none, its chunks zeros (`mosaic.unwalked`).
+        if initial is not None:
+            if tuple(acc.shape for acc in initial) != tuple(shapes):
+                given = [acc.shape for acc in initial]
+                raise ValueError(f"a walk of {shapes} was given tensor memory of {given}")
+            return tuple(initial)
+        return tuple(Accumulator(None, shape) for shape in shapes)
+
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
+                       ) -> tuple[C, tuple]:
+        # The accumulators stay in tensor memory, out of the loops' carries: a step's products add onto them
+        # but at the walk's first step.
+        del interpret
+        accumulators = self.started(shapes, initial)
+        if any(acc.ref is None for acc in accumulators):
+            raise ValueError(f"{self._HOME}: a walk takes the tensor memory its persist gives it")
+        first = segments[0].lo if segments else 0
+        carry = start
+        for loop in segments:
+            def stepped(index, carry, step=loop.step):
+                at = tuple(dataclasses.replace(acc, accumulate=index > first) for acc in accumulators)
+                return step(index, carry, at)[0]
+
+            carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
+            if loop.then is not None:
+                loop.then()
+        return carry, accumulators
+
+    def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
+                 ) -> Accumulator:
+        # The left operand from shared memory, or from tensor memory (an `Accumulator` a role wrote,
+        # tcgen05's TS form: FlashAttention 4's P·V); the right from shared memory.
+        del interpret  # Mosaic GPU's interpreter models tensor memory and tcgen05's products
+        left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
+        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
+        return dataclasses.replace(acc, accumulate=True)
+
+    def scaled_products(self, acc: Accumulator, lhs, rhs, scales: tuple, interpret: bool) -> Accumulator:
+        """`products` of block-scaled operands (an MX product's: each 32 depths of `lhs`'s rows and `rhs`'s
+        columns times its E8M0 scale), `scales` the step's two `ScaleRing` slots, each its shared-memory tiles
+        and their tensor memory: both copied in, then the products read them (`tcgen05_mma`'s `a_scale`,
+        `b_scale`)."""
+        del interpret  # Mosaic GPU's interpreter models scaled tcgen05 products
+        (a_tiles, a_scale), (b_tiles, b_scale) = scales
+        plgpu.async_copy_scales_to_tmem(a_tiles, a_scale)
+        plgpu.async_copy_scales_to_tmem(b_tiles, b_scale)
+        plgpu.tcgen05_mma(_tensor_memory(acc), lhs, rhs, a_scale=a_scale, b_scale=b_scale,
+                          accumulate=acc.accumulate)
+        return dataclasses.replace(acc, accumulate=True)
+
+    def settled(self, pending: int = 0) -> None:
+        # The walk's release of a step's slots is its products' commit (`CommittedRing`): nothing to await.
+        del pending
+
+    def held(self, ref):
+        return ref
+
+    def zeros(self, shape: tuple[int, ...]) -> jax.Array:
+        return plgpu.layout_cast(jnp.zeros(shape, jnp.float32), STORED)
+
+    def added_into(self, acc, value, interpret: bool):
+        raise NotImplementedError(f"{self._HOME}; nothing adds a register tile into one")
+
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False):
+        raise NotImplementedError(f"{self._HOME}; a fresh product takes the launch's, not its own")
+
+    def registers_product(self, lhs, rhs, interpret: bool):
+        raise NotImplementedError(f"{self._HOME}; its operands are read from shared or tensor memory")
+
+    def register_products(self, acc, parts, rhs, interpret: bool):
+        raise NotImplementedError(f"{self._HOME}; its operands are read from shared or tensor memory")
+
+    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
+        raise NotImplementedError(f"{self._HOME}; its operands are read from shared or tensor memory")
+
+
+class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
+    """tcgen05's bundle: its issuer and tensor-memory home (`Tcgen05Issuer`) on TMA rings a producer warpgroup
+    fills (`mosaic.RingFamily`), whose slots its products release by their commit (`CommittedRing`). A
+    persistent launch's tiles run three roles: the producer's load warp fills the rings, its product warp
+    walks each tile's steps into one of two accumulator turns in tensor memory (`issue`), and the consumer
+    warpgroup reads each finished tile's accumulators out in chunks and stores them (`finish`), freeing its
+    turn for the tile after next, so a tile's epilogue runs while the next tile's products fill the other
+    (JAX's `blackwell_ragged_dot_mgpu.py`'s schedule, CUTLASS's sm100 persistent GEMM)."""
+
+    consumers = 1
+    gathers_rows = True  # its load warp's TMA four-row gathers (`gathered.Committed`, row 1376)
+
+    turns = 2
+    """The accumulator turns a launch's tensor memory holds: an epilogue reads one while the products fill
+    the other."""
+
+    def column_unit(self, dtype) -> int:
+        # A packed 4-bit operand's swizzled row spans 256 of them along its depth (K-major, as tcgen05 reads
+        # E2M1), not along a tile's columns: the columns step by the 128 its block scales' tiles take.
+        return min(super().column_unit(dtype), BLOCK_SCALED_COLUMNS)
+
+    def tensor_columns(self, columns: int, accumulators: int) -> int:
+        # Each turn holds every accumulator of a tile (`persist`).
+        return self.turns * columns * accumulators
+
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
+                gathered: tuple[str, ...] = ()) -> dict:
+        from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `mosaic.Ring`
+
+        if multicast:
+            raise NotImplementedError("tcgen05's pair of CTAs shares a product, not a multicast ring "
+                                      "(`Topology`; not yet a stream of this bundle's)")
+        # A gathered stream's rows are its load warp's four-row gathers (`gathered.Committed`).
+        streams = {name: gathered_rows.ring(shape, dtype, stages, released_by_products=True)
+                   if name in gathered else
+                   mosaic.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
+                               copies=(copies or {}).get(name, 1), released_by_products=True)
+                   for name, (shape, dtype) in blocks.items()}
+        # A block-scale stream's slots each pair with the tensor memory its products read them from: its
+        # block's rows (`[rows / 128, depth / 128, 32, 16]`) by its depth's scales, a slot's columns each.
+        for name, (shape, dtype) in blocks.items():
+            if tuple(shape[-2:]) == SCALE_TILE:
+                streams[name]['tmem'] = plgpu.TMEM((shape[0] * 128, stages * shape[1] * 4), dtype,
+                                                   layout=plgpu.TMEMLayout.SCALES_LAYOUT)
+        return streams
+
+    def opened(self, allocated: dict, views: dict | None = None) -> dict:
+        from dew.nn.kernels.templates import gathered  # it builds on `mosaic.Ring`
+
+        del views
+        # A gathered stream's load barriers are shared memory of its own (`gathered.ring`).
+        return {name: ScaleRing(**scoped) if 'tmem' in scoped
+                else CommittedRing(**scoped) if isinstance(scoped['full'].dtype, plgpu_core.BarrierType)
+                else gathered.Committed(**scoped) for name, scoped in allocated.items()}
+
+    def roles_of(self, table: tuple, *, load: Callable[[], None], products: Callable[[], None]) -> None:
+        """Each of a program's warpgroups its role (`mosaic.tabled`): the template's `table`, `(count,
+        body)` in turn, `count` warpgroups each running `body(index)`, its index among them; then the
+        issuing warpgroup, its load warp running `load()` and its product warp `products()` (`kernel`'s
+        warpgroups: the table's and one)."""
+        mosaic.tabled(lax.axis_index("wg"), table, lambda: _issuing(load, products))
+
+    def persist_scratch(self, consumers: int) -> tuple[tuple, int]:
+        # Its accumulator turns' barriers, filled and drained (`persist`), and its tensor memory's address.
+        return ((plgpu.Barrier(num_barriers=self.turns, orders_tensor_core=True),
+                 plgpu.Barrier(num_barriers=self.turns, num_arrivals=consumers, orders_tensor_core=True)),
+                resources.TMEM_ADDRESS_BYTES)
+
+    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
+                *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
+                unrolled: bool = False, accumulators: tuple = ()) -> None:
+        if not accumulators:
+            raise ValueError(f"{self._HOME}: a persistent launch states their shapes (`accumulators`)")
+        rows = {shape[0] for shape in accumulators}
+        if rows != {self.rows}:
+            raise ValueError(f"a tcgen05 accumulator is {self.rows} rows on one CTA, not {sorted(rows)}")
+        del in_flight  # the products' commit releases each step's slots
+        rings = self.opened(streams)
+        for ring in rings.values():
+            ring.initialized()
+        staging = self.output_staging(outputs, consumers)
+        width = sum(shape[1] for shape in accumulators)
+        offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]
+
+        def scoped(tmem, done, read, *smems):
+            def turn_of(done_tiles) -> mosaic.Turn:
+                return mosaic.Turn.of(done_tiles, self.turns)
+
+            def held(turn: mosaic.Turn) -> tuple:
+                # The turn's accumulators: each its columns of the turn's share of tensor memory.
+                return tuple(Accumulator(columns(tmem, turn.slot * width + offset, shape[1]), shape)
+                             for offset, shape in zip(offsets, accumulators, strict=True))
+
+            def products(counter, active, steps, views, tile, done_tiles):
+                # The product warp: each active tile's steps into its turn's accumulators once the tile
+                # `turns` back has been read out of them, then a commit the epilogue waits on.
+                @pl.when(active)
+                def _():
+                    turn = turn_of(done_tiles)
+                    pl.when(turn.counter >= self.turns)(lambda: plgpu.barrier_wait(
+                        read.at[turn.slot], parity=turn.freed))
+                    into = held(turn)
+
+                    def walk(step, start, shapes, *, initial=None):
+                        if initial is not None:
+                            raise NotImplementedError(f"{self._HOME}; a walk starts it from no value")
+
+                        def stepped(at, slots, carry, accs):
+                            return step(at - counter, slots, carry, accs)
+
+                        return self.walk(rings, ((stepped, counter, counter + steps),), start, shapes,
+                                         interpret, initial=into, unrolled=unrolled)
+
+                    issue(0, tile, walk, active=True)
+                    plgpu.tcgen05_commit_arrive(done.at[turn.slot])
+
+            def epilogue(index):
+                store = self._stores(smems, index)
+
+                def visit(counter, active, steps, views, tile, done_tiles):
+                    del counter, steps, views
+
+                    @pl.when(active)
+                    def _():
+                        turn = turn_of(done_tiles)
+                        plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
+                        into = held(turn)
+
+                        def walk(step, start, shapes, *, initial=None):
+                            # The products issued it: the tile's accumulators, done.
+                            del step, initial
+                            if tuple(shapes) != accumulators:
+                                raise ValueError(f"a tile walks {shapes}, its launch stated {accumulators}")
+                            return start, into
+
+                        finish(index, tile, issue(index, tile, walk, active=True), store, active=True)
+                        plgpu.wait_load_tmem()
+                        plgpu.barrier_arrive(read.at[turn.slot])
+
+                    pl.when(~active)(lambda: finish(index, tile, issue(index, tile, mosaic.unwalked(self),
+                                                                       active=False), store, active=False))
+
+                mosaic.tiled(tiles, schedule, visit, axis=axis)
+                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+            def load():
+                loaded, _ = mosaic.tiled(tiles, schedule, functools.partial(mosaic.loads, rings), axis=axis)
+                for ring in rings.values():
+                    ring.drain(loaded)
+
+            def issue_all():
+                _, computed = mosaic.tiled(tiles, schedule, products, axis=axis)
+                mosaic.drained(read, computed, self.turns)
+
+            self.roles_of(((consumers, epilogue),), load=load, products=issue_all)
+
+        pl.run_scoped(scoped, plgpu.TMEM((self.rows, self.turns * width), jnp.float32),
+                      *self.persist_scratch(consumers)[0], *staging, collective_axes="wg")
+
+
+RINGS = Tcgen05Rings()
+"""The tcgen05 bundle (`bundles.of` on sm100 and sm103)."""
+
+
+def _issuing(load: Callable[[], None], products: Callable[[], None]) -> None:
+    """The issuing warpgroup's warps: its load warp runs `load`, its product warp `products`."""
+    @plgpu.warp_map
+    def _(warp):
+        pl.when(warp == LOAD_WARP)(load)
+        pl.when(warp == MMA_WARP)(products)
+
+
+class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | jax.Array]):
+    """tcgen05's issuer for 64-row tiles a consumer holds in registers (the recurrence's chunks, row 4747):
+    each product into a scoped 64-row fp32 accumulator in tensor memory (one CTA's M=64 MMA, the half-lane
+    layout `tcgen05.tmem_half_lane_layout`), its left operand from shared memory or, written there first,
+    from tensor memory (the TS form, `products`' `Accumulator`), its right from shared memory; awaited by a
+    tensor-core barrier its commit arrives at, then read into registers in the WGMMA layout, which a
+    half-lane tile loads natively (`WgmmaLayout`). Its walks carry their sums in registers, as wgmma's
+    consumers do: no accumulator outlives its product's read. Mosaic GPU's interpreter models tensor memory
+    and tcgen05's products, so interpreted it runs the same."""
+
+    name = "tcgen05.chunks"
+    # Mosaic GPU's tcgen05 lowering takes no TF32 operand ("Unsupported input element type: tf32",
+    # jsf-gate100b): an fp32 product takes bf16 parts.
+    takes_fp8 = True
+    takes_register_left = False
+    rows = 64
+    role_rows = 64
+    widest_product = 256
+    operands_in_registers = False
+    products_overlap = False  # each product is awaited where its value is read (`summed`)
+
+    def narrowest_columns(self, dtype) -> int:
+        # A 64-row product splits its N columns between two lane groups, each a whole tile of 16 (Mosaic
+        # GPU: "the M or N MMA instruction size was chosen to be 24, which is not a multiple of the tiling of
+        # the non-contracting dimension 16" at 48 columns, and a 16-column one's swizzle past its half's 8,
+        # jsf-gate100b): a staged block's columns step in 32.
+        return max(2 * 16, super().narrowest_columns(dtype))
+
+    def right_swizzle(self, dtype, columns: int) -> int:
+        # A 64-row product splits its N columns between two lane groups, each reading whole tiles of its
+        # right operand's swizzle (Mosaic GPU: "the M or N MMA instruction size was chosen to be 96, which is
+        # not a multiple of the tiling of the non-contracting dimension 64" at 192 columns, jsf-trace100b).
+        half = columns // 2
+        return next((swizzle for swizzle in (mosaic.SWIZZLE_BYTES, mosaic.SWIZZLE_BYTES // 2,
+                                             mosaic.NARROWEST_SWIZZLE_BYTES)
+                     if half % mosaic.swizzle_columns(dtype, swizzle) == 0), mosaic.NARROWEST_SWIZZLE_BYTES)
+
+    def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = ()) -> dict:
+        # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
+        # groups, so a narrower product's is no column slice of a wider one's (Mosaic GPU's layout inference
+        # refused one, jsf-tmem4). A 16-column product is issued 32 wide, its right operand padded
+        # (`_padded`), its sum's first columns read (`summed`). A role's shared tile of each register left
+        # operand's depth and dtype in `lefts` (`register_products` stages one there).
+        widths = tuple(sorted({max(width, PADDED) for width in widths}))
+        return {"tmem": {width: tuple(accumulator_columns(self.rows, width) for _ in range(consumers))
+                         for width in widths},
+                "padded": tuple(plgpu.SMEM((self.rows, PADDED), jnp.bfloat16,
+                                           transforms=mosaic.swizzle_transforms(jnp.bfloat16, PADDED))
+                                for _ in range(consumers)),
+                "lefts": {_left_key(depth, dtype): tuple(
+                    plgpu.SMEM((self.rows, depth), dtype, transforms=mosaic.swizzle_transforms(dtype, depth))
+                    for _ in range(consumers)) for depth, dtype in dict.fromkeys(lefts)},
+                "done": plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True)}
+
+    def product_addresses(self, products: tuple | None) -> int:
+        # Its accumulators' tensor memory keeps its address in a word: every launch's compile was those 4
+        # bytes past its plan (the sm100 gate, jsf-g100fix).
+        return 0 if products is None else resources.TMEM_ADDRESS_BYTES
+
+    def product_shared(self, scratch) -> tuple:
+        # Its accumulators are tensor memory: its padded right operands, its staged left operands and its
+        # barrier are shared memory, as `product_scratch` allocates them.
+        return (*scratch["padded"], *(tile for tiles in scratch["lefts"].values() for tile in tiles),
+                scratch["done"])
+
+    @contextlib.contextmanager
+    def products_in(self, refs):
+        token = _PRODUCTS.set(refs)
+        try:
+            yield
+        finally:
+            _PRODUCTS.reset(token)
+
+    def _scoped(self) -> dict:
+        """The program's product scratch (`product_scratch`'s, scoped, `products_in`)."""
+        found = _PRODUCTS.get()
+        if found is None:
+            raise ValueError(f"{self.name}'s products take their program's product scratch (`products_in`)")
+        return found
+
+    def _scratch(self, width: int):
+        """The building role's accumulator `width` columns wide (`PADDED` at least) and its barrier
+        (`product_scratch`'s)."""
+        width = max(width, PADDED)
+        found = self._scoped()
+        if width not in found["tmem"]:
+            raise ValueError(f"{self.name} has no {width}-column accumulator in its program's product "
+                             f"scratch (`product_scratch`'s widths)")
+        role = mosaic.ROLE.get()
+        return found["tmem"][width][role], found["done"].at[role]
+
+    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+        del interpret
+        tmem, done = self._scratch(shape[1])
+        issue(Accumulator(tmem, (shape[0], max(shape[1], PADDED))))
+        found = _awaited(tmem, done)
+        return found if shape[1] >= PADDED else found[:, :shape[1]]
+
+    def products(self, acc: Accumulator | jax.Array, lhs, rhs, interpret: bool, *, accumulate: bool = True
+                 ) -> Accumulator | jax.Array:
+        if not isinstance(acc, Accumulator):
+            # A sum the walk carries in registers: the product in a fresh accumulator, added to it.
+            return acc + self.summed(acc.shape, lambda fresh: self.products(fresh, lhs, rhs, interpret),
+                                     interpret)
+        left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
+        if rhs.shape[1] < PADDED:
+            rhs = self._padded(rhs)
+        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
+        return dataclasses.replace(acc, accumulate=True)
+
+    def _padded(self, rhs):
+        """A right operand of fewer than `PADDED` columns in the building role's padded tile, zeros past
+        its columns: a 64-row product splits its columns between two lane groups, and 16's halves of 8 are
+        whole tiles of no shared-memory tiling a transposed operand takes (Mosaic GPU's layout inference
+        refused Kimi delta attention's 16-wide sub-chunk pairs on a B200; row 4747's debugging at
+        0e5d3aa9df8: padded, they lower)."""
+        padded = self._scoped()["padded"][mosaic.ROLE.get()]
+        rows, columns = rhs.shape
+        if rows != self.rows:
+            raise ValueError(f"{self.name} pads a {self.rows}-row right operand, not {rows} rows")
+        padded[...] = jnp.zeros((rows, PADDED), padded.dtype)
+        plgpu.store(padded.at[:, :columns], plgpu.load(rhs, layout=plgpu.Layout.WGMMA, optimized=False),
+                    optimized=False)
+        plgpu.commit_smem()
+        return padded
+
+    def register_products(self, acc: Accumulator | jax.Array, parts, rhs, interpret: bool
+                          ) -> Accumulator | jax.Array:
+        # A 64-row product takes no left operand from tensor memory (tcgen05.py: M=128 alone) nor registers:
+        # each part is staged into the building role's shared tile of its depth and dtype
+        # (`product_scratch`'s lefts), made visible to the tensor core's proxy, multiplied from there, and
+        # its product's commit awaited before the next part, or the caller, may write the tile again (the
+        # tensor core reads it as it runs). A sum the walk carries in registers takes the parts' products
+        # in a fresh accumulator, added to it (`summed`).
+        if not isinstance(acc, Accumulator):
+            return acc + self.summed(acc.shape, lambda fresh: self.register_products(
+                fresh, parts, rhs, interpret), interpret)
+        _, done = self._scratch(acc.shape[1])
+        for part in parts:
+            tile = self._left(part)
+            plgpu.store(tile, part, optimized=False)
+            plgpu.commit_smem()
+            acc = self.products(acc, tile, rhs, interpret)
+            plgpu.tcgen05_commit_arrive(done)
+            plgpu.barrier_wait(done)
+        return acc
+
+    def _left(self, part: jax.Array):
+        """The building role's shared tile for a register left operand like `part` (`register_products`)."""
+        rows, depth = part.shape
+        tiles = self._scoped()["lefts"].get(_left_key(depth, part.dtype))
+        if tiles is None or rows != self.rows:
+            raise ValueError(f"{self.name} stages a {self.rows}-row register left operand of its program's "
+                             f"product scratch (`product_scratch`'s lefts), not {part.shape} {part.dtype}")
+        return tiles[mosaic.ROLE.get()]
+
+    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+        return self.summed((lhs.shape[0], rhs.shape[1]), lambda acc: self.register_products(
+            acc, (lhs,), rhs, interpret), interpret)
+
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+        def issue(acc):
+            self.products(acc, lhs, rhs, interpret)
+            if then is not None:
+                then()
+
+        return self.summed(shape, issue, interpret)
+
+    def added_into(self, acc: Accumulator | jax.Array, value: jax.Array, interpret: bool
+                   ) -> Accumulator | jax.Array:
+        # Its products done (a commit awaited), its value read, `value` added, written back; a sum the
+        # walk carries in registers takes `value` there.
+        if not isinstance(acc, Accumulator):
+            return acc + value
+        del interpret
+        _, done = self._scratch(acc.shape[1])
+        plgpu.tcgen05_commit_arrive(done)
+        plgpu.barrier_wait(done)
+        plgpu.async_store_tmem(_tensor_memory(acc), _read(_tensor_memory(acc)) + value)
+        plgpu.commit_tmem()
+        return dataclasses.replace(acc, accumulate=True)
+
+    def rescaled_products(self, acc: Accumulator | jax.Array, scale, parts, rhs, interpret: bool
+                          ) -> Accumulator | jax.Array:
+        if not isinstance(acc, Accumulator):
+            return self.register_products(scale(acc), parts, rhs, interpret)
+        _, done = self._scratch(acc.shape[1])
+        plgpu.tcgen05_commit_arrive(done)
+        plgpu.barrier_wait(done)
+        plgpu.async_store_tmem(_tensor_memory(acc), scale(_read(_tensor_memory(acc))))
+        plgpu.commit_tmem()
+        return self.register_products(dataclasses.replace(acc, accumulate=True), parts, rhs, interpret)
+
+    def settled(self, pending: int = 0) -> None:
+        # Every product is awaited where its accumulator is read (`summed`): nothing in flight past it.
+        del pending
+
+
+class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
+    """The recurrence's bundle on Blackwell (row 4747): tcgen05's chunks issuer (`Tcgen05ChunksIssuer`) on TMA
+    rings fed by a producer warpgroup (`mosaic.RingFamily`), as wgmma's bundle is: the one composition in
+    which its products are the family's own, mma.sync's on TMA rings spilling its key-block, fp32 solve and
+    scores' gradient launches at every geometry on a B200."""
+
+    consumers = 3
+
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
+                gathered: tuple[str, ...] = ()) -> dict:
+        # A 64-row product reads a transposed operand as two halves of 32 rows and splits its columns
+        # between two lane groups, each whole tiles of its swizzle: at 128 bytes the keys' (64, 8) transposed
+        # tiling divides no half (Mosaic GPU's layout inference refused a 27B gated delta net's fp32 forward
+        # on a B200; row 4747's debugging at 0e5d3aa9df8: at 64 bytes it lowers and compiles), a 96-column
+        # operand's halves of 48 no 32-column tile (`right_swizzle`), a role's share of a stream's columns
+        # (the SSD's values two roles read 32 of 64 each) whole tiles of its halves, and a stream read as a
+        # transposed right operand (Kimi delta attention's memories, 32 of their rows its columns) whole
+        # tiles of its narrower side's halves (the debugging's SSD and KDA cases).
+        capped = {name: min((swizzles or {}).get(name, resources.widest_swizzle(dtype, shape[-1])),
+                            mosaic.SWIZZLE_BYTES // 2, self.right_swizzle(dtype, shape[-1] // consumers),
+                            self.right_swizzle(dtype, min(shape)))
+                  for name, (shape, dtype) in blocks.items() if len(shape) == 2}
+        return super().streams(blocks, stages, consumers, multicast, {**(swizzles or {}), **capped}, copies,
+                               gathered)
+
+
+PADDED = 32
+"""The fewest columns a 64-row tcgen05 product takes (`Tcgen05ChunksIssuer._padded`)."""
+
+
+def _left_key(depth: int, dtype) -> str:
+    """A staged left operand's tile's name in a program's product scratch (`product_scratch`'s lefts)."""
+    return f"{depth}:{jnp.dtype(dtype).name}"
+
+CHUNKS = Tcgen05Chunks()
+"""tcgen05's bundle for the recurrence's 64-row chunks."""
+
+_PRODUCTS: contextvars.ContextVar[dict | None] = contextvars.ContextVar("products", default=None)
+"""The program's product scratch while it is traced (`Tcgen05ChunksIssuer.products_in`)."""
+
+
+def _read(tmem) -> jax.Array:
+    """A 64-row accumulator's value in registers, in the WGMMA layout its half-lane tile loads into."""
+    value = plgpu.async_load_tmem(tmem, layout=plgpu.Layout.WGMMA)
+    plgpu.wait_load_tmem()
+    return value
+
+
+def _awaited(tmem, done) -> jax.Array:
+    """The products issued into `tmem` committed to `done`, awaited, and their sum read (`_read`)."""
+    plgpu.tcgen05_commit_arrive(done)
+    plgpu.barrier_wait(done)
+    return _read(tmem)
+
+
+def _tensor_memory(acc: Accumulator) -> Ref:
+    """A tile's tensor memory; a tile that multiplies nothing has none to issue into or write."""
+    if acc.ref is None:
+        raise ValueError("a tile that multiplies nothing holds no tensor memory")
+    return acc.ref
+
+
+def _columns(ref, first, columns: int):
+    """Columns `first` to `first + columns` of a tile in tensor memory."""
+    return ref.at[:, pl.ds(first, columns)]

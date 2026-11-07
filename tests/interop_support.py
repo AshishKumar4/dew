@@ -203,18 +203,20 @@ def extract_fixture(archive: Path, directory: Path) -> Path:
 
 
 def hub_cache(cache: Path, repo_id: str, source: Path,
-              commit: str = "0123456789abcdef0123456789abcdef01234567") -> str:
-    """Put `source` in `cache` as `repo_id` at `commit`, as a download leaves
-    it: the snapshot, the branch's commit and the commit's tree listing
-    (huggingface_hub's tree cache). A process with HF_HUB_CACHE=cache and
-    HF_HUB_OFFLINE=1 then resolves `repo_id` to that commit, which this returns."""
+              commit: str = "0123456789abcdef0123456789abcdef01234567", branch: str = "main") -> str:
+    """Put `source` in `cache` as `repo_id` at `commit` on `branch`, as a
+    download leaves it: the snapshot, the branch's commit and the commit's
+    tree listing (huggingface_hub's tree cache). A process with
+    HF_HUB_CACHE=cache and HF_HUB_OFFLINE=1 then resolves `repo_id` at
+    `branch` to that commit, which this returns; another call puts another
+    commit of the same repo beside it."""
     from huggingface_hub._tree_cache import TREE_CACHE_FORMAT_VERSION
 
     repo = cache / f"models--{repo_id.replace('/', '--')}"
     shutil.copytree(source, repo / "snapshots" / commit)
-    (repo / "refs").mkdir()
-    (repo / "refs" / "main").write_text(commit)
-    (repo / "trees").mkdir()
+    (repo / "refs").mkdir(parents=True, exist_ok=True)
+    (repo / "refs" / branch).write_text(commit)
+    (repo / "trees").mkdir(exist_ok=True)
     files = sorted(path for path in source.rglob("*") if path.is_file())
     (repo / "trees" / f"{commit}.json").write_text(json.dumps({
         "format_version": TREE_CACHE_FORMAT_VERSION,

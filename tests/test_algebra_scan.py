@@ -16,6 +16,7 @@ from reference_error import assert_as_exact
 
 from dew.algebra import SATURATION, cost, linear_scan, scan
 from dew.nn.kernels import generation
+from dew.nn.precision import float32_matmul
 
 TOKENS, STATE, WIDTH, CHUNK = 128, 16, 32, 32
 
@@ -60,6 +61,14 @@ def draw(seed):
             jnp.asarray(rng.standard_normal((TOKENS, STATE)) / np.sqrt(STATE), jnp.float32))
 
 
+def deep_draw(seed):
+    """`draw`'s inputs with steps of one to two: each token's log decay -0.7 to -1.4, so a chunk's reach
+    e^-45, where a log decay's fp32 ulp is 4e-6 and an exponent rounded whole before its exponential loses
+    that much of every decay."""
+    x, _, B, C = draw(seed)
+    return x, jnp.asarray(np.random.default_rng(seed + 1).uniform(1, 2, TOKENS), jnp.float32), B, C
+
+
 def operands(x, dt, B, C) -> dict:
     return {"x": x, "dt": dt, "B": B, "C": C, "rate": jnp.float32(RATE), "skip": jnp.float32(SKIP)}
 
@@ -72,9 +81,11 @@ def chunk_of(values: dict, index: int, axes: dict = OPERANDS) -> dict:
 
 def walk(forms, values, chunks: range, state, axes: dict = OPERANDS):
     outputs = []
+    # A walk that carries its transfer composes each chunk's transition.
+    transition = isinstance(state, scan.Walk) and state.transfer is not None
     for index in chunks:
         chunk = chunk_of(values, index, axes)
-        prepared = forms.prepare(chunk)
+        prepared = forms.prepare(chunk, transition=transition)
         outputs.append(forms.mapped(prepared, state))
         state = forms.step(state, prepared)
     return outputs, state
@@ -291,6 +302,46 @@ def test_two_delta_rule_walks_merged_give_the_final_state(update_fn, operands, d
                     f"{update_fn.__name__} merged", seeds=16)
 
 
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
+def test_two_delta_rule_walks_merged_through_an_issuer_give_the_final_state(update_fn, operands, draw_fn):
+    """The two halves' walks of the delta rules stepped, their transfers composed from each chunk's prepared
+    transition and joined, every product a mainloop's issuer's by its role (`issue`, Dew's own products
+    here): the final state on par with the token-by-token scan's against the float64 truth (check 1), the
+    transfer held as the issuer's own value, which no operation but the issuer's reads."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    half = TOKENS // CHUNK // 2
+    roles = set()
+
+    class Held:
+        """A transfer as a mainloop's issuer holds it (its own tiles), which only the issuer reads."""
+
+        def __init__(self, value):
+            self.value = value
+
+    def issue(role, left, right):
+        roles.add(role)
+        left, right = (x.value if isinstance(x, Held) else x for x in (left, right))
+        made = right * left[None, :] if role == "transfer_decay" else float32_matmul(left, right)
+        return Held(made) if role in ("transfer_compose", "transfer_decay") else made
+
+    def merged(q, k, v, g, beta):
+        values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+        states = []
+        for chunks in (range(half), range(half, 2 * half)):
+            state = forms.init(chunk_of(values, 0, operands))
+            for index in chunks:
+                prepared = forms.prepare(chunk_of(values, index, operands), issue, transition=True)
+                state = forms.step(state, prepared, issue)
+            states.append(state)
+        return forms.finish(forms.merge(*states, values, issue), values)
+
+    assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: gated_tokenwise(update_fn)(*xs)[1]), draw_fn,
+                    f"{update_fn.__name__} merged through an issuer", seeds=16)
+    assert {"transfer_compose", "transfer_apply"} <= roles, roles
+
+
 @pytest.mark.parametrize("target", ["sm86", "sm90"])
 def test_a_chunk_form_any_target_extracts_computes_the_token_scan(target):
     """The gated delta rule's chunks derived under an A10 (its step's latency unstated, so the token loop is
@@ -326,6 +377,32 @@ def test_a_scans_carry_derived_for_one_target_serves_no_other():
             splits.append(forms.prepare(chunk).split)
     assert splits[1] is not splits[0]
     assert splits[2] is splits[0]
+
+
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
+def test_a_derived_scans_products_are_its_issuers_each_by_its_role(update_fn, operands, draw_fn):
+    """A derived scan's chunk walked through a mainloop's issuer (`issue(role, lhs, rhs)`) at prepare, step
+    and mapped: every product of its forms is the issuer's, under the roles a chunk's form makes (its gram,
+    a per-key decay's factored around each sub-chunk's reference among them, its inverse's doubling, its
+    correction, write and readouts), and the walk computes what Dew's own products do, bit for bit."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    roles = []
+
+    def issue(role, left, right):
+        roles.append(role)
+        return float32_matmul(left, right)
+
+    chunk = chunk_of(dict(zip(operands, draw_fn(0), strict=True)), 0, operands)
+    state = forms.init(())
+    plain = forms.prepare(chunk)
+    expected = forms.mapped(plain, state), forms.step(state, plain)
+    issued = forms.prepare(chunk, issue)
+    made = forms.mapped(issued, state, issue), forms.step(state, issued, issue)
+    np.testing.assert_array_equal(np.asarray(made[0]), np.asarray(expected[0]))
+    np.testing.assert_array_equal(np.asarray(made[1][1]), np.asarray(expected[1][1]))
+    assert {"gram", "inverse_merge", "correct", "carry", "readout_memory"} <= set(roles), roles
 
 
 def test_a_derived_scan_holds_its_latest_splits_alone():
@@ -402,6 +479,26 @@ def test_a_delta_rules_carry_stays_finite_wherever_the_token_scan_is():
     prepared = forms.prepare(chunk)
     outputs, (_, leaving) = forms.mapped(prepared, entering), forms.step(entering, prepared)
     assert np.all(np.isfinite(np.asarray(outputs))) and np.all(np.isfinite(np.asarray(leaving)))
+
+
+def test_a_chunks_adjoint_meets_its_decay_once():
+    """The gated delta rule's one-token chunk, its key and write gate unit on one key, its query and value
+    zero, its decay e^-1, entering a state of 2^120 on that key alone, with a cotangent of 2^20 on the state
+    it leaves: the token's correction cancels its write, so the state's cotangent through the decay is zero
+    on the key the state holds and so is the decay's gradient, and the derived chunk's adjoint
+    (`Derived.backward`, the token update replayed) keeps the entering state's cotangent and the decay's
+    gradient finite, the latter exactly zero (row 1966's head review). The key's and write gate's gradients
+    exceed float32's range at this state and cotangent."""
+    chunk = {"q": jnp.zeros((1, KEY)), "k": jnp.zeros((1, KEY)).at[0, 0].set(1.0),
+             "v": jnp.zeros((1, VALUE)), "g": jnp.full((1,), -1.0), "beta": jnp.ones((1,))}
+    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    entering = jnp.zeros((KEY, VALUE)).at[0].set(2.0 ** 120)
+    d_state, d_operands = forms.backward(chunk, (None, entering), jnp.full((KEY, VALUE), 2.0 ** 20),
+                                         jnp.zeros((1, VALUE)))
+    assert np.all(np.isfinite(np.asarray(d_state)))
+    assert np.all(np.isfinite(np.asarray(d_operands["g"])))
+    np.testing.assert_array_equal(d_operands["g"], jnp.zeros_like(chunk["g"]))
 
 
 def test_a_chunks_decay_gradient_reads_no_pair_of_its_future():
@@ -588,9 +685,11 @@ def cotangents_of(seed, outputs_shape, state_shape):
             jnp.asarray(rng.standard_normal(state_shape), jnp.float32))
 
 
-def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient():
+@pytest.mark.parametrize("draw_fn", [draw, deep_draw], ids=["steps over three decades", "deep decays"])
+def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient(draw_fn):
     """Mamba-2's chunk adjoint (`backward`), walked back over the chunks: each token operand's gradient on par
-    with the token-by-token scan's against the float64 truth (check 1)."""
+    with the token-by-token scan's against the float64 truth (check 1), its steps' too where a chunk's
+    decays reach e^-45."""
     forms = scan.derive_scan(DECLARED, saturation=SATURATION)
     names = ("x", "dt", "B", "C")
 
@@ -600,7 +699,7 @@ def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient():
     derived = adjoint(forms, chunked, TOKENS // CHUNK)
 
     def draw_with_cotangents(seed):
-        return (*draw(seed), *cotangents_of(seed, (TOKENS, WIDTH), (STATE, WIDTH)))
+        return (*draw_fn(seed), *cotangents_of(seed, (TOKENS, WIDTH), (STATE, WIDTH)))
 
     def as_derived(x, dt, B, C, d_out, d_final):
         grads = derived({"x": x, "dt": dt, "B": B, "C": C}, (d_out, d_final))

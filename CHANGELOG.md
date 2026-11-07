@@ -7,6 +7,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- FlashAttention's wrapper, `dew-flash-attn` 0.3.8, lowers its call for the GPU a host states (`targeting`), so a
+  host with no GPU, the CPU lock's `kernel-compile` extra with the CUDA runtime its library loads, compiles a
+  step ahead as the GPU's program with FlashAttention's kernel in it.
+- A distillation under a host layout (`Layout(host=("variables",))`) keeps its frozen teacher as it keeps
+  a frozen stack: each scanned run of the teacher's layers, its frozen split's beside its params, is one
+  bank beside the accelerator, which the teacher's forward reads a layer at a time, where the whole
+  teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
+  host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
+  does not restore into it; start such a run afresh from its teacher.
 - Every release Dew writes is planned once and written once (`dew.interop.releases.ReleasePlan`): `dew
   export`, `Pretrained.save`, `Decide.save_pretrained` and `SavedModel.save_pretrained` each write a plan of
   a model part, a decision head's files, the task's assets and one release record, and `export` returns the
@@ -111,9 +120,17 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post60: Mosaic GPU's SMEM transfer check answers once per target, so one
-  process compiling a kernel for two GPUs reads each one's answer (post60: a kernel body still unplaced reads the
-  device's), and `lax.ragged_all_to_all`'s gradient keeps
+- Dew requires its JAX build 0.12.0.1.post65: a host callback returns its results at its program's lowered
+  precision, so a float64 callback compiled under `jax.enable_x64` and run on another thread keeps float64;
+  post64: Pallas Mosaic GPU keeps each kernel it lowers under a key of all
+  the lowering reads, which another process reads back (a 400-op kernel's 43-46 s lowering about 1 s), and
+  Dew's compilation cache keeps those lowerings beside its compiled programs (`<cache>/pallas`); post62:
+  Pallas's Mosaic GPU interpreter runs a block-scaled tcgen05 MMA,
+  its scales applied per block before the product, and copies scales to TMEM undoing their SMEM tiling; post61:
+  Pallas's Mosaic GPU interpreter runs a thread map's role body with
+  every argument it was traced with, so a Blackwell causal forward's role threads compile there; post60: Mosaic
+  GPU's SMEM transfer check answers once per target, so one process compiling a kernel for two GPUs reads each
+  one's answer (a kernel body still unplaced reads the device's), and `lax.ragged_all_to_all`'s gradient keeps
   its `axis_index_groups`; post58: a `custom_jvp` whose primal makes and frees its own refs
   discharges them inside a `jit`, its custom JVP kept (a grouped paged-KV decode's in-place kernel); post57: a
   `checkify` check reaching a partially manual `shard_map` partitions its errors over the manual axes alone;

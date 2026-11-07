@@ -12,7 +12,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from certified import assert_certified
 from jax.sharding import Mesh, PartitionSpec as P
 from port_support import row_names_port
 from reference_error import (
@@ -21,12 +20,12 @@ from reference_error import (
     assert_fp32_reduction_bound,
     chain_roundings,
     widened,
+    with_gradients,
 )
 
-from dew.algebra import forms as algebra_forms
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
-from dew.nn.precision import float32_einsum, l2norm
+from dew.nn.precision import l2norm
 
 ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 8
 CHUNK = 16
@@ -64,11 +63,6 @@ clipped with the skip, the gated RMS norm after the l2 norm and after a plain sc
 `chunk_ssd` hands it over (a rated decay, the step its write gate), with its gated norm, a rated decay
 under the delta rule and the l2 norm, the norm after the skip, and a decay without any write gate."""
 
-COMPOSED_SEEDS = {(HOOKS[4], False): 16, (HOOKS[4], True): 16, (HOOKS[8], False): 8, (HOOKS[8], True): 8,
-                  (HOOKS[6], False): 16, (HOOKS[6], True): 16}
-"""The composed-chunks sites' declared seeds (the scalar and the vector decay with the delta rule, the
-scalar without; one sequence and packed), sized by `seeds_for` on armada (2026-10-21)."""
-
 PACKED = (False, True)
 
 
@@ -88,7 +82,7 @@ def formed(forms: str, fn):
 
 def chunk_on(kernel: str, hooks, *args, **kwargs):
     """`chunk` on `kernel`, which `generation.chosen` names for the delta rule's selector where it runs it,
-    and for the rated scan's where that runs it: the portable math ('xla') and the recurrence template
+    and for the rated scan's where that runs it: the plain-JAX mainloop ('xla') and the recurrence template
     ('mosaic_gpu') both, the port of mamba_ssm's kernels ('pallas') the scan's alone, the rated scan's
     reference under the fast forms (test_recurrence_template_stability's `reference_arm`)."""
     named = {**({} if kernel == 'pallas' else {'gated_delta_rule': kernel}),
@@ -105,60 +99,86 @@ independently by `seeds_for` on armada (2026-10-21), on the draw with a memory e
 document starting on a chunk's first token."""
 
 
+def hosted(x, dtype=jnp.float32) -> jax.Array:
+    """A float64 NumPy draw rounded once to fp32, then to `dtype`, as JAX takes it. A recorded site's draws
+    (`fla_sites`) are NumPy's, their arithmetic float64's, the same bits on any host and jaxlib: JAX's
+    draws and their transcendentals on a host CPU were not (JS-DIGEST-a100: an A100 node drew two
+    gpu-geometry sites' inputs apart from the recording's, where a cpu-geometry one's matched)."""
+    return jnp.asarray(np.asarray(x, np.float64).astype(np.float32)).astype(dtype)
+
+
+def sigmoid(x):
+    """The logistic function of a float64 draw (`hosted`)."""
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def softplus(x):
+    """`log(1 + e^x)` of a float64 draw (`hosted`)."""
+    return np.logaddexp(0.0, x)
+
+
+def unit(x):
+    """A float64 draw's vectors over its last axis scaled to unit length (`hosted`)."""
+    return x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
+
+
+def cotangents(operands: Chunk, seed: int) -> tuple[jax.Array, jax.Array]:
+    """Cotangents of `operands`' output `[B, S, Hv, Dv]`, in their values' dtype, and of their final memory
+    `[B, Hv, Dk, Dv]`, fp32: normals of the seed's own stream (`hosted`)."""
+    normal = np.random.default_rng([seed, 101]).standard_normal
+    batch, length, heads, width = operands.value.shape
+    return (hosted(normal((batch, length, heads, width)), operands.value.dtype),
+            hosted(normal((batch, heads, operands.key.shape[-1], width))))
+
+
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
          value_heads: int = VALUE_HEADS) -> tuple[Chunk]:
-    """A sequence's operands for `hooks` from `seed`, its keys' and values' dimensions each permuted
-    by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
+    """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
+    permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
     and values (`NORMED_WIDTH` wide under the norm), a log decay a head or a key dimension in (-1, 0),
     a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, and with
     `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
     chunk's first token."""
-    keys = jax.random.split(jax.random.key(seed), 8)
     rng = np.random.default_rng(seed)
+    normal = np.random.default_rng([seed, 1]).standard_normal
     width = VALUE_WIDTH if hooks.output is None else NORMED_WIDTH
     key_order, value_order = rng.permutation(KEY_WIDTH), rng.permutation(width)
-    query = jax.random.normal(keys[0], (ROWS, length, KEY_HEADS, KEY_WIDTH))
-    key = jax.random.normal(keys[1], (ROWS, length, KEY_HEADS, KEY_WIDTH))
-    key = key / jnp.linalg.norm(key, axis=-1, keepdims=True)
-    value = jax.random.normal(keys[2], (ROWS, length, value_heads, width))
-    shape = (ROWS, length, value_heads, KEY_WIDTH) if hooks.decay == 'vector' else (ROWS, length, value_heads)
-    log_decay = -jax.nn.softplus(jax.random.normal(keys[3], shape) - 1.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (ROWS, length, value_heads)))
-    skip = jax.random.normal(keys[5], (value_heads,))
+    query = normal((ROWS, length, KEY_HEADS, KEY_WIDTH))[..., key_order]
+    key = unit(normal((ROWS, length, KEY_HEADS, KEY_WIDTH)))[..., key_order]
+    value = normal((ROWS, length, value_heads, width))[..., value_order]
+    vector = hooks.decay == 'vector'
+    log_decay = -softplus(normal((ROWS, length, value_heads) + ((KEY_WIDTH,) if vector else ())) - 1.0)
+    if vector:
+        log_decay = log_decay[..., key_order]
+    written = normal((ROWS, length, value_heads))
+    beta = sigmoid(written)
+    skip = normal((value_heads,))
+    state = (0.3 * normal((ROWS, value_heads, KEY_WIDTH, width)))[:, :, key_order][..., value_order]
     gates = {}
     if hooks.gates is not None:
         # Pre-activations: the gate and beta raw, `log_a` and `bias` a head's.
-        heads = jax.random.split(keys[6], 3)
-        gates = {'gate': jax.random.normal(heads[0], (ROWS, length, value_heads)),
-                 'log_a': 0.5 * jax.random.normal(heads[1], (value_heads,)),
-                 'bias': jax.random.normal(heads[2], (value_heads,))}
-        beta = jax.random.normal(keys[4], (ROWS, length, value_heads))
+        gates = {'gate': hosted(normal((ROWS, length, value_heads))),
+                 'log_a': hosted(0.5 * normal((value_heads,))), 'bias': hosted(normal((value_heads,)))}
+        beta = written
     if hooks.rated:
         # The step through softplus is the write gate; the rate is `A = -exp(A_log)`, a head's.
-        beta = jax.nn.softplus(jax.random.normal(keys[4], (ROWS, length, value_heads)) - 1.0)
-        gates = {'rate': -jnp.exp(0.5 * jax.random.normal(keys[6], (value_heads,)))}
+        beta = softplus(written - 1.0)
+        gates = {'rate': hosted(-np.exp(0.5 * normal((value_heads,))))}
     epilogue = {}
     if hooks.output is not None:
-        norms = jax.random.split(keys[7], 2)
-        epilogue = {'z': jnp.take(jax.random.normal(norms[0], (ROWS, length, value_heads, width)),
-                                  value_order, axis=-1),
-                    'weight': jnp.take(1.0 + 0.1 * jax.random.normal(norms[1], (width,)), value_order)}
-    query, key = (jnp.take(x, key_order, axis=-1) for x in (query, key))
-    value = jnp.take(value, value_order, axis=-1)
-    if hooks.decay == 'vector':
-        log_decay = jnp.take(log_decay, key_order, axis=-1)
-    state = 0.3 * jax.random.normal(jax.random.fold_in(jax.random.key(seed), 8),
-                                    (ROWS, value_heads, KEY_WIDTH, width))
-    state = jnp.take(jnp.take(state, key_order, axis=2), value_order, axis=3)
+        epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
+                    'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
     starts = None
     if packed:
-        starts = (jnp.zeros((ROWS, length), bool).at[0, jnp.array([0, 23, 40])].set(True)
-                  .at[1, jnp.array([9, 48])].set(True))
+        starts = np.zeros((ROWS, length), bool)
+        starts[0, [0, 23, 40]] = True
+        starts[1, [9, 48]] = True
+        starts = jnp.asarray(starts)
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
-    return (Chunk(query, key, value, log_decay=log_decay if plain else None,
-                  beta=beta if reads_beta else None, skip=skip if hooks.skip else None, state=state,
-                  starts=starts, **gates, **epilogue),)
+    return (Chunk(hosted(query), hosted(key), hosted(value), log_decay=hosted(log_decay) if plain else None,
+                  beta=hosted(beta) if reads_beta else None, skip=hosted(skip) if hooks.skip else None,
+                  state=hosted(state), starts=starts, **gates, **epilogue),)
 
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
@@ -203,27 +223,100 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
                     seeds=SEEDS[hooks, packed])
 
 
-DERIVED = [hooks for hooks in HOOKS + FORMED if hooks.delta or not hooks.rated]
-"""The hooks the delta rule's op runs (`GATED_DELTA`), which the derived forms take: every one but a rated
-scan without the delta rule (Mamba2's SSD, the scan's own op)."""
+DOCUMENTS = ((0, 23, 40), (0, 9, 48))
+"""Each row's packed documents' first tokens under `draw`'s `packed`."""
+
+ENTERED = ((2, 0, 1), (3, 1, 2))
+"""The slot each row's document enters (one-based, zero a zero memory): a row's slots each entered once
+but the second row's first, and its third entered twice, so the slot's gradient sums two documents'."""
 
 
-@pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
-@pytest.mark.parametrize('hooks', DERIVED, ids=str)
-def test_the_derived_forms_are_as_exact_as_the_recurrence_token_by_token(hooks, packed):
-    """The forms derived from the token update (`recurrence_chunk.derived_rule`, `dew.algebra.scan`), the
-    portable math's behind the switch (`dew.algebra.forms.derived`), against the same recurrence a token at
-    a time, output and final memory, on the portable math's draws of one sequence or of packed documents,
-    each document's first token its forms' reset (check 1): the accuracy check the derived forms are taken
-    behind."""
-    def derived(*args, **kwargs):
-        with algebra_forms.derived():
-            return chunk_on('xla', hooks, *args, chunk_size=CHUNK, **kwargs)
+def entered_draw(hooks, seed: int):
+    """`draw`'s packed operands, each document entering its `ENTERED` slot's memory of three a row, and
+    cotangents of the output and each document's final memory."""
+    (operands,) = draw(hooks, packed=True, seed=seed)
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 9), 3)
+    slots = 0.3 * jax.random.normal(keys[0], (ROWS, 3, *operands.state.shape[1:]))
+    out = jax.random.normal(keys[1], operands.value.shape)
+    final = jax.random.normal(keys[2], slots.shape)
+    # The documents' bounds and slots are the call's structure, which the arms close over: no gradient.
+    return dataclasses.replace(operands, state=slots, starts=None), (out, final)
 
-    dew = jax.jit(derived)
+
+
+
+def _documents(operands):
+    """`operands` with `draw`'s packed documents, each entering its `ENTERED` slot."""
+    starts = jnp.zeros(operands.value.shape[:2], bool)
+    for row, begins in enumerate(DOCUMENTS):
+        starts = starts.at[row, jnp.asarray(begins)].set(True)
+    return dataclasses.replace(operands, starts=starts, entered=jnp.asarray(ENTERED, jnp.int32))
+
+
+def document_by_document(hooks, operands):
+    """Each document of `operands` a sequence of its own from its slot's memory through `token_by_token`,
+    its outputs back in place and its final memory its own `[B, D, Hv, Dk, Dv]`."""
+    tokens = ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z')
+    outs, finals = [], []
+    for row, (begins, entered) in enumerate(zip(DOCUMENTS, ENTERED, strict=True)):
+        ends = (*begins[1:], operands.value.shape[1])
+        pieces, kept = [], []
+        for begin, end, slot in zip(begins, ends, entered, strict=True):
+            state = (operands.state[row, slot - 1] if slot else jnp.zeros_like(operands.state[row, 0]))
+            fields = {name: getattr(operands, name)[row:row + 1, begin:end] for name in tokens
+                      if getattr(operands, name) is not None}
+            piece = dataclasses.replace(operands, **fields, state=state[None], starts=None, entered=None)
+            out, final = token_by_token(hooks, piece)
+            pieces.append(out[0])
+            kept.append(final[0])
+        outs.append(jnp.concatenate(pieces))
+        finals.append(jnp.stack(kept))
+    return jnp.stack(outs), jnp.stack(finals)
+
+
+@pytest.mark.check1_shards(seeds=80, per_task=16)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0]], ids=str)
+def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
+    """80 draws, 16 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
+    inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b), and 40 took up to 115 s.
+    Packed documents each entering a memory of its own (`Chunk.entered`, a request's shared prefix's
+    final memory for each of its questions): the portable math's output, each document's final memory and
+    every operand's gradient, the slots' memories' included (a slot entered twice summing both documents'),
+    against each document a sequence of its own from its slot's memory, the recurrence a token at a time
+    from float64."""
+    def ours(operands):
+        out, final = chunk_on('xla', hooks, _documents(operands), chunk_size=CHUNK)
+        return out.astype(jnp.float32), final.astype(jnp.float32)
+
+    def theirs(operands):
+        out, final = document_by_document(hooks, operands)
+        return out.astype(jnp.promote_types(out.dtype, jnp.float32)), final
+
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)),
+                    functools.partial(entered_draw, hooks),
+                    f'{hooks} documents entering their own memories', seeds=80)
+
+
+def edge_draw(hooks, seed: int):
+    """`draw`'s operands over a chunk's 64 tokens entering a memory of about 2^96, the largest `chunk` reads
+    at its size through any decay, which each row's first token decays by exp2(-124.8), a normal fp32 whose
+    prefix leaves fp32's normals at the next token: every later token reads the memory near its values."""
+    (operands,) = draw(hooks, packed=False, seed=seed, length=64)
+    g = operands.log_decay.at[:, 0].set(-124.8 * np.log(2.0))
+    memory = jax.random.normal(jax.random.key(seed + 7), operands.state.shape) * 2.0 ** 96
+    return (dataclasses.replace(operands, log_decay=g, state=memory),)
+
+
+@pytest.mark.parametrize('hooks', [hooks for hooks in HOOKS if hooks.decay == 'scalar'], ids=str)
+def test_a_memory_read_through_a_decay_past_fp32s_normals_is_as_exact_as_the_recurrence(hooks):
+    """The portable math's output and final memory where a memory at `chunk`'s bound is read through a
+    chunk's decay prefix past fp32's normals (`edge_draw`), on par with the recurrence a token at a time from
+    float64, which decays the memory in place: a decay under 2^-126 reads it as zero, a term under fp32's
+    resolution of the output within the bound (row 2344)."""
+    dew = jax.jit(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK))
     reference = jax.jit(functools.partial(token_by_token, hooks))
-    assert_as_exact(dew, reference, lambda seed: draw(hooks, packed=packed, seed=seed), f'{hooks} derived',
-                    seeds=SEEDS[hooks, packed])
+    assert_as_exact(dew, reference, functools.partial(edge_draw, hooks), f'{hooks} past the normals',
+                    seeds=FEWEST_SEEDS)
 
 
 ROUNDED_ONCE = [recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
@@ -302,12 +395,13 @@ def rated_draw(seed: int) -> tuple:
     """A decode token over a memory and a chunked sequence, each with its write gate in [0, 0.5), a rate a
     head in [-2, -0.1) and a skip: `(token, sequence)`, each a dict of the step's or chunk's operands."""
     rng = np.random.default_rng(seed)
-    rows, heads, width = 2, 2, 16
+    # The token's heads a warpgroup's keys, as the launch steps them (`templates.recurrence.step.fits`).
+    rows, heads, width, stepped = 2, 2, 16, 128
     rate = -jnp.asarray(rng.uniform(0.1, 2.0, (heads,)), jnp.float32)
     skip = jnp.asarray(rng.standard_normal((heads,)), jnp.float32)
-    token = {name: jnp.asarray(rng.standard_normal((rows, heads, width)), jnp.float32)
+    token = {name: jnp.asarray(rng.standard_normal((rows, heads, stepped)), jnp.float32)
              for name in ('query', 'key', 'value')}
-    token |= {'state': jnp.asarray(rng.standard_normal((rows, heads, width, width)), jnp.float32),
+    token |= {'state': jnp.asarray(rng.standard_normal((rows, heads, stepped, stepped)), jnp.float32),
               'beta': jnp.asarray(rng.uniform(0.0, 0.5, (rows, heads)), jnp.float32), 'rate': rate,
               'skip': skip}
     sequence = {name: jnp.asarray(rng.standard_normal((rows, LENGTH, heads, width)), jnp.float32)
@@ -358,8 +452,9 @@ def test_aligned_unit_keys_erase_the_decay_gradient():
     value = jnp.array([0.314159, -0.271828, 0.577216, 1.414214], jnp.float32).reshape(unit.shape)
     decay = jnp.array([-0.17, -0.23, -0.31, -0.41], jnp.float32).reshape(unit.shape)
     beta = jnp.ones((1, 4, 1), jnp.float32)
-    gradient = jax.jit(jax.grad(lambda g: jnp.sum(recurrence_chunk.chunk_delta_rule(
-        unit, unit, value, g, beta, chunk_size=4, scale=1.0)[0])))(decay)
+    gradient = jax.jit(jax.grad(lambda g: jnp.sum(recurrence_chunk.xla_mainloop(
+        recurrence_chunk.Tiles(4), unit, unit, value, g[..., 0], beta, scale=1.0, delta=True,
+        dtype=jnp.float32)[0])))(decay)
     np.testing.assert_array_equal(np.asarray(gradient), np.zeros_like(np.asarray(gradient)))
 
 
@@ -367,10 +462,12 @@ def test_aligned_unit_keys_erase_the_decay_gradient():
 @pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
 @pytest.mark.parametrize("delta", [False, True], ids=["write", "delta"])
 @pytest.mark.parametrize("channels", [1, 2], ids=["scalar decay", "vector decay"])
-def test_the_peeled_write_keeps_ragged_tokens_and_document_resets(
+def test_a_ragged_last_chunk_keeps_its_tokens_and_document_resets(
         length, chunk_size, packed, delta, channels):
-    """The peeled token is the last real one, including an empty prefix and starts before or on it.
-    Dyadic operands make the writes and outputs exact, so a misplaced reset or token has no tolerance."""
+    """The plain-JAX mainloop over rows whose last chunk is ragged, a chunk of one token or of an empty
+    prefix, documents starting before, on or after a chunk's first token: every output and the final
+    memory the recurrence's exactly. Dyadic operands make the writes and outputs exact, so a misplaced reset
+    or token has no tolerance."""
     key = np.zeros((2, length, 1, 2), np.float32)
     key[..., 0] = 1.0
     value = np.broadcast_to(np.arange(1, length + 1, dtype=np.float32)[None, :, None, None] / 4,
@@ -393,50 +490,14 @@ def test_the_peeled_write_keeps_ragged_tokens_and_document_resets(
             predicted = expected_final[row, 0, 0, 0] if delta else 0.0
             expected_final[row, 0, 0, 0] += 0.5 * (value[row, t, 0, 0] - predicted)
             expected_output[row, t, 0, 0] = expected_final[row, 0, 0, 0]
-    run = jax.jit(functools.partial(recurrence_chunk.chunk_delta_rule, chunk_size=chunk_size,
-                                    starts=starts, delta=delta, scale=1.0))
-    output, final = run(*(jnp.asarray(x) for x in (key, key, value, g, beta, initial)))
+    def run(key, query, value, g, beta, initial):
+        decay = g if channels > 1 else g[..., 0]
+        return recurrence_chunk.xla_mainloop(recurrence_chunk.Tiles(chunk_size), query, key, value, decay,
+                                             beta, initial, starts, scale=1.0, delta=delta, dtype=jnp.float32)
+
+    output, final = jax.jit(run)(*(jnp.asarray(x) for x in (key, key, value, g, beta, initial)))
     np.testing.assert_array_equal(np.asarray(output), expected_output)
     np.testing.assert_array_equal(np.asarray(final), expected_final)
-
-    steps = recurrence_chunk.chunked(*(jnp.asarray(x) for x in (key, key, value, g, beta)),
-                                      chunk_size, starts=starts, delta=delta, scale=1.0)
-    _, _, kept, last = recurrence_chunk._peeled_chunk_inputs(
-        steps, jnp.asarray(value), jnp.asarray(g), jnp.asarray(beta), starts, chunk_size)
-    positions = np.minimum((np.arange(steps.key.shape[2]) + 1) * chunk_size, length) - 1
-    np.testing.assert_array_equal(np.asarray(last[1]), np.moveaxis(value[:, positions], 2, 1))
-    np.testing.assert_array_equal(np.asarray(last[-1]), begins[:, positions, None].transpose(0, 2, 1))
-    expected_kept = np.array([[not begins[row, i * chunk_size:end].any()
-                               for i, end in enumerate(positions)] for row in range(2)])[:, None]
-    actual_kept = np.broadcast_to(np.asarray(kept[..., 0, 0]), expected_kept.shape)
-    np.testing.assert_array_equal(actual_kept, expected_kept)
-
-
-@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
-@pytest.mark.parametrize("delta", [False, True], ids=["write", "delta"])
-def test_the_peeled_transition_carries_the_peeled_memory_and_its_adjoint(packed, delta):
-    """The custom VJP's boundary transition is the peeled carry's own linear part; corrected values
-    keep the whole chunk's WY readout, even when its ragged last chunk has an empty prefix. Exact data:
-    dyadic operands every product and sum of which fp32 holds, each side equal to the same in float64."""
-    key = jnp.broadcast_to(jnp.array([1.0, 0.0]), (1, 5, 1, 2))
-    value = jnp.arange(1, 6, dtype=jnp.float32).reshape(1, 5, 1, 1) / 4
-    g, beta = jnp.zeros((1, 5, 1, 2)), jnp.full((1, 5, 1), 0.5)
-    starts = jnp.array([[False, False, True, False, True]]) if packed else None
-    steps = recurrence_chunk.chunked(key, key, value, g, beta, 4, starts=starts, delta=delta, scale=1.0)
-    grown, last, kept, tail = recurrence_chunk._peeled_chunk_inputs(steps, value, g, beta, starts, 4)
-    step = steps.key, steps.w, steps.u, grown, last, kept, *tail
-    entered = jnp.full((1, 1, 2, 2, 1), 2.0)
-    carried, (_, corrected) = algebra.peeled_carry(entered, step, delta=delta)
-    linear, written = algebra.peeled_transition(
-        steps.key, steps.w, steps.u, grown, last, kept, tail, delta=delta)
-    gradient = jax.jit(jax.grad(
-        lambda state: algebra.peeled_carry(state, step, delta=delta)[0].sum()))(entered)
-    with jax.enable_x64(new_val=True):
-        wide = [np.asarray(x, np.float64) for x in (linear, entered, written, steps.u, steps.w)]
-    exact = {'carried': wide[0] @ wide[1] + wide[2], 'corrected': wide[3] - wide[4] @ wide[1],
-             'gradient': np.swapaxes(wide[0], -1, -2) @ np.ones(np.shape(carried))}
-    for name, found in (('carried', carried), ('corrected', corrected), ('gradient', gradient)):
-        np.testing.assert_array_equal(np.asarray(found, np.float64), exact[name], err_msg=name)
 
 
 @pytest.mark.parametrize('staged', ['jit', 'remat', 'scan'])
@@ -514,33 +575,6 @@ def test_each_shard_enters_with_the_spans_before_it_applied_in_turn(dense, shard
                     seeds=FEWEST_SEEDS)
 
 
-@pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
-@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[8], HOOKS[6]], ids=str)
-def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
-    """The chunks' transitions (`recurrence_algebra.transition` over production's `chunked` operands)
-    composed as an associative scan runs them (`compose`) leave the final memory the recurrence leaves a
-    token at a time (`token_by_token`, the decode step's reference), on par from float64 over the site's
-    draws: the scalar and the vector decay with the delta rule and the scalar without, over one sequence
-    and over packed documents (one starting on a chunk's first token, the memory entering dropped)."""
-    group = VALUE_HEADS // KEY_HEADS
-
-    def composed(operands):
-        query, key = (jnp.repeat(x, group, axis=2) for x in (operands.query, operands.key))
-        g = operands.log_decay if hooks.decay == 'vector' else operands.log_decay[..., None]
-        steps = recurrence_chunk.chunked(query, key, operands.value, g, operands.beta, CHUNK,
-                                         starts=operands.starts, delta=hooks.delta)
-        t, w = jax.lax.associative_scan(algebra.compose, algebra.transition(
-            steps.key, steps.w, steps.u, steps.grown, steps.last, steps.kept), axis=2)
-        entered = float32_einsum('bhkj,bhjv->bhkv', t[:, :, -1], operands.state.astype(t.dtype))
-        return entered + w[:, :, -1]
-
-    def recurrent(operands):
-        return token_by_token(hooks, operands)[1]
-
-    assert_as_exact(jax.jit(composed), jax.jit(recurrent), functools.partial(draw, hooks, packed),
-                    f'{hooks} composed', seeds=COMPOSED_SEEDS[hooks, packed])
-
-
 PORTABLE_SEEDS = 8
 """The portable rule's differentiation sites' declared draws (check 1), sized by `seeds_for` (paired, on
 armada): the remat rung's gradients, the public seam's tangents, two forwards and a TPU's scan under
@@ -579,86 +613,19 @@ def portable_draw(seed: int, rows: int, packed: bool) -> tuple:
     return operands, starts, tuple(jax.random.normal(keys[6], x.shape) for x in operands)
 
 
-CERTIFIED_SEEDS = 2
-"""The chunk ops' check-2 draws: every element of every operation certified on each (tests/certified.py)."""
-
-
-@pytest.mark.parametrize("decay", ["gated", "none"])
-@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
-def test_the_chunk_ops_certify_element_by_element(packed, decay, monkeypatch):
-    """The portable delta rule's chunk ops (`chunk_delta_rule`: the decay's prefix, the chunks' WY
-    inverse and memories, the scan over chunks and the outputs), with a decay a head and with none, over
-    one sequence and packed documents: run one primitive at a time, every element of every operation,
-    each step of the scan included, within its own operation's certified bound (check 2, row 1340). The
-    program certified is the library's own, which every platform runs: without the test lane's wide CPU
-    arithmetic (`precision.WIDE_CPU_ARITHMETIC`, which only makes a CPU's float32 sums check 1's
-    references round once), each of its float32 sums certified as the sum it is."""
-    from dew.nn import precision
-
-    monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "0")
-    def draw(seed):
-        operands, starts, _ = portable_draw(seed, 1, packed)
-        query, key, value, g, beta = operands
-        return query, key, value, g if decay == "gated" else jnp.zeros_like(g), beta, starts
-
-    def rule(query, key, value, g, beta, starts):
-        return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=CHUNK, starts=starts)
-
-    assert_certified(rule, draw, f"the chunk ops, {decay} decay", seeds=CERTIFIED_SEEDS)
-
-
-@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
-def test_the_portable_rule_recomputes_its_memory_where_the_rung_names_it(packed):
-    """Under a remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`,
-    'delta_memory'), the portable rule (`chunk_delta_rule`, a CPU's route) keeps its operands alone and
-    computes its memory again in its backward, as the port and the template drop theirs: its residuals
-    hold fewer bytes than the kept rule's, and its gradients, another program's, are on par with the kept
-    rule's over the draws (check 1), truth the kept rule's in float64."""
-    def loss(*operands, starts=None):
-        out, final = recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
-        return jnp.sum(out ** 2) + jnp.sum(final)
-
-    def recomputed(*operands, starts=None):
-        with recurrence_chunk.recomputing(("delta_memory",)):
-            return loss(*operands, starts=starts)
-
-    operands, starts, _ = portable_draw(7, 2, packed)
-
-    def residual_bytes(fn) -> int:
-        return sum(leaf.nbytes for leaf in jax.tree.leaves(jax.vjp(functools.partial(fn, starts=starts),
-                                                                   *operands)[1]))
-
-    assert residual_bytes(recomputed) < residual_bytes(loss)
-
-    def draw(seed):
-        operands, starts, _ = portable_draw(seed, 2, packed)
-        return (*operands, starts)
-
-    def gradient(fn):
-        return lambda *drawn: jax.grad(functools.partial(fn, starts=drawn[5]), argnums=range(5))(*drawn[:5])
-
-    assert_as_exact(jax.jit(gradient(recomputed)), jax.jit(gradient(loss)), draw, "recomputed memory",
-                    seeds=PORTABLE_SEEDS, truth_fn=gradient(loss))
-
-
 @pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
 def test_the_portable_rule_takes_forward_mode_at_its_public_seam(packed):
-    """`chunk_delta_rule` (a CPU's route, the portable math) under a plain `jax.jvp` and `jax.linearize`,
-    with no forward-mode context: its value and tangents on par with the chunked math's own forward mode
-    over the draws (check 1), truth the math's in float64, and its gradient still its reverse rule's
-    (`_chunk_delta_backward`), finite, the custom VJP's that refused a plain `jax.jvp` before (row 1834)."""
+    """The plain-JAX mainloop (`recurrence_chunk.xla_mainloop`, a CPU's route) under a plain `jax.jvp` and
+    `jax.linearize`, with no forward-mode context: its value and tangents on par with the token recurrence's
+    own forward mode over the draws (check 1, `recurrent_delta_rule` in float64 the truth), and its gradient
+    finite (row 1834: a custom VJP refused a plain `jax.jvp`)."""
     operands, starts, directions = portable_draw(11, 1, packed)
-    rows, _, heads, width = operands[0].shape
 
     def rule(starts):
-        return lambda *operands: recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
+        return lambda *operands: portable_rule(*operands, starts=starts)
 
-    def math(starts):
-        def run(*operands):
-            state, delta = jnp.zeros((rows, heads, width, width), operands[0].dtype), True
-            return recurrence_chunk._chunk_delta_rule(*operands, state, CHUNK, starts, delta, width ** -0.5,
-                                                      jnp.dtype(operands[0].dtype))
-        return run
+    def recurrent(starts):
+        return lambda *operands: recurrence_chunk.recurrent_delta_rule(*operands, starts=starts)
 
     def draw(seed):
         operands, starts, directions = portable_draw(seed, 1, packed)
@@ -671,8 +638,8 @@ def test_the_portable_rule_takes_forward_mode_at_its_public_seam(packed):
             return value, along, jax.linearize(fn(starts), *primal)[1](*tangent)
         return run
 
-    assert_as_exact(jax.jit(forward(rule)), jax.jit(forward(math)), draw, "public seam's forward mode",
-                    seeds=PORTABLE_SEEDS, truth_fn=forward(math))
+    assert_as_exact(jax.jit(forward(rule)), jax.jit(forward(recurrent)), draw, "public seam's forward mode",
+                    seeds=PORTABLE_SEEDS)
     found = jax.jit(lambda *a: jax.jvp(rule(starts), a, directions))(*operands)
     cotangent = jax.tree.map(jnp.ones_like, found[0])
     def scored(*operands):
@@ -682,9 +649,17 @@ def test_the_portable_rule_takes_forward_mode_at_its_public_seam(packed):
     assert all(bool(jnp.all(jnp.isfinite(x))) for x in gradient)
 
 
+def portable_rule(query, key, value, g, beta, *, starts):
+    """`portable_draw`'s operands through the plain-JAX mainloop (a CPU's route), its decay a head."""
+    return recurrence_chunk.xla_mainloop(recurrence_chunk.Tiles(CHUNK), query, key, value, g[..., 0], beta,
+                                         None, starts, scale=key.shape[-1] ** -0.5, delta=True,
+                                         dtype=jnp.float32)
+
+
 @pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
 def test_the_portable_rule_takes_nested_differentiation(packed):
-    """`chunk_delta_rule` under forward over reverse (`jax.jvp` of `jax.grad`), reverse over forward
+    """The plain-JAX mainloop (`portable_rule`) under forward over reverse (`jax.jvp` of `jax.grad`), reverse
+    over forward
     (`jax.grad` of `jax.jvp`) and two forwards (`jax.jvp` of `jax.jvp`), which raised before (rows 1861: its
     saved bool resets took a bool tangent, not float0's; 1862: its pullback gave six cotangents of seven
     operands): each runs and is finite (the public seam's forward mode is the chunked math's by check 1,
@@ -692,7 +667,7 @@ def test_the_portable_rule_takes_nested_differentiation(packed):
     (query, key, value, g, beta), starts, (direction, *_) = portable_draw(13, 1, packed)
 
     def rule(query):
-        return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=CHUNK, starts=starts)
+        return portable_rule(query, key, value, g, beta, starts=starts)
 
     def loss(fn, query):
         out, final = fn(query)
@@ -747,8 +722,8 @@ def test_a_rated_scan_traced_for_a_jvp_on_a_tpu_gives_its_tangent():
 @pytest.mark.parametrize("replicated", [(), (2, 5)], ids=["every operand split", "values and memory whole"])
 @pytest.mark.parametrize("entering", [False, True], ids=["zero memory", "a memory entering"])
 def test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes(entering, replicated):
-    """The portable math's forms derived from the token update behind the switch
-    (`dew.algebra.forms.derived`, `recurrence_chunk.derived_rule`) inside a `shard_map` that checks varying
+    """The portable math's forms derived from the token update (`recurrence_chunk.xla_mainloop`, a CPU's
+    route, named `generation.chosen(gated_delta_rule='xla')`) inside a `shard_map` that checks varying
     axes over operands that vary by row, or with the values and the entering memory whole beside split keys
     and gates, from a zero memory and from one that enters: its carries vary as its operands do, and its
     outputs and gradients are finite."""
@@ -771,7 +746,7 @@ def test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes(entering,
     specs = tuple(P() if index in replicated else rows for index in range(len(operands)))
     mapped = jax.shard_map(rule, mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)), in_specs=specs,
                            out_specs=rows, check_vma=True)
-    with algebra_forms.derived():
+    with generation.chosen(gated_delta_rule='xla'):
         got = jax.jit(jax.value_and_grad(lambda *given: jnp.sum(mapped(*given) * do),
                                          argnums=range(len(operands))))(*operands)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(got))

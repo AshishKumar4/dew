@@ -19,19 +19,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
 import flax.linen as nn
-import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
 from dew import _records
 from dew.batch import Variables
-from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 
 from ..activations import silu
 from ..blocks import Upsample
-from .api import LatentNormalization, ModuleAutoEncoder, published_source
+from .api import LatentNormalization, ModuleAutoEncoder, bound_autoencoder, published_source
 from .kl import posterior_latent
 from .vae import FlaxDownsample2D
 from .wan import WanMidBlock, WanResidualBlock, WanRMSNorm, causal_conv
@@ -367,11 +365,8 @@ def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revisio
     (`dew.interop.weights.record_layouts`)."""
     directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
     model = QwenImageVAE(**qwen_image_vae_fields(config), dtype=compute)
-    frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
-                                 jnp.float32)
-    return bind_component(
-        directory, "vae", config, model, qwen_image_vae_path,
+    return bound_autoencoder(
+        directory, config, model, qwen_image_vae_path,
         lambda bound: QwenImageAutoencoder(model=model, params=bound, latents_mean=config["latents_mean"],
                                            latents_std=config["latents_std"]),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,),
-        shapes=shapes)
+        params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes)

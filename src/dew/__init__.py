@@ -66,6 +66,7 @@ def _parse_absl_flags() -> None:
 _parse_absl_flags()
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew import kernels
     from dew._version import __version__
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset
@@ -74,6 +75,8 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.eval import Mean
     from dew.inference import pipeline
     from dew.inputs import Condition, Field, InputSpec
+    from dew.nn.kernels.generation import GpuFacts, gpu_facts
+    from dew.nn.kernels.options import jit
     from dew.objectives import Objective
     from dew.objectives.base import Aux, EMASpec, Step
     from dew.objectives.supervised import Supervised
@@ -117,6 +120,8 @@ _EXPORTS = {
     "sample": "dew.sampling", "CFG": "dew.sampling",
     "pipeline": "dew.inference",
     "Profiler": "dew.telemetry.profile",
+    "gpu_facts": "dew.nn.kernels.generation", "GpuFacts": "dew.nn.kernels.generation",
+    "kernels": "dew.kernels", "jit": "dew.nn.kernels.options",
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
@@ -141,6 +146,7 @@ __all__ = [
     "EvalSuite",
     "Evaluation",
     "Field",
+    "GpuFacts",
     "ImageGrid",
     "InputSpec",
     "Keep",
@@ -169,6 +175,9 @@ __all__ = [
     "VideoGrid",
     "WandbTracker",
     "__version__",
+    "gpu_facts",
+    "jit",
+    "kernels",
     "pipeline",
     "sample",
 ]

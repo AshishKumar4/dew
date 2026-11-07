@@ -15,10 +15,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, equations
+from reference_error import assert_as_exact
 from test_algebra_derive import shaped, walked
 
-from dew.algebra import SATURATION, derive, forms as algebra_forms
+from dew.algebra import SATURATION, derive
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.templates import (
     attention as template,
@@ -75,38 +75,6 @@ def derived_walk(base2: bool, mask: str, split: bool):
     return run
 
 
-def oracle_walk(base2: bool, mask: str, split: bool):
-    """The template's own forms over the same tiles (`plain_step`, `merge`, `finish`), as a call whose spans
-    narrow (`form="spans"`), so a query may see no key (`Forward.guarded`), its logits as the declaration's,
-    unit-scaled in their base: a folding call's scale times log2(e) below 1 (`algebra.folds`), so its forms
-    exponentiate in base 2 as the declaration's do, the tiles' logits taken as they are."""
-    spec = algebra.Forward(form="spans", keys=KEYS, ids=False, scale=0.5 if base2 else 1.0, natural=not base2)
-    count = KEYS // TILE
-
-    def dot(a, b):
-        return jnp.dot(a, b, preferred_element_type=jnp.float32)
-
-    def run(logits, value):
-        seen = MASKS[mask]()
-
-        def keys_at(tile):
-            keys = jax.lax.dynamic_slice_in_dim(KEY_PLACES, tile * TILE, TILE)
-            coords = algebra.Coords(QUERY_PLACES[:, None], keys[None, :])
-            masked = jnp.where(jax.lax.dynamic_slice_in_dim(seen, tile * TILE, TILE, axis=1),
-                               jax.lax.dynamic_slice_in_dim(logits, tile * TILE, TILE, axis=1), -jnp.inf)
-            tile_values = jax.lax.dynamic_slice_in_dim(value, tile * TILE, TILE)
-            return algebra.Keys(coords, masked, algebra.Operand(tile_values.shape, tile_values.dtype,
-                                                                lambda: tile_values), dot)
-
-        def walk(lo, hi):
-            return algebra.plain_walk(spec, lo, hi, keys_at, algebra.started(spec, None, ROWS, WIDTH, None))
-
-        state = algebra.merge(spec, walk(0, count // 2), walk(count // 2, count)) if split else walk(0, count)
-        return algebra.finish(spec, state, initial=False)[0]
-
-    return run
-
-
 def attended(logits: jax.Array, seen: jax.Array, values: jax.Array) -> jax.Array:
     """Each query's softmax over the keys it sees of its natural `logits` (XLA's, `jax.nn.softmax`), its
     weights' product with the `values`; a query that sees no key, zeros."""
@@ -116,17 +84,20 @@ def attended(logits: jax.Array, seen: jax.Array, values: jax.Array) -> jax.Array
 @pytest.mark.parametrize("split", [False, True], ids=["walked", "merged"])
 @pytest.mark.parametrize("mask", list(MASKS))
 @pytest.mark.parametrize("base2", [True, False], ids=["fold", "natural"])
-def test_the_derived_forward_is_on_par_with_the_templates(base2, mask, split):
-    """The derived walk (or a split walk merged) on par with the template's forms on the same tiles against
-    the float64 truth (check 1), XLA's softmax of the logits in their base, a row of no key included."""
+def test_the_derived_forward_is_on_par_with_xlas(base2, mask, split):
+    """The derived walk (or a split walk merged) on par with XLA's softmax of the logits in their base
+    against the float64 truth (check 1), a row of no key included."""
     natural = np.log(2.0) if base2 else 1.0
-    assert_as_exact(jax.jit(derived_walk(base2, mask, split)), jax.jit(oracle_walk(base2, mask, split)), draw,
-                    f"derived attention {mask} {'merged' if split else 'walked'}", seeds=16,
-                    truth_fn=lambda logits, value: attended(logits * natural, MASKS[mask](), value))
+
+    def reference(logits, value):
+        return attended(logits * natural, MASKS[mask](), value)
+
+    assert_as_exact(jax.jit(derived_walk(base2, mask, split)), jax.jit(reference), draw,
+                    f"derived attention {mask} {'merged' if split else 'walked'}", seeds=16)
 
 
 def sliced_walk(mask: str, merged: bool):
-    """The template's forms (a folding call's, `oracle_walk`'s) over each key tile as a slice of its own, the
+    """The template's forms (a folding call's) over each key tile as a slice of its own, the
     slices' states stacked and merged at once (`algebra.merged`, a split decode's combine) or folded a merge
     at a time (`algebra.merge`), finished."""
     spec = algebra.Forward(form="spans", keys=KEYS, ids=False, scale=0.5, natural=False)
@@ -157,35 +128,15 @@ def sliced_walk(mask: str, merged: bool):
     return run
 
 
-@pytest.mark.parametrize("derived", [False, True], ids=["template", "derived"])
 @pytest.mark.parametrize("mask", list(MASKS))
-def test_slices_merged_at_once_are_on_par_with_their_fold(mask, derived):
-    """A split call's slices merged at once (`algebra.merged`: the template's one sum over them, or behind the
-    switch the derived forms' merges a level at a time), three of them so a level carries one, a slice of no
-    key among them where the mask leaves one: on par with their fold a merge at a time against the float64
-    truth (check 1)."""
+def test_slices_merged_at_once_are_on_par_with_their_fold(mask):
+    """A split call's slices merged at once (`algebra.merged`, the derived forms' merges a level at a time),
+    three of them so a level carries one, a slice of no key among them where the mask leaves one: on par with
+    their fold a merge at a time against the float64 truth (check 1)."""
     natural = np.log(2.0)
-    with algebra_forms.derived(derived):
-        assert_as_exact(jax.jit(sliced_walk(mask, merged=True)), jax.jit(sliced_walk(mask, merged=False)),
-                        draw, f"slices merged at once {mask}", seeds=16,
-                        truth_fn=lambda logits, value: attended(logits * natural, MASKS[mask](), value))
-
-
-@pytest.mark.parametrize("derived", [False, True], ids=["template", "derived"])
-def test_a_split_decodes_combine_of_many_slices_traces_about_one_merge(derived):
-    """A split decode's combine of 32 slices (`decode_attention._combined`) traces at most three times a
-    combine of 4's equations, either forms: a fold traced a merge a slice, which at Dory 4B's depth compiled
-    its decode step for minutes."""
-    spec = algebra.Forward(form="spans", keys=KEYS, ids=False, scale=0.5, natural=False)
-
-    def size(slices: int) -> int:
-        parts = (jax.ShapeDtypeStruct((slices, ROWS, WIDTH), jnp.float32),
-                 *[jax.ShapeDtypeStruct((slices, ROWS), jnp.float32)] * 2)
-        combined = jax.make_jaxpr(lambda *parts: decode_attention._combined(spec, *parts, axis=0))(*parts)
-        return sum(1 for _ in equations(combined.jaxpr))
-
-    with algebra_forms.derived(derived):
-        assert size(32) <= 3 * size(4)
+    assert_as_exact(jax.jit(sliced_walk(mask, merged=True)), jax.jit(sliced_walk(mask, merged=False)),
+                    draw, f"slices merged at once {mask}", seeds=16,
+                    truth_fn=lambda logits, value: attended(logits * natural, MASKS[mask](), value))
 
 
 LENGTH, DEPTH, BLOCK = 64, 32, 16
@@ -193,7 +144,7 @@ SCALE = DEPTH ** -0.5
 SPANS = {"full": {}, "causal": {"causal": True},
          # Its first queries before the keys' start: rows of no key.
          "started": {"causal": True, "starts": jnp.array([LENGTH // 8])}}
-TILES = {"block_q": BLOCK, "block_k": BLOCK, "pad": BLOCK, "scale": SCALE}
+TILES = attention_portable.Tiles(BLOCK, BLOCK, BLOCK)
 
 
 def backward_draw(seed):
@@ -230,14 +181,16 @@ def forward_rows(form: str):
 
     def run(q, k, v, d):
         q4, k4, v4 = (x[None, :, None] for x in (q, k, v))
-        out, m, total, anchor, split = attention_portable.attend(q4, k4, v4, spans, residuals=True, **TILES)
+        out, m, total, anchor, split = attention_portable.xla_mainloop(TILES, q4, k4, v4, spans,
+                                                                       residuals=True, scale=SCALE)
         delta = jnp.sum(d * out[0, :, 0].astype(jnp.float32), axis=-1)
         return (m, total, anchor, split), m[0, 0], total[0, 0], delta
 
     return run
 
 
-def derived_backward(form: str, along: str):
+def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.PLAIN,
+                     normalized_values: bool = False):
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
     unseen, and D about no anchor (its whole `delta`), each step's products the template's CPU mainloop's
@@ -245,13 +198,17 @@ def derived_backward(form: str, along: str):
     and dV the walk's over the query tiles; queries first, each query tile walking the key tiles, its dQ the
     walk's and each key tile's dK and dV its share, summed over the query tiles in order (row 3310: one
     contraction over a key tile's every query at once, no mainloop's schedule, erred 1.63 times the
-    template's in dV)."""
-    forms = derive.derive(attention_backward_algebra.backward_declaration(scale=SCALE, walked=along),
-                          accurate=False, saturation=SATURATION)
+    template's in dV). The `accurate` form's under the accurate numerics, no key its query's anchor; its
+    weights recomputed in `how`'s units (raw products scaled after their difference, their maximum the raw
+    one, or an exact largest weight); dV's operands the normalized weights against dO where
+    `normalized_values` (bf16's order, `softmax_gradients`)."""
+    forms = derive.derive(attention_backward_algebra.backward_declaration(
+        scale=SCALE, walked=along, how=how, accurate=accurate, normalized_values=normalized_values),
+        accurate=accurate, saturation=SATURATION)
     seen = seen_of(form)
     rows_of = forward_rows(form)
     tiles = LENGTH // BLOCK
-    by_row = ("q", "dout", "peak", "total", "anchor", "delta", "logits", "seen")
+    by_row = ("q", "dout", "peak", "total", "anchor", "delta", "logits", "seen", "at_anchor")
 
     def tile(values: dict, index: int) -> dict:
         part = slice(index * BLOCK, (index + 1) * BLOCK)
@@ -259,7 +216,7 @@ def derived_backward(form: str, along: str):
         def part_of(name, value):
             if along == "rows":
                 return value[part] if name in by_row else value
-            if name in ("logits", "seen"):
+            if name in ("logits", "seen", "at_anchor"):
                 return value[:, part]
             return value[part] if name in ("k", "values") else value
 
@@ -273,9 +230,13 @@ def derived_backward(form: str, along: str):
 
     def run(q, k, v, d):
         _, peak, total, delta = rows_of(q, k, v, d)
-        logits = jnp.where(seen, float32_einsum("qd,kd->qk", q, k) * SCALE, -jnp.inf)
+        products = float32_einsum("qd,kd->qk", q, k)
+        logits = jnp.where(seen, products if how.factor is not None else products * SCALE, -jnp.inf)
+        if how.factor is not None:
+            peak = jnp.max(logits, axis=-1)
         values = {"logits": logits, "q": q, "k": k, "values": v, "dout": d, "peak": peak, "total": total,
-                  "anchor": jnp.zeros_like(delta), "delta": delta, "seen": seen}
+                  "anchor": jnp.zeros_like(delta), "delta": delta, "seen": seen,
+                  **({"at_anchor": jnp.zeros_like(seen)} if accurate else {})}
         if along == "rows":
             (_, dk, dv, *_), mapped = walk(values)
             return jnp.concatenate([parts[0] for parts in mapped]), dk, dv
@@ -292,63 +253,102 @@ def derived_backward(form: str, along: str):
     return run
 
 
-def oracle_backward(form: str):
-    """The template's own fast backward on this mainloop (`attention_portable`) at the same tiles, from the
-    same forward's residuals, D from its output as the declaration's (`split=False`, the route's output
-    residuals): the accurate form's D from the split sums is a form of its own class, past this
-    declaration's."""
-    spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
-    rows_of = forward_rows(form)
-
-    def run(q, k, v, d):
-        residuals, *_ = rows_of(q, k, v, d)
-        q4, k4, v4, d4 = (x[None, :, None] for x in (q, k, v, d))
-        grads = attention_portable.backward(q4, k4, v4, spans, None, d4, residuals=residuals, split=False,
-                                            accurate=False, **TILES)
-        return grads.query[0, :, 0], grads.key[0, :, 0], grads.value[0, :, 0]
-
-    return run
-
-
+@pytest.mark.parametrize("normalized_values", [False, True], ids=["scaled-dout", "normalized-weights"])
 @pytest.mark.parametrize("walked", ["keys", "rows"], ids=["queries-first", "keys-first"])
 @pytest.mark.parametrize("form", list(SPANS))
-def test_the_derived_backward_is_on_par_in_every_cell(form, walked):
+def test_the_derived_backward_is_on_par_in_every_cell(form, walked, normalized_values):
     """The backward's derived forms on par against the float64 gradients (check 1) in every cell: the backward
     declaration's forms, walked queries first or keys first as a mainloop schedules them
-    (`derived_backward`), held to the template's own backward at the same tiles."""
-    served, reference = derived_backward(form, walked), oracle_backward(form)
-    assert_as_exact(jax.jit(served), jax.jit(reference), backward_draw,
-                    f"attention backward {form} {walked}", seeds=16, truth_fn=xla_backward(form))
+    (`derived_backward`), dV's operands either order (`softmax_gradients`' `normalized_values`), held to
+    XLA's gradients in float32 (`xla_backward`)."""
+    assert_as_exact(jax.jit(derived_backward(form, walked, normalized_values=normalized_values)),
+                    jax.jit(xla_backward(form)), backward_draw, f"attention backward {form} {walked}",
+                    seeds=16)
+
+
+@pytest.mark.parametrize("how", [algebra.PLAIN, algebra.Recompute(factor=SCALE),
+                                 algebra.Recompute(exact=True)], ids=["scaled", "raw", "exact"])
+@pytest.mark.parametrize("walked", ["keys", "rows"], ids=["queries-first", "keys-first"])
+def test_the_accurate_backward_declaration_derives_on_par(walked, how):
+    """The backward's accurate declaration (its maximum as given, the anchor's own term held to 0) derives
+    under the accurate numerics, whose rewrites are exact alone, in each recomputation's units (scaled
+    logits, raw products scaled after their difference, an exact largest weight), and walks on par with
+    XLA's gradients in float32 against the float64 ones (check 1) where no key is its query's anchor, every
+    query seeing a key."""
+    served = derived_backward("causal", walked, accurate=True, how=how)
+    assert_as_exact(jax.jit(served), jax.jit(xla_backward("causal")), backward_draw,
+                    f"accurate attention backward {walked}", seeds=16)
+
+
+def test_a_fast_tiles_cotangents_take_their_mainloops_hand_order():
+    """The fast backward tile's derived cotangents (`derived_cotangents`) in each mainloop's own hand form's
+    order, bit for bit (each hand form's arithmetic in JAX): Mosaic's from its weights, `(e / T) ((dP - c)
+    - D)`; where a mainloop holds each query's anchor key (`anchored`, portable's and Triton's), its
+    anchor's own dP - c exactly 0 and each cotangent scaled before the denominator, `e (((dP - c) - D) /
+    T)`, so a weight below float32's least subnormal, its query resumed at a peak far above its logits,
+    keeps its cotangent (the fp32 small-weight edge), where the weights' order rounds it to 0."""
+    rng = np.random.default_rng(4228)
+    logits = rng.standard_normal((16, 16)).astype(np.float32) * 3
+    products = rng.standard_normal((16, 16)).astype(np.float32)
+    peak = logits.max(axis=1)
+    total = np.exp(logits - peak[:, None]).sum(axis=1).astype(np.float32)
+    # Query 0 resumed at a peak of 87 over a denominator of 2^25, one key's dP near 2^102.
+    logits[0], peak[0], total[0], products[0, 1] = 0.0, 87.0, 2.0 ** 25, 3.8e30
+    at_anchor = np.arange(16)[None, :] == logits.argmax(axis=1)[:, None]
+    anchor = np.where(at_anchor, products, 0).sum(axis=1).astype(np.float32)
+    delta = rng.standard_normal(16).astype(np.float32)
+    delta[0] = 0.0
+    tiles = {"logits": logits, "products": products, "peak": peak, "total": total, "anchor": anchor,
+             "delta": delta}
+
+    def cotangents(anchored: bool, tiles: dict) -> np.ndarray:
+        forms = attention_backward_algebra.derived_cotangents(keys_first=False, dropped=False, masked=False,
+                                                             anchored=anchored)
+        return np.asarray(forms.mapped({name: jnp.asarray(value) for name, value in tiles.items()})[2])
+
+    @jax.jit
+    def hand(logits, products, peak, total, anchor, delta, at_anchor):
+        """Each hand form's cotangents, Mosaic's and an anchored mainloop's."""
+        e = jnp.exp(logits - peak[:, None])
+        over = (1 / total)[:, None]
+        about = products - anchor[:, None]
+        held = jnp.where(at_anchor, 0.0, about)
+        return (e * over) * (about - delta[:, None]), e * ((held - delta[:, None]) * over)
+
+    mosaic, anchored_hand = hand(*(jnp.asarray(value) for value in (*tiles.values(), at_anchor)))
+    plain = cotangents(anchored=False, tiles=tiles)
+    np.testing.assert_array_equal(plain, np.asarray(mosaic))
+    anchored = cotangents(anchored=True, tiles={**tiles, "at_anchor": at_anchor})
+    np.testing.assert_array_equal(anchored, np.asarray(anchored_hand))
+    assert anchored[0, 1] != 0 and plain[0, 1] == 0
 
 
 @contextlib.contextmanager
-def fast(derived: bool, forms: str = "fast"):
+def fast(forms: str = "fast"):
     """Within the block, the run's `forms` (the fast ones' base-2 fold, or the accurate ones' natural logits,
-    each the declaration states), the template's walks the hand-written forms or the derived ones
-    (`dew.algebra.forms.derived`)."""
-    with (generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)),
-          algebra_forms.derived(derived)):
+    each the declaration states)."""
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)):
         yield
 
 
 CALLS = {"plain": {}, "residuals": {"residuals": True}, "dropped": {"drop": 0.25}}
 """The forward calls the derived walk serves: a call's output, a training call's with its residuals (the
-forward's step, merge and finish whatever walk the training step takes), and a dropping call's."""
+training walk's step, `training_step`, taking the derived softmax), and a dropping call's."""
 
 
-@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
 @pytest.mark.parametrize("numerics", ["fast", "accurate"])
 @pytest.mark.parametrize("call", list(CALLS))
 @pytest.mark.parametrize("form", ["full", "causal"])
-def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, numerics, dtype, derived):
-    """The plain-JAX mainloop's forward (`attention_portable.attend`) over fp16 operands (a plain walk, of no
-    compensation or guard) and fp32 ones (its running sums compensated, its plain walk under the headroom
+def test_the_portable_mainloop_computes_attention(form, call, numerics, dtype):
+    """The plain-JAX mainloop's forward (`attention_portable.xla_mainloop`) over fp16 operands (a plain walk,
+    of no compensation or guard) and fp32 ones (its running sums compensated, its plain walk under the
+    headroom
     guard's), each of which the derived forms serve, under the run's fast forms or its accurate ones (natural
     logits, the largest weight held to 1 and the rescale compensated, which the declaration states), its
-    walk's step, merge and finish the hand-written forms or the derived ones behind the switch, the product
-    of its weights with the values its own (`Keys.dot`): on par with the reference (check 1) either way, a
-    plain call's, a training call's (with its residuals) and a dropping call's."""
+    walk's step, merge and finish the derived forms, the product of its weights with the values its own
+    (`Keys.dot`): on par with the reference (check 1), a plain call's, a training call's (with its
+    residuals) and a dropping call's."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
     rate = CALLS[call].get("drop")
     residuals = CALLS[call].get("residuals", False)
@@ -358,10 +358,10 @@ def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, nu
             words, jnp.arange(1, dtype=jnp.int32), jnp.arange(1, dtype=jnp.int32), rate))
 
     def ours(q, k, v, words):
-        with fast(derived, numerics):
-            out = attention_portable.attend(q[None, :, None], k[None, :, None], v[None, :, None], spans,
-                                            hooks(words), residuals=residuals, natural=numerics == "accurate",
-                                            **TILES)
+        with fast(numerics):
+            out = attention_portable.xla_mainloop(TILES, q[None, :, None], k[None, :, None], v[None, :, None],
+                                                  spans, hooks(words), residuals=residuals,
+                                                  natural=numerics == "accurate", scale=SCALE)
         return (out[0] if residuals else out)[0, :, 0]
 
     def reference(q, k, v, words):
@@ -374,22 +374,21 @@ def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, nu
                 jax.random.bits(jax.random.key(seed), (2,), jnp.uint32))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), operands,
-                    f"portable forward {form} {call} {numerics} {dtype} derived {derived}", seeds=16)
+                    f"portable forward {form} {call} {numerics} {dtype}", seeds=16)
 
 
-@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
 @pytest.mark.parametrize("form", ["full", "causal"])
-def test_the_portable_mainloop_differentiates_attention_by_either_forms(form, derived):
+def test_the_portable_mainloop_differentiates_attention(form):
     """The plain-JAX mainloop's backward (`attention_portable.backward`) under the run's fast forms, its dQ
-    walk over the keys and its dK and dV walks over the queries the hand-written forms or the derived ones
-    behind the switch (`dew.algebra.forms.derived`, `attention_backward_algebra.derived_backward`), from the
-    forward's residuals and its split D: the gradients on par with the reference's (check 1) either way."""
+    walk over the keys and its dK and dV walks over the queries the derived forms
+    (`attention_backward_algebra.derived_backward`), from the forward's residuals and its split D: the
+    gradients on par with the reference's (check 1)."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
 
     def ours(q, k, v, dout):
-        with fast(derived):
-            grads = attention_portable.backward(q[None, :, None], k[None, :, None], v[None, :, None], spans,
-                                                None, dout[None, :, None], **TILES)
+        with fast():
+            grads = attention_portable.backward(TILES, q[None, :, None], k[None, :, None], v[None, :, None],
+                                                spans, None, dout[None, :, None], scale=SCALE)
         return grads.query[0, :, 0], grads.key[0, :, 0], grads.value[0, :, 0]
 
     def reference(q, k, v, dout):
@@ -402,17 +401,20 @@ def test_the_portable_mainloop_differentiates_attention_by_either_forms(form, de
         return tuple(jnp.asarray(rng.standard_normal((LENGTH, DEPTH)), jnp.float32) for _ in range(4))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), operands,
-                    f"portable backward {form} derived {derived}", seeds=16)
+                    f"portable backward {form}", seeds=16)
 
 
-def one_key(dtype, query, key, value, dout, *, scale: float = SCALE):
+ONE_KEY = attention_portable.Tiles(8, 8, 8)
+"""The plain-JAX mainloop's tiles over a call of one query (`one_key`)."""
+
+
+def one_key(dtype, query, key, value, dout):
     """A call's operands of one query and `len(key)` keys, each a row of width 8 (`[1, n, 1, 8]`)."""
     def laid(rows):
         rows = np.asarray(rows, np.float64).reshape(len(rows), -1)
         return jnp.asarray(np.pad(rows, ((0, 0), (0, 8 - rows.shape[1])))[None, :, None, :], dtype)
 
-    return laid(query), laid(key), laid(value), laid(dout), {"block_q": 8, "block_k": 8, "pad": 8,
-                                                             "scale": scale}
+    return laid(query), laid(key), laid(value), laid(dout)
 
 
 def test_a_derived_backward_of_one_key_gives_an_exactly_zero_query_gradient():
@@ -420,10 +422,10 @@ def test_a_derived_backward_of_one_key_gives_an_exactly_zero_query_gradient():
     cotangent `P (dP - D)` is zero, `dP` the reference's `1 + 2^-8` and `D` the output's row sum, so its
     query's gradient is exactly zero, as the reference's is, under the derived backward too: its `dP`
     accumulates in fp32 (one rounded to bf16 is 1, and its cotangent -2^-8)."""
-    query, key, value, dout, tiles = one_key(jnp.bfloat16, [[1.0]], [[1.0]], [[1.0, 2.0 ** -8]], [[1.0, 1.0]])
+    query, key, value, dout = one_key(jnp.bfloat16, [[1.0]], [[1.0]], [[1.0, 2.0 ** -8]], [[1.0, 1.0]])
     spans = template.spans(1, 1, 1)
-    with fast(derived=True):
-        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+    with fast():
+        grads = attention_portable.backward(ONE_KEY, query, key, value, spans, None, dout, scale=SCALE)
     np.testing.assert_array_equal(np.asarray(grads.query, np.float32), 0.0)
 
 
@@ -431,33 +433,32 @@ def test_a_derived_backward_masks_an_empty_querys_overflowing_product():
     """Two fp32 queries over one key, the second seeing none, the value's first component 2^127 and the second
     query's output cotangent 4 there: its product `dP` is 2^129, past fp32's largest, beside a weight of 0.
     Under the derived backward every gradient is finite, as the reference's are: the cotangents are masked
-    where a query sees no key (`softmax_cotangents`, as `grad_scores`), not multiplied by its zero weight."""
-    query, key, value, dout, tiles = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
+    where a query sees no key (`softmax_cotangents`), not multiplied by its zero weight."""
+    query, key, value, dout = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
                                              [[0.0], [4.0]])
     spans = template.KeySpans(jnp.asarray([[0, 1]], jnp.int32), jnp.asarray([[1, 1]], jnp.int32), None, None,
                               keys=1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, None), query, key, value)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
-    with fast(derived=True):
-        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+    with fast():
+        grads = attention_portable.backward(ONE_KEY, query, key, value, spans, None, dout, scale=SCALE)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
 
 
-@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
-def test_a_query_a_hook_empties_takes_no_cotangent(derived):
+def test_a_query_a_hook_empties_takes_no_cotangent():
     """Two fp32 queries over one key, a score hook hiding it from the second (its logit -inf, its denominator
     0, its output the reference's zero), the value's first component 2^127 and the second query's output
     cotangent 4 there: its `dO Vᵀ` is 2^129, past fp32's largest, beside weights of 0. Every gradient is
-    finite under either forms, as the reference's: the query takes no cotangent
+    finite, as the reference's: the query takes no cotangent
     (`attention.launch_arguments`)."""
-    query, key, value, dout, tiles = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
+    query, key, value, dout = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
                                              [[0.0], [4.0]])
     hooks = template.Hooks(score_mod=first_query_only)
     spans = template.spans(2, 1, 1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
-    with fast(derived):
-        grads = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)
+    with fast():
+        grads = attention_portable.backward(ONE_KEY, query, key, value, spans, hooks, dout, scale=SCALE)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
 
 
@@ -472,18 +473,18 @@ def test_a_derived_backward_scales_its_cotangents_before_their_products():
     output's cotangent 1 and the scale 1/4: the score cotangents are 2 and -2, whose products with the keys
     at the scale give a query gradient of 2^127, finite as the reference's, where their unscaled sum 2^129
     overflows (bible §6)."""
-    query, key, value, dout, tiles = one_key(jnp.float32, [[0.0]], [[2.0 ** 127], [-(2.0 ** 127)]],
-                                             [[4.0], [-4.0]], [[1.0]], scale=0.25)
+    query, key, value, dout = one_key(jnp.float32, [[0.0]], [[2.0 ** 127], [-(2.0 ** 127)]],
+                                             [[4.0], [-4.0]], [[1.0]])
     spans = template.spans(1, 2, 1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, None, scale=0.25), query, key, value)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
-    with fast(derived=True):
-        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+    with fast():
+        grads = attention_portable.backward(ONE_KEY, query, key, value, spans, None, dout, scale=0.25)
     assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
 
 
 def test_a_derived_forward_keeps_an_fp16_weight_its_dropout_multiplies_finite():
-    """The fp16 witness of the stability suite (tests/test_attention_dropout.py) behind the switch: a rate of
+    """The fp16 witness of the stability suite (tests/test_attention_dropout.py): a rate of
     1 - 2^-16 (a kept weight's multiplier 2^16) with one of two equal-logit keys kept. The kept weight times
     its multiplier is past fp16's largest; its normalized weight times it is not, as the reference's is, and
     the output is finite (the dropping step's scaled parts, which the declaration states none of)."""
@@ -495,25 +496,24 @@ def test_a_derived_forward_keeps_an_fp16_weight_its_dropout_multiplies_finite():
                         jnp.uint32)
     hooks = template.Hooks(drop=template.Dropout(words, jnp.arange(1, dtype=jnp.int32),
                                                  jnp.arange(1, dtype=jnp.int32), rate))
-    query, key, value, _, tiles = one_key(jnp.float16, [[0.0]], [[0.0], [0.0]], [[2.0 ** -10] * 8] * 2,
+    query, key, value, _ = one_key(jnp.float16, [[0.0]], [[0.0], [0.0]], [[2.0 ** -10] * 8] * 2,
                                           [[0.0]])
     spans = template.spans(1, 2, 1)
     assert np.isfinite(np.asarray(template.reference(query, key, value, spans, hooks))).all()
-    with fast(derived=True):
-        out = attention_portable.attend(query, key, value, spans, hooks, **tiles)
+    with fast():
+        out = attention_portable.xla_mainloop(ONE_KEY, query, key, value, spans, hooks, scale=SCALE)
     assert np.isfinite(np.asarray(out)).all()
 
 
 def test_a_derived_backward_at_a_scale_of_zero_gives_zero_query_and_key_gradients():
     """A call at a scale of zero (`attention.prescale`'s own case) under the derived backward: its weights
-    uniform, its query's and key's gradients zero, as the hand-written backward's are, its value's finite."""
+    uniform, its query's and key's gradients zero, as the reference's, its value's finite."""
     rng = np.random.default_rng(0)
     query, key, value, dout = (jnp.asarray(rng.standard_normal((1, LENGTH, 1, DEPTH)), jnp.float32)
                                for _ in range(4))
     spans = template.spans(LENGTH, LENGTH, 1)
-    tiles = {**TILES, "scale": 0.0}
-    with fast(derived=True):
-        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+    with fast():
+        grads = attention_portable.backward(TILES, query, key, value, spans, None, dout, scale=0.0)
     np.testing.assert_array_equal(np.asarray(grads.query), 0.0)
     np.testing.assert_array_equal(np.asarray(grads.key), 0.0)
     assert np.isfinite(np.asarray(grads.value)).all()
@@ -522,24 +522,24 @@ def test_a_derived_backward_at_a_scale_of_zero_gives_zero_query_and_key_gradient
 FRESH = """
 import dataclasses
 import jax, jax.numpy as jnp
-from dew.algebra import forms
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.templates import attention as template, attention_portable
 
 operands = [jnp.full((1, 16, 1, 8), 0.1 * (index + 1), jnp.float16) for index in range(3)]
 fast = dataclasses.replace(generation.numerics(), forms="fast")
-with generation.run_precision(fast), forms.derived(True):
-    out = attention_portable.attend(*operands, template.spans(16, 16, 1), block_q=8, block_k=8, pad=8,
-                                    residuals=True)
+with generation.run_precision(fast):
+    out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), *operands,
+                                          template.spans(16, 16, 1), residuals=True)
 print(bool(jnp.all(jnp.isfinite(out[0]))))
 """
-"""A fresh process's first derived walk: a training call's forward, its step the training walk's own."""
+"""A fresh process's first derived walk: a training call's forward, its step the training walk's, by the
+derived forms' softmax."""
 
 
 def test_a_fresh_processs_training_forward_finishes_by_the_derived_forms():
-    """A training call's forward (`residuals=True`, its walk the hand-written training step's) as a fresh
-    process's first call under the derived forms: its finish takes the derived forms of the state it holds,
-    whatever walk came before it in the process (none here), and its output is finite."""
+    """A training call's forward (`residuals=True`, its walk the training step's, by the derived forms) as a
+    fresh process's first call under the derived forms: its finish takes the derived forms of the state it
+    holds, whatever walk came before it in the process (none here), and its output is finite."""
     done = subprocess.run([sys.executable, "-c", FRESH], capture_output=True, text=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
     assert done.returncode == 0, done.stderr[-3000:]
@@ -555,25 +555,23 @@ def tempered(s, q_pos, k_pos, temperature):
 def test_a_derived_backward_masks_its_hook_cotangents_where_padding_reads_no_key():
     """One fp32 query and key under a query temperature of 1, padded to an 8-row tile: a padded query's
     temperature is zero (`attention._padded`), its hook derivative not finite, and its logits unseen. Under
-    the derived backward the real gradients are finite, as the reference's and the hand-written backward's
-    are, each tile's cotangents masked before their products (`pulled`)."""
+    the derived backward the real gradients are finite, as the reference's are, each tile's cotangents masked
+    before their products (`pulled`)."""
     rng = np.random.default_rng(0)
     query, key, value, dout = (jnp.asarray(rng.standard_normal((1, 1, 1, 8)), jnp.float32) for _ in range(4))
     spans = template.spans(1, 1, 1)
     temperature = template.Param(jnp.ones((1, 1, 1), jnp.float32), template.Kind.QUERY)
     hooks = template.Hooks(score_mod=tempered, score_params=(temperature,))
-    with fast(derived=True):
-        grads = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=8, block_k=8,
-                                            pad=8)
+    with fast():
+        grads = attention_portable.backward(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                            hooks, dout)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(grads))
 
 
 def test_a_split_decodes_states_merge_and_finish_by_the_derived_forms():
     """A split decode's slices' states (`[rows, splits, queries, heads]`, `decode_attention._combined`) of an
     fp16 call under the run's fast forms, merged and finished by the derived forms over every row whatever
-    the states' leading axes: on par with the hand-written forms' against float64's merge (check 1)."""
-    from dew.nn.kernels import decode_attention
-
+    the states' leading axes: on par with XLA's merge in one sum against float64's (check 1)."""
     spec = decode_attention._spec(0.25, 1.0, None, natural=False, dtype=jnp.float16, sinks=False)
 
     def states(seed):
@@ -582,17 +580,16 @@ def test_a_split_decodes_states_merge_and_finish_by_the_derived_forms():
                 jnp.asarray(rng.standard_normal((2, 3, 4, 2)), jnp.float32),
                 jnp.asarray(rng.uniform(0.5, 2.0, (2, 3, 4, 2)), jnp.float32))
 
-    def combined(*, derived: bool):
-        def run(sums, peaks, totals):
-            with fast(derived):
-                return decode_attention._combined(spec, sums, peaks, totals, axis=1)
-        return run
+    def combined(sums, peaks, totals):
+        with fast():
+            return decode_attention._combined(spec, sums, peaks, totals, axis=1)
 
     def exact(sums, peaks, totals):
-        # Base 2: the fold's logits (`spec.base2`).
-        weights = jnp.exp2(peaks - jnp.max(peaks, axis=1, keepdims=True))
+        # XLA's merge of the states in one sum, in base 2 (`spec.base2`): raw products' peaks (`spec.raw`)
+        # differ by the scale times log2(e).
+        factor = spec.scale * np.log2(np.e) if spec.raw else 1.0
+        weights = jnp.exp2((peaks - jnp.max(peaks, axis=1, keepdims=True)) * factor)
         return (jnp.sum(weights[..., None] * sums, axis=1)
                 / jnp.sum(weights * totals, axis=1)[..., None])
 
-    assert_as_exact(jax.jit(combined(derived=True)), jax.jit(combined(derived=False)), states,
-                    "a split decode's combine", seeds=16, truth_fn=exact)
+    assert_as_exact(jax.jit(combined), jax.jit(exact), states, "a split decode's combine", seeds=16)

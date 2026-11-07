@@ -36,15 +36,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from delta_rule_support import fused_step, recurrence, through
+from entered_support import LAYOUTS, assert_entered_as_own_rows
 from flax import linen as nn
 from model_support import as_stepped, decode_through, float64_twin
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 
+from dew.algebra.scan import _decays_of
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.kernels import recurrence as kernel, tuning
-from dew.nn.kernels.recurrence_algebra import decays, factor
-from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
+from dew.nn.kernels import recurrence as kernel
+from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Tiles, chunk_gated_delta_rule, fla_rule, xla_mainloop
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
@@ -116,11 +117,14 @@ def test_the_chunked_rule_matches_the_reference(reference):
     assert_matches((out, state), reference, "chunk")
 
 
-def portable(query, key, value, g, beta, state=None):
-    """The gated rule on the portable math (`chunk_delta_rule`), the port of
-    `torch_chunk_gated_delta_rule` a GPU does not run: it runs fla's kernels,
-    held to fla's numbers (tests/test_fla_gdn.py)."""
-    return chunk_delta_rule(query, key, value, g[..., None], beta, state)
+def portable(query, key, value, g, beta, state=None, starts=None, chunk: int = CHUNK_SIZE):
+    """The gated rule on the portable math (`recurrence_chunk.xla_mainloop`), the port of
+    `torch_chunk_gated_delta_rule` a GPU does not run: it runs fla's kernels, held to fla's numbers
+    (tests/test_fla_gdn.py). A decay a key dimension's `[..., K]`, a head's as given."""
+    if g.ndim == 4 and g.shape[-1] == 1:
+        g = g[..., 0]
+    return xla_mainloop(Tiles(chunk), query, key, value, g, beta, state, starts, scale=key.shape[-1] ** -0.5,
+                        delta=True, dtype=jnp.float32)
 
 
 CHUNKED_SEEDS = 16
@@ -240,10 +244,10 @@ def the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, stron
         return q, k, v, g, beta, h0, do, dht
 
     def packed(*args):
-        return chunk_delta_rule(*args, chunk, starts=jnp.asarray(starts))
+        return portable(*args, starts=jnp.asarray(starts), chunk=chunk)
 
     def chunked(*args):
-        return chunk_delta_rule(*args, chunk)
+        return portable(*args, chunk=chunk)
 
     def evaluated(rule, *inputs):
         with jax.default_matmul_precision("highest"):
@@ -770,16 +774,10 @@ def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
                     truth_fn=truth)
 
 
-@pytest.mark.parametrize("chunk", [4, 16, 64])
-def test_the_chunk_inverse_is_exact_where_its_series_cancels(chunk):
-    """Every key the same and beta one make A every -1 below the diagonal:
-    (I - A)^-1 is I minus the subdiagonal, entries of at most 1, while the
-    series' powers of A grow as binomials (to 1.8e17 at 64), which summed
-    in fp32 left Qwen3.5-0.8B's fifth delta-rule layer 1e24 off on a
-    256-token prompt and its logits NaN."""
-    a = -jnp.tril(jnp.ones((2, chunk, chunk), jnp.float32), -1)
-    want = np.eye(chunk) - np.eye(chunk, k=-1)
-    np.testing.assert_allclose(factor(a), np.broadcast_to(want, a.shape), atol=1e-6)
+def between(g):
+    """Each chunk's pairwise decays `[..., C, C, K]` of its log decays `g` `[..., C, K]`, `exp(G_s - G_t)` on
+    and below the diagonal: the derived forms' (`dew.algebra.scan`'s `_Decays.between`), a chunk at a time."""
+    return jax.vmap(lambda chunk: _decays_of(chunk, base2=False).between)(g)
 
 
 def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
@@ -792,7 +790,7 @@ def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
     ~128 u on a decay between neighbours, which the KDA gradient amplified
     to twice the reference's distance from float64 (tests/test_kimi_linear.py)."""
     g = np.random.default_rng(7).uniform(-3, -1, (2, 64, 4)).astype(np.float32)
-    _, decay = decays(jnp.asarray(g))
+    decay = between(jnp.asarray(g))
     wide = np.asarray(g, np.float64)
     rows, cols = np.tril_indices(64)
     ranges = [wide[:, c + 1:r + 1] for r, c in zip(rows, cols, strict=True)]
@@ -820,19 +818,19 @@ def test_the_decay_gradient_sums_only_the_pairs_spanning_each_position():
     cotangent = rng.standard_normal((2, 64, 64, 4)).astype(np.float32)
 
     def gradient(g, cotangent):
-        _, pull = jax.vjp(lambda g: decays(g)[1], g)
+        _, pull = jax.vjp(between, g)
         return pull(cotangent)[0]
 
     got = np.asarray(gradient(jnp.asarray(g), jnp.asarray(cotangent)), np.float64)
     with jax.enable_x64(new_val=True):
         wide = widened((g, cotangent))
         want = np.asarray(gradient(*wide))
-        weighed = np.abs(np.asarray(wide[1] * decays(wide[0])[1]))
+        weighed = np.abs(np.asarray(wide[1] * between(wide[0])))
     spans = np.array([weighed[:, i:, :i].sum((1, 2)) for i in range(64)]).transpose(1, 0, 2)
     bound = 2 * 64 * (np.finfo(np.float32).eps / 2) * spans
     assert np.all(np.abs(got - want) <= bound), float(np.max(np.abs(got - want) / np.maximum(bound, 1e-30)))
     tangent = rng.standard_normal(g.shape).astype(np.float32)
-    _, forward = jax.jvp(lambda g: decays(g)[1], (jnp.asarray(g),), (jnp.asarray(tangent),))
+    _, forward = jax.jvp(between, (jnp.asarray(g),), (jnp.asarray(tangent),))
     paired = float(jnp.vdot(forward, cotangent))
     np.testing.assert_allclose(paired, float(np.vdot(tangent, got)), rtol=1e-5)
 
@@ -872,7 +870,8 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
 
     from dew.nn.linear import decode_gated_delta_rule
 
-    rows, H, D = 4, 4, 32
+    # A model's 128 keys and values a head, as the template's step takes them (a thread a value column).
+    rows, H, D = 4, 4, 128
     active = jnp.asarray([True, False, True, False])
 
     def draw(seed):
@@ -919,7 +918,7 @@ def test_the_decode_step_keeps_the_kernel_contract_on_a_mesh_for_each_decay(form
 
     from dew.nn.linear import stepped_per_shard
 
-    rows, heads, groups, width = 4, 4, 2, 32
+    rows, heads, groups, width = 4, 4, 2, 128
     keyed = form == "a decay a key dimension"
     hooks = KEYED if keyed else RATED
     active = jnp.asarray([True, False, True, False])
@@ -1003,7 +1002,7 @@ def test_a_cached_layer_traced_for_a_jvp_decodes_its_token(staged):
     `generation.linear_tangent`), which the in-place launch does not give (row 2395)."""
     from dew.nn.kernels.generation import assumed
 
-    layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
+    layer, variables, cache, token = fused_case(4, 128, 2, jnp.float32, jnp.float32)
 
     def step(token):
         return layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True), mutable=["cache"])[0]
@@ -1018,7 +1017,7 @@ def test_the_fused_decode_step_leaves_an_idle_row_alone():
     """A row the fused step marks idle: its history and state as they were, bitwise, and its output
     zeros, beside an active row that moves."""
 
-    layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
+    layer, variables, cache, token = fused_case(4, 128, 2, jnp.float32, jnp.float32)
     operands = fused_inputs(layer, variables, cache, token)
     out, history, state = jax.jit(functools.partial(
         fused_step, epsilon=layer.norm_eps, activation=layer.gate_activation,
@@ -1044,7 +1043,7 @@ def test_the_fused_decode_step_computes_the_layers_token(held):
     read in fp32, its state against the unfused token's written back `held`; its history bit for bit the
     unfused token's, and its state's dtype the one it holds. A GPU's widths are its flow's
     (tests/test_gpu_recurrence.py)."""
-    heads, width, rows = 4, 32, 3
+    heads, width, rows = 4, 128, 3
     layer = fused_case(heads, width, rows, jnp.float32, held)[0]
     wide = layer.clone(dtype=jnp.float64)
     step = MixerCall(decode=True)
@@ -1082,7 +1081,7 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     step needs before the first token."""
     from dew.nn.kernels.generation import assumed, chosen
 
-    module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
+    module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=128, head_v_dim=128,
                            dtype=jnp.bfloat16)
     x = jnp.zeros((2, 1, 64), jnp.bfloat16)
     unfused = jax.eval_shape(lambda: nn.unbox(module.init(jax.random.key(0), x, MixerCall(decode=True))))
@@ -1094,18 +1093,16 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     assert described(fused) == described(unfused)
 
 
-@pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
-def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(target):
-    """The fused decode step at Qwen3.5-0.8B's widths (16 value heads over 16 key heads of 128, a
-    conv of 4 taps over an fp32 history, a bf16 state) and at Qwen3.5-9B's value heads over half as
-    many key heads, at every config of its space, lowered for each GPU on this CPU and compiled by
-    Triton within its block's shared memory."""
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+def test_the_fused_step_compiles_within_each_gpus_resources(target):
+    """The fused decode step, the recurrence template's step on Mosaic GPU, at Qwen3.5-0.8B's widths (16
+    value heads over 16 key heads of 128, a conv of 4 taps over an fp32 history, a bf16 state) and at
+    Qwen3.5-9B's value heads over half as many key heads, lowered for each GPU on this CPU and compiled by
+    its compiler spill-free within its block (`kernel_compile.mosaic_failures`)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_kernels, failures
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    from dew.nn.kernels.recurrence import Launch, StepLaunch
-
-    def case(key_heads, value_heads, warps):
+    def case(key_heads, value_heads):
         rows, width = 8, 128
         channels = (2 * key_heads + value_heads) * width
         specs = (jax.ShapeDtypeStruct((rows, channels), jnp.bfloat16),
@@ -1118,15 +1115,22 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
                  jax.ShapeDtypeStruct((rows, value_heads, width, width), jnp.bfloat16))
 
         def run(*operands):
-            with tuning.pinned({StepLaunch: Launch(0, warps)}):
-                return fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
+            return fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
         return run, specs
 
-    cases = [KernelCase(f"fused/{key}x{value}/warps{warps}",
-                        lambda key=key, value=value, warps=warps: case(key, value, warps))
-             for key, value in ((16, 16), (16, 32)) for warps in (4, 8, 16)]
-    found = compile_kernels(cases, target)
-    assert len(found) == len(cases)
-    assert not failures(found), "\n".join(failures(found))
+    cases = [KernelCase(f"fused/{key}x{value}", lambda key=key, value=value: case(key, value))
+             for key, value in ((16, 16), (16, 32))]
+    found = compile_mosaic_kernels(cases, target)
+    assert found and not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_documents_that_enter_another_read_its_memory_and_history_as_their_own_rows_do(reference, geometry,
+                                                                                        layout):
+    """A row of shared parts and the documents that enter them (`dew.batch.Entered`, the questions of rows
+    over one state) gives each document's tokens, and the gradients through them, what its own row of the
+    part it enters and itself gives, over drawn inputs (check 1): the conv reads the entered part's last
+    tokens and the recurrence starts from its final memory (`entered_scan`), documents numbered out of
+    their order in the row and one token each among them (row 1506)."""
+    assert_entered_as_own_rows(layer(geometry), layer_params(reference), geometry["hidden_size"], layout,
+                               "gated delta net")

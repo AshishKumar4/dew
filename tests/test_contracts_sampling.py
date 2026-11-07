@@ -45,9 +45,10 @@ def test_a_transitions_quadratic_term_holds_every_order(edge):
     """`flow._half_mahalanobis` (a custom JVP whose tangent is the plain formula's, scaled to range): every
     order finite wherever float64 is a normal float32, past where the plain formula overflows, at values,
     means and variances near float32's ends, a value equal to its mean among them (ledger 2383); there,
-    at zero, at one and near float32's least normal, under tangents of their own scales, the second
-    forward derivative and the gradient's forward derivative are the plain formula's, |t|**2 / v and
-    t / v, exactly (each a power of two)."""
+    at zero, at one and near float32's least normal, under tangents of their own scales and far from them
+    (ledger 3331), the second forward derivative and the gradient's forward derivative are the plain
+    formula's, |t|**2 / v and t / v, and a first derivative past the old rule's product's range, exactly
+    (each a power of two)."""
     from dew.sampling import flow
 
     value, mean = normal_draw(2283, (3, 4), (3, 4), scale=EDGES[edge])
@@ -60,7 +61,9 @@ def test_a_transitions_quadratic_term_holds_every_order(edge):
                     f"a transition's quadratic term {edge}", truth_fn=half_squared_over)
 
     unit = jnp.ones((1,), jnp.float32)
-    for level, scale in ((0.0, 1.0), (1.0, 2.0**10), (2.0**-100, 2.0**-40)):
+    # A tangent far from its operands' scale among them: a value and mean of 2**-120 under 2**10
+    # (ledger 3331).
+    for level, scale in ((0.0, 1.0), (1.0, 2.0**10), (2.0**-100, 2.0**-40), (2.0**-120, 2.0**10)):
         at, along = jnp.full((1, 3), level, jnp.float32), jnp.full((1, 3), scale, jnp.float32)
 
         def term(value, at=at):
@@ -73,6 +76,15 @@ def test_a_transitions_quadratic_term_holds_every_order(edge):
         gradient = jax.grad(lambda value, term=term: term(value).sum())
         np.testing.assert_array_equal(np.asarray(jax.jvp(gradient, (at,), (along,))[1]),
                                       np.full((1, 3), scale))
+    # A residual of 2**100 under a variance of 2**100 along a tangent of 2**100: 3 * 2**100, exactly.
+    wide, far = jnp.full((1,), 2.0**100, jnp.float32), jnp.full((1, 3), 2.0**100, jnp.float32)
+    first = jax.jvp(lambda value: flow._half_mahalanobis(value, jnp.zeros_like(far), wide), (far,), (far,))[1]
+    np.testing.assert_array_equal(np.asarray(first), [3 * 2.0**100])
+    # A small coordinate beside a large one, moved alone by a large tangent: 2**-40, exactly, kept.
+    mixed = jnp.asarray([[2.0**100, 2.0**-40]], jnp.float32)
+    first = jax.jvp(lambda value: flow._half_mahalanobis(value, jnp.zeros_like(mixed), wide), (mixed,),
+                    (jnp.asarray([[0.0, 2.0**100]], jnp.float32),))[1]
+    np.testing.assert_array_equal(np.asarray(first), [2.0**-40])
 
 
 @pytest.mark.parametrize("edge", EDGES)

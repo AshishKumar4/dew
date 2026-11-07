@@ -252,6 +252,17 @@ def slot(term: Term) -> i64: ...
 """A walked reduction's index among the walk's, its carried state's (`Term.state`)."""
 
 
+@function(merge=lambda old, new: old)
+def at_least(term: Term) -> i64: ...
+"""A floor `term` is at least (`floor_of`'s class): a floored maximum's carried state (`_floors`), and a
+maximum of a value at least it."""
+
+
+@function(merge=lambda old, new: old)
+def floor_of(literal: Term) -> i64: ...
+"""The class of a literal's value among the walk's floors (`_floors`): literals of one value one class."""
+
+
 def _exponentials(scaled: bool = False) -> list:
     """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential; and
     `scaled`, as `exp(-c k)`, an exponential of a difference times a positive literal `c` (raw logits, the
@@ -419,11 +430,41 @@ def _shapes():
         name="derived shapes")
 
 
+def _floored():
+    """The floors' rules (the module's account): a maximum is at least what either side is, and a maximum
+    of a value at least a floor with that floor's literal is the value."""
+    x, y, t = vars_("x y t", Term)
+    c, p = vars_("c p", i64)
+    return ruleset(
+        rule(eq(t).to(x.binary(String("max"), y, p)), eq(at_least(x)).to(c)).then(set_(at_least(t)).to(c)),
+        rule(eq(t).to(y.binary(String("max"), x, p)), eq(at_least(x)).to(c)).then(set_(at_least(t)).to(c)),
+        rule(eq(t).to(x.binary(String("max"), y, p)), eq(at_least(x)).to(c), eq(floor_of(y)).to(c)).then(
+            union(t).with_(x)),
+        rule(eq(t).to(y.binary(String("max"), x, p)), eq(at_least(x)).to(c), eq(floor_of(y)).to(c)).then(
+            union(t).with_(x)),
+        name="floored")
+
+
+FLOORED = _floored()
+"""A floored maximum's readings: its floor taken once, at its identity (`_floors`)."""
+
 WALKING = _walking()
 WALKING_SCALED = _walking(scaled=True)
 """`WALKING` for a declaration that states its own rescale (`Reduction.rescale`), which carries a scaled
 exponential's factor."""
 SHAPES = _shapes()
+
+
+def _parts_of(value: Callable, accumulated, added) -> Accumulated | Added | None:
+    """A reduction's step's parts as a mainloop's own step takes them (`Derived.step`'s `stepped`), each
+    evaluated by `value`: a product's (`Accumulated`), a sum's (`Added`), or None."""
+    if accumulated is not None:
+        factor, weights, values = accumulated
+        return Accumulated(None if factor is None else value(factor), value(weights), value(values))
+    if added is not None:
+        factor, summed, terms_of = added
+        return Added(value(factor), value(summed), value(terms_of))
+    return None
 
 
 def _decoupled(rescaling: bool = False):
@@ -466,6 +507,12 @@ def _decoupled(rescaling: bool = False):
         ]
 
     slotted = eq(i).to(slot(t))
+    # A walked sum of local products states its weights and values as it writes them (no factor: it takes no
+    # rescale), which a mainloop's own accumulator takes (`Accumulated`).
+    stepped, merged = vars_("stepped merged", Term)
+    derived.append(rule(eq(stepped).to(t.stepped()), eq(t).to(x.dot(y, p)), summed(t), local_of(t),
+                        slotted).then(set_(weighed(stepped)).to(x.stepped()),
+                                      set_(weighted(stepped)).to(y.stepped())))
     for combined, which, index in (("max", peaked, largest), ("add", summed, added)):
         stocked = eq(index).to(stock(combined))
         derived += [
@@ -494,7 +541,6 @@ def _decoupled(rescaling: bool = False):
               eq(lift).to(lifts(given, to, along)),
               eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), eq(largest).to(stock("max")),
               eq(floor).to(least(k)), eq(typed).to(retype(i)), slotted)
-    stepped, merged = vars_("stepped merged", Term)
     for summed_term, tile in ((x.reduce(String("sum"), axes, p), x.stepped().reduce(String("sum"), axes, p)),
                               (x.dot(y, p), x.stepped().dot(y.stepped(), p)),
                               (y.dot(x, p), y.stepped().dot(x.stepped(), p))):
@@ -585,15 +631,19 @@ class _Forms:
     walked_leaves: frozenset[int]
     consts: tuple
     report: program.AlgebraReport
-    accumulated: tuple[tuple[Term, Term, Term] | None, ...] = ()
-    """Each reduction's step as a mainloop's accumulator takes it (`rescaled_by`): its row factor, the tile
-    product's weights and values, extracted with the forms; None for a step of no such rule."""
+    accumulated: tuple[tuple[Term | None, Term, Term] | None, ...] = ()
+    """Each reduction's step as a mainloop's accumulator takes it (`rescaled_by`): its row factor (None for a
+    sum that takes no rescale), the tile product's weights and values, extracted with the forms; None for a
+    step of no such rule."""
     added: tuple[tuple[Term, Term, Term] | None, ...] = ()
     """Each reduction's step as a mainloop's own addition takes it (`summand`): its row factor, the tile's sum
     and the terms it sums (`summed_terms`), extracted with the forms; None for a step of no such rule."""
     merged: tuple[tuple[Term, Term] | None, ...] = ()
     """Each reduction's merge as a mainloop's own merge takes it (`merge_factors`): the factors its first and
     second states take, extracted with the forms; None for a merge of no such rule."""
+    floors: tuple[float | None, ...] = ()
+    """Each reduction's floor, the identity it is carried from where the declaration reads it only floored
+    (`_floors`); None for every other."""
 
 
 def context() -> tuple:
@@ -645,8 +695,9 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         typed = jax.eval_shape(lambda *values: tuple(evaluated(made.region, reduction,
                                                                [*made.consts, *values], {})
                                                      for reduction in made.reductions), *avals)
-        return tuple(jnp.full(aval.shape, _identity(reduction, aval.dtype), aval.dtype)
-                     for reduction, aval in zip(made.reductions, typed, strict=True))
+        return tuple(jnp.full(aval.shape, _identity(reduction, aval.dtype) if floor is None else floor,
+                              aval.dtype)
+                     for reduction, aval, floor in zip(made.reductions, typed, made.floors, strict=True))
 
     def carried(made: _Forms, *states) -> dict:
         return {terms.key(Term.state(i64(index), i64(side))): state[index]
@@ -657,17 +708,6 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         made = forms(shaped(tiles))
         value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)],
                           carried(made, state), product=product, **declared)
-        # The mainloop's own step where it gives one, once, over each reduction's parts as the rules state
-        # them (each value evaluated once), every reduction it leaves (None) by its form.
-        taken = (None,) * len(made.steps)
-        if stepped is not None:
-            parts = tuple(Accumulated(*map(value, accumulated)) if accumulated is not None
-                          else Added(*map(value, added)) if added is not None else None
-                          for accumulated, added in zip(made.accumulated, made.added, strict=True))
-            taken = tuple(stepped(tuple(state), parts))
-        stepped = [value(form) if own is None else own for own, form in zip(taken, made.steps, strict=True)]
-        if not outputs:
-            return tuple(stepped)
         # The tile's outputs along the walked axis `outputs` names (by place), by the same evaluation: a
         # term both read, once.
         along = []
@@ -675,7 +715,19 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
             if not made.mapped[index] or (output := made.outputs[index]) is None:
                 raise Refused(f"output {index} is no output along the walked axis")
             along.append(value(output))
-        return tuple(stepped), tuple(along)
+        # The mainloop's own step where it gives one, once, over each reduction's parts as the rules state
+        # them (each value evaluated once), every reduction it leaves (None) by its form. Every value the
+        # step computes whatever the mainloop takes (each reduction of no parts, the outputs along the walk)
+        # before it: none written while its products run (a Hopper group's registers, which ptxas otherwise
+        # serializes, C7513).
+        parts = ((None,) * len(made.steps) if stepped is None else
+                 tuple(_parts_of(value, accumulated, added)
+                       for accumulated, added in zip(made.accumulated, made.added, strict=True)))
+        steps = [value(form) if part is None else None for part, form in zip(parts, made.steps, strict=True)]
+        taken = (None,) * len(made.steps) if stepped is None else tuple(stepped(tuple(state), parts))
+        stepped = [own if own is not None else made_step if made_step is not None else value(form)
+                   for own, made_step, form in zip(taken, steps, made.steps, strict=True)]
+        return tuple(stepped) if not outputs else (tuple(stepped), tuple(along))
 
     def merge(a, b, operands=None, *, shapes: Mapping, merged=None):
         made = forms(shapes)
@@ -776,7 +828,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     graph.register(declared, bundle)
     schedule = cost.walk(cost.target())
     _, before = extract.cheapest(graph, declared, cost.model(region, schedule))
-    facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), walking.saturate())
+    floors = _floors(graph, region, reductions)
+    facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), walking.saturate(), FLOORED.saturate())
     decoupled = DECOUPLED if declaration.rescale is None else DECOUPLED_RESCALED
     _decoupled_through(graph, region, facts, decoupled)
     saturated = program.saturate(graph, region, (*rules.admitted(accurate), decoupled),
@@ -788,8 +841,10 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
 
     accumulating = [index for index, reduction in enumerate(reductions) if stated(weighed, reduction)]
     adding = [index for index, reduction in enumerate(reductions) if stated(summand, reduction)]
+    rescaling = [index for index, reduction in enumerate(reductions) if stated(rescaled_by, reduction)]
     parts = [part(reductions[index].stepped()) for index in range(len(reductions))
-             for part in ((rescaled_by, weighed, weighted) if index in accumulating
+             for part in ((*((rescaled_by,) if index in rescaling else ()), weighed, weighted)
+                          if index in accumulating
                           else (rescaled_by, summand, summed_terms) if index in adding else ())]
     merging = [index for index, reduction in enumerate(reductions)
                if graph.lookup_function_value(merge_factors(reduction.merged())) is not None]
@@ -802,7 +857,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     held = iter(chosen[len(roots):])
     accumulated, added = [], []
     for index in range(len(reductions)):
-        accumulated.append((next(held), next(held), next(held)) if index in accumulating else None)
+        accumulated.append(((next(held) if index in rescaling else None), next(held), next(held))
+                           if index in accumulating else None)
         added.append((next(held), next(held), next(held)) if index in adding else None)
     merged = [(next(held), next(held)) if index in merging else None for index in range(len(reductions))]
     chosen = chosen[:len(roots)]
@@ -827,7 +883,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
             raise Refused("a merge reads a walked operand: no tile is there to read")
     return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
                   walked_leaves, tuple(closed.consts), report, tuple(accumulated), tuple(added),
-                  tuple(merged))
+                  tuple(merged), floors)
 
 
 def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:
@@ -1019,6 +1075,51 @@ def _holds(graph: EGraph, fact) -> bool:
     except EggSmolError:
         return False
     return True
+
+
+def _floors(graph: EGraph, region: terms.Region, reductions: Sequence[Term]) -> tuple[float | None, ...]:
+    """Each walked maximum's floor where the declaration reads it only floored, `max(m, c)` at one finite
+    literal value `c` (attention's `max(m, least)`), else None: the walk carries it floored from `c` (its
+    identity, `init`), so each of its states is at least `c` (`at_least`) and a floor of one is the state
+    itself (`FLOORED`), the per-step floor and the correction's shift dropped (row 3520: the hand walk
+    carries its maximum floored from the least finite value)."""
+    places = {terms.key(reduction): index for index, reduction in enumerate(reductions)
+              if _role(reduction) == "max"}
+    floors: dict[int, float] = {}
+    barred = {places[terms.key(term)] for term in region.outputs
+              if term is not None and terms.key(term) in places}
+
+    def literal_of(term: Term) -> float | None:
+        if (args := get_callable_args(term, Term.literal)) is None:
+            return None
+        value = np.asarray(region.literals[terms.integer(args[0])])
+        return value.item() if value.shape == () and np.isfinite(value) else None
+
+    for term, _ in region.shapes:
+        for constructor in terms.LANGUAGE:
+            if (args := get_callable_args(term, constructor)) is None:
+                continue
+            children = [arg for arg in args if isinstance(arg, Term)]
+            for child in children:
+                if (index := places.get(terms.key(child))) is None:
+                    continue
+                binary = get_callable_args(term, Term.binary)
+                floor = None
+                if binary is not None and terms.text(binary[1]) == "max":
+                    other = binary[2] if terms.key(binary[0]) == terms.key(child) else binary[0]
+                    floor = literal_of(other)
+                if floor is None or floors.setdefault(index, floor) != floor:
+                    barred.add(index)
+    held = {index: floor for index, floor in floors.items() if index not in barred}
+    classes = {floor: number for number, floor in enumerate(dict.fromkeys(held.values()))}
+    for literal, value in enumerate(region.literals):
+        value = np.asarray(value)
+        if value.shape == () and value.item() in classes:
+            graph.register(set_(floor_of(Term.literal(i64(literal)))).to(i64(classes[value.item()])))
+    for index, floor in held.items():
+        for side in (0, 1):
+            graph.register(set_(at_least(Term.state(i64(index), i64(side)))).to(i64(classes[floor])))
+    return tuple(held.get(index) for index in range(len(reductions)))
 
 
 def _identity(reduction: Term, dtype) -> float:
