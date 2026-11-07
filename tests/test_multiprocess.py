@@ -28,6 +28,7 @@ import threading
 import time
 from pathlib import Path
 
+import jax.numpy as jnp
 import multiprocess_worker as worker
 import numpy as np
 import pytest
@@ -180,6 +181,22 @@ def assert_trained_once(reports: list[dict], *, clocked: bool = True) -> None:
     trained = {record: round(count, 4) for record, count in reports[0]["counts"].items()}
     assert trained == {record: round(count, 4) for record, count in reports[0]["dealt"].items()}
     assert sorted(trained.values()) == [1] * 3 + [2] * 7
+
+
+def test_a_share_that_ran_out_counts_no_work_in_the_batch_it_steps_with():
+    """A share whose stream ran out steps with its pool's batch emptied (`emptied`): no row real, none
+    consuming an example, none counting a token, and none counting work, so train/flops and train/mfu
+    count the rows that train, where the work its last batch counted was counted again each step it
+    stepped emptied (row 4403)."""
+    from dew.batch import VALID_ROWS
+    from dew.training._fit import emptied
+    from dew.training.model_flops import TOKENS, TRAINING_FLOPS, step_counts
+
+    batch = {"x": np.ones((4, 2), np.float32), VALID_ROWS: np.ones(4, bool),
+             TOKENS: np.full((4, 2), 3, np.uint32), TRAINING_FLOPS: np.full(4, 7.0, np.float32)}
+    held = emptied(batch)
+    counted = step_counts({name: jnp.asarray(held[name]) for name in (TOKENS, TRAINING_FLOPS)})
+    assert float(counted[TRAINING_FLOPS]) == 0.0 and not np.asarray(counted[TOKENS]).any()
 
 
 @pytest.mark.distributed

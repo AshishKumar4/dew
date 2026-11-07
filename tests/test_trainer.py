@@ -102,14 +102,19 @@ class TokenRegression(Regression):
 def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation, steps, logged):
     """Eight rows of lengths 1, 2, 3, 4 a step, without padding: a budget of 30 tokens counts the
     updates committed, so it ends at the first commit past 30, step 3 (48) one microbatch an update
-    and step 4 (80) two, whose first update commits 24."""
+    and step 4 (80) two, whose first update commits 24. A log reports the tokens its steps scored
+    (`train/tokens`), each step's whether its update committed or not, apart from those its committed
+    updates trained on (`train/committed_tokens`): a log that cuts an accumulation window reads its
+    steps, not its commits."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=TokenRegression(), tracker=tracker, accumulation=accumulation)
     state = trainer.fit(dataset(), tokens=30, log_every=log_every)
     assert int(state.step) == steps
     if log_every == 1:
+        assert [scalars["train/committed_tokens"] for _, scalars in tracker.scalars
+                if "train/committed_tokens" in scalars] == logged
         assert [scalars["train/tokens"] for _, scalars in tracker.scalars
-                if "train/tokens" in scalars] == logged
+                if "train/tokens" in scalars] == [8, 16, 24, 32][:steps]
 
 
 class PaddedTokenRegression(TokenRegression):
@@ -375,7 +380,8 @@ def test_a_schedule_trains_each_stage_at_the_row_length_it_lays_out(tmp_path):
     of 8 x 6, then steps of 8 x 10."""
     tracker = RecordingTracker()
     budget_lm_trainer(tracker=tracker).fit(context_schedule(tmp_path, 10), steps=4, log_every=1)
-    committed = [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars]
+    committed = [scalars["train/committed_tokens"] for _, scalars in tracker.scalars
+                 if "train/committed_tokens" in scalars]
     assert committed == [LM_ROWS * LM_CONTEXT] * 2 + [LM_ROWS * 10] * 2
 
 
@@ -1709,15 +1715,15 @@ def test_a_share_of_a_token_budget_falls_where_the_committed_tokens_pass_its_mul
     every = RecordingTracker()
     make_trainer(objective=TokenRegression(), tracker=every).fit(dataset(), tokens=96, log_every=1)
     # A log every step reports the tokens that step committed; the run's are their running sum.
-    each = sorted((step, scalars["train/tokens"]) for step, scalars in every.scalars
-                  if "train/tokens" in scalars)
+    each = sorted((step, scalars["train/committed_tokens"]) for step, scalars in every.scalars
+                  if "train/committed_tokens" in scalars)
     committed = dict(zip((step for step, _ in each), itertools.accumulate(tokens for _, tokens in each),
                          strict=True))
     passing = sorted(step for step, tokens in committed.items()
                      if tokens // 24 > committed.get(step - 1, 0) // 24)
     shared = RecordingTracker()
     make_trainer(objective=TokenRegression(), tracker=shared).fit(dataset(), tokens=96, log_every="25%")
-    logged = sorted({step for step, scalars in shared.scalars if "train/tokens" in scalars})
+    logged = sorted({step for step, scalars in shared.scalars if "train/committed_tokens" in scalars})
     assert passing and logged == passing
 
 
