@@ -241,3 +241,18 @@ def test_gemm_takes_an_nvfp4_bank_as_its_matrix(kernel):
     placed = np.zeros_like(truth)
     placed[np.asarray(slots)] = truth
     np.testing.assert_array_equal(np.asarray(got, np.float64), placed)
+
+
+def test_an_nvfp4_products_input_gradient_keeps_its_cotangents_precision():
+    """The packed NVFP4 product's input gradient (audit A2) multiplies the cotangent at its own precision:
+    a cotangent row of 1 and -511/512 against a matrix of equal values sums to the 1/512 their difference
+    is, where the cotangent narrowed to bfloat16 first (-511/512 rounding to -1) summed to 0."""
+    matrix = gemm.NvFp4.quantized(jnp.ones((512, 128), jnp.float32))
+    rows = jnp.zeros((8, 512), jnp.float32)
+    cotangent = jnp.zeros((8, 128), jnp.float32).at[:, 0].set(1.0).at[:, 1].set(-511 / 512)
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), generation.routes() as routes:
+        _, pullback = jax.vjp(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32,
+                                                           interpret_on_cpu=True), rows)
+        (d_rows,) = pullback(cotangent)
+    assert {route.kernel for route in routes if route.choice == "nvfp4"} == {"packed"}, routes
+    np.testing.assert_array_equal(np.asarray(d_rows), np.full((8, 512), 1 / 512, np.float32))
