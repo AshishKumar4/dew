@@ -766,7 +766,7 @@ class Pretrained:
 
         # A packed load's expert banks are written as the dense matrices they hold (`decoded_expert_banks`),
         # which the source's format encodes back.
-        held = decoded_expert_banks(unboxed(self.variables if variables is None else variables))
+        held = unboxed(decoded_expert_banks(self.variables if variables is None else variables))
         values = unpacked(self.model, stored_layers(self.model, held, banks=True))
         if self.adapter is not None:
             values = self.adapter.merge(values)
@@ -2304,10 +2304,11 @@ def _translated(config: Mapping[str, object],
     media wrapper or DiffusionGemma translated and checked against its tree, and any stored input scales
     bound. No processor, generation config or bundle is built."""
     banks: dict[str, object] = {}
+    placing = streaming
     if packed_experts:
         tensors, banks = _packed_banks(tensors, config)
         # Its leaves translated as views read when placed, as a streaming load's: the banks' unread leaves
-        # are replaced before any is read (`_with_banks`).
+        # are replaced before any is read (`_with_banks`), the rest read below where the load places none.
         streaming = True
     tensors, quantized_tensors, scale_dtype, grid, checked, stored = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
@@ -2338,6 +2339,12 @@ def _translated(config: Mapping[str, object],
                 quantized=source_quantization(config) is not None, checked=checked)
     model, variables = _input_quantization(built.model, built.variables, built.layouts, config, grid)
     variables = _with_banks(variables, built.layouts, banks)
+    if banks and not placing:
+        from dew.interop.streaming import SourceLeaf
+        from dew.nn.kernels.gemm import NvFp4
+
+        variables = jax.tree.map(lambda leaf: np.asarray(leaf) if isinstance(leaf, SourceLeaf) else leaf,
+                                 variables, is_leaf=lambda leaf: isinstance(leaf, NvFp4))
     return _Translated(built._replace(model=model, variables=variables), quantized_tensors, scale_dtype, grid,
                        stored)
 
