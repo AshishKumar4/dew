@@ -944,7 +944,9 @@ def test_a_packed_prefill_decodes_its_last_document_as_that_document_alone(mixer
 
     @jax.jit
     def packed(params, ids):
-        prefill, state = cached(model, params, ids[:, :prompt], positions=positions, segment_ids=segment_ids)
+        # The padding's validity stated too, every slot marked: the cache takes the real tokens alone.
+        prefill, state = cached(model, params, ids[:, :prompt], positions=positions, segment_ids=segment_ids,
+                                attention_mask=jnp.ones((2, prompt), bool))
         return jnp.concatenate([prefill[:, first:first + second],
                                 *stepped(model, params, state, ids, named=True)], axis=1)
 

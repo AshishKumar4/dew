@@ -1171,14 +1171,6 @@ class CausalTransformer(LinearProducts):
         # prediction depths read its coordinates alone.
         coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
                                         valid=attention_mask, positions=positions, right_padded=right_padded)
-        if (decode and coordinates is not None and coordinates.max_segments > 1
-                and coordinates.segments is not None and coordinates.valid is None):
-            # A cache keeps a packed row's real tokens alone: its padding (segment 0) writes no key and moves
-            # no recurrent state, its documents' starts counted over its real tokens.
-            coordinates = build_coordinates(tokens.shape[:2], segments=coordinates.segments,
-                                            valid=coordinates.segments != 0, positions=coordinates.positions,
-                                            max_segments=coordinates.max_segments,
-                                            right_padded=coordinates.right_padded)
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
@@ -1618,6 +1610,17 @@ class CausalTransformer(LinearProducts):
         - `progress` is a training step's (`dew.nn.progress`), which its DEX
           layers anneal over; None is the run's end, outside a training step.
         """
+        if (decode and coordinates is not None and coordinates.max_segments > 1
+                and coordinates.segments is not None):
+            # A cache keeps a packed row's real tokens alone (`dew.batch.real_slots`: its validity less its
+            # padding, segment 0): its padding writes no key and moves no recurrent state, its documents'
+            # starts counted over its real tokens.
+            real = coordinates.segments != 0
+            valid = real if coordinates.valid is None else coordinates.valid & real
+            coordinates = build_coordinates(tokens.shape[:2], segments=coordinates.segments, valid=valid,
+                                            positions=coordinates.positions,
+                                            max_segments=coordinates.max_segments,
+                                            right_padded=coordinates.right_padded)
         attention_metadata = self._attention_metadata(
             tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
             attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
