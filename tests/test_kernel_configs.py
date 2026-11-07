@@ -1029,6 +1029,13 @@ def test_a_hoppers_gathered_projections_reverse_pass_reads_its_rows_where_they_l
     _assert_launches("sm90", "gathered projection gradient", _gathered_projection_gradient, 5, "dew_tgmm")
 
 
+def test_a_b200s_gathered_projections_reverse_pass_reads_its_rows_on_the_template():
+    """The reverse pass of a gathered, scattered expert projection on a compile-only B200 (row 4852): its
+    kernel gradient on the template's next issuer, mma.sync's consumer-fed rings, whose loading consumer
+    gathers each step's token and cotangent rows by cp.async (`gathered.Ring`), which ptxas compiles."""
+    _assert_launches("sm100", "gathered projection gradient", _gathered_projection_gradient, 5, "dew_tgmm")
+
+
 def _blockwise_gradient():
     """A blockwise-scaled FP8 MoE projection's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`: 2048
     deep, 768 wide, eight experts of 4 to 12 whole 128-row blocks) through the template named."""

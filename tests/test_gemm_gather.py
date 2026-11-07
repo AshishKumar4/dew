@@ -198,7 +198,9 @@ def test_a_blackwells_gathered_product_reads_its_rows_by_its_load_warps_gathers(
 def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu: bool = False):
     """A gathered, scattered grouped product on a Blackwell GPU (row 1376): tcgen05's bundle takes it (its
     load warp's TMA four-row gathers, `gathered.Committed`), its value bitwise the product of the rows
-    gathered first and put at their slots after. Integers, every sum exact in the bf16 output."""
+    gathered first and put at their slots after; and its kernel gradient's tables on the template too (row
+    4852: mma.sync's consumer-fed rings, their loading consumer gathering each step's rows, `gathered.Ring`),
+    bitwise the gradient of the rows gathered first. Integers, every sum exact."""
     from dew.nn.kernels import gemm
 
     rng = np.random.default_rng(13)
@@ -206,6 +208,7 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
     matrices = jnp.asarray(rng.integers(-1, 2, size=(3, 256, 256)), jnp.bfloat16)
     table = jnp.asarray(rng.integers(0, 200, 384), jnp.int32)
     slots = jnp.asarray(rng.permutation(384), jnp.int32)
+    cotangent = jnp.asarray(rng.integers(-1, 2, size=(384, 256)), jnp.bfloat16)
     sizes = jnp.asarray([128, 0, 200], jnp.int32)
     options = {"out_dtype": jnp.bfloat16, "precision": "default", "interpret_on_cpu": interpret_on_cpu}
     derived, original = [], mosaic_gpu.gmm
@@ -220,31 +223,75 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
         assert {tile.family for tile in derived} == {"tcgen05"}
         apart = jax.jit(lambda: gemm.gemm(tokens[table], matrices, sizes, **options))()
     np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.zeros_like(apart).at[slots].set(apart)))
+    gradient = {**options, "out_dtype": jnp.float32}
+    with generation.routes() as routes:
+        got = jax.jit(lambda: gemm.gemm_t(tokens, cotangent, sizes, gather=(table, slots), **gradient))()
+    assert {route.kernel for route in routes} == {"mosaic_gpu"}, routes
+    expected = jax.jit(lambda: gemm.gemm_t(tokens[table], cotangent[slots], sizes, **gradient))()
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
 def test_a_blackwells_gathered_product_lowers_for_cuda():
     """A gathered grouped product on a compile-only B200 lowers through Mosaic GPU on tcgen05's bundle: its
     load warp's TMA four-row gathers into the swizzled ring (`gathered.tma_rows`), each slot released by its
-    products' commit. A gathered block-scaled product is refused: its loads read the rows' scales in the
-    rows' order, not gathered."""
-    from dew.nn.kernels.templates import mosaic_sm100
-
+    products' commit; and its kernel gradient's tables on mma.sync's consumer-fed rings, the loading
+    consumer's cp.async gather (`gathered.Ring`, row 4852), at the tiles its launch derives for a wide and a
+    32-column cotangent."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
-    refused = functools.partial(mosaic_gpu._tables_refused, jnp.zeros((256,), jnp.int32), None, tiles,
-                                mosaic_sm100.RINGS, prologue=None, dense=False, transpose_lhs=False)
-    refused(block_scaled=False)
-    with pytest.raises(ValueError):
-        refused(block_scaled=True)
     sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
 
     def gathered(tokens, matrices, table):
         return mosaic_gpu.gmm(tokens, matrices, sizes, tiles=tiles, transpose_rhs=False,
                               out_dtype=jnp.bfloat16, multiprocessors=148, interpret=False, gather=table)
 
+    def gradient(tokens, cotangent, table, slots):
+        bound = launch.bind(*(jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (tokens, cotangent)),
+                            jax.ShapeDtypeStruct(sizes.shape, sizes.dtype), (), (table, slots),
+                            out_dtype="float32", interpret=False)
+        tile = launch.derived(bound, generation.gpu_target())
+        assert tile is not None and tile.family == "mma.sync.fed", tile
+        return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=tile, out_dtype=jnp.float32,
+                               multiprocessors=148, interpret=False, gather=(table, slots))
+
+    launch = grouped_matmul.MosaicTgmm()
+
     with generation.assumed("sm100"):
         jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
                                 jax.ShapeDtypeStruct((4, 512, 256), jnp.bfloat16),
                                 jax.ShapeDtypeStruct((2048,), jnp.int32)).lower(lowering_platforms=("cuda",))
+        # A narrow cotangent's stage too, its tile the launch's own, staged at the swizzle its row holds
+        # (`gathered.swizzled`).
+        for width in (256, 32):
+            operands = (jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((2048, width), jnp.bfloat16),
+                        *(jax.ShapeDtypeStruct((2048,), jnp.int32),) * 2)
+            jax.jit(gradient).trace(*operands).lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.parametrize("format_", ["mxfp8", "nvfp4"])
+def test_a_blackwells_gathered_block_scaled_product_gathers_its_scales_by_its_table(format_):
+    """A gathered block-scaled product on an sm100, interpreted (row 4851: `mxfp8_product`'s and
+    `nvfp4_block_product`'s `gather`): its codes read where they lie by tcgen05's gather and its rows' block
+    scales by the same table, bitwise the product of the operand gathered first (codes and scales), its
+    groups whole 128-row blocks, one empty."""
+    from dew.nn.kernels import gemm
+
+    choice, form, product = {"mxfp8": ("mxfp8", gemm.MxFp8, gemm.mxfp8_product),
+                             "nvfp4": ("nvfp4_block", gemm.NvFp4Block, gemm.nvfp4_block_product)}[format_]
+    rng = np.random.default_rng(17)
+    tokens = form.quantized(jnp.asarray(rng.normal(size=(300, 256)), jnp.float32))
+    matrices = form.quantized(jnp.asarray(rng.normal(size=(4, 128, 256)), jnp.float32))
+    blocks = jnp.asarray([1, 0, 2, 1], jnp.int32)
+    table = jnp.asarray(rng.integers(0, 300, 512), jnp.int32)
+    gathered = dataclasses.replace(tokens, codes=tokens.codes[table], scales=tokens.scales[table])
+    named = generation.chosen(**{choice: "mosaic_gpu"})
+    with generation.assumed("sm100"), named, generation.routes() as routes:
+        got = jax.jit(lambda: product(tokens, matrices, blocks, out_dtype=jnp.float32, interpret_on_cpu=True,
+                                      gather=table))()
+        expected = jax.jit(lambda: product(gathered, matrices, blocks, out_dtype=jnp.float32,
+                                           interpret_on_cpu=True))()
+    assert {route.kernel for route in routes if route.choice == choice} == {"mosaic_gpu"}, routes
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
 def test_a_gathered_products_table_covers_every_tile_its_schedule_walks():
