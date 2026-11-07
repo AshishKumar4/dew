@@ -520,14 +520,16 @@ def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
     (`_dot_product_attention_core`), which the reference's jax.nn form
     (`scale_logits`) declares as jax.nn does: a 16-bit operand's own product
     with fp32 sums (bf16's `BF16_BF16_F32`, fp16's `F16_F16_F32`) where the
-    call states no precision above the default and the device runs it (a GPU
-    from `BF16_GPU` on for bf16, `bf16_dot_runs`; no TPU for fp16); None
-    otherwise, the call's own precision taking the product."""
+    call states no precision above the default and the platform it is placed
+    on lowers it (`placed_platform`: bf16's everywhere but a GPU before
+    `BF16_GPU`, `bf16_dot_runs`; fp16's on a GPU alone, where a CPU's dot and
+    a TPU's refuse it, jax.nn's own attention with them); None otherwise, the
+    call's own precision taking the product."""
     if not asks_default_precision(precision):
         return None
     if dtype == jnp.bfloat16 and bf16_dot_runs():
         return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-    if dtype == jnp.float16 and generation.backend() != 'tpu':
+    if dtype == jnp.float16 and generation.placed_platform() == 'gpu':
         return jax.lax.DotAlgorithmPreset.F16_F16_F32
     return None
 
