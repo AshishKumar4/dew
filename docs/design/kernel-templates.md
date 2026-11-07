@@ -143,6 +143,8 @@ The update is `S' = T·S·E + W`, with the transitions as values.
 
 Auxiliary scans (a normalizer z, LSE pre-passes) are an algebra extension point, not hooks. The T=1 token update is the definitional form. Decode is a mainloop over it that shares the transition values. The chunk functions are its reformulation.
 
+A recurrence's memory is read through its decays within a stated range, within 2^100 of its values: there every form is on par with the recurrence a token at a time, and past it fp32's own token recurrence holds no such read (4e-6 from float64 at 2^110, 6e-2 at 2^124). Under a decay a head every form reads the memory output-side, `(q S) exp2(g)`, so an out-of-range read overflows to inf, visible, never a silent value (row 2344); no form carries an exponent past fp32's range. A decay a key dimension's read past the range is unmeasured.
+
 ### GEMM
 
 **Product declaration**, the same for every product in every template:
