@@ -6,6 +6,7 @@ same tiles). It takes a call at its launches' padded shapes, as `TritonForward` 
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import Literal, overload
 
 import jax
@@ -97,9 +98,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
     blocks_map = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
     ids = None if query_ids is None or key_ids is None else (query_ids, key_ids)
 
-    def program(index):
-        i, rest = index // (batch * heads), index % (batch * heads)
-        row, head = rest // heads, rest % heads
+    def program(i, row, head):
         draw = None if drop is None else drop.draw(row, head)
         first_query = i * block_q
         rows = first_query + jnp.arange(block_q)
@@ -160,8 +159,22 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         weighted = functools.partial(_weighted, rows=anchor_rows) if residuals else None
         return algebra.walked(spec, walk, finished, weighted)
 
-    mapped = jax.lax.map(program, jnp.arange(blocks * batch * heads))
+    mapped = _heads_batched(program, blocks * batch, batch, heads)
     return _unmapped(mapped, (blocks, batch, heads, block_q, value_width), residuals=residuals)
+
+
+def _heads_batched(program: Callable, programs: int, batch: int, heads: int):
+    """`program(block, row, head)` over every block and row in sequence (`lax.map`) and their heads at
+    once (`vmap`), as `[programs * heads, ...]` in block, row, head order: a row's heads walk the same
+    key tiles (its spans' bounds read the row alone), so each step's products are one batched product and
+    its loop one loop, where a program a head took a step's overhead a head (row 4826: a CPU's tile steps
+    ~45 us each, their arithmetic a fraction of it)."""
+    def blocked(index):
+        i, row = index // batch, index % batch
+        return jax.vmap(lambda head: program(i, row, head))(jnp.arange(heads))
+
+    mapped = jax.lax.map(blocked, jnp.arange(programs))
+    return jax.tree.map(lambda x: x.reshape(programs * heads, *x.shape[2:]), mapped)
 
 
 def _unmapped(mapped, shape: tuple[int, ...], *, residuals: bool):
@@ -502,8 +515,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     start, end, query_ids, key_ids = spans
     ranges = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
 
-    def program(index):
-        row, head = index // heads, index % heads
+    def program(_, row, head):
         kv_head = head // group
 
         def block(j, carry):
@@ -543,7 +555,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                  jnp.zeros((keys, value.shape[-1]), jnp.float32))
         return jax.lax.fori_loop(0, blocks, block, start)
 
-    dq, dk, dv = jax.lax.map(program, jnp.arange(batch * heads))
+    dq, dk, dv = _heads_batched(program, batch, batch, heads)
+
     def laid_out(x):
         return jnp.swapaxes(x.reshape(batch, heads, *x.shape[1:]), 1, 2)
 
