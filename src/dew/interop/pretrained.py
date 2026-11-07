@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+import logging
 import os
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -24,7 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.traverse_util import unflatten_dict
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.typing import DTypeLike
 
 from dew import _records
@@ -110,6 +111,8 @@ if TYPE_CHECKING:
     from dew.nn.dex import DifferentialExtension
     from dew.sampling.guidance import Guidance
     from dew.sampling.solvers.common import Solver
+
+_log = logging.getLogger(__name__)
 
 
 def _refined(layout: Layout | None, model: RefinesLayout | None) -> Layout | None:
@@ -478,7 +481,7 @@ class Pretrained:
              trust_remote_code: bool | None = None, text_only: bool = False,
              prediction_depths: int | None = None, dex: DifferentialExtension | None = None,
              precision: Numerics | str | None = None, scan_layers: bool = False,
-             step: int | str | None = None, ema: bool | None = None) -> Self:
+             step: int | str | None = None, ema: bool | None = None, packed_experts: bool = False) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and projector weights keep
@@ -559,6 +562,13 @@ class Pretrained:
         (`AttentionMixer.bidirectional_blocks`, a call's `block_groups`) on any decoder or wrapper this
         loads natively, and "causal" turns a release's back off. A saved model states it in its own
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
+        `packed_experts` serves an MXFP4 source's routed experts as their codes (row 4516): each bank
+        whose depth is whole NVFP4 stages and whose group powers one tensor scale an expert spans
+        (`codecs.mxfp4_tensor_powers`) is held packed (`dew.nn.kernels.gemm.NvFp4`, exactly its MXFP4
+        values) in the `QUANTIZATION` collection under its matrix's name, which the expert layers read
+        (`dew.quantization.expert_matrix`) and an export decodes (`decoded_expert_banks`); one that is
+        not stays dense, named in the load's log. Refused beside another source format, a mesh or
+        layout, or `scan_layers`.
         A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
         name_or_dir, trust_remote_code = released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
@@ -571,14 +581,15 @@ class Pretrained:
                 "subfolder": subfolder, "gguf_file": gguf_file, "single_file": single_file,
                 "dduf_file": dduf_file, "fallback": fallback, "text_only": text_only,
                 "modeling_overrides": modeling_overrides or None, "prediction_depths": prediction_depths,
-                "dex": dex, "precision": precision, "scan_layers": scan_layers})
+                "dex": dex, "precision": precision, "scan_layers": scan_layers,
+                "packed_experts": packed_experts})
         return cls._from_family(
             name_or_dir, trust_remote_code, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,
             gguf_file=gguf_file, single_file=single_file, dduf_file=dduf_file, fallback=fallback, mesh=mesh,
             layout=layout, on_host=on_host, weights=weights, modeling_overrides=modeling_overrides,
             text_only=text_only, prediction_depths=prediction_depths, dex=dex, precision=precision,
-            scan_layers=scan_layers)
+            scan_layers=scan_layers, packed_experts=packed_experts)
 
 
     @classmethod
@@ -590,8 +601,12 @@ class Pretrained:
                      layout: Layout | None, on_host: bool, weights: bool,
                      modeling_overrides: Mapping[str, object] | None, text_only: bool,
                      prediction_depths: int | None, dex: DifferentialExtension | None,
-                     precision: Numerics | str | None, scan_layers: bool) -> Self:
+                     precision: Numerics | str | None, scan_layers: bool, packed_experts: bool) -> Self:
         """`load` of a source a family's loader reads, its every option as `load` states it."""
+        if packed_experts and (mesh is not None or layout is not None or scan_layers):
+            # A bank's three leaves place and stack by the dense matrix's axes, which neither reads yet.
+            raise ValueError("packed_experts holds each expert bank on one device unscanned; load it without "
+                             "a mesh, layout or scan_layers")
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
@@ -607,7 +622,8 @@ class Pretrained:
             dduf_file=dduf_file, placed=placed, streaming=streaming or not weights, weights=weights,
             dtype=loading.dtype, param_dtype=loading.param_dtype, attention_impl=attention_impl,
             max_seq_len=loading.max_seq_len, overrides=modeling_overrides,
-            trust_remote_code=trust_remote_code, text_only=text_only, prediction_depths=prediction_depths)
+            trust_remote_code=trust_remote_code, text_only=text_only, prediction_depths=prediction_depths,
+            packed_experts=packed_experts)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
@@ -746,8 +762,12 @@ class Pretrained:
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
         # home as they are written.
-        values = unpacked(self.model, stored_layers(self.model, unboxed(self.variables if variables is None
-                                                                        else variables), banks=True))
+        from dew.quantization import decoded_expert_banks
+
+        # A packed load's expert banks are written as the dense matrices they hold (`decoded_expert_banks`),
+        # which the source's format encodes back.
+        held = decoded_expert_banks(unboxed(self.variables if variables is None else variables))
+        values = unpacked(self.model, stored_layers(self.model, held, banks=True))
         if self.adapter is not None:
             values = self.adapter.merge(values)
         if isinstance(self.model, Differential) and self.model.dex is not None:
@@ -1476,7 +1496,8 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
                  weights: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                  max_seq_len: int | None, overrides: Mapping[str, object] | None,
                  trust_remote_code: bool, text_only: bool,
-                 prediction_depths: int | None = None) -> tuple[Pretrained, bool]:
+                 prediction_depths: int | None = None, packed_experts: bool = False
+                 ) -> tuple[Pretrained, bool]:
     """The source `Pretrained.load` resolved, loaded as its kind loads: a composite release, the
     transformers forward it asks for, a diffusion pipeline, or a natively translated decoder or
     wrapper (a wrapper's language model alone where `text_only` asks, the first `prediction_depths`
@@ -1527,7 +1548,8 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
                                    attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights,
                                    overrides=overrides,
                                    remote=None if remote is None else reference.directory(remote),
-                                   pinned=reference, text_only=text_only, prediction_depths=prediction_depths)
+                                   pinned=reference, text_only=text_only, prediction_depths=prediction_depths,
+                                   packed_experts=packed_experts)
     return loaded, False
 
 
@@ -2275,10 +2297,15 @@ class _Translated(NamedTuple):
 def _translated(config: Mapping[str, object],
                 route: DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute,
                 tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str, param_dtype: str,
-                attention_impl: AttentionImpl, max_seq_len: int | None, streaming: bool) -> _Translated:
+                attention_impl: AttentionImpl, max_seq_len: int | None, streaming: bool,
+                packed_experts: bool = False) -> _Translated:
     """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
-    weights decoded, the decoder, media wrapper or DiffusionGemma translated and checked against its
-    tree, and any stored input scales bound. No processor, generation config or bundle is built."""
+    weights decoded, or its expert banks held packed (`packed_experts`, `_packed_banks`), the decoder,
+    media wrapper or DiffusionGemma translated and checked against its tree, and any stored input scales
+    bound. No processor, generation config or bundle is built."""
+    banks: dict[str, object] = {}
+    if packed_experts:
+        tensors, banks = _packed_banks(tensors, config)
     tensors, quantized_tensors, scale_dtype, grid, checked, stored = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
@@ -2307,8 +2334,68 @@ def _translated(config: Mapping[str, object],
                 max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
                 quantized=source_quantization(config) is not None, checked=checked)
     model, variables = _input_quantization(built.model, built.variables, built.layouts, config, grid)
+    variables = _with_banks(variables, built.layouts, banks)
     return _Translated(built._replace(model=model, variables=variables), quantized_tensors, scale_dtype, grid,
                        stored)
+
+
+def _packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, object]
+                  ) -> tuple[dict[str, unread.Stored], dict[str, object]]:
+    """`tensors` with each MXFP4 expert bank a load serves packed (`Pretrained.load`'s `packed_experts`)
+    taken out of the source's decoding, and those banks by their source names (`dew.nn.kernels.gemm.NvFp4`,
+    built on the host, exactly the MXFP4 values: `codecs.mxfp4_as_nvfp4`). In each one's place an unread
+    leaf of its decoded shape and dtype, which the decoder's translation binds as it binds a load without
+    weights (`unread.Unread`), and `_with_banks` replaces. A bank whose depth is no whole NVFP4 stages
+    (`gemm.NVFP4_STAGE`) or whose experts' group powers span past one tensor scale's reach
+    (`mxfp4_tensor_powers` None) is decoded as the source states it, and named in the load's log, once a
+    load; another source format is refused."""
+    from dew.interop import codecs
+    from dew.nn.kernels.gemm import NVFP4_STAGE, NvFp4
+
+    quantization = source_quantization(config)
+    if quantization is None or quantization is not codecs.MXFP4:
+        raise ValueError("packed_experts serves an MXFP4 source's expert banks (gpt-oss's quant_method "
+                         f"mxfp4); this source's quantization is {config.get('quantization_config')!r}")
+    tensors, banks = dict(tensors), {}
+    for name in quantization.names(tensors):
+        blocks, scales = (tensors[name + suffix] for suffix in codecs.MXFP4_SUFFIXES)
+        experts, outputs, groups, _ = blocks.shape
+        powers = None if groups * codecs.GROUP % NVFP4_STAGE else codecs.mxfp4_tensor_powers(scales)
+        if powers is None:
+            _log.warning("packed_experts: %s stays dense: its depth %d is %s", name, groups * codecs.GROUP,
+                         f"no whole {NVFP4_STAGE}-deep stages" if groups * codecs.GROUP % NVFP4_STAGE else
+                         "whole stages, but its experts' group powers span past one tensor scale's reach")
+            continue
+        banks[name] = NvFp4.of(*codecs.mxfp4_as_nvfp4(blocks, scales, powers))
+        for suffix in codecs.MXFP4_SUFFIXES:
+            del tensors[name + suffix]
+        tensors[name] = unread.Unread((experts, groups * codecs.GROUP, outputs), np.dtype(np.float32))
+    return tensors, banks
+
+
+def _with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: Mapping[str, object]
+                ) -> Variables:
+    """`variables` with each packed bank (`_packed_banks`) in `QUANTIZATION` under the path its source name's
+    layout binds, the unread leaf there taken out of `params`: a bank its layout reads as it stands, one
+    path, untransposed, uncut, whole (gpt-oss's experts), the expert layers read it so
+    (`dew.quantization.expert_matrix`); any other binding is refused."""
+    if not banks:
+        return variables
+    from dew.quantization import QUANTIZATION
+
+    params: dict[tuple, object] = dict(flatten_dict(dict(variables["params"])))
+    held: dict[tuple, object] = dict(flatten_dict(dict(variables.get(QUANTIZATION, {}))))
+    bound = {layout.name: layout for layout in layouts}
+    for name, bank in banks.items():
+        layout = bound.get(name)
+        if layout is None or len(layout.paths) != 1 or layout.paths[0][0] != "params" or (
+                layout.transpose or layout.concatenate is not None or layout.expert_index is not None):
+            raise ValueError(f"{name} binds {None if layout is None else layout.paths}, which a packed bank "
+                             "does not take: it holds a whole [experts, in, out] matrix at one path")
+        path = layout.paths[0][1:]
+        del params[path]
+        held[path] = bank
+    return {**variables, "params": unflatten_dict(params), QUANTIZATION: unflatten_dict(held)}
 
 
 def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping[str, object], Variables]:
@@ -2394,7 +2481,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                         remote: Path | None = None, pinned: sources.SourceReference | None = None,
                         routed: _Routed | None = None,
                         text_only: bool = False, prediction_depths: int | None = None,
-                        config_root: Path | None = None) -> tuple[Pretrained, bool]:
+                        config_root: Path | None = None, packed_experts: bool = False
+                        ) -> tuple[Pretrained, bool]:
     """Decode native source weights and bind their processors and export layout, and whether the
     bundle is a wrapper's language model taken alone (`text_only`). `remote` is the source's own code
     where the load runs it, and `pinned` where it was fetched (`source_route`). `routed` is the route a
@@ -2461,7 +2549,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     if language is not None:
         tensors = _language_model_tensors(tensors, language)
     translated = _translated(config, route, tensors, directory, dtype=dtype, param_dtype=param_dtype,
-                             attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming)
+                             attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming,
+                             packed_experts=packed_experts)
     model, variables, record, built, layouts, retained, export_adapter = translated.built
     quantized_tensors, scale_dtype, grid, stored = translated[1:]
     resolved_commit = commit
