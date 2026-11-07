@@ -15,11 +15,11 @@ from jax.extend import core
 LAUNCHES = (pallas_call_module.pallas_call_p, mpmd.mpmd_map_p)
 """The primitives a Pallas launch binds: `pallas_call`, and `mpmd_map` (`pl.kernel`, `plgpu.kernel`)."""
 
-NESTED = {"pjit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr", "remat": "jaxpr",
-          "checkpoint": "jaxpr", "custom_jvp_call": "call_jaxpr", "custom_vjp_call": "call_jaxpr",
-          "custom_vjp_call_jaxpr": "fun_jaxpr", "custom_lin": None}
-"""The primitives whose body runs once on their operands, and the parameter holding it: walked into. A
-`custom_lin` is a linearization's own, run as bound."""
+NESTED = {"jit": "jaxpr", "pjit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr",
+          "remat": "jaxpr", "checkpoint": "jaxpr", "custom_jvp_call": "call_jaxpr",
+          "custom_vjp_call": "call_jaxpr", "custom_vjp_call_jaxpr": "fun_jaxpr", "custom_vmap_call": "call"}
+"""The primitives whose body runs once on their operands, and the parameter holding it: walked into
+(`jit` is a nested `jax.jit`'s; `custom_vmap_call` wraps a Mosaic GPU kernel's `mpmd_map`)."""
 
 
 def launched_outputs(function, *args) -> list[tuple[str, list[np.ndarray]]]:
@@ -55,7 +55,7 @@ def _evaluated(jaxpr: core.Jaxpr, consts, args, found: list) -> list:
             found.append((str(label),
                           [np.asarray(jax.device_get(output)) for output in launched]))
             outs = list(launched)
-        elif NESTED.get(name) is not None and NESTED[name] in equation.params:
+        elif name in NESTED and NESTED[name] in equation.params:
             body = equation.params[NESTED[name]]
             inner, inner_consts = ((body.jaxpr, body.consts) if isinstance(body, core.ClosedJaxpr)
                                    else (body, ()))
