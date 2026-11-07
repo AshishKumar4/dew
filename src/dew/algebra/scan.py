@@ -18,7 +18,7 @@ exponents' inclusive prefix (per key), `Gamma[i, j, k] = exp(G_ik - G_jk)` for `
     h_out = gamma_last h_in + sum_j (B_j * exp(G_last - G_j)) w_j^T,
 
 Mamba-2's state-space dual where no token corrects (`w = U`), derived from the token update rather than
-written. The prefix is taken compensated (each partial a float and its rounding error, `two_sum`), and every
+written. The prefix is taken compensated (each partial a float and its rounding error, `compensated_add`), and every
 difference of two partials from both parts: a plain prefix loses about 1e-6 of a deep decay (ledger 2098). A
 chunk's adjoint (`backward`) is its forms' derivative, each exponent's from the decays whose sums hold it,
 summed without one term added and taken away again (`_decays_backward`). A token a reset marks (`Scan.reset`,
@@ -47,7 +47,7 @@ from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_derivative
-from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum, vanishing
+from dew.nn.precision import at_least_fp32, compensated_add, float32_einsum, float32_matmul, vanishing
 
 Axes = tuple[str, ...]
 
@@ -752,10 +752,11 @@ def _lowered_rule() -> Callable:
 def _compensated(values, *, reverse: bool = False, restarts=None) -> tuple[jax.Array, jax.Array]:
     """`values`' inclusive prefix sums along their first axis (suffix sums where `reverse`), each a float and
     its rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
-    element of it the first of its segment's)."""
+    element of it the first of its segment's). Each pair joined renormalized (`compensated_add`), the hand
+    math's sum: a pair left unrenormalized held a residual that a product XLA:CPU fused into its sum (a
+    rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966)."""
     def combine(left, right):
-        total, error = two_sum(left[0], right[0])
-        summed = total, error + left[1] + right[1]
+        summed = compensated_add(left[:2], right[:2])
         if restarts is None:
             return summed
         # Where the right part restarts, the left's sums are not its segment's.
