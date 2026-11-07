@@ -207,6 +207,47 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
+@pytest.mark.parametrize("scale_dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("offset", [False, True])
+def test_a_weight_folded_into_the_inverse_associates_as_flax_and_takes_every_gradient(dtype, scale_dtype,
+                                                                                       offset):
+    """`rms_normalized(..., weight_first=True)`: the weight folded into the inverse RMS before the rows,
+    Flax's `nn.RMSNorm` (`x * (rsqrt(mean + eps) * w)`, every step in fp32, cast once). XLA's path computes
+    exactly that, Flax's module's own output bitwise; the fused norm takes it (interpreted on this CPU),
+    its output and every gradient on par with XLA's by check 1. A cast between the weight and the rows
+    (`scale_after_cast`) has no fold to make, and is refused."""
+    from flax import linen as nn
+
+    def xla(output_dtype, x, scale):
+        return rms_normalized(x, scale, 1e-5, output_dtype, scale_offset=offset, scale_after_cast=False,
+                              fp32_statistics=True, implementation="xla", weight_first=True)
+
+    def portable(x, branch, scale):
+        return stream_rms_normalized(x, branch, scale, 1e-5, dtype, scale_offset=offset,
+                                     scale_after_cast=False, fp32_statistics=True, implementation="xla",
+                                     weight_first=True)
+
+    def fused(x, scale):
+        return norm_swiglu.stream_rms_norm(x, None, scale, 1e-5, dtype, offset=offset, after_cast=False,
+                                           portable=portable, weight_first=True)[1]
+
+    (x, scale), _ = norm_operands((3, 5, 64), dtype, scale_dtype)
+    # The offset adds in the stored weight's dtype, as Dew's norm adds it.
+    weight = scale + 1.0 if offset else scale
+    flax = nn.RMSNorm(epsilon=1e-5, dtype=jnp.float32, param_dtype=weight.dtype)
+    expected = flax.apply({"params": {"scale": weight}}, x.astype(jnp.float32)).astype(dtype)
+    np.testing.assert_array_equal(np.asarray(jax.jit(functools.partial(xla, dtype))(x, scale), np.float32),
+                                  np.asarray(expected, np.float32))
+    compare((functools.partial(xla, dtype), fused, functools.partial(xla, jnp.float64)),
+            lambda draw: norm_operands((2, 3, 31), dtype, scale_dtype, draw), ("y", "x", "scale"),
+            SEEDS[(2, 3, 31)],
+            coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=False))
+    with pytest.raises(ValueError, match="weight_first"):
+        rms_normalized(x, scale, 1e-5, dtype, scale_offset=offset, scale_after_cast=True,
+                       fp32_statistics=True, weight_first=True)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("case", ["random-2x3x31", "random-3x257x17", "random-5x2x128", "aligned-1x128",
                                   "large-1x128", "small-1x128"])
 def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(dtype, case):

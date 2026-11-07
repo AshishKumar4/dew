@@ -523,24 +523,92 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     return executable
 
 
+TRITON_TARGET = "__gpu$xla.gpu.triton"
+"""The custom call target of a Pallas-Triton kernel, whose backend config names it."""
+
+
+def refused_alone(lowered: jax.stages.Lowered) -> dict[str, int]:
+    """The Pallas-Triton kernels of `lowered` XLA refuses for their shared memory each compiled alone, by
+    name, with the bytes each asked (`shared_asked`): each kernel's call cloned into a module of its own,
+    its operands the module's parameters and its results the module's, compiled by `lowered`'s own backend
+    for one of its devices (a compile-only device's too). A kernel alone that compiles, or that XLA refuses
+    for another reason, is none of them."""
+    from jax._src import compiler
+    from jax._src.lib import xla_client
+    from jax._src.lib.mlir.dialects import func
+
+    # The compile's own backend and devices (JAX's lowering holds them; `Lowered` states neither).
+    lowering = lowered._lowering
+    backend, device = lowering.compile_args["backend"], next(iter(lowering._device_list))
+    module = lowered.compiler_ir("stablehlo")
+    calls = []
+
+    def walk(operation) -> None:
+        for region in operation.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    inner = inner.operation
+                    if (inner.name == "stablehlo.custom_call"
+                            and ir.StringAttr(inner.attributes["call_target_name"]).value == TRITON_TARGET):
+                        calls.append(inner)
+                    walk(inner)
+
+    walk(module.operation)
+    refused: dict[str, int] = {}
+    for call in calls:
+        name = ir.StringAttr(ir.DictAttr(call.attributes["mhlo.backend_config"])["name"]).value
+        if name in refused:
+            continue
+        with module.context, ir.Location.unknown():
+            alone = ir.Module.create()
+            alone.operation.attributes["sym_name"] = ir.StringAttr.get("alone")
+            with ir.InsertionPoint(alone.body):
+                kind = ir.FunctionType.get([value.type for value in call.operands],
+                                           [value.type for value in call.results])
+                entry = func.FuncOp("main", kind)
+                entry.attributes["sym_visibility"] = ir.StringAttr.get("public")
+                block = entry.add_entry_block()
+                with ir.InsertionPoint(block):
+                    clone = call.clone()
+                    for index, argument in enumerate(block.arguments):
+                        clone.operands[index] = argument
+                    # A sharding names the program's mesh, which the module alone holds none of.
+                    held = [getattr(attribute, "name", attribute) for attribute in clone.attributes]
+                    for attribute in [name for name in held if name.startswith("sdy.")]:
+                        del clone.attributes[attribute]
+                    func.ReturnOp(clone.results)
+        options = compiler.get_compile_options(num_replicas=1, num_partitions=1, device_assignment=(device,),
+                                               backend=backend)
+        try:
+            compiler.backend_compile_and_load(backend, alone, xla_client.DeviceList((device,)), options, [])
+        except jax.errors.JaxRuntimeError as error:
+            if (bytes_asked := shared_asked(error)) is not None:
+                refused[name] = bytes_asked
+    return refused
+
+
 def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                relower: Callable[[], jax.stages.Lowered], asked: int,
                error: Exception) -> jax.stages.Compiled:
     """The program XLA refused for a Triton kernel asking `asked` shared bytes past a block, compiled once
-    more with every one of its Triton launches' configs refused at once (each its next derived config, as a
-    spill refuses one, `kept`): XLA's refusal names no kernel, and a search for the asking launch would
-    compile the whole program a launch at a time (row 3584). Each launch's miss is recorded and logged at
-    the bytes asked; where the relowered program is refused again, or a derivation finds no config left
-    (`Exhausted`), the refusal stands, each a miss not stepped."""
+    more with the configs of the Triton launches XLA refuses each compiled alone refused (`refused_alone`,
+    each its next derived config, as a spill refuses one, `kept`), or every Triton launch's where none is
+    refused alone: XLA's refusal names no kernel, and a search compiling the whole program a launch at a
+    time costs a program's compile a launch (row 3584), where a kernel's call compiled alone costs its own
+    (audit group 71). Each launch's miss is recorded and logged at the bytes it asked; where the relowered
+    program is refused again, or a derivation finds no config left (`Exhausted`), the refusal stands, each
+    a miss not stepped."""
     from dew.nn.kernels.lowered import kernel_calls
 
     tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
+    alone = refused_alone(lowered)
     # Every Triton kernel XLA compiles, a branch no run reaches too (a guarded forward's rewalk).
     for call in kernel_calls(lowered, unrun=True):
         kernel, digest = kernel_of(call.name)
         launch = None if call.kind != "triton" or digest is None else traced(digest)
-        if launch is not None:
+        if launch is not None and (not alone or call.name in alone):
             tried.setdefault((launch.identity, launch.config), (kernel, launch))
+    asked_by = {kernel_of(name)[0]: bytes_asked for name, bytes_asked in alone.items()}
     try:
         with _proposing([(refusal, kernel) for refusal, (kernel, _) in tried.items()]) as proposal:
             replacement, spilling = _compiled_reported(relower(), options)
@@ -548,12 +616,12 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
         if isinstance(again, jax.errors.JaxRuntimeError) and shared_asked(again) is None:
             raise
         for kernel, launch in tried.values():
-            _missed_block(kernel, launch, asked, stepped=False)
+            _missed_block(kernel, launch, asked_by.get(kernel, asked), stepped=False)
         raise error from again
     _commit(proposal)
     for refusal, (kernel, launch) in tried.items():
         _record(refusal, None, frozenset({kernel}))
-        _missed_block(kernel, launch, asked, stepped=True)
+        _missed_block(kernel, launch, asked_by.get(kernel, asked), stepped=True)
     _recorded(_misses_of(spilling), stepped=False)
     return replacement
 

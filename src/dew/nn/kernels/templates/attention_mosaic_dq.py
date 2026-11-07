@@ -223,7 +223,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
         interpret=walk.interpret, approx_math=walk.approx_math,
         name=name,
-        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
+        reducing_warpgroups=reducing(family, consumers, walk.reduces),
         # The products this launch issues (`stated`): its `S` and `dP` recomputed, each part of its share of
         # dQ's (`part_count`) and, in the accurate form, of the keyed sums'; its share of dQ's product the
         # model's it owns (`modelled`).
