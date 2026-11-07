@@ -99,6 +99,19 @@ def test_dew_pipeline_loads_a_packages_run_only_when_trusted(tmp_path):
     module, name, value = loaded.stdout.split()
     assert (module, name) == ("toypackage.models", "Scalar")
     assert float(value) == float(trained.stdout.split()[-1])
+    # Its export, the run's native release, loads in a new process only when trusted, as the run does.
+    release = tmp_path / "release"
+    export = ("from dew.inference.tasks import SavedRun\n"
+              "from dew.interop.saved_sources import export_run\n"
+              f"export_run(SavedRun.pinned({str(run)!r}, trust=('toypackage',)), {str(release)!r})\n")
+    exported = _run(tmp_path, export)
+    assert exported.returncode == 0, exported.stderr[-2000:]
+    refused = _run(tmp_path, refuse.replace(str(run), str(release)))
+    assert refused.returncode == 0, refused.stderr[-2000:]
+    assert json.loads(refused.stdout.splitlines()[-1]) == {"refused": True, "imported": False}
+    again = _run(tmp_path, load.replace(str(run), str(release)))
+    assert again.returncode == 0, again.stderr[-2000:]
+    assert again.stdout.split() == loaded.stdout.split()
 
 
 PACKAGE_RUN = '''
