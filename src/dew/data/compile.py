@@ -1269,12 +1269,14 @@ def _compile_phases(
         # and again with the ends of the phases before it once the run reaches them (`opened`).
         ends = [end for _, end in staged if end is not None]
         phase = staged_at(index, {} if tokens else consumed_by([phase for phase, _ in staged], ends))
-        # One batch for the run: its steps are one program, and a phase's end is its steps in those rows.
+        # One batch for every phase: a phase's end on the step clock is its steps in the first phase's
+        # rows (`until * batch`), which phases of other batches would misplace, and the token clock's
+        # phases are held to it alike until each phase's own steps count toward its end (row 4812).
         if staged and phase.build.batch != staged[0][0].build.batch:
             raise ValueError(f"phase {index} reads batches of {phase.build.batch} rows and phase 0 of "
-                             f"{staged[0][0].build.batch}; a run's steps are of one batch, so batch every "
-                             "phase alike, or ramp the batch the run steps (`dew.data.dataset.ramped`, a run "
-                             "config's trainer.batch_ramp)")
+                             f"{staged[0][0].build.batch}; a phase's end is counted in the first phase's "
+                             "batch, so batch every phase alike, or ramp the batch the run steps "
+                             "(`dew.data.dataset.ramped`, a run config's trainer.batch_ramp)")
         staged.append((phase, None if tokens or until is None else until * phase.build.batch))
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
