@@ -635,13 +635,16 @@ class AttentionMetadata:
         return None if self.coordinates is None else self.coordinates.entered
 
 def check_tree(parents: tuple[int, ...], length: int, *, decode: bool, positioned: bool,
-               ordered: bool) -> None:
+               ordered: bool, entered: bool) -> None:
     """Refuse a tree call (`AttentionMetadata.tree_parents`) no layer could read as its paths: outside a
     cached call, of another length than its `length` tokens, with a parent not before its child,
     branching where the call does not state its tokens' positions (`positioned`: coordinates or rotary
     positions, each token's its depth, which its index is on a chain alone), or in a model that reads the
     call's tokens in their order before its mixers see the tree (`ordered`: n-gram hashes, routing
-    blocks)."""
+    blocks), or beside documents that enter another (`entered`: a tree verify reads the cache as held,
+    and an entered document reads another's memory, which no mixer reads along a tree's paths)."""
+    if entered:
+        raise ValueError("a tree call reads the row's cache as held; its documents enter no other")
     if not decode or len(parents) != length or any(not -1 <= parent < index
                                                    for index, parent in enumerate(parents)):
         raise ValueError(f"a tree is a cached call's, each of its {length} tokens' parent an earlier one "
