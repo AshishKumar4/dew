@@ -345,6 +345,7 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
     env.update(zip(jaxpr.invars, values, strict=True))
     widened: dict[int, object] = {}
     laid: dict[int, tuple] = {}
+    squeezed: dict[int, object] = {}
 
     def read(atom):
         return atom.val if isinstance(atom, jcore.Literal) else env[atom]
@@ -360,7 +361,8 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
             # A value of constants alone is computed where it is made, so the program and a declaration
             # hold one constant (a mean of zeros, a mask of iotas) however each built it.
             with jax.ensure_compile_time_eval():
-                outputs = _normal(equation, operands, widened, laid)
+                outputs = _erased(equation, operands, widened, laid, squeezed) or _normal(
+                    equation, operands, widened, laid)
         env.update(zip(equation.outvars, outputs, strict=True))
     return [read(atom) for atom in jaxpr.outvars]
 
@@ -418,6 +420,88 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]
         return [_converted(equation.primitive.bind(*wide, **equation.params), out, widened)]
     bound = equation.primitive.bind(*operands, **equation.params)
     return bound if equation.primitive.multiple_results else [bound]
+
+
+UNIT_ERASED = frozenset({"dot_general", "transpose", "reduce_sum", "reduce_max", "reduce_min", "reshape",
+                         "broadcast_in_dim"})
+"""The layout-reading equations `_erased` computes over their operands' axes of more than one element."""
+
+
+def _erased(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object], laid: dict[int, tuple],
+            squeezed: dict[int, object]) -> list | None:
+    """An equation over values with axes of one element computed over those values with every such axis
+    erased (`_squeeze`), then laid back out to its shape: a size-1 axis holds the same elements wherever
+    a layout puts it, so jax.nn's grouped `[B, T, K, 1, D]` attention and a `[B, T, H, D]` one are one
+    computation. The equation's axes are renumbered over the erased ones: a product's batch and
+    contracting pairs of one element and a reduction over one dropped, a transpose's order kept among the
+    rest. None for an equation that reads no layout (`UNIT_ERASED`, `ELEMENTWISE`) or holds no such axis,
+    which `_normal` computes as it is."""
+    name = jax_name(equation.primitive)
+    if len(equation.outvars) != 1 or not (name in UNIT_ERASED or name in ELEMENTWISE):
+        return None
+    out = equation.outvars[0].aval
+    shapes = [jnp.shape(value) for value in operands]
+    if 1 not in out.shape and not any(1 in shape for shape in shapes):
+        return None
+    kept = [[axis for axis, size in enumerate(shape) if size != 1] for shape in shapes]
+    renumbered = [{axis: place for place, axis in enumerate(axes)} for axes in kept]
+    inner = [_squeeze(value, squeezed) for value in operands]
+    params = dict(equation.params)
+    if name == "dot_general":
+        (lc, rc), (lb, rb) = params["dimension_numbers"]
+        left, right = renumbered
+        contracting = [(a, b) for a, b in zip(lc, rc, strict=True) if a in left]
+        batch = [(a, b) for a, b in zip(lb, rb, strict=True) if a in left]
+        params["dimension_numbers"] = ((tuple(left[a] for a, _ in contracting),
+                                        tuple(right[b] for _, b in contracting)),
+                                       (tuple(left[a] for a, _ in batch), tuple(right[b] for _, b in batch)))
+    elif name == "transpose":
+        order = [axis for axis in params["permutation"] if axis in renumbered[0]]
+        params["permutation"] = tuple(renumbered[0][axis] for axis in order)
+    elif name.startswith("reduce_"):
+        params["axes"] = tuple(renumbered[0][axis] for axis in params["axes"] if axis in renumbered[0])
+        if not params["axes"]:
+            core = inner[0]
+            return [_unsqueezed(core, out.shape, squeezed)]
+    elif name == "broadcast_in_dim":
+        target = [size for size in out.shape if size != 1]
+        at = {axis: place for place, axis in enumerate(a for a, size in enumerate(out.shape) if size != 1)}
+        params["shape"] = tuple(target)
+        params["broadcast_dimensions"] = tuple(at[params["broadcast_dimensions"][axis]] for axis in kept[0])
+    elif name == "reshape":
+        target = tuple(size for size in out.shape if size != 1)
+        core = inner[0] if jnp.shape(inner[0]) == target else jax.lax.reshape(inner[0], target)
+        return [_unsqueezed(core, out.shape, squeezed)]
+    elif any(jnp.shape(value) != () and jnp.shape(value) != out.shape for value in operands):
+        return None
+    core_shape = jax.eval_shape(lambda *values: equation.primitive.bind(*values, **params), *inner).shape
+    inner_equation = equation.replace(params=params, outvars=[jcore.Var(out.update(shape=core_shape))])
+    core = _normal(inner_equation, inner, widened, laid)[0]
+    return [_unsqueezed(core, out.shape, squeezed)]
+
+
+def _squeeze(value, squeezed: dict[int, object]):
+    """`value` with its axes of one element erased: the erased value it was laid out from where it was
+    (`squeezed`), else its reshape, once a value."""
+    shape = jnp.shape(value)
+    if 1 not in shape:
+        return value
+    if id(value) in squeezed:
+        return squeezed[id(value)]
+    target = tuple(size for size in shape if size != 1)
+    made = (np.reshape(np.asarray(value), target) if not isinstance(value, jax.core.Tracer)
+            else jax.lax.reshape(value, target))
+    squeezed[id(value)] = made
+    return made
+
+
+def _unsqueezed(core, shape: tuple[int, ...], squeezed: dict[int, object]):
+    """`core` laid out to `shape`, its axes of one element restored, recorded as `core`'s (`squeezed`)."""
+    if jnp.shape(core) == tuple(shape):
+        return core
+    made = jax.lax.reshape(core, tuple(shape))
+    squeezed[id(made)] = core
+    return made
 
 
 ELEMENTWISE = ROUNDED_ONCE | {"convert_element_type", "select_n", "integer_pow", "square", "sign", "floor",
