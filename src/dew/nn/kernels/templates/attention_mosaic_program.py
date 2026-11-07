@@ -407,11 +407,24 @@ def _multiples(family: mosaic.Family, unit: int, extent: int) -> tuple[int, ...]
     return tuple(range(top * unit, 0, -unit))
 
 
+BACKWARD_CONSUMERS = 2
+"""The consumers a backward launch takes at most: its exchanges and splits pair them (a dK/dV block's column
+shares, a slot's query shares, `Family.exchange`'s two schedules). A third left a 64-row tile 21 rows a share
+and the accurate form 30 to 290 times the reference's error (045aa11863e). The forward's walk
+takes the family's every consumer (FlashAttention 3's d64 tile: three, 192 rows)."""
+
+
+def most_consumers(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> int:
+    """The consumers a launch of `tiles` takes at most on `family`: a forward's the family's own
+    (`Family.consumers`), a backward's at most `BACKWARD_CONSUMERS`."""
+    return family.consumers if isinstance(tiles, Tiles) else min(family.consumers, BACKWARD_CONSUMERS)
+
+
 def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
     """Whether a program of `family` takes `tiles`: its query and key tiles positive whole multiples of the
-    rows a role's products cover (`Family.rows`), and one to the family's count of consumers
-    (`Family.consumers`), whose turns its walks are written for."""
-    return (0 < tiles.consumers <= family.consumers and tiles.block_q > 0 and tiles.block_k > 0
+    rows a role's products cover (`Family.rows`), and one to its launch's count of consumers
+    (`most_consumers`), whose turns its walks are written for."""
+    return (0 < tiles.consumers <= most_consumers(family, tiles) and tiles.block_q > 0 and tiles.block_k > 0
             and tiles.block_q % family.rows == 0 and tiles.block_k % family.rows == 0)
 
 
@@ -971,7 +984,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
     def __post_init__(self):
         if not whole_tiles(self.family, self.tiles):
             raise ValueError(f"{self.tiles}: query and key tiles of whole {self.family.rows} rows and "
-                             f"{self.family.consumers} consumers at most ({self.family.name})")
+                             f"{most_consumers(self.family, self.tiles)} consumers at most "
+                             f"({self.family.name})")
 
     def walked(self, first):
         """The key tiles a query block from `first` reads: those holding the call's keys (none wholly past

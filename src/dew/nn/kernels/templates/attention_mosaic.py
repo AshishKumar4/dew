@@ -66,6 +66,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     fewer_rows,
     launch_scope,
     layouts,
+    most_consumers,
     query_rows,
     query_swizzle,
     reducing,
@@ -113,7 +114,7 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     of a smaller one). `tiles(rows, walked, consumers)` builds the config; `rows` a consumer's where given
     (a backward's `fewer_rows`). None where no tile fits."""
     rows = query_rows(family, dtype, held) if rows is None else rows
-    most = family.consumers if overlapped else 1
+    most = most_consumers(family, tiles(rows, family.rows, 1)) if overlapped else 1
     for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
         for extent in walks(family, dtype, walked):
             for narrow in stagings(family):
@@ -236,7 +237,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
                    {"consumers": config.consumers - 1}, {"consumers": config.consumers + 1}]
         return tuple(dataclasses.replace(config, **change) for change in changes
                      if all(value > 0 for value in change.values())
-                     and change.get("stages", 2) >= 2 and change.get("consumers", 1) <= family.consumers)
+                     and change.get("stages", 2) >= 2
+                     and change.get("consumers", 1) <= most_consumers(family, config))
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         target = generation.gpu_target()
