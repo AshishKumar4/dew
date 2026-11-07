@@ -285,13 +285,10 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
                and var not in inputs]
     wanted = list(dict.fromkeys(var for candidate, _ in spans for var in (*candidate.operands,
                                                                          *candidate.outputs)))
-    window = jcore.Jaxpr([var for var in index.consts if _reads(index, places, var)], inputs, wanted,
-                         [index.jaxpr.eqns[place] for place in places])
-    consts = [index.consts[var] for var in window.constvars]
-    run = jcore.jaxpr_as_fun(jcore.ClosedJaxpr(window, consts))
+    run, consts = _window(index, places, inputs, wanted)
 
     def joint(*values):
-        held = dict(zip(wanted, run(*values), strict=True))
+        held = dict(zip(wanted, run(*consts, *values), strict=True))
         results = [held[var] for candidate, _ in spans for var in candidate.outputs]
         for candidate, _ in spans:
             results += _declaration(candidate)(*(held[var] for var in candidate.operands))
@@ -364,6 +361,16 @@ def _typed(value) -> Hashable:
     if isinstance(value, (tuple, list)):
         return tuple(_typed(item) for item in value)
     return value
+
+
+def _window(index: fusion.Index, places: Sequence[int], inputs: Sequence[jcore.Var],
+            outputs: Sequence[jcore.Var]) -> tuple[Callable, list]:
+    """The equations at `places` as a function of the body's constants they read, then `inputs`, making
+    `outputs`, and those constants' values: its constants passed as its leading arguments, as a program
+    closing over them computes them."""
+    held = [var for var in index.consts if _reads(index, places, var)]
+    window = jcore.Jaxpr([], [*held, *inputs], list(outputs), [index.jaxpr.eqns[place] for place in places])
+    return jcore.jaxpr_as_fun(jcore.ClosedJaxpr(window, [])), [index.consts[var] for var in held]
 
 
 def _reads(index: fusion.Index, places: Sequence[int], var: jcore.Var) -> bool:
@@ -1054,10 +1061,9 @@ def _fills(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequence[
             if isinstance(atom, jcore.Var) and atom not in index.consts
             and index.producer.get(atom) not in places)
     inputs = list(dict.fromkeys([*operands, *read]))
-    window = jcore.Jaxpr([var for var in index.consts if _reads(index, places, var)], inputs, [output],
-                         [index.jaxpr.eqns[place] for place in places])
-    closed = _canonical(jax.make_jaxpr(jcore.jaxpr_as_fun(jcore.ClosedJaxpr(
-        window, [index.consts[var] for var in window.constvars])))(*(_shape(var) for var in inputs)))
+    run, consts = _window(index, places, inputs, [output])
+    closed = _canonical(jax.make_jaxpr(lambda *values: run(*consts, *values))(
+        *(_shape(var) for var in inputs)))
     found: dict[float, None] = {}
     for equation in closed.jaxpr.eqns:
         if jax_name(equation.primitive) != "select_n":
