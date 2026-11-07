@@ -38,7 +38,8 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "flaxdiff_family"
 LAYOUT = json.loads((FIXTURES / "layout.json").read_text())
 """Each case's FlaxDiff parameters' shapes by '/'-joined path, and the Fourier table its FourierEmbedding
 draws, the model's constant (tools/flaxdiff_family_worker.py --layout)."""
-FAMILY_SEEDS = dict.fromkeys(CASES, 8)
+FAMILY_SEEDS = {**dict.fromkeys(CASES, 8), "simple_udit/variant": 32, "simple_mmdit/variant": 16,
+                "unet/variant": 32}
 """Each case's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
 OUTPUTS = ("output", "gradients")
 """The leaves `dew` gives, each site's recorded leaves."""

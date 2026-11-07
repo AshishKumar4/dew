@@ -20,10 +20,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from float64_terms import float32_values
+from float64_terms import float32_values, float64_forward
 from multimodal_families import FAMILIES
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import GateFailure, widened
-from reference_runs import assert_as_exact_as_recorded
 from safetensors.numpy import load_file
 
 from dew.batch import coordinates
@@ -474,151 +474,100 @@ def test_a_cached_continuation_reads_the_coordinates_its_prefill_was_placed_at()
                                   np.asarray(continued(positions=positions[:, :4])))
 
 
-def test_source_processor_and_cached_generation_match_reference(family_source):
-    """Actual processors to native models: Gemma4's padded patches with active clipping and its video
-    placeholder decode rule, Qwen3.5's packed channel-time patches with spatial M-RoPE, Llama4's local and
-    global tiles, Gemma3n's MobileNet features, hard vocabulary ranges, fixed audio slots and per-layer
-    input masking beside its conformer audio: each family's processor encodes the reference's ids, and its
-    cached greedy continuation is the reference's."""
-    _, loaded, inputs, directory = family_source
+def test_source_processor_forward_and_cached_generation_match_reference(family_source):
+    """Actual processors to native models: Gemma4's padded patches with active
+    clipping and its video placeholder decode rule, Qwen3.5's packed
+    channel-time patches with spatial M-RoPE, Llama4's local and global tiles,
+    Gemma3n's MobileNet features, hard vocabulary ranges, fixed audio slots
+    and per-layer input masking beside its conformer audio.
+
+    The valid logits are as exact as the reference's (`assert_as_exact_as_the_reference`), the truth
+    its float64 twin's; each family's characteristic slip fails the same rule.
+    """
+    family, loaded, inputs, directory = family_source
     np.testing.assert_array_equal(inputs.tokens, np.load(directory / "input_ids.npy"))
+    logits = jax.jit(lambda variables: loaded.model.apply(
+        variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
+    valid = np.asarray(inputs.token_fields["attention_mask"])
+    expected, truth = np.load(directory / "logits.npy"), np.load(directory / "logits_f64.npy")
+    assert_as_exact_as_the_reference(np.asarray(logits)[valid], expected[valid], truth[valid],
+                                     f"{family} logits")
+    wrong_inputs = _wrong_inputs(family, inputs)
+    wrong = loaded.model.apply(loaded.variables, wrong_inputs.tokens, **wrong_inputs.kwargs())
+    with pytest.raises(GateFailure):
+        assert_as_exact_as_the_reference(np.asarray(wrong)[valid], expected[valid], truth[valid],
+                                         f"{family} logits of a slip")
     generated = loaded.text_generation()(inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(directory / "continuation.npy"))
 
 
-FAMILY_SEEDS = dict.fromkeys(FAMILIES, 8)
-"""Each family's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
-OUTPUTS = ("logits", "loss", "pixel_gradient", "updated_logits")
-"""The leaves `dew` gives, each site's recorded leaves (tools/multimodal_worker.py)."""
-LEARNING_RATE = 1e-4
-"""The SGD step's rate, tools/multimodal_reference.py's."""
+def test_source_backward_trained_export_and_frozen_buffers_match_reference(family_source, tmp_path):
+    """Loss, pixel gradient and all-parameter SGD against the reference backward.
 
-
-def processed(family: str):
-    """The family's checkpoint loaded, its prompts, and `process(images, clips)`: its processor over them,
-    one image in the first row and two in the second."""
-    references, checkpoint = FAMILIES[family]
-    loaded = Pretrained.load(FIXTURE.parent / checkpoint, dtype="float32", attention_impl="reference")
-    prompts = json.loads((FIXTURE.parent / references / "prompts.json").read_text())
-
-    def process(images, clips):
-        return loaded.processor(prompts, images=[[images[0]], [images[1], images[2]]], audio=clips or None)
-    return loaded, process
-
-
-def drawing(family: str):
-    """`draw(seed)` of `family`: three images of its recorded images' shape, one in the first row and two in
-    the second, and for a family that hears, waveforms of its recorded clips' lengths, which the reference's
-    processor reads; and their encoding by the family's own processor, each leaf `dew.<index>` in its
-    tree's order (`encoding`), which Dew reads."""
-    references, checkpoint = FAMILIES[family]
-    shape = np.load(FIXTURE.parent / references / "raw_images.npy").shape
-    clips = [np.load(path).shape for path in sorted((FIXTURE.parent / checkpoint).glob("waveform_*.npy"))]
-    _, process = processed(family)
-
-    def draw(seed: int) -> dict[str, np.ndarray]:
-        rng = np.random.default_rng([493, seed])
-        raw = {"images": rng.integers(0, 256, shape, dtype=np.uint8),
-               **{f"audio_{clip}": (rng.standard_normal(length) * 0.1).astype(np.float32)
-                  for clip, length in enumerate(clips)}}
-        leaves = jax.tree.leaves(process(raw["images"], [raw[f"audio_{clip}"] for clip in range(len(clips))]))
-        return {**raw, **{f"dew.{index}": np.asarray(leaf) for index, leaf in enumerate(leaves)}}
-    return draw
-
-
-def computing(family: str, *, slipped: bool = False):
-    """`dew(dtype, inputs)` of `family`: over a draw's encoding (`drawing`), at `dtype` (the model rebuilt in
-    float64 for a float64 run, `ModelConfig.with_dtype`), its logits at every valid position, the summed
-    next-token loss, its pixel gradient in the reference's image order (`_real_pixels`, over the encoding's
-    image counts, which every draw shares) and the logits after one SGD step on every parameter. A `slipped`
-    run takes each family's characteristic slip (`_wrong_inputs`) into its logits and one layer's gradient
-    with its sign flipped (`_one_layer_negated`) into its step."""
-    loaded, process = processed(family)
-    references, checkpoint = FAMILIES[family]
-    waveforms = sorted((FIXTURE.parent / checkpoint).glob("waveform_*.npy"))
-    sample = process(np.load(FIXTURE.parent / references / "raw_images.npy"),
-                     [np.load(path) for path in waveforms])
-    tree = jax.tree.structure(sample)
-
-    def dew(dtype, inputs) -> dict:
-        encoded = jax.tree.unflatten(tree, [inputs[f"dew.{index}"] for index in range(tree.num_leaves)])
-        model = (loaded.model if dtype == jnp.float32
-                 else ModelConfig.from_model(loaded.model).with_dtype("float64").build())
-        encoded, variables = jax.tree.map(
-            lambda leaf: jnp.asarray(leaf, dtype) if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating)
-            else leaf, (encoded, loaded.variables))
-        valid = jnp.asarray(encoded.token_fields["attention_mask"], bool)[..., None]
-        objective = LMObjective(model, encoded.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
-        step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
-
-        def forward(variables, given):
-            return model.apply(variables, given.tokens, **given.kwargs())
-
-        def loss(params, pixels):
-            conditioning = {**encoded.conditioning, "pixel_values": pixels}
-            data = dataclasses.replace(encoded, conditioning=conditioning)
-            statistics, _ = objective.loss({**variables, "params": params}, {"text": data}, step)
-            return objective.reduce_loss(statistics)[0]
-
-        value, (gradient, pixels) = jax.value_and_grad(loss, argnums=(0, 1))(
-            variables["params"], encoded.conditioning["pixel_values"])
-        if slipped:
-            gradient = _one_layer_negated(gradient)
-        optimizer = optax.sgd(LEARNING_RATE)
-        updates, _ = optimizer.update(gradient, optimizer.init(variables["params"]), variables["params"])
-        trained = {**variables, "params": optax.apply_updates(variables["params"], updates)}
-        given = _wrong_inputs(family, encoded) if slipped else encoded
-        return {"logits": jnp.where(valid, forward(variables, given), 0), "loss": value,
-                "pixel_gradient": _real_pixels(sample, pixels),
-                "updated_logits": jnp.where(valid, forward(trained, encoded), 0)}
-    return dew
-
-
-def pipeline_arms(family: str):
-    """tools/venv_reference.py's `multimodal-<family>` site: its recording, draw, Dew run and leaves."""
-    return FIXTURE.parent / FAMILIES[family][0] / "recording.npz", drawing(family), computing(family), OUTPUTS
-
-
-@pytest.mark.parametrize("family", list(FAMILIES))
-def test_a_familys_logits_loss_pixel_gradient_and_step_are_on_par_with_its_reference(family):
-    """Each family's valid logits, its summed next-token loss, its pixel gradient and its logits after one
-    SGD step of every parameter on par with the reference's over drawn images and audio (check 1), the
-    truth the reference's float64 twin taking the same step; and each family's characteristic slip, and one
-    layer's gradient with its sign flipped, fail the same check. Whatever order a backend sums Gemma 3n's
-    layer-scale gradients in moves Dew's error and the reference's alike, so no margin for it is chosen."""
-    pytest.importorskip("torchvision", reason="the vision extra supplies the actual processors")
-    recording, draw, dew, _ = pipeline_arms(family)
-    site = f"multimodal-{family}"
-    assert_as_exact_as_recorded(recording, site, FAMILY_SEEDS[family], draw, dew, family)
-    with pytest.raises(GateFailure):
-        assert_as_exact_as_recorded(recording, site, FAMILY_SEEDS[family], draw,
-                                    computing(family, slipped=True), f"{family} slipped")
-
-
-def test_source_trained_export_and_frozen_buffers_match_reference(family_source, tmp_path):
-    """The model trained one SGD step exports under the source's tensor names and reloads to the logits
-    the trained model computes, and every non-parameter collection (Gemma4's standardization and clipping
-    buffers) survives training bitwise. Qwen3.5's root tie_word_embeddings=False overrides its nested text
-    flag: tying the head keeps the initial logits but misses this update."""
-    _, loaded, inputs, _ = family_source
-    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
+    The loss, the pixel gradient and the post-SGD logits are each as exact as the
+    reference's (`assert_as_exact_as_the_reference`), the truth the reference's float64 twin taking
+    the same step, and the rule still fails one layer's gradient with its sign flipped. Whatever
+    order a backend sums Gemma 3n's layer-scale gradients in moves Dew's error and the reference's
+    alike, so no margin for it is chosen. The trained model exports under the
+    source's tensor names and reloads to the reference's updated logits; every
+    non-parameter collection (Gemma4's standardization and clipping buffers)
+    survives training bitwise. Qwen3.5's root tie_word_embeddings=False
+    overrides its nested text flag: tying the head keeps the initial logits
+    but misses this update by 0.00167.
+    """
+    family, loaded, inputs, directory = family_source
+    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1,
+                            ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
 
-    def loss(params):
-        statistics, _ = objective.loss({**loaded.variables, "params": params}, {"text": inputs}, step)
+    def loss(variables, pixels):
+        values = {**loaded.variables, "params": variables}
+        data = dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels})
+        statistics, _ = objective.loss(values, {"text": data}, step)
         return objective.reduce_loss(statistics)[0]
 
-    gradient = jax.jit(jax.grad(loss))(loaded.variables["params"])
+    value, (gradient, pixels) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
+        loaded.variables["params"], inputs.conditioning["pixel_values"])
+    expected = json.loads((directory / "training.json").read_text())
+    truth = json.loads((directory / "training_f64.json").read_text())
+    assert_as_exact_as_the_reference(np.asarray(value), np.asarray(expected["loss"]),
+                                     np.asarray(truth["loss"]), f"{family} loss")
+    assert_as_exact_as_the_reference(_real_pixels(inputs, pixels),
+                                     np.load(directory / "pixel_gradient.npy"),
+                                     np.load(directory / "pixel_gradient_f64.npy"),
+                                     f"{family} pixel gradient")
+    optimizer = optax.sgd(expected["learning_rate"])
     params = loaded.variables["params"]
-    optimizer = optax.sgd(LEARNING_RATE)
-    updates, _ = optimizer.update(gradient, optimizer.init(params), params)
-    trained = {**loaded.variables, "params": optax.apply_updates(params, updates)}
+    valid = np.asarray(inputs.token_fields["attention_mask"])
+    reference = np.load(directory / "updated_logits.npy")[valid]
+    updated = np.load(directory / "updated_logits_f64.npy")[valid]
+
+    def trained(gradient):
+        updates, _ = optimizer.update(gradient, optimizer.init(params), params)
+        return {**loaded.variables, "params": optax.apply_updates(params, updates)}
+
+    # Compiled, where op by op the forwards took a third of the test (ledger 3894).
     forward = jax.jit(lambda model, variables: model.apply(variables, inputs.tokens, **inputs.kwargs()),
                       static_argnums=0)
-    loaded.save(tmp_path / "trained", variables=trained)
+
+    def terms(model, variables):
+        """Each valid logit's float64 terms over `model`'s step, which size its row's rounding: the
+        whole model widened, its language model and towers with the wrapper."""
+        wide = ModelConfig.from_model(model).with_dtype("float64").build()
+        _, sized = float64_forward(wide, variables, inputs.tokens, **inputs.kwargs())
+        return np.asarray(sized)[valid]
+
+    loaded.save(tmp_path / "trained", variables=trained(gradient))
     restored = Pretrained.load(tmp_path / "trained", dtype="float32", attention_impl="reference")
-    np.testing.assert_array_equal(np.asarray(forward(restored.model, restored.variables)),
-                                  np.asarray(forward(loaded.model, trained)))
+    output = np.asarray(forward(restored.model, restored.variables))[valid]
+    assert_as_exact_as_the_reference(output, reference, updated, f"{family} post-SGD logits",
+                                     terms=terms(restored.model, restored.variables))
+    # The rule still catches one layer's gradient with its sign flipped.
+    slip = trained(_one_layer_negated(gradient))
+    slipped = np.asarray(forward(loaded.model, slip))[valid]
+    with pytest.raises(GateFailure):
+        assert_as_exact_as_the_reference(slipped, reference, updated, f"{family} post-SGD logits of a slip",
+                                         terms=terms(loaded.model, slip))
     for collection, tree in restored.variables.items():
         if collection != "params":
             for actual, original in zip(jax.tree.leaves(tree),

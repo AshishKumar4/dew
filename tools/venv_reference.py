@@ -79,11 +79,6 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
              "test": "test_flaxdiff_family_source", "arms": case, "worker": "flaxdiff_family_worker.py",
              "reference": "AshishKumar4/FlaxDiff 15c55b001304604147a2a8002a76cf5d4c32092f", "license": "MIT"}
             for case in importlib.import_module("flaxdiff_family_cases").CASES},
-         **{f"multimodal-{family}": {"test": "test_multimodal_model", "arms": family,
-                                     "worker": "multimodal_worker.py",
-                                     "reference": "huggingface/transformers 5.16.1",
-                                     "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")}
-            for family in ("gemma4", "qwen35", "llama4", "gemma3n")},
          **{f"codec-storage-{kind}": {"test": "test_codec_checkpoints", "arms": f"storage/{kind}",
                                       "worker": "codec_worker.py",
                                       "reference": "neuralmagic/compressed-tensors 0.17.1 with "

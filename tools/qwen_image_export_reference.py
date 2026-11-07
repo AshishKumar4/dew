@@ -32,7 +32,6 @@ import hashlib
 import json
 import sys
 import tarfile
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -42,8 +41,9 @@ ARCHIVE = ROOT / "tests" / "fixtures" / "qwen_image_source.tar.xz"
 GRID = (4, 6)
 PROMPT = 5
 SEED = 89
-EXPORT = Path(tempfile.gettempdir()) / "dew-qwen-image-export" / "export"
-"""Where the recording's Dew half writes the export its worker reads."""
+EXPORT = Path.home() / ".cache" / "dew" / "qwen-image-export" / "export"
+"""Where the recording's Dew half writes the export its worker reads: the user's cache, one path whatever
+temporary directory either process is given."""
 
 
 def perturbed_variables(variables, seed: int = SEED):
