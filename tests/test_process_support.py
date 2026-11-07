@@ -4,6 +4,7 @@ import os
 import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -181,3 +182,24 @@ def test_groups_started_and_stopped_from_many_threads_at_once_each_end_as_their_
 
     with ThreadPoolExecutor(16) as pool:
         assert list(pool.map(ran, range(400))) == [0] * 400
+
+
+def test_a_relayed_child_says_its_output_as_it_comes_and_its_stacks_when_it_runs_past_its_time():
+    """`relayed` runs a child as its own group, every line it writes passed on as it comes, so a rank's log
+    holds how far a gang's child got even when the gang's deadline kills the rank (row 4686: trains 670 and
+    671's lost gangs logged nothing of their children); one past its time is aborted for its faulthandler
+    stacks, which pass on too, its group ended and the test failed."""
+    from process_support import relayed, worker_env
+
+    started = time.monotonic()
+    arrived: list[tuple[float, str]] = []
+    program = "import time\nprint('first step done', flush=True)\ntime.sleep(600)\n"
+    with pytest.raises(pytest.fail.Exception):
+        relayed([sys.executable, "-c", program], worker_env(1), timeout=5,
+                sink=lambda line: arrived.append((time.monotonic() - started, line)))
+    # The first line passed on before the deadline, and the abort's stacks after it, within the deadline's
+    # minute of grace.
+    assert arrived[0][1] == "first step done\n" and arrived[0][0] < 5 < arrived[-1][0] < 120
+    assert len(arrived) > 1
+    done = relayed([sys.executable, "-c", "print('ok')"], worker_env(1), timeout=60, sink=lambda line: None)
+    assert (done.returncode, done.output) == (0, "ok\n")
