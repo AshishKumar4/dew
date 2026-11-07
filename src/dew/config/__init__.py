@@ -393,7 +393,7 @@ class SourceOptions:
     """DEX's differential on chosen heads (`dew.nn.dex`, `Pretrained.load`'s `dex`), its record as
     JSON: `--source.dex '{"layers": [[0, [1, 3]], [5, [0, 2]]], "anneal_steps": 1000}'`, its
     `trains` the paper's recipe unless "all"; None for none."""
-    scan_layers: bool = True
+    scan_layers: bool = False
     """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
     (`Pretrained.load`'s `scan_layers`): a step's program grows with the period, not the depth."""
     param_dtype: str | None = None

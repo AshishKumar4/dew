@@ -23,6 +23,7 @@ from model_support import TINY_DECODER
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
 
+from dew.batch import FROZEN
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
@@ -674,6 +675,36 @@ def test_a_stage_local_lora_fit_merges_and_saves_as_every_layer_whole(tmp_path):
         adapter.save(variables, tmp_path / name)
         written.append({path.name: path.read_bytes() for path in sorted((tmp_path / name).iterdir())})
     assert written[0] == written[1]
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
+    """A LoRA run over a decoder that scans its layers on one stage holds its adapter's factors stacked as
+    the scan reads them, and its frozen base on its stored layers, the arrays the run was given, each
+    iteration reading its layer's rows where they lie (`decoder_stack.LAYER_ROWS`), so the base is held
+    once whatever else holds it (row 4751): its step computes the step whose state stacks the base too, bit
+    for bit, and holds fewer temporaries than that step, which stacks a copy of the base each time it runs
+    and kept each iteration's rows for its backward."""
+    model = decoder(scan_layers=True)
+    base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
+    batch = shard_batch(token_rows(VOCAB, BATCH, SEQ + 1), MeshSpec(fsdp=2).build(jax.devices()))
+    stepped = []
+    for stage_local in (True, False):
+        run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables,
+                      stage_local=stage_local)
+        state, _, _ = run.place()
+        step = run.compile(state, batch)
+        stepped.append((run, state, run.executable.memory_analysis().temp_size_in_bytes, step(state, batch)))
+    ((run, rows, rows_temporaries, (moved, loss, *_)),
+     (_, _, stacked_temporaries, (whole, whole_loss, *_))) = stepped
+    assert "stages" in rows.variables["params"] and "stages" not in rows.variables[FROZEN]
+    assert set(rows.variables[FROZEN]) == set(on_host(adapter.variables)[FROZEN])
+    np.testing.assert_array_equal(np.asarray(loss), np.asarray(whole_loss))
+    for mine, theirs in zip(jax.tree.leaves(on_host(run.stored(moved).variables["params"])),
+                            jax.tree.leaves(on_host(whole.variables["params"])), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
+    assert rows_temporaries < stacked_temporaries, (rows_temporaries, stacked_temporaries)
 
 
 @pytest.mark.mesh(devices=8)

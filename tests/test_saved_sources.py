@@ -98,6 +98,23 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
 
 
 @pytest.mark.mesh(devices=8)
+def test_a_run_resumes_whether_its_decoder_scans_its_layers_or_not(tmp_path):
+    """How a decoder executes its layers (`scan_layers`, `RunConfig.EXECUTED`) is no part of what a run
+    computes or stores, its checkpoint holding every layer `layers_N` either way: a run saved running a
+    layer at a time resumes scanning them, and back, where its resume refused it as another model (row
+    4104)."""
+    first = lm(tmp_path, drawn=False)
+    deeper = dataclasses.replace(first, model=ModelConfig("causal_transformer",
+                                                          {**first.model.fields, "num_layers": 2}))
+    trained(deeper, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
+    for scanned, steps in ((True, 2), (False, 3)):
+        run = dataclasses.replace(deeper, model=ModelConfig("causal_transformer", {
+            **deeper.model.fields, "scan_layers": scanned}))
+        trained(run, tmp_path, "run", trainer={"name": "run", "steps": steps, "checkpoint_final": True})
+        assert str(steps) in {path.name for path in (tmp_path / "runs" / "run").iterdir()}
+
+
+@pytest.mark.mesh(devices=8)
 def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_later_one_is(tmp_path):
     """A decision run calibrated at its first step and trained on, calibrated again at its second, reads
     each step with the calibration fitted on it (`Decide.save` keeps each, `CALIBRATIONS`, and a latest an

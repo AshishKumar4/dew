@@ -450,7 +450,7 @@ class CausalTransformer(LinearProducts):
     (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
-    scan_layers: bool = True
+    scan_layers: bool = False
     """Runs of like layers under flax's scan, and a step over resident weights, training's or a decode
     step's, a period's repeats as one body too (`scan_groups(periodic=True)`), so its program grows with
     the period, not the depth; a stage-local state on one stage holds each run as the scan reads it."""
