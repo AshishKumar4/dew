@@ -1156,10 +1156,11 @@ class Schedule:
         if set(bodies) != {role.name for role in self.roles}:
             raise ValueError(f"a schedule of {[role.name for role in self.roles]} given bodies for "
                              f"{sorted(bodies)}")
-        wg = lax.axis_index("wg")
         if len(self.roles) == 1:
+            # One warpgroup's program has no warpgroup axis to read (an sm80 program's).
             role = self.roles[0]
-            return bodies[role.name](0 if role.count == 1 else wg)
+            return bodies[role.name](0 if role.count == 1 else lax.axis_index("wg"))
+        wg = lax.axis_index("wg")
         budgets = self.registers(_RESIDENT.get())
         first = 0
         for role in self.raised:
