@@ -461,11 +461,17 @@ class Chunk(Expr):
     """`(I + lower)^-1 given` by forward substitution, a row a step."""
 
 
-def _identities(corrects: bool):
-    """The identities of the module's account, `wy` where tokens correct the state."""
+def _identities(corrects: bool, scalar: bool):
+    """The identities of the module's account, `wy` where tokens correct the state. A `scalar` decay's
+    memory is read and then decayed, `(Q h) exp(G)`, as the template's output (`recurrence_algebra.
+    chunk_output`): a memory past fp32's range reads infinite, where its queries decayed first would read a
+    finite, wrong value (ledger 2344). A decay a key's decays each key before the read."""
     values = Chunk.token("U")
     given, other, lower, left, right = vars_("given other lower left right", Chunk)
     h = Chunk.entering()
+    entering = Chunk.decay("entering")
+    queries = Chunk.token("Q")
+    memory = queries.matmul(h).times(entering) if scalar else queries.times(entering).matmul(h)
     found = []
     if corrects:
         system = Chunk.gram(Chunk.token("C"), Chunk.token("B"), 1).rows(Chunk.token("s"))
@@ -474,7 +480,7 @@ def _identities(corrects: bool):
         found.append(rewrite(Chunk.loop(values)).to(Chunk.plain(corrected)))
     found += [
         rewrite(Chunk.plain(given)).to(Chunk.pair(
-            Chunk.token("Q").times(Chunk.decay("entering")).matmul(h).plus(
+            memory.plus(
                 Chunk.gram(Chunk.token("Q"), Chunk.token("B"), 0).matmul(given)).plus(Chunk.token("R")),
             Chunk.decayed(h).plus(Chunk.written(Chunk.token("B"), given)))),
         rewrite(Chunk.pair(left, right).outputs()).to(left),
@@ -561,7 +567,7 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, checked
     loop = Chunk.loop(values) if corrects else Chunk.plain(values)
     root = Chunk.pair(loop.outputs(), loop.state())
     graph.register(root, *_leaves(extents))
-    graph.run((_identities(corrects) | _shapes(extents)).saturate())
+    graph.run((_identities(corrects, extents.decay_keys == 1) | _shapes(extents)).saturate())
 
     def marginal(egraph: EGraph, node) -> cost.Seconds:
         if get_callable_args(node, Chunk.solve) is not None:

@@ -1347,7 +1347,9 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
     compute what their own programs do, as those compiled one after another do, on inputs that tell the
     programs apart: those lowered in distinct MLIR contexts (here, each on a thread of its own, as JAX lowers
     a thread's programs in one) and those sharing one alike, whose compiles JAX's cache key reads without
-    writing their context from 0.12.0.1.post54; each program compiled once (`Compiles`' events)."""
+    writing their context from 0.12.0.1.post54; each program compiled once (`Compiles`' events). Each
+    executable's output is bitwise its own program's compiled by JAX (`Lowered.compile`): one module, one
+    compiler, one executable's arithmetic."""
     import threading
 
     from dew.nn.kernels.templates import report
@@ -1367,13 +1369,18 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
     shared = [jax.jit(function).lower(square, square) for function in functions]
     keys = jax.random.split(jax.random.key(11))
     x, y = (jax.random.normal(key, (256, 256), jnp.float32) for key in keys)
-    expected = [np.asarray(function(x, y)) for function in functions]
+    ran = []
     for lowerings in (apart, shared):
         with Compiles(None) as compiles:
             together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
                                                 for lowered in lowerings])
         assert len([program for program in compiles.programs if program.kind == "compiled"]) == len(functions)
         alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
-        for executables in (together, alone):
-            for executable, want in zip(executables, expected, strict=True):
-                np.testing.assert_allclose(np.asarray(executable(x, y)), want, rtol=1e-6, atol=1e-6)
+        ran.append((lowerings, [[np.asarray(executable(x, y)) for executable in executables]
+                                for executables in (together, alone)]))
+    # JAX's own compiles after every counted one, none of them a cache entry those read.
+    for lowerings, outputs in ran:
+        expected = [np.asarray(lowered.compile()(x, y)) for lowered in lowerings]
+        for got in outputs:
+            for value, want in zip(got, expected, strict=True):
+                np.testing.assert_array_equal(value, want)

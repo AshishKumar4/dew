@@ -33,13 +33,6 @@ def flattened(fn):
     return lambda *operands: jnp.concatenate([out.ravel() for out in jax.tree.leaves(fn(*operands))])
 
 
-PACKED_OVERFLOW_ORDERS = ("primal", "jvp", "vjp", "second jvp", "second jvp, remat")
-"""The orders a packed row of the chunked delta rule holds from 2^62: all but the second orders through its
-gradient, forward over reverse and reverse over reverse, which the owner's decision accepts there (one
-cause, documents sharing chunks, an overflow-only difference: ledger 2470;
-`test_the_chunked_delta_rule_holds_every_order`)."""
-
-
 def precedent_chunked(query, key, value, g, beta, *, chunk_size: int, starts=None):
     """fla's upstream chunked gated delta rule as it is written (`naive_chunk_gated_delta_rule`,
     fla/ops/gated_delta_rule/naive.py), in JAX for its derivatives, over each packed document alone as fla
@@ -94,6 +87,12 @@ in one case took 127 to 156 s near float32's largest, each order's program compi
 4433)."""
 
 
+PACKED_OVERFLOW_ORDERS = tuple(name for orders in ORDER_SETS.values() for name in orders
+                               if name != "grad of grad")
+"""A packed row at 2^63 holds every order but reverse over reverse, the remaining overflow-only difference
+the owner's decision accepts (ledger 2470)."""
+
+
 def outside(taken: str) -> tuple[str, ...]:
     """The orders outside `taken`'s set (`ORDER_SETS`), which its case leaves to the others."""
     return tuple(name for orders in ORDER_SETS.values() for name in orders if name not in ORDER_SETS[taken])
@@ -109,8 +108,8 @@ checkpoint`); a GPU's kernel carries none."""
 @pytest.mark.parametrize(("packed", "edge"), list(itertools.product((False, True), DELTA_RULE_EDGES)),
                          ids=lambda value: {False: "one sequence", True: "packed"}.get(value, value))
 def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
-    """`recurrence_chunk.chunk_delta_rule` (the portable rule's custom derivative through
-    `generation.linear_tangent`, rows 1861 and 1862): every order runs, its boolean document starts a
+    """`recurrence_chunk.xla_mainloop` (the recurrence template's plain-JAX mainloop, the portable route, its
+    derivatives the derived forms' rules, `dew.algebra.scan`): every order runs, its boolean document starts a
     residual with no tangent space, and each is finite wherever float64 is a normal float32 and JAX's own
     derivatives of the token recurrence are (`recurrent_delta_rule`, an independent formula of the same
     rule, in float64 the truth too: the chunk's own float64 run excused its float32 NaNs wherever it was NaN
@@ -119,11 +118,9 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     the chunk weighs zero once multiplied its overflowed tangent by zero, the queries' second derivative NaN
     from 2^48 (ledger 2470).
 
-    A packed row's documents share chunks, so from 2^62 one document's overflow reaches another's forward
-    over reverse (ledger 2608); its other orders hold. The owner accepted that under the accuracy-for-speed
-    rule (ledger 2470, 10-30): documents in chunks of their own held every order and cost the portable
-    packed gradient 25% (JS-cost2470d-h100-80113cc1c) for a difference at overflow alone, where the
-    parameters' gradient is NaN either way."""
+    Packed documents sharing chunks hold the same orders, including forward over reverse through the replay's
+    gradient. Reverse over reverse at 2^63 retains the owner's accepted overflow-only difference (ledger
+    2470)."""
     keys = jax.random.split(jax.random.key(1861), 8)
     rows, length, heads, width = 1, 37, 2, 8
     scale = DELTA_RULE_EDGES[edge]
@@ -133,7 +130,9 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
 
     def rule(query, key, value, g, beta):
-        return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=16, starts=starts)[0]
+        return recurrence_chunk.xla_mainloop(recurrence_chunk.Tiles(16), query, key, value, g[..., 0], beta,
+                                             None, starts, scale=width ** -0.5, delta=True,
+                                             dtype=jnp.float32)[0]
 
     def recurrence(query, key, value, g, beta):
         return recurrence_chunk.recurrent_delta_rule(query, key, value, g, beta, starts=starts)[0]
@@ -144,14 +143,11 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     direction = tuple(jax.random.normal(keys[6], x.shape) * (scale if at < 3 else 1.0)
                       for at, x in enumerate(primals))
     cotangent = jax.random.normal(keys[7], query.shape)
-    # A packed row's second orders through its gradient from 2^62: the owner's accuracy-for-speed acceptance
-    # (ledger 2470, 10-30).
-    accepted = packed and scale >= 2.0**62
     # Each order one program (`jax.jit`): run op by op, an order's eager dispatch compiled 2,570 programs of
     # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
     assert_contract(jax.jit(rule), primals, direction, cotangent, f"the chunked delta rule {edge}",
                     truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=outside(taken),
-                    held=PACKED_OVERFLOW_ORDERS if accepted else None)
+                    held=PACKED_OVERFLOW_ORDERS if packed and edge == "near the largest" else None)
 
 
 def plain_delta_rule(query, key, value, g, beta, state, scale):
@@ -524,12 +520,10 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders(edge):
-    """`dew.algebra.scan`'s chunk adjoint (`backward`) walked back over three chunks of the gated delta rule,
-    each chunk's solve its forward's kept inverse (`_kept`) and each product a mainloop's issuer's, its
-    adjoint's products the issuer's too (`_adjoined`): the queries' gradient, and its reverse derivative (a
-    reverse-only custom derivative's other orders do not run), finite wherever float64 is a normal float32
-    and the token-by-token scan's gradient is."""
+def test_the_derived_delta_rules_chunk_adjoint_holds_its_orders(edge):
+    """`dew.algebra.scan`'s chunk adjoint (`backward`, its token update replayed per chunk) walked back over
+    three chunks of the gated delta rule: the queries' gradient, and every order of it, forward mode among
+    them, finite wherever float64 is a normal float32 and the token-by-token scan's gradient is."""
     tokens, chunk, keys_, values = 24, 8, 4, 6
     draws = jax.random.split(jax.random.key(3312), 6)
     scale = EDGES[edge]
@@ -543,24 +537,17 @@ def test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orde
     forms = scan.derive_scan(scan.Scan(_gated, _read, axes, walked="time",
                                        state=((keys_, values), jnp.float32)), saturation=SATURATION)
 
-    def issue(role, left, right):
-        del role
-        return left @ right
-
     def gradient(q, k, v, g, beta):
         values_ = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
         parts = [{name: value[index * chunk:(index + 1) * chunk] for name, value in values_.items()}
                  for index in range(tokens // chunk)]
-        states, inverses = [forms.init({})], []
+        states = [forms.init({})]
         for part in parts:
-            prepared = forms.prepare(part)
-            inverses.append(prepared.inverse)
-            states.append(forms.step(states[-1], prepared))
+            states.append(forms.step(states[-1], forms.prepare(part)))
         d_state, d_queries = jnp.zeros((keys_, values)), []
         for index in reversed(range(len(parts))):
             d_state, d_chunk = forms.backward(parts[index], states[index], d_state,
-                                              d_out[index * chunk:(index + 1) * chunk], issue,
-                                              inverse=inverses[index])
+                                              d_out[index * chunk:(index + 1) * chunk])
             d_queries.append(d_chunk["q"])
         return jnp.concatenate(d_queries[::-1])
 
@@ -577,5 +564,5 @@ def test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orde
     primals = (q, k, v, g, beta)
     direction = tuple(jax.random.normal(draws[5], x.shape) for x in primals)
     cotangent = jax.random.normal(draws[0], (tokens, keys_))
-    assert_contract(gradient, primals, direction, cotangent, f"the kept and issued delta-rule adjoint {edge}",
-                    truth_fn=tokenwise, plain_fn=tokenwise, without=REVERSE_ONLY)
+    assert_contract(gradient, primals, direction, cotangent, f"the derived delta-rule adjoint {edge}",
+                    truth_fn=tokenwise, plain_fn=tokenwise)
