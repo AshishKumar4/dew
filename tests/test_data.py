@@ -198,6 +198,73 @@ def _by_hand(source, *, seed, batch, count):
             for start in range(0, count * batch, batch)]
 
 
+@dataclasses.dataclass(frozen=True)
+class _Jittered:
+    """A record step that runs Python on each record: its index scaled by a draw from its own generator."""
+
+    identity = "jittered@1"
+
+    def __call__(self, record, rng):
+        return {"index": record["index"], "drawn": float(record["index"]) * rng.uniform()}
+
+
+def _workers_started(reader, count: int) -> tuple[list, int]:
+    """The first `count` batches of `reader` (`listed`) and the processes this one had started by then."""
+    import psutil
+
+    read = listed(reader, count)
+    return read, len(psutil.Process().children(recursive=True))
+
+
+def test_a_training_read_naming_no_loading_reads_its_records_python_in_workers_alike(monkeypatch):
+    """A training read whose chain names no loading, a global order whose records a step runs Python on,
+    reads in automatic workers (`dew.data.compile._TRAINING_LOADING`), here two for two CPUs: the batches
+    are the ones the same read makes in the training process (`Loading(workers=0)`), in its order, and a
+    position either saved resumes in the other, on the batches the uninterrupted read goes on to (row
+    4862)."""
+    from dew.data.dataset import Host
+
+    monkeypatch.setattr(Host, "current", classmethod(lambda cls, *args, **kwargs: Host(2, 2**34)))
+    chain = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().random_map(_Jittered()).batch(4)
+    automatic, inline = compile(chain, seed=5), compile(chain, seed=5, loading=Loading(workers=0))
+    reader = automatic.train(DataPartition())
+    try:
+        read, started = _workers_started(reader, 12)
+    finally:
+        reader.close()
+    assert started >= 2
+    whole = inline.train(DataPartition())
+    try:
+        assert read == listed(whole, 12)
+    finally:
+        whole.close()
+    for saved_by, resumed_by in ((automatic, inline), (inline, automatic)):
+        before = saved_by.train(DataPartition())
+        try:
+            head = listed(before, 5)
+            saved = before.get_state()
+        finally:
+            before.close()
+        resumed = resumed_by.train(DataPartition())
+        try:
+            resumed.set_state(saved)
+            assert head + listed(resumed, 7) == read
+        finally:
+            resumed.close()
+
+
+def test_a_training_read_of_stored_records_reads_in_the_training_process():
+    """A training read that names no loading and runs no Python on its records, stored records shuffled into
+    batches, starts no worker: a process would only copy what the training process reads as fast."""
+    chain = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().batch(4)
+    reader = compile(chain, seed=5).train(DataPartition())
+    try:
+        _, started = _workers_started(reader, 4)
+    finally:
+        reader.close()
+    assert started == 0
+
+
 @pytest.mark.parametrize("workers", [0, pytest.param(1, marks=pytest.mark.slow),
                                      pytest.param(2, marks=pytest.mark.slow),
                                      pytest.param(3, marks=pytest.mark.slow)])

@@ -394,6 +394,19 @@ class Loading:
     a shared workstation, the first batch of a 100-record pipeline took 17.8 s
     and 7.07 GiB resident across 33 processes with 32 workers, against under
     0.1 s and 0.23 GiB with none.
+
+    A training read whose chain names no loading reads with automatic workers
+    (`workers="auto"`, `dew.data.compile.compile`): a worker for each CPU the
+    host's memory holds (`resolved`) where the read is a global order whose
+    stages run Python on its records, its steps, packing or windows
+    (`dew.data.lowering._runs_records`), else none. In the training process the
+    records' Python holds the interpreter the step's dispatch needs: a decision
+    run's encoding held it 59% of the run on a GH200, and four workers took its
+    step from 20.9 to 10.5 ms (row 4862). A read of stored records into batches
+    gains nothing from a process. A read cut per share saves its workers in its
+    position, which a count sized by the host would change, so it reads with
+    none. Workers change no record and no order: a global order's batches are
+    the ones its records' indices make, read in order.
     """
 
     workers: int | Literal["auto"] = 0
@@ -408,9 +421,14 @@ class Loading:
 
     def resolved(self, records: pygrain.IterDataset, *, reads: int, host: Host | None = None) -> Loading:
         """These settings with automatic workers and read buffer sized for `host` (this process's
-        by default) from its CPUs and its memory together, as tf.data's autotuning budgets both.
-        Grain's own pick (`pick_performance_config`) reads memory alone, takes the machine's CPU
-        count where a container may run on a few of them, and counts one batch for each worker.
+        by default) from its CPUs and its memory together. The sizing is static: it reads the batches'
+        bytes, the CPUs and the memory once, as a read opens, and measures no throughput, so it never
+        changes the count as the read runs. Grain 0.2.18, which Dew pins, has no autotuning that
+        measures: its `autotune` and `AutotuneParameter` raise NotImplementedError. Its static pick
+        (`pick_performance_config`) sizes workers from memory alone, `ram_budget_mb` over one batch's
+        bytes, capped at `multiprocessing.cpu_count()`, the machine's CPUs, where a container or a
+        job's affinity may run on a few of them (`Host.current` reads both), so it starts a worker for
+        each of the machine's CPUs on a large host.
 
         A worker for each CPU, as tf.data's parallelism takes each schedulable one, where there is
         more than one: on one CPU a worker adds a process and no parallelism, so the reading process

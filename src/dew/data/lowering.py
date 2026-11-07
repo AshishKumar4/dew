@@ -2093,6 +2093,12 @@ class _Build:
         loading = self.loading
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
         size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
+        if loading.workers == "auto" and not (self.global_order and _runs_records(pipeline)):
+            # Workers take a read's per-record Python off the training process (a decision run's
+            # encoding: 2.0x its step's rate on a GH200, row 4862); a read with none they only add
+            # processes to. A read cut per share saves its workers in its position (its topology), which
+            # automatic workers would size by the host, so a resume elsewhere would be refused.
+            loading = dataclasses.replace(loading, workers=0)
         if loading.workers == "auto":
             # A global order is read by the batch, as an elastic read is, a batch's count of its inputs a
             # group (`_InputOrder`, `_StreamOrder`); any other order by the record (`batch_order`).
@@ -2418,6 +2424,18 @@ def _weights(mixture: Mixture) -> Sequence[float]:
         [integer(stated["rows"], "rows") for stated in facts],
         [integer(stated["valid_targets"], "valid_targets") for stated in facts],
     )
+
+
+_RECORD_STEPS = (Map, RandomMap, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit, Batched, MapBatch,
+                 Native)
+"""The stages that run Python on each record or batch a read makes (its steps, its packing and windows, a
+handed Grain dataset's own), which loading workers run beside the training process (`_runs_records`)."""
+
+
+def _runs_records(pipeline: Pipeline) -> bool:
+    """Whether `pipeline`'s tree runs Python on its records (`_RECORD_STEPS`), which automatic loading
+    reads in workers (`_Build.tuned`); a read of stored records into batches, none."""
+    return any(isinstance(stage, _RECORD_STEPS) for stage in _steps(pipeline))
 
 
 def _workers(pipeline: Pipeline, loading: Loading) -> int:

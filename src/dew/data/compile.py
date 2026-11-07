@@ -153,6 +153,9 @@ from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Coordinated
 
 _DEFAULT_LOADING = Loading()
+_TRAINING_LOADING = Loading(workers="auto")
+"""A training read's loading where its chain names none (`compile`): automatic workers (`Loading.resolved`),
+which read its records' Python off the training process where it has some (`_Build.tuned`)."""
 
 
 @runtime_checkable
@@ -768,7 +771,7 @@ def compile(
     read_by(plan_version)
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
-    loading = loading or train._loading or _DEFAULT_LOADING
+    loading = loading or train._loading or _TRAINING_LOADING
     if isinstance(train.source, Phases) and examples is None:
         return _compile_phases(
             train,
