@@ -256,7 +256,22 @@ fitted to them, and a rule set ships only with measured receipts.
   less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450). Its
   softmax attention, as jax.nn's XLA form and Flax's write it (no mask or a causal one of positions, the
   default scale), is written as Dew's attention where Dew's selector gives the call a kernel of its own
-  (`dew.algebra.attention_regions`).
+  (`dew.algebra.attention_regions`), until recognition takes it (row 4783).
+- **Recognition (compile time, row 4783):** a region of a program is written as one of Dew's calls (its
+  RMSNorm, stream and gated norms, SwiGLU) only where the e-graph proves the region computes that call
+  (`dew.algebra.recognize`). Each call's math is declared once, as the call itself on its portable path
+  (`implementation='xla'`), the arithmetic its kernels are held to; no account of a spelling is written
+  anywhere. Around an equation of the primitive every declaration of a family holds (`rsqrt`, `logistic`),
+  the family names its candidates: the values the call would read and make, its static arguments read from
+  the region's own constants, each choice the call takes tried. The region's equations and each
+  candidate's declaration over the same operands enter one term region in a normal form (nested programs
+  inlined, constants of masks and divisors folded, a square a product, a narrow float's correctly rounded
+  arithmetic its float32 arithmetic rounded once, axes of one element erased, equal equations once),
+  saturate under exactly the rule sets the call's numerics admit (`rules.admitted`: the exact sets alone
+  under the accurate forms), and the region is the call's where each of its results shares its
+  declaration's e-class and the call's selector gives it a kernel of Dew's. A different constant, cast,
+  axis, statistic or rounding point is another program and stays as traced: a reordering matches only
+  where the fast forms admit it and the engine can bound what it makes (§6.3).
 
 ## 3. Verification
 

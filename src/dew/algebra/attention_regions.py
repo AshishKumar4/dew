@@ -29,20 +29,18 @@ Dew's kernels do, on par with the program's own (check 1), not bitwise.
 
 from __future__ import annotations
 
-import contextlib
 import itertools
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import mesh as mesh_lib
 from jax._src.core import ShapedArray, Tracer
 from jax.extend import core as jcore
 
-from dew.nn.programs import jax_name
+from dew.nn.programs import host_evaluated, jax_name
 
 MASK_ENTRIES = 1 << 26
 """The most entries a mask is evaluated at to read whether it is causal; a larger one keeps its region
@@ -313,51 +311,38 @@ def _evaluated(eqn: jcore.JaxprEqn, inputs: list, index: int) -> np.ndarray | No
     platforms = jax.config.jax_platforms
     if platforms and "cpu" not in platforms.split(","):
         return None
-    return _outputs(eqn, inputs)[index]
+    made = _outputs(eqn, inputs)
+    return None if made is None else made[index]
 
 
-def _outputs(eqn: jcore.JaxprEqn, inputs: list) -> list[np.ndarray]:
+def _outputs(eqn: jcore.JaxprEqn, inputs: list) -> list[np.ndarray] | None:
     """`eqn`'s outputs over concrete `inputs` on this host's CPU, the placement it states dropped, which
     changes no value: a placing primitive's outputs its inputs (`PLACEMENTS`), a nested jit's body
     evaluated an equation at a time (its shardings its traced mesh's), another primitive bound without its
-    output's sharding, outside the mesh the program traces under (`_meshless`)."""
+    output's sharding (`dew.nn.programs.host_evaluated`); None where this host cannot read an input."""
     if eqn.primitive.name in PLACEMENTS:
         return [np.asarray(value) for value in inputs]
     if eqn.primitive.name in ("jit", "pjit"):
         closed = eqn.params["jaxpr"]
         return _interpreted(closed.jaxpr, closed.consts, inputs)
-    params = {name: None if name in ("sharding", "out_sharding") else value
-              for name, value in eqn.params.items()}
-    with jax.ensure_compile_time_eval(), _meshless(), jax.default_device(jax.devices("cpu")[0]):
-        made = eqn.primitive.bind(*inputs, **params)
-    return [np.asarray(value) for value in (made if eqn.primitive.multiple_results else [made])]
+    made = host_evaluated(eqn.primitive, inputs, eqn.params)
+    return None if made is None else [np.asarray(value) for value in made]
 
 
-def _interpreted(jaxpr: jcore.Jaxpr, consts, inputs: list) -> list[np.ndarray]:
-    """`jaxpr`'s outputs over concrete `consts` and `inputs`, each equation's by `_outputs`."""
+def _interpreted(jaxpr: jcore.Jaxpr, consts, inputs: list) -> list[np.ndarray] | None:
+    """`jaxpr`'s outputs over concrete `consts` and `inputs`, each equation's by `_outputs`; None where one
+    is none."""
     env = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, inputs, strict=True))
 
     def read(atom):
         return atom.val if isinstance(atom, jcore.Literal) else env[atom]
 
     for eqn in jaxpr.eqns:
-        env.update(zip(eqn.outvars, _outputs(eqn, [read(atom) for atom in eqn.invars]), strict=True))
+        made = _outputs(eqn, [read(atom) for atom in eqn.invars])
+        if made is None:
+            return None
+        env.update(zip(eqn.outvars, made, strict=True))
     return [np.asarray(read(atom)) for atom in jaxpr.outvars]
-
-
-@contextlib.contextmanager
-def _meshless() -> Iterator[None]:
-    """No mesh in context, abstract or concrete: a step traced under its devices' mesh (`jax.set_mesh`, a
-    compile-only TPU topology's) places an eager primitive's operands on that mesh's devices, which run
-    nothing, where the default device places them on this host's CPU. `jax.set_mesh(None)` says the same
-    but refuses to run under a trace, which a program's rewrite may be."""
-    abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
-    concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
-    try:
-        yield
-    finally:
-        mesh_lib.device_context.set_local(concrete)
-        mesh_lib.abstract_mesh_context_manager.set_local(abstract)
 
 
 def _matched(graph: Graph, exp_place: int) -> Attention | None:
