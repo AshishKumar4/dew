@@ -60,8 +60,9 @@ class KeySpans:
     form: str = dataclasses.field(default="spans", metadata={"static": True})
     per_span: int = dataclasses.field(default=1, metadata={"static": True})
     """The consecutive queries each interval of a call of one run and no documents holds, `start` and `end`
-    then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), which a
-    program reads by position (`per_query` repeats them)."""
+    then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), or a
+    call's every query where lengths and starts alone bound its keys (`spans`), which a program reads by
+    position (`per_query` repeats them)."""
 
     def per_query(self) -> "KeySpans":
         """These spans an interval a query (`per_span` 1)."""
@@ -278,6 +279,12 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
     if valid is not None:
         query_ids, key_ids = _valid_ids(query_ids, key_ids, jnp.asarray(valid, bool), batch, queries)
+    if form == "spans" and queries > 1 and not causal and all(
+            narrowing is None for narrowing in (sliding_window, chunk, segment_ids, valid, runs, slots)):
+        # Lengths and starts alone bound a row's keys for every query alike: one interval a row
+        # (`KeySpans.per_span`), which a program reads by position, so no block map is formed over its
+        # queries (a grouped decode step's packed heads, `dew.nn.decode_geometry.grouped_query`).
+        return KeySpans(start[:, :1], end[:, :1], None, None, keys, form, queries)
     return KeySpans(start, end, query_ids, key_ids, keys, form)
 
 
