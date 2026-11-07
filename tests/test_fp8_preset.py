@@ -1,12 +1,12 @@
 """The 'fp8' run numerics (`dew.nn.precision.FP8`, row 2513): DeepSeek-V3's blockwise FP8 recipe on the
 projections whose role it takes, the rest in the run's dtypes."""
 
+import itertools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -15,7 +15,7 @@ from dew.nn.precision import FP8, LowPrecision, Numerics, RecipeRefused, numeric
 
 VOCAB, WIDTH = 256, 128
 SEEDS = 64
-"""The preset step's check-1 seeds, sized by `seeds_for` on armada."""
+"""The recipe projection's check-1 seeds."""
 
 
 def mixed(dtype=jnp.bfloat16) -> CausalTransformer:
@@ -195,48 +195,56 @@ def emulated(dtype):
     return projection
 
 
-def step(model):
-    """One training step's loss and gradients of `model`'s parameters under the 'fp8' numerics: next-token
-    cross entropy over the drawn tokens."""
-    def loss(params, tokens):
-        with generation.run_precision(FP8):
-            logits = model.apply(params, tokens[:, :-1])
-        logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
-        picked = jnp.take_along_axis(jax.nn.log_softmax(logits), tokens[:, 1:, None], axis=-1)
-        return -jnp.mean(picked)
-    return loss
+def laid_reference(dtype, sizes: tuple[int, ...]):
+    """`gemm.recipe_projection` of a projection's rows written apart in `dtype`: each group's rows (`sizes` a
+    group's, any rows past their sum outside every group) laid in whole 128-row blocks behind zero rows, the
+    recipe emulated over them (`emulated`), and each row's output read back, a row outside every group's
+    zero; a matrix `[in, out]` a dense projection's, its one group every row."""
+    project = emulated(dtype)
+    blocks = jnp.asarray([-(-size // 128) for size in sizes], jnp.int32)
+    starts = np.cumsum([0, *sizes])
+
+    def run(rows, matrix):
+        matrices = matrix if matrix.ndim == 3 else matrix[None]
+        laid = jnp.concatenate([jnp.pad(rows[first:last], ((0, -(last - first) % 128), (0, 0)))
+                                for first, last in itertools.pairwise(starts)])
+        out = project(laid, matrices, blocks, out_dtype=dtype)
+        laid_starts = np.cumsum([0, *(128 * np.asarray(blocks))])
+        read = [out[first:first + size] for first, size in zip(laid_starts[:-1], sizes, strict=True)]
+        return jnp.concatenate([*read, jnp.zeros((rows.shape[0] - starts[-1], out.shape[1]), dtype)])
+
+    return run
 
 
-def test_a_training_step_in_the_fp8_preset_is_on_par_with_its_fake_quantized_reference():
-    """One training step of a dense and MoE stack under the 'fp8' numerics (Dew's recipe through XLA's arm
-    on a CPU), its loss and every parameter's gradient, on par with the same step whose quantized
-    projections are the recipe emulated in float32 (the fake-quantized reference a recipe is measured
-    against), from the step in float64 with the recipe emulated in float64 (check 1)."""
-    model = mixed()
-    tokens = jnp.zeros((2, 65), jnp.int32)
-    shapes = jax.eval_shape(model.init, jax.random.key(0), tokens[:, :-1])
+@pytest.mark.parametrize("role", ["mlp", "experts"])
+def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role):
+    """A projection the 'fp8' numerics take (`gemm.recipe_projection`, which a layer of the role hands its
+    rows): a dense one's, every row its one group's, and experts' of ragged groups, one empty, with rows
+    past them; its output and both gradients on par with the recipe written apart in float32 over the same
+    groups' whole 128-row blocks (`laid_reference`: the fake-quantized reference a recipe is measured
+    against), from it in float64 (check 1)."""
+    from dew.nn.precision import projection_role
+
+    sizes = (200,) if role == "mlp" else (70, 0, 129)
+    count = sum(sizes) + (0 if role == "mlp" else 5)
+    matrix = (256, WIDTH) if role == "mlp" else (len(sizes), 256, WIDTH)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        params = jax.tree.map(lambda leaf: jnp.asarray(rng.normal(size=leaf.shape) * 0.05, leaf.dtype),
-                              shapes)
-        drawn = jnp.asarray(rng.integers(0, VOCAB, (2, 65)), jnp.int32)
-        return params, drawn, jnp.ones((), jnp.float32)
+        return (jnp.asarray(rng.normal(size=(count, 256)), jnp.float32),
+                jnp.asarray(rng.normal(size=matrix) / 16, jnp.float32),
+                jnp.asarray(rng.normal(size=(count, WIDTH)), jnp.float32))
 
-    def arm(model, projection=None):
-        def run(params, tokens, cotangent):
-            stepped = with_gradients(lambda params: step(model)(params, tokens))
-            if projection is None:
-                return stepped(params, cotangent)
-            with gemm.recipe_projected(projection):
-                return stepped(params, cotangent)
-        return run
+    def projected(rows, matrix):
+        with generation.run_precision(FP8), projection_role(role):
+            sized = None if role == "mlp" else jnp.asarray(sizes, jnp.int32)
+            return gemm.recipe_projection(rows, matrix, sized, out_dtype=jnp.float32)
 
     @as_given
-    def truth(params, tokens, cotangent):
+    def truth(rows, matrix, cotangent):
         with jax.enable_x64(new_val=True):
-            return arm(float64_twin(model), emulated(jnp.float64))(widened(params), tokens,
-                                                                  cotangent.astype(jnp.float64))
+            return with_gradients(laid_reference(jnp.float64, sizes))(*widened((rows, matrix, cotangent)))
 
-    assert_as_exact(jax.jit(arm(model)), jax.jit(arm(model, emulated(jnp.float32))), draw, "fp8 preset step",
+    reference = with_gradients(laid_reference(jnp.float32, sizes))
+    assert_as_exact(jax.jit(with_gradients(projected)), jax.jit(reference), draw, f"recipe projection {role}",
                     seeds=SEEDS, truth_fn=truth)
