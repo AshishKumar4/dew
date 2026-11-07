@@ -386,12 +386,13 @@ def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var],
             output: jcore.Var) -> list[jcore.Var] | None:
     """The values beside `row` (one value, or several: attention's query, keys and values) the equations
     from it to `output` read: each a value of the body made from neither it nor constants alone (a weight,
-    a gate, a branch, a bias), in the order first read; None where `output` is not made from every one."""
+    a gate, a branch, a bias), in the order first read; None where `output` is not made from every one.
+    Made from a row is read within `output`'s own ancestry (`_backward`), never past it."""
     rows = (row,) if isinstance(row, jcore.Var) else tuple(row)
-    reached = [_forward(index, source, SPAN) for source in rows]
-    if not all(output in found for found in reached):
+    ancestry = _backward(index, output, SPAN)
+    if not all(source in ancestry for source in rows):
         return None
-    descendants = set().union(*reached)
+    descendants = _within(index, rows, ancestry)
     extras: dict[jcore.Var, None] = {}
     seen, frontier = set(), [output]
     while frontier:
@@ -406,6 +407,18 @@ def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var],
         if place is not None:
             frontier += [atom for atom in index.jaxpr.eqns[place].invars if isinstance(atom, jcore.Var)]
     return list(extras)
+
+
+def _within(index: fusion.Index, rows: Sequence[jcore.Var], ancestry: dict[jcore.Var, int]) -> set[jcore.Var]:
+    """The values of `ancestry` made from any of `rows`: `rows` carried forward through the equations whose
+    outputs `ancestry` holds, nearest the rows first."""
+    made: set[jcore.Var] = set(rows)
+    for var in sorted(ancestry, key=lambda value: -ancestry[value]):
+        place = index.producer.get(var)
+        if place is not None and any(isinstance(atom, jcore.Var) and atom in made
+                                     for atom in index.jaxpr.eqns[place].invars):
+            made.add(var)
+    return made
 
 
 def _constant(index: fusion.Index, var: jcore.Var) -> bool:
