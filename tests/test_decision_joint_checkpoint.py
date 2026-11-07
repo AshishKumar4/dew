@@ -511,15 +511,24 @@ def test_a_trained_joint_task_on_a_multimodal_backbone_exports_and_reloads_as_it
     """A task trained from a joint-head release over Qwen 3.5's multimodal backbone (`joint_runs`), its
     model a run's, not the release's source, exports as a release (`save_pretrained`): its backbone
     planned from the model it trained (`PretrainedDecoder.from_model` of its `MultimodalTransformer`),
-    its head and layout beside it, and the release loads back as a task answering every question as the
-    trained task does (row 4525)."""
+    its head and layout beside it, and the release loads back as the task its bundle is, every weight and
+    answer the bundle's as a load serves it, its projections packed (`Decide.of`), bit for bit (row
+    4525). The trained task itself holds them unpacked, as a run trains them, one program apart."""
+    from dew.decision.sources import PretrainedDecision
+
     objective, state, asked = joint_runs["objective"], joint_runs["state"], joint_runs["asked"]
     trained = objective.pipeline(state)
     trained.save_pretrained(tmp_path / "exported")
     assert json.loads((tmp_path / "exported" / "config.json").read_text())["model_type"] == "qwen3_5"
     reloaded = Decide.from_pretrained(tmp_path / "exported", attention_impl="xla")
+    served = Decide.of(PretrainedDecision.of(trained))
+    assert reloaded.model == served.model and reloaded.layout == served.layout
+    assert jax.tree.structure(reloaded.variables) == jax.tree.structure(served.variables)
+    for written, held in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(served.variables),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(written), np.asarray(held), strict=True)
     for state_text in ("charged twice!", "is the site down?"):
-        for answer, again in zip(trained(state_text, asked).values(), reloaded(state_text, asked).values(),
+        for answer, again in zip(served(state_text, asked).values(), reloaded(state_text, asked).values(),
                                  strict=True):
             np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
