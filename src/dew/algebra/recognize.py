@@ -253,7 +253,7 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
         held = dict(zip(wanted, run(*values), strict=True))
         results = [held[var] for candidate, _ in spans for var in candidate.outputs]
         for candidate, _ in spans:
-            results += list(jax.tree.leaves(candidate.declared(*(held[var] for var in candidate.operands))))
+            results += _declaration(candidate)(*(held[var] for var in candidate.operands))
         return results
 
     closed = _canonical(jax.make_jaxpr(joint)(*(jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype)
@@ -290,6 +290,38 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
 def _atom_key(atom) -> Hashable:
     """An output of a canonical program as its value: the variable itself, or a literal's value."""
     return terms.literal_key(atom) if isinstance(atom, jcore.Literal) else atom
+
+
+_DECLARATIONS: collections.OrderedDict[Hashable, Callable] = collections.OrderedDict()
+"""Each declaration traced once (`_declaration`), by its call, its choices and its operands' types, the latest
+`fusion.DECISIONS_HELD` held: every norm of a stack weighs the same declaration."""
+
+
+def _declaration(candidate: Candidate) -> Callable:
+    """`candidate`'s declaration as its traced program over its operands' types, run over values to its
+    results' leaves; traced once for each call, choices and types (`_DECLARATIONS`)."""
+    declared = candidate.declared
+    function = declared.func
+    cells = tuple(cell.cell_contents for cell in function.__closure__ or ())
+    key = (function.__code__, _typed(function.__defaults__), _typed(cells),
+           _typed(tuple(sorted(declared.keywords.items()))), _typed(tuple(candidate.operands)))
+    if key not in _DECLARATIONS:
+        traced = jax.make_jaxpr(lambda *values: jax.tree.leaves(declared(*values)))(
+            *(_shape(var) for var in candidate.operands))
+        _DECLARATIONS[key] = jcore.jaxpr_as_fun(traced)
+        if len(_DECLARATIONS) > fusion.DECISIONS_HELD:
+            _DECLARATIONS.popitem(last=False)
+    _DECLARATIONS.move_to_end(key)
+    return _DECLARATIONS[key]
+
+
+def _typed(value) -> Hashable:
+    """`value` as a declaration's key reads it: a body's value by its type, a sequence item by item."""
+    if isinstance(value, jcore.Var):
+        return value.aval
+    if isinstance(value, (tuple, list)):
+        return tuple(_typed(item) for item in value)
+    return value
 
 
 def _reads(index: fusion.Index, places: Sequence[int], var: jcore.Var) -> bool:
