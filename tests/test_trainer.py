@@ -102,7 +102,10 @@ class TokenRegression(Regression):
 def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation, steps, logged):
     """Eight rows of lengths 1, 2, 3, 4 a step, without padding: a budget of 30 tokens counts the
     updates committed, so it ends at the first commit past 30, step 3 (48) one microbatch an update
-    and step 4 (80) two, whose first update commits 24."""
+    and step 4 (80) two, whose first update commits 24. A log reports the tokens its steps scored
+    (`train/tokens`), each step's whether its update committed or not, apart from those its committed
+    updates trained on (`train/committed_tokens`): a log that cuts an accumulation window reads its
+    steps, not its commits."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=TokenRegression(), tracker=tracker, accumulation=accumulation)
     state = trainer.fit(dataset(), tokens=30, log_every=log_every)
@@ -110,6 +113,8 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
     if log_every == 1:
         assert [scalars["train/committed_tokens"] for _, scalars in tracker.scalars
                 if "train/committed_tokens" in scalars] == logged
+        assert [scalars["train/tokens"] for _, scalars in tracker.scalars
+                if "train/tokens" in scalars] == [8, 16, 24, 32][:steps]
 
 
 class PaddedTokenRegression(TokenRegression):
