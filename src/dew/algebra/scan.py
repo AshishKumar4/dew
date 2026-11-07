@@ -251,10 +251,12 @@ def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping
 def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h) -> tuple:
     """`chunk` walked token by token from the state `h` entering it by the affine map's parts at each token
     (`_token_parts`): `(outputs, h)`, each token's output and the state leaving the chunk, in the state's
-    carried dtype. Each token's correction reads its decay before the state, `(c * D) . h`, and writes its
-    input values by keys, so a zero state's cotangent is zero, not a decay's infinity times it; a token whose
-    exponent vanishes (a reset's, `RESET_DECAY`) enters a zero state, selected, so no NaN of the state before
-    it reaches the one after (row 1966's overflow orders)."""
+    carried dtype. Each token's correction and its update read one decayed state, `D h`, so a state's
+    cotangent meets the decay once, summed before it does: two reads of the decay apart (`(c D) . h` beside
+    `D h`) formed opposing decay cotangents that overflowed to a NaN where the decay's gradient is zero (a
+    state of 2^120 under a cotangent of 2^20, the head review of row 1966); a token whose exponent vanishes
+    (a reset's, `RESET_DECAY`) enters a zero state, selected, so no NaN of the state before it reaches the
+    one after (row 1966's overflow orders)."""
     exponent, B, U, s, C, Q, R = _token_parts(declaration, names, affine, chunk)
     floor = vanishing(exponent.dtype, affine.base2)
 
@@ -262,8 +264,9 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
         z, b, u, strength, c, q, r = parts
         h = jnp.where((z <= floor)[:, None], 0.0, h)
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
-        correction = jnp.sum((c * decay)[:, None] * h, axis=0)
-        h = h * decay[:, None] + b[:, None] * (u - strength * correction)[None, :]
+        decayed = h * decay[:, None]
+        correction = jnp.sum(c[:, None] * decayed, axis=0)
+        h = decayed + b[:, None] * (u - strength * correction)[None, :]
         return h, jnp.sum(q[:, None] * h, axis=0) + r
 
     carried = at_least_fp32(h.dtype)
