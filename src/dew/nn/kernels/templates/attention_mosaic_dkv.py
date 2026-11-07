@@ -13,7 +13,12 @@ from jax.experimental import pallas as pl
 
 from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, mosaic
+from dew.nn.kernels.templates import (
+    across,
+    attention_algebra as algebra,
+    attention_gradient as gradient,
+    mosaic,
+)
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -444,9 +449,9 @@ def _shared_views(family: mosaic.Family, outputs, grad_refs, graded: list[Kind],
 
 def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: int, interpret: bool) -> None:
     """The sums of the `consumers` sharing a key block (each over its share of the queries) added in a fixed
-    order and stored once to their `views` (`mosaic.summed_across`), dK's and dV's, the key gradients' added
+    order and stored once to their `views` (`across.summed_across`), dK's and dV's, the key gradients' added
     into theirs (`Family.added`: a parameter the batch rows or heads share takes each program's), each in a
-    scope after the walk's, whose shared memory it reuses (`mosaic.summing`): the walk's last adds' reads of
+    scope after the walk's, whose shared memory it reuses (`across.summing`): the walk's last adds' reads of
     their stage (`Family.added`, its tile gradients') done first (row 2633, ET-DETDIAG-h100: the last query
     tile's gradient read from a stage this scope had written)."""
     family.store_wait(0)
@@ -458,11 +463,11 @@ def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: 
                 family.added(summed, view, interpret, smem=stage)
 
         def total(stage, value=value, written=written, **scratch):
-            mosaic.summed_across(value, scratch, lax.axis_index("wg"), consumers,
+            across.summed_across(value, scratch, lax.axis_index("wg"), consumers,
                                  lambda summed: written(summed, stage))
 
         pl.run_scoped(total, family.staged_memory(value.shape, jnp.float32),
-                      **mosaic.summing(value.shape, consumers), collective_axes="wg")
+                      **across.summing(value.shape, consumers), collective_axes="wg")
 
 def _dkv_scoped(refs, *, widths: bool, split: bool) -> tuple:
     """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, dK's output
@@ -498,7 +503,7 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math,
         name=name,
-        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
+        reducing_warpgroups=reducing(family, consumers, walk.reduces),
         # The products this launch issues (`stated`): its `S` and `dP` recomputed, its share of dV's, and
         # each part of its share of dK's and of dQ's where it adds it (`part_count`); the model's of them it
         # owns (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.

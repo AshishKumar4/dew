@@ -71,6 +71,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     approximate,
     bundle_of,
     extents,
+    hook_reduces,
     issued_into,
     issued_pairs,
     modelled,
@@ -1175,7 +1176,10 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     state_rows = (row, head, pl.ds(first, tiles.block_q))
     start, live, merged = _started(program, spec, guard, hooked, state_rows, first, value_width,
                                    training=residuals is not None, merges=merging is not None)
-    pl.when(consumer == 1)(turn)
+    # Every consumer but the first takes a turn ahead, which the first's closing turn matches: each makes
+    # as many arrivals as the others at any count of consumers (three take one fewer than the first and
+    # second, and its partners' last turn waited forever: the interpreted hang of row 4840).
+    pl.when(consumer > 0)(turn)
     # The queries' intervals and ids read once, before the walk (`_query_bounds`).
     held = None if spans is None else program.bounds(first, spans, row)
 
@@ -1543,7 +1547,8 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, place[0])
     q = _query_of(program, q_view, q_smem, q_loaded)
-    pl.when(consumer == 1)(turn)
+    # Every consumer but the first a turn ahead, as `_consumer`'s.
+    pl.when(consumer > 0)(turn)
     held = None if spans is None else program.bounds(first, spans, place[0])
 
     def step(index, slots, arg, accumulators):
@@ -1847,7 +1852,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret, resident=resident,
                          approx_math=approx_math, name=name, cost=cost, model_flops=model,
-                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod,
+                         reducing_warpgroups=reducing(family, consumers,
+                                                      hook_reduces(hooks) or hooks.output_mod is not None,
                                                       guarded=read.guard is not None or flags)
                          )(query, key, value, *leaves)
 

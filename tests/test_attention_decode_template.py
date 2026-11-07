@@ -481,3 +481,75 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
 
     assert_as_exact(jax.jit(ours), jax.jit(whole), draw, f"decode merge over {slices} slices", seeds=SEEDS)
 
+
+
+RESUMED = 1e38
+"""A resumed state's maximum, finite, past fp32's largest in a raw fold's units at a scale of 1/8 (fp16's
+decode 64 wide leaves its scale whole, `template.prescale`): audit A6's, infinite there unsaturated."""
+
+
+def _resumed(maximum: jax.Array, acc: jax.Array) -> template.Initial:
+    """A resumed state of `maximum` `[..., Q]` whose first row's is `RESUMED`, a denominator of 1 and the
+    sums `acc`."""
+    return template.Initial(maximum.at[0].set(RESUMED), jnp.ones_like(maximum), acc)
+
+
+@pytest.mark.parametrize("slices", [1, 3])
+def test_merging_slices_with_a_resumed_maximum_past_fp32s_largest_in_raw_units_keeps_its_share(slices):
+    """A row's slices in the raw fold's units fp16's decode takes (`attention_decode._spec`: a scale of 1/8),
+    merged in XLA with a resumed state whose first row's maximum is `RESUMED` (`algebra.merged_slices`): the
+    state's maximum saturates there as the walk's does (`algebra.initial_state`, `raw_maximum`), so that row
+    is the state's own sums over its denominator, every row on par with the whole softmax (check 1)."""
+    cuts = np.linspace(0, 40, slices + 1).astype(int)
+    spec = attention_decode._spec(jnp.zeros((2, 3, 1, 64), jnp.float16), template.spans(3, 40, 2),
+                                  template.Hooks(), scale=None)
+
+    def ours(logits, values, maximum, acc):
+        out, peak, total = _states(logits, values, cuts)
+        return algebra.merged_slices(spec, out, peak / spec.scale, total, _resumed(maximum, acc))
+
+    def whole(logits, values, maximum, acc):
+        initial = _resumed(maximum, acc)
+        m = jnp.transpose(initial.m, (0, 2, 1))
+        peak = jnp.maximum(jnp.max(logits, axis=-1), m)
+        weights, own = jnp.exp(logits - peak[..., None]), jnp.exp(m - peak)
+        state = own[..., None] * jnp.swapaxes(initial.acc, 1, 2)
+        sums = jnp.einsum("bqhk,bqhkd->bqhd", weights, values) + state
+        return sums / (jnp.sum(weights, axis=-1) + own)[..., None]
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 4)
+        return (4.0 * jax.random.normal(streams[0], (2, 3, 1, 40)),
+                jax.random.normal(streams[1], (2, 3, 1, 40, 8)), jax.random.normal(streams[2], (2, 1, 3)),
+                jax.random.normal(streams[3], (2, 1, 3, 8)))
+
+    assert_as_exact(jax.jit(ours), jax.jit(whole), draw,
+                    f"decode merge resumed past raw fp32 over {slices} slices", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_a_split_decode_step_resumed_past_fp32s_largest_in_raw_units_keeps_its_share_interpreted():
+    """An fp16 decode step on an H100 of two rows over 4096 keys, 8 query heads over 2 and 64 wide, its keys
+    cut into slices the launch merges with a resumed state whose first row's maximum is `RESUMED`
+    (`Hooks.initial`): the state's maximum saturates in the raw fold's units (`algebra.initial_state`), so
+    that row is the state's own sums over its denominator, on par with the reference path (check 1)."""
+    keys = 4096
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys // 2], jnp.int32))
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 5)
+        query = jax.random.normal(streams[0], (2, 1, 8, 64), jnp.float16)
+        key, value = (jax.random.normal(stream, (2, keys, 2, 64), jnp.float16) for stream in streams[1:3])
+        return (query, key, value, jax.random.normal(streams[3], (2, 8, 1)),
+                jax.random.normal(streams[4], (2, 8, 1, 64)))
+
+    def ours(query, key, value, maximum, acc):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans,
+                                           template.Hooks(initial=_resumed(maximum, acc)), interpret=True)
+
+    def reference(query, key, value, maximum, acc):
+        return template.reference(query, key, value, spans, template.Hooks(initial=_resumed(maximum, acc)))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode split resumed past raw fp32",
+                    seeds=SEEDS)
