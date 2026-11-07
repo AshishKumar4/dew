@@ -898,8 +898,9 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
 
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
     """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), a refusal of
-    every tile of the run's training call's launch (its identity as its lowering for an H100 names it,
-    `report.traced`) reaches the selector, which takes another kernel for the call: its bind is the run's
+    every tile of the run's training call's launch (its identity as its lowering for an A100 names it,
+    `report.traced`; an H100's gated delta net trains on the port, row 4346) reaches the selector, which
+    takes another kernel for the call: its bind is the run's
     launch, the rung's flag resolved alike (`recurrence_chunk.recomputed_memory`); bound as kept, it judged
     another launch than the run's (row 4133)."""
     from dew.nn.kernels import recurrence_chunk
@@ -921,7 +922,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
 
     # The run's rounded products are its declaration's at the default precision (`rounds_products`; the
     # suite's lanes configure 'highest').
-    with (report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)),
+    with (report.refusals(), generation.assumed('sm80'), recurrence_chunk.recomputing(('delta_memory',)),
           jax.default_matmul_precision('default')):
         target = template.Mosaic.launched()
         assert selected() == 'mosaic_gpu'
