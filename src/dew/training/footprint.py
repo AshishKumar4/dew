@@ -36,7 +36,7 @@ from dew.data.dataset import rows_of
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability, gpu_target
-from dew.nn.programs import bodies, computed, opaque
+from dew.nn.programs import bodies, computed, named, opaque
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
@@ -247,7 +247,7 @@ def biased(program: jcore.Jaxpr) -> jcore.Jaxpr:
     dropped: set[int] = set()
     replaced: dict[int, jcore.JaxprEqn] = {}
     for equation in program.eqns:
-        if equation.primitive.name not in ("add", "add_any") or len(equation.invars) != 2:
+        if named(equation.primitive) not in ("add", "add_any") or len(equation.invars) != 2:
             continue
         out = equation.outvars[0]
         first, second = equation.invars
@@ -286,14 +286,14 @@ def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
     dropped: set[int] = set()
     replaced: dict[int, list[jcore.JaxprEqn]] = {}
     for equation in program.eqns:
-        if equation.primitive.name not in ("add", "add_any") or len(equation.invars) != 2:
+        if named(equation.primitive) not in ("add", "add_any") or len(equation.invars) != 2:
             continue
         first, second = equation.invars
         for scattered, other in ((first, second), (second, first)):
             if not isinstance(scattered, jcore.Var):
                 continue
             scatter = producers.get(scattered)
-            if (scatter is None or scatter.primitive.name != "scatter-add" or readers[scattered] != 1
+            if (scatter is None or named(scatter.primitive) != "scatter-add" or readers[scattered] != 1
                     or scattered.aval != equation.outvars[0].aval or id(scatter) in dropped):
                 continue
             base, *rest = scatter.invars
@@ -318,7 +318,7 @@ def zero(value: jcore.Var | jcore.Literal, producers: Mapping) -> bool:
     unstacked."""
     producer = producers.get(value) if isinstance(value, jcore.Var) else None
     while producer is not None and producer.invars and (
-            producer.primitive.name in ("broadcast_in_dim", "convert_element_type") or bitcast(producer)):
+            named(producer.primitive) in ("broadcast_in_dim", "convert_element_type") or bitcast(producer)):
         value = producer.invars[0]
         producer = producers.get(value) if isinstance(value, jcore.Var) else None
     return isinstance(value, jcore.Literal) and not np.any(np.asarray(value.val))
@@ -334,7 +334,7 @@ def zeros_added(program: jcore.Jaxpr) -> jcore.Jaxpr:
     for equation in program.eqns:
         operands = [renamed.get(value, value) if isinstance(value, jcore.Var) else value
                     for value in equation.invars]
-        if equation.primitive.name in ("add", "add_any") and len(operands) == 2:
+        if named(equation.primitive) in ("add", "add_any") and len(operands) == 2:
             first, second = operands
             out = equation.outvars[0]
             for added, other in ((first, second), (second, first)):
@@ -374,7 +374,7 @@ def deduplicated(program: jcore.Jaxpr) -> jcore.Jaxpr:
     kept = []
     for equation in program.eqns:
         operands = [renamed.get(value, value) if computed(value) else value for value in equation.invars]
-        own = (equation.effects or equation.primitive.name == "optimization_barrier"
+        own = (equation.effects or named(equation.primitive) == "optimization_barrier"
                or any(map(callable, equation.params.values())))
         key = None if own else (parameters_key(equation.primitive, equation.params),
                                 tuple(map(operand_key, operands)))
@@ -493,7 +493,7 @@ def sunk(program: jcore.Jaxpr) -> jcore.Jaxpr:
         made = [out for out in program.eqns[index].outvars if computed(out)]
         # Every result read by late equations alone, none a product, and one at least read or returned.
         if any(readers[out] or out in outputs for out in made) and all(
-                reader in late and program.eqns[reader].primitive.name not in PRODUCTS
+                reader in late and named(program.eqns[reader].primitive) not in PRODUCTS
                 for out in made for reader in readers[out]):
             late.add(index)
     ordered = sorted(range(len(program.eqns)), key=lambda index: index in late)
@@ -528,7 +528,7 @@ def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
     priority_fusion.cc) keep buffers by their cost models' judgment, no rule the derivation can source.
     Such a step's compile decides its fit, and a miss is logged with the need it compiled to."""
     return platform == "gpu" and any(
-        equation.primitive.name == "ragged_dot_general"
+        named(equation.primitive) == "ragged_dot_general"
         or any(bounded_below(body, platform) for body in bodies(equation))
         for equation in program.eqns)
 
@@ -578,7 +578,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
             running = (looped(frontier, last, index, equation, made, carried) + inner
-                       if equation.primitive.name in LOOPS else max(inner, made_bytes) - taken)
+                       if named(equation.primitive) in LOOPS else max(inner, made_bytes) - taken)
             # The fusions that make its operands run before it, each buffer they alone read freed with them
             # (`freed`): the most is theirs, or its own past them.
             freed = sum(map(device_share, dying(frontier, equation, made_for, held, last, index)))
@@ -599,7 +599,7 @@ def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
     scatter fuses its indices and updates but those reading its base, which XLA computes apart, as it
     computes the base apart into the buffer the scatter writes (`CanEmitInputFusedScatter`,
     xla/service/gpu/gpu_fusible.cc): its updates computed from its base hold a buffer of their own."""
-    name = equation.primitive.name
+    name = named(equation.primitive)
     if name == "optimization_barrier" or not equation.invars:
         return set()
     if name.startswith("scatter"):
@@ -636,7 +636,7 @@ def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapp
     (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, xla/hlo/analysis/hlo_dataflow_analysis.cc) and
     a GEMM's bias's that nothing else reads, before it or after (`FuseMatrixBiasAdd`'s `can_overwrite_bias`,
     xla/backends/gpu/transforms/gemm_rewriter.cc); none for any other equation."""
-    name = equation.primitive.name
+    name = named(equation.primitive)
     if name.startswith("scatter") and equation.invars:
         at = 0
     elif name == "dot_general" and len(equation.invars) == 3:
@@ -670,13 +670,13 @@ def carry(equation: jcore.JaxprEqn) -> list[tuple]:
     (`ComputeAliasedValues`, xla/hlo/analysis/hlo_alias_analysis.cc), copying the initial value into a
     buffer of the loop's where it is an input or still read (copy insertion,
     xla/service/copy_insertion.cc)."""
-    if equation.primitive.name == "while":
+    if named(equation.primitive) == "while":
         start = equation.params["cond_nconsts"] + equation.params["body_nconsts"]
         body = equation.params["body_jaxpr"].jaxpr
         taken = body.invars[equation.params["body_nconsts"]:]
         changed = [returned is not took for returned, took in zip(body.outvars, taken, strict=True)]
         return list(zip(equation.invars[start:], equation.outvars, changed, strict=True))
-    if equation.primitive.name == "scan":
+    if named(equation.primitive) == "scan":
         body = equation.params["jaxpr"].jaxpr
         _, started, _ = equation.params["ft_in"].update(equation.invars).unpack()
         _, taken, _ = equation.params["ft_in"].update(body.invars).unpack()
@@ -705,9 +705,9 @@ def looped(frontier: Frontier, last: Mapping, index: int, equation: jcore.JaxprE
 def returned_carry(equation: jcore.JaxprEqn, body: jcore.Jaxpr) -> frozenset:
     """The values `body` returns into the buffers the loop `equation` carries, where it is the loop's
     body (`carry`); none of any other program."""
-    if equation.primitive.name == "while" and body is equation.params["body_jaxpr"].jaxpr:
+    if named(equation.primitive) == "while" and body is equation.params["body_jaxpr"].jaxpr:
         return frozenset(value for value in body.outvars if computed(value))
-    if equation.primitive.name == "scan" and body is equation.params["jaxpr"].jaxpr:
+    if named(equation.primitive) == "scan" and body is equation.params["jaxpr"].jaxpr:
         returned, _ = equation.params["ft_out"].update(body.outvars).unpack()
         return frozenset(value for value in returned if computed(value))
     return frozenset()
@@ -751,7 +751,7 @@ class Frontier:
         # (`HloDataflowAnalysis::UpdateOptimizationBarrierValueSet`,
         # xla/hlo/analysis/hlo_dataflow_analysis.cc).
         self.forwards = {out: operand for equation in program.eqns
-                         if equation.primitive.name == "optimization_barrier"
+                         if named(equation.primitive) == "optimization_barrier"
                          for out, operand in zip(equation.outvars, equation.invars, strict=True)}
         self.barred = {operand for operand in self.forwards.values() if computed(operand)}
 
@@ -773,7 +773,7 @@ class Frontier:
         if bitcast(equation):
             return operand in self.inputs or not self.fused(operand) or self.view(operand)
         # XLA lays a value out once, so a transpose is its storage only where it is its one reader.
-        return (equation.primitive.name in TRANSPOSES and operand not in self.inputs
+        return (named(equation.primitive) in TRANSPOSES and operand not in self.inputs
                 and self.readers[operand] == 1 and (not self.fused(operand) or self.view(operand)))
 
     def fused(self, value) -> bool:
@@ -811,7 +811,7 @@ class Frontier:
         result and its updates read from its base apart (`unfused`):
         Qwen3.5-4B's tied embedding's gradient, a scatter-add into zeros, was derived holding the zeros
         beside it, 2.37 GiB over XLA's 4.76 at its step's peak under 'full' (row 4089)."""
-        name = equation.primitive.name
+        name = named(equation.primitive)
         return (recomputed(equation, self.platform) or name == "reduce"
                 or name.startswith(("reduce_", "arg", "scatter")))
 
@@ -867,7 +867,7 @@ def cublas_product(equation: jcore.JaxprEqn) -> bool:
     `--xla_gpu_gemm_rewrite_size_threshold`; `IsDotSupportedByClassicalEmitters`, matmul_utils.cc). A
     product XLA's Triton GEMM fusions take instead takes none, which this does not tell apart: it
     holds the workspace."""
-    if equation.primitive.name != "dot_general":
+    if named(equation.primitive) != "dot_general":
         return False
     (left_contracting, right_contracting), (left_batch, right_batch) = equation.params["dimension_numbers"]
     left, right = dimensions(equation.invars[0]), dimensions(equation.invars[1])
@@ -909,7 +909,7 @@ def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
     """Whether XLA's fusion on `platform` recomputes what `equation` computes in each consumer rather than
     keep it: on a GPU every elementwise primitive (`ELEMENTWISE`), elsewhere the cheap ones (`CHEAP`, and
     `REAL_CHEAP` over real values). A program it reads has its calls inlined (`compiled`)."""
-    name = equation.primitive.name
+    name = named(equation.primitive)
     if bitcast(equation):
         # A bitcast holds no buffer of its own, on any platform.
         return True

@@ -20,7 +20,7 @@ import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
 
-from dew.nn.programs import bodies, called, computed, inlined, opaque, platform_branch
+from dew.nn.programs import bodies, called, computed, inlined, named, opaque, platform_branch
 
 VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
@@ -34,7 +34,7 @@ def bitcast(equation: jcore.JaxprEqn) -> bool:
     loop reads its weight gradient's carry by unstacking it and writes it back by stacking, each a view of
     the carry's buffer, which the derivation counted twice over (Qwen3.5-4B's fused tiled head, 2 x 2.37
     GiB, row 4089)."""
-    name = equation.primitive.name
+    name = named(equation.primitive)
     if name in VIEWS:
         return True
     if name == "stack":
@@ -95,7 +95,7 @@ def compiled(program: jcore.Jaxpr, lowering: str,
         return renamed.get(value, value) if computed(value) else value
 
     for equation in program.eqns:
-        name, params = equation.primitive.name, dict(equation.params)
+        name, params = named(equation.primitive), dict(equation.params)
         operands = [read(value) for value in equation.invars]
         body, consts, reading = None, (), operands
         if name == "shard_map" and math.prod(params["mesh"].shape[axis]
@@ -229,7 +229,7 @@ def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list
 def evaluable(equation: jcore.JaxprEqn) -> bool:
     """Whether XLA's evaluator computes `equation` to find an offset: no side effect, no custom call and
     no device index, in it or any program it runs (`UNEVALUATED`)."""
-    return (not equation.effects and equation.primitive.name not in UNEVALUATED
+    return (not equation.effects and named(equation.primitive) not in UNEVALUATED
             and all(evaluable(inner) for body in bodies(equation) for inner in body.eqns))
 
 
@@ -277,7 +277,7 @@ class Slicing:
         counting: list[jcore.JaxprEqn] = []
         counted = {self.counter} if self.counter is not None else set()
         for equation in program.eqns:
-            name = equation.primitive.name
+            name = named(equation.primitive)
             reads = [value for value in equation.invars if computed(value)]
             if name == "slice" and _static_slice(equation):
                 sliced.update(equation.outvars)
@@ -294,10 +294,10 @@ class Slicing:
                 counting.append(equation)
         # A transpose a matmul reads is folded into its dimensions (`TransposeFolding`,
         # xla/service/transpose_folding.cc, which folds a dot's operand that is itself a transpose).
-        folded = {out for equation in program.eqns if equation.primitive.name == "transpose"
+        folded = {out for equation in program.eqns if named(equation.primitive) == "transpose"
                   and computed(equation.invars[0]) and equation.invars[0] in sliced
                   for out in equation.outvars
-                  if all(reader.primitive.name == "dot_general" for reader in readers.get(out, ()))}
+                  if all(named(reader.primitive) == "dot_general" for reader in readers.get(out, ()))}
         return dataclasses.replace(self, sliced=frozenset(sliced | folded), updated=frozenset(updated))
 
     def _annotated(self, equation: jcore.JaxprEqn, counting: Sequence[jcore.JaxprEqn]) -> bool:
@@ -305,7 +305,7 @@ class Slicing:
         and aligned, its offsets literals or computed from the loop's counter alone, whose byte offsets
         over the loop's turns, clamped as the slice clamps them or not, step evenly."""
         whole = dimensions(equation.invars[0])
-        updating = equation.primitive.name == "dynamic_update_slice"
+        updating = named(equation.primitive) == "dynamic_update_slice"
         part = dimensions(equation.invars[1] if updating else equation.outvars[0])
         itemsize = _itemsize(equation.invars[0])
         if not contiguous_aligned(whole, part, itemsize):
@@ -339,7 +339,7 @@ class Slicing:
         of its stacked inputs, the update of each stacked output into the buffer the loop returns, and
         its first carry where its turns count it by one from a literal (the counter a `fori_loop` over
         fixed bounds carries), over its turns; nothing for any other program."""
-        if equation.primitive.name != "scan":
+        if named(equation.primitive) != "scan":
             return Slicing()
         _, carried, stacked = equation.params["ft_in"].update(body.invars).unpack()
         _, started, _ = equation.params["ft_in"].update(equation.invars).unpack()
@@ -352,7 +352,7 @@ class Slicing:
         counter, turns = None, ()
         counting = carried and returned and carried[0].aval.dtype == np.int32
         if counting and isinstance(started[0], jcore.Literal):
-            stepped = any(step.outvars == [returned[0]] and step.primitive.name == "add"
+            stepped = any(step.outvars == [returned[0]] and named(step.primitive) == "add"
                           and step.invars[0] is carried[0] and isinstance(step.invars[1], jcore.Literal)
                           and step.invars[1].val == 1 for step in body.eqns)
             if stepped:
@@ -445,7 +445,7 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
     with jax.set_mesh(None), jax.ensure_compile_time_eval():
         for equation in reversed(reading):
             operands = list(map(read, equation.invars))
-            if equation.primitive.name == "dot_general" and len(operands) == 3:
+            if named(equation.primitive) == "dot_general" and len(operands) == 3:
                 # A product with its bias, as the derivation reads a sum XLA's GEMM computes
                 # (`footprint.biased`): the product of the first two, plus the third.
                 *operands, bias = operands

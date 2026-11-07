@@ -120,6 +120,22 @@ def jax_name(primitive) -> str | None:
     return _jax_own().get(primitive)
 
 
+HOLDERS = CALLS | {"pallas_call", "shard_map"}
+"""The primitives a reader knows by their names though no module of JAX's exports them: the calls
+(`CALLS`), a Pallas kernel's (`opaque`) and a manual mesh's, each running a program it holds."""
+
+
+def named(primitive) -> str:
+    """The name a reader of a program knows `primitive` by: JAX's own operation's (`jax_name`), a
+    program holder's (`HOLDERS`), else none (""): a primitive of another library or of a user's takes any
+    name, whatever it computes, so no reader reads one as the JAX operation its name spells (row 4094: a
+    user's `convert_element_type` read as a cast raised KeyError on its params)."""
+    own = jax_name(primitive)
+    if own is not None:
+        return own
+    return primitive.name if primitive.name in HOLDERS else ""
+
+
 def computed(value) -> TypeGuard[jcore.Var]:
     """Whether `value` is a program's variable, not a literal it reads."""
     return isinstance(value, jcore.Var) and not isinstance(value, jcore.Literal)
