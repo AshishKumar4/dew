@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
-"""Write the Qwen-Image 2.1 export fixture: Diffusers reading what Dew wrote.
+"""Diffusers reading what Dew wrote: Qwen-Image 2.1's own classes over a Dew export, run on drawn inputs in
+float32 and float64, the reference arm of tools/venv_reference.py's `qwen-image-export` site (its protocol
+tools/reference_worker.py).
 
-Qwen-Image 2.1's classes exist only in Diffusers at
-6256aa7666cedd47443adc8f82da9a10e110b09c (with transformers 5.17.0), which
-the Dew environment does not install, so its reading of a Dew export is
-recorded rather than run in the suite. Two halves, in two environments:
+Qwen-Image 2.1's classes exist only in Diffusers at 6256aa7666cedd47443adc8f82da9a10e110b09c (with
+transformers 5.17.0), which the Dew environment does not install, so its reading of a Dew export is recorded
+rather than run in the suite. Two halves, in two environments:
 
-- `export DIR` (the Dew environment): the committed tiny Qwen-Image 2.1
-  pipeline (tests/fixtures/qwen_image_source.tar.xz) loaded with
-  `Pretrained.load`, every transformer parameter moved by a seeded draw (a
-  stand-in for training that every machine reproduces bit for bit), and
-  saved with `Pretrained.save` into DIR/export. `perturbed_export` is what
-  tests/test_qwen_image_source.py reruns.
-- `consume DIR OUTPUT.npz` (the isolated Qwen-Image environment,
-  tools/diffusers_qwen_image_reference.py's): `QwenImage21Pipeline` loads
-  the export whole, each weighted component loads with
-  `output_loading_info` and has to report nothing, and the transformer runs
-  the pipeline's own call (`transformer_call`) on fixed inputs in float32
-  and in float64 (`torch_precision.float64`). The fixture holds the
-  SHA-256 of every exported file, the inputs and both outputs.
+- The Dew environment: the committed tiny Qwen-Image 2.1 pipeline (tests/fixtures/qwen_image_source.tar.xz)
+  loaded with `Pretrained.load`, every transformer parameter moved by a seeded draw (a stand-in for training
+  that every machine reproduces bit for bit), and saved with `Pretrained.save` (`perturbed_export`), which
+  tests/test_qwen_image_source.py reruns and whose files' SHA-256 (tests/fixtures/qwen_image_export.json)
+  it holds; the recording writes it to EXPORT.
+- The worker (the isolated Qwen-Image environment, tools/diffusers_qwen_image_reference.py's):
+  `QwenImage21Pipeline` loads EXPORT whole, each weighted component loads with `output_loading_info` and
+  has to report nothing, and the transformer runs the pipeline's own call (`transformer_call`) on each
+  draw's `packed`, `context` and `times` in float32 and in float64 (`torch_precision.float64`), its
+  `output` packed.
 
-The source's own float32 sinusoid table is kept as published: the float64
-run builds its own, so the rule measures it as rounding.
+The source's own float32 sinusoid table is kept as published: the float64 run builds its own, so check 1
+measures it as rounding.
 
-    python tools/qwen_image_export_reference.py export DIR
     QWEN=~/.cache/dew/reference-venvs/qwen-image/bin/python
-    $QWEN tools/qwen_image_export_reference.py consume DIR OUTPUT.npz
+    python tools/venv_reference.py qwen-image-export $QWEN
 """
 
 from __future__ import annotations
@@ -35,6 +32,7 @@ import hashlib
 import json
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +42,8 @@ ARCHIVE = ROOT / "tests" / "fixtures" / "qwen_image_source.tar.xz"
 GRID = (4, 6)
 PROMPT = 5
 SEED = 89
+EXPORT = Path(tempfile.gettempdir()) / "dew-qwen-image-export" / "export"
+"""Where the recording's Dew half writes the export its worker reads."""
 
 
 def perturbed_variables(variables, seed: int = SEED):
@@ -78,25 +78,14 @@ def digests(directory: Path) -> dict[str, str]:
             for path in sorted(directory.rglob("*")) if path.is_file()}
 
 
-def inputs(config: dict) -> dict[str, np.ndarray]:
-    rng = np.random.default_rng(SEED + 1)
-    rows, columns = GRID
-    return {"packed": rng.standard_normal((1, rows * columns, config["in_channels"])).astype(np.float32),
-            "context": rng.standard_normal((1, PROMPT, config["context_in_dim"])).astype(np.float32),
-            "times": np.asarray([500.0], np.float32)}
-
-
-def consume(directory: Path, output: Path) -> None:
+def checked(export: Path):
+    """The export loaded whole by `QwenImage21Pipeline`, each weighted component loading with nothing in its
+    loading report; returns its transformer in float32 and float64."""
     import torch
     from diffusers import QwenImage21Pipeline, QwenImage21Transformer2DModel
 
-    sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
-    from diffusers_qwen_image_reference import transformer_call
-    from reference_source import saved_fixture
-
     from tools.torch_precision import float64
 
-    export = directory / "export"
     index = json.loads((export / "model_index.json").read_text())
     for name, entry in index.items():
         weighted = isinstance(entry, list) and entry[0] is not None
@@ -110,41 +99,39 @@ def consume(directory: Path, output: Path) -> None:
             raise SystemExit(f"{name} loads with {problems}")
     QwenImage21Pipeline.from_pretrained(str(export), torch_dtype=torch.float32, local_files_only=True)
 
-    config = json.loads((export / "transformer" / "config.json").read_text())
-    given = inputs(config)
-    arrays = dict(given)
-    for precision, dtype in (("fp32", torch.float32), ("fp64", torch.float64)):
-        with float64() if dtype == torch.float64 else contextlib.nullcontext():
-            model = QwenImage21Transformer2DModel.from_pretrained(
-                str(export), subfolder="transformer", torch_dtype=dtype, local_files_only=True).eval()
-            with torch.no_grad():
-                out = transformer_call(model, torch.from_numpy(given["packed"]).to(dtype),
-                                       torch.from_numpy(given["context"]).to(dtype),
-                                       torch.from_numpy(given["times"]).to(dtype), GRID)
-        arrays[f"{precision}.output"] = out.numpy()
-    import diffusers
-    import transformers
+    def transformer(dtype):
+        return QwenImage21Transformer2DModel.from_pretrained(
+            str(export), subfolder="transformer", torch_dtype=dtype, local_files_only=True).eval()
 
-    meta = {"digests": digests(export), "grid": GRID, "diffusers": diffusers.__version__,
-            "transformers": transformers.__version__, "torch": torch.__version__}
-    saved_fixture(output, arrays, meta)
-    gap = float(np.abs(arrays["fp32.output"] - arrays["fp64.output"]).max())
-    print(f"{output}: fp32 off float64 by {gap:.3g}, {len(meta['digests'])} files")
+    narrow = transformer(torch.float32)
+    with float64():
+        wide = transformer(torch.float64)
+    return narrow, wide
 
 
-def main() -> None:
-    if sys.argv[1:2] == ["export"] and len(sys.argv) == 3:
-        import tempfile
+def run(models, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Every draw's output under the export's transformer, in float32 and float64."""
+    import torch
+    from diffusers_qwen_image_reference import transformer_call
 
-        destination = Path(sys.argv[2]) / "export"
-        with tempfile.TemporaryDirectory(dir=sys.argv[2]) as scratch:
-            perturbed_export(destination, Path(scratch))
-        print(f"{destination}: {len(digests(destination))} files")
-    elif sys.argv[1:2] == ["consume"] and len(sys.argv) == 4:
-        consume(Path(sys.argv[2]), Path(sys.argv[3]))
-    else:
-        raise SystemExit(__doc__)
+    from tools.torch_precision import float64
+
+    out = {}
+    for name in sorted({key.split(".", 1)[0] for key in cases}):
+        for kind, model, dtype in (("reference", models[0], torch.float32),
+                                   ("truth", models[1], torch.float64)):
+            given = [torch.from_numpy(cases[f"{name}.{key}"]).to(dtype)
+                     for key in ("packed", "context", "times")]
+            with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+                out[f"{name}.{kind}.output"] = transformer_call(model, *given, GRID).numpy()
+    return out
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] != ["qwen-image-export"]:
+        raise SystemExit(__doc__)
+    sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
+    from reference_worker import serve
+
+    models = checked(EXPORT)
+    serve(lambda cases: run(models, cases))
