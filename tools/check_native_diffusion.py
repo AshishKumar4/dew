@@ -89,6 +89,20 @@ def prompts(inputs) -> dict[str, str]:
     return {name: bytes(np.asarray(inputs[name], np.uint8)).decode() for name in SAVED if name in inputs}
 
 
+_ENCODINGS: dict[int, tuple[object, object]] = {}
+"""Each conditioner's encode, compiled once (`encoded`), by the conditioner's identity, held with it."""
+
+
+def encoded(encoder, params, tokens):
+    """`encoder`'s conditions of `tokens`, its encode compiled once a conditioner, as a pipeline runs it:
+    each draw's prompts encoded by one program where its CLIP towers ran op by op, 147 s of the SDXL image
+    walk's 263 (row 4625)."""
+    held = _ENCODINGS.get(id(encoder))
+    if held is None or held[0] is not encoder:
+        held = _ENCODINGS[id(encoder)] = (encoder, jax.jit(encoder.encode))
+    return held[1](params, tokens)
+
+
 def conditions(source, texts=SAVED, extended=False):
     """The conditions of `texts`' prompt and negative, SDXL's second tower's with them where `extended`."""
     encoder = source.inputs.conditions["conditioning"].encoder
@@ -96,8 +110,8 @@ def conditions(source, texts=SAVED, extended=False):
     positive = {"text": texts["prompt"], **({"second": texts["prompt_2"]} if extended else {})}
     negative = {"text": texts["negative"], "negative": True,
                 **({"second": texts["negative_2"]} if extended else {})}
-    return ({"conditioning": encoder.encode(params, encoder.tokenize([positive]))},
-            {"conditioning": encoder.encode(params, encoder.tokenize([negative]))})
+    return ({"conditioning": encoded(encoder, params, encoder.tokenize([positive]))},
+            {"conditioning": encoded(encoder, params, encoder.tokenize([negative]))})
 
 
 def task_kind(source, meta):
