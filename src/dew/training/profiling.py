@@ -47,8 +47,11 @@ class ProfileWindow:
     times over), and on GPU at most its `activity_cap` CUDA activity events.
 
     A window that `reports` nothing keeps its trace and manifest alone, which needs no XProf and its stop
-    writes at once; one that reports converts its capture's reports as its stop is waited for at the
-    fit's end, minutes for a training window. A run's own window (`RunProfile`, every run's by default) is
+    writes at once; one that reports converts its capture's reports in a process of its own while the run
+    trains on, waited for at the fit's end, minutes for a training window, or, where it `wait`s, in the
+    run's own process as its capture stops, before the run's next step, as `Profiler.stop(wait=True)`
+    does: a short interactive run's, or one whose sandbox forbids it to create a process (a live page's
+    kernel). A run's own window (`RunProfile`, every run's by default) is
     resolved into one by its config (`dew.config.TrainerConfig.window`), kept with its records.
 
     `dew.Profiler` is the other way to capture a trace, as a context manager
@@ -62,6 +65,7 @@ class ProfileWindow:
     capture: telemetry_profile.CaptureOptions = dataclasses.field(
         default_factory=telemetry_profile.CaptureOptions)
     reports: bool = True
+    wait: bool = False
 
 
 def pgle_runs() -> int:
@@ -165,13 +169,14 @@ def start_capture(profiler: "Profiler") -> None:
         raise
 
 
-def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
+def stop_capture(profiler: "Profiler", loss: "jax.Array | None", *, wait: bool = False) -> None:
     """Stop the window's owned capture on every rank.
 
     The core Profiler drains the backend and stops the trace here, and
     exports its native reports in a process of its own while the run
     trains on (`Profiler.stop`, row 2017), which the run's cleanup waits
-    for (`dew.telemetry.profile.exported`). The run's last `loss` is blocked
+    for (`dew.telemetry.profile.exported`), or here where the window
+    `wait`s (`ProfileWindow.wait`). The run's last `loss` is blocked
     on only to order the primary's failure ahead of the profiler's own drain.
     A window that reports nothing writes its manifest as it stops, a
     diagnostic of the run's: its write failing is logged, and the run trains
@@ -184,7 +189,7 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
         finally:
             primary = sys.exception()
             try:
-                profiler.stop(wait=False)
+                profiler.stop(wait=wait)
             except telemetry_profile.ExportFailed as failure:
                 _log.warning("the profile window traced, and its manifest was not written: %s (%s)",
                              failure, failure.exceptions)

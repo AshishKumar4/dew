@@ -601,6 +601,54 @@ def test_a_run_that_stops_inside_its_profile_window_stops_its_capture_and_report
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
 
 
+def test_a_waiting_window_reports_in_a_run_that_cannot_create_a_process(tmp_path):
+    """A window that waits (`ProfileWindow.wait`) converts its capture's reports in the run's own process as
+    it stops: a fit in a program its sandbox forbids to create processes (the live site's guest policy, a
+    seccomp filter on fork and clone, `site/live/container/guest_limits.py`) finishes with its window's
+    reports written, where an exporter's process of its own could not start."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import dew
+
+    root = Path(dew.__file__).resolve().parents[2]
+    script = f"""
+import importlib.util, sys
+sys.path.insert(0, {str(root / "tests")!r})
+import jax, jax.numpy as jnp, numpy as np, optax
+from affine_run import Replaying
+from dew.data.dataset import Loader
+from dew.distributed.placement import MeshSpec
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.lm import LMObjective
+from dew.training import ProfileWindow, Trainer
+spec = importlib.util.spec_from_file_location("guest_limits",
+                                              {str(root / "site/live/container/guest_limits.py")!r})
+limits = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(limits)
+limits.install("train")
+model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                          max_seq_len={SEQ})
+trainer = Trainer(LMObjective(model, seq_len={SEQ}), optax.sgd(1e-2), key=jax.random.key(0),
+                  profile=ProfileWindow({str(tmp_path / "trace")!r}, steps=2, warmup=0, wait=True))
+trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+text = np.asarray((np.arange({ROWS} * {SEQ + 1}).reshape({ROWS}, {SEQ + 1}) * 7) % 64, np.int32)
+rows = Replaying(lambda position: dict(text=text))
+trainer.fit(Loader(lambda partition: rows, None, None, {ROWS}), steps=3)
+"""
+    source = str(root / "src")
+    path = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
+    subprocess.run([sys.executable, "-"], input=script, text=True, check=True,
+                   env={**os.environ, "PYTHONPATH": path})
+    (capture,) = (tmp_path / "trace").glob("capture-*")
+    record = json.loads((capture / "manifest.json").read_text())
+    assert record["capture_status"] == record["export_status"] == "completed"
+    assert any(report["status"] == "completed" for report in record["reports"])
+
+
 def test_a_profile_window_spanning_a_checkpoints_evaluation_holds_the_training_steps_alone(tmp_path):
     """A window that spans the evaluation a checkpoint's ranking runs (its cadence's, every second step) and
     the save holds the training steps alone: the work between them runs outside its capture, which
