@@ -170,10 +170,10 @@ TPU_CASES = (
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change)."""
 
 
-def _on_par(family: str, case: tuple[str, ...]) -> None:
+def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> None:
     """The chunked op's training step of `case` on its GPU, its kernel named, on par with its reference's
-    (`_reference`; check 1, the recurrence a token at a time in float64 the truth): the output, the final
-    memory and every operand's gradient. Its routes are its family's (`CHOICES`)."""
+    (`_reference`; check 1, the recurrence a token at a time in float64 the truth) over `seeds` draws: the
+    output, the final memory and every operand's gradient. Its routes are its family's (`CHOICES`)."""
     named = dict(zip(AXES[family], case, strict=True))
     hooks, starts = FORMS[named["form"]], _starts(named)
 
@@ -182,7 +182,7 @@ def _on_par(family: str, case: tuple[str, ...]) -> None:
 
     with generation.routes() as found:
         assert_as_exact(jax.jit(_step(named, named["kernel"])), jax.jit(_step(named, _reference(named))),
-                        functools.partial(_drawn, named), "-".join(case), seeds=FEWEST_SEEDS,
+                        functools.partial(_drawn, named), "-".join(case), seeds=seeds,
                         truth_fn=with_gradients(truth))
     assert {route.choice for route in found} <= CHOICES
     assert any(route.kernel == named["kernel"] for route in found)

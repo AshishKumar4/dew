@@ -761,16 +761,20 @@ def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_inte
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed)
 
 
+@pytest.mark.check1_shards(seeds=128, per_task=16)
 def test_a_bf16_gated_delta_nets_training_step_with_its_norm_is_on_par_interpreted():
     """Row 184's gated delta net cell (tests/recurrence_matrix.py: the template, bf16, one sequence)
     interpreted off a GPU, its reference the portable math there (fla's Triton kernels run on a GPU alone):
     its output, final memory and every operand's gradient on par from float64 (check 1). The chunked op's l2
     norm rounds the normalized queries and keys to the call's own dtype; kept fp32, the call reached the
     template as an fp32 one, its final memory 30 to 41 times the portable math's distance in two parts
-    (acb1301632c), 29 times fla's on a GH200 (M-JS-9)."""
+    (acb1301632c), 29 times fla's on a GH200 (M-JS-9). Over 128 draws, sixteen a map task: declared the
+    fewest, its log decay's and bias's gradients resolved no factor over the 40 it staged to on the NumPy
+    draws (row 4815, jsf-npdraw3)."""
     import recurrence_matrix
 
-    recurrence_matrix._on_par("recurrence", ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'))
+    recurrence_matrix._on_par("recurrence", ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'),
+                              seeds=128)
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=16)
