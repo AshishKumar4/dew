@@ -639,11 +639,10 @@ class KVStore:
                 leaves.append((name, codes))
                 scales.append((scale_name, scale))
         leaves += [(GROUPS[field], held[:, None].astype(jnp.int32)) for field, held in (groups or {}).items()]
-        # Each token continues its row's last document (`Append.documents`), the row's first 1.
-        kept = self.read_documents()
-        before = jnp.arange(kept.shape[-1])[None, :] < positions[:, None]
-        last = jnp.max(jnp.where(before, kept[jnp.clip(rows, 0, kept.shape[0] - 1)], 0), axis=-1)
-        leaves.append((DOCUMENTS, jnp.maximum(last, 1)[:, None]))
+        # Each token continues its row's last document (`Append.documents`; a serving row holds one), its
+        # row's largest kept, the row's first 1: a reduction a row, no slot of it a token.
+        last = jnp.max(self.read_documents(), axis=-1)
+        leaves.append((DOCUMENTS, jnp.maximum(last[jnp.clip(rows, 0, last.shape[0] - 1)], 1)[:, None]))
         size = self.layout.page_size
         # A paged pool's scales `[heads, pages, page]` written as its groups are, a dense cache's head-major
         # `[rows, heads, capacity]` at each token's row and slot (`scale_shape`).
