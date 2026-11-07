@@ -15,7 +15,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir as mgpu_ir
 from jax.extend.mlir.dialects import arith as mgpu_arith, memref as mgpu_memref
 
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import mosaic, resources
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,9 +71,12 @@ class Ring(mosaic.Ring):
 
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, swizzle: int | None = None) -> dict:
     """A gathered `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, their rows
-    staged at `swizzle` bytes (the widest where None), a load mbarrier each in shared memory (`uint64`,
-    `Ring.initialized`) and a release barrier each that `consumers` arrive at."""
-    return {'smem': mosaic.staged((stages, *block), dtype, swizzle or mosaic.SWIZZLE_BYTES),
+    staged at `swizzle` bytes (where None, the widest a row fills, `resources.widest_swizzle`, as layout
+    inference stages an ungathered ring's: a value column block's 32 bf16 columns at 64), a load mbarrier
+    each in shared memory (`uint64`, `Ring.initialized`) and a release barrier each that `consumers` arrive
+    at."""
+    swizzle = swizzle or resources.widest_swizzle(dtype, block[-1])
+    return {'smem': mosaic.staged((stages, *block), dtype, swizzle),
             'full': plgpu.SMEM((stages,), jnp.uint64),
             'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
 
