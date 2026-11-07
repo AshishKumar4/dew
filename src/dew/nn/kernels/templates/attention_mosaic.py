@@ -1041,10 +1041,11 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # (`gradient.pulled`) beside both products, and a dropping call's multipliers (`algebra.drawn`): the
         # fused launch at 64 x 64 and width 128 under a softcap spilled 104 bytes where its slopes priced a
         # phase of their own, 246 registers (softcap2).
-        # fp16's parts formed one at a time at the running scale, the scaled tile beside each
-        # (`algebra.running_parts`).
+        # fp16's parts formed at the running scale beside the tile and its scaled copy, the other left
+        # operand fp32 still live (`algebra.running_parts`: a 128-wide fused launch 281 registers live at its
+        # peak, the scale's exp2, and 2240 bytes spilled where one tile priced it at 246, et-c7512).
         held = ([logits] * slopes + ([logits] if dropped else [])
-                + ([logits] if jnp.dtype(dtype) == jnp.dtype(jnp.float16) else []))
+                + ([logits] * 3 if jnp.dtype(dtype) == jnp.dtype(jnp.float16) else []))
         return resources.live_registers(family, carried, products + held, pullback + held, dq_tile,
                                         *fragments) + statistics
     queries = block_q // config.consumers if split else block_q
