@@ -72,7 +72,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     refused,
     split_queries,
     stagings,
-    values_deferred,
     varying_slopes,
     walked_extents,
     whole_tiles,
@@ -347,15 +346,9 @@ class MosaicForward(_Mainloop[Tiles]):
         # A quantized call's codes converted where the device converts them (`mosaic.converts`: an FP8 cache
         # on sm_89 on), its call the gathered keys' path elsewhere.
         codes = _codes_of(ba.arguments["key"], ba.arguments.get("scales"))
-        # Its values' converted tile one buffer a consumer, which no deferred P·V may still read (`_Codes`).
-        if codes is not None and (config.deferred or not mosaic.converts(codes)):
+        if codes is not None and not mosaic.converts(codes):
             return False
         family = bundle_of(config, query.dtype)
-        # A P·V a step late (pinned: the derivation takes none, `derived`) where its walk takes one.
-        dropped = ba.arguments.get("drop") is not None
-        if config.deferred and not values_deferred(family, self.form, self.splits, query.dtype, dropped,
-                                                   self.parts):
-            return False
         # A tile of fewer rows than a role's lays its warps along its keys, a whole 16-key product's columns
         # each (Mosaic's layouts take whole such tiles a warp: a 96-key tile's 24 refused, dd-q5p4; 64-key
         # tiles lower at widths 64 to 256 on sm80 and sm90, dd-k16b).
@@ -427,9 +420,6 @@ class MosaicForward(_Mainloop[Tiles]):
                 break
         if config is None or chosen is None:
             return None
-        # No P·V a step late (`values_deferred`, `Tiles.deferred`, reachable pinned): measured a loss on an
-        # H100 against the walk that issues each tile's P·V in turn, Qwen3-8B's causal forward 1.23x and
-        # full 1.11x the time, an 8k causal one 1.27x, the training step 1.05x (M-ET-1, W5-gh200-5).
         return self._relaunched(ba, config, target)
 
     def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:
@@ -570,12 +560,8 @@ class MosaicForward(_Mainloop[Tiles]):
             return _peaks_registers(family, config, query.dtype, params=params, width=width)
         value_width = columns or config.columns or _width(value.shape[-1], family, query.dtype)
         residuals = ba.arguments.get("residuals")
-        # The plain inference walk's weights carried a step where it issues their P·V late
-        # (`Tiles.deferred`).
-        deferred = config.deferred and residuals is not Kept.SPLIT
         return _forward_registers(family, config, value_width, query.dtype, residuals is Kept.SPLIT,
-                                  natural=natural, params=params, width=width, deferred=deferred,
-                                  parts=self.parts)
+                                  natural=natural, params=params, width=width, parts=self.parts)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -658,7 +644,7 @@ def _mask_places(family: mosaic.Family, block_q: int, block_k: int) -> list:
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = (), width: int | None = None,
-                       deferred: bool = False, parts: int = 1) -> int:
+                       parts: int = 1) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -676,11 +662,10 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     64 x 64 on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and
     196). Where its family reads operands from registers, its products' fragments beside their tiles
     (`_products`): the logits' product of `width`-deep queries and keys, and the values' product of the
-    weights. A key tile whose indices do not fold holds its masks' places (`_mask_places`). A walk that issues
-    a tile's P·V a step late (`deferred`, `values_deferred`) carries the tile's weights across the next step,
-    its logits read while that product runs. An fp32 call's `parts` (`MosaicForward.parts`) issue its logits'
-    products' terms into one accumulator and form its weights' parts one at a time, its remainder fp32 and the
-    part beside the weights (`attention_mosaic_forward._parted_products`)."""
+    weights. A key tile whose indices do not fold holds its masks' places (`_mask_places`). An fp32 call's
+    `parts` (`MosaicForward.parts`) issue its logits' products' terms into one accumulator and form its
+    weights' parts one at a time, its remainder fp32 and the part beside the weights
+    (`attention_mosaic_forward._parted_products`)."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
@@ -707,7 +692,7 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     products = _products(family, dtype, (block_q, depth, block_k, [logits], False, True),
                          (block_q, block_k, value_width, [weights], True, False), narrow=tiles.narrow,
                          lhs_swizzle=query_swizzle(family))
-    carried = [(block_q, value_width, jnp.float32), *([weights] if deferred else [])]
+    carried = [(block_q, value_width, jnp.float32)]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0

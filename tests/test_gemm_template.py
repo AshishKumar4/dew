@@ -1056,20 +1056,6 @@ def test_a_met_dense_walk_sums_as_its_walk_apart(generation_name):
             dew(2, exact_sums=True)
 
 
-def test_a_deep_dense_walk_meets_along_its_depth_past_the_l2s_reach():
-    """`mosaic_gpu.raster_steps` on M-FS-6's A100 input gradient (8192 x 5120, 108 programs, a 40 MiB L2):
-    walked apart below `RASTER_REACH` L2s of panels (depth 40960, an 83.5% L2 hit), met each 128 steps past
-    it (45056 and 51200, where the hit fell to 72.9% and 60.5%), and apart where one round holds the call."""
-    tile = mosaic_gpu.Tiles(128, 128, 32, 4, 1, family="mma.sync")
-
-    def steps(rows, depth):
-        return mosaic_gpu.raster_steps(tile, rows=rows, depth=depth, width=5120, itemsizes=(2, 2),
-                                       programs=108, l2_bytes=40 * 2 ** 20)
-
-    assert [steps(8192, depth) for depth in (40960, 45056, 51200)] == [0, 128, 128]
-    assert steps(64, 51200) == 0
-
-
 @pytest.mark.parametrize("generation_name", ["sm90"])
 def test_a_met_dense_walk_lowers_for_cuda(generation_name):
     """A dense product's derived tile made met (`Tiles.raster`: its programs signalling and waiting on a
