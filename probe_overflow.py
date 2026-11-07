@@ -41,6 +41,11 @@ if "replay" in mode:
                 def token(h,xs):
                     z,B,U,s,C,Q,R=xs
                     h=j.where((z<=scan.vanishing(z.dtype,affine.base2))[:,None],0.,h)
+                    if "factored" in mode:
+                        decay=j.broadcast_to(scan._exp(affine.base2,z),(h.shape[0],))
+                        correction=j.sum((C*decay)[:,None]*h,axis=0)
+                        h=h*decay[:,None]+((U-s*correction)[:,None]*B[None,:]).T
+                        return h,j.sum(Q[:,None]*h,axis=0)+R
                     d=scan._exp(affine.base2,z)[:,None]*h
                     h=d+B[:,None]*(U-s*(C@d))[None,:]
                     return h,Q@h+R
@@ -116,6 +121,8 @@ for packed in (False,True):
         print("K",mode,packed,power,"vjp",at,"bad",np.sum(normal&~np.isfinite(a)),"held",np.sum(normal),flush=True)
         if packed and at==0 and "detail" in mode:
             print("K",mode,"starts",np.flatnonzero(np.asarray(starts)).tolist(),"badq",np.sum(normal&~np.isfinite(a),axis=(0,2,3)).tolist(),flush=True)
+        if packed and at==3 and "detail" in mode:
+            print("K",mode,"badg",np.argwhere(normal&~np.isfinite(a)).tolist(),flush=True)
     if not packed:
         along=jax.jit(lambda *xs:jax.jvp(gradfn(rule),xs,direction)[1])(*operands)
         with jax.enable_x64():

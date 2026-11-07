@@ -29,3 +29,15 @@ for safe in (False,True):
   return left@right
  inv=scan._doubled(-a,issue)
  print("K inverse",safe,"nan",int(j.sum(j.isnan(inv))),"paddednan",int(j.sum(j.isnan(inv[3:]))),flush=True)
+# A zero entering state has a zero decay gradient. Projecting the decayed state first overflows its
+# adjoint; scaling the correction vector first keeps the zero-state factor before that overflow.
+key=j.array(2.**62,j.float32)
+for factored in (False,True):
+ def token(h,g):
+  decay=j.exp(g)
+  decayed=h*decay
+  projected=(key*decay)*h if factored else key*decayed
+  updated=decayed+(.5*key)*(key-projected)
+  return key*updated
+ grad=jax.jit(jax.grad(token,argnums=1))(j.array(0.,j.float32),j.array(-.5,j.float32))
+ print("K zero_state_decay",factored,float(grad),flush=True)
