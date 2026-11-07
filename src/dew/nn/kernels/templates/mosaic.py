@@ -326,21 +326,24 @@ def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: 
     along `axis`, each tile's `schedule(index)`, `(active, steps, views, tile)`, visited as `visit(counter,
     active, steps, views, tile, done)` at the step its streams are at across the tiles (`counter`: the steps
     of the active tiles before it) and its turn round accumulators a tile takes whole (`done`: the active
-    tiles before it). Returns both past the last tile. The loop's one induction variable is the tile's flat
-    index (from the program's, by the programs' count, while below the grid's size, a constant): Pallas's
-    `nd_loop` kept the program's index and its own trip count live beside its step, two uniform integers
-    ptxas spilled at a 256-column exact tile's register pressure (16 bytes, NSDBG3620-F5, row 3620)."""
+    tiles before it). Returns both past the last tile. Its trip count is a constant (the waves of tiles,
+    the last masked past the grid), each tile's flat index the program's plus its wave's: Pallas's
+    `nd_loop` counted each program's own trips, keeping that count live beside the program's index, two
+    uniform integers ptxas spilled (16 bytes) at a 256-column exact tile's register pressure (NSDBG3620-F5,
+    row 3620); a `fori_loop`, so the walk lowers in warp semantics too (`scf.for`)."""
     total, programs = math.prod(tiles), lax.axis_size(axis)
+    program = lax.axis_index(axis).astype(jnp.int32)
 
-    def walked(carry):
-        flat, counter, done = carry
-        active, steps, views, tile = schedule(_unraveled(flat, tiles))
+    def walked(wave, carry):
+        counter, done = carry
+        flat = program + wave * programs
+        inside = flat < total
+        scheduled, steps, views, tile = schedule(_unraveled(jnp.minimum(flat, total - 1), tiles))
+        active = scheduled & inside
         visit(counter, active, steps, views, tile, done)
-        return flat + programs, counter + jnp.where(active, steps, 0), done + jnp.where(active, 1, 0)
+        return counter + jnp.where(active, steps, 0), done + jnp.where(active, 1, 0)
 
-    start = (lax.axis_index(axis).astype(jnp.int32), jnp.int32(0), jnp.int32(0))
-    _, counter, done = lax.while_loop(lambda carry: carry[0] < total, walked, start)
-    return counter, done
+    return lax.fori_loop(0, -(-total // programs), walked, (jnp.int32(0), jnp.int32(0)))
 
 
 def _unraveled(flat, shape: tuple[int, ...]) -> tuple:
