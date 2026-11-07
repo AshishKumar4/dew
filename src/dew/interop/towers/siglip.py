@@ -12,9 +12,10 @@ from dew import _records
 from dew.batch import Variables
 from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigLayout, ConfigPart, Table
+from dew.interop.text_encoders import encoder_layer_routes
 from dew.interop.unread import Stored, held
 from dew.interop.weights import checkpoint_array
-from dew.nn.text_encoders import TOWER_ACTIVATIONS, encoder_layer_routes
+from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.nn.vision.siglip import GemmaProjector, SiglipVision
 from dew.registry import Record
 

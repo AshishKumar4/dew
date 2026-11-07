@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dew import _records
 from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigField, ConfigLayout, Table
-from dew.nn.text_encoders import encoder_layer_routes
+from dew.interop.text_encoders import encoder_layer_routes
 from dew.nn.vision.llama4 import Llama4Projector, Llama4Vision
 from dew.registry import Record
 
