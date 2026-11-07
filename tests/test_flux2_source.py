@@ -243,7 +243,7 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, name)
                  "probe": generator.standard_normal((2, 3, 16, 24)).astype(np.float32)},)
 
     def walked(inputs):
-        image, probe_latent, code, probe = (nhwc(inputs[key])
+        image, probe_latent, code, probe = (jnp.transpose(inputs[key], (0, 2, 3, 1))
                                             for key in ("image", "probe_latent", "code", "probe"))
         latent = autoencoder.encode(params, image)
         grad_image = jax.grad(lambda image: jnp.sum(autoencoder.encode(params, image) * probe_latent))(image)
@@ -340,17 +340,23 @@ def words(*rows) -> list[str]:
 @pytest.fixture(scope="module")
 def klein_pipelines(source):
     """The saved [klein] pipeline Diffusers loads in float32, and its float64 twin (each module's
-    `float64_twin`) with the run that widens it (the recorder's `widened_walk`)."""
+    `float64_twin`) with the run that widens it: `walk(pipe, torch.float64)` inside `float64`, the
+    flow-matching scheduler's own tables widened around every call into it (`float64_scheduler`)."""
     import copy
 
     import torch
     from diffusers import Flux2KleinPipeline
+    from diffusers.schedulers import scheduling_flow_match_euler_discrete
 
-    from tools.torch_precision import float64_twin
+    from tools.torch_precision import float64, float64_twin
 
     with pytest.MonkeyPatch.context() as patched:
         patched.syspath_prepend(str(ROOT / "tools"))
-        tool = tool_support.load("diffusers_flux2_reference")
+        tool = tool_support.load("diffusers_wan_reference")
+
+    def widened_walk(walk, model):
+        with float64(), tool.float64_scheduler(scheduling_flow_match_euler_discrete):
+            return walk(model, torch.float64)
     narrow = Flux2KleinPipeline.from_pretrained(source / "pipeline", torch_dtype=torch.float32,
                                                 local_files_only=True)
     narrow.set_progress_bar_config(disable=True)
@@ -358,7 +364,7 @@ def klein_pipelines(source):
     for name, component in narrow.components.items():
         if isinstance(component, torch.nn.Module):
             setattr(wide, name, float64_twin(component))
-    return narrow, wide, tool.widened_walk
+    return narrow, wide, widened_walk
 
 
 def klein_arms(pipelines, run):
