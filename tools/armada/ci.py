@@ -1201,7 +1201,21 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
     rest = [] if cells == "1" else [name for name in every if name not in NEWEST_FILES]
     collecting = collect_entries(rest, timings, target)
-    return entries + [{**entry, **stamped} for entry in collecting]
+    return keyed(entries + [{**entry, **stamped} for entry in collecting])
+
+
+def keyed(entries: list[dict]) -> list[dict]:
+    """`entries`, each with the `key` armada keeps its recorded use under (its `keyOf`): the rows it runs, a
+    kept task's apart (it looks its rows up and runs none), and a site's judge by its name, never an
+    entry's name or weight, which each plan cuts anew. A task that recurs then packs on what it used, not on
+    its class's estimate (2026-11-07: no record of a task ever matched the next plan's, and each container's
+    CPU was about a quarter used). Hashed: a kept task's entry, which travels whole as one environment
+    string, holds up to `KEPT_BYTES` of row names already."""
+    def key(entry: dict) -> str:
+        kept = KEPT_AT in entry["tests"]
+        named = ("kept " if kept else "") + (" ".join(entry["rows"]) if entry.get("rows") else entry["name"])
+        return hashlib.sha256(named.encode()).hexdigest()
+    return [{**entry, "key": key(entry)} for entry in entries]
 
 
 def collect_entries(names: list[str], timings: dict, target: float) -> list[dict]:
