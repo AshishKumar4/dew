@@ -541,10 +541,10 @@ def at_iteration(variables: Mapping[str, Mapping], layer: jax.Array) -> dict:
 
 class Gathered(NamedTuple):
     """Expert-sorted rows read where they lie: row `i` is `tokens[rows[i]]`, slot `slots[i]`
-    (`_sorted_locally`'s slots of a dispatch that scales no input, for a `project` that takes them:
-    `expert_dispatch`'s `gathers`). The expert projections multiply them through the template's gathered
-    rows (`gemm.gemm`'s `gather`: Mosaic GPU's producer reads each slot's token where it lies, no sorted
-    copy of the tokens made, row 1376), any other use reading them gathered (`gathered`); the last
+    (`_sorted_locally`'s slots of a dispatch that scales no input, for a project that takes them:
+    `expert_dispatch`'s `gathered_project`). The expert projections multiply them through the template's
+    gathered rows (`gemm.gemm`'s `gather`: Mosaic GPU's producer reads each slot's token where it lies, no
+    sorted copy of the tokens made, row 1376), any other use reading them gathered (`gathered`); the last
     projection writes each row at its slot (`gemm.gemm`'s `scatter`), the slots in token order."""
 
     tokens: jax.Array
@@ -732,7 +732,9 @@ def expert_dispatch[Parameters](
         parameter_axes: Sequence[LogicalAxes], *,
         num_experts: int, dispatch: str, output_dtype: Dtype,
         input_weights: jax.Array | None = None, initializing: bool = False,
-        capacity_factor: float | None = None, gathers: bool = False) -> jax.Array:
+        capacity_factor: float | None = None,
+        gathered_project: Callable[[Gathered, jax.Array, jax.Array, Parameters], jax.Array] | None = None
+        ) -> jax.Array:
     """Run every routed token through its expert, and return the slots in
     token order.
 
@@ -759,11 +761,11 @@ def expert_dispatch[Parameters](
     receives. Parameters take part in at least fp32, so gradients sum across
     devices in fp32 and meet the master dtype once.
 
-    `gathers`, for a `project` whose expert projections take `Gathered` rows
-    (`ExpertMLP`'s), hands it the slots of a dispatch that sorts them where
-    they are and scales no input as the tokens, the rows each reads and the
-    slots each lands at, no sorted copy of the tokens made, and takes its rows
-    back in slot order, no un-permute (row 1376).
+    `gathered_project`, `project` as it takes `Gathered` rows (`ExpertMLP`'s),
+    is handed the slots of a dispatch that sorts them where they are and
+    scales no input as the tokens, the rows each reads and the slots each
+    lands at, no sorted copy of the tokens made, and returns its rows in slot
+    order, no un-permute (row 1376).
     """
     if dispatch not in EXPERT_DISPATCHES:
         raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {dispatch!r}")
@@ -785,7 +787,7 @@ def expert_dispatch[Parameters](
     run = functools.partial(
         _dispatched, project, parameter_axes=parameter_axes, num_experts=num_experts,
         dispatch=dispatch, output_dtype=output_dtype, initializing=initializing,
-        capacity=capacity, gathers=gathers)
+        capacity=capacity, gathered_project=gathered_project)
     if mesh.shape.get(STAGE_AXIS, 1) > 1:
         # A pipeline's stages trace the dispatch inside their own manual
         # axes, which a jvp rule traced outside them cannot hold; and a
@@ -864,14 +866,16 @@ def _dispatched[Parameters](
         x: jax.Array, indices: jax.Array, parameters: Parameters,
         input_weights: jax.Array | None, *, parameter_axes: Sequence[LogicalAxes],
         num_experts: int, dispatch: str, output_dtype: Dtype, initializing: bool,
-        capacity: int | None, gathers: bool = False) -> jax.Array:
+        capacity: int | None,
+        gathered_project: Callable[[Gathered, jax.Array, jax.Array, Parameters], jax.Array] | None = None
+        ) -> jax.Array:
     """`expert_dispatch` past its checks, over the parameters it is given."""
     mesh = jax.sharding.get_abstract_mesh()
     shards = mesh.shape.get(EXPERT_AXIS, 1)
     exchanging = dispatch == 'exchange' and not initializing and x.size > 0
     if not exchanging and (initializing or mesh.empty):
         return _sorted_locally(project, x, indices, parameters, input_weights,
-                               num_experts=num_experts, gathers=gathers)
+                               num_experts=num_experts, gathered_project=gathered_project)
     rows = x.shape[0]
     if exchanging:
         # Each expert shard sends tokens of its own: the rows are padded until
@@ -922,7 +926,8 @@ def _dispatched[Parameters](
         inner = functools.partial(_exchange_shard, project, num_experts=num_experts,
                                   shards=shards, output_dtype=output_dtype, capacity=capacity)
     else:
-        inner = functools.partial(_sorted_locally, project, num_experts=num_experts, gathers=gathers)
+        inner = functools.partial(_sorted_locally, project, num_experts=num_experts,
+                                  gathered_project=gathered_project)
 
     def body(x, indices, parameters, input_weights):
         def gathers(spec: P) -> list[tuple[int, tuple[str, ...]]]:
@@ -956,13 +961,15 @@ def _dispatched[Parameters](
             x, indices, parameters, input_weights)[:rows]
 
 
-def _sorted_locally(
-        project: Callable[..., jax.Array],
-        x: jax.Array, indices: jax.Array, parameters: object,
-        input_weights: jax.Array | None, *, num_experts: int, gathers: bool = False) -> jax.Array:
+def _sorted_locally[Parameters](
+        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
+        x: jax.Array, indices: jax.Array, parameters: Parameters,
+        input_weights: jax.Array | None, *, num_experts: int,
+        gathered_project: Callable[[Gathered, jax.Array, jax.Array, Parameters], jax.Array] | None = None
+        ) -> jax.Array:
     """Project every slot of `x`'s tokens where they are: sort the slots by
     expert, gather their token rows and put the results back in slot order
-    (or, `gathers`, hand `project` the tokens, the rows each slot reads and the
+    (or hand `gathered_project` the tokens, the rows each slot reads and the
     slot each lands at, `Gathered`, where no input is scaled, and take its rows
     in slot order). A dropped slot's sentinel id sorts last, outside every
     group, and its row comes back zero."""
@@ -971,8 +978,9 @@ def _sorted_locally(
     experts = indices.ravel()
     order = jnp.argsort(experts).astype(jnp.int32)
     sizes = jnp.bincount(experts, length=num_experts)
-    if gathers and input_weights is None:
-        projected = project(Gathered(tokens, order // top_k, order), sizes, experts[order], parameters)
+    if gathered_project is not None and input_weights is None:
+        rows = Gathered(tokens, order // top_k, order)
+        projected = gathered_project(rows, sizes, experts[order], parameters)
         projected = jnp.where((experts < num_experts)[:, None], projected, 0)
         return projected.reshape(*indices.shape, projected.shape[-1])
     grouped = tokens[order // top_k]
@@ -1168,12 +1176,13 @@ class ExpertMLP(nn.Module):
         # inferred inside the dispatch, where the parameters may be widened.
         compute = expert_compute_dtype(x, *(kernel.stack if isinstance(kernel, Layered) else kernel
                                             for kernel in kernels), dtype=self.dtype)
+        project = functools.partial(self._project, dtype=compute)
         slots = expert_dispatch(
-            functools.partial(self._project, dtype=compute), x, indices, kernels,
+            project, x, indices, kernels,
             tuple(EXPERT_AXES[name] for name in names), num_experts=self.num_experts, dispatch=self.dispatch,
             initializing=self.is_initializing(), output_dtype=compute,
             input_weights=weights if self.scale_inputs else None,
-            capacity_factor=self.capacity_factor, gathers=True)
+            capacity_factor=self.capacity_factor, gathered_project=project)
         return self._combine(slots, weights)
 
 
