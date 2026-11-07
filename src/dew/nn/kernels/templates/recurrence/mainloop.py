@@ -1039,12 +1039,18 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     sub-chunk's middle factor and its laid references, each output's gated rows, their masks, and one
     product's operands, its right a key sub-chunk's."""
     pairing = _pairing_operand(call)
+    if outputs == 1:
+        # A lone output's sum carried in registers across the key blocks, as its launch held it before the
+        # walks merged (M-JS-17's A100 parent), beside one gated output's factors.
+        return Held(carried=[f32(CHUNK, CHUNK)], phases=(
+            [f32(CHUNK, block)] * 5,
+            [f32(CHUNK, block)] * 12 + masks(CHUNK, block) * 2
+            + fragments(call, (pairing, CHUNK, block), (pairing, algebra.SUB, block))))
     # Live at once: the prefix halves and their separated pair, the rows' grid, the keys and the queries as
     # read, one output's rows and their gated form, the keys gated up, the gate down, a sub-chunk's middle
     # factor and the masked keys; the output's pairs and its sum read back. Its sums held in registers across
     # the key blocks, both outputs' at once, the merged launch spilled 336 to 424 bytes at 32 keys a block on
     # an A100 and an H100 (jsf-scan4 at d54ec6b02).
-    del outputs
     return Held(carried=[], phases=(
         [f32(CHUNK, block)] * 5,
         [f32(CHUNK, block)] * 12 + [f32(CHUNK, CHUNK)] * 2 + masks(CHUNK, block) * 2
@@ -1114,12 +1120,11 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     inverts, and the decay's prefix halves (`call.gates`, `algebra.prefix`'s pair) from the laid decay `g`
     `[R, HV * Dk]` fp32, which every later launch reads. Each pair's decay factored over the chunk's
     sub-chunks (`algebra.key_block_pairs`, which the call's declared floor bounds), their products on the
-    tensor cores (fla_kda's intra rows); the scores and the system share every factor, their sums in shared
-    memory, one output's formed at a time (`_intra_walk`): on every family where the pairs factor
-    (`Call.factored`). Held in registers, both sums with their factors spilled 336 to 408 bytes at every key
-    block on an A100, whose mma.sync then ran them as two launches of 0.87 ms each (M-JS-7). Where the pairs
-    do not factor, each sub-chunk's own pairs taking their own decays besides, each output is a launch of its
-    own (no model calls one: every model's Kimi delta attention declares its floor)."""
+    tensor cores (fla_kda's intra rows); the scores and the system share every factor in one walk, their sums
+    in shared memory, one output's formed at a time (`_intra_walk`), where `_intra_merges` (wgmma's); else
+    each output walks a launch of its own, its sum in registers. Where the pairs do not factor
+    (`Call.factored`), each sub-chunk's own pairs taking their own decays besides, each output is a launch of
+    its own (no model calls one: every model's Kimi delta attention declares its floor)."""
     if solves and not (call.factored and _intra_merges(call)):
         scores, hi, lo = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("scores",))
         (system,) = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("system",))
@@ -1129,9 +1134,14 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
 
 
 def _intra_merges(call: Call) -> bool:
-    """Whether the scores and the system take one intra walk (`_intra_walk`): a key block at which a
-    multiprocessor holds a program of it, both sums in shared memory (an A100's or an H100's; an sm86's 99
-    KB held none of a narrow key dimension's, whose outputs then walk a launch each)."""
+    """Whether the scores and the system take one intra walk (`_intra_walk`): where the family's products
+    read their operands from shared memory (wgmma's), at a key block at which a multiprocessor holds a
+    program of it, both sums in shared memory (an sm86's 99 KB held none of a narrow key dimension's). Where
+    they read registers (mma.sync's), each output walks a launch of its own: one walk's sums through shared
+    memory beside the fragments took 1.736 ms of an A100's Kimi Linear forward against the two launches'
+    0.762 and 0.717 (M-JS-17, W33-a100-1), the forward 2.754 ms against 2.487."""
+    if call.family.operands_in_registers:
+        return False
     resident = functools.partial(_resident, call, functools.partial(_intra_held, call, outputs=2),
                                  functools.partial(_intra_staged, call, products=("scores", "system")),
                                  functools.partial(_intra_streamed, call, queries=True))
@@ -1149,15 +1159,19 @@ def _shifted_keys(call: Call, tiles, keys: jax.Array, prefix: tuple):
                            for i in range(3))
 
 
-def _intra_summed(call: Call, found: jax.Array, at, *, first, strict: bool, scale: float, diagonal) -> None:
-    """A key block's pairs `found` of an output added to its sum in shared memory `at` (written at the first
-    block), before the next output's are formed: below the diagonal where `strict` (the system), else on and
-    below it and scaled (the scores); where the pairs do not factor, each sub-chunk's own pairs besides
-    (`diagonal`, `algebra.key_diagonal_pairs` given its strictness)."""
+def _intra_masked(found: jax.Array, *, strict: bool, scale: float, diagonal) -> jax.Array:
+    """A key block's pairs `found` of an output as its sum takes them: below the diagonal where `strict` (the
+    system), else on and below it and scaled (the scores); where the pairs do not factor, each sub-chunk's own
+    pairs besides (`diagonal`, `algebra.key_diagonal_pairs` given its strictness)."""
     if diagonal is not None:
         found = found + diagonal(strict=strict)
     lag = algebra._lags((CHUNK, CHUNK))
-    found = jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
+    return jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
+
+
+def _intra_summed(call: Call, found: jax.Array, at, *, first) -> None:
+    """A key block's masked pairs `found` of an output (`_intra_masked`) added to its sum in shared memory
+    `at` (written at the first block), before the next output's are formed (a merged walk's)."""
     mosaic.synced(call.interpret)
 
     # The first block's written, the rest added, in branches: a scalar condition laid over a tile
@@ -1210,7 +1224,8 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                              decays=gates.views(g_ref, row, CHUNK, h * width, width),
                              **({"queries": call.given.views(q_ref, row, CHUNK, keyed, width)} if scored
                                 else {}))
-        pairing, scanned, summed_at, *padded = staging
+        pairing, scanned, *rest = staging
+        summed_at, padded = (rest[0], rest[1:]) if outputs > 1 else (None, rest)
         sums, prefixes = outs[:outputs], outs[outputs:]
 
         def half_at(half, rows):
@@ -1264,22 +1279,29 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                                             Issuer(call, {"pairs": gated}).summed,
                                             lambda up: staged_parts(family, up, keyed), chunk=CHUNK,
                                             diagonal=call.factored)
-            for o, (name, found) in enumerate(zip(products, pairs, strict=True)):
+            masked = []
+            for name, found in zip(products, pairs, strict=True):
                 diagonal = None if call.factored else functools.partial(
                     algebra.key_diagonal_pairs, lambda c, name=name: rows(name), shifted, 1, lambda c: prefix,
                     chunk=CHUNK)
-                _intra_summed(call, found, summed_at.at[o], first=index == 0,
-                              strict=name == "system", scale=scale, diagonal=diagonal)
+                masked.append(_intra_masked(found, strict=name == "system", scale=scale, diagonal=diagonal))
+                if summed_at is not None:
+                    _intra_summed(call, masked[-1], summed_at.at[len(masked) - 1], first=index == 0)
+            if summed_at is None:
+                totals = (totals[0] + masked[0],)
 
             @pl.when(index == steps - 1)
             def _():
-                mosaic.synced(call.interpret)
-                totals = tuple(family.tile_of(summed_at.at[o]) for o in range(outputs))
-                _intra_sums_stored(call, products, totals, sums, landing, row=row, head=h)
+                if summed_at is not None:
+                    mosaic.synced(call.interpret)
+                found = (totals if summed_at is None
+                         else tuple(family.tile_of(summed_at.at[o]) for o in range(outputs)))
+                _intra_sums_stored(call, products, found, sums, landing, row=row, head=h)
 
             return totals, accumulators
 
-        return mosaic.Walk(views, step, steps=steps)
+        carry = () if outputs > 1 else (family.as_tile(family.zeros((CHUNK, CHUNK))),)
+        return mosaic.Walk(views, step, steps=steps, carry=carry)
 
     blocks = _intra_streamed(call, keys, queries=scored)
     formed = [held if name == "scores" else _systems(call) for name in products]
@@ -1326,8 +1348,9 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     # fragment store's rows off one another's banks.
     padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),)
     scanned = mosaic.plain((2, 2 * CHUNK, keys), jnp.float32)
-    sums = mosaic.plain((len(products), CHUNK, CHUNK), jnp.float32)
-    return (_pairing(call, keys), scanned, sums, *padded), landing
+    # A merged walk's sums in shared memory; a lone output's in registers (`_intra_held`).
+    sums = (mosaic.plain((len(products), CHUNK, CHUNK), jnp.float32),) if len(products) > 1 else ()
+    return (_pairing(call, keys), scanned, *sums, *padded), landing
 
 
 def _pairing_operand(call: Call) -> Operand:

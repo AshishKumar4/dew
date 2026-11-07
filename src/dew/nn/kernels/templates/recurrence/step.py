@@ -190,11 +190,11 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
 
     @pl.when(active_ref[token.row] == 0)
     def _():
-        def copied(k, carry):
-            token.stored(state_out, token.tile(state_ref, k), k)
+        def copied(k, tile, carry):
+            token.stored(state_out, tile, k)
             return carry
 
-        lax.fori_loop(0, key_width, copied, None)
+        _walked(key_width, lambda k: token.tile(state_ref, k), copied, None)
         token.stored(out_ref, jnp.zeros((block.heads, block.columns), jnp.float32))
         if conv is not None:
             conv.write(conv.held())
@@ -359,7 +359,7 @@ def _softplus(x):
 
 
 def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
-    """`recurrence.update` over the block's column of the state, a key a turn of a rolled loop, read from
+    """`recurrence.update` over the block's column of the state, `UNROLLED` keys a turn (`_walked`), read from
     `state_ref` (its delta rule's correction a pass of its own, which reads it again) and written to
     `state_out` as it is held (`recurrence._held`): the output `q^T S'`. Each key dimension's vectors are read
     from `vectors` as each head's scalars (`_key_entry`) and each sum over the keys a pairwise tree
@@ -370,17 +370,20 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
     def entry(which, k):
         return _key_entry(vectors, token, which, k)
 
+    def row(k):
+        return token.tile(state_ref, k)
+
     levels = key_width.bit_length()
     empty = tuple(jnp.zeros_like(value) for _ in range(levels))
     corrected = value
     if hooks.delta:
-        def correction(k, partials):
-            return _tree_added(partials, k, (entry(1, k) * entry(2, k)) * token.tile(state_ref, k))
+        def correction(k, tile, partials):
+            return _tree_added(partials, k, (entry(1, k) * entry(2, k)) * tile)
 
-        corrected = value - lax.fori_loop(0, key_width, correction, empty)[-1]
+        corrected = value - _walked(key_width, row, correction, empty)[-1]
 
-    def updated(k, partials):
-        entry_k = token.tile(state_ref, k) * entry(2, k) + (entry(1, k) * write) * corrected
+    def updated(k, tile, partials):
+        entry_k = tile * entry(2, k) + (entry(1, k) * write) * corrected
         # Held as `recurrence._held` holds it: bf16 rounded stochastically, salted by its key and value, the
         # key's entry laid over the block as the entry is (a scalar's bit cast lowers to no vector).
         keyed = jnp.zeros_like(entry_k) + entry(1, k)
@@ -389,7 +392,26 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
         token.stored(state_out, kept, k)
         return _tree_added(partials, k, entry(0, k) * entry_k)
 
-    return lax.fori_loop(0, key_width, updated, empty)[-1]
+    return _walked(key_width, row, updated, empty)[-1]
+
+
+UNROLLED = 16
+"""The keys a turn of the step's loops reads at once, each turn's state rows loaded before any is used so
+their loads overlap: a key a turn, each row's load latency was the step's, one row's gated delta net token
+0.038 ms on an A100 against the Triton step's 0.016 (M-JS-18). A turn holds a register a key's row."""
+
+
+def _walked(key_width: int, read, body, carry):
+    """`body(k, read(k), carry)` over the keys in order, `UNROLLED` keys a turn of a rolled loop, each turn's
+    reads issued before its first use."""
+    def turn(i, carry):
+        base = i * UNROLLED
+        tiles = [read(base + u) for u in range(UNROLLED)]
+        for u, tile in enumerate(tiles):
+            carry = body(base + u, tile, carry)
+        return carry
+
+    return lax.fori_loop(0, key_width // UNROLLED, turn, carry)
 
 
 def _tree_added(partials: tuple, index, term) -> tuple:
