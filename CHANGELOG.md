@@ -7,6 +7,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A decision objective's "none of the above" draws no longer touch a yes-or-no choice by default
+  (`none_of_the_above_options` defaults to 3); a run recorded before keeps its recorded floor.
 - A streamed Parquet store reads file by file: its shards are its files, each read row group by row group,
   its footer read as its reader reaches it, so a stream's first record waits for one file's footer, where it
   waited for every one's (FineWeb-Edu's default configuration, 2410 files on the Hub: 196 s). This is data
