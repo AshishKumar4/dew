@@ -2058,8 +2058,7 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
     # Main's whole run's gates start after every lane's run at a head, as its suite does.
-    for ref, whole, priority in (("fix/lane", "", []), ("ci/batch-abc-1", "", ["--priority=10"]),
-                                 ("ci/stage-abc-1", "", ["--priority=5"]), ("main", "", ["--priority=5"]),
+    for ref, whole, priority in (("fix/lane", "", []), ("main", "", ["--priority=5"]),
                                  ("main", "1", ["--priority=-15"])):
         script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
         environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref,
@@ -2092,7 +2091,7 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
     assert cold == {tests: weight + ci.COLD_SECONDS for tests, weight in warm.items()}
 
     def deadline(policy: str) -> list[str]:
-        calls = suite_step(tmp_path / f"cold-{policy}", "ci/batch-abc-1", "", policy, 2)
+        calls = suite_step(tmp_path / f"cold-{policy}", "fix/lane", "", policy, 2)
         [run] = [call for call in calls if call[0] == "run"]
         return [word for word in run if word.startswith("--deadline")]
 
@@ -2108,29 +2107,15 @@ def run_options(tmp_path: Path, ref: str, policy: str, option: str, whole: bool 
     return [word for word in run if word.startswith(option)]
 
 
-def test_a_staged_trains_suite_asks_no_more_than_its_lease(tmp_path):
-    """A train staged on the testing train's tip runs its suite on the pool its branch names
-    (ci/stage-...-p<N>, the share of its lease the queue's promote.sh leaves the suite), never the whole
-    pool, so it asks armada no more than it leased (the maintainer, 2026-10-28); a train on main asks the
-    whole pool."""
-    assert run_options(tmp_path, "ci/stage-abc-1-p120", "on", "--pool") == ["--pool=120"]
-    assert run_options(tmp_path, "ci/batch-abc-1", "on", "--pool") == []
-
-
 def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
-    """A push to base/kernels and a base/<producer> promote run their suite
-    at a lane's whole-suite priority, -10 as verdict.sh's, so they never take containers from a train (10)
-    or a lane's precheck or targeted run (0); a train's runs at 10, and a lane's branch at the default
-    (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger)."""
+    """A push to base/kernels runs its suite at a lane's whole-suite priority, -10 as verdict.sh's, so it
+    never takes containers from a lane's precheck or targeted run (0), and a lane's branch at the default
+    (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger); a train's CI is the
+    queue's gates on the hub, which set its own (runbooks/hub.md)."""
     def priority(ref: str) -> list[str]:
         return run_options(tmp_path, ref, "off", "--priority")
 
-    for ref in ("base/kernels", "ci/base-abc-1"):
-        assert priority(ref) == ["--priority=-10"], ref
-    assert priority("ci/batch-abc-1") == ["--priority=10"]
-    # A train staged on the testing train's tip runs beside it, below it (owner and the maintainer,
-    # 2026-10-28).
-    assert priority("ci/stage-abc-1") == ["--priority=5"]
+    assert priority("base/kernels") == ["--priority=-10"]
     assert priority("fix/lane") == []
     # Main's whole run (the schedule's, the queue's whole dispatch) is background work, below every lane's run
     # at a head (verdict.sh's -10), so no head waits behind it (Main, 2026-11-06); a push to main stays its

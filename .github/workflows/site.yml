@@ -1,9 +1,10 @@
 # Builds dewml.dev on every change to what it is made of, and fails on generated
 # pages out of step with their docs, tutorials and posts, a broken link, a
 # notebook without its outputs, a public module without an API page or a
-# registered model family the model list does not name. A ci/** push builds
-# and checks it beside CI and keeps the build as its artifact `site`; a red
-# build holds a deploy, never a train, which publishes on CI alone.
+# registered model family the model list does not name. Main's push, which
+# the hub's mirror makes once a train publishes, builds and checks it and keeps
+# the build as its artifact `site`; a red build holds a deploy, never a train,
+# which publishes on CI alone.
 #
 # Deploys are manual, from that artifact of the commit main is at, which its
 # revision.txt names (served at dewml.dev/revision.txt):
@@ -14,8 +15,8 @@ name: Site
 
 on:
   push:
-    # ci/** is where a branch goes for its own run before it lands.
-    branches: [ "ci/**" ]
+    # Main as the hub's mirror pushes it, after a train publishes: a red site holds a deploy, never a train.
+    branches: [ "main" ]
     paths: &paths [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml",
              ".github/actions/site/**" ]
   pull_request:
@@ -33,7 +34,7 @@ permissions:
 
 concurrency:
   group: site-${{ github.ref }}${{ inputs.run_cells && '-cells' || '' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/ci/') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
 
 jobs:
   build:
