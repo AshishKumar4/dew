@@ -449,7 +449,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     stores_through_registers = True
 
-    copies_rows_alone = False  # cp.async lands a copy in whole swizzled tiles of rows
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
 
     pieces_of_views = False  # its pieces are a table's runs (`_run`), a paged call's pages alone
