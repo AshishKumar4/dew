@@ -71,7 +71,7 @@ def bundle_dtype(dtype) -> jnp.dtype:
 def family_of(dtype=jnp.bfloat16) -> mosaic.Family | None:
     """The bundle of the device's instruction family for a call of `dtype` (`bundles.of`), None where the
     mainloop has none (a CPU's)."""
-    return bundles.of(generation.device_generation(), bundle_dtype(dtype))
+    return bundles.of(generation.device_generation(), bundle_dtype(dtype), chunks=True)
 
 CHUNK = 64
 """Tokens a chunk, fla's."""
@@ -815,7 +815,7 @@ def _solving(call: Call) -> mosaic.Family:
     (JS-fed5-h100-d82eeb171). Interpreted, the interpreter's (`bundles.INTERPRETED`)."""
     if call.interpret:
         return call.family
-    layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype))
+    layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype), chunks=True)
     return max((call.family, *layouts), key=lambda layout: layout.programs(1))
 
 

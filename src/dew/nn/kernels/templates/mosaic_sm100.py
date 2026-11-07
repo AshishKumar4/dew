@@ -27,7 +27,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, resources
+from dew.nn.kernels.templates import mosaic, mosaic_sm90, resources
 from dew.nn.kernels.templates.mosaic import Ref
 
 ISSUE, READ = 0, 1
@@ -690,6 +690,126 @@ def _issuing(load: Callable[[], None], products: Callable[[], None]) -> None:
     def _(warp):
         pl.when(warp == LOAD_WARP)(load)
         pl.when(warp == MMA_WARP)(products)
+
+
+class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
+    """tcgen05's issuer for 64-row tiles a consumer holds in registers (the recurrence's chunks, row 4747):
+    each product into a scoped 64-row fp32 accumulator in tensor memory (one CTA's M=64 MMA, the half-lane
+    layout `tcgen05.tmem_half_lane_layout`), its left operand from shared memory or, written there first,
+    from tensor memory (the TS form, `products`' `Accumulator`), its right from shared memory; awaited by a
+    tensor-core barrier its commit arrives at, then read into registers in the WGMMA layout, which a
+    half-lane tile loads natively (`WgmmaLayout`). Its walks carry their sums in registers, as wgmma's
+    consumers do: no accumulator outlives its product's read. Mosaic GPU's interpreter models tensor memory
+    and tcgen05's products, so interpreted it runs the same."""
+
+    name = "tcgen05.chunks"
+    takes_tf32 = True
+    takes_fp8 = True
+    rows = 64
+    role_rows = 64
+    widest_product = 256
+    operands_in_registers = False
+    products_overlap = False  # each product is awaited where its value is read (`summed`)
+
+    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+        del interpret
+
+        def run(tmem, done):
+            issue(Accumulator(tmem, shape))
+            return _awaited(tmem, done)
+
+        return pl.run_scoped(run, accumulator_columns(*shape), plgpu.Barrier(orders_tensor_core=True))
+
+    def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
+                 ) -> Accumulator:
+        del interpret
+        left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
+        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
+        return dataclasses.replace(acc, accumulate=True)
+
+    def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
+        # Each part written into tensor memory and its product issued from there (the TS form), awaited
+        # before the part's tensor memory is given back.
+        for formed in parts:
+            part = mosaic.unscaled_part(formed)
+
+            def run(tmem, done, acc=acc, part=part):
+                plgpu.async_store_tmem(tmem, part)
+                plgpu.commit_tmem()
+                self.products(acc, Accumulator(tmem, part.shape, dtype=part.dtype), rhs, interpret)
+                plgpu.tcgen05_commit_arrive(done)
+                plgpu.barrier_wait(done)
+
+            pl.run_scoped(run, operand_columns(*part.shape, part.dtype),
+                          plgpu.Barrier(orders_tensor_core=True))
+            acc = dataclasses.replace(acc, accumulate=True)
+        return acc
+
+    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+        return self.summed((lhs.shape[0], rhs.shape[1]),
+                           lambda acc: self.register_products(acc, (lhs,), rhs, interpret), interpret)
+
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+        def issue(acc):
+            self.products(acc, lhs, rhs, interpret)
+            if then is not None:
+                then()
+
+        return self.summed(shape, issue, interpret)
+
+    def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
+        # Its products done (a commit awaited), its value read, `value` added, written back.
+        del interpret
+
+        def run(done):
+            plgpu.tcgen05_commit_arrive(done)
+            plgpu.barrier_wait(done)
+            plgpu.async_store_tmem(_tensor_memory(acc), _read(_tensor_memory(acc)) + value)
+            plgpu.commit_tmem()
+
+        pl.run_scoped(run, plgpu.Barrier(orders_tensor_core=True))
+        return dataclasses.replace(acc, accumulate=True)
+
+    def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
+        def run(done):
+            plgpu.tcgen05_commit_arrive(done)
+            plgpu.barrier_wait(done)
+            plgpu.async_store_tmem(_tensor_memory(acc), scale(_read(_tensor_memory(acc))))
+            plgpu.commit_tmem()
+
+        pl.run_scoped(run, plgpu.Barrier(orders_tensor_core=True))
+        return self.register_products(dataclasses.replace(acc, accumulate=True), parts, rhs, interpret)
+
+    def settled(self, pending: int = 0) -> None:
+        # Every product is awaited where its accumulator is read (`summed`): nothing in flight past it.
+        del pending
+
+
+class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
+    """The recurrence's bundle on Blackwell (row 4747): tcgen05's chunks issuer (`Tcgen05ChunksIssuer`) on TMA
+    rings fed by a producer warpgroup (`mosaic.RingFamily`), as wgmma's bundle is: the one composition in
+    which its products are the family's own, mma.sync's on TMA rings spilling its key-block, fp32 solve and
+    scores' gradient launches at every geometry on a B200."""
+
+    consumers = 3
+
+
+CHUNKS = Tcgen05Chunks()
+"""tcgen05's bundle for the recurrence's 64-row chunks."""
+
+
+def _read(tmem) -> jax.Array:
+    """A 64-row accumulator's value in registers, in the WGMMA layout its half-lane tile loads into."""
+    value = plgpu.async_load_tmem(tmem, layout=plgpu.Layout.WGMMA)
+    plgpu.wait_load_tmem()
+    return value
+
+
+def _awaited(tmem, done) -> jax.Array:
+    """The products issued into `tmem` committed to `done`, awaited, and their sum read (`_read`)."""
+    plgpu.tcgen05_commit_arrive(done)
+    plgpu.barrier_wait(done)
+    return _read(tmem)
 
 
 def _tensor_memory(acc: Accumulator) -> Ref:

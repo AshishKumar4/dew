@@ -41,7 +41,7 @@ class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
     consumers = 1
 
 
-def groups(generation_name: str, dtype, *, stated: bool = False, tpu: bool = False
+def groups(generation_name: str, dtype, *, stated: bool = False, chunks: bool = False, tpu: bool = False
            ) -> tuple[tuple[mosaic.Family, ...], ...]:
     """The bundles a launch on a device of `generation_name` (`'sm80'`, the assumed or a real one's) may run
     for operands of `dtype`, by matrix issuer, most capable first (`generation.Architecture.issuers`, stated
@@ -49,8 +49,9 @@ def groups(generation_name: str, dtype, *, stated: bool = False, tpu: bool = Fal
     accumulator home and execution with it, in the issuer's order, those the device runs (`legal`):
 
     - tcgen05 (`mosaic_sm100.RINGS`): TMA rings into tensor memory, for a launch that states its tiles'
-      accumulators (`stated`, `Transport.persist`'s `accumulators`: the GEMM template's); a launch that does
-      not takes the next issuer.
+      accumulators (`stated`, `Transport.persist`'s `accumulators`: the GEMM template's); for a launch whose
+      tiles are a consumer's 64-row chunks in registers (`chunks`, the recurrence template's), tcgen05's
+      chunks issuer on TMA rings (`mosaic_sm100.CHUNKS`, row 4747); any other takes the next issuer.
     - wgmma: TMA rings a producer fills (`mosaic_sm90.WGMMA`), then rings its consumers fill
       (`mosaic_sm90.FED`).
     - mma.sync, which every NVIDIA GPU from sm80 issues: TMA rings its consumer fills where the device moves
@@ -65,7 +66,8 @@ def groups(generation_name: str, dtype, *, stated: bool = False, tpu: bool = Fal
     if architecture is None or (architecture.family != "tpu"
                                 and generation.capability(generation_name) is None):
         return ()
-    composed = {mosaic_sm100.RINGS.name: (mosaic_sm100.RINGS,) if stated else (),
+    composed = {mosaic_sm100.RINGS.name: ((mosaic_sm100.RINGS,) if stated
+                                          else (mosaic_sm100.CHUNKS,) if chunks else ()),
                 mosaic_sm90.WGMMA.name: (mosaic_sm90.WGMMA, mosaic_sm90.FED),
                 mosaic_sm80.Mma.name: (MmaFed(jnp.dtype(dtype)), mosaic_sm80.Mma(jnp.dtype(dtype))),
                 "tpu": (mosaic_tpu.MXU,) if tpu else ()}
@@ -86,10 +88,11 @@ def legal(family: mosaic.Family, architecture: generation.Architecture) -> bool:
             and (architecture.block_scales or not family.takes_block_scales))
 
 
-def of(generation_name: str, dtype, *, stated: bool = False, tpu: bool = False) -> mosaic.Family | None:
+def of(generation_name: str, dtype, *, stated: bool = False, chunks: bool = False, tpu: bool = False
+       ) -> mosaic.Family | None:
     """The most capable bundle a launch on a device of `generation_name` may run for operands of `dtype`
     (`groups`' first), None where there is none."""
-    found = groups(generation_name, dtype, stated=stated, tpu=tpu)
+    found = groups(generation_name, dtype, stated=stated, chunks=chunks, tpu=tpu)
     return found[0][0] if found else None
 
 
@@ -100,15 +103,15 @@ def useful_rows(family: mosaic.Family, rows: int) -> float:
     return rows / (-(-rows // family.rows) * family.rows)
 
 
-def layouts(generation_name: str, dtype, rows: int | None = None, *, stated: bool = False, tpu: bool = False
-            ) -> tuple[mosaic.Family, ...]:
+def layouts(generation_name: str, dtype, rows: int | None = None, *, stated: bool = False,
+            chunks: bool = False, tpu: bool = False) -> tuple[mosaic.Family, ...]:
     """The bundles a launch on a device of `generation_name` may take for operands of `dtype`, in preference
     order: its most capable issuer's (`groups`' first), a producer's layout before one whose consumers fill
     their own rings. Given a launch's `rows`, every issuer's, ordered by the share of its padded rows the
     launch fills (`useful_rows`), the issuers' order on a tie: a decode step's 8 rows take mma.sync's 16
     before wgmma's 64 (row 4042), where a launch's tile pads its rows to the bundle's least. None where the
-    device has none; `stated` and `tpu` as `groups`'."""
-    found = groups(generation_name, dtype, stated=stated, tpu=tpu)
+    device has none; `stated`, `chunks` and `tpu` as `groups`'."""
+    found = groups(generation_name, dtype, stated=stated, chunks=chunks, tpu=tpu)
     if rows is None:
         return found[0] if found else ()
     flat = [family for group in found for family in group]
@@ -120,7 +123,8 @@ def named(name: str, dtype) -> mosaic.Family:
     for composed in (mosaic_sm80.Mma, MmaFed):
         if composed.name == name:
             return composed(jnp.dtype(dtype))
-    for bundle in (mosaic_sm90.WGMMA, mosaic_sm90.FED, mosaic_sm100.RINGS, mosaic_tpu.MXU):
+    for bundle in (mosaic_sm90.WGMMA, mosaic_sm90.FED, mosaic_sm100.RINGS, mosaic_sm100.CHUNKS,
+                   mosaic_tpu.MXU):
         if bundle.name == name:
             return bundle
     raise ValueError(f"no Mosaic GPU bundle is named {name!r}")

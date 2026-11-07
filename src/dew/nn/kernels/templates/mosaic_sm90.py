@@ -13,21 +13,11 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import fed, mosaic, resources
 
 
-class WgmmaIssuer(mosaic.Issuer):
-    """wgmma's issuer and home: a warpgroup's 64 rows, products from shared memory or registers into a
-    warpgroup accumulator in the WGMMA layout, asynchronous until waited for, one step's in flight
-    (CUTLASS's sm90 `K_PIPE_MMAS`). Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a
-    warpgroup MMA: interpreted, such a product is the dot it would compute."""
-
-    name = "wgmma"
-    takes_tf32 = True
-    takes_fp8 = True
-    rows = 64
-    role_rows = 64
-    widest_product = 256
-    operands_in_registers = False
-    products_overlap = True
-    in_flight = 1
+class WgmmaLayout:
+    """A home whose 64-row tiles sit in registers in the WGMMA layout (`plgpu.Layout.WGMMA`), a thread two
+    adjacent columns of each 8 in a warp's 16 rows: its tiles', rows' and columns' layouts and what a thread
+    holds of them. wgmma's accumulators, and tcgen05's 64-row ones read out of tensor memory
+    (`mosaic_sm100.Tcgen05Chunks`), whose half-lane layout loads into it."""
 
     @property
     def lane_columns(self) -> int:
@@ -79,6 +69,23 @@ class WgmmaIssuer(mosaic.Issuer):
         # the fast attention backward's dQ consumer carries seven fp32 row vectors, 4 registers each at 128
         # rows (DQROWPROOF64: 260 against ptxas's 255 and 512 bytes spilled; DQROWPROOF128: 184 at 64 rows).
         return -(-rows * jnp.dtype(dtype).itemsize // 128)
+
+
+class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
+    """wgmma's issuer and home: a warpgroup's 64 rows, products from shared memory or registers into a
+    warpgroup accumulator in the WGMMA layout, asynchronous until waited for, one step's in flight
+    (CUTLASS's sm90 `K_PIPE_MMAS`). Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a
+    warpgroup MMA: interpreted, such a product is the dot it would compute."""
+
+    name = "wgmma"
+    takes_tf32 = True
+    takes_fp8 = True
+    rows = 64
+    role_rows = 64
+    widest_product = 256
+    operands_in_registers = False
+    products_overlap = True
+    in_flight = 1
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
         del interpret  # wgmma lowers interpreted
