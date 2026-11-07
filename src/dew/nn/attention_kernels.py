@@ -456,14 +456,15 @@ TEMPLATE_SUPPORTS = (
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
-    _Need('dropout', lambda case: not case.dropout or attention_route.drops(),
+    _Need('dropout', lambda case: not case.dropout or attention_route.drops(case.dtype),
           attention_route.DROPS_NOT, row='1521'),
     _ARITHMETIC,
 )
 """The attention template's requirements (`attention_route.attend`, the 'template' kernel): one dtype of fp32,
 bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
-starts, block groups, sinks, a softcap, and probability dropout off a GPU (`attention_route.drops`). A call
+starts, block groups, sinks, a softcap, and probability dropout off a GPU or over 16-bit operands on one
+(`attention_route.drops`). A call
 on a GPU or a TPU runs it by default, where its cell's declared old route does not take the call
 (`_attention_preferred`, `DECLARED`), and anywhere a call names it (`implementation='template'`, or
 `generation.chosen(attention='template')`)."""
@@ -488,9 +489,11 @@ DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
                  "full (CELLS-a100, CUPTI, 11 interleaved rounds)"),
     ('mma.sync', 'float32 attention'): (
-        'xla', "the template's fp32 training step at Qwen3-8B's widths, 1 x 1024, does not compile on an "
-               "A100 (its Triton launch asks 182272 bytes of shared memory, past the 166912 a block holds: "
-               "CELLS-a100), where jax.nn's xla attention runs"),
+        'xla', "the template's fp32 training step at Qwen3-8B's widths, 1 x 1024, did not compile on an "
+               "A100 (its Triton launch asked 182272 bytes of shared memory, past the 166912 a block holds: "
+               "CELLS-a100), where jax.nn's xla attention runs; it compiles since (147456 bytes, causal and "
+               "full, et-fp32a100 at 4f10564940), and its time against xla's is M-ET-28's to measure, as "
+               "the H100's cell measured xla 12 times as fast"),
 }
 """Attention's declared cells (bible §4, owner 10-25; `Op.declared`), by (instruction family, kind of call)
 (`AttentionCase.cell`): where an old route measured faster than the template, the old route and its receipt.
@@ -525,8 +528,12 @@ def _attention_preferred(case: AttentionCase) -> str:
     causal on an H100, but 1.07 to 1.48 full there and 1.12 to 2.23 on an A100 (M-DD-8, W55-gh200 and
     W57-a100: bf16, 32/8 heads x 128, 2048 and 8192 tokens, B 1 and 4). An accurate call trains on the
     template whatever its bias, as 'inference' takes the fast form alone (xla's attention computes no
-    other)."""
+    other). A call only spans express (`AttentionCase.spans_only`: block groups, key validity, runs or counted
+    places) runs the template on every backend, which alone reads them: every other kernel refuses it and the
+    reference path builds its dense mask, `[B, 1, S, S]` (rows 1495, 1953)."""
     backend = generation.backend()
+    if case.spans_only:
+        return 'template'
     if (backend == 'gpu' and case.dense_bias and case.form == "fast"
             and not (case.causal and generation.gpu_target().architecture.wgmma)):
         return 'inference'
@@ -555,7 +562,10 @@ ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
-    Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS)),
+    Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need(
+        'spans_only', lambda case: not case.spans_only,
+        "the call's visibility is spans alone, which a differentiated call's xla attention would build "
+        "densely: the template takes it", row=INHERENT))),
 ), _attention_preferred, _hosted, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,

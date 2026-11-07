@@ -172,7 +172,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_shared",
         # A score hook's warpgroups reserve their reduction scratch (`reducing`).
-        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
+        reducing_warpgroups=reducing(family, consumers, walk.reduces),
         # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
         # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads,
