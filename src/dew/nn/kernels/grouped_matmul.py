@@ -189,10 +189,12 @@ def _side_tile_bytes(operands, axes_of, extents: dict) -> int:
 
 def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array:
     """Group sizes summing to `rows` over the groups the third spec (the launch's group sizes) names,
-    drawn unevenly, one group left empty, as a step routes them."""
+    drawn unevenly, the first left empty where there are several, as a step routes them; a dense call's
+    one group every row (emptied, its share's sum was zero and its sizes NaN cast to integers, W28-a100-2)."""
     groups = specs[2].shape[0]
     shares = np.random.default_rng(seed).dirichlet(np.ones(groups))
-    shares[0] = 0.0
+    if groups > 1:
+        shares[0] = 0.0
     sizes = np.floor(shares / shares.sum() * rows).astype(np.int32)
     sizes[-1] += rows - sizes.sum()
     return jnp.asarray(sizes)
