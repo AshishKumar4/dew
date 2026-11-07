@@ -3,6 +3,7 @@ and E4M3 block scales decoded exactly (`NvFp4.decoded`, its codes in the staged 
 deferred factor applied to the fp32 accumulator before the one rounding."""
 
 import dataclasses
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -151,3 +152,42 @@ def test_an_nvfp4_products_packed_kernel_is_its_decoded_product(generation_name)
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
         np.testing.assert_array_equal(np.asarray(pull(cotangent)[0]), np.asarray(pull_xla(cotangent)[0]))
     np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
+
+
+def nvfp4_bank(seed: int, groups: int, depth: int, width: int) -> tuple[gemm.NvFp4, np.ndarray]:
+    """A bank of `groups` NVFP4 matrices (`nvfp4`'s each, its own tensor scale, row 4516) as one
+    `gemm.NvFp4` (`[groups, depth, width]`), and its values."""
+    matrices = [nvfp4(seed + group, depth, width, scale=2.0 ** -group) for group in range(groups)]
+    codes = jnp.stack([matrix.codes() for matrix, _ in matrices])
+    scales = jnp.stack([matrix.scales.T for matrix, _ in matrices])
+    bank = gemm.NvFp4.of(codes, scales, jnp.asarray([2.0 ** -group for group in range(groups)], jnp.float32))
+    return bank, np.stack([values for _, values in matrices])
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_an_nvfp4_banks_packed_grouped_product_is_its_decoded_banks_product(generation_name):
+    """`gemm.nvfp4_product` of a bank of four experts' NVFP4 matrices (row 4516: each its own tensor scale)
+    over a ragged group table (one group empty, rows past the groups), its packed kernel named (each tile
+    decoding its group's expert's stages in place) against the decoded bank's grouped product (XLA's arm),
+    bitwise, and both exactly the float64 product of the values: small integer rows, every product and sum
+    exact in fp32; the bank takes no gradient."""
+    bank, values = nvfp4_bank(11, 4, 512, 128)
+    sizes = np.asarray([40, 0, 72, 24])
+    rows = jnp.asarray(np.random.default_rng(12).integers(-3, 4, size=(140, 512)), jnp.float32)
+
+    def product(x, kernel):
+        with generation.chosen(nvfp4=kernel):
+            return gemm.nvfp4_product(x, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32,
+                                      interpret_on_cpu=True)
+
+    with generation.assumed(generation_name):
+        with generation.routes() as routes:
+            got = product(rows, "packed")
+        assert {route.kernel for route in routes if route.choice == "nvfp4"} == {"packed"}, routes
+        want = product(rows, "xla")
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    starts = np.cumsum([0, *sizes])
+    truth = np.zeros((140, 128))
+    for group, (first, last) in enumerate(itertools.pairwise(starts)):
+        truth[first:last] = np.asarray(rows[first:last], np.float64) @ values[group]
+    np.testing.assert_array_equal(np.asarray(got, np.float64), truth)
