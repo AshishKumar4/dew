@@ -1015,6 +1015,12 @@ def takes_dtype(model: ModelConfig) -> bool:
     return isinstance(owner, type) and any(name == "dtype" for name, _, _ in member_fields(owner))
 
 
+def _without(record: Mapping[str, JSON], names: tuple[str, ...]) -> dict[str, JSON]:
+    """`record` without a field of `names` wherever it nests one (`_records.without_fields`), held as the
+    record it is: a wrapper's language model's, a decision run's backbone's among them."""
+    return {key: _records.without_fields(value, names) for key, value in record.items() if key not in names}
+
+
 def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -> bool:
     """Whether an objective `now` trains what `before` trained: one class, every argument the same but
     those its class lets a resume change (`dew.objectives.base.Objective.resumable`), a stated argument
@@ -1380,12 +1386,6 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     if not isinstance(held, dict):
         raise KeyError(f"{key} holds {held!r}, not a record of fields")
     return held
-
-
-def _without(record: Mapping[str, JSON], names: tuple[str, ...]) -> dict[str, JSON]:
-    """`record` without a field of `names` wherever it nests one: a wrapper's language model's, a decision
-    run's backbone's among them (`_records.without_fields`)."""
-    return {key: _records.without_fields(value, names) for key, value in record.items() if key not in names}
 
 
 def _holds(config: "RunConfig", path: str) -> bool:
