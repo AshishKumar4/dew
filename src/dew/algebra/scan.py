@@ -592,9 +592,17 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
         # decay's derivative would read it.
-        return jnp.where(active, issue(role, left, right.T), 0.0) * joined[..., 0]
+        return jnp.where(active, _halved(issue, role, left, right.T), 0.0) * joined[..., 0]
     # The factors read the reference's own decay (1, on the diagonal a strict pairing excludes).
     return jnp.where(active, _factored(left, right, between, joined, issue, role), 0.0)
+
+
+def _halved(issue: Callable, role: str, left, right):
+    """`left @ right` the product `role` makes, summed over its depth as its two halves' products added, as
+    the hand math paired its keys: over the whole depth in one product, a packed walk's final memory landed
+    4.1 times the token scan's distance from float64 where the halves' land 2.4 times (row 1966)."""
+    half = left.shape[-1] // 2
+    return issue(role, left[..., :half], right[:half]) + issue(role, left[..., half:], right[half:])
 
 
 def _factored(left, right, between, joined, issue: Callable, role: str):
@@ -622,8 +630,8 @@ def _factored(left, right, between, joined, issue: Callable, role: str):
                 blocks.append(float32_einsum("ik,ijk->ij", left[own], right[None, keys] * joined[own, keys]))
             else:
                 reference = first - 1
-                blocks.append(issue(role, left[own] * between[own, reference],
-                                    (right[keys] * between[reference, keys]).T))
+                blocks.append(_halved(issue, role, left[own] * between[own, reference],
+                                      (right[keys] * between[reference, keys]).T))
         rows.append(jnp.concatenate(blocks, axis=1))
     return jnp.concatenate(rows, axis=0)
 
