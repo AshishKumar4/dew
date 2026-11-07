@@ -180,12 +180,14 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
     def truth(operands):
         return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
 
+    step = jax.jit(_step(named, named["kernel"]))
+    # Its routes read from one draw's step: a check-1 site's judge pools its map tasks' records, running none.
     with generation.routes() as found:
-        assert_as_exact(jax.jit(_step(named, named["kernel"])), jax.jit(_step(named, _reference(named))),
-                        functools.partial(_drawn, named), "-".join(case), seeds=seeds,
-                        truth_fn=with_gradients(truth))
+        jax.block_until_ready(step(*_drawn(named, 0)))
     assert {route.choice for route in found} <= CHOICES
     assert any(route.kernel == named["kernel"] for route in found)
+    assert_as_exact(step, jax.jit(_step(named, _reference(named))), functools.partial(_drawn, named),
+                    "-".join(case), seeds=seeds, truth_fn=with_gradients(truth))
 
 
 @cell("recurrence", covers=lambda case: dict(zip(AXES["recurrence"], case, strict=True)))
