@@ -509,38 +509,37 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
     if not _sums_in_float64(*operands):
-        if (dense := _dense_float32(product, preferred_element_type, operands)) is not None:
-            return dense
         return product(*operands, preferred_element_type=preferred_element_type)
     if (key := _contraction(product, preferred_element_type)) is not None:
         return _traced_once(key)(*operands)
     return _summed_wide(product, preferred_element_type, *operands)
 
 
-def _dense_float32(product: Callable, preferred_element_type, operands: tuple) -> jax.Array | None:
-    """A `jax.lax.dot_general` of two float32 arrays into float32 (a dense layer's product, `accumulated`'s
-    outside Dew's wide test sums), summed blocked and pairwise where a CPU runs it
-    (`pairwise.pairwise_dot_general`, row 4863) and as XLA sums it on any other platform; None for any
-    other product, and for one a library intercepts (Qwix's)."""
+def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision,
+                       preferred_element_type) -> jax.Array | None:
+    """A layer's projection (`product`, its own `jax.lax.dot_general`, as `gemm.dot_general` takes a layer's
+    product past the template) of float32 operands into float32, summed as a vectorized dot sums it where a
+    CPU runs it (`pairwise.pairwise_dot_general`, row 4863) and as `product` sums it on any other platform;
+    None where `product` is the CPU's sum already (Dew's wide test arithmetic, `_sums_in_float64`), a
+    library intercepts it (Qwix's), its declared algorithm narrows the operands (`exact_products`: its own
+    product keeps the declaration), or its dtypes are others. A layer's projections alone: a product the
+    algebra derives or a mixer forms (attention's `dP` and `D`, whose sums cancel bit for bit on a one-key
+    row) keeps XLA's sum."""
     from dew.nn import pairwise
 
-    if len(operands) != 2 or _intercepted() or jax.lax.dot_general.__code__ is not _JAX_CODE[0]:
-        return None
-    function, keywords = product, {}
-    while (isinstance(function, functools.partial) and type(function) is functools.partial
-           and not function.args):
-        keywords, function = {**function.keywords, **keywords}, function.func
-    if (function is not jax.lax.dot_general or set(keywords) - {'dimension_numbers', 'precision'}
-            or 'dimension_numbers' not in keywords
+    if (_sums_in_float64(lhs, rhs) or _intercepted() or not exact_products(precision, jnp.float32)
             or jnp.dtype(preferred_element_type or jnp.float32) != jnp.float32
             or not all(isinstance(operand, jax.Array | np.ndarray) and operand.dtype == jnp.float32
-                       for operand in operands)):
+                       for operand in (lhs, rhs))):
         return None
-    plain = functools.partial(product, preferred_element_type=preferred_element_type)
-    blocked = functools.partial(pairwise.pairwise_dot_general,
-                                dimension_numbers=keywords['dimension_numbers'],
-                                precision=keywords.get('precision'))
-    return jax.lax.platform_dependent(*operands, cpu=blocked, default=plain)
+
+    def plain(lhs, rhs):
+        return product(lhs, rhs, dimension_numbers, precision=precision,
+                       preferred_element_type=preferred_element_type)
+
+    blocked = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=dimension_numbers,
+                                precision=precision)
+    return jax.lax.platform_dependent(lhs, rhs, cpu=blocked, default=plain)
 
 
 CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)

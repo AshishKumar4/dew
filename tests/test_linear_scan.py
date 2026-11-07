@@ -240,17 +240,18 @@ VARIABLES = {"given": (TOKENS, VALUES), "other": (TOKENS, KEYS), "left": (TOKENS
 """Each chunk identity's variable's shape: a solve's given values and the left operand of a product with
 the entering state, a pair's parts; a solve's `lower` strictly lower."""
 
-CHUNK_IDENTITIES = [(corrects, index, rule) for corrects in (True, False)
-                    for index, rule in enumerate(_declared(linear_scan._identities(corrects)))]
+CHUNK_IDENTITIES = [(corrects, per_key, index, rule)
+                    for corrects in (True, False) for per_key in (False, True)
+                    for index, rule in enumerate(_declared(linear_scan._identities(corrects, not per_key)))]
 
 
-@pytest.mark.parametrize("per_key", [False, True], ids=["scalar", "per_key"])
-@pytest.mark.parametrize(("corrects", "index", "rule"), CHUNK_IDENTITIES,
-                         ids=[f"{'wy' if corrects else 'plain'}[{index}]" for corrects, index, _ in
-                              CHUNK_IDENTITIES])
-def test_every_chunk_identity_holds_over_the_reals(corrects, index, rule, per_key):
+@pytest.mark.parametrize(("corrects", "per_key", "index", "rule"), CHUNK_IDENTITIES,
+                         ids=[f"{'wy' if corrects else 'plain'}-{'per_key' if per_key else 'scalar'}[{index}]"
+                              for corrects, per_key, index, _ in CHUNK_IDENTITIES])
+def test_every_chunk_identity_holds_over_the_reals(corrects, per_key, index, rule):
     """The identity's two sides equal exactly over a symbolic chunk of three tokens, its decays a scalar's
-    or each key's: every entry of each side's value."""
+    or each key's, each under the identities the engine saturates for that decay
+    (`linear_scan._identities`): every entry of each side's value."""
     chunk = _chunk_values(per_key)
     bound = {name: _symbols(name, shape) for name, shape in VARIABLES.items()}
     bound["lower"] = np.tril(_symbols("lower", (TOKENS, TOKENS)), -1)
