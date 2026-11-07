@@ -19,6 +19,8 @@ identity (`program._within`'s). A region's decision is held by its structure
 and the context it was weighed in (`_decided`), so every layer of a stack, and every retrace, weighs it once.
 A softmax attention (`attention_regions`) is found first and written as Dew's attention where a kernel of
 Dew's takes it, through the same splice (`_spliced`); a product inside it is none of the products' regions.
+An RMSNorm or SwiGLU no product's epilogue took (`norm_regions`) is written as Dew's where its fused kernel
+takes it, through the same splice.
 """
 
 from __future__ import annotations
@@ -62,9 +64,10 @@ class Region(NamedTuple):
 
 def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     """`jaxpr` with each attention region a kernel of Dew's takes written as Dew's attention
-    (`attention_regions`) and each product region the template takes fused (the module's account); `jaxpr`
-    itself where none is."""
-    from dew.algebra import attention_regions
+    (`attention_regions`), each product region the template takes fused (the module's account), and each
+    RMSNorm and SwiGLU region the fused norms take written as Dew's (`norm_regions`); `jaxpr` itself where
+    none is."""
+    from dew.algebra import attention_regions, norm_regions
     from dew.nn.kernels import fused_gemm
 
     index = Index(jaxpr)
@@ -75,10 +78,16 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     products = [region for region in _regions(index) if not held & set(region.places)
                 and _decided(jaxpr, region.places, region.inputs, region.outputs,
                              lambda region=region: _takes(fused_gemm, jaxpr, region))]
-    if not attention and not products:
+    held |= {place for region in products for place in region.places}
+    norms = [region for region in norm_regions.regions(index) if not held & set(region.places)
+             and _decided(jaxpr, region.places, _read(jaxpr, region.places), (region.output,),
+                          lambda region=region: norm_regions.taken(region))]
+    if not attention and not products and not norms:
         return jaxpr
     written = [Written(region.places, region.operands, (region.output,), region.places[-1],
-                       attention_regions.written(region)) for region in attention]
+                       module.written(region))
+               for module, found in ((attention_regions, attention), (norm_regions, norms))
+               for region in found]
     written += [Written(region.places, region.inputs, region.outputs, region.at,
                         _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm)) for region in products]
     return _spliced(jaxpr, written)

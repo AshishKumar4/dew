@@ -353,3 +353,76 @@ def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
     with generation.assumed("sm90"):
         routes = _attention_routes(lambda: dew.jit(written_out(**options)).trace(*shapes))
     assert bool(routes) == (variant == "attention"), routes
+
+
+def flax_rms(x, w):
+    """Flax's RMSNorm as a Flax model applies it."""
+    from flax import linen as nn
+
+    return nn.RMSNorm(epsilon=1e-6, dtype=x.dtype).apply({"params": {"scale": w}}, x)
+
+
+def plain_rms(x, w):
+    """An RMSNorm as a plain program writes it: float32 statistics, the weight before the cast."""
+    widened = x.astype(jnp.float32)
+    inverse = jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + 1e-6)
+    return (widened * inverse * w).astype(x.dtype)
+
+
+def offset_rms(x, w):
+    """Gemma's RMSNorm: the normalized row cast first, then times one more than its weight."""
+    widened = x.astype(jnp.float32)
+    normed = widened * jax.lax.rsqrt(jnp.mean(jnp.square(widened), axis=-1, keepdims=True) + 1e-6)
+    return normed.astype(x.dtype) * (1 + w.astype(x.dtype))
+
+
+def swiglu(a, b):
+    """A gated MLP's product as a plain program writes it."""
+    return jax.nn.silu(a) * b
+
+
+NORM_FORMS = {
+    "flax RMSNorm": (flax_rms, {"scale_offset": False, "scale_after_cast": False}),
+    "plain RMSNorm": (plain_rms, {"scale_offset": False, "scale_after_cast": False}),
+    "Gemma RMSNorm": (offset_rms, {"scale_offset": True, "scale_after_cast": True}),
+    "SwiGLU": (swiglu, None),
+}
+"""Each plain program's fused norm, and how Dew's own RMSNorm weighs it (None: Dew's SwiGLU)."""
+
+
+@pytest.mark.parametrize("form", list(NORM_FORMS))
+def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
+    """A plain program's RMSNorm (Flax's, a plain one, Gemma's offset weight after the cast) or SwiGLU,
+    compiled through `dew.jit` on an H100, runs the kernel Dew's own norm routes the call to (none where that
+    is XLA's arithmetic), where the program as written runs XLA's; on this host, its output and gradients on
+    par with the program as written (check 1)."""
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
+    import dew
+    from dew.nn.activations import gated_product
+    from dew.nn.norms import rms_normalized
+
+    program, weighed = NORM_FORMS[form]
+    rows = jax.ShapeDtypeStruct((256, 1024), jnp.bfloat16)
+    shapes = (rows, rows) if weighed is None else (rows, jax.ShapeDtypeStruct((1024,), jnp.float32))
+
+    def own(x, w):
+        if weighed is None:
+            return gated_product("swiglu")(x, w)
+        return rms_normalized(x, w, 1e-6, x.dtype, fp32_statistics=True, **weighed)
+
+    def fused(trace) -> list[str]:
+        with generation.routes() as found:
+            trace()
+        return [route.kernel for route in found if route.choice in ("rms_norm", "swiglu")
+                and route.kernel != "xla"]
+
+    with generation.assumed("sm90"):
+        assert not fused(lambda: jax.jit(program).trace(*shapes))
+        assert fused(lambda: dew.jit(program).trace(*shapes)) == fused(lambda: jax.jit(own).trace(*shapes))
+    sizes = [shape.shape for shape in shapes]
+    draw = normal_drawn(43, *sizes, sizes[0], dtype=jnp.bfloat16)
+    assert_as_exact(jax.jit(with_gradients(dew.jit(program))), jax.jit(with_gradients(program)), draw,
+                    f"dew.jit {form}", seeds=8, truth_fn=with_gradients(
+                        lambda *x: program(*(a.astype(jnp.float64) for a in x))))
