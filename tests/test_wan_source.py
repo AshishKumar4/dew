@@ -326,7 +326,8 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
                        encoder_hidden_states=tensor(context)).sample
         return channels_last(output.numpy())
 
-    assert_export_recomputes(export, forward, call, draw, "trained Wan")
+    assert_export_recomputes(forward, lambda wide: consumer.denoiser(export, call, wide=wide), draw,
+                             "trained Wan")
 
 
 def test_an_unchanged_sample_cannot_exceed_its_sources_measured_float64_error():

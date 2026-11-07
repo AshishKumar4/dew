@@ -325,9 +325,10 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
                                    jnp.ones((1, 10), jnp.float32))
     # The reload builds the trained model, so one compiled forward reads both trees.
     assert again.model == loaded.model
-    forward = jax.jit(lambda tree: loaded.model.apply(tree, latent, jnp.asarray([0.5]), condition))
-    trained = forward({"params": state.variables["params"], "buffers": state.variables["buffers"]})
-    reloaded = forward({"params": again.variables["params"], "buffers": again.variables["buffers"]})
+    forward = jax.jit(lambda tree, drawn: loaded.model.apply(tree, drawn, jnp.asarray([0.5]), condition))
+    trained_tree = {"params": state.variables["params"], "buffers": state.variables["buffers"]}
+    trained = forward(trained_tree, latent)
+    reloaded = forward({"params": again.variables["params"], "buffers": again.variables["buffers"]}, latent)
     np.testing.assert_array_equal(reloaded, trained)
 
     # Diffusers' own classes read the export: every component cleanly, the
@@ -337,9 +338,6 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
-    forward = jax.jit(lambda drawn: loaded.model.apply(
-        {"params": state.variables["params"], "buffers": state.variables["buffers"]}, drawn,
-        jnp.asarray([0.5]), condition))
 
     def draw(seed):
         """A latent of the pipeline's shape, its values drawn."""
@@ -351,4 +349,6 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
                        pooled_projections=tensor(condition.pooled), timestep=tensor([0.5])).sample
         return output.permute(0, 2, 3, 1).numpy()
 
-    assert_export_recomputes(export, forward, call, draw, "trained SD3")
+    assert_export_recomputes(lambda drawn: forward(trained_tree, drawn),
+                             lambda wide: consumer.denoiser(export, call, wide=wide), draw,
+                             "trained SD3")
