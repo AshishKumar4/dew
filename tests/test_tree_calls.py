@@ -8,12 +8,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
-from dew.batch import Coordinates, Entered
 from flax import linen as nn
 from model_support import TINY_DECODER, float64_twin
 from reference_error import assert_as_exact
 
+from dew.batch import Coordinates, Entered
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 VOCAB = 37
