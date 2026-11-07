@@ -96,14 +96,6 @@ def preactivation(window, taps, bias):
     return total if bias is None else total + bias[None, :]
 
 
-def _pieces(parts):
-    """Each piece's first channel, width and head."""
-    first = 0
-    for width, head in parts:
-        yield first, width, head
-        first += width
-
-
 def _launched(interpret: bool):
     """The family the kernels issue by, and whether they interpret (off a GPU, the interpreted bundle's)."""
     from .templates import bundles
@@ -119,22 +111,17 @@ def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: floa
 
     return tuple(conv.forward(x, taps, bias, valid, documents, first=first, width=width, head=head,
                               activation=activation, eps=eps, dtype=dtype, **_launched(interpret))
-                 for first, width, head in _pieces(parts))
+                 for first, width, head in conv.pieces(parts))
 
 
 def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bool, eps: float,
               interpret: bool):
-    """Each piece's gradients, a launch each (`templates.recurrence.conv.backward`), its input's gradient its
-    channels'."""
+    """Every piece's gradients in one launch (`templates.recurrence.conv.backward`)."""
     from .templates.recurrence import conv
 
-    found = [conv.backward(x, taps, bias, valid, documents, dy, first=first, width=width, head=head,
-                           activation=activation, eps=eps, **_launched(interpret))
-             for (first, width, head), dy in zip(_pieces(parts), cotangents, strict=True)]
-    dx = jnp.concatenate([piece[0] for piece in found], axis=-1).astype(x.dtype)
-    dw = jnp.concatenate([piece[1].T for piece in found]).astype(taps.dtype)
-    db = None if bias is None else jnp.concatenate([piece[2] for piece in found]).astype(bias.dtype)
-    return dx, dw, db
+    dx, dw, db = conv.backward(x, taps, bias, valid, documents, tuple(cotangents), parts=tuple(parts),
+                               activation=activation, eps=eps, **_launched(interpret))
+    return dx, dw.T.astype(taps.dtype), None if bias is None else db.astype(bias.dtype)
 
 
 def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float, dtype, interpret: bool):

@@ -554,7 +554,10 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         return self.turns * columns * accumulators
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None) -> dict:
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
+                gathered: tuple[str, ...] = ()) -> dict:
+        if gathered:
+            raise NotImplementedError("tcgen05's load warp gathers no rows (`gathers_rows`)")
         if multicast:
             raise NotImplementedError("tcgen05's pair of CTAs shares a product, not a multicast ring "
                                       "(`Topology`; not yet a stream of this bundle's)")

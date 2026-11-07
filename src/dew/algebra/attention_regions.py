@@ -226,7 +226,7 @@ class Graph:
         self.jaxpr, self.producer, self.readers, self.escaping = (index.jaxpr, index.producer, index.readers,
                                                                   index.escaping)
         # The body's constants (jax.nn's mask positions, an iota it closed over) by their values.
-        self._constants: dict[jcore.Var, object] = {
+        self._constants: dict[jcore.Var, np.ndarray | None] = {
             var: np.asarray(value) for var, value in index.consts.items()
             if not isinstance(value, jax.core.Tracer)
             and math.prod(getattr(var.aval, "shape", ())) <= MASK_ENTRIES}
@@ -260,7 +260,7 @@ class Graph:
         value = float(value)
         return value == -math.inf or value <= 0.5 * float(jnp.finfo(dtype).min)
 
-    def constant(self, atom):
+    def constant(self, atom) -> np.ndarray | None:
         """`atom`'s value where no input of the program makes it (literals, the body's constants, iotas,
         through any equation without effects), None else, nor where it holds more than MASK_ENTRIES
         entries."""
@@ -279,17 +279,16 @@ class Graph:
         return value
 
 
-def _evaluated(eqn: jcore.JaxprEqn, inputs: list, index: int):
+def _evaluated(eqn: jcore.JaxprEqn, inputs: list, index: int) -> np.ndarray | None:
     """`eqn`'s output `index` over concrete `inputs`, evaluated on this host's CPU (a compile-only mesh's
-    devices run nothing); None where the host evaluates it to no value (no CPU backend, or the primitive has
-    no rule there), so a region whose mask is not read keeps its program's own math."""
-    try:
-        cpu = jax.devices("cpu")[0]
-        with jax.ensure_compile_time_eval(), jax.default_device(cpu):
-            made = eqn.primitive.bind(*inputs, **eqn.params)
-        return np.asarray((made if eqn.primitive.multiple_results else [made])[index])
-    except (RuntimeError, ValueError, TypeError, AttributeError, NotImplementedError):
+    devices run nothing); None in a process whose platforms hold no CPU (`jax_platforms`), so a region whose
+    mask is not read keeps its program's own math."""
+    platforms = jax.config.jax_platforms
+    if platforms and "cpu" not in platforms.split(","):
         return None
+    with jax.ensure_compile_time_eval(), jax.default_device(jax.devices("cpu")[0]):
+        made = eqn.primitive.bind(*inputs, **eqn.params)
+    return np.asarray((made if eqn.primitive.multiple_results else [made])[index])
 
 
 def _matched(graph: Graph, exp_place: int) -> Attention | None:
