@@ -933,14 +933,13 @@ class MultiHeadLatentAttention(LinearProducts):
         turned = jnp.broadcast_to(turned, shape)
         slots = jnp.broadcast_to(jnp.arange(total), (batch, total))
         own = call_visibility(metadata, turned, batch=batch, queries=length, keys=total, key_places=slots,
-                              sliding_window=self.sliding_window)
+                              sliding_window=self.sliding_window, cached=True)
         if own is None:
             return None
-        mask, runs, window, key_places = own
         # The runs index the cache's slots; the queries' and keys' places count a window and a chunk.
-        return visibility_mask(length, total, causal=False, sliding_window=window, mask=mask,
-                               key_valid=cached_validity(self, total), key_runs=runs,
-                               places=(turned, key_places), chunk=self.attention_chunk)
+        return visibility_mask(length, total, causal=False, sliding_window=own.window, mask=own.mask,
+                               key_valid=cached_validity(self, total), key_runs=own.runs,
+                               places=(turned, own.key_places), chunk=self.attention_chunk)
 
     def _visible(self, slots, total: int):
         """`[B, 1, T, total]`: which of the cache's `total` slots each query at `slots` sees, those up
