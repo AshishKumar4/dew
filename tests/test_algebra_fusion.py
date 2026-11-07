@@ -10,6 +10,7 @@ import pytest
 
 from dew import algebra
 from dew.nn.kernels import generation
+from dew.nn.precision import Numerics
 
 
 def draw(seed: int = 7):
@@ -128,15 +129,18 @@ def test_a_layers_gradient_under_the_pass_is_its_gradient_as_written(layer):
         assert_equal(jax.jit(algebra.rewritten(grad))(*operands), jax.jit(grad)(*operands))
 
 
+@pytest.mark.parametrize("forms", ["fast", "accurate"])
 @pytest.mark.parametrize("layer", [bare, kernel_gradient, grouped, grouped_kernel_gradient],
                          ids=lambda layer: layer.__name__)
-def test_a_plain_programs_product_runs_the_template_its_call_names(layer):
+def test_a_plain_programs_product_runs_the_template_its_call_names(layer, forms):
     """A plain JAX program's product of each form the template takes (`fusion.Form`: alone, a kernel
     gradient's, each group's rows times its matrix, a grouped kernel gradient's), under the pass on an H100
     whose template a call names, runs the template's launch (its route reported as the selector's), where
-    the program as written runs XLA's dot."""
+    the program as written runs XLA's dot; under the accurate forms too, which limit the pass's
+    reassociation alone (row 4730)."""
     operands = draw()
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
+          generation.run_precision(Numerics(forms=forms))):
         with generation.routes() as written:
             jax.jit(layer).trace(*operands)
         with generation.routes() as passed:
