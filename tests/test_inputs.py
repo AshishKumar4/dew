@@ -43,7 +43,6 @@ def test_a_seeds_key_is_jaxs_own_and_compiles_nothing(wide, offset):
     compiles for it, as a run compiled ahead compiles none of its start on its devices (Main 11-07: the
     seed's two programs compiled on the GPU)."""
     import jax
-    from jax.experimental import disable_x64, enable_x64
 
     from dew.nn.inputs import request_key
     from dew.telemetry.compiles import Compiles
@@ -52,7 +51,7 @@ def test_a_seeds_key_is_jaxs_own_and_compiles_nothing(wide, offset):
     previous = jax.config.jax_random_seed_offset
     jax.config.update("jax_random_seed_offset", offset)
     try:
-        with enable_x64() if wide else disable_x64():
+        with jax.enable_x64(new_val=wide):
             for seed in seeds:
                 with Compiles(None) as compiles:
                     made = request_key(seed)
