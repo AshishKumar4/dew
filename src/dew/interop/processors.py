@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -74,6 +74,55 @@ class MediasProcessor(Protocol):
 
     def __call__(self, *, medias: Sequence[Mapping[str, object]], text: str,
                  return_tensors: str) -> Mapping[str, object]: ...
+
+
+def _mimo_processor(tokenizer: PreTrainedTokenizerBase, config: Mapping[str, object]) -> HostProcessor:
+    from dew.interop.mimo_media import MiMoProcessor
+
+    return MiMoProcessor(tokenizer, config)
+
+
+OWN_PROCESSORS: Mapping[str, Callable[[PreTrainedTokenizerBase, Mapping[str, object]], HostProcessor]] = {
+    "mimo_v2": _mimo_processor}
+"""The processor Dew runs, by a source's model type, for a release that ships none and states its
+processing in its config.json: MiMo-V2.6's (`processor_config`), as vLLM's MiMo processor runs it
+(`dew.interop.mimo_media`)."""
+
+
+def chat_images(messages: Sequence[Mapping[str, object]], reader: str) -> list[Media | str | bytes]:
+    """The images of a chat's image parts in order, as a release's template and call read them: an `image`
+    or `image_url` part, its image under either name (`_extract_medias_from_messages` reads `image_url` for
+    both kinds) and held as `_chat_image` reads it; a part of another media kind is refused, its `reader`
+    reading images alone."""
+    from dew.data.chat import ContentPart
+
+    parts = [ContentPart.parse(part, "chat") for message in messages
+             for content in (message.get("content"),)
+             if isinstance(content, Sequence) and not isinstance(content, str) for part in content
+             if isinstance(part, Mapping)]
+    kinds = sorted({part.type for part in parts if part.needs_processor} - {"image", "image_url"})
+    if kinds:
+        raise ValueError(f"{reader} reads images alone from a chat, not {kinds}: hand the model its "
+                         "processed fields (`from_hf`)")
+    images = []
+    for part in parts:
+        if part.type in ("image", "image_url"):
+            held = [part.fields[name] for name in ("image", "image_url") if name in part.fields]
+            if len(held) != 1:
+                raise ValueError(f"an {part.type} part holds its image under one of image and image_url, "
+                                 f"not {sorted(part.fields)}")
+            images.append(_chat_image(held[0]))
+    return images
+
+
+def _chat_image(image: object) -> Media | str | bytes:
+    """A chat's image as a processor reads it: an array or a PIL image, a path or url, or its bytes."""
+    from PIL import Image
+
+    if isinstance(image, np.ndarray | Image.Image | str | bytes):
+        return image
+    raise ValueError(f"an image part holds an array, a PIL image, a path or url, or bytes, not "
+                     f"{type(image).__name__}")
 
 
 def takes_medias(reference: HostProcessor | MediasProcessor) -> TypeGuard[MediasProcessor]:
@@ -284,12 +333,9 @@ class Processor:
                                                                  "preprocessor_config.json")):
             from transformers import PreTrainedTokenizerBase
 
-            if "processor_config" in self.config and isinstance(self.reference, PreTrainedTokenizerBase):
-                # MiMo-V2.6 states its processing in its config.json (`processor_config`) and ships no code
-                # that runs it: Dew's own, as vLLM's MiMo processor runs it (`dew.interop.mimo_media`).
-                from dew.interop.mimo_media import MiMoProcessor
-
-                return MiMoProcessor(self.reference, self.config)
+            own = OWN_PROCESSORS.get(_records.text(self.config.get("model_type", ""), "model_type"))
+            if own is not None and isinstance(self.reference, PreTrainedTokenizerBase):
+                return own(self.reference, self.config)
             raise ValueError(f"{self.config.get('model_type')} ships no processor of its own: hand the model "
                              "its processed fields (`from_hf`)")
         from transformers import AutoProcessor
@@ -434,38 +480,15 @@ class Processor:
                     for message in messages for content in (message.get("content"),)
                     if isinstance(content, Sequence) and not isinstance(content, str)
                     for part in content)
-        from dew.interop.mimo_media import MiMoProcessor
-
-        own = self._media_reference if media else None
-        if media and (takes_medias(self._media_reference) or isinstance(own, MiMoProcessor)):
+        if media and takes_medias(self._media_reference):
             # Its template writes each image part's placeholder, and its call reads the images beside the
-            # text (`_medias_fields`), as its own call over the messages does (kimi_k25_processor.py:103-119);
-            # MiMo-V2.6's own (`dew.interop.mimo_media`) reads the template's text and the images alike.
+            # text (`_medias_fields`), as its own call over the messages does (kimi_k25_processor.py:103-119).
             text = self.reference.apply_chat_template(messages, tokenize=False,
                                                       add_generation_prompt=add_generation_prompt,
                                                       **template_options)
             if not isinstance(text, str):
                 raise TypeError("the source's chat template must render text")
-            parts = [ContentPart.parse(part, "chat") for message in messages
-                     for content in (message.get("content"),)
-                     if isinstance(content, Sequence) and not isinstance(content, str) for part in content
-                     if isinstance(part, Mapping)]
-            # An image part as the release's template and call read it: an `image` or `image_url` part, its
-            # image under either name (`_extract_medias_from_messages` reads `image_url` for both kinds).
-            kinds = sorted({part.type for part in parts if part.needs_processor} - {"image", "image_url"})
-            if kinds:
-                raise ValueError(f"{type(self._media_reference).__name__} reads images alone from a chat, "
-                                 f"not {kinds}: hand the model its processed fields (`from_hf`)")
-            images = []
-            for part in parts:
-                if part.type in ("image", "image_url"):
-                    held = [part.fields[name] for name in ("image", "image_url") if name in part.fields]
-                    if len(held) != 1:
-                        raise ValueError(f"an {part.type} part holds its image under one of image and "
-                                         f"image_url, not {sorted(part.fields)}")
-                    images.append(held[0])
-            if isinstance(own, MiMoProcessor):
-                return self._from_arrays(own(text=text, images=images))
+            images = chat_images(messages, type(self._media_reference).__name__)
             return self._from_arrays(self._medias_fields(images, text=text))
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(

@@ -1,7 +1,7 @@
 """Float-range and nested-derivative contracts of the products' seams: embedding lookups, bf16 and wide CPU
 products, the grouped GEMM and its portable projection, the GEMM prologue and transposed hooks, a stored
-expert primal, the frozen FP8 product, the quantized convolution, a broadcast summing its gradient wide
-(ledger 2641; the harness is tests/contract_support.py)."""
+expert primal and a router's report of its differentiation, the frozen FP8 product, the quantized
+convolution, a broadcast summing its gradient wide (ledger 2641; the harness is tests/contract_support.py)."""
 
 import functools
 import itertools
@@ -262,6 +262,27 @@ def test_a_stored_expert_primal_holds_every_order(edge):
     (cotangent,) = normal_draw(599, (6, 4))
     assert_contract(stored, primals, direction, cotangent, f"a stored expert primal {edge}", truth_fn=plain,
                     plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_routers_differentiation_report_holds_every_order(edge):
+    """A fixed router's report of its differentiation (`moe._differentiated`, a custom JVP: its parameters
+    themselves, their tangent passed through) over a router's kernel scaled to the edge: every order finite
+    wherever float64 is a normal float32 and the plain identity is, and every order that differentiates
+    the kernel reports it."""
+    from dew.nn import moe
+
+    reports = []
+    (kernel,) = normal_draw(3211, (8, 4), scale=EDGES[edge])
+    (direction,) = normal_draw(3212, (8, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(3213, (8, 4))
+
+    def reported(kernel):
+        return moe._differentiated(functools.partial(reports.append, edge), kernel)
+
+    assert_contract(reported, (kernel,), (direction,), cotangent, f"a router's report {edge}",
+                    plain_fn=lambda kernel: kernel)
+    assert reports
 
 
 LINEAR_EDGES = {"normal": 1.0, "near the largest": 2.0**122, "near the least normal": 2.0**-122}

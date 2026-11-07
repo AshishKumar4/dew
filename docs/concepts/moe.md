@@ -50,7 +50,7 @@ Every layer here routes to two of four experts, and the logits keep the usual `(
 | `shared_features`, `shared_gate` | `0`, `False` | Width of one dense shared expert every token takes, and a learned sigmoid gate on it. |
 | `parallel` | `False` | Gemma 4's placement: experts beside the dense MLP. |
 | `implementation` | `'auto'` | Grouped matmul kernel: `'auto'`, `'xla'` or `'pallas'`. |
-| `dispatch` | `'global'` | `'global'` or `'exchange'` (expert parallelism). |
+| `dispatch` | `'auto'` | `'exchange'` (expert parallelism) on an expert mesh that divides the experts, `'global'` otherwise; or either by name. |
 | `capacity_factor` | `None` | Per-expert slot capacity; `None` keeps every selected slot. |
 | `hash_layers`, `latent_features`, `latent_norm`, `media_bias` | | DeepSeek V4 hash routing, Kimi K3 latent experts, DeepSeek-V4.1's media bias. |
 
@@ -84,11 +84,13 @@ The choice is the same on a mesh. The experts run inside the dispatch's `shard_m
 
 The `expert` mesh axis splits the expert dimension across devices. Dense parameter dimensions can use FSDP or tensor placement on their own; [Distributed training](distributed.md) covers the global batch and layout requirements.
 
-`dispatch='global'`, the default, sorts and gathers tokens on the device that already holds them. On a mesh, each device routes its own tokens through every expert, so every layout computes each token once.
+`dispatch='auto'`, the default, exchanges where the mesh has an `expert` axis larger than one that divides the number of experts, so each device keeps its own experts in place, and dispatches globally everywhere else: on a 4-way expert mesh, a global step gathered every expert's weights to every device (200,704 bytes for eight 64-wide experts) where the exchange moved 4,096.
 
-`dispatch='exchange'` is expert parallelism. Each device sends its selected tokens to the devices that hold their experts in one JAX `ragged_all_to_all`, each shard receiving exactly the rows routed to it, and receives the results back in another. It needs an `expert` mesh axis larger than one that divides the number of experts; the data, fsdp and sequence axes may split the tokens further. The exchange keeps every selected token, even when all of the traffic goes to one shard: a shard's receiving buffer holds every device's slots.
+`dispatch='global'` sorts and gathers tokens on the device that already holds them. On a mesh, each device routes its own tokens through every expert, so every layout computes each token once.
 
-You can initialize the model outside a mesh, but applying the exchange needs the mesh. `TextGeneration` refuses `dispatch='exchange'` ([Inference](inference.md)), so generate with `dispatch='global'`, which computes the same layer. Gated experts and GPT OSS's interleaved biased experts are exchanged the same way, and each keeps its own activation and output-weight arithmetic.
+`dispatch='exchange'` is expert parallelism. Each device sends its selected tokens to the devices that hold their experts in one JAX `ragged_all_to_all`, each shard receiving exactly the rows routed to it, and receives the results back in another. It needs an `expert` mesh axis larger than one that divides the number of experts; the data, fsdp and sequence axes may split the tokens further. The exchange keeps every selected token, even when all of the traffic goes to one shard. It moves them a round at a time: a round's receiving buffer holds every device's balanced share of its slots once, which a balanced routing sends in one round, and a skewed routing's overflow takes further rounds, each skipped where no device has rows left for it.
+
+You can initialize the model outside a mesh, but applying the exchange needs the mesh. `TextGeneration` refuses `dispatch='exchange'` ([Inference](inference.md)), so generate with `dispatch='auto'`, which dispatches globally there, or `'global'`; both compute the same layer. Gated experts and GPT OSS's interleaved biased experts are exchanged the same way, and each keeps its own activation and output-weight arithmetic.
 
 To drop tokens over a fixed capacity, as GShard and MaxText do, set `capacity_factor`. Each sequence keeps `max(ceil(length * top_k / experts) * capacity_factor, capacity_factor)` slots per expert, filled in token order, and a dropped slot adds nothing to its token's output. Because the count runs over whole sequences, both dispatch modes drop the same slots on every placement. With a capacity set, a shard's receiving buffer holds what the capacity keeps.
 
