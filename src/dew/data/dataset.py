@@ -1648,13 +1648,22 @@ class RampedStream(Forwarding):
     Records left in the buffer have not been trained on and are not counted in
     the position, which is the number of records handed out so far. A restore
     gives the source that count, so it reopens its read there.
+
+    Over an elastic read (`elastic`), whose position is its order's, not a record
+    count (`dew.data.Pipeline.elastic`), the position is the read's own where the
+    ramp last read, and how many of that read's records its steps had handed over
+    (`dew._position.Ramped`): a restore reopens the read there and skips them. The
+    records left in the buffer are a suffix of that last read, as a step reads one
+    whole batch only where the buffer holds less than its own. Every reader of an
+    elastic read keeps every count-th record of each batch, so the records skipped
+    are each reader's first ones and any process count resumes it (row 1913).
     """
 
     # MaxText reference: common/data_loader.py:122-176.
 
     def __init__(self, source: Resumable, stages: Sequence[Stage], partition: DataPartition, *,
-                 tail: Tail = "dropped", order_records: int | None = None):
-        self._source = source
+                 tail: Tail = "dropped", order_records: int | None = None, elastic: bool = False):
+        self._source, self._elastic = source, elastic
         self._stages = tuple(stages)
         # Where a global order ends, every share ends its last step at the same record: whole where
         # its short last step is dropped, holding the order's last records, the rest filled, where
@@ -1665,6 +1674,11 @@ class RampedStream(Forwarding):
         self._partition = partition
         self._records = 0
         self._held: Batch | None = None
+        # Over an elastic read: its position before the ramp's last read of it, the records handed over
+        # before that read, and the records of the next read a restore skips.
+        self._mark: bytes | None = None
+        self._marked = 0
+        self._skip = 0
 
     def __iter__(self) -> Iterator[Batch]:
         return self
@@ -1690,9 +1704,18 @@ class RampedStream(Forwarding):
         if left is not None and (left <= 0 or (left < stage.batch and self._tail == "dropped")):
             raise StopIteration
         while self._held is None or rows_of(self._held) < rows:
+            if self._elastic:
+                # The records handed over before this read's first: those handed so far, less the ones a
+                # restore skips of it, and the buffer's, which this step hands over first.
+                self._mark = self._source.get_state()
+                self._marked = self._records - self._skip + (0 if self._held is None else
+                                                             rows_of(self._held) * self._partition.count)
             read = next(self._source, None)
             if read is None:
                 break
+            if self._skip:
+                read = take_batch(read, slice(self._skip // self._partition.count, None))
+                self._skip = 0
             self._held = read if self._held is None else _joined(self._held, read)
         if self._held is None or not rows_of(self._held):
             raise StopIteration
@@ -1712,13 +1735,31 @@ class RampedStream(Forwarding):
         return step
 
     def get_state(self) -> bytes:
+        if self._elastic:
+            if self._mark is None or not self._held or not rows_of(self._held):
+                # Every record read is handed over: the read resumes where it stands.
+                return _position.encode_ramped(_position.Ramped(self._source.get_state(), self._skip,
+                                                                self._records))
+            return _position.encode_ramped(_position.Ramped(self._mark, self._records - self._marked,
+                                                            self._records))
         place = _position.read(_global_position(self._source.get_state()))
         return _position.encode(dataclasses.replace(place, records=self._records))
 
     def set_state(self, state: bytes) -> None:
-        self._source.set_state(state)
-        self._held = None
-        self._records = _position.read(state).records
+        self._held, self._mark = None, None
+        if self._elastic:
+            place = _position.ramped(state)
+            if place is None:
+                raise ValueError("this batch ramp reads an elastic read, and the saved position is no ramp's "
+                                 "over one; resume it with the chain and ramp that saved it")
+            if place.skip % self._partition.count:
+                raise ValueError(f"the saved ramp's next read skips {place.skip} records, which "
+                                 f"{self._partition.count} readers cannot share evenly")
+            self._source.set_state(place.source)
+            self._records, self._skip = place.records, place.skip
+        else:
+            self._source.set_state(state)
+            self._records = _position.read(state).records
         stage = self._stage()
         if (self._records - stage.records) % stage.batch:
             raise ValueError(
@@ -1739,11 +1780,11 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
     A validation pass keeps the whole batch, since a score over a growing
     number of records is a score of a different thing each time.
 
-    Only a stream whose position is a global record count can ramp. The ramp
-    cuts that order into other steps, and the count it saves has to be the
-    records it handed over. A stream that batches its own records reports a
-    shard offset and is refused, by name, as is an elastic read, whose
-    position is its order's, not a record count the ramp's steps cut.
+    A stream whose position is a global record count ramps over that count:
+    the ramp cuts that order into other steps, and the count it saves is the
+    records it handed over. An elastic read ramps over its own position, the
+    ramp's beside it (`RampedStream`'s `elastic`, row 1913). A stream that
+    batches its own records reports a shard offset and is refused, by name.
     """
     # An impossible schedule fails here, not mid-run. Moving its stages to update boundaries
     # (`Ramp.stages`' window) cannot make one impossible, so this checks the schedule as given.
@@ -1759,11 +1800,11 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
             )
         if isinstance(stream, Resumable):
             state = stream.get_state()
-            # A global record count alone: an elastic read's position is the order's, which the
-            # ramp's steps, cut from a global order, do not save or restore (`RampedStream`).
-            if isinstance(state, bytes) and _position.decode(state) is not None:
+            # A global record count, or an elastic read's own position, which the ramp saves beside its own.
+            elastic = isinstance(state, bytes) and _position.replicated(state) is not None
+            if isinstance(state, bytes) and (_position.decode(state) is not None or elastic):
                 return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition,
-                                    tail=dataset.tail, order_records=dataset.order_records)
+                                    tail=dataset.tail, order_records=dataset.order_records, elastic=elastic)
         if isinstance(stream, Closeable):
             stream.close()
         raise TypeError(
