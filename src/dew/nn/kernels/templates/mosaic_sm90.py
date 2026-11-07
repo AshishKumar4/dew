@@ -156,12 +156,12 @@ class WgmmaIssuer(mosaic.Issuer):
     def settled(self, pending: int = 0) -> None:
         plgpu.wgmma_wait(pending)
 
-    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None,
-                       finish=None) -> tuple[C, tuple[jax.Array, ...]]:
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
+                       ) -> tuple[C, tuple[jax.Array, ...]]:
         # Warpgroup accumulators scoped across the walk, read once its MMAs are done; interpreted, arrays
         # the walk carries.
         if interpret:
-            return super().accumulated(segments, start, shapes, interpret, initial, finish)
+            return super().accumulated(segments, start, shapes, interpret, initial)
         initial = (None,) * len(shapes) if initial is None else initial
 
         def run(*accumulators):
@@ -176,8 +176,6 @@ class WgmmaIssuer(mosaic.Issuer):
                 carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
                 if loop.then is not None:
                     loop.then()
-            if finish is not None:
-                carry = finish(carry, accumulators)[0]
             plgpu.wgmma_wait(0)
             return carry, tuple(acc[...] for acc in accumulators)
 
