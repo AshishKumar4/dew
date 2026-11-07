@@ -144,11 +144,36 @@ class ShardManifest:
     fixed_parts: bool = False
 
     def parts(self) -> tuple[Shard, ...]:
-        """The store's finer shards its subdivision always cuts (`fixed_parts`); none where it cuts by
-        count, or cuts none."""
+        """The store's finer shards its subdivision always cuts (`fixed_parts`), as a read by more readers
+        than its shards cuts them; none where it cuts by count, or cuts none."""
         if not self.fixed_parts or self.subdivide is None:
             return ()
-        return self.subdivide(len(self.shards))
+        return self.subdivide(len(self.shards) + 1)
+
+    def parted(self, reads: int) -> dict[str, tuple[Shard, ...]]:
+        """Each shard's parts (`parts`), in order, by the shard's id: the run of parts whose rows make its
+        own (`sized`, `reads` at once), every shard's in turn; none where a shard or a part states no rows
+        (a filtered store's), or the parts make no shard's rows."""
+        parts = self.parts()
+        if not parts:
+            return {}
+        shards = self.sized(reads).shards
+        if any(shard.rows is None for shard in (*shards, *parts)):
+            return {}
+        # A part of no rows holds no record any shard reads: the walk takes those that hold some.
+        holding = [part for part in parts if part.rows]
+        held: dict[str, tuple[Shard, ...]] = {}
+        at = 0
+        for shard in shards:
+            taken = 0
+            first = at
+            while at < len(holding) and taken < (shard.rows or 0):
+                taken += holding[at].rows or 0
+                at += 1
+            if taken != shard.rows:
+                return {}
+            held[shard.id] = tuple(holding[first:at])
+        return held if at == len(holding) else {}
 
     def sized(self, reads: int) -> ShardManifest:
         """The manifest with each shard's rows its store counts (`counted`), `reads` at once (its reading's

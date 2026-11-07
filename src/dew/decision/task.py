@@ -636,6 +636,9 @@ class Decide(SavedRunTask, InItsForm):
                                  "request's context in contexts=, and ask a request with images alone")
             return [answers for answers, _ in self._answered(self.rows(state, contexts=contexts),
                                                              [asked for _, asked in state])]
+        if contexts is not None:
+            raise ValueError("one request reads its context in context=; contexts= is a batch's, each "
+                             "request's own")
         if images:
             return self._seen(state, questions, images, context, request=request)[0]
         return self._answered([self._encoded(state, questions, context=context, request=request)],

@@ -935,7 +935,19 @@ class _CachedReader:
 
     def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         return _CachedIter(self.reader(shard, options), self.cache, self.key, shard, self.transform,
-                           self.published, self.source, self.transparent, self.shards, self.halted)
+                           self.published, self.source, self.transparent, self.shards, self.halted,
+                           self.held_parts)
+
+    def held_parts(self) -> Mapping[str, tuple[Shard, ...]]:
+        """Each of its store's shards' finer shards a read by them fills (`ShardManifest.parted`), by the
+        shard's id, derived once for every shard this reader opens."""
+        return self._parts
+
+    @cached_property
+    def _parts(self) -> Mapping[str, tuple[Shard, ...]]:
+        if self.source is None:
+            return {}
+        return self.source.manifest(filled_version(self.key.fill)).parted(1)
 
 
 class _CachedIter(grain.IterDataset):
@@ -951,11 +963,12 @@ class _CachedIter(grain.IterDataset):
         transparent: bool,
         shards: int | None,
         halted: set[str],
+        parts: Callable[[], Mapping[str, tuple[Shard, ...]]],
     ):
         super().__init__(parent)
         self.cache, self.key, self.shard, self.transform = cache, key, shard, transform
         self.published, self.input_parent, self.source = published, parent, source
-        self.transparent, self.shards, self.halted = transparent, shards, halted
+        self.transparent, self.shards, self.halted, self.parts = transparent, shards, halted, parts
 
     def __iter__(self) -> grain.DatasetIterator:
         return _CachedIterator(self.input_parent.__iter__(), self.writer, self.shard, self.transform,
@@ -980,10 +993,7 @@ class _CachedIter(grain.IterDataset):
     def _parted(self, published: _Published) -> _Parted | None:
         """Its shard's records as the generation holds them in its store's finer shards, every one of
         its parts held (`ShardManifest.parts`, each stating its rows); None where they are not."""
-        if self.source is None:
-            return None
-        parts = [part for part in self.source.manifest(filled_version(self.key.fill)).parts()
-                 if part.uri == self.shard.uri]
+        parts = self.parts().get(self.shard.id, ())
         if not parts or any(part.rows is None or (part.rows and not published.generation.holds((part.id, 0)))
                             for part in parts):
             return None

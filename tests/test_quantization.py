@@ -23,7 +23,7 @@ import pytest
 from lane_environment import without_flags
 from flax import linen as nn
 from flax.core import FrozenDict
-from one_draw import assert_as_exact_as_the_reference
+from model_support import parameter_loss
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
 from token_support import token_rows
 
@@ -1484,20 +1484,32 @@ def test_an_einsum_of_three_operands_runs_as_the_unquantized_model_runs_it():
     np.testing.assert_array_equal(Quantization().apply(model).apply({}, x), plain)
 
 
-def assert_computed_as_on_the_host(run, label: str) -> None:
-    """`run(dtype)` under the default device in float32, held as exact as the same run on the host's
-    CPU in float32 to the host's float64 (`assert_as_exact_as_the_reference`).
+HOST_SEEDS = 8
+"""Check 1's declared seeds for a device's int8 run against the same run on the host."""
+
+
+def assert_computed_as_on_the_host(run, draw, label: str) -> None:
+    """`run(dtype, *inputs)` under the default device in float32 on par with the same run on the host's
+    CPU in float32 (check 1), over the inputs `draw(seed)` computes on the host, the host's float64 run the
+    truth.
 
     The host computes an int8 product exactly in either dtype, so a device whose int8 GEMM returns
     twice its product (XLA's Triton fusion, openxla/xla#51016) is further from float64 by orders of
     magnitude, while one that rounds its float parts in another order is as exact as the host."""
     cpu = jax.devices("cpu")[0]
-    found = np.asarray(run(jnp.float32), np.float64)
-    with jax.default_device(cpu):
-        reference = np.asarray(run(jnp.float32), np.float64)
-        with jax.enable_x64(new_val=True):
-            truth = np.asarray(run(jnp.float64), np.float64)
-    assert_as_exact_as_the_reference(found, reference, truth, label)
+
+    def on(dtype, device=None):
+        def ran(*inputs):
+            with jax.default_device(device):
+                return jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), run(dtype, *inputs))
+        return as_given(ran)
+
+    def drawn(seed):
+        with jax.default_device(cpu):
+            return jax.device_get(draw(seed))
+
+    assert_as_exact(on(jnp.float32), on(jnp.float32, cpu), drawn, label, seeds=HOST_SEEDS,
+                    truth_fn=on(jnp.float64, cpu))
 
 
 def placed(tree, dtype):
@@ -1538,15 +1550,17 @@ def served_text_flow():
     from dew.sampling import Sampling
 
     prompt = token_batch()["text"][:, :4]
-    held = jax.device_get(nn.unbox(tiny().init(jax.random.key(0), jnp.asarray(prompt))))
 
-    def run(dtype):
+    def draw(seed):
+        return (nn.unbox(tiny().init(jax.random.key(seed), jnp.asarray(prompt))),)
+
+    def run(dtype, held):
         task = TextGeneration(tiny(dtype=dtype), placed(held, dtype), sampling=Sampling(temperature=0),
                               max_new_tokens=4)
         served = task.quantized(Quantization(patterns=(".*_proj",)))
         return served(jnp.asarray(prompt), key=7).host().raw_log_probs
 
-    assert_computed_as_on_the_host(run, "an int8 text task's log-probabilities")
+    assert_computed_as_on_the_host(run, draw, "an int8 text task's log-probabilities")
 
 
 def test_an_int8_image_task_walks_as_the_host_does():
@@ -1562,14 +1576,18 @@ def image_flow():
     with tempfile.TemporaryDirectory() as root:
         task = flux_source(Path(root))
     served = task.quantized(Quantization(patterns=FLUX_BLOCKS))
-    prepared, held = jax.device_get((served.prepare("a red bird", key=0, steps=2), served.variables))
+    held = jax.device_get(served.variables)
 
-    def run(dtype):
+    def draw(seed):
+        return (dataclasses.replace(served, variables=placed(held, jnp.float32)).prepare(
+            "a red bird", key=seed, steps=2),)
+
+    def run(dtype, prepared):
         walked = dataclasses.replace(served, model=served.model.clone(dtype=dtype),
                                      variables=placed(held, dtype))
         return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
 
-    assert_computed_as_on_the_host(run, "an int8 image task's latents")
+    assert_computed_as_on_the_host(run, draw, "an int8 image task's latents")
 
 
 def test_an_objective_encodes_through_an_int8_text_tower_as_the_host_does():
@@ -1588,10 +1606,14 @@ def int8_tower_flow():
 
     encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures" / "clip" / "tiny"))
     tower = Quantization(dtype="int8").apply(encoder.transformer)
-    tokens = encoder.tokenize(["a red bird", "a blue fish"])
     held = jax.device_get(encoder.params)
+    words = ("a", "red", "blue", "green", "bird", "fish", "tree", "small")
 
-    def run(dtype):
+    def draw(seed):
+        generator = np.random.default_rng(seed)
+        return (encoder.tokenize([" ".join(generator.choice(words, 4)) for _ in range(2)]),)
+
+    def run(dtype, tokens):
         encoding = dataclasses.replace(encoder, transformer=tower.clone(dtype=dtype))
         objective = DiffusionObjective(
             SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1, dtype=dtype),
@@ -1600,7 +1622,7 @@ def int8_tower_flow():
         encode = objective.program("prompt encoding", objective.encode)
         return encode({"textcontext": placed(held, dtype)}, {"textcontext": tokens})["textcontext"].hidden
 
-    assert_computed_as_on_the_host(run, "an int8 text tower's encoding")
+    assert_computed_as_on_the_host(run, draw, "an int8 text tower's encoding")
 
 
 def test_an_int8_guide_walks_as_the_host_does():
@@ -1619,15 +1641,19 @@ def autoguided_image_flow():
         task = flux_source(Path(root))
     guide = task.quantized(Quantization(patterns=FLUX_BLOCKS))
     weaker = {name: tree for name, tree in guide.variables.items() if name not in ("encoders", "autoencoder")}
-    prepared, held = jax.device_get((task.prepare("a red bird", key=0, steps=2),
-                                     {**task.variables, "guide": weaker}))
+    own = jax.device_get(task.variables)
+    held = {**own, "guide": jax.device_get(weaker)}
 
-    def run(dtype):
+    def draw(seed):
+        return (dataclasses.replace(task, variables=placed(own, jnp.float32)).prepare("a red bird", key=seed,
+                                                                                      steps=2),)
+
+    def run(dtype, prepared):
         walked = dataclasses.replace(task, model=task.model.clone(dtype=dtype), variables=placed(held, dtype),
                                      guidance=Autoguidance(2.0, guide.model.clone(dtype=dtype)))
         return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
 
-    assert_computed_as_on_the_host(run, "an int8 guide's latents")
+    assert_computed_as_on_the_host(run, draw, "an int8 guide's latents")
 
 
 def test_an_int8_decision_task_answers_as_the_host_does():
@@ -1646,15 +1672,17 @@ def decision_flow():
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
                                  max_seq_len=128, attention_impl="xla")
     base = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    held = jax.device_get(nn.unbox(base.init(jax.random.key(0))))
     spec = Quantization(patterns=(".*_proj",))
 
-    def run(dtype):
+    def draw(seed):
+        return (nn.unbox(base.init(jax.random.key(seed))),)
+
+    def run(dtype, held):
         model = DecisionModel(spec.apply(backbone.clone(dtype=dtype)), base.model.head.clone(dtype=dtype))
         task = Decide(model, placed(held, dtype), LAYOUT, TOKENIZER, SPECIALS)
         return task("charged twice!", {"team": INTENT})["team"].probabilities
 
-    assert_computed_as_on_the_host(run, "an int8 decision task's probabilities")
+    assert_computed_as_on_the_host(run, draw, "an int8 decision task's probabilities")
 
 
 def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
@@ -1692,41 +1720,44 @@ def training_on_xla_default_options_flow():
 
 def assert_step_moves_by_the_hosts_gradient():
     """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
-    of its loss the host computes."""
+    of its loss the host computes, over the weights and rows each seed draws (check 1, HOST_SEEDS)."""
     from dew.data import Loading, Memory
     from dew.training.trainer import Trainer
 
     # Eight rows, one on each of the host's eight test devices.
     spec, length = Quantization(patterns=(".*_proj",)), 4
-    batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, length + 1)).astype(np.int32)}
-    held = jax.device_get(nn.unbox(tiny().init(jax.random.key(0), jnp.ones((1, length), jnp.int32))))
-    objective = LMObjective(spec.apply(tiny()), seq_len=length, ema_decay=None, variables=held)
-    rows = Memory([{"text": row} for row in batch["text"]]).read("memory")
-    data = rows.shuffle().repeat().batch(8).loading(Loading(workers=0, threads=1, read_buffer=1))
-    state = Trainer(objective, optax.sgd(1.0), key=0).fit(data, steps=1, log_every=100)
-    moved = jax.tree.map(lambda before, after: np.asarray(before, np.float64) - np.asarray(after, np.float64),
-                         held["params"], jax.device_get(state.variables["params"]))
+    cpu = jax.devices("cpu")[0]
 
-    def gradient(dtype):
-        step = Step(jnp.asarray(0), jax.random.key(0), None, training=True)
-        program = LMObjective(spec.apply(tiny(dtype=dtype)), seq_len=length, ema_decay=None)
-        variables = placed(held, dtype)
-        def loss(params):
-            stats, _ = program.loss({**variables, "params": params}, {"text": jnp.asarray(batch["text"])},
-                                    step)
-            return program.reduce_loss(stats)[0]
-
-        return jax.grad(loss)(variables["params"])
+    def draw(seed):
+        with jax.default_device(cpu):
+            held = nn.unbox(tiny().init(jax.random.key(seed), jnp.ones((1, length), jnp.int32)))
+        text = np.random.default_rng(seed).integers(0, VOCAB, (8, length + 1)).astype(np.int32)
+        return jax.device_get(held), text
 
     def flat(tree):
-        return np.concatenate([np.ravel(leaf) for leaf in jax.tree.leaves(tree)])
+        return np.concatenate([np.ravel(np.asarray(leaf, np.float64)) for leaf in jax.tree.leaves(tree)])
 
-    cpu = jax.devices("cpu")[0]
-    with jax.default_device(cpu):
-        reference = flat(jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), gradient(jnp.float32)))
-        with jax.enable_x64(new_val=True):
-            truth = flat(jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), gradient(jnp.float64)))
-    assert_as_exact_as_the_reference(flat(moved), reference, truth, "an int8 training step's gradient")
+    @as_given
+    def moved(held, text):
+        objective = LMObjective(spec.apply(tiny()), seq_len=length, ema_decay=None, variables=held)
+        rows = Memory([{"text": row} for row in text]).read("memory")
+        data = rows.shuffle().repeat().batch(8).loading(Loading(workers=0, threads=1, read_buffer=1))
+        state = Trainer(objective, optax.sgd(1.0), key=0).fit(data, steps=1, log_every=100)
+        return flat(held["params"]) - flat(jax.device_get(state.variables["params"]))
+
+    def gradient(dtype):
+        @as_given
+        def on_the_host(held, text):
+            program = LMObjective(spec.apply(tiny(dtype=dtype)), seq_len=length, ema_decay=None)
+            with jax.default_device(cpu):
+                step = Step(jnp.asarray(0), jax.random.key(0), None, training=True)
+                variables = placed(held, dtype)
+                loss = parameter_loss(program, variables, {"text": jnp.asarray(text)}, step)
+                return flat(jax.grad(loss)(variables["params"]))
+        return on_the_host
+
+    assert_as_exact(moved, gradient(jnp.float32), draw, "an int8 training step's gradient", seeds=HOST_SEEDS,
+                    truth_fn=gradient(jnp.float64))
 
 
 @pytest.mark.parametrize("tile", [None, 16], ids=["per channel", "tiled"])

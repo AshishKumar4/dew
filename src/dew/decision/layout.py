@@ -560,7 +560,8 @@ class Labels:
     its own, its span the whole line, and after the options the `cue`, whose last token the readout
     reads. Each label is read as the token id of each of `variants`, a template of its name (`{}`): a
     release's slot is one variant, its name after a space; a readout groups several as one. A variant
-    that spells as other than one token is refused.
+    that spells as other than one token is refused, and so are two labels spelled as one token (a
+    vocabulary that spells both as its unknown token), which no readout tells apart.
 
     `names` are the labels in slot order, a release's own list where it names its slots otherwise
     (one that leaves out the pairs its tokenizer spells as two tokens), or `label_names`' where unset;
@@ -581,32 +582,40 @@ class Labels:
 
     def capacity(self, encoder: Tokenizer) -> int:
         """How many options these labels letter under `encoder`: their own names, or every name of
-        `LABEL_NAMES` whose every variant it spells as one token (`spelled`)."""
+        `LABEL_NAMES` it spells apart (`spelled`)."""
         if self.names is not None:
             return len(self.names)
-        same = _same(encoder)
-        return sum(all(len(_piece(same, variant.format(name))) == 1 for variant in self.variants)
-                   for name in LABEL_NAMES)
+        return len(self._spelled_apart(encoder))
+
+    def _spelled_apart(self, encoder: Tokenizer) -> list[str]:
+        """The names of `LABEL_NAMES` whose every variant `encoder` spells as one token that no earlier such
+        name's holds."""
+        same, taken, named = _same(encoder), set[int](), list[str]()
+        for name in LABEL_NAMES:
+            pieces = [_piece(same, variant.format(name)) for variant in self.variants]
+            if all(len(piece) == 1 for piece in pieces) and not taken & {piece[0] for piece in pieces}:
+                taken.update(piece[0] for piece in pieces)
+                named.append(name)
+        return named
 
     def spelled(self, encoder: Tokenizer, count: int) -> "Labels":
         """These labels named for `encoder`: themselves where they name their own, else the first `count` of
-        `LABEL_NAMES` whose every variant `encoder` spells as one token, skipping those it spells as
-        two (Qwen3.5 spells " BQ" as two, and 570 of the 702 as one), so a run letters as many options
-        as its tokenizer can. Fewer than `count` such names is refused."""
+        `LABEL_NAMES` whose every variant `encoder` spells as one token of its own, skipping those it
+        spells as two (Qwen3.5 spells " BQ" as two, and 570 of the 702 as one) or as an earlier name's
+        (a vocabulary's unknown token), so a run letters as many options as its tokenizer tells apart.
+        Fewer than `count` such names is refused."""
         if self.names is not None:
             return self
-        same = _same(encoder)
-        named = [name for name in LABEL_NAMES
-                 if all(len(_piece(same, variant.format(name))) == 1 for variant in self.variants)]
+        named = self._spelled_apart(encoder)
         if count > len(named):
             raise ValueError(f"{count} options outnumber the {len(named)} labels this tokenizer spells as "
-                             f"one token each (of {len(LABEL_NAMES)})")
+                             f"one token each, apart (of {len(LABEL_NAMES)})")
         return dataclasses.replace(self, names=tuple(named[:count]))
 
     def ids(self, encoder: Tokenizer, count: int) -> tuple[tuple[int, ...], ...]:
-        """Each of the first `count` labels' ids, one a variant."""
+        """Each of the first `count` labels' ids, one a variant; two labels of one id are refused."""
         same = _same(encoder)
-        found = []
+        found, owners = [], dict[int, str]()
         for name in self.names_for(count):
             ids = []
             for variant in self.variants:
@@ -614,6 +623,9 @@ class Labels:
                 pieces = _piece(same, spelled)
                 if len(pieces) != 1:
                     raise ValueError(f"the label {spelled!r} spells as {len(pieces)} tokens, not one")
+                if owners.setdefault(pieces[0], name) != name:
+                    raise ValueError(f"the labels {owners[pieces[0]]!r} and {name!r} spell as one token "
+                                     f"({pieces[0]}), which no readout tells apart")
                 ids.append(pieces[0])
             found.append(tuple(ids))
         return tuple(found)
@@ -701,8 +713,30 @@ class QuestionLayout(Layout):
     option's text, which a fresh head reads (`default_layout`), so a key that only identifies the
     option (`option_0`) writes nothing the row reads. An option with no description is its key."""
 
+    shared_state: int | None = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
+    """The most questions a row asks over one copy of their request's state (None: a row a question). Each
+    reads what its own row writes before it, written once, and itself, at its own row's positions, so it
+    decides as its own row does (`dew.decision.shared_state`); questions that outgrow a row take several,
+    each repeating the state, and one whose own row cuts the state is a row of its own."""
+    siblings: bool = dataclasses.field(default=False, repr=False, metadata={_records.ADDED: True})
+    """Whether a question of a row of several (`shared_state`) also reads the questions before it in its
+    row, whole; off, each reads the shared part and itself alone."""
+
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.shared_state is not None:
+            _least("shared_state", self.shared_state, 1)
+            if self.parallel or self.blocks or self.reads is not None or self.spans_in_context:
+                raise ValueError("a row of questions over one state sets what its tokens read, as parallel "
+                                 "options, blocks, reads and a question in context do; a row takes one")
+            kinds = [type(segment) for segment in self.written]
+            asked = [at for at, kind in enumerate(kinds) if kind in (Instructions, OptionLines, AnswerCue)]
+            if max((at for at, kind in enumerate(kinds) if kind is State), default=-1) > min(asked) or (
+                    kinds.index(Instructions) != min(asked)):
+                raise ValueError("a row of questions over one state writes its state before its question, "
+                                 "and the question's instructions before its options and cue")
+        elif self.siblings:
+            raise ValueError("siblings are the questions a row over one state asks; give shared_state=")
         if self.head_max_len is not None:
             _least("head_max_len", self.head_max_len, 1)
         if self.option_tokens is not None:
@@ -772,8 +806,8 @@ class QuestionLayout(Layout):
         return tuple(encoder.encode(text, add_special_tokens=False))
 
     def row_questions(self, questions: int) -> int:
-        """One: a question layout writes a row a question."""
-        return 1
+        """One, a row a question; or with `shared_state`, as many of them as one row asks."""
+        return 1 if self.shared_state is None else min(questions, self.shared_state)
 
     @property
     def spans_in_context(self) -> bool:
@@ -783,8 +817,16 @@ class QuestionLayout(Layout):
 
     @property
     def attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
-        """Its rows' reads over their streams (`streamed_attention`)."""
-        return streamed_attention(self.reads, self.written)
+        """Its rows' reads over their streams (`streamed_attention`); with `shared_state`, the shared part
+        reads itself causally, and each question itself causally, it whole and with `siblings` the earlier."""
+        if self.shared_state is None:
+            return streamed_attention(self.reads, self.written)
+        count = self.shared_state
+        questions = tuple((HOWS["causal"], HOWS["whole"],
+                           *(HOWS["whole"] if self.siblings and other < own else 0
+                             for other in range(1, count + 1)))
+                          for own in range(1, count + 1))
+        return ((HOWS["causal"], *[0] * (count + 1)), *questions), count + 1
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
@@ -795,10 +837,15 @@ class QuestionLayout(Layout):
         if tokens is None and self._unit == "pieces":
             # The request's questions share its state, encoded once for them all.
             tokens = self.state(encoder, specials, state)
-        return [self._written(encoder, specials, question, (orders or {}).get(name), name, state=state,
-                              tokens=tokens, conversation=_conversation(state),
-                              request=questions if request is None else request)
-                for name, question in questions.items()]
+        own = [self._written(encoder, specials, question, (orders or {}).get(name), name, state=state,
+                             tokens=tokens, conversation=_conversation(state),
+                             request=questions if request is None else request)
+               for name, question in questions.items()]
+        if self.shared_state is None:
+            return own
+        from dew.decision.shared_state import over_one_state
+
+        return over_one_state(own, self.max_len, self.shared_state)
 
     def encode(self, encoder: Tokenizer, specials: Specials, question: Question,
                state: Sequence[int], *, conversation: bool = False,
@@ -2194,6 +2241,7 @@ def _begin(specials: Specials) -> list[int]:
     return [] if specials.begin is None else [specials.begin]
 
 
+
 def _parallel(spans: list[tuple[int, int]], length: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Laya's `parallel_layout`, over each option's span of the row: every
     span starts at the first one's position, and what follows the options
@@ -2335,17 +2383,19 @@ class DecisionInputs:
         where it holds none) is padded to that many tokens. Rows in streams are read as their layout's
         `attention` says (`Layout.attention`).
         """
-        parallel = rows[0].positions is not None
-        if any((row.positions is not None) != parallel for row in rows):
-            raise ValueError("one batch lays its rows out one way, sequential or parallel")
+        positioned = rows[0].positions is not None
+        if any((row.positions is not None) != positioned for row in rows):
+            raise ValueError("one batch lays its rows out one way, at their positions or in order")
         in_context = rows[0].spans_in_context
         if any(row.spans_in_context != in_context for row in rows):
             raise ValueError("one batch reads its rows' schemas one way, in the row or as its context")
         blocked = rows[0].blocks is not None
         if any((row.blocks is not None) != blocked for row in rows):
             raise ValueError("one batch reads its rows one way, in blocks or in order")
-        fields = ({POSITIONS_FIELD: [row.positions or () for row in rows],
-                   "slots": [row.slots or () for row in rows]} if parallel else {})
+        # Parallel options' slots beside their positions; a row of questions over one state, positions alone.
+        fields = {POSITIONS_FIELD: [row.positions or () for row in rows]} if positioned else {}
+        if rows[0].slots is not None:
+            fields["slots"] = [row.slots or () for row in rows]
         if blocked:
             fields["blocks"] = [row.blocks or () for row in rows]
         streamed = rows[0].streams is not None
@@ -2384,8 +2434,8 @@ class DecisionInputs:
             lengths = jnp.asarray([len(tokens) for tokens in held], jnp.int32)
         return cls(tokens=jnp.asarray(tokens), segments=jnp.asarray(valid, jnp.int32),
                    **along,
-                   positions=jnp.asarray(padded[POSITIONS_FIELD], jnp.int32) if parallel else None,
-                   slots=jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
+                   positions=jnp.asarray(padded[POSITIONS_FIELD], jnp.int32) if positioned else None,
+                   slots=jnp.asarray(padded["slots"], jnp.int32) if "slots" in fields else None,
                    option_slots=slots_of, slotted=slotted,
                    context=context, context_lengths=lengths,
                    # The padding is in no block, and no stream.

@@ -194,7 +194,7 @@ def boot() -> None:
     directory.mkdir(exist_ok=True)
     children = str(directory)
     for name, module in list(sys.modules.items()):
-        write(SHARED, f"{followed.IMPORTED}{name.partition('.')[0]}")
+        write(SHARED, followed.shadowing(name))
         if followed.checkout(file := getattr(module, "__file__", None) or "", root):
             write(SHARED, file[len(root):])
     importer = followed.imports(lambda item: write(owner(), item))

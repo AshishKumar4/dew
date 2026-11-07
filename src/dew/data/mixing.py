@@ -28,6 +28,13 @@ from dew.data.shared import SharedMapping
 _log = logging.getLogger(__name__)
 
 
+COUNT = {"count": "number"}
+"""A `CorpusCounts` counter that counts (`counters`): a number a position keeps as it is."""
+
+KINDS = {"count": "kinds"}
+"""A `CorpusCounts` counter by kind (`counters`): a `Counter` a position keeps as a record of its kinds."""
+
+
 @dataclasses.dataclass
 class CorpusCounts:
     """What one corpus's read counted, under its identity (`name`, which plans and saved positions
@@ -64,27 +71,27 @@ class CorpusCounts:
     complete, as each says (`CONSUMED`, less those it carries for examples a step refused or made no row
     of, `REFUSED`): a run bounded in examples counts them so where its rows are delivered, in the reading
     process (`dew.data.lowering._Build.records`)."""
-    attempted: int = 0
-    accepted: int = 0
-    truncated: int = 0
-    delivered_rows: int = 0
-    chunks: int = 0
-    chunk_records: int = 0
-    rejected: Counter[str] = dataclasses.field(default_factory=Counter)
-    cut_examples: Counter[str] = dataclasses.field(default_factory=Counter)
-    cut_rows: Counter[str] = dataclasses.field(default_factory=Counter)
-    cut_removed: Counter[str] = dataclasses.field(default_factory=Counter)
-    left_out: Counter[str] = dataclasses.field(default_factory=Counter)
+    attempted: int = dataclasses.field(default=0, metadata=COUNT)
+    accepted: int = dataclasses.field(default=0, metadata=COUNT)
+    truncated: int = dataclasses.field(default=0, metadata=COUNT)
+    delivered_rows: int = dataclasses.field(default=0, metadata=COUNT)
+    chunks: int = dataclasses.field(default=0, metadata=COUNT)
+    chunk_records: int = dataclasses.field(default=0, metadata=COUNT)
+    rejected: Counter[str] = dataclasses.field(default_factory=Counter, metadata=KINDS)
+    cut_examples: Counter[str] = dataclasses.field(default_factory=Counter, metadata=KINDS)
+    cut_rows: Counter[str] = dataclasses.field(default_factory=Counter, metadata=KINDS)
+    cut_removed: Counter[str] = dataclasses.field(default_factory=Counter, metadata=KINDS)
+    left_out: Counter[str] = dataclasses.field(default_factory=Counter, metadata=KINDS)
     """The members delivered rows left out, by reason (`_dew_rejected`), counted apart from the records
     the corpus rejected whole, so a recount of the delivered rows (`counted_anew`) starts them over."""
-    rejected_cut: Counter[str] = dataclasses.field(default_factory=Counter)
+    rejected_cut: Counter[str] = dataclasses.field(default_factory=Counter, metadata=KINDS)
     """The tokens the cuts of the records the corpus rejected whole removed, by what each cut
     (`Rejected.cut`), counted with their rejections."""
-    left_out_cut: Counter[str] = dataclasses.field(default_factory=Counter)
+    left_out_cut: Counter[str] = dataclasses.field(default_factory=Counter, metadata=KINDS)
     """The tokens the cuts of the members delivered rows left out removed, by what each cut
     (`_dew_left_out_cut`), counted with them."""
-    declined: Counter[str] = dataclasses.field(default_factory=Counter)
-    tokens: int = 0
+    declined: Counter[str] = dataclasses.field(default_factory=Counter, metadata=KINDS)
+    tokens: int = dataclasses.field(default=0, metadata=COUNT)
     """The valid target tokens of the rows its reader weighed as it accepted them, under its member where a
     mixture's rows are (row 4119): what a mixture measured in tokens (`mix(..., by="tokens")`) drew of each
     member, the shares it balances, or a layout's windows that hold a target. A step after the weighing
@@ -168,38 +175,25 @@ class CorpusCounts:
         }
 
     def state(self) -> Mapping[str, object]:
-        return {
-            "attempted": self.attempted,
-            "accepted": self.accepted,
-            "truncated": self.truncated,
-            "delivered_rows": self.delivered_rows,
-            "chunks": self.chunks,
-            "chunk_records": self.chunk_records,
-            "rejected": dict(self.rejected),
-            "left_out": dict(self.left_out),
-            "cut_examples": dict(self.cut_examples),
-            "cut_rows": dict(self.cut_rows),
-            "cut_removed": dict(self.cut_removed),
-            "rejected_cut": dict(self.rejected_cut),
-            "left_out_cut": dict(self.left_out_cut),
-            "declined": dict(self.declined),
-            "tokens": self.tokens,
-        }
+        """Its counters (`counters`) as a saved position keeps them."""
+        return {field.name: dict(value) if isinstance(value := getattr(self, field.name), Counter) else value
+                for field in counters()}
 
     def restore(self, state: Mapping[str, object]) -> None:
-        self.attempted = integer(state["attempted"], "attempted")
-        self.accepted = integer(state["accepted"], "accepted")
-        self.truncated = integer(state["truncated"], "truncated")
-        self.delivered_rows = integer(state["delivered_rows"], "delivered_rows")
-        self.chunks = integer(state["chunks"], "chunks")
-        self.chunk_records = integer(state["chunk_records"], "chunk_records")
-        self.tokens = integer(state["tokens"], "tokens")
-        self.rejected = Counter(
-            {name: integer(value, name) for name, value in record(state["rejected"], "rejected").items()}
-        )
-        for name in CUT_COUNTS:
-            setattr(self, name, Counter({kind: integer(value, kind)
-                                         for kind, value in record(state[name], name).items()}))
+        """Its counters read back from a saved position (`state`), each by its codec."""
+        for field in counters():
+            held = state[field.name]
+            setattr(self, field.name, integer(held, field.name) if field.metadata == COUNT else Counter(
+                {kind: integer(value, kind) for kind, value in record(held, field.name).items()}))
+
+    def add(self, counts: CorpusCounts) -> None:
+        """Add `counts`, another iterator's of the records it read, to its counters."""
+        for field in counters():
+            held = getattr(self, field.name)
+            if isinstance(held, Counter):
+                held.update(getattr(counts, field.name))
+            else:
+                setattr(self, field.name, held + getattr(counts, field.name))
 
     def followed(self, reader: CorpusCounts) -> CorpusCounts:
         """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
@@ -335,9 +329,15 @@ class _KeepAccepted:
 
 COUNTER = "dew.corpus_counts"
 
-CUT_COUNTS = ("cut_examples", "cut_rows", "cut_removed", "left_out", "rejected_cut", "left_out_cut",
-              "declined")
-"""A corpus's counts by kind (`CorpusCounts`), each a record of its own in a saved position."""
+def counters() -> tuple[dataclasses.Field, ...]:
+    """`CorpusCounts`' counters, declared once with their codec (`COUNT`, `KINDS`): what a saved position
+    keeps of a corpus's counts (`state`, `restore`) and what two reads' counts add (`add`)."""
+    return tuple(field for field in dataclasses.fields(CorpusCounts) if field.metadata in (COUNT, KINDS))
+
+
+CUT_COUNTS = tuple(field.name for field in counters() if field.metadata == KINDS and field.name != "rejected")
+"""A corpus's counts by kind but its rejections, which a position version 7 saved kept alone
+(`dew.data.plan.earlier_position`)."""
 """Where a counting iterator's position keeps its corpus's counts, beside its parent's position:
 a key of Dew's own, which `state_counts` and `rewound` find and no Grain position holds."""
 
@@ -1140,19 +1140,4 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     """Add a corpus's counts from an iterator that read records of its own."""
     if counts.name not in counted:
         counted[counts.name] = CorpusCounts(counts.name, counts.label, rows=counts.rows)
-    combined = counted[counts.name]
-    combined.attempted += counts.attempted
-    combined.accepted += counts.accepted
-    combined.delivered_rows += counts.delivered_rows
-    combined.tokens += counts.tokens
-    combined.truncated += counts.truncated
-    combined.chunks += counts.chunks
-    combined.chunk_records += counts.chunk_records
-    combined.rejected.update(counts.rejected)
-    combined.cut_examples.update(counts.cut_examples)
-    combined.cut_rows.update(counts.cut_rows)
-    combined.cut_removed.update(counts.cut_removed)
-    combined.left_out.update(counts.left_out)
-    combined.rejected_cut.update(counts.rejected_cut)
-    combined.left_out_cut.update(counts.left_out_cut)
-    combined.declined.update(counts.declined)
+    counted[counts.name].add(counts)

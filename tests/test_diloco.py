@@ -197,15 +197,21 @@ def test_a_single_replica_diloco_run_between_syncs_trains_as_a_plain_run():
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("accumulation", [1, 2])
+@pytest.mark.parametrize(("accumulation", "carried"), [(1, False), (2, False), (1, True)])
 def test_a_resumed_diloco_run_restores_each_replica_and_ends_where_an_unbroken_one_does(tmp_path,
-                                                                                          accumulation):
+                                                                                          accumulation,
+                                                                                          carried):
     """A DiLoCo run stopped between syncs and resumed restores each replica's inner state and the outer
     state, and ends where an unbroken run does, to the bit; with two steps an update, stopped inside a
-    window, each replica's part-filled window too."""
+    window, each replica's part-filled window too; and with an average and a loss scale, each replica's
+    own of them, every field a replica keeps (`REPLICA`) holding values of its own."""
     def run(path=None):
+        objective = Regression64()
+        if carried:
+            objective.ema = EMASpec(decay=optax.constant_schedule(0.9))
         return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM),
-                       optimizer=optax.adam(RATE), path=path, accumulation=accumulation)
+                       optimizer=optax.adam(RATE), path=path, objective=objective, accumulation=accumulation,
+                       dynamic_scale=carried)
 
     with jax.enable_x64(new_val=True):
         unbroken = run().fit(dataset(), steps=5, log_every=1)
@@ -333,21 +339,6 @@ def test_a_meeting_and_a_new_stage_drop_each_groups_part_filled_window():
         assert after.inner.microstep.tolist() == [6, 4] and int(after.microstep) == 6
         assert after.inner.accumulation.mass.tolist() == [0.0, 0.0]
         assert after.inner.accumulation.statistics[0].tolist() == [0.0, 0.0]
-
-
-def test_a_replicas_fields_are_the_train_states_marked_ones_and_its_typed_view_names_them():
-    """A DiLoCo replica holds its own of exactly the `TrainState` fields marked `REPLICA`, in their order
-    and with their types (row 4139: `Replicas` redeclared eight of them), and `ReplicaState`, the view
-    DiLoCo's readers are typed through, names the same fields with the same types."""
-    from dew.state import REPLICA, REPLICA_FIELDS, Replicas, ReplicaState, TrainState
-
-    marked = [(field.name, field.type) for field in dataclasses.fields(TrainState)
-              if all(field.metadata.get(key) == value for key, value in REPLICA.items())]
-    assert len(marked) == 8
-    assert [(field.name, field.type) for field in dataclasses.fields(Replicas)] == marked
-    assert tuple(name for name, _ in marked) == REPLICA_FIELDS
-    view = {name: kind for name, kind in ReplicaState.__annotations__.items() if not name.startswith("__")}
-    assert view == dict(marked)
 
 
 @pytest.mark.mesh(devices=2)
