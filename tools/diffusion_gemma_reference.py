@@ -20,18 +20,15 @@ import jax
 import numpy as np
 import torch
 import transformers
-from diffusion_gemma_worker import media_inputs
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import PreTrainedTokenizerFast
 from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-    DiffusionGemmaConfig,
-    DiffusionGemmaTextConfig,
+    DiffusionGemmaConfig, DiffusionGemmaTextConfig,
 )
 from transformers.models.diffusion_gemma.generation_diffusion_gemma import (
-    DiffusionGemmaGenerationConfig,
-    EntropyBoundSampler,
+    DiffusionGemmaGenerationConfig, EntropyBoundSampler,
 )
 from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
@@ -90,6 +87,20 @@ def diffusion_gemma_model(fields: dict, canvas_length: int):
         text_config=DiffusionGemmaTextConfig(**text), vision_config=vision, canvas_length=canvas_length,
         tie_word_embeddings=False))
     return model.float().eval()
+
+
+def media_inputs(pixels) -> dict[str, torch.Tensor]:
+    """The image inputs DiffusionGemma's forward reads for a prompt's `pixels` ([batch, 1, 3, 4, 4], torch or
+    NumPy): each image's Gemma 4 patches at patch size 2 (`convert_image_to_patches`), in the pixels' dtype,
+    and the patches' places on their 2 by 2 grid."""
+    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
+
+    pixels = torch.as_tensor(pixels)
+    # Patched in float64, which holds every narrower float exactly (NumPy holds no bfloat16), then cast back.
+    patches = torch.stack([torch.as_tensor(convert_image_to_patches(image.to(torch.float64).numpy(), 2))
+                           for image in pixels[:, 0]])
+    positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(len(pixels), -1, -1)
+    return {"pixel_values": patches.to(pixels.dtype), "image_position_ids": positions}
 
 
 def reference_generation(model, prompt, *, steps=4, confidence=0.005, stability=1, eos=None, model_kwargs=None):

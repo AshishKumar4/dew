@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
-"""Write the bfloat16 attention fixture and the transformers `generate` fixtures that
-tests/test_generate_reference.py checks against.
+"""Write the float64 and bfloat16 reference fixtures and the transformers
+`generate` fixtures that tests/test_generate_reference.py and
+tests/test_block_diffusion.py check against.
 
 Everything runs under torch and transformers 5.16.1 on CPU, against the
 checkpoints already committed under tests/fixtures/hf, so no fixture weight
-changes. DiffusionGemma's bfloat16 denoiser is tools/diffusion_gemma_worker.py's
-recording over drawn inputs.
+changes. Each fixture's fp32 reference output is recomputed and placed
+against the float64 one beside the committed output; a committed output
+further from float64 than twice the fresh one stops the script, since the new
+files would then describe different weights or a different reference.
 
     PYTHONPATH=src:tools python tools/numerics_reference.py
 
+in the repository's environment, which holds torch and transformers 5.16.1
+beside JAX: the artifact check is the gate's (tests/reference_error.py
+`assert_same_artifact`), which reads Dew.
+
 What lands, beside each fixture's own files:
 
+- numerics.npz in diffusion-gemma-workflow: `<forward>_f64` and
+  `<forward>_bf16`, the reference with weights and activations in float64
+  and in bfloat16 (stored as float32, which holds every bfloat16 exactly), for
+  the three denoiser forwards in its reference.npz (`bare`, `conditioned`,
+  `image_logits`). The float64 run is the truth both precisions are
+  measured from, with every float32 pin of the model widened
+  (`torch_precision.float64`). tests/test_bf16_reference.py runs the
+  denoiser's bfloat16 reference in the test.
 - tests/fixtures/attention_bf16.npz: one head of 512 queries over 512 keys
   of width 64, logits of standard deviation 0.5, through transformers'
   `eager_attention_forward` (the fp32 softmax every decoder's eager path
@@ -31,14 +46,18 @@ What lands, beside each fixture's own files:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from diffusion_gemma_worker import eager
+from safetensors.torch import load_file
 from torch_precision import float64
 from transformers import AutoModelForCausalLM
 from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from reference_error import assert_same_artifact
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 GENERATORS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny")
@@ -46,6 +65,15 @@ PROMPT_LENGTHS = (4, 7, 5)
 NEW_TOKENS = 10
 TEMPERATURE, TOP_K, TOP_P, SAMPLE_SEED = 0.7, 20, 0.9, 5
 PAD = 0
+
+
+def eager(model):
+    """Eager attention, as tools/hf_reference.py ran it, and the per-expert
+    loop, the one routed kernel that runs in float64 on CPU (grouped_mm
+    takes no double), so all three precisions run one order of operations."""
+    model.set_attn_implementation("eager")
+    model.set_experts_implementation("eager")
+    return model.eval()
 
 
 def decoder(name: str, dtype: torch.dtype):
@@ -57,6 +85,53 @@ def logits(model, ids: np.ndarray) -> np.ndarray:
     with torch.no_grad():
         out = model(input_ids=torch.from_numpy(ids).long(), use_cache=False).logits
     return out.to(torch.float64).numpy()
+
+
+def report(name: str, fp32: np.ndarray, bf16: np.ndarray, f64: np.ndarray) -> None:
+    print(f"{name}: fp32 reference error {np.max(np.abs(fp32 - f64)):.3e}, "
+          f"bf16 reference error {np.max(np.abs(bf16 - f64)):.3e}")
+
+
+def workflow(dtype: torch.dtype):
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
+    return eager(DiffusionGemmaForBlockDiffusion.from_pretrained(
+        FIXTURES / "diffusion-gemma-workflow", dtype=dtype, local_files_only=True))
+
+
+def workflow_outputs(model, reference, dtype: torch.dtype) -> dict[str, np.ndarray]:
+    """The three forwards tools/diffusion_gemma_reference.py stores, from its
+    own stored inputs."""
+    from diffusion_gemma_reference import media_inputs
+
+    prompt, canvas = (torch.from_numpy(reference[key]) for key in ("prompt", "canvas"))
+    previous = torch.from_numpy(reference["previous"]).to(dtype)
+    media = media_inputs(torch.from_numpy(reference["pixels"]).to(dtype))
+    image_prompt = torch.from_numpy(reference["image_prompt"])
+    with torch.no_grad():
+        outputs = {
+            "bare": model(input_ids=prompt, decoder_input_ids=canvas).logits,
+            "conditioned": model(input_ids=prompt, decoder_input_ids=canvas,
+                                 self_conditioning_logits=previous).logits,
+            "image_logits": model(input_ids=image_prompt, decoder_input_ids=canvas, **media).logits,
+        }
+    return {key: value.to(torch.float64).numpy() for key, value in outputs.items()}
+
+
+def write_workflow() -> None:
+    directory = FIXTURES / "diffusion-gemma-workflow"
+    with np.load(directory / "reference.npz") as stored:
+        reference = {key: stored[key] for key in stored.files}
+    with float64():
+        f64 = workflow_outputs(workflow(torch.float64), reference, torch.float64)
+    fp32 = workflow_outputs(workflow(torch.float32), reference, torch.float32)
+    for key, value in fp32.items():
+        assert_same_artifact(value.astype(np.float32), reference[key], f64[key], f"workflow {key}")
+    bf16 = workflow_outputs(workflow(torch.bfloat16), reference, torch.bfloat16)
+    arrays = {f"{key}_f64": value for key, value in f64.items()}
+    arrays.update({f"{key}_bf16": value.astype(np.float32) for key, value in bf16.items()})
+    np.savez(directory / "numerics.npz", **arrays)
+    for key in f64:
+        report(f"workflow {key}", reference[key], arrays[f"{key}_bf16"], f64[key])
 
 
 def prompts(vocab: int) -> tuple[np.ndarray, np.ndarray]:
@@ -175,6 +250,7 @@ def main() -> None:
     from reference_releases import require
 
     require("transformers")
+    write_workflow()
     for name in GENERATORS:
         write_generation(name)
     write_attention()

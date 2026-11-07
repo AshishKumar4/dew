@@ -109,7 +109,7 @@ def canvas_draw(prompt: np.ndarray, canvas: np.ndarray, vocab: int, *, previous:
 def transformers_canvas(network, prompt, canvas, *rest):
     """transformers' canvas logits after `prompt`, self-conditioned on the previous logits where given, or
     with the prompt's images where pixels are (the reference's patches and their positions)."""
-    from tools.diffusion_gemma_worker import media_inputs
+    from tools.diffusion_gemma_reference import media_inputs
 
     fields = {}
     if rest and rest[0].ndim == 3:

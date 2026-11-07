@@ -84,10 +84,6 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                      "reference": "huggingface/transformers 5.16.1",
                                      "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")}
             for family in ("gemma4", "qwen35", "llama4", "gemma3n")},
-         "diffusion-gemma-bf16": {"test": "test_bf16_reference", "arms": "workflow",
-                                  "worker": "diffusion_gemma_worker.py",
-                                  "reference": "huggingface/transformers 5.16.1", "license": "Apache-2.0",
-                                  "distribution": ("transformers", "5.16.1"), "narrow": "bfloat16"},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",
@@ -136,9 +132,8 @@ def recording(site: str, python: str, source: str | None, given=None) -> dict[st
             reference, truth = arms(answer, "case.")
             return tuple({leaf: arm[leaf] for leaf in outputs} for arm in (reference, truth))
 
-        narrow = getattr(jnp, known.get("narrow", "float32"))
-        dew = ((lambda inputs: run(narrow, inputs)) if known.get("host")
-               else jax.jit(lambda inputs: run(narrow, inputs)))
+        dew = ((lambda inputs: run(jnp.float32, inputs)) if known.get("host")
+               else jax.jit(lambda inputs: run(jnp.float32, inputs)))
         return record_case(site, draw, evaluate, store_inputs=False, summary=not known.get("outputs"),
                            dew=dew)
 

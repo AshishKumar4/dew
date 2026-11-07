@@ -41,7 +41,6 @@ import pytest
 from interop_support import fixture_ids, transformers_arms, transformers_model
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
-from reference_runs import assert_as_exact_as_recorded
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
@@ -173,58 +172,31 @@ def denoise(model, variables, prompt, canvas, **conditioning):
     return model.apply({**variables, "cache": cache}, canvas, **conditioning).astype(jnp.float32)
 
 
-WORKFLOW = FIXTURES / "diffusion-gemma-workflow"
-WORKFLOW_SEEDS = 8
-"""The denoiser's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
-WORKFLOW_OUTPUTS = ("bare", "conditioned", "image_logits")
-"""The leaves `denoised` gives, the site's recorded leaves (tools/diffusion_gemma_worker.py)."""
-IMAGE_TOKEN = 60
-
-
-def workflow_draw(seed: int) -> dict[str, np.ndarray]:
-    """Two prompts of five ids clear of the special and image tokens, the same with an image token in third
-    place, two canvases of four ids, the previous step's logits over the vocabulary and a 4 by 4 picture
-    for each image prompt."""
-    rng = np.random.default_rng([198, seed])
-    prompt = rng.integers(2, IMAGE_TOKEN, (2, 5))
-    image_prompt = prompt.copy()
-    image_prompt[:, 2] = IMAGE_TOKEN
-    return {"prompt": prompt, "image_prompt": image_prompt, "canvas": rng.integers(2, IMAGE_TOKEN, (2, 4)),
-            "previous": rng.standard_normal((2, 4, 64)).astype(np.float32),
-            "pixels": rng.uniform(0, 1, (2, 1, 3, 4, 4)).astype(np.float32)}
-
-
-def denoised(dtype, inputs) -> dict:
-    """DiffusionGemma's three denoiser forwards at `dtype` over a draw: the canvas over the prompt, with the
-    previous step's logits, and over the image prompt with its pictures, the workflow checkpoint's weights
-    float32 masters (float64 for a float64 run)."""
-    config = json.loads((WORKFLOW / "config.json").read_text())
-    model = adapter.build(config, dtype=jnp.dtype(dtype).name, attention_impl="xla")
-    variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
-    wide = jnp.float64 if dtype == jnp.float64 else jnp.float32
-    variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, wide), variables)
-    prompt, image_prompt, canvas = (jnp.asarray(inputs[name], jnp.int32)
-                                    for name in ("prompt", "image_prompt", "canvas"))
-    image = ({"image_indices": jnp.where(image_prompt == IMAGE_TOKEN, 0, -1)},
-             {"pixel_values": jnp.asarray(inputs["pixels"], wide)})
-    return {"bare": denoise(model, variables, prompt, canvas),
-            "conditioned": denoise(model, variables, prompt, canvas,
-                                   self_conditioning_logits=jnp.asarray(inputs["previous"], wide)),
-            "image_logits": denoise(model, variables, image_prompt, canvas, media=image)}
-
-
-def pipeline_arms(_):
-    """tools/venv_reference.py's `diffusion-gemma-bf16` site: its recording, draw, Dew run and leaves."""
-    return WORKFLOW / "recording.npz", workflow_draw, denoised, WORKFLOW_OUTPUTS
-
-
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
-    """DiffusionGemma's shared text tree with routed experts, a sliding and a full layer, self-conditioning
-    and the vision conditioner, each forward the fp32 test in tests/test_block_diffusion.py makes, now in
-    bf16, on par with the reference's bf16 forward over drawn prompts, canvases, logits and pictures
-    (check 1), the truth its float64 run from the same weights."""
-    assert_as_exact_as_recorded(WORKFLOW / "recording.npz", "diffusion-gemma-bf16", WORKFLOW_SEEDS,
-                                workflow_draw, denoised, "DiffusionGemma bf16", narrow=jnp.bfloat16)
+    """DiffusionGemma's shared text tree with routed experts, a sliding and a
+    full layer, self-conditioning and the vision conditioner, each forward
+    the fp32 test in tests/test_block_diffusion.py makes, now in bf16."""
+    directory = FIXTURES / "diffusion-gemma-workflow"
+    config = json.loads((directory / "config.json").read_text())
+    tensors = load_file(str(directory / "model.safetensors"))
+    reference = {}
+    for name in ("reference.npz", "numerics.npz"):
+        with np.load(directory / name) as stored:
+            reference.update({key: stored[key] for key in stored.files})
+    model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
+    variables, _ = adapter.translate_weights(tensors, config)
+    image = (reference["image_prompt"],
+             ({"image_indices": jnp.where(reference["image_prompt"] == 60, 0, -1)},
+              {"pixel_values": jnp.asarray(reference["pixels"])}))
+    runs = {
+        "bare": (reference["prompt"], {}),
+        "conditioned": (reference["prompt"], {"self_conditioning_logits": reference["previous"]}),
+        "image_logits": (image[0], {"media": image[1]}),
+    }
+    for name, (prompt, conditioning) in runs.items():
+        logits = denoise(model, variables, prompt, reference["canvas"], **conditioning)
+        assert_as_exact_as_the_reference(logits, reference[f"{name}_bf16"], reference[f"{name}_f64"],
+                                         f"workflow {name}")
 
 
 def bfloat16(bits: np.ndarray) -> jax.Array:
