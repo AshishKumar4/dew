@@ -71,6 +71,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     approximate,
     bundle_of,
     extents,
+    hook_reduces,
     issued_into,
     issued_pairs,
     modelled,
@@ -1847,7 +1848,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret, resident=resident,
                          approx_math=approx_math, name=name, cost=cost, model_flops=model,
-                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod,
+                         reducing_warpgroups=reducing(family, consumers,
+                                                      hook_reduces(hooks) or hooks.output_mod is not None,
                                                       guarded=read.guard is not None or flags)
                          )(query, key, value, *leaves)
 

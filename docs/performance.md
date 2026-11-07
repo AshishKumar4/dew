@@ -2683,10 +2683,8 @@ write put a dropped token's keys at another head's kept slot (jax 0.11.2, an
 RTX 4080). The write is a scatter into the pool's page and offset axes past
 an unindexed head axis. The scatter expander padded the out-of-range rows
 with 0 on the unindexed axis, so a window offset along that axis collided
-with a kept index. openxla/xla#49498 fixes it (issue #49380), in an XLA
-later than Dew's jax pin. Mapped over a group of one, as the paged cache's
-other write already is, the scatter is right, so `KVStore.write_tokens`
-writes that way.
+with a kept index. openxla/xla#49498 fixes it (issue #49380), in the XLA
+jaxlib 0.12.0.1 builds from (an A100's red and green, PC-951-scatter-redgreen-a100).
 
 Open: latent attention (MLA, DSA), sliding windows, sinks, quantized or
 rotated caches, a pool split into groups, hybrids whose recurrent layers

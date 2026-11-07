@@ -132,8 +132,14 @@ def _runs(query_ids: jax.Array | None, key_ids: jax.Array | None, batch: int, qu
     def row(wanted, held):
         order = jnp.argsort(held, stable=True)
         ordered = held[order]
-        return (order.astype(jnp.int32), jnp.searchsorted(ordered, wanted, side="left").astype(jnp.int32),
-                jnp.searchsorted(ordered, wanted, side="right").astype(jnp.int32))
+        # Each search one sort of the keys' and queries' ids together, no loop: a loop's log2(K) trips ran
+        # as a GPU launch each (M-DD-10: a speculative verify of 4 queries over 4096 keys 284 us against its
+        # 22 us attention), and unrolled, their gathers chained into `_searched`'s unrolled steps, which
+        # XLA:CPU took past four minutes to compile a decode step over a paged pool (tests/test_kv_cache.py's
+        # greedy decodes, red at ce05446f953; either unrolled alone, or this sort, 15 to 30 s).
+        return (order.astype(jnp.int32),
+                jnp.searchsorted(ordered, wanted, side="left", method="sort").astype(jnp.int32),
+                jnp.searchsorted(ordered, wanted, side="right", method="sort").astype(jnp.int32))
 
     return jax.vmap(row)(query_ids, key_ids)
 
@@ -158,7 +164,8 @@ def _searched(values: jax.Array, lo: jax.Array, hi: jax.Array, wanted: jax.Array
         return jnp.where(live & right, middle + 1, low), jnp.where(live & ~right, middle, high)
 
     steps = max(values.shape[1], 1).bit_length()
-    return jax.lax.fori_loop(0, steps, step, (lo, hi))[0]
+    # Unrolled into one program: a loop ran each step as a launch of its own (`dew.nn.documents._searched`).
+    return jax.lax.fori_loop(0, steps, step, (lo, hi), unroll=True)[0]
 
 
 def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_window: int | None = None,
@@ -786,6 +793,11 @@ class Dropout:
         the call's global `queries` and `keys` where a sequence exchange holds a slice of them."""
         return Draw((self.seed[0], self.seed[1]), self.rows[row], self.heads[head], self.rate, self.queries,
                     self.keys)
+
+    @property
+    def bound(self) -> float:
+        """The multiplier a kept entry takes, every draw's (`Draw.bound`)."""
+        return 1.0 / (1.0 - self.rate)
 
 
 @jax.tree_util.register_dataclass

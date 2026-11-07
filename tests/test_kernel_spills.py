@@ -662,6 +662,26 @@ WATERFALL_LISTING = """
 """A copy whose operand ptxas could not prove uniform, issued lane by lane in an elect waterfall (BRA.U.ANY)
 around its R2UR (notes/ptxas-re.md §2: a divergent copy operand)."""
 
+DEAD_MMA_LISTING = """
+.text.negated_mosaic_gpu_kernel:
+        /*0570*/                   WARPGROUP.ARRIVE ;
+        /*0580*/                   HGMMA.64x8x16.F16 RZ, gdesc[URZ], RZ, !UPT, gsb0 ;
+        /*0590*/                   WARPGROUP.DEPBAR.LE gsb0, 0x0 ;
+        /*05b0*/                   STS.64 [R3+0x4000], R16 ;
+        /*05c0*/                   EXIT ;
+"""
+"""ptxas 12.9's listing of a negated warpgroup product (row 4346's minimal kernel at base): its four MMAs
+dropped for one writing no register, the stored tile a constant."""
+
+
+def test_the_sass_rules_find_a_warpgroup_mma_whose_products_were_dropped():
+    """A warpgroup MMA writing no register (`HGMMA ... RZ`) is what ptxas leaves of products it found never
+    read (row 4346), a SASS finding the compile gate fails; an MMA into registers is none."""
+    (dead,) = report.sass_findings_of(DEAD_MMA_LISTING)
+    assert "warpgroup MMA writing no register" in dead
+    assert report.sass_findings_of(CONVERTING_LISTING) == ()
+
+
 def test_the_sass_rules_find_an_elect_waterfall_around_a_conversion():
     """The compile gate's SASS rules (row 4071, the kernel challenge's harness/ptxas checks) read nvdisasm's
     listing of a kernel: an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
