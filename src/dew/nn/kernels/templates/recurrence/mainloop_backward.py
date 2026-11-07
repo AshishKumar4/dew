@@ -621,9 +621,10 @@ def _query_key_split(call: Call) -> int:
     an A100, past its 166912 (fp32-plan-sm90 at cdcd620ef, wide-backward). Halved instead, 192 columns took
     96, a block and a half, and the split's programs read no column past their first block's. Each split's
     bytes are the launch's own (`shared_allocation`, as `launch_kernel` lays it: its streams one deep, its
-    landing). Compiled as interpreted: the weights' gradient a split once landed zero natively came from a
-    lowering served under an incomplete cache key, not the split (row 4346: JAX post64's key of all a Pallas
-    Mosaic GPU lowering reads; at its build every launch native as interpreted, M-JS-21)."""
+    landing). Compiled as interpreted: the weights' gradient a split once landed zero natively, `-dw` read
+    from its accumulator, because CUDA 12.9's ptxas folded the read's sign flip (an xor) so that the
+    product's HGMMA wrote the zero register, not the split (row 4346: the JAX fork's float-sign-ops
+    lowering, post66; M-JS-22q native as interpreted)."""
     def streamed(vq: int) -> int:
         tiles, _ = _query_key_launched(call, vq)
         _, scope, _, _ = shared_allocation(call, tiles, (), _query_key_landing(call, call.value_width // vq))
