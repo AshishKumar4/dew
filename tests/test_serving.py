@@ -11,6 +11,7 @@ import dataclasses
 import functools
 import itertools
 import threading
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -888,6 +889,101 @@ def test_a_hybrid_stack_reads_a_shared_prefix_from_a_store_of_one_entry(requests
     """`assert_reads_a_shared_prefix`'s sites of 512 seeds, a store of one entry's, which CI draws in map
     tasks of 128."""
     assert_reads_a_shared_prefix(requests, options, hits, rounds, site)
+
+
+QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-tiny"
+"""A Qwen3.5 checkpoint (its byte-vocabulary text decoder): three gated delta net layers, each a recurrent
+memory and a four-tap conv tail a row keeps, and one of gated full attention, whose keys a server pages."""
+
+
+QWEN35_BUDGET = 16
+"""The tokens each question draws."""
+EXP_ULPS = 8
+"""The float32 ulps XLA's exp and log each lose at most, within which their CPU and GPU kernels hold."""
+
+
+def float32_score_bound(logits: np.ndarray, tokens: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    """How far a drawn token's log probability may lie from its float64 value, `scores`, where a server
+    computes `logits` (`[steps, V]`, the float64 full forward's) in float64 and scores them in float32,
+    as every draw scores its model's logits (`dew.sampling.strategies.draw`: the logits cast to float32,
+    then `log_softmax` at the token). With u = 2^-24, the unit roundoff of float32, element by element:
+
+    - the cast moves each logit by at most u |z_j|, which moves the score z_t - m - log S
+      (m = max z, S = sum_j exp(z_j - m)) by at most u (|z_t| + sum_j p_j |z_j|) <= 2 u max |z|;
+    - float32 rounds z_t - m by u |z_t - m|, each exp(z_j - m) and the log by EXP_ULPS u relatively,
+      and the sum of the V positive terms by (V - 1) u relatively (Higham's gamma_{V-1}), so log S by
+      (V - 1 + 2 EXP_ULPS) u absolutely, plus u |log S| for its rounding, and the last subtraction by
+      u |score|;
+    - the float64 logits the server computes part from the full forward's by float64 rounding, 2^-40 of
+      max |z| here with room to spare.
+
+    A state the segment left copied wrong moves a score by the model's own sensitivity, 1e-2 and more."""
+    u = 2.0 ** -24
+    steps = np.arange(len(tokens))
+    peak = np.max(logits, axis=-1)
+    largest = np.max(np.abs(logits), axis=-1)
+    total = np.sum(np.exp(logits - peak[:, None]), axis=-1)
+    chosen = logits[steps, tokens]
+    vocab = logits.shape[-1]
+    return u * (2 * largest + np.abs(chosen - peak) + (vocab - 1 + 2 * EXP_ULPS) + np.abs(np.log(total))
+                + np.abs(scores)) + 2.0 ** -40 * largest
+
+
+@pytest.mark.parametrize("hits, rounds", [((0, 6, 12), None), ((12,), (3,))], ids=["one-a-round", "at-once"])
+def test_a_qwen35_checkpoint_serves_each_question_from_its_shared_turn_encoded_once(hits, rounds):
+    """Shared-prefix serving end to end on a Qwen3.5 checkpoint as `Pretrained.load` reads it: a request's
+    chat turn and state, a segment each question past it declares shared (`SEGMENT`), is encoded once (the
+    server's prefix hits), and each question is served from what the segment left, its attention pages,
+    each gated delta net's recurrent memory and conv tail, kept at the segment's end and copied into its
+    row, asked one a round or all at once. Served in float64, each question draws what the lone task
+    draws, token for token, and scores each draw within `float32_score_bound` of the float64 full forward
+    over the prompt and the tokens drawn before it: the server's float32 scoring alone rounds, so a state
+    copied wrong is orders past it. A check-1 ratio of the float32 server does not resolve on this
+    checkpoint's 64 wide layers within 512 seeds (heavy-tailed draws); the NARROW and WIDE hybrid sites
+    hold the same path's float32 parity (check 1)."""
+    from serving_support import served_inputs
+
+    from dew.interop import Pretrained
+    from dew.nn.visibility import with_served_blocks
+
+    source = Pretrained.load(str(QWEN35), dtype="float32")
+    with jax.enable_x64(new_val=True):
+        model, variables = source.model.clone(dtype=jnp.float64), float64_held(source.variables)
+        served = TextGeneration(model, variables, sampling=Sampling(temperature=0, pad_token_id=0))
+        server = Server.from_task(served, **HYBRID_SHARED)
+        full = model.clone(attention_impl="reference")
+        forward = jax.jit(lambda weights, tokens, groups: full.apply(weights, tokens, **groups))
+        vocab = model.vocab_size
+        for seed in range(4):
+            row = np.random.default_rng([0x1536, seed]).integers(1, vocab, SEGMENT[0].length).astype(np.int32)
+            tickets, shared, before = [], [], server.prefix_hits
+            for end in itertools.accumulate((1,) * len(SEGMENT) if rounds is None else rounds):
+                tickets.extend(server.submit(served_inputs(row, SEGMENT[index], vocab), QWEN35_BUDGET,
+                                             key=index, shared=SEGMENT[index].shared)
+                               for index in range(len(tickets), end))
+                server.run()
+                shared.append(server.prefix_hits - before)
+            assert shared == list(hits), shared
+            for index, (request, ticket) in enumerate(zip(SEGMENT, tickets, strict=True)):
+                inputs = served_inputs(row, request, vocab)
+                generation = ticket.result().host()
+                tokens = np.asarray(generation.tokens)[0, -QWEN35_BUDGET:]
+                alone = np.asarray(served(inputs, QWEN35_BUDGET, key=index).host().tokens)[0, -QWEN35_BUDGET:]
+                np.testing.assert_array_equal(tokens, alone)
+                prompt = np.asarray(inputs.tokens)
+                held = with_served_blocks({}, np.ones(prompt.shape, bool), served.prefix)
+                # One forward over the prompt and the draws, whose logits at the prompt's last position on
+                # score each draw.
+                whole = jnp.asarray(np.concatenate([prompt, tokens[None, :-1]], 1))
+                logits = np.asarray(forward(variables, whole, {name: jnp.asarray(value)
+                                                               for name, value in held.items()}),
+                                    np.float64)[0, prompt.shape[1] - 1:]
+                truth = np.asarray(jax.nn.log_softmax(logits, axis=-1))[np.arange(QWEN35_BUDGET), tokens]
+                scored = np.asarray(generation.raw_log_probs[0], np.float64)
+                bound = float32_score_bound(logits, tokens, truth)
+                assert np.all(np.abs(scored - truth) <= bound), (
+                    f"seed {seed}, question {index}: {np.max(np.abs(scored - truth) / bound):.3g} times "
+                    "the float32 scoring's bound")
 
 
 def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):

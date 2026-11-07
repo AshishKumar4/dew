@@ -32,19 +32,48 @@ def tiny(**overrides):
 
 
 
-def test_every_native_sampler_declares_the_key_it_requires():
-    """A native draw needs its key, so the samplers declare it required rather than defaulting it
-    to a None that the request refuses (`request_key`): leaving it out is a TypeError at the call."""
-    import inspect
+def test_every_native_sampler_takes_the_key_it_draws_from(rng):
+    """A native draw needs its key: each sampler run without one is refused at the call (a TypeError,
+    the key a required keyword rather than a None that the request refuses, `request_key`), and run with
+    one draws: a decoder's generation, a block denoiser's and a masked one's, and a text-to-image task's
+    preparation and its whole walk."""
+    from flax import linen as nn
+    from test_discrete import MASK, transformer
+    from test_inference_tasks import Counting
 
+    from dew.diffusion import DirectPredictionTransform, FlowMatchingScheduler, Process
     from dew.diffusion.block import BlockProcess
-    from dew.diffusion.discrete import DiscreteProcess
+    from dew.diffusion.discrete import DiscreteProcess, LogLinear
     from dew.inference import TextToImage
+    from dew.inputs import Field, InputSpec
+    from dew.sampling import Euler
 
-    for function in (generate, BlockProcess.generate, DiscreteProcess.generate, TextToImage.prepare,
-                     TextToImage.__call__):
-        key = inspect.signature(function).parameters["key"]
-        assert key.default is inspect.Parameter.empty, function.__qualname__
+    class Scaled(nn.Module):
+        @nn.compact
+        def __call__(self, x, time, train=False):
+            return x * self.param("scale", nn.initializers.ones, ())
+
+    decoder = tiny()
+    prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
+    decoder_params = decoder.init(rng, prompt)
+    counting = Counting()
+    masked = transformer(causal=False)
+    image = TextToImage(Scaled(), Process(FlowMatchingScheduler(), DirectPredictionTransform()),
+                        InputSpec(Field("image", (2, 2, 1))), {"params": {"scale": jnp.ones(())}}, steps=1,
+                        guidance=None, solver=Euler())
+    samplers = {
+        "generate": functools.partial(generate, decoder, decoder_params, prompt, 2),
+        "block": functools.partial(BlockProcess(canvas_length=4, vocab_size=11).generate, counting,
+                                   counting.init(rng, jnp.zeros((1, 4), jnp.int32)), [[1, 5, 7]], 4),
+        "masked": functools.partial(DiscreteProcess(LogLinear(), mask_id=MASK).generate, masked,
+                                    masked.init(rng, jnp.zeros((1, 4), jnp.int32)), [[1, 2]], 3, steps=4),
+        "prepare": functools.partial(image.prepare, ""),
+        "image": functools.partial(image, ""),
+    }
+    for name, sampler in samplers.items():
+        with pytest.raises(TypeError):
+            sampler()
+        assert sampler(key=0) is not None, name
 
 
 def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
