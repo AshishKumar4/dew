@@ -24,6 +24,7 @@ def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
     with generation.assumed("sm90"):
         a_gathered_product_is_on_par(grouped_matmul.INTERPRETED)
         a_gathered_product_is_on_par(grouped_matmul.INTERPRETED, paired=True, scattered=True)
+        a_gathered_product_is_on_par(grouped_matmul.INTERPRETED, deep=True)
     tokens, table = jnp.zeros((200, 128), jnp.bfloat16), jnp.zeros((256,), jnp.int32)
     with generation.assumed("sm80"), pytest.raises(ValueError):
         mosaic_gpu.gmm(tokens, jnp.zeros((4, 128, 256), jnp.bfloat16),
@@ -33,22 +34,24 @@ def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
                        gather=table)
 
 
-def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False, scattered: bool = False):
+def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False, scattered: bool = False,
+                                 deep: bool = False):
     """A grouped product whose rows are gathered from the tokens by a table (`gmm`'s `gather`: a MoE's sort
     fused into the rows' loads, row 1376), its groups ragged, one empty, rows past them, a token read by
     several slots and some by none, on par with XLA's ragged dot of the gathered rows (check 1), from
     float64: on this GPU (test_gpu_gemm's cell, the producer's cp.async gather), or `interpret`ed; `paired`,
     a second matrix's product beside it; `scattered`, each row stored at its entry of a permutation (`gmm`'s
-    `scatter`: the MoE's un-permute fused into the stores)."""
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
-    sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
+    `scatter`: the MoE's un-permute fused into the stores); `deep`, a 256-deep step, four swizzled tiles a
+    row (each row's copies `mosaic.row_copies`: counted apart, the packed NVFP4 bank's gathered walk hung)."""
+    tiles = mosaic_gpu.Tiles(128, 128, 256 if deep else 64, 2, 1, warpgroups=2, family='wgmma')
+    sizes, depth = jnp.asarray([70, 0, 129, 51], jnp.int32), 512 if deep else 128
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        tokens = jnp.asarray(rng.normal(size=(200, 128)), jnp.bfloat16)
+        tokens = jnp.asarray(rng.normal(size=(200, depth)), jnp.bfloat16)
         table = jnp.asarray(rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 106)])),
                             jnp.int32)
-        matrices = jnp.asarray(rng.normal(size=(2, 4, 128, 256)) / np.sqrt(128), jnp.bfloat16)
+        matrices = jnp.asarray(rng.normal(size=(2, 4, depth, 256)) / np.sqrt(depth), jnp.bfloat16)
         slots = jnp.asarray(rng.permutation(256), jnp.int32)
         return tokens, table, matrices, slots
 

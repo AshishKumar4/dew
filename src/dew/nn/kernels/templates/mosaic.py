@@ -881,9 +881,8 @@ class Ring:
         """A piece's copies into `slot`'s rows from `start` (`load`), each a source and its destination: the
         slot's rows as its transforms index them, where they are whole tiles of rows (`TILE_ROWS`) or the slot
         is plain; else, a row's alone (a gathered stream's, `Rows` of one row), each of its tiles' columns
-        into the slot's physical row at the slot's swizzle. TMA swizzles a row by its shared-memory address
-        (the CUDA programming guide's swizzle pointer offset: a 128-byte-aligned row swizzled as the row of
-        the pattern it lies at), so the row lands as its tile's row does."""
+        into the slot's physical row at the slot's swizzle (`row_copies`). TMA swizzles a row by its address
+        (a 128-byte-aligned row swizzled as the pattern's row it lies at), so it lands as its tile's row."""
         rows, smem = piece.shape[0], self.smem
         match smem.transforms if isinstance(smem, state_types.TransformedRef) else ():
             case (plgpu_core.UnswizzleRef() as unswizzled, plgpu_core.UntilingTransform(tiling=(tile, width)),
@@ -911,6 +910,12 @@ class Ring:
         it filled last, so no slot is freed (or reallocated) while a consumer still reads it, and every
         release is seen (`drained`)."""
         drained(self.consumed, end, self.stages)
+
+
+def row_copies(block: tuple, dtype, swizzle: int | None) -> int:
+    """A row's copies into a slot of `block` at `swizzle` (`Ring.parts`' rule), a gathered ring's arrivals a
+    row: computed apart, a 256-deep step's barrier waited for arrivals no copy made (row 4516)."""
+    return 1 if swizzle in (None, UNSWIZZLED) else block[1] // swizzle_columns(dtype, swizzle)
 
 
 def drained(barriers, end, stages: int) -> None:
