@@ -53,7 +53,7 @@ from dew.interop.generation_config import (
     return_sequences,
     source_decoding,
 )
-from dew.interop.layouts import Unwritable
+from dew.interop.layouts import CROSSING_UNWRITTEN, Unwritable
 from dew.interop.pipeline_assembly import (
     SourceTask,
     assemble_pipeline,
@@ -706,8 +706,7 @@ class Pretrained:
         from dew.nn.protocols import CrossAttending, Differential
 
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
-            raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
-                             "keeps this model")
+            raise ValueError(CROSSING_UNWRITTEN)
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
         # home as they are written.
