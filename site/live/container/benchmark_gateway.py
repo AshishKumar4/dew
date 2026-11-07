@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import pathlib
 import queue
+import re
 import statistics
 import sys
 import threading
@@ -93,6 +94,18 @@ class Silent(TimeoutError):
         self.output = output
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+"""IPython's colours in a traceback, which say nothing in a log and took most of the 4000 characters the
+preparer keeps of a failed smoke (site/live/src/preparer.ts), crowding out the exception's name."""
+
+
+def failure(content):
+    """A cell's error as a smoke's log can read it: the exception, then its traceback's last lines,
+    uncoloured."""
+    frames = ANSI.sub("", "\n".join(content.get("traceback", []))).splitlines()[-12:]
+    return f"{content.get('ename')}: {content.get('evalue')}\n" + "\n".join(frames)
+
+
 def collect(client, message, timeout=30):
     stdout = ""
     while True:
@@ -105,7 +118,7 @@ def collect(client, message, timeout=30):
         if result["msg_type"] == "stream":
             stdout += result["content"]["text"]
         if result["msg_type"] == "error":
-            raise RuntimeError(str(result["content"]))
+            raise RuntimeError(failure(result["content"]))
         if result["msg_type"] == "status" and result["content"]["execution_state"] == "idle":
             return stdout
 
