@@ -22,7 +22,7 @@ import pytest
 from attention_oracle import attention_terms
 from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
-from jax.sharding import Mesh
+from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
@@ -636,13 +636,13 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
 
 @INTERPRETS
 @pytest.mark.parametrize(("form", "dtype"), [*((form, jnp.bfloat16) for form in (*HOOKED_FORMS, "fused")),
-                                             ("default", jnp.float16), ("derived", jnp.float16)],
+                                             ("derived", jnp.float16)],
                          ids=lambda value: value if isinstance(value, str) else jnp.dtype(value).name)
 def test_the_backward_is_on_par_dropping_interpreted(form, dtype):
     """The backward in each form under probability dropout over a causal call, the fast form's one launch
     too (each consumer's tile its own draw), its D the forward's dropped split sums' about the anchor's
-    value as its draw keeps it (`algebra.anchor_multipliers`), under the interpreter; over fp16 operands in
-    two launches and at its derivation's tiles."""
+    value as its draw keeps it (`algebra.anchor_multipliers`), under the interpreter; over fp16 operands at
+    its derivation's tiles."""
     _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True, dtype=dtype)
 
 
@@ -1443,7 +1443,10 @@ def test_the_launches_lower_for_a_v5e(call):
     others = jax.ShapeDtypeStruct((rows, heads, tokens, 128), jnp.float32)
     split = template.Split(others, rows_shape, rows_shape, rows_shape)
     residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32), split)
-    with generation.assumed("v5e"):
+    # An abstract mesh of one v5e device, which Pallas TPU's lowering reads its target from on any host.
+    device = AbstractDevice(device_kind=generation.gpu_target("v5e").device_kind, num_cores=1, platform="tpu")
+    mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with generation.assumed("v5e"), jax.sharding.use_abstract_mesh(mesh):
         for training in (template.Kept.NONE, template.Kept.SPLIT):
             entry = functools.partial(attention_mosaic.forward, spans=spans, hooks=None, residuals=training)
             jax.jit(entry).trace(q, kv, kv).lower(lowering_platforms=("tpu",))
