@@ -1,0 +1,14 @@
+diff --git a/tools/flaxdiff_family_worker.py b/tools/flaxdiff_family_worker.py
+--- a/tools/flaxdiff_family_worker.py
++++ b/tools/flaxdiff_family_worker.py
+@@ -88,6 +88,10 @@ def flaxdiff(wide: bool) -> dict[str, types.ModuleType]:
+         source = local.read_text()
+         if wide:
+             source = source.replace("jnp.float32", "jnp.float64").replace("np.float32", "np.float64")
++            # Flax's forced softmax casts inside the library, outside this source copy.
++            source = source.replace(
++                "force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True",
++                "force_fp32_for_softmax=False, deterministic=True")
+             if stem == "common" and source.count(FOURIER) != 1:
+                 raise ValueError(f"common.py at {COMMIT} draws its Fourier frequencies otherwise than "
+                                  f"{FOURIER!r}")

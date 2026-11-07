@@ -12,12 +12,13 @@ import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import summed_as_run, unrewritten
 import test_flaxdiff_family_source as t
-from flaxdiff_family_worker import applying
+from flaxdiff_family_worker import applying, fourier_table
 
-case = 'unet_3d/variant'
 mode = sys.argv[1] if len(sys.argv)>1 else 'split'
+case = 'unet_3d/published' if mode == 'published' else 'unet_3d/variant'
 start = int(sys.argv[2]) if len(sys.argv)>2 else 0
 count = int(sys.argv[3]) if len(sys.argv)>3 else 8
+fourier_table(t.CASES[case][2]['emb_features'], 16)
 
 def rms(x):
     return np.sqrt(np.mean(np.square(np.asarray(x,np.float64))))
@@ -45,14 +46,14 @@ t.dew_model=original_model
 r32ctx=applying(case,'float32'); ref32=r32ctx.__enter__()
 r64ctx=applying(case,'float64'); ref64=r64ctx.__enter__()
 
-def ref(apply,inputs):
-    return apply({k.removeprefix('param.'):v for k,v in inputs.items() if k.startswith('param.')},inputs)
+def ref(apply,inputs,dtype):
+    return apply({k.removeprefix('param.'):jnp.asarray(v,dtype) for k,v in inputs.items() if k.startswith('param.')},inputs)
 
 narrow=jax.jit(lambda x: old(jnp.float32,x))
 old64=unrewritten(jax.jit(lambda x: old(jnp.float64,x)))
 new64=unrewritten(jax.jit(lambda x: wide(jnp.float64,x)))
-rn=unrewritten(jax.jit(lambda x:ref(ref32,x)))
-rw=unrewritten(jax.jit(lambda x:ref(ref64,x)))
+rn=unrewritten(jax.jit(lambda x:ref(ref32,x,jnp.float32)))
+rw=unrewritten(jax.jit(lambda x:ref(ref64,x,jnp.float64)))
 errors={}
 for seed in range(start,start+count):
     inputs=t.drawing(case)(seed)
