@@ -482,16 +482,16 @@ def test_a_delta_rules_carry_stays_finite_wherever_the_token_scan_is():
 
 def test_a_chunks_adjoint_meets_its_decay_once():
     """The gated delta rule's one-token chunk, its key and write gate unit on one key, its query and value
-    zero, its decay e^-1, entering a state of 2^120, with a cotangent of 2^20 on the state it leaves: the
-    token's correction cancels its write, so the state's cotangent through the decay is zero and so is the
-    decay's gradient, and the derived chunk's adjoint (`Derived.backward`, the token update replayed) is
-    finite, the state's two reads of the decay one decayed state whose cotangent is summed before it meets
-    the decay (row 1966's head review)."""
+    zero, its decay e^-1, entering a state of 2^120 on that key alone, with a cotangent of 2^20 on the state
+    it leaves: the token's correction cancels its write, so the state's cotangent through the decay is zero
+    on the key the state holds and so is the decay's gradient, and the derived chunk's adjoint
+    (`Derived.backward`, the token update replayed) is finite, the state's two reads of the decay one
+    decayed state whose cotangent is summed before it meets the decay (row 1966's head review)."""
     chunk = {"q": jnp.zeros((1, KEY)), "k": jnp.zeros((1, KEY)).at[0, 0].set(1.0),
              "v": jnp.zeros((1, VALUE)), "g": jnp.full((1,), -1.0), "beta": jnp.ones((1,))}
     forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
                                        state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
-    entering = jnp.full((KEY, VALUE), 2.0 ** 120)
+    entering = jnp.zeros((KEY, VALUE)).at[0].set(2.0 ** 120)
     d_state, d_operands = forms.backward(chunk, (None, entering), jnp.full((KEY, VALUE), 2.0 ** 20),
                                          jnp.zeros((1, VALUE)))
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves((d_state, d_operands)))
