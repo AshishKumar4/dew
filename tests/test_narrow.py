@@ -141,7 +141,8 @@ def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False, see
 
 
 def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
-             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None, dex=False, seed=0):
+             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None, dex=False, seed=0,
+             visited=None):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     `copies` on or off on this device's generation, on `mesh` with every
@@ -156,8 +157,9 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     many rows, whose shape the trainer plans apart. A `dex` decoder's first
     layer is a differential pair (`_decoder`). `seed` draws the batch and the
     start; a float64 process trains a float64 decoder (a check-1 truth,
-    `_on_par_with_the_plain_update`). Returns the state, each step's loss and
-    the trainer, its plan the last shape's."""
+    `_on_par_with_the_plain_update`). `visited(variables, batch)` sees each
+    step's parameters and the batch it reads before the step. Returns the
+    state, each step's loss and the trainer, its plan the last shape's."""
     from dew.batch import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
     wide = x64()
@@ -178,6 +180,8 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     losses = []
     for index, current in enumerate(trained + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded):
         step, read = steps_by[bool(long) and index % 2 == 1]
+        if visited is not None:
+            visited(state.variables, current if read is None else read)
         state, loss, *_ = step(state, current if read is None else read)
         losses.append(np.asarray(loss))
     return state, losses, trainer
@@ -196,19 +200,27 @@ def _on_par_with_the_plain_update(optimizer, label: str, **options):
         return (np.int32(seed),)
 
     def clears(inputs):
-        """Whether a mixture's start routes the seed's batch with a margin (`selection_margins.MARGIN`): a
-        top-2 flip between the arms and the float64 truth decides by rounding, which no precision bounds."""
+        """Whether a mixture's run routes every step's batch with a margin (`selection_margins.MARGIN`): its
+        training forward's routes (`routing_margin`) at the parameters each update reads, on the batch it
+        reads (ragged, padded or longer), as the decoder-remat test's primed phase checks past its start. A
+        top-2 flip between the arms and the float64 truth at any update decides by rounding, which no
+        precision bounds."""
         import selection_margins
 
         from dew.batch import TEXT_KEY
-        from dew.training import Trainer
 
         seed = int(inputs[0])
-        objective, batch = _decoder(mixture=True, rows=options.get("rows", 8), seed=seed)
-        variables = Trainer(objective, optimizer(), key=jax.random.key(seed)).initial_state().variables
+        objective, _ = _decoder(mixture=True, rows=options.get("rows", 8), seed=seed)
         routed = jax.jit(lambda tree, tokens: objective.token_scores(tree, tokens, routing=True).routing)
-        sown = jax.device_get(routed(variables, batch[TEXT_KEY]))
-        return selection_margins.routing_margin(sown, variables.get("moe", {}), 2) >= selection_margins.MARGIN
+        margins = []
+
+        def visited(variables, batch):
+            sown = jax.device_get(routed(variables, batch[TEXT_KEY]))
+            moe = jax.device_get(variables.get("moe", {}))
+            margins.append(selection_margins.routing_margin(sown, moe, 2))
+
+        _trained(optimizer(), copies=False, seed=seed, visited=visited, **options)
+        return min(margins) >= selection_margins.MARGIN
 
     if options.get("mixture"):
         import selection_margins
