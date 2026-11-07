@@ -351,16 +351,20 @@ def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows
                                                   ("logits narrowed", {"logits_cast": jnp.float16}),
                                                   ("sum narrowed", {"sum_cast": jnp.float16}),
                                                   ("attention by a root", {"root": 32 ** 0.5}),
-                                                  ("a root near sqrt(D)", {"root": 32 ** 0.5 * 1.0005})])
+                                                  ("attention by a root", {"root": 32 ** 0.5,
+                                                                           "dtype": jnp.float32}),
+                                                  ("a root near sqrt(D)", {"root": 32 ** 0.5 * 1.0005,
+                                                                           "dtype": jnp.float32})])
 def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
     """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100, scaled after its
     product or its queries divided by sqrt(D) before it (Flax's); written out with
     any step computing otherwise (a finite fill, truncated or narrowed logits, an initial maximum above the
-    logits, a row normalized by another's sum, a sum narrowed past its range, a scale near the default one
-    but not it), it stays as written, XLA's."""
+    logits, a row normalized by another's sum, a sum narrowed past its range, a divisor near sqrt(D) but not
+    it, in float32, where bfloat16 holds no value that near), it stays as written, XLA's."""
     import dew
 
-    shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), jnp.bfloat16),) * 3
+    options = dict(options)
+    shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), options.pop("dtype", jnp.bfloat16)),) * 3
     with generation.assumed("sm90"):
         routes = _attention_routes(lambda: dew.jit(written_out(**options)).trace(*shapes))
     assert bool(routes) == (variant in ("attention", "attention by a root")), routes
