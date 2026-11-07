@@ -14,6 +14,8 @@ one process (`gpu_flow`), each cell its own file's property:
   (test_gemm_tcgen05).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
   H100 and an A100 (test_contracts_gemm).
+- A grouped product whose producer gathers its rows from the tokens by a table (cp.async, row 1376) holds
+  check 1 on an H100, plain and paired (test_gemm_gather).
 - The template's grouped product of 16-bit operands sums into fp32 as exactly as XLA's at depths 128 and
   512, its sums promoted a step at a time (test_grouped_gemm; row 4331).
 - The toolkit's warpgroup scan walks a linear recurrence forward and reversed, each position's state or
@@ -42,6 +44,7 @@ import nvfp4_matrix
 import pytest
 import test_contracts_gemm as contracts_gemm
 import test_gemm_blockwise as gemm_blockwise
+import test_gemm_gather as gemm_gather
 import test_gemm_tcgen05 as gemm_tcgen05
 import test_gemm_template as gemm_template
 import test_grouped_gemm as grouped_gemm
@@ -134,6 +137,9 @@ def test_the_gemm_kernels_run_on_this_gpu():
              grouped_gemm.the_template_takes_a_gpt_oss_width_as_exactly_as_xla),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90"),
+        *(Cell(f"a gathered grouped product is on par{': paired' if paired else ''}",
+               functools.partial(gemm_gather.a_gathered_product_is_on_par, paired=paired), "sm90")
+          for paired in (False, True)),
         *(Cell(f"CUTLASS runs a mapped projection as exactly as XLA where chosen: "
                f"{'shared' if shared else 'mapped'} matrices",
                functools.partial(grouped_gemm.cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen,

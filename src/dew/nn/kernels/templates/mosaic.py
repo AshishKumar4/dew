@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 import jax
 from jax import lax, numpy as jnp
-from jax._src.lib.mlir.dialects import gpu as mgpu_gpu, llvm as mgpu_llvm, nvvm as mgpu_nvvm
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
@@ -35,8 +34,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
-from jax.extend.mlir import ir as mgpu_ir
-from jax.extend.mlir.dialects import arith as mgpu_arith, memref as mgpu_memref
 
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import product, report, resources
@@ -865,7 +862,7 @@ class Ring:
         (the CUDA programming guide's swizzle pointer offset: a 128-byte-aligned row swizzled as the row of
         the pattern it lies at), so the row lands as its tile's row does."""
         rows = piece.shape[0]
-        match getattr(self.smem, "transforms", ()):
+        match self.smem.transforms if isinstance(self.smem, state_types.TransformedRef) else ():
             case (plgpu_core.UnswizzleRef() as unswizzled, plgpu_core.UntilingTransform(tiling=(tile, width)),
                   ) if rows % tile:
                 physical = state_types.TransformedRef(self.smem.ref, (unswizzled,))
@@ -904,126 +901,6 @@ def drained(barriers, end, stages: int) -> None:
         turn = Turn.of(end - back, stages)
         pl.when(turn.counter >= 0)(lambda turn=turn: plgpu.barrier_wait(barriers.at[opaque(turn.slot)],
                                                                        parity=turn.parity))
-
-
-@dataclasses.dataclass(frozen=True)
-class GatheredRing(Ring):
-    """A `Ring` of rows each read where a table says (a gathered stream: `Rows` of one row a run, a mixture
-    of experts' tokens in their own order, row 1376), loaded by the producer warpgroup's cp.async copies:
-    each thread copies its 16-byte pieces of the slot's rows from the rows the table names
-    (`_gathered_copies`), and the slot's load barrier, an mbarrier of shared memory (`gathered_ring`:
-    Pallas's barriers take no lane-level arrival), tracks them; the consumers wait on it (`acquire`) and
-    release the slot as any ring's. TMA lands a copy in whole tiles of rows, a row alone only by copies
-    Mosaic's layout inference refuses, and from one thread a row a copy (about 5k clocks a step against 1k
-    of products); CUTLASS's sm90 gather is the producer warps' cp.async too."""
-
-    def initialized(self) -> None:
-        stages = self.stages
-        plgpu.inline_mgpu(arg_types=(plgpu.RefType(),))(
-            lambda ctx, barriers: _barriers_initialized(barriers, stages))(self.full)
-
-    def viewed(self, view: tuple, step):
-        ref, index_map = view
-        return ref, index_map(step)
-
-    def load(self, turn: Turn, view) -> None:
-        slot = opaque(turn.slot)
-        pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
-            self.consumed.at[slot], parity=turn.freed))
-        tokens, rows = view
-        height, width = self.block
-        [depth] = rows.rest
-        source = tokens.at[:, pl.ds(depth * width, width)]
-        swizzle = swizzle_transforms(tokens.dtype, SWIZZLE_BYTES)
-        refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(swizzle), plgpu.RefType())
-        plgpu.inline_mgpu(arg_types=refs)(lambda ctx, *refs: _gathered_copies(*refs, swizzle=SWIZZLE_BYTES))(
-                source, rows.table.at[pl.ds(rows.start, height)], self.smem.at[slot],
-                self.full.at[pl.ds(slot, 1)])
-
-    def acquire(self, turn: Turn):
-        slot = opaque(turn.slot)
-        plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.Layout.WG_SPLAT(())))(
-            lambda ctx, barrier, parity: _barrier(barrier).wait_parity(_splat_value(parity)))(
-                self.full.at[pl.ds(slot, 1)], jnp.asarray(turn.parity, jnp.int32))
-        return self.smem.at[slot]
-
-
-def _barrier(memref) -> mgpu_utils.BarrierRef:
-    """The mbarrier at a one-entry shared memref of `uint64` (`GatheredRing`'s), as Mosaic GPU's lane-level
-    barrier: its arrivals and parity waits, no phases tracked."""
-    i32 = mgpu_ir.IntegerType.get_signless(32)
-    return mgpu_utils.BarrierRef(mgpu_utils.memref_ptr(memref), mgpu_utils.c(0, i32), None, 1)
-
-
-def _splat_value(array):
-    """A splat scalar's value (a `WG_SPLAT` argument of `inline_mgpu`)."""
-    [value] = array.registers.flat
-    return value
-
-
-def _barriers_initialized(barriers, stages: int) -> None:
-    """Each of `stages` mbarriers of `barriers` (shared `uint64`) initialized to one arrival, by one thread of
-    the block, the block meeting after so none is waited on or arrived at first."""
-    i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
-    base = mgpu_utils.memref_ptr(barriers)
-    predicate = mgpu_utils.single_thread_predicate(scope=mgpu_utils.ThreadSubset.BLOCK)
-    for stage in range(stages):
-        mgpu_nvvm.mbarrier_init(mgpu_utils.getelementptr(base, [stage], i64), mgpu_utils.c(1, i32),
-                                predicate=predicate)
-    mgpu_gpu.barrier()
-
-
-def _gathered_copies(source, rows, slot, barrier, *, swizzle: int) -> None:
-    """The producer warpgroup's cp.async copies of the slot's rows (`GatheredRing.load`): row `r` of `slot`
-    (`[height, width]`, 8-row tiles at `swizzle` bytes) row `rows[r]` of `source` (`[tokens, width]`, the
-    step's columns of the tokens), each thread its 16-byte pieces in the tiled copy's layout
-    (`tiled_copy_smem_gmem_layout`, as Mosaic GPU's own cp.async copy of a tile places them), then the
-    copies tracked at `barrier` and the warpgroup's one arrival there once every thread has issued its own."""
-    i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
-    index = mgpu_ir.IndexType.get()
-    element = mgpu_ir.MemRefType(source.type).element_type
-    bits = mgpu_utils.bitwidth(element)
-    shape = tuple(mgpu_ir.MemRefType(slot.type).shape)
-    height, width = shape[0] * shape[2], shape[1] * shape[3]
-    layout = mgpu_fragments.tiled_copy_smem_gmem_layout(shape[0], shape[1], swizzle, bits)
-    [row_stride, column_stride], _ = mgpu_ir.MemRefType(source.type).get_strides_and_offset()
-    rank = 2
-
-    def thread_part(strides):
-        tiled = [mgpu_arith.constant(i32, stride) for stride in layout.tiling.tile_strides(strides)[rank:]]
-        return mgpu_arith.addi(mgpu_utils.dyn_dot(layout.lane_indices(), tiled),
-                               mgpu_utils.dyn_dot(layout.warp_indices(), tiled))
-
-    thread_row, thread_column = thread_part((1, 0)), thread_part((0, 1))
-    base = mgpu_llvm.addrspacecast(mgpu_llvm.PointerType.get(address_space=1),
-                                   mgpu_utils.memref_ptr(source))
-    gep = mgpu_ir.IntegerType.get_signless(8) if bits == 8 else element
-    width_bytes = layout.vector_length * bits // 8
-    for _, _, base_index, smem_ptr in mgpu_fragments.FragmentedArray.transfer_tiled(
-            slot, swizzle, layout, (height, width), optimized=False):
-        row_constant, column_constant = base_index()
-        row = mgpu_arith.addi(thread_row, mgpu_arith.constant(i32, row_constant))
-        token = mgpu_arith.extsi(i64, mgpu_memref.load(rows, [mgpu_arith.index_cast(index, row)]))
-        column = mgpu_arith.extui(i64, mgpu_arith.addi(thread_column,
-                                                       mgpu_arith.constant(i32, column_constant)))
-        offset = mgpu_arith.addi(mgpu_arith.muli(token, mgpu_utils.c(row_stride, i64)),
-                                 mgpu_arith.muli(column, mgpu_utils.c(column_stride, i64)))
-        mgpu_nvvm.cp_async_shared_global(smem_ptr, mgpu_utils.getelementptr(base, [offset], gep), width_bytes,
-                                         mgpu_nvvm.LoadCacheModifierKind.CG)
-    tracked = _barrier(barrier)
-    # cp.async.mbarrier.arrive is no arrival: it holds the phase open until this thread's copies land.
-    mgpu_nvvm.cp_async_mbarrier_arrive(tracked.get_ptr())
-    mgpu_utils.warpgroup_barrier()
-    tracked.arrive(predicate=mgpu_utils.single_thread_predicate(mgpu_utils.ThreadSubset.WARPGROUP))
-
-
-def gathered_ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
-    """A `GatheredRing`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, their rows
-    staged at the widest swizzle, a load mbarrier each in shared memory (`uint64`, `GatheredRing.initialized`)
-    and a release barrier each that `consumers` arrive at."""
-    return {'smem': staged((stages, *block), dtype, SWIZZLE_BYTES),
-            'full': plgpu.SMEM((stages,), jnp.uint64),
-            'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
 
 
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False,
@@ -1768,7 +1645,7 @@ class Transport[Allocated, Opened](abc.ABC):
 
     gathers_rows: bool = False
     """Whether its producer warpgroup gathers a step's rows from a table (a gathered stream's `Rows` of one
-    row: `GatheredRing`, its threads' cp.async copies; a ring family's); where not (mma.sync's pipeline, no
+    row: `gathered.Ring`, its threads' cp.async copies; a ring family's); where not (mma.sync's pipeline, no
     producer of its own), a gathered call is not its launch's."""
 
     copies_vectors: bool = True
@@ -2256,15 +2133,19 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()) -> dict:
-        return {name: gathered_ring(shape, dtype, stages, consumers=consumers) if name in gathered
+        from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `Ring`
+
+        return {name: gathered_rows.ring(shape, dtype, stages, consumers=consumers) if name in gathered
                 else ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
                           swizzle=(swizzles or {}).get(name), copies=(copies or {}).get(name, 1))
                 for name, (shape, dtype) in blocks.items()}
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:
+        from dew.nn.kernels.templates import gathered  # it builds on `Ring`
+
         del views
-        # A gathered stream's load barriers are shared memory of its own (`gathered_ring`).
-        return {name: (Ring if isinstance(scoped['full'].dtype, plgpu_core.BarrierType) else GatheredRing)(
+        # A gathered stream's load barriers are shared memory of its own (`gathered.ring`).
+        return {name: (Ring if isinstance(scoped['full'].dtype, plgpu_core.BarrierType) else gathered.Ring)(
                     **scoped) for name, scoped in allocated.items()}
 
     def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:

@@ -692,3 +692,40 @@ def test_the_tuners_group_sizes_route_every_row(groups):
              jax.ShapeDtypeStruct((groups, 64, 64), jnp.bfloat16), jax.ShapeDtypeStruct((groups,), jnp.int32)]
     sizes = np.asarray(grouped_matmul.MosaicGmm().operands(specs, 0)[2])
     assert sizes.sum() == 300 and (sizes >= 0).all() and (groups == 1 or sizes[0] == 0), sizes
+
+
+def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order():
+    """`gemm.gemm`'s `gather` (row 1376) on a CPU (XLA's program): the projection of `tokens[gather]`, its
+    value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a token
+    no slot reads zero) bitwise the projection of the rows gathered first, plain and paired; a gathered
+    dense or stacked call is refused."""
+    from dew.nn.kernels import gemm
+
+    rng = np.random.default_rng(3)
+    tokens = jnp.asarray(rng.normal(size=(40, 64)), jnp.float32)
+    table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
+    matrices = jnp.asarray(rng.normal(size=(2, 3, 64, 32)) / 8, jnp.float32)
+    sizes = jnp.asarray([20, 0, 44], jnp.int32)
+
+    def fused(tokens, first, second):
+        return gemm.gemm(tokens, first, sizes, out_dtype=jnp.float32, out_dtypes=(jnp.float32,) * 2,
+                         paired=second, gather=table)
+
+    def apart(tokens, first, second):
+        return gemm.gemm(tokens[table], first, sizes, out_dtype=jnp.float32, out_dtypes=(jnp.float32,) * 2,
+                         paired=second)
+
+    operands = (tokens, matrices[0], matrices[1])
+    tangents = tuple(jnp.asarray(rng.normal(size=operand.shape), jnp.float32) for operand in operands)
+    cotangent = tuple(jnp.asarray(rng.normal(size=(72, 32)), jnp.float32) for _ in range(2))
+    for check in (lambda f: f(*operands), lambda f: jax.jvp(f, operands, tangents),
+                  lambda f: jax.vjp(f, *operands)[1](cotangent)):
+        jax.tree.map(np.testing.assert_array_equal, check(fused), check(apart))
+    unread = np.setdiff1d(np.arange(40), np.asarray(table))
+    assert np.all(np.asarray(jax.vjp(fused, *operands)[1](cotangent)[0])[unread] == 0)
+    for refused in ({"group_sizes": None}, {"layer": jnp.asarray(0, jnp.int32)}):
+        with pytest.raises(ValueError):
+            arguments = {"group_sizes": sizes, **refused}
+            stack = matrices if "layer" in refused else matrices[0]
+            gemm.gemm(tokens, stack, arguments.pop("group_sizes"), out_dtype=jnp.float32, gather=table,
+                      **arguments)
