@@ -343,6 +343,9 @@ class CommittedRing(mosaic.Ring):
         plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)])
 
 
+BLOCK_SCALED_COLUMNS = 128
+"""The columns of one block-scale tile's rows (`SCALE_TILE`): a block-scaled product's tile is whole 128s."""
+
 SCALE_TILE = (32, 16)
 """A block-scale stream's tile (`Tcgen05Rings.streams`): a block-scaled product's scales (an MX product's
 E8M0, an NVFP4 one's E4M3), tiled in shared memory as `tcgen05.scales_layout` lays them out, `[rows / 128,
@@ -549,6 +552,11 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     turns = 2
     """The accumulator turns a launch's tensor memory holds: an epilogue reads one while the products fill
     the other."""
+
+    def column_unit(self, dtype) -> int:
+        # A packed 4-bit operand's swizzled row spans 256 of them along its depth (K-major, as tcgen05 reads
+        # E2M1), not along a tile's columns: the columns step by the 128 its block scales' tiles take.
+        return min(super().column_unit(dtype), BLOCK_SCALED_COLUMNS)
 
     def tensor_columns(self, columns: int, accumulators: int) -> int:
         # Each turn holds every accumulator of a tile (`persist`).
