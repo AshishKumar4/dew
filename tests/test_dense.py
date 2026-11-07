@@ -207,7 +207,9 @@ def test_a_bias_gradient_is_as_exact_however_its_positions_are_split(site):
     """A bias's gradient sums its cotangents over every position, and is as exact with the batch
     split over eight devices as on one: check 1 over the site's seeds, truth the cotangents' float64
     sum. A CPU sums each shard's in float64 and their total before it rounds (`precision.spread`);
-    a plain sum of each device's shard was 5.7 times as far from float64 (ledger 833)."""
+    a plain sum of each device's shard was 5.7 times as far from float64 (ledger 833). Under check 1's
+    stated fp32 sums each arm's is a product's fp32 sum, whatever XLA's CPU fusions sum a reduction by
+    (row 4520)."""
     layer, shape, seeds = SPLIT[site]
     variables = layer.init(jax.random.key(0), jnp.zeros(shape, jnp.float32))
     out = jax.eval_shape(layer.apply, variables, jnp.zeros(shape, jnp.float32)).shape
