@@ -402,7 +402,7 @@ def tree_windows(tree: tuple[int, ...], width: int, valid: jax.Array) -> jax.Arr
     call's conv skips a token it does not hold without advancing its history (`held_conv1d`)."""
     paths = tree_paths(tree, width)
     held = jnp.concatenate([jnp.ones((valid.shape[0], width), bool), valid], axis=1)
-    real = ((paths >= 0) & held[:, np.maximum(paths, 0)]).at[..., -1].set(values=True)
+    real = (jnp.asarray(paths >= 0) & held[:, np.maximum(paths, 0)]).at[..., -1].set(values=True)
     # The token itself counts 1, its nearest real predecessor 2, and so on back from the path's end.
     behind = jnp.cumsum(real[..., ::-1], axis=-1)[..., ::-1]
     picked = jnp.stack([jnp.argmax(real & (behind == width + 1 - place), axis=-1)
