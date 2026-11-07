@@ -99,10 +99,10 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post64,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post65,<0.12.1`.
 <!-- END JAX requirement -->
 
-It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post64's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
+It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, post45's, which post46's to post65's Python fixes left as it was, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
 
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502)), so two checkouts share one compiled kernel. JAX is removing its Pallas Triton backend and takes no change to it, so this fix stays in the build while Dew runs Pallas Triton.
 - The device-to-host transfer guard holds on a CPU array's first implicit host read (`float`, `item`, `np.asarray`, its buffer), as on the copy an accelerator array's first read caches.
@@ -155,6 +155,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A `checkify` check whose error reaches a `shard_map` manual over some of a mesh's axes traces its errors under the body's manual axes and partitions them over those axes alone; such a check failed on a context-mesh mismatch or the manual axes' order, so a sampling loop under `checkify` can run an expert exchange.
 - A `custom_jvp` whose primal makes and frees its own refs (a kernel's in-place outputs) discharges them inside a `jit`, rebound on its discharged primal with its custom JVP kept; a `custom_jvp` taking a ref argument stays refused. A grouped paged-KV decode's in-place kernel holds such refs.
 - Pallas Mosaic GPU keeps each kernel it lowers under a key of all the lowering reads, with `jax_pallas_lowering_cache_dir` set, and another process reads it back: a 400-op kernel lowers in 43 to 46 s and reads back in about 1 s. The key is the installed code's identity (every file of jax, jaxlib and the CUDA plugins, as their wheels' RECORDs list them) and the lowering's inputs; an installation not as its RECORD says, or a value the key cannot hold exactly (a user's own layout class), lowers afresh. Dew keeps it beside its compilation cache.
+- A host callback (`io_callback`, `pure_callback`) returns its results at the precision its program was lowered with, not the one the thread running it holds: a float64 callback compiled under `jax.enable_x64` and run on another thread kept float64, where it was narrowed to float32 and refused its own dtype.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 

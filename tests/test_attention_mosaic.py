@@ -482,9 +482,10 @@ def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call):
     """An fp16 call's backward in the fast form's one launch (row 3886): its weights and score cotangents as
     two fp16 parts at each walk's running scale (`algebra.running_parts`), dV's and dK's accumulators taken
     to the new scale as it grows and back at the end, each tile's dQ by its own; every gradient the
-    reference's (check 1), under the interpreter. (A dropping fp16 call takes no Mosaic walk at all: its
-    dropping walk takes bf16 operands.)"""
-    _check_backward(call, SHAPES["interpreted"], form="fused", interpret=True, dtype=jnp.float16)
+    reference's (check 1), under the interpreter, heads 64 wide, where one launch's registers hold fp16's
+    parts (at 128 the derivation takes the two launches). (A dropping fp16 call takes no Mosaic walk at
+    all: its dropping walk takes bf16 operands.)"""
+    _check_backward(call, SHAPES["interpreted"], form="fused", interpret=True, dtype=jnp.float16, width=64)
 
 
 @COMPILES_ON_CPU
