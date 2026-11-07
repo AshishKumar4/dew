@@ -20,8 +20,9 @@ from flax import linen as nn
 from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
+from dew.batch import CONSUMED_COUNT, VALID_ROWS, ConsumedCount
 from dew.data.chat import ROLES_KEY, Role
-from dew.data.dataset import Loader
+from dew.data.dataset import Loader, rows_of, take_batch
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
@@ -377,6 +378,28 @@ def test_host_row_counts_add_to_objectives_total_without_padding():
     assert counted["text"] is batch["text"]
     with pytest.raises(ValueError):
         prepare_counts(objective, counted, count_model=True)
+
+
+def test_a_batchs_repeats_count_no_tokens_and_no_model_work():
+    """A batch filled with repeats of its rows (`VALID_ROWS`, as a short last batch and a ramp's steps past a
+    read's end are) counts the tokens and the model work of its real rows alone, a batch of repeats alone
+    none: the work the run does for its signal (row 4811's review: a ramp's all-repeat steps counted their
+    rows' model work into the run's FLOPs)."""
+    objective = LMObjective(decoder(), seq_len=6, pad_id=0)
+    batch = packed_batch()
+    rows = rows_of(batch)
+    real = np.arange(rows) < 1
+    # A host count the examples clock adds before the work is counted (`consumption_counted`) stays whole.
+    held = {**batch, VALID_ROWS: real, CONSUMED_COUNT: ConsumedCount(1)}
+    counted = prepare_counts(objective, held, count_model=True)
+    assert counted[CONSUMED_COUNT] == ConsumedCount(1)
+    alone = prepare_counts(objective, take_batch(batch, np.flatnonzero(real)), count_model=True)
+    assert counted[TRAINING_FLOPS].sum() == alone[TRAINING_FLOPS].sum() > 0
+    assert not np.any(counted[TRAINING_FLOPS][~real])
+    np.testing.assert_array_equal(_TokenCount.host(_TokenCount.sum(jnp.asarray(counted[TOKENS]))),
+                                  _TokenCount.host(_TokenCount.sum(jnp.asarray(alone[TOKENS]))))
+    repeats = prepare_counts(objective, {**batch, VALID_ROWS: np.zeros(rows, bool)}, count_model=True)
+    assert not np.any(repeats[TRAINING_FLOPS]) and not np.any(repeats[TOKENS])
 
 
 def packed_windows(questions: int = 2) -> dict[str, np.ndarray]:
