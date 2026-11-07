@@ -684,11 +684,11 @@ def _tile_at(index, grid: tuple, grid_names: tuple) -> dict:
 
 def _product_widths(blocks: dict, staging: tuple) -> tuple[int, ...]:
     """Each width a launch's products may take: a row or column count of a tile it streams or stages (a
-    product's right operand, as it is or transposed), or the chunk's, one a tensor instruction issues (16
-    to 256 columns, whole 16s)."""
+    product's right operand, as it is or transposed), the chunk's or a sub-chunk's (`algebra.SUB`, the
+    factored pairs' diagonal blocks), one a tensor instruction issues (16 to 256 columns, whole 16s)."""
     shapes = [shape for shape, _ in blocks.values()]
     shapes += [leaf.shape for leaf in jax.tree.leaves(staging) if hasattr(leaf, "shape")]
-    found = {CHUNK, *(extent for shape in shapes if len(shape) >= 2 for extent in shape[-2:])}
+    found = {CHUNK, algebra.SUB, *(extent for shape in shapes if len(shape) >= 2 for extent in shape[-2:])}
     return tuple(sorted(width for width in found if 16 <= width <= 256 and width % 16 == 0))
 
 
