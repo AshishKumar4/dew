@@ -1751,6 +1751,15 @@ def role_tiles(staging, landing: dict, walkers: int):
     return of
 
 
+def _write_staging(call: Call, bv: int) -> tuple:
+    """A walk's staged right operands of its memory's prediction ('corrected': a key slice of the memory
+    `[block, bv]`) and of its write ('write': the gated values `[C, bv]`, or the gated keys `[C, block]`
+    where the gate takes the keys' side, which no prediction reads): one tile where they are one shape."""
+    if call.gated_keys:
+        return staging_tiles(call.held, (call.chunk, call.block))
+    return staging_tiles(call.held, *dict.fromkeys(((call.block, bv), (call.chunk, bv))))
+
+
 def final_memory_landing(call: Call, bv: int) -> tuple[dict, tuple]:
     """`sequence_walk`'s final memory's landing, a key slice `[block, bv]` fp32: `(landing, after)`, the
     launch's own tile (`landing['final']`) where its family's walks share its scope, else one the walk
@@ -1902,7 +1911,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
 
         def step(role):
             (staged, scratch), lands = roled(role)
-            issue = Issuer(call, {"corrected": staged, "write": staged})
+            issue = Issuer(call, {"corrected": staged[0], "write": staged[-1]})
             column = walked + role * bv
             return functools.partial(_states_step, lands, issue, scratch, column, role)
 
@@ -1980,8 +1989,7 @@ def _states_launch(call: Call, tiles: Tiles, delta: bool, keys: Operand, values:
                            values=((chunk, walked_width), values))
     initials = stream_blocks(**{f"initial{i}": ((call.block, walked_width), initial)
                                 for i in range(width // call.block)})
-    staging = (*staging_tiles(held, (chunk, call.block) if call.gated_keys else (call.block, bv)),
-               column_sums_scratch(call))
+    staging = (_write_staging(call, bv), column_sums_scratch(call))
     final_landing, after = final_memory_landing(call, bv)
     landing = {**memory_landing(call, bv),
                **({"corrected": held.landing(chunk, bv)} if stores_corrected else {}), **final_landing}
@@ -2071,8 +2079,8 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
 
         def step(role):
             (staged, scratch, scored, entered, local, *applied), lands = roled(role)
-            issue = Issuer(call, {"corrected": staged, "write": staged, "memory": entered, "local": local,
-                                  **({"apply_u": applied[0]} if applied else {})})
+            issue = Issuer(call, {"corrected": staged[0], "write": staged[-1], "memory": entered,
+                                  "local": local, **({"apply_u": applied[0]} if applied else {})})
             return functools.partial(_scan_step, lands, issue, scratch, scored, walked + role * bv, role)
 
         def _scan_step(lands, issue, scratch, scored, column, role, n, slots, state, accumulators, loaded):
@@ -2162,8 +2170,7 @@ def _scan_launched(call: Call, tiles: Tiles, out_dtype, *, steps: float, rows: i
                            values=((chunk, walked_width), keys))
     initials = stream_blocks(**{f"initial{i}": ((call.block, walked_width), initial)
                                 for i in range(width // call.block)})
-    staging = (*staging_tiles(held, (chunk, call.block) if call.gated_keys else (call.block, bv)),
-               column_sums_scratch(call), *staging_tiles(held, (chunk, chunk)),
+    staging = (_write_staging(call, bv), column_sums_scratch(call), *staging_tiles(held, (chunk, chunk)),
                *staging_tiles(call.memories, (call.block, bv)), *staging_tiles(held, (chunk, bv)),
                # The delta rule's corrected values' operand for the inverse's product.
                *(staging_tiles(held, (chunk, bv)) if delta else ()))
