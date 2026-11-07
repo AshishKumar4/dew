@@ -219,22 +219,23 @@ def held_by_stage(sites: Sequence[DecoderBank]) -> Iterator[None]:
 def stacked_layers(path: tuple) -> tuple[tuple[tuple, ...], int] | None:
     """The paths of the stored layers a leaf at `path` stacks, in its rows' order, and how many of
     its leading dimensions stack them, where `path` is a stage-local run's under the sites in
-    context (`held_by_stage`): a parameter's, or a mirror's of one (an optimizer's moment, an
+    context (`held_by_stage`), a pipeline's or one stage's scan's, a periodic run's by position
+    (`StackView.staged_layers`): a parameter's, or a mirror's of one (an optimizer's moment, an
     average), whose path ends in the parameter's. None for any other leaf, whose rule reads it as
     it is."""
     for index, entry in enumerate(path[:-1]):
         if not (isinstance(entry, jax.tree_util.DictKey) and entry.key == 'stages'):
             continue
         before = tuple(key.key for key in path[:index] if isinstance(key, jax.tree_util.DictKey))
-        inside = path[index + 1]
+        inside = tuple(key.key for key in path[index + 1:-1] if isinstance(key, jax.tree_util.DictKey))
         for site in _STAGE_SITES.get():
-            held = site.view.run_layers(inside.key) if isinstance(inside, jax.tree_util.DictKey) else None
+            held = site.view.staged_layers(inside)
             if held is None or before[len(before) - len(site.namespace):] != site.namespace:
                 continue
-            layers, count = held
-            paths = tuple((*path[:index], jax.tree_util.DictKey(layer), *path[index + 2:])
+            layers, stacked, named = held
+            paths = tuple((*path[:index], jax.tree_util.DictKey(layer), *path[index + 1 + named:])
                           for layer in layers)
-            return paths, len(site.view.stacked_shape(count))
+            return paths, stacked
     return None
 
 

@@ -395,7 +395,7 @@ class SourceOptions:
     `trains` the paper's recipe unless "all"; None for none."""
     scan_layers: bool = False
     """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
-    (`Pretrained.load`'s `scan_layers`): a decode step's program grows with the period, not the depth."""
+    (`Pretrained.load`'s `scan_layers`): a step's program grows with the period, not the depth."""
     param_dtype: str | None = None
     """The dtype the source's parameters are stored in, its checkpoint's own as 'auto'; None stores a
     source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
@@ -1353,6 +1353,16 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     return held
 
 
+def _without(record: JSON, names: tuple[str, ...]) -> JSON:
+    """`record` without a field of `names` wherever it nests one: a wrapper's language model's, a decision
+    run's backbone's among them."""
+    if isinstance(record, Mapping):
+        return {key: _without(value, names) for key, value in record.items() if key not in names}
+    if isinstance(record, list):
+        return [_without(value, names) for value in record]
+    return record
+
+
 def _holds(config: "RunConfig", path: str) -> bool:
     """Whether `config` holds every record along the dotted `path` up to its field: false past an optional
     record it holds none of (a teacher of None)."""
@@ -1435,6 +1445,11 @@ class RunConfig:
     and scores, and, in a kind of run that adds them, how it previews. Every other field says what
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
+
+    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers",)
+    """The model and source fields, by name, that say how a model's layers execute and not what they
+    compute or store: a decoder's runs under one scan or a layer at a time hold the same layers on disk
+    (`layers_N`) and compute the same step, so a run resumes under either (`check_resume`)."""
 
     BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
@@ -1664,8 +1679,11 @@ class RunConfig:
 
     def built_fresh(self) -> None:
         """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
-        `Pretrained.load` builds of a source (`source_keywords`) reaches nothing such a run builds."""
-        if self.source != SourceOptions():
+        `Pretrained.load` builds of a source (`source_keywords`) reaches nothing such a run builds. How
+        its layers execute (`EXECUTED`), which a saved run records whatever its source, is no such word."""
+        unsourced = SourceOptions()
+        executed = {name: getattr(unsourced, name) for name in self.EXECUTED if hasattr(unsourced, name)}
+        if dataclasses.replace(self.source, **executed) != unsourced:
             raise ValueError(f"--source says what a run builds of the source it loads, and this "
                              f"{type(self).__name__} loads none: its model is built from --model, whose "
                              "own fields say it; or start the run from a source")
@@ -1690,7 +1708,8 @@ class RunConfig:
         if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        before, now = recorded._fields_record(), self._fields_record()
+        before, now = (_without(record, self.EXECUTED)
+                       for record in (recorded._fields_record(), self._fields_record()))
         # A field the saved run left to its build and its record holds unresolved, which no checkpoint
         # states either (`earlier_option_writing`), is the one this build resolves (`BUILT`).
         unresolved = {path for path in self.BUILT if "." not in path and before.get(path) is None}

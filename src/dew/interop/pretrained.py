@@ -1994,8 +1994,9 @@ def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | N
                                    placed: Callable[[Variables], Variables], scan: bool = False) -> Loaded:
     """`loaded` with DEX attached where a load names it (`Pretrained.with_dex`), drawn from key 0, its
     parameters placed as the load places the source's (`placed`), before the load's residency; and its
-    decoder, or a wrapper's language model, scanning its runs where `scan` says (`Scanning`), a field of
-    how the model runs, its stored tree unchanged, as its stack reads the layers through its view."""
+    decoder, or a wrapper's language model, scanning its runs or not as `scan` says (`Scanning`), a
+    field of how the model runs, its stored tree unchanged, as its stack reads the layers through its
+    view."""
     from dew.nn.protocols import Scanning
 
     extended = loaded if dex is None else loaded.with_dex(dex, key=0).map_variables(placed)

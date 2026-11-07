@@ -451,8 +451,9 @@ class CausalTransformer(LinearProducts):
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
     scan_layers: bool = False
-    """Runs of like layers under flax's scan; a decode step over resident weights scans a period's repeats as
-    one body too (`scan_groups(periodic=True)`), so its program grows with the period, not the depth."""
+    """Runs of like layers under flax's scan, and a step over resident weights, training's or a decode
+    step's, a period's repeats as one body too (`scan_groups(periodic=True)`), so its program grows with
+    the period, not the depth; a stage-local state on one stage holds each run as the scan reads it."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
@@ -682,9 +683,13 @@ class CausalTransformer(LinearProducts):
     def stored_view(self, store: Variables) -> StackView:
         """How `store` holds this decoder's layer stack (`bank_sites`), as a decoder bound to its shapes
         plans its runs (`SteppedFeedForward`)."""
-        bound = self if self.scope is not None else self.bind(jax.tree.map(
-            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
-        return StackView(bound.groups)
+        if self.scope is not None:
+            return StackView(self.groups)
+        # Through the model's own `apply`, which an adapted model runs under its interceptor, so its runs
+        # split where its adapter's targets do (`scanned_like`).
+        return StackView(self.apply(jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store),
+            method=lambda module: module.groups))
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
         """Resolve every kind the pattern names, plus the kinds of the prediction depths and the drafter.
@@ -844,7 +849,8 @@ class CausalTransformer(LinearProducts):
         self.specs = specs
         # What one scanned body shares: the layers' spec and how their variables are stored.
         structures = StackView.layer_structures(self.variables, self.num_layers)
-        self.scan_keys = tuple(zip(specs, structures, strict=True))
+        self.scan_keys = tuple(self.scanned_like(index, key)
+                               for index, key in enumerate(zip(specs, structures, strict=True)))
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
         self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
@@ -1013,10 +1019,18 @@ class CausalTransformer(LinearProducts):
                                      self._dex_start(index), spec.routed)
         return (spec.kind.mixer or self.layer_mixer).build(context)(parent=None)
 
+    def scanned_like(self, index: int, key: Hashable) -> Hashable:
+        """What layer `index`, of spec and stored structure `key`, runs and draws as under a scan (its entry
+        of `scan_keys`), so like layers run as one scanned run (`groups`, `run_period`). A method interceptor
+        that gives a layer parameters of its own (an adapter's factors and scales, `dew.lora`) keys it apart
+        where they differ, so a run of layers adapted alike stacks one factor pair, and a layer adapted
+        otherwise runs a run of its own."""
+        del index
+        return key
+
     def drawn_like(self, index: int) -> Hashable:
-        """What layer `index` draws as: its scan key and what its extension starts from (`_dex_start`), so
-        like layers draw under one scan. A method interceptor that gives a layer parameters of its own (an
-        adapter's factors, `dew.lora`) keys it apart where they differ."""
+        """What layer `index` draws as: its scan key (`scanned_like`) and what its extension starts from
+        (`_dex_start`), so like layers draw under one scan."""
         return (self.scan_keys[index], self._dex_start(index))
 
     @nn.nowrap
@@ -1709,8 +1723,6 @@ class CausalTransformer(LinearProducts):
             x = x.astype(at_least_fp32(x.dtype))
         stages = pipeline_stages()
         first, end = (0, self.num_layers) if span is None else span
-        spanned = tuple((first + start, count) for start, count in scan_groups(self.scan_keys[first:end],
-                                                                               self.bank_layers))
         # A seeded initialization (PTQ's abstract annotation pass) reads the
         # supplied layout; the scan's init=True pass would draw over it first.
         if (self.is_initializing() and stages == 1 and not decode
@@ -1732,7 +1744,8 @@ class CausalTransformer(LinearProducts):
                 tuple((index, 1) for index in range(first, end)), x,
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
-        banked = self.banked_collections()
+        staged = stored_by_stage(self.variables)
+        banked = () if staged else self.banked_collections()
         allocating = not any(group_layers(name) for name in self.variables.get('cache', {}))
         if decode and 'params' in banked and allocating:
             # A decode over a store banked by run keeps the cache its layers allocate banked as the store
@@ -1742,19 +1755,18 @@ class CausalTransformer(LinearProducts):
             # layers of 64 rows of 512 slots on an H100, 371 and 317 us a step, OM-1342-cache-base-2474a6e4c).
             # A cache handed in a layer at a time goes back so.
             banked = (*banked, 'cache')
-        if stages == 1:
+        if stages == 1 and staged:
+            if span is not None:
+                raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a stage-local "
+                                    f"state holds whole runs; {list(staged)} arrived stacked")
+            # A stage-local state on one stage holds each run as the scan reads it (`stage_view`).
+            view, split = (dataclasses.replace(self.stage_view(1), staged=staged),
+                           StageSplit(0, self.num_layers, 0))
+        elif stages == 1:
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
-            groups = self.groups if span is None else spanned
-            # A decode step over resident weights scans by period; weights a step reads a layer at
-            # a time (banked, streamed from disk or in host memory) keep the runs their banks hold,
-            # and a layer that leaves what a later one reads (`_provides`) runs alone.
-            if decode and not (banked or self._provides or 'streaming' in self.variables
-                               or on_host(self.variables.get('params', {}))):
-                keys = self.scan_keys[first:end]
-                groups = tuple((first + start, count) for start, count in scan_groups(keys, periodic=True))
-            periods = tuple(run_period(self.scan_keys, start, count) for start, count in groups)
+            groups, periods = self._one_stage_runs(first, end, banked=bool(banked))
             view, split = (StackView(groups, banked=banked, periods=periods),
                            StageSplit(0, self.num_layers, 0))
         else:
@@ -1811,9 +1823,26 @@ class CausalTransformer(LinearProducts):
             staged=stored_by_stage(self.variables), batch_axis=batch_axis)
         return view, split_stages(self.specs, stages)
 
+    def _one_stage_runs(self, first: int, end: int, *, banked: bool = False
+                        ) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
+        """The runs layers [first, end) scan in on one stage and their periods (`run_period`): by period over
+        resident weights; the runs a store's banks hold where a step reads a layer at a time (banked,
+        streamed, on the host), and like runs where a layer leaves what a later one reads (`_provides`)."""
+        groups = self.groups if (first, end) == (0, self.num_layers) else tuple(
+            (first + start, count)
+            for start, count in scan_groups(self.scan_keys[first:end], self.bank_layers))
+        if self.scan_layers and not (banked or self._provides or 'streaming' in self.variables
+                                     or on_host(self.variables.get('params', {}))):
+            groups = tuple((first + start, count)
+                           for start, count in scan_groups(self.scan_keys[first:end], periodic=True))
+        return groups, tuple(run_period(self.scan_keys, start, count) for start, count in groups)
+
     def stage_view(self, stages: int) -> StackView:
         """How a pipeline over `stages` stacks the run of layers they repeat (`split_stages`): each
-        stage's runs as its scan takes them, from the store's rows (`scan_keys`)."""
+        stage's runs as its scan takes them, from the store's rows (`scan_keys`); one stage's its scan's."""
+        if stages == 1:
+            groups, periods = self._one_stage_runs(0, self.num_layers)
+            return StackView(groups, periods=periods)
         split = split_stages(self.specs, stages)
         start, count = split.prefix, split.per_stage
         groups = (scan_groups(self.scan_keys[start:start + count], self.bank_layers) if self.scan_layers
@@ -1821,14 +1850,17 @@ class CausalTransformer(LinearProducts):
         return StackView(groups, stages=stages, offset=start)
 
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
-        """Where the run a pipeline over `stages` stacks is stored in `store`, the variables a
-        stage-local state is made from (`stage_view`): none for a looped stack, which no pipeline
-        runs."""
+        """Where the run a pipeline over `stages` (or one stage's scan) stacks is stored in `store`, the
+        variables a stage-local state is made from (`stage_view`): none for a looped stack, nor on one
+        stage where no scan stacks a run (a stack that does not scan, or whose runs are one layer each)."""
         if self.loop is not None:
             return ()
         bound = self if self.scope is not None else self.bind(jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
-        return (DecoderBank((), bound.stage_view(stages)),)
+        view = bound.stage_view(stages)
+        if stages == 1 and not (self.scan_layers and any(count > 1 for _, count in view.groups)):
+            return ()
+        return (DecoderBank((), view),)
 
     def banked_collections(self) -> tuple[str, ...]:
         """Return the collections whose layer subtrees the store holds as banks.
@@ -1878,8 +1910,8 @@ class CausalTransformer(LinearProducts):
         These are layer 0's variables, a bank's first row with the layer axis
         dropped, or layer 0's variables completed by the bank's
         (`banked_collections`), or a stage-local store's first stage's first
-        row of the run that holds layer 0 (`StackView.stage_form`). Nothing is
-        read, fetched or sliced.
+        row of the run that holds layer 0 (`StackView.stage_form`), on one
+        stage too. Nothing is read, fetched or sliced.
         """
         banked = self.banked_collections()
         first = StackView(self.groups).bank_names()[0]
@@ -1906,11 +1938,16 @@ class CausalTransformer(LinearProducts):
                 held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
             for name, run in tree.get('stages', {}).items():
                 layers = group_layers(name)
-                if layers is not None and layers.start == 0 and 'layers_0' not in tree:
-                    # The stage axis, and a scanned run's own layer axis.
+                # A run that holds layer 0: a one-stage run its first group stacks, beside the leaves its
+                # stage-local state keeps on layer 0 itself (a frozen base joined in), or a pipeline's run
+                # where no layer 0 runs before it.
+                if layers is not None and layers.start == 0 and (stacked or 'layers_0' not in tree):
+                    # The stage axis, a run's own layer axis; a periodic run's layer 0 at its first position.
                     rows = 1 + (len(layers) > 1)
-                    held = jax.tree.map(
-                        lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), run)
+                    if run_period(self.scan_keys, 0, len(layers)) > 1:
+                        run, rows = run['layers_0'], 2
+                    held = merge(held, jax.tree.map(
+                        lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), run))
             if held:
                 variables[collection] = held
         return variables
@@ -2180,9 +2217,10 @@ class CausalTransformer(LinearProducts):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def with_scanned_layers(self) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
-        return self.clone(scan_layers=True)
+    def with_scanned_layers(self, scanned: bool = True) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`), or a layer at a
+        time where not `scanned`."""
+        return self.clone(scan_layers=scanned)
 
     @nn.nowrap
     def reads_progress(self) -> bool:
