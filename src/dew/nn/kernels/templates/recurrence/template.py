@@ -260,8 +260,9 @@ def walk_roles(family: mosaic.Family) -> int:
     (`Family.warpgroups`), each its own value blocks, else one, where a family without one runs its
     consumers over one pipeline together, whose scoped allocations the walks do not make collective
     (mma.sync's two consumers, d1a42595a22, failed to lower the walks on an A100: test_lowering and the
-    compile gate red at base 14e38ca857)."""
-    return family.consumers if family.warpgroups(1) > 1 else 1
+    compile gate red at base 14e38ca857); at most two, a third (wgmma's attention forward's) unmeasured on a
+    walk."""
+    return min(family.consumers, 2) if family.warpgroups(1) > 1 else 1
 
 
 @dataclasses.dataclass(frozen=True)
