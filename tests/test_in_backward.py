@@ -2,9 +2,13 @@
 4796): the same step as the one that takes the whole gradient first, without holding it."""
 
 import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
 import pytest
+from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, widened
 from token_support import token_rows
 
 from dew.distributed.batches import shard_batch
@@ -19,11 +23,6 @@ VOCAB, SEQ, BATCH = 128, 8, 8
 
 TINY_SHARD = 1
 """The smallest leaf the layout shards, so the tiny decoder's are."""
-
-STEP_SEEDS = 16
-"""Check 1's declared seeds for a scanned step against a layer-at-a-time one, sized by `seeds_for` on
-armada."""
-
 
 def decoder(*, scan: bool, dtype: str = "float32", num_layers: int = 3):
     fields = {**TINY_DECODER, "vocab_size": VOCAB, "max_seq_len": SEQ, "num_layers": num_layers}
@@ -41,29 +40,76 @@ def trainer(model, optimizer: OptimConfig, *, key: int = 0) -> Trainer:
 ADAMW = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1)
 
 
-def stepped(run: Trainer):
-    """`run`'s first step over a batch drawn at a seed: its weights and moments on their stored layers."""
-    state, _, _ = run.place()
+RUN_SEEDS = 16
+"""Check 1's declared seeds for a run updating in its backward against the whole step's update, sized by
+`seeds_for` on armada."""
 
-    def step(seed):
-        batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1, seed=seed))
-        moved = run.stored(run.compile(state, batch)(state, batch)[0])
-        return moved.variables["params"], moved.opt_state
-    return step
+
+def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
+    """A scanned run of three layers that updates in its backward (`dew.nn.in_backward.scanned_run`) under
+    adamw, each layer's update the optimizer's on the layer alone, moves each layer's weights as adamw's
+    update of the whole tree a layer at a time moves them, on par with it (check 1): two programs, the scanned
+    one never holding the run's gradient whole, a layer below reading the layer above as its forward did."""
+    from dew.nn import in_backward
+
+    scanned = decoder(scan=True)
+    plain, wide = scanned.clone(scan_layers=False), scanned.clone(scan_layers=False, dtype=jnp.float64)
+    ids = jnp.zeros((2, SEQ), jnp.int32)
+    # Stored a layer at a time, as both stacks read them: the scan stacks its run as it reads it.
+    layered = nn.unbox(scanned.init(jax.random.key(0), ids))["params"]
+    layers = [f"layers_{index}" for index in range(3)]
+    solver = optax.adamw(1e-2, weight_decay=0.1)
+
+    def update(path, index, gradient, weights, moments):
+        state = (optax.ScaleByAdamState(count=jnp.zeros((), jnp.int32), mu=moments["mu"], nu=moments["nu"]),
+                 optax.EmptyState(), optax.EmptyState())
+        moved, after = solver.update(gradient, state, weights)
+        return optax.apply_updates(weights, moved), {"mu": after[0].mu, "nu": after[0].nu}
+
+    def loss(model, params, extra, tokens):
+        return jnp.mean(model.apply({"params": params, **extra}, tokens, train=True).astype(jnp.float32) ** 2)
+
+    def in_backward_step(tokens):
+        zeros = jax.tree.map(jnp.zeros_like, layered)
+        norms = {name: {"sumsq": jnp.zeros(()), "nonfinite": jnp.zeros(())} for name in layers}
+        extra = {"mu": zeros, "nu": zeros, in_backward.NORMS: norms}
+        with in_backward.planned(in_backward.InBackward(update=update, moments=("mu", "nu"))):
+            moved = jax.grad(lambda params: loss(scanned, params, extra, tokens))(layered)
+        return [moved[name] for name in layers]
+
+    def whole_step(model, params):
+        def step(tokens):
+            gradient = jax.grad(lambda params: loss(model, params, {}, tokens))(params)
+            moved = optax.apply_updates(params, solver.update(gradient, solver.init(params), params)[0])
+            return [moved[name] for name in layers]
+        return step
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), (2, SEQ), 0, VOCAB),)
+
+    assert_as_exact(jax.jit(in_backward_step), jax.jit(whole_step(plain, layered)), draw,
+                    "a run updating in its backward", seeds=RUN_SEEDS,
+                    truth_fn=jax.jit(whole_step(wide, widened(layered))))
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_scanned_step_updates_each_layer_in_its_backward_as_a_layer_at_a_time_would():
+def test_a_scanned_steps_runs_update_in_their_backward_and_train():
     """A one-stage step over a decoder that scans its layers, under an update that reads each gradient
-    alone (adamw), updates its runs in their backward (`Transaction.planned`) and moves its weights and
-    moments as the same step a layer at a time does, on par with it (check 1): two programs, the scanned
-    one never holding the run's gradient whole. Three layers, so a layer's update below reads the layer
-    above as its forward did, before the backward wrote it."""
-    def draw(seed):
-        return (seed,)
-
-    assert_as_exact(stepped(trainer(decoder(scan=True), ADAMW)), stepped(trainer(decoder(scan=False), ADAMW)),
-                    draw, "a scanned step updating in its backward", seeds=STEP_SEEDS)
+    alone (adamw), updates its runs in their backward (`Transaction.planned`): it moves their weights and
+    moments, advances the optimizer's count once, and its loss falls."""
+    run = trainer(decoder(scan=True), ADAMW)
+    state, _, _ = run.place()
+    batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
+    step = run.compile(state, batch)
+    losses, moved = [], state
+    for _ in range(3):
+        moved, loss, *_ = step(moved, batch)
+        losses.append(float(loss))
+    assert losses[-1] < losses[0], losses
+    before, after = (jax.device_get(held.variables["params"]["stages"]) for held in (state, moved))
+    pairs = zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True)
+    assert all(not np.array_equal(old, new) for old, new in pairs)
+    assert int(jax.device_get(moved.updates)) == 3
 
 
 @pytest.mark.parametrize("generation, dtype", [("sm90", "float32"), ("sm80", "bfloat16")])

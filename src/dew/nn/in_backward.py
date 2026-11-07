@@ -193,9 +193,14 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
         count = jax.tree.leaves(weights)[0].shape[0]
         shared_leaves = jax.tree.leaves(shared)
 
+        # The tree the update moves, written in place as the walk goes: the weights, or the masters where the
+        # step keeps narrow copies, which the layers below read as the forward did (the step casts its new
+        # masters to them again as it commits); the copies are read, not carried.
+        narrow = masters is not None
+
         def body(carry, index):
-            dx, weights, masters, moments, sumsq, nonfinite = carry
-            weights_i = _sliced(weights, index)
+            dx, moving, moments, sumsq, nonfinite = carry
+            weights_i = _sliced(weights if narrow else moving, index)
             given = {"weights": jax.tree.leaves(weights_i), "shared": shared_leaves,
                      "x": jax.tree.leaves(_sliced(inputs, index)),
                      "per_layer": jax.tree.leaves(_sliced(per_layer, index))}
@@ -203,7 +208,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             back = jax.tree_util.tree_unflatten(treedef, [given[slot[0]][slot[1]] if slot is not None
                                                           else next(stored) for slot in slots])
             gradient, dx = back(dx)
-            held = weights_i if masters is None else _sliced(masters, index)
+            held = _sliced(moving, index)
             held_moments = {name: _sliced(tree, index) for name, tree in moments.items()}
             moved, moved_moments = current.update(path, index, gradient, held, held_moments)
             leaves = jax.tree.leaves(gradient)
@@ -213,25 +218,21 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
                 moved = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old), moved, held)
                 moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),
                                              moved_moments, held_moments)
-            # A layer below reads its own weights alone, so the narrow copies a step keeps stay as the
-            # forward read them; the step casts its new masters to them again as it commits.
-            if masters is None:
-                weights = _written(weights, moved, index)
-            else:
-                masters = _written(masters, moved, index)
+            moving = _written(moving, moved, index)
             moments = {name: _written(tree, moved_moments[name], index) for name, tree in moments.items()}
             sumsq = sumsq.at[index].set(squares)
             nonfinite = nonfinite.at[index].set(bad)
-            return (dx, weights, masters, moments, sumsq, nonfinite), None
+            return (dx, moving, moments, sumsq, nonfinite), None
 
-        start = (cotangent, weights, masters, moments, jnp.zeros((count,), jnp.float32),
+        start = (cotangent, masters if narrow else weights, moments, jnp.zeros((count,), jnp.float32),
                  jnp.zeros((count,), jnp.float32))
-        (dx, weights, masters, moments, sumsq, nonfinite), _ = jax.lax.scan(body, start, jnp.arange(count),
-                                                                            reverse=True)
+        (dx, moved, moments, sumsq, nonfinite), _ = jax.lax.scan(body, start, jnp.arange(count), reverse=True)
         written_norms = {"sumsq": sumsq.astype(norms["sumsq"].dtype),
                          "nonfinite": nonfinite.astype(norms["nonfinite"].dtype)}
-        return (weights, masters, moments, written_norms, dx, jax.tree.map(_zeros_like_input, per_layer),
-                jax.tree.map(_zeros_like_input, shared))
+        # The copies' cotangent is nothing the step reads (`Transaction.split_planned` takes the masters').
+        weights_out = jax.tree.map(jnp.zeros_like, weights) if narrow else moved
+        return (weights_out, moved if narrow else None, moments, written_norms, dx,
+                jax.tree.map(_zeros_like_input, per_layer), jax.tree.map(_zeros_like_input, shared))
 
     run.defvjp(run_forward, run_backward)
     return run(weights, masters, dict(moments), norms, x, per_layer,

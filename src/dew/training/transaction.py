@@ -343,14 +343,16 @@ def _at(tree, path: tuple[str, ...]):
 
 
 def _stage_runs(params: Variables, path: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
-    """The paths of the runs a one-stage scanned state holds stacked (`dew.training.stages`): each under a
-    `stages` subtree whose leaves lead with a stage axis of one."""
+    """The paths of the runs a one-stage scanned state holds stacked whole (`dew.training.stages`): each
+    under a `stages` subtree whose leaves lead with a stage axis of one; a run of a repeated period, held by
+    position of its period (`layers_0`, ...), updates as before."""
     found = []
     for name, child in params.items():
         if not isinstance(child, Mapping):
             continue
         if name == "stages" and all(np.shape(leaf)[:1] == (1,) for leaf in jax.tree.leaves(child)):
-            found += [(*path, name, run) for run in child]
+            found += [(*path, name, run) for run, layers in child.items()
+                      if not all(str(key).startswith("layers_") for key in layers)]
         else:
             found += _stage_runs(child, (*path, name))
     return found
