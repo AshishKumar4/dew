@@ -759,7 +759,45 @@ def a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
     case = {"causal": True}
     draw = drawing(length, length, dtype, sinks=False, heads=2, kv_heads=1, rows=1)
     assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
-                    f"template route causal {length} {jnp.dtype(dtype).name}", seeds=SEEDS)
+                    f"template route causal {length} {jnp.dtype(dtype).name}", seeds=SEEDS,
+                    truth_fn=_causal_truth(length))
+
+
+TRUTH_ROWS = 1024
+"""The queries a long call's float64 truth attends a block at a time (`_causal_truth`)."""
+
+
+def _causal_truth(length: int):
+    """The float64 truth of a causal call of `length` tokens (check 1's `truth_fn`): the reference path's
+    attention of `TRUTH_ROWS` queries at a time over every key, masked as causal, each block's output and
+    query gradient its own and the keys' and values' gradients the blocks' sum. The whole call's truth held
+    `length` squared logits a head in float64, 3 GiB at 8192, more than a GPU tier job's pool of an A100
+    (2.69 GiB, MAINGPU-a9e29b08f); a block's are an eighth of them."""
+    keys = jnp.arange(length)
+
+    def truth(query, key, value, sinks, dout):
+        del sinks
+
+        def block(first):
+            seen = (first + jnp.arange(TRUTH_ROWS))[:, None] >= keys[None, :]
+
+            def call(query, key, value):
+                return scaled_dot_product_attention(query, key, value, implementation="reference",
+                                                    mask=seen[None, None])
+
+            row_query, row_dout = (jax.lax.dynamic_slice_in_dim(array, first, TRUTH_ROWS, axis=1)
+                                   for array in (query, dout))
+            out, pull = jax.vjp(call, row_query, key, value)
+            return (out, *pull(row_dout))
+
+        out, d_query, d_key, d_value = jax.lax.map(block, jnp.arange(0, length, TRUTH_ROWS))
+
+        def whole(blocks):
+            return jnp.moveaxis(blocks, 0, 1).reshape(query.shape)
+
+        return whole(out), whole(d_query), d_key.sum(0), d_value.sum(0), None
+
+    return truth
 
 
 def test_the_accurate_form_is_one_option_away():
