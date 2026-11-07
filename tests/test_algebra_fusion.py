@@ -425,19 +425,16 @@ def gated_product_of(a, b):
 
 def _norms_written(fn, *shapes):
     """`fn` with each RMSNorm and SwiGLU the compile point takes on an H100 written as Dew's norm
-    (`norm_regions`), decided under the H100 and written on this host, whose norms run their portable
+    (`recognize.recognized`), decided under the H100 and written on this host, whose norms run their portable
     arithmetic: what the compile point's rewrite computes, run here."""
     from jax.extend.core import jaxpr_as_fun
 
-    from dew.algebra import fusion, norm_regions
+    from dew.algebra import fusion, recognize
 
     closed = jax.make_jaxpr(fn)(*shapes)
     with generation.assumed("sm90"):
-        found = [region for region in norm_regions.regions(fusion.Index(closed.jaxpr))
-                 if norm_regions.taken(region)]
-    written = [fusion.Written(region.places, region.operands, region.outputs, region.places[-1],
-                              norm_regions.written(region)) for region in found]
-    return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(found)
+        written = recognize.recognized(closed.jaxpr, fusion.Index(closed.jaxpr))
+    return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(written)
 
 
 def residual_rms(x, branch, w):
