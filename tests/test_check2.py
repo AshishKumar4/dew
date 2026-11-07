@@ -756,7 +756,8 @@ def test_the_recurrence_step_witness_holds_a_packed_call(begins):
     import jax.numpy as jnp
 
     operands = rw.draw(0, "mild")
-    starts = jnp.zeros((1, operands[0].shape[1]), bool).at[0, int(begins * rw.CHUNK)].set(True)
+    chunk = rw.recorded(*operands, carried=False).chunk
+    starts = jnp.zeros((1, operands[0].shape[1]), bool).at[0, int(begins * chunk)].set(True)
     run = rw.recorded(*operands, starts=starts, max_segments=2)
     held = rw.witness(run, rw.interpreted_lane())
     for name in rw.RECORDS:

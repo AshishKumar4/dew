@@ -26,8 +26,31 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn import derivatives
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, bundles, mosaic, report, resources
+from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
+
+
+def chunks(family: mosaic.Family, target: generation.GpuTarget) -> tuple[int, ...]:
+    """The tokens a chunk a call's tiles may take on `family`'s bundle on `target`, widest first
+    (`Mosaic.derived`'s first rule): a consumer role's rows (`Family.role_rows`), doubled while a chunk's fp32
+    square, the inverse and the scores every launch holds or stages, fits the device's block
+    (`generation.shared_budget`)."""
+    found, chunk = [], family.role_rows
+    while chunk * chunk * jnp.dtype(jnp.float32).itemsize <= generation.shared_budget(target):
+        found.append(chunk)
+        chunk *= 2
+    return tuple(reversed(found))
+
+
+def launch_seconds(launch: mainloop.Launch, target: generation.GpuTarget) -> float:
+    """A planned launch's seconds by the work-span model (`cost.walked`): a program's tensor FLOPs,
+    exponentials and steps on one multiprocessor, as many waves as the device's multiprocessors hold its
+    programs in (`Launch.resident`), or its device bytes at the memory's rate where longer."""
+    waves = -(-launch.programs // max(1, (target.multiprocessors or 1) * launch.resident))
+    program = cost.walked(cost.Work(flops=launch.flops, exponentials=launch.exponentials, span=launch.steps),
+                          target)
+    memory = launch.device_bytes / target.memory_rate if target.memory_rate else 0.0
+    return max(waves * program, memory)
 
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
@@ -51,7 +74,7 @@ def _dtype(ba: tokamax.BoundArguments) -> jnp.dtype:
 def bundle(target: generation.GpuTarget, dtype=jnp.bfloat16) -> mosaic.Family | None:
     """The mainloop's bundle for `target`'s instruction family and a call of `dtype` (`bundles.of`), None
     where none claims it."""
-    return bundles.of(target.generation, mainloop.bundle_dtype(dtype))
+    return bundles.of(target.generation, mainloop.bundle_dtype(dtype), scoped=True)
 
 
 
@@ -354,6 +377,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
         (docs/design/kernel-templates.md §7; no candidate space, no ranking: each rule gives way from the
         widest value block to the next narrower where it does not hold), each rule naming the fact it reads:
+        - chunk, of those the bundle offers (`chunks`) at which the rules below find tiles and, where any
+          chunk's do, the fast backward holds, the one whose launches the cost model prices least
+          (`launch_seconds`; `Tiles.chunk`): a wider chunk's quadratic work against a narrower one's
+          walks of more chunks;
         - value block, in steps of the narrowest a staged operand block takes (`Family.narrowest_columns`)
           dividing the padded values: the widest legal (`legal`: every launch's shared memory within a block
           of the device and its registers within a thread's, `registers`), then the widest at which the
@@ -391,12 +418,31 @@ class Mosaic(base.Template[mainloop.Tiles]):
         tiles the spilling kernels ran at down to their next narrower value block: the training call's where
         they are the fast backward's alone, else both, a forward launch running at the training call's tiles
         and, where they differ, at the forward's (`Tiles.forward`)."""
+        family = bundle(target, _dtype(ba))
+        if family is None:
+            return None
+        found = [tiles for chunk in chunks(family, target)
+                 if (tiles := self._chunked(ba, target, chunk)) is not None]
+        trained = [tiles for tiles in found if self._backward_holds(ba, tiles, target)] or found
+        return min(trained, key=lambda tiles: self._seconds(ba, tiles, target), default=None)
+
+    def _seconds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+                 ) -> float:
+        """The call's launches' seconds at `tiles` (`launch_seconds`), its fast backward's with them where it
+        takes one at them."""
+        backward = self._backward_holds(ba, tiles, target)
+        return sum(launch_seconds(launch, target) for launch in self._launches(ba, tiles, target,
+                                                                                 backward=backward))
+
+    def _chunked(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int
+                 ) -> mainloop.Tiles | None:
+        """`derived`'s tiles at `chunk`, past the value blocks a compile refused."""
         refused: dict[bool, set[int]] = {True: set(), False: set()}
         while True:
-            trained = self._derive(ba, target, training=True, refused=refused[True])
+            trained = self._derive(ba, target, chunk, training=True, refused=refused[True])
             if trained is None:
                 return None
-            alone = self._derive(ba, target, training=False, refused=refused[False])
+            alone = self._derive(ba, target, chunk, training=False, refused=refused[False])
             family = bundle(target, _dtype(ba))
             # A forward alone pads its values narrower than a training call does (`_widths`): its own tiles.
             narrower = family is not None and (_widths(ba, family, training=False)[1]
@@ -414,10 +460,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
             if alone is not None and any(kernel.startswith(name) for kernel in spilled for name in forward):
                 refused[False].add(alone.block_v)
 
-    def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, *, training: bool,
-                refused: Set[int] = frozenset()) -> mainloop.Tiles | None:
-        """`derived`'s rules, the fast backward's with them where `training`, past the value blocks a compile
-        `refused`."""
+    def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int, *,
+                training: bool, refused: Set[int] = frozenset()) -> mainloop.Tiles | None:
+        """`derived`'s rules at `chunk`, the fast backward's with them where `training`, past the value blocks
+        a compile `refused`."""
         family = bundle(target, _dtype(ba))
         if family is None:
             return None
@@ -427,7 +473,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         # backward holds where it holds at any narrower, then the narrowest still running the states
         # launch in one wave.
         staged = functools.cache(lambda index: None if blocks[index] in refused
-                                 else self._staged(ba, blocks[index], target, training=training))
+                                 else self._staged(ba, blocks[index], target, chunk, training=training))
         start = next((index for index in range(len(blocks)) if staged(index) is not None), None)
         if start is None:
             return None
@@ -500,7 +546,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         for walkers in range(min(walk_roles(family), waves), 1, -1):
             if blocks % walkers:
                 continue
-            grouped = self._staged(ba, tiles.block_v, target, walkers=walkers,
+            grouped = self._staged(ba, tiles.block_v, target, tiles.chunk, walkers=walkers,
                                    wide=tiles.block_o or tiles.block_v, training=training)
             if grouped is not None and (not training or self._backward_holds(ba, grouped, target)
                                         == self._backward_holds(ba, tiles, target)):
@@ -558,18 +604,19 @@ class Mosaic(base.Template[mainloop.Tiles]):
         unit = family.narrowest_columns(jnp.bfloat16)
         return [block for block in range(columns - columns % unit, 0, -unit) if columns % block == 0]
 
-    def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget, *,
-                walkers: int = 1, wide: int | None = None, training: bool = False) -> mainloop.Tiles | None:
-        """`block`'s tiles at `walkers` walk roles (`Tiles.walkers`) with the widest output block legal beside
-        it (`Tiles.block_o`; `wide` where given), at the ring of the states launch's steps, within the
-        GPU's block (`generation.shared_budget`) over a step's bytes, whose plan hides the most latency,
-        its programs a multiprocessor running at once (`_running`) and its depth one choice
+    def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget, chunk: int, *,
+                walkers: int = 1, wide: int | None = None, training: bool = False
+                ) -> mainloop.Tiles | None:
+        """`block`'s tiles at `chunk` and `walkers` walk roles (`Tiles.walkers`) with the widest output block
+        legal beside it (`Tiles.block_o`; `wide` where given), at the ring of the states launch's steps,
+        within the GPU's block (`generation.shared_budget`) over a step's bytes, whose plan hides the most
+        latency, its programs a multiprocessor running at once (`_running`) and its depth one choice
         (`resources.hidden`); None where no output block is legal beside it."""
         family = bundle(target, _dtype(ba))
         assert family is not None
         widths = self._blocks(ba, family, training=training) if wide is None else [wide]
         shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if width == block else width,
-                                                              walkers)
+                                                              walkers, chunk=chunk)
                                                for width in widths)
                            if self.legal(ba, tiles, target)), None)
         if shallowest is None:
@@ -608,7 +655,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None
         blocks = self._blocks(ba, family)
         at = blocks.index(config.block_v)
-        beside = [self._staged(ba, blocks[index], target) for index in (at - 1, at + 1)
+        beside = [self._staged(ba, blocks[index], target, config.chunk) for index in (at - 1, at + 1)
                   if 0 <= index < len(blocks)]
         other = dataclasses.replace(config, stages=config.stages - 1 if config.stages > 1 else 2)
         return [tiles for tiles in (*beside, other) if tiles is not None]
