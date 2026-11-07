@@ -13,6 +13,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import hashlib
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
@@ -161,6 +162,31 @@ class JitArguments(TypedDict, total=False):
 
 
 _PROGRAMS: weakref.WeakSet[OuterProgram] = weakref.WeakSet()
+
+type Taken = Mapping[str, Callable[[], jax.stages.Compiled]]
+"""Executables compiled ahead (`dew.training.ahead`), each loaded on demand, by the digest of the program it
+runs (`program_digest`)."""
+
+_TAKEN: contextvars.ContextVar[Taken | None] = contextvars.ContextVar("dew_taken_programs", default=None)
+
+
+def program_digest(lowered: jax.stages.Lowered) -> str:
+    """A program as `lowered` holds it, its text's digest: two lowerings of one program agree, whichever
+    devices of one target they were lowered over."""
+    return hashlib.sha256(lowered.as_text().encode()).hexdigest()
+
+
+@contextlib.contextmanager
+def taking(programs: Taken) -> Iterator[None]:
+    """Within the block, a program compiled through Dew's compile point (`OuterProgram.compiled`) whose
+    lowering is one of `programs` (`program_digest`) runs that executable, compiled ahead, in place of
+    compiling it: a run handed its start's programs (`dew.training.ahead.AheadOfTime.starts`) compiles
+    none of them on its devices."""
+    token = _TAKEN.set({**(_TAKEN.get() or {}), **programs})
+    try:
+        yield
+    finally:
+        _TAKEN.reset(token)
 """Every program alive (`OuterProgram`), whose executables `release` drops."""
 
 
@@ -304,7 +330,11 @@ class OuterProgram:
             lowered = self._traced(fresh, args, kwargs).lower()
             relowered.append(fresh)
             return lowered
-        executable = report.compiled(self.lower(*args, **kwargs), relower=relower)
+        lowered = self.lower(*args, **kwargs)
+        # A program compiled ahead for this target runs as it was compiled (`taking`).
+        if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
+            return ahead()
+        executable = report.compiled(lowered, relower=relower)
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
             self.jitted = relowered[-1]

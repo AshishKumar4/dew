@@ -616,8 +616,9 @@ def test_a_decision_runs_step_compiled_ahead_is_the_program_its_run_lowers_as_fi
     from run_kinds import decision
 
     from dew.decision.config import DecisionRunConfig
+    from dew.nn.kernels.options import program_digest
     from dew.training._lowering import Lowered
-    from dew.training.ahead import AheadOfTime, CompiledAhead, program_of
+    from dew.training.ahead import AheadOfTime, CompiledAhead
 
     path = tmp_path / "ahead.dew-aot"
     stated = ["--trainer.checkpoint-dir", str(tmp_path / "runs"), *CLOCKED]
@@ -631,7 +632,7 @@ def test_a_decision_runs_step_compiled_ahead_is_the_program_its_run_lowers_as_fi
                                      default=decision(tmp_path, drawn=False))
     with pytest.raises(Lowered) as lowered:
         lowering.run()
-    assert program_of(lowered.value.lowered) == AheadOfTime.load(path).program
+    assert program_digest(lowered.value.lowered) == AheadOfTime.load(path).program
 
 
 def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other(tmp_path):

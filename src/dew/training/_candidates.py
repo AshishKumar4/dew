@@ -71,7 +71,7 @@ def candidate_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Tra
     part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
     # The batch as shapes with the placement it is read under, whoever lowers it: a lowering over the host
     # arrays a step compiled ahead reads (`first_step_batch`) and one over the placed arrays a run steps
-    # are two texts of one program (`dew.training.ahead.program_of`), the types of a helper call's
+    # are two texts of one program (`dew.nn.kernels.options.program_digest`), the types of a helper call's
     # arguments, their shardings among them, telling its functions apart in the module.
     given = placed_shapes(batch, placement)
     lower = Routed(functools.partial(

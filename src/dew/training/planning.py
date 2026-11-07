@@ -37,13 +37,13 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import compiler_options, program
+from dew.nn.kernels.options import compiler_options, program, program_digest
 from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.instrumentation import compiled_memory
 from dew.telemetry.profile import Profiler, active_profile
-from dew.training.ahead import handed, program_of
+from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
 from dew.training.memory import (
@@ -173,7 +173,7 @@ class Relowered:
 
 class SampledStep(NamedTuple):
     """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
-    from (`dew.training.ahead.program_of`) and its executable."""
+    from (`dew.nn.kernels.options.program_digest`) and its executable."""
 
     program: str
     executable: jax.stages.Compiled
@@ -1021,7 +1021,7 @@ class FitSearch[LossT, EffectsT]:
                                            first=None if beside is None else firsts[1])
             if len(lowered) > 1:
                 self.footprints.clear()
-            self.sampled = None if compiled is None else SampledStep(program_of(lowered[-1]), compiled)
+            self.sampled = None if compiled is None else SampledStep(program_digest(lowered[-1]), compiled)
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)

@@ -38,7 +38,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
-import hashlib
 import importlib.metadata
 import json
 import logging
@@ -71,7 +70,7 @@ from dew.nn.kernels.generation import (
     routes,
     tpu,
 )
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import owned_program, program_digest
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
@@ -184,21 +183,22 @@ class Executable:
 @dataclasses.dataclass(frozen=True)
 class AheadProgram:
     """A program compiled ahead beside a step (`AheadOfTime.sampled`): its executable (`Executable`) and the
-    program it was compiled from (`program_of`), which a run that takes it lowers too (`taken`)."""
+    program it was compiled from (`program_digest`), which a run that takes it lowers too (`taken`)."""
 
     program: str
     executable: Executable
 
     @staticmethod
     def of(program: str, compiled: jax.stages.Compiled) -> AheadProgram:
-        """`compiled`, the executable `program` (`program_of`) compiled to, as a program compiled ahead."""
+        """`compiled`, the executable `program` (`program_digest`) compiled to, as a program compiled
+        ahead."""
         return AheadProgram(program, Executable.of(compiled))
 
     def taken(self, lowered: jax.stages.Lowered, devices: list) -> jax.stages.Compiled:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered`: refused
         where that is another program than this one, and admitted as a compiled one is
         (`dew.communicators.admit`)."""
-        if program_of(lowered) != self.program:
+        if program_digest(lowered) != self.program:
             raise ValueError("the sampled step compiled ahead is another program than the one this run "
                              "compiles: compile it ahead from this run's config, with its inspection")
         return self.executable.loaded(devices)
@@ -208,7 +208,7 @@ class AheadProgram:
 class AheadOfTime:
     """A training step compiled for `devices` devices of `generation` (`compile_ahead`), compile-only
     GPUs of a CUDA generation or a TPU topology's of its chip ('v5e'): the executable,
-    serialized, the program it was compiled from (`program`, `program_of`), and what it costs.
+    serialized, the program it was compiled from (`program`, `program_digest`), and what it costs.
     `flops` are its matmuls' and convolutions' on one device, read off its optimized program as a
     run's are (`dew.telemetry.instrumentation.step_flops`, which
     counts the cuBLAS and cuDNN calls XLA's own cost analysis cannot see into), None where it runs a
@@ -220,7 +220,7 @@ class AheadOfTime:
     devices: int
     mesh: dict[str, int]
     program: str
-    """The step's program as it lowered (`program_of`), which a run that loads it lowers too (`taken`)."""
+    """The step's program as it lowered (`program_digest`), which a run that loads it lowers too (`taken`)."""
     executable: Executable
     flops: StepFlops | None
     argument_bytes: int
@@ -333,7 +333,7 @@ class AheadOfTime:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
         that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
         that differs, which the executable would not run as the run's step."""
-        if program_of(lowered) != self.program:
+        if program_digest(lowered) != self.program:
             raise ValueError("the step compiled ahead is another program than the one this run compiles "
                              "first: compile it ahead from this run's config and data "
                              "(--trainer.compile-ahead), with this Dew, and no plan recorded for another "
@@ -570,11 +570,6 @@ def handed(ahead: AheadOfTime | None) -> Iterator[None]:
         yield
 
 
-def program_of(lowered: jax.stages.Lowered) -> str:
-    """A step's program as `lowered` holds it, its text's digest: two lowerings of one step agree."""
-    return hashlib.sha256(lowered.as_text().encode()).hexdigest()
-
-
 @dataclasses.dataclass(frozen=True)
 class AheadTarget:
     """Where a configured run compiles its first step ahead and saves it, then exits, training nothing
@@ -768,7 +763,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
     return AheadOfTime(
-        generation, len(devices), dict(trainer.device_mesh.shape), program_of(lowered),
+        generation, len(devices), dict(trainer.device_mesh.shape), program_digest(lowered),
         Executable.of(compiled),
         flops=step_flops(compiled),
         argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
