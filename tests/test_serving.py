@@ -1446,29 +1446,41 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
     assert_as_exact(served, alone("float32"), draw, label, seeds=count, truth_fn=alone("float64"))
 
 
-def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
+BASE_ROW_SEEDS = 16
+"""Check 1's declared seeds for an adapter set's base row against the base model, sized by `seeds_for` on
+armada."""
+
+
+def test_a_row_of_an_adapter_sets_base_computes_the_base():
     """A row naming no adapter of a set (-1 in the call's `adapters`) takes no branch: beside a row whose
-    adapter's factors overflow its update to inf, its logits are the base model's, bit for bit."""
+    adapter's factors overflow its update to inf, its logits are the base model's, on par with them
+    (check 1), the set's program another than the base's."""
     from pathlib import Path
+
+    from arm_arithmetic import widened
 
     from dew.interop.pretrained import Pretrained
     from dew.lora import AdapterSet, LoRA
 
     fixtures = Path(__file__).resolve().parent / "fixtures"
-    # A layer at a time: bit for bit holds between two programs XLA fuses alike, which two scanned bodies of
-    # different operations need not be.
-    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference",
-                              scan_layers=False)
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
     fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
                         layouts=decoder.layouts)
     huge = dataclasses.replace(fixture, variables={**fixture.variables, "params": jax.tree.map(
         lambda leaf: leaf * 1e30, fixture.variables["params"])})
     adapters = AdapterSet.of({"huge": huge})
-    tokens = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8]], jnp.int32)
-    served = adapters.model.apply(adapters.variables, tokens, adapters=jnp.asarray([0, -1], jnp.int32))
-    base = decoder.model.apply(decoder.variables, tokens)
-    assert not np.isfinite(np.asarray(served[0])).all()
-    np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
+    rows = jnp.asarray([0, -1], jnp.int32)
+    served = jax.jit(lambda tokens: adapters.model.apply(adapters.variables, tokens, adapters=rows))
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), (2, 4), 1, 30),)
+
+    assert not np.isfinite(np.asarray(served(draw(0)[0])[0])).all()
+    assert_as_exact(lambda tokens: served(tokens)[1],
+                    jax.jit(lambda tokens: decoder.model.apply(decoder.variables, tokens)[1]), draw,
+                    "an adapter set's base row", seeds=BASE_ROW_SEEDS,
+                    truth_fn=jax.jit(lambda tokens: decoder.model.clone(dtype=jnp.float64).apply(
+                        widened(decoder.variables), tokens)[1]))
 
 
 def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():

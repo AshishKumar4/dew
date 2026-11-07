@@ -23,7 +23,7 @@ import pytest
 import torch
 from flax import linen as nn
 from model_support import TINY_DECODER, Digits, decoder, flat_tree, stepped_outputs
-from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 from test_serving import assert_same_generation
 
 from dew.batch import FROZEN, coordinates, thaw
@@ -79,7 +79,7 @@ FORMS = {
 """Each residual a decoder carries beside the plain stream, which the blocks read and join in its form."""
 
 SEEDS = {"block float32": 512, "block bfloat16": 512, "base": 16, "decode": 16, "scan": 16, "fresh altup": 16,
-         "fresh mhc": 32, "fresh single-pass-mhc": 16, "fresh depth": 16, "fresh ngpt": 8}
+         "fresh mhc": 32, "fresh single-pass-mhc": 16, "fresh depth": 16, "fresh ngpt": 8, "zero gates": 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
 
@@ -453,12 +453,15 @@ def test_the_blocks_train_beside_a_whole_source_where_it_is_not_frozen(source):
     assert {path for path in held if not crossing(path)} == set(own)
     for path, leaf in own.items():
         np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(leaf), err_msg=path)
-    tokens = jnp.arange(8, dtype=jnp.int32)[None] % 256
-    # The block's layer runs apart from the others (`CausalTransformer.scanned_like`), as the source's plain
-    # loop runs every layer: the same program but for the zero-gated block.
-    np.testing.assert_array_equal(np.asarray(attached.model.apply(attached.variables, tokens)),
-                                  np.asarray(source.model.clone(scan_layers=False).apply(source.variables,
-                                                                                         tokens)))
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), (1, 8), 0, 256),)
+
+    # The block's layer runs apart from the others, another program than the source's: on par (check 1).
+    assert_as_exact(jax.jit(lambda tokens: attached.model.apply(attached.variables, tokens)),
+                    jax.jit(lambda tokens: source.model.apply(source.variables, tokens)), draw,
+                    "zero-gated blocks as their source", seeds=SEEDS["zero gates"],
+                    truth_fn=jax.jit(lambda tokens: source.model.clone(dtype=jnp.float64).apply(
+                        widened(source.variables), tokens)))
     lora = LoRA(rank=2, modules=("q_proj",))
     later = attached.adapt(lora, key=1)
     earlier = source.adapt(lora, key=1).with_cross_attention(cross, key=0, frozen=False)

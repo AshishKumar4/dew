@@ -81,10 +81,16 @@ def test_a_scanned_minimax_decodes_as_its_plain_loop():
                     'scanned MiniMax decode', seeds=SCAN_SEEDS, truth_fn=truth)
 
 
+LEGACY_SEEDS = 16
+"""Check 1's declared seeds for a record of a kind a lightning layer against the record of one kind, sized
+by `seeds_for` on armada."""
+
+
 def test_a_record_saved_with_a_kind_for_each_lightning_layer_computes_as_it_did():
     """A run saved before the stack handed each lightning layer its place recorded a kind for each,
     `linear_attention_{index}` stating its `layer_idx` (ledger 2564); its record still builds and
-    computes minimax-tiny's logits bit for bit as the record of one kind does."""
+    computes minimax-tiny's logits as the record of one kind does, on par with them (check 1): its layers,
+    each a kind of its own, run apart where the one kind's scan together."""
     loaded = load()
     record = translate_config(released('minimax-tiny'))
     lightning = record['kinds']['linear_attention']
@@ -98,8 +104,15 @@ def test_a_record_saved_with_a_kind_for_each_lightning_layer_computes_as_it_did(
         for index, name in enumerate(legacy['layer_types']) if name.startswith('linear_attention_')}}
     model = from_record(CausalTransformer, {**legacy, 'attention_impl': 'reference'})
     ids = np.load(TINY / 'input_ids.npy')
-    np.testing.assert_array_equal(model.apply(loaded.variables, ids),
-                                  loaded.model.apply(loaded.variables, ids))
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), ids.shape, 0, loaded.model.vocab_size),)
+
+    wide = loaded.model.clone(dtype=jnp.float64)
+    assert_as_exact(jax.jit(lambda tokens: model.apply(loaded.variables, tokens)),
+                    jax.jit(lambda tokens: loaded.model.apply(loaded.variables, tokens)), draw,
+                    "minimax's legacy kinds", seeds=LEGACY_SEEDS,
+                    truth_fn=jax.jit(lambda tokens: wide.apply(widened(loaded.variables), tokens)))
 
 
 def test_a_minimax_model_writes_no_checkpoint_another_runtime_would_misread(tmp_path):

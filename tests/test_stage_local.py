@@ -359,8 +359,9 @@ def test_the_state_a_stage_local_fit_returns_is_the_one_it_holds_and_reads_off_t
     for mine, theirs in zip(jax.tree.leaves(restored), jax.tree.leaves(held), strict=True):
         np.testing.assert_array_equal(mine, theirs)
     ids = jnp.asarray(token_rows(VOCAB, 2, SEQ, seed=3457)["text"])
+    # Both in the step's form, the stored state staged again (`Trainer.staged`): one program, bit for bit.
     np.testing.assert_array_equal(np.asarray(model.apply(dict(trained.variables), ids)),
-                                  np.asarray(model.apply(dict(stored.variables), ids)))
+                                  np.asarray(model.apply(dict(run.staged(stored).variables), ids)))
     generated = [run.objective.pipeline(held)([[1, 2]], 4, key=0).host() for held in (trained, stored)]
     np.testing.assert_array_equal(np.asarray(generated[0].tokens), np.asarray(generated[1].tokens))
     assert int(trainer(model, optimizer, STAGED, 8).fit(stream(), steps=STEPS + 1, log_every=1,

@@ -623,25 +623,39 @@ def test_a_recorded_kernel_no_rule_matches_multiplies_by_its_own_recipe():
         activations.apply(served_variables, ids)
 
 
+SERVED_INT8_SEEDS = 16
+"""Check 1's declared seeds for the int8 served forward against the training one, sized by `seeds_for` on
+armada."""
+
+
 def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     """Served weights are int8 values with their scales, and the served
-    projections reproduce the quantized-training forward they were trained
-    under bit for bit, away from fp32 (unquantized products would leave it
-    bitwise). Observed on CPU: 1.2e-01 from fp32 on logits of order 3.
+    projections compute the quantized-training forward they were trained
+    under, on par with it (check 1), away from fp32. Observed on CPU: 1.2e-01 from fp32 on logits of order 3.
     (Qwix's serving and training providers quantize attention's matmuls of
     two activations differently: with those quantized too, the two forwards
     differ by 3e-02.)"""
     pytest.importorskip("qwix")
     spec = Quantization(patterns=(".*_proj",))
-    # A layer at a time: bit for bit holds between two programs XLA fuses alike, which two scanned bodies
-    # of different operations need not be.
-    model, qmodel, variables, ids = quantized_forward(spec, scan_layers=False)
+    model, qmodel, variables, ids = quantized_forward(spec)
     served, served_variables = quantize_for_serving(model, variables, spec, ids)
     dtypes = {leaf.dtype for leaf in jax.tree.leaves(served_variables["params"])}
     assert jnp.dtype(jnp.int8) in dtypes
     logits = served.apply(served_variables, ids)
-    np.testing.assert_array_equal(logits, qmodel.apply(variables, ids))
     assert not np.array_equal(logits, model.apply(variables, ids))
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), ids.shape, 0, model.vocab_size),)
+
+    # The served and the training forwards are two programs over the same codes: on par (check 1), the
+    # training forward's float64 run the truth.
+    from arm_arithmetic import widened
+
+    wide = spec.apply(model.clone(dtype=jnp.float64))
+    assert_as_exact(jax.jit(lambda tokens: served.apply(served_variables, tokens)),
+                    jax.jit(lambda tokens: qmodel.apply(variables, tokens)), draw, "int8 served as trained",
+                    seeds=SERVED_INT8_SEEDS,
+                    truth_fn=jax.jit(lambda tokens: wide.apply(widened(variables), tokens)))
 
 
 def test_a_banked_runs_expert_lookup_reads_served_quantized_kernels():

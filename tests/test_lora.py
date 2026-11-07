@@ -530,6 +530,10 @@ def test_muon_steps_an_adapted_head_whose_factors_it_splits_between_its_optimize
         assert not np.array_equal(np.asarray(after), np.asarray(before)), jax.tree_util.keystr(path)
 
 
+IDENTITY_SEEDS = 16
+"""Check 1's declared seeds for a fresh adapter against its base, sized by `seeds_for` on armada."""
+
+
 def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, reference):
     """PEFT's target_modules: a suffix names every projection under it; B
     starts at zero so the adapted forward is the base forward; A is drawn
@@ -541,12 +545,18 @@ def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, referenc
                                     ("params", "layers_1", "self_attn", "q_proj"),
                                     ("params", "layers_1", "mlp", "up_proj")}
     assert {target.alpha for target in adapter.targets.values()} == {6.0}
-    tokens = jnp.asarray(reference["input_ids"])
-    # Its layers' targets differ, so the adapted stack runs them apart (`CausalTransformer.scanned_like`),
-    # as the base's plain loop does: the same program but for the exact zero update.
-    np.testing.assert_array_equal(np.asarray(adapter.model.apply(variables, tokens)),
-                                  np.asarray(decoder.model.clone(scan_layers=False).apply(decoder.variables,
-                                                                                          tokens)))
+    shape, vocab = np.shape(reference["input_ids"]), decoder.model.vocab_size
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), shape, 1, vocab),)
+
+    # The adapted stack runs its unlike layers apart (`CausalTransformer.scanned_like`), another program than
+    # the base's: on par with it (check 1).
+    base = jax.jit(lambda tokens: decoder.model.apply(decoder.variables, tokens))
+    assert_as_exact(jax.jit(lambda tokens: adapter.model.apply(variables, tokens)), base, draw,
+                    "a fresh adapter as its base", seeds=IDENTITY_SEEDS,
+                    truth_fn=jax.jit(lambda tokens: decoder.model.clone(dtype=jnp.float64).apply(
+                        widened(decoder.variables), tokens)))
     a = variables["params"]["layers_1"]["mlp"]["up_proj"]["lora_A"]
     assert a.shape == (64, 3) and 0 < float(jnp.abs(a).max()) <= 1 / 8
     assert not bool(jnp.any(variables["params"]["layers_1"]["mlp"]["up_proj"]["lora_B"]))

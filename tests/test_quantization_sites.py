@@ -38,6 +38,9 @@ def case(request):
     return directory, Pretrained.load(directory, dtype="float32", attention_impl="reference"), reference
 
 
+APART_SEEDS = 16
+"""Check 1's declared seeds for the prepared tree of members scaled apart against the loaded one, sized by
+`seeds_for` on armada."""
 VIEW_SEEDS = 8
 """Each view's declared check-1 seeds against the plain loop, sized by `seeds_for` paired on armada."""
 
@@ -216,9 +219,18 @@ def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call
     # loaded tree draws what one over the prepared tree draws.
     apart = scaled_apart(loaded)
     full = reference["ids"].astype(np.int32)
-    np.testing.assert_array_equal(
-        np.asarray(loaded.model.apply(inference_projections(loaded.model, apart), full)),
-        np.asarray(loaded.model.apply(apart, full)))
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), full.shape, 0, loaded.model.vocab_size),)
+
+    # Two programs over the same members: the prepared tree's and the loaded tree's, on par (check 1).
+    from arm_arithmetic import widened
+
+    prepared, wide = inference_projections(loaded.model, apart), loaded.model.clone(dtype=jnp.float64)
+    assert_as_exact(jax.jit(lambda ids: loaded.model.apply(prepared, ids)),
+                    jax.jit(lambda ids: loaded.model.apply(apart, ids)), draw,
+                    "members scaled apart, prepared", seeds=APART_SEEDS,
+                    truth_fn=jax.jit(lambda ids: wide.apply(widened(apart), ids)))
     drawn, expected = (task(ids, 3, key=0).host() for task in (
         borrowed.bind(apart), borrowed.bind(inference_projections(loaded.model, apart))))
     np.testing.assert_array_equal(drawn.tokens, expected.tokens)

@@ -29,7 +29,8 @@ def tokens(rng, length=12, rows=2):
     return jax.random.randint(rng, (rows, length), 0, VOCAB)
 
 
-SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 512, 'block decode': 32}
+SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 512, 'block decode': 32, 'block repeat': 64,
+         'one pass': 64}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
@@ -176,28 +177,43 @@ def test_checkpointed_passes_leave_decode_and_its_collections_unchanged(rng, sca
     assert boundaries[0] == boundaries[1]
 
 
-def test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all(rng):
-    """Layers 1 and 2 of four, run twice with no norm between, compute six
-    layers whose fourth and fifth repeat the second and third, to the bit,
-    and keep the second pass's entries after the first's; decoded, and
-    scanned, they are on par with their prefill (check 1)."""
-    looped = tiny(num_layers=4, loop=Loop(2, step_norm=False, layers=(1, 3)))
-    ids = tokens(rng)
-    params = nn.unbox(looped.init(rng, ids))
+BLOCK_ORDER = (0, 1, 2, 1, 2, 3)
+"""The deep stack's layers a loop over layers 1 and 2 of four runs, by the stored layer each repeats."""
+STORED_OF_DEEP = ((0, 0), (1, 1), (2, 2), (4, 3), (5, 4), (3, 5))
+"""Each stored cache entry of the loop by the deep stack's layer it holds: the second pass's block sits after
+the decoder's own layers, deep layers 3 and 4 at stored 4 and 5."""
+
+
+def repeated(params):
+    """The deep stack's parameters: the loop's layers in `BLOCK_ORDER`, its other leaves as they are."""
     tree = dict(params['params'])
     shared = {name: value for name, value in tree.items() if not name.startswith('layers_')}
-    order = [0, 1, 2, 1, 2, 3]
-    repeated = {f'layers_{index}': tree[f'layers_{source}'] for index, source in enumerate(order)}
-    deep_params = {'params': {**shared, **repeated}}
+    return {'params': {**shared, **{f'layers_{index}': tree[f'layers_{source}']
+                                    for index, source in enumerate(BLOCK_ORDER)}}}
+
+
+def test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all(rng):
+    """Layers 1 and 2 of four, run twice with no norm between, compute what six layers whose fourth and
+    fifth repeat the second and third compute, and keep the second pass's entries after the first's:
+    the loop and the deep stack, two programs, on par (check 1), their logits, their decode and each
+    cache entry; decoded, and scanned, they are on par with their prefill (check 1)."""
+    looped = tiny(num_layers=4, loop=Loop(2, step_norm=False, layers=(1, 3)))
     deep = tiny(num_layers=6, loop=None)
-    np.testing.assert_array_equal(looped.apply(params, ids), deep.apply(deep_params, ids))
-    ours, cache = decoded(looped, params, ids)
-    theirs, deep_cache = decoded(deep, deep_params, ids)
-    np.testing.assert_array_equal(ours, theirs)
-    # The second pass's block sits after the decoder's own layers: deep layers 3, 4 at stored 4, 5.
-    for stored, deep_index in ((0, 0), (1, 1), (2, 2), (4, 3), (5, 4), (3, 5)):
-        jax.tree.map(np.testing.assert_array_equal, cache[f'layers_{stored}'],
-                     deep_cache[f'layers_{deep_index}'])
+
+    def loop_run(params, ids):
+        logits, cache = decoded(looped, params, ids)
+        return looped.apply(params, ids), logits, {f'layers_{deep_index}': cache[f'layers_{stored}']
+                                                    for stored, deep_index in STORED_OF_DEEP}
+
+    def deep_run(model):
+        def run(params, ids):
+            wide_params = repeated(params)
+            logits, cache = decoded(model, wide_params, ids)
+            return model.apply(wide_params, ids), logits, cache
+        return run
+
+    assert_as_exact(loop_run, deep_run(deep), drawn(looped), 'block loop as the deep stack',
+                    seeds=SEEDS['block repeat'], truth_fn=deep_run(deep.clone(dtype=jnp.float64)))
     assert_as_exact(lambda params, ids: decoded(looped, params, ids)[0], passes(looped), drawn(looped),
                     'block loop decode', seeds=SEEDS['block decode'], truth_fn=wide(looped))
     scanned = tiny(num_layers=4, loop=Loop(2, step_norm=False, layers=(1, 3)), scan_layers=True)
@@ -211,7 +227,9 @@ def test_a_decoder_gains_a_loop_over_its_own_block_that_one_pass_leaves_as_it_wa
     params = nn.unbox(plain.init(rng, ids))
     once, twice = plain.with_passes(1, (1, 3)), plain.with_passes(2, (1, 3))
     assert twice.loop == Loop(2, step_norm=False, layers=(1, 3))
-    np.testing.assert_array_equal(once.apply(params, ids), plain.apply(params, ids))
+    # One pass over the block computes the stack it loops over, another program on par with it (check 1).
+    assert_as_exact(jax.jit(once.apply), jax.jit(plain.apply), drawn(plain), 'one pass of a block',
+                    seeds=SEEDS['one pass'], truth_fn=wide(plain))
     assert not np.array_equal(twice.apply(params, ids), plain.apply(params, ids))
     assert plain.with_passes(2) is None and plain.with_passes(None, (1, 3)) is None
     assert twice.with_passes(4).loop == Loop(4, step_norm=False, layers=(1, 3))
