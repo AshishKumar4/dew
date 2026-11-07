@@ -88,6 +88,10 @@ def flaxdiff(wide: bool) -> dict[str, types.ModuleType]:
         source = local.read_text()
         if wide:
             source = source.replace("jnp.float32", "jnp.float64").replace("np.float32", "np.float64")
+            # Flax's own attention casts a forced softmax's logits to float32 inside the library, past this
+            # copy's reach: the float64 copy's temporal attention asks for none (row 4763).
+            source = source.replace("force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True",
+                                    "force_fp32_for_softmax=False, deterministic=True")
             if stem == "common" and source.count(FOURIER) != 1:
                 raise ValueError(f"common.py at {COMMIT} draws its Fourier frequencies otherwise than "
                                  f"{FOURIER!r}")

@@ -233,10 +233,6 @@
    "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_flaxdiff_family_source.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_flow_matching.py": {
    "comparisons": 1,
    "lane": "Training"
