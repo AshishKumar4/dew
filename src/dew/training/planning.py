@@ -75,6 +75,10 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
+MODEL_MISS = "dew_model_miss"
+"""The attribute a model miss's warning carries, the probe the derivation judged otherwise than its compile
+(`Probe.named`): what a reader selects a miss by, whatever its wording."""
+
 
 def read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
                rollout: Rollout | None, mesh: MeshSpec | Mesh) -> str | None:
@@ -1046,7 +1050,8 @@ class FitSearch[LossT, EffectsT]:
                          None if footprint is None else footprint.temporaries,
                          None if footprint is None else footprint.peak,
                          None if footprint is None else footprint.staged,
-                         None if probe.derived is None else probe.derived.record())
+                         None if probe.derived is None else probe.derived.record(),
+                         extra={MODEL_MISS: probe.named()})
         return options, candidate, executable, probe
 
     def fits_here(self, split: int, pruned: bool = False) -> bool:
