@@ -161,10 +161,9 @@ def _sixteen_step(walk: _Backward, k_smem, staged, add_dq, slots, carry, accumul
     for (acc, rhs, first), exponent, left in zip(((dv_acc, do_slot, 0), (dk_acc, q_slot, 2)), carry,
                                                  operands, strict=True):
         exponent, shift, parts = algebra.running_parts(left, exponent)
-        # The accumulator taken to the new scale exactly (`algebra.power2`, a power of two at most 1).
-        acc = family.rescaled_products(
-            acc, lambda value, shift=shift: algebra.power2(value, jnp.broadcast_to(shift, value.shape),
-                                                           reach=2 * 127), (), rhs, walk.interpret)
+        # The accumulator taken to the new scale (`algebra.scaled_by`, a power of two at most 1).
+        acc = family.rescaled_products(acc, lambda value, shift=shift: algebra.scaled_by(value, shift), (),
+                                       rhs, walk.interpret)
         for offset, part in enumerate(parts):
             family.staged(part, staged.at[first + offset])
             acc = family.products(acc, staged.at[first + offset].transpose((1, 0)), rhs, walk.interpret)
