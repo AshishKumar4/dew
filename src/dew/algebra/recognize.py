@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import collections
 import functools
+import hashlib
 import itertools
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Sequence
@@ -35,7 +36,8 @@ import numpy as np
 from egglog import eq
 from jax.extend import core as jcore
 
-from dew.algebra import SATURATION, fusion, program, rules, terms
+from dew import _cache
+from dew.algebra import SATURATION, derive, fusion, program, rules, terms
 from dew.nn.kernels import generation
 from dew.nn.programs import jax_name
 
@@ -75,11 +77,63 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int] = f
     norm's activation is the norm's rather than a SwiGLU's, an anchor's candidates in the order its family
     names them, the first equal one taken, no two regions sharing an equation nor one `held` (a product's
     epilogue's). Each candidate's decision is fusion's (`fusion._decided`), held by its region's structure
-    and context."""
+    and context; the body's whole recognition held by its structure and constants (`_HELD_BODIES`)."""
+    families = tuple(families or FAMILIES)
+    key = (_body_key(jaxpr, index), held, tuple(family.anchor for family in families), derive.context(),
+           _cache.KERNEL_CHOICES.value)
+    if key not in _HELD_BODIES:
+        _HELD_BODIES[key] = [_positioned(jaxpr, written)
+                             for written in _recognizing(jaxpr, index, held, families)]
+        if len(_HELD_BODIES) > fusion.DECISIONS_HELD:
+            _HELD_BODIES.popitem(last=False)
+    _HELD_BODIES.move_to_end(key)
+    return [_placed(jaxpr, written) for written in _HELD_BODIES[key]]
+
+
+_HELD_BODIES: collections.OrderedDict[Hashable, list] = collections.OrderedDict()
+"""Each body's recognition by its structure, its constants and the context it was weighed in
+(`recognized`), positioned (`_positioned`): every retrace of a step, and every layer body of one structure,
+recognized once, the latest `fusion.DECISIONS_HELD` held."""
+
+
+def _body_key(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
+    """A body's structure (`program.structure`, its constants among its inputs) and its constants' values,
+    which a call's static arguments read (an epsilon, a mask)."""
+    window = jcore.Jaxpr([], [*jaxpr.constvars, *jaxpr.invars], list(jaxpr.outvars), jaxpr.eqns)
+    held = tuple((str(np.asarray(index.consts[var]).dtype), np.shape(index.consts[var]),
+                  hashlib.sha256(np.ascontiguousarray(index.consts[var]).tobytes()).hexdigest())
+                 if var in index.consts else None for var in jaxpr.constvars)
+    return program.structure(window), held
+
+
+def _positions(jaxpr: jcore.Jaxpr) -> dict[jcore.Var, int]:
+    """Each value of a body by its position: its constants, inputs, then each equation's outputs in order."""
+    values = [*jaxpr.constvars, *jaxpr.invars, *(var for equation in jaxpr.eqns for var in equation.outvars)]
+    return {var: place for place, var in enumerate(values)}
+
+
+def _positioned(jaxpr: jcore.Jaxpr, written: fusion.Written) -> tuple:
+    """`written` with its values by their positions (`_positions`), for another body of one structure."""
+    at = _positions(jaxpr)
+    return (written.places, tuple(at[var] for var in written.inputs),
+            tuple(at[var] for var in written.outputs), written.at, written.call)
+
+
+def _placed(jaxpr: jcore.Jaxpr, held: tuple) -> fusion.Written:
+    """A positioned recognition (`_positioned`) in `jaxpr`'s own values."""
+    values = [*jaxpr.constvars, *jaxpr.invars, *(var for equation in jaxpr.eqns for var in equation.outvars)]
+    places, inputs, outputs, at, call = held
+    return fusion.Written(places, tuple(values[place] for place in inputs),
+                          tuple(values[place] for place in outputs), at, call)
+
+
+def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int],
+                 families: Sequence[Family]) -> list[fusion.Written]:
+    """`recognized`'s search."""
     accurate = generation.numerics().forms == "accurate"
     found: list[fusion.Written] = []
     claimed: set[int] = set(held)
-    for family in families or FAMILIES:
+    for family in families:
         for place, equation in enumerate(jaxpr.eqns):
             if place in claimed or not _holds(equation, family.anchor):
                 continue
