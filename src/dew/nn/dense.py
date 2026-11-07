@@ -98,7 +98,7 @@ def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dim
     reshaped by `shaped` to broadcast over it (`biased`: added as flax adds it, its gradient summed
     at fp32, in float64 on a CPU under Dew's tests); where the layer computes in a 16-bit dtype and its
     bias is `stored` at fp32, the product and that bias rounded once (`_rounds_once`)."""
-    if bias is not None and _rounds_once(layer, inputs, kernel, stored):
+    if bias is not None and _rounds_once(layer, inputs, kernel, bias, stored):
         widened = _widened(inputs, kernel, dimensions, layer.precision)
         return biased(widened, shaped(stored)).astype(inputs.dtype)
     product = _product(layer)(inputs, kernel, dimensions, precision=layer.precision)
@@ -107,14 +107,16 @@ def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dim
     return biased(product, shaped(bias))
 
 
-def _rounds_once(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, stored: Array | None
-                 ) -> bool:
+def _rounds_once(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, bias: Array,
+                 stored: Array | None) -> bool:
     """Whether a biased layer rounds its product and bias once, as torch's addmm does: its operands
-    16-bit, its bias stored at fp32, and its product the plain one (no product of its own, no wrapper
-    owning the products: `_product`)."""
-    narrow = jnp.result_type(inputs, kernel) in (jnp.bfloat16, jnp.float16)
+    16-bit, its bias stored at fp32 and promoted to their dtype (flax's promotion, whose sum it rounds
+    in that dtype; a promotion that keeps the bias wider adds it as it gives, row 4870), and its product
+    the plain one (no product of its own, no wrapper owning the products: `_product`)."""
+    narrow = jnp.result_type(inputs, kernel)
     plain = layer.dot_general is None and layer.dot_general_cls is None and not intercepted()
-    return narrow and plain and stored is not None and stored.dtype == jnp.float32
+    return (narrow in (jnp.bfloat16, jnp.float16) and bias.dtype == narrow and plain and stored is not None
+            and stored.dtype == jnp.float32)
 
 
 def _widened_value(inputs: Array, kernel: Array, dimensions, precision) -> jax.Array:

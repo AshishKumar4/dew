@@ -301,6 +301,27 @@ def test_every_registered_solver_samples_its_processes_and_refuses_the_rest(name
             generate(*build(), solver, shape=shape)
 
 
+def test_a_walk_over_rows_an_explicit_mesh_splits_keeps_its_solver_state_there():
+    """A jitted walk whose rows an Explicit axis splits over two devices builds its solver's state from its
+    rows (`MultiStepDPM`'s history, `zeros_like` of the sample) under the caller's mesh, which keeps the
+    rows' placement, while its grid's checks run on the host (`on_host`): the walk compiles and samples as
+    the same walk on one device does."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    process, model = karras_process()
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)))
+    denoise = process.denoiser(model, params, {})
+    x_T = process.noise(jax.random.PRNGKey(0), (4, 8, 8, 3))
+
+    def walked(x):
+        return sample(denoise, x, 4, solver=MultiStepDPM(), key=jax.random.PRNGKey(1))
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        split = jax.jit(walked)(jax.device_put(x_T, NamedSharding(mesh, PartitionSpec("data"))))
+    np.testing.assert_allclose(np.asarray(split), np.asarray(jax.jit(walked)(x_T)), rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("name, case", [
     (name, case) for name in sorted(solvers) if name not in CONFIDENCE
     for case in INTEGRATES.get(name, CONVERGES_ON.get(name, GAUSSIAN)) if case in FLOATING])
