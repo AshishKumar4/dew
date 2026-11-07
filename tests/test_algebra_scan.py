@@ -62,6 +62,14 @@ def draw(seed):
             jnp.asarray(rng.standard_normal((TOKENS, STATE)) / np.sqrt(STATE), jnp.float32))
 
 
+def deep_draw(seed):
+    """`draw`'s inputs with steps of one to two: each token's log decay -0.7 to -1.4, so a chunk's reach
+    e^-45, where a log decay's fp32 ulp is 4e-6 and an exponent rounded whole before its exponential loses
+    that much of every decay."""
+    x, _, B, C = draw(seed)
+    return x, jnp.asarray(np.random.default_rng(seed + 1).uniform(1, 2, TOKENS), jnp.float32), B, C
+
+
 def operands(x, dt, B, C) -> dict:
     return {"x": x, "dt": dt, "B": B, "C": C, "rate": jnp.float32(RATE), "skip": jnp.float32(SKIP)}
 
@@ -671,9 +679,11 @@ def cotangents_of(seed, outputs_shape, state_shape):
             jnp.asarray(rng.standard_normal(state_shape), jnp.float32))
 
 
-def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient():
+@pytest.mark.parametrize("draw_fn", [draw, deep_draw], ids=["steps over three decades", "deep decays"])
+def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient(draw_fn):
     """Mamba-2's chunk adjoint (`backward`), walked back over the chunks: each token operand's gradient on par
-    with the token-by-token scan's against the float64 truth (check 1)."""
+    with the token-by-token scan's against the float64 truth (check 1), its steps' too where a chunk's
+    decays reach e^-45."""
     forms = scan.derive_scan(DECLARED, saturation=SATURATION)
     names = ("x", "dt", "B", "C")
 
@@ -683,7 +693,7 @@ def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient():
     derived = adjoint(forms, chunked, TOKENS // CHUNK)
 
     def draw_with_cotangents(seed):
-        return (*draw(seed), *cotangents_of(seed, (TOKENS, WIDTH), (STATE, WIDTH)))
+        return (*draw_fn(seed), *cotangents_of(seed, (TOKENS, WIDTH), (STATE, WIDTH)))
 
     def as_derived(x, dt, B, C, d_out, d_final):
         grads = derived({"x": x, "dt": dt, "B": B, "C": C}, (d_out, d_final))
