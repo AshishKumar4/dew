@@ -452,10 +452,7 @@ def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
         # A call (a jitted helper's, a custom derivative's primal): its jaxpr's inputs its own, read where
         # every reader reads a call's program (`dew.nn.programs.called`).
         body = called(eqn)
-        if body is not None:
-            reads = _live_inputs(body.jaxpr if isinstance(body, jax_core.ClosedJaxpr) else body, used)
-        else:
-            reads = [not nested] * len(eqn.invars)
+        reads = [not nested] * len(eqn.invars) if body is None else _live_inputs(body, used)
         live.update(var for var, read in zip(eqn.invars, reads, strict=True)
                     if read and not isinstance(var, jax_core.Literal))
     return [var in live for var in jaxpr.invars]

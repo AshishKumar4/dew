@@ -203,7 +203,7 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
             default = branches[-1]
             operands = [read(atom) for atom in equation.invars[1:]]
             outs = evaluated_inline(default.jaxpr, default.consts, operands)
-        elif (called := programs.called(equation)) is not None and isinstance(called, jcore.ClosedJaxpr):
+        elif (called := programs.called(equation)) is not None:
             # A call's program (`dew.nn.programs.called`), its constants with it.
             outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])
         else:
