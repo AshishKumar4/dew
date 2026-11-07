@@ -482,21 +482,29 @@ def test_the_reference_filling_with_minus_infinity_is_the_written_out_program(he
     assert np.isnan(np.asarray(ours, np.float32))[0, [3, 7]].all()
 
 
+def _documents(rows: int, queries: int) -> jax.Array:
+    """`[rows, queries]` documents: two a row, of 40 and the rest, beside padding (id 0) at queries 3 and 7,
+    which under causality see no key, every other query a key of its own document's before it."""
+    ids = np.where(np.arange(queries) < 40, 1, 2)
+    ids[[3, 7]] = 0
+    return jnp.asarray(np.broadcast_to(ids, (rows, queries)))
+
+
 @pytest.mark.parametrize("sinks", [False, True], ids=["plain", "sinks"])
 @pytest.mark.parametrize("fill", [JAX_NN_FILL, -2.0], ids=["jax-nn", "within-reach"])
 def test_a_template_call_filling_its_masked_logits_is_on_par_with_the_portable_path(fill, sinks):
-    """A call on the template with a finite masked logit (`mask_fill`), its mask leaving rows no key and
-    others a key in three: jax.nn's, which outweighs no key a row sees, so the template weighs its masked
-    keys nothing and a row that sees none reads every value alike (beside its sink, the sink's share); and
-    one within the logits' reach, which weighs a masked key beside them, the call the portable path's. Its
-    output and gradients on par with the portable path's (check 1)."""
-    mask = _rows_mask(QUERIES, KEYS)
+    """A causal call on the template over packed documents with padding rows, which see no key, under a
+    finite masked logit (`mask_fill`): jax.nn's, which outweighs no key a row sees, so the template weighs
+    its masked keys nothing and a padding row reads every value alike (beside its sink, the sink's share);
+    and one within the logits' reach, which weighs a masked key beside them, the call the portable path's.
+    Its output and gradients on par with the portable path's (check 1)."""
+    documents = _documents(ROWS, QUERIES)
 
     def call(implementation: str):
         def run(query, key, value, sink_logits, dout):
             def attend(query, key, value, sink_logits):
-                return scaled_dot_product_attention(query, key, value, mask=mask, mask_fill=fill,
-                                                    sinks=sink_logits if sinks else None,
+                return scaled_dot_product_attention(query, key, value, causal=True, segment_ids=documents,
+                                                    mask_fill=fill, sinks=sink_logits if sinks else None,
                                                     implementation=implementation)
 
             out, pull = jax.vjp(attend, query, key, value, sink_logits)
@@ -505,29 +513,30 @@ def test_a_template_call_filling_its_masked_logits_is_on_par_with_the_portable_p
         return run
 
     assert_as_exact(jax.jit(call("template")), jax.jit(call("reference")),
-                    drawing(QUERIES, KEYS, jnp.bfloat16, sinks=True), f"template filled {fill:g}",
+                    drawing(QUERIES, QUERIES, jnp.bfloat16, sinks=True), f"template filled {fill:g}",
                     seeds=SEEDS)
 
 
 def test_a_template_call_filling_with_minus_infinity_reads_nan_where_a_row_sees_no_key():
-    """A call on the template with -inf for a masked logit, its mask leaving rows 3 and 7 no key: those rows
-    NaN, as the portable path's, and every value's gradient NaN with them (the portable path's NaN weights
-    reach every key); every other row and the query's and key's gradients on par with it (check 1)."""
-    mask = _rows_mask(QUERIES, KEYS)
-    seen = np.asarray(mask).any(axis=-1)[0, 0][None, :, None, None]
+    """A causal call on the template over packed documents with -inf for a masked logit: its padding rows,
+    3 and 7, which see no key, NaN, as the portable path's, and every value's gradient NaN with them (the
+    portable path's NaN weights reach every key); every other row and the query's and key's gradients on
+    par with it (check 1)."""
+    documents = _documents(ROWS, QUERIES)
+    seen = (documents != 0)[:, :, None, None]
 
     def call(implementation: str):
         def run(query, key, value, _sinks, dout):
             def attend(query, key, value):
-                return scaled_dot_product_attention(query, key, value, mask=mask, mask_fill=-jnp.inf,
-                                                    implementation=implementation)
+                return scaled_dot_product_attention(query, key, value, causal=True, segment_ids=documents,
+                                                    mask_fill=-jnp.inf, implementation=implementation)
 
             out, pull = jax.vjp(attend, query, key, value)
             return (out, *pull(dout))
 
         return run
 
-    draw = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)
+    draw = drawing(QUERIES, QUERIES, jnp.bfloat16, sinks=False)
     ours, theirs = (jax.jit(call(implementation))(*draw(0)) for implementation in ("template", "reference"))
     for mine, reference in ((ours[0], theirs[0]), (ours[3], theirs[3])):
         np.testing.assert_array_equal(np.isnan(np.asarray(mine, np.float32)),
