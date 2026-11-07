@@ -164,28 +164,17 @@ def nvfp4_bank(seed: int, groups: int, depth: int, width: int) -> tuple[gemm.NvF
     return bank, np.stack([values for _, values in matrices])
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-def test_an_nvfp4_banks_packed_grouped_product_is_its_decoded_banks_product(generation_name):
+def test_an_nvfp4_banks_grouped_product_is_its_values_product():
     """`gemm.nvfp4_product` of a bank of four experts' NVFP4 matrices (row 4516: each its own tensor scale)
-    over a ragged group table (one group empty, rows past the groups), its packed kernel named (each tile
-    decoding its group's expert's stages in place) against the decoded bank's grouped product (XLA's arm),
-    bitwise, and both exactly the float64 product of the values: small integer rows, every product and sum
-    exact in fp32; the bank takes no gradient."""
+    over a ragged group table (one group empty, rows past the groups), the bank decoded once a call (the
+    packed kernel takes a dense call alone): exactly the float64 product of the values, small integer rows
+    making every product and sum exact in fp32; the bank takes no gradient."""
     bank, values = nvfp4_bank(11, 4, 512, 128)
     sizes = np.asarray([40, 0, 72, 24])
     rows = jnp.asarray(np.random.default_rng(12).integers(-3, 4, size=(140, 512)), jnp.float32)
-
-    def product(x, kernel):
-        with generation.chosen(nvfp4=kernel):
-            return gemm.nvfp4_product(x, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32,
-                                      interpret_on_cpu=True)
-
-    with generation.assumed(generation_name):
-        with generation.routes() as routes:
-            got = product(rows, "packed")
-        assert {route.kernel for route in routes if route.choice == "nvfp4"} == {"packed"}, routes
-        want = product(rows, "xla")
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    with generation.assumed("sm90"), generation.routes() as routes:
+        got = gemm.nvfp4_product(rows, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32)
+    assert {route.kernel for route in routes if route.choice == "nvfp4"} == {"xla"}, routes
     starts = np.cumsum([0, *sizes])
     truth = np.zeros((140, 128))
     for group, (first, last) in enumerate(itertools.pairwise(starts)):
@@ -208,13 +197,11 @@ def test_an_nvfp4_bank_packs_its_nibbles_on_the_host_as_its_values():
     np.testing.assert_array_equal(host.words, np.asarray(device.words))
 
 
-@pytest.mark.parametrize("kernel", ["packed", "xla"])
-def test_gemm_takes_an_nvfp4_bank_as_its_matrix(kernel):
+def test_gemm_takes_an_nvfp4_bank_as_its_matrix():
     """`gemm.gemm` of a bank of NVFP4 experts (row 4516: moe's projection seam, no branch of its own), its
     bias epilogue on the fp32 sums before the one rounding, its rows gathered from the tokens and scattered
     back by a permutation: bitwise the decoded bank's grouped product of the gathered rows plus the bias,
-    the rows put back by the permutation (small integers, every sum exact), through `kernel`; and refused
-    with a prologue."""
+    the rows put back by the permutation (small integers, every sum exact); and refused with a prologue."""
     bank, values = nvfp4_bank(14, 4, 512, 128)
     rng = np.random.default_rng(15)
     tokens = jnp.asarray(rng.integers(-3, 4, size=(60, 512)), jnp.float32)
@@ -226,10 +213,9 @@ def test_gemm_takes_an_nvfp4_bank_as_its_matrix(kernel):
     def plus(acc, b):
         return acc + b
 
-    with generation.assumed("sm90"), generation.chosen(nvfp4=kernel):
+    with generation.assumed("sm90"):
         got = gemm.gemm(tokens, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32, gather=table,
-                        scatter=slots, epilogue=plus, epilogue_operands=((bias, ("groups", "columns")),),
-                        interpret_on_cpu=True)
+                        scatter=slots, epilogue=plus, epilogue_operands=((bias, ("groups", "columns")),))
         with pytest.raises(ValueError):
             gemm.gemm(tokens, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32,
                       prologue=lambda x: x)
