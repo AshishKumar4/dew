@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import functools
 import math
 import queue
 import threading
@@ -27,6 +28,7 @@ from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
+from dew.optim import learning_rate
 from dew.state import TrainState
 from dew.telemetry.instrumentation import (
     NO_FLOPS,
@@ -34,7 +36,7 @@ from dew.telemetry.instrumentation import (
     compilation_cache_counts,
     model_flops_utilization,
 )
-from dew.training.diloco import learning_rate_of
+from dew.training.diloco import rated
 from dew.training.display import EXAMPLES_CONSUMED_SCALAR, TrainingDisplay
 from dew.training.inspection import Summaries, logged
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
@@ -403,22 +405,27 @@ def added_tokens(left: jax.Array, right: jax.Array) -> jax.Array:
     return _TokenCount.add(left, right)
 
 
-@program
-def held(rate: jax.typing.ArrayLike | None,
-         scale: jax.Array | None) -> tuple[jax.Array | None, jax.Array | None]:
+@functools.partial(program, static_argnames="grouped")
+def held(rate: jax.typing.ArrayLike | None, scale: jax.Array | None,
+         grouped: bool = False) -> tuple[jax.Array | None, jax.Array | None]:
     """Copies, in device memory, of the learning rate and the loss scale a
-    log reads from the state. The next step donates that state, and a
-    donated buffer is gone once the step is dispatched, however long the
-    log waits to be read."""
+    log reads from the state, the first group's rate of a run whose groups
+    each hold theirs (`grouped`, DiLoCo's), every group's alike. The next
+    step donates that state, and a donated buffer is gone once the step is
+    dispatched, however long the log waits to be read."""
     def copied(leaf: jax.typing.ArrayLike) -> jax.Array:
         return jnp.copy(jax.device_put(jnp.asarray(leaf), jax.memory.Space.Device))
+    if grouped and rate is not None:
+        rate = jnp.asarray(rate)[0]
     return None if rate is None else copied(rate), None if scale is None else copied(scale)
 
 
 def copied(state: TrainState) -> tuple[jax.Array | None, jax.Array | None]:
-    """`held`'s copies of `state`'s learning rate (`learning_rate_of`) and loss scale, which a log reads:
-    the run's call and a run compiled ahead's alike (`dew.training.ahead.started`)."""
-    return held(learning_rate_of(state), None if state.scale is None else state.scale.scale)
+    """`held`'s copies of the learning rate `state`'s optimizer state holds (`dew.optim.learning_rate`,
+    under DiLoCo its groups') and its loss scale, which a log reads: the run's call and a run compiled
+    ahead's alike (`dew.training.ahead.started`)."""
+    return held(learning_rate(rated(state)), None if state.scale is None else state.scale.scale,
+                grouped=state.inner is not None)
 
 
 @runtime_checkable
