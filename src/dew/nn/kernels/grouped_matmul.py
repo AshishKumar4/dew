@@ -722,7 +722,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         whole column units, one of its depths, and each streamed block's rows in its consumers' equal
         shares (`Family.shares_rows`)."""
         dtype = ba.arguments['tokens'].dtype
-        return not (config.warpgroups > family.consumers
+        return not (config.warpgroups > min(family.consumers, mosaic_gpu.CONSUMERS)
                     or config.programs > family.programs(config.warpgroups) or config.stages < 2
                     or config.block_m % (family.role_rows * config.warpgroups)
                     or config.block_n % family.column_unit(dtype)

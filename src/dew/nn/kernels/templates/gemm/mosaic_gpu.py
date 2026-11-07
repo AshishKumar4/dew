@@ -121,6 +121,11 @@ class Tiles:
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
 
 
+CONSUMERS = 2
+"""The most consumer warpgroups a GEMM tile takes: CUTLASS's sm90 cooperative kernel's two; a family's third
+(wgmma's, FlashAttention 3's d64 forward's) unmeasured on a product."""
+
+
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its
@@ -216,12 +221,13 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # further consumers would compute padding alone; where groups average a role's rows, a routing's groups
     # past it keep the further consumers' rows real. Row 3622, H100 (FS-3622-AB1/AB2-h100): one consumer ran
     # 0.73 to 0.999 of the cooperative tile's time at 1 to 32 rows a group, and 1.13 to 1.26 of it at 64.
-    whole = rows >= family.role_rows if grouped else rows % (family.role_rows * family.consumers) == 0
+    most = min(family.consumers, CONSUMERS)
+    whole = rows >= family.role_rows if grouped else rows % (family.role_rows * most) == 0
     # Each consumer count's tile at the most programs that hold one, the count the objective prices least
     # (`_reads`), the most consumers on a tie.
     counted = [next((tile for programs in range(family.programs(consumers), 0, -1)
                      if (tile := tiled(consumers, programs)) is not None), None)
-               for consumers in range(family.consumers if whole else 1, 0, -1)]
+               for consumers in range(most if whole else 1, 0, -1)]
     return min((tile for tile in counted if tile is not None), key=functools.partial(_reads, family),
                default=None)
 
@@ -716,8 +722,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     prologue_operands, epilogue_operands = sides
     m, n, k, g = shape
     block_m, block_n, block_k, consumers = tiles.block_m, tiles.block_n, tiles.block_k, tiles.warpgroups
-    pair = tiles.cluster
-    share = block_m // consumers
+    pair, share = tiles.cluster, block_m // consumers
     part = (share, block_n)
     # A stream for each operand that follows the steps, but a vector a family does not copy, which its
     # step reads from global memory; a prologue side operand without depth is loaded once a tile.
@@ -1018,13 +1023,16 @@ def _walked_rows(lhs, gather, tiles: Tiles, *, transpose_lhs: bool, dense: bool,
     """Dew: `gmm`'s rows as its schedule walks them: `lhs`, or a gathered product's table (`gather`, a pad
     reading row 0 of the tokens, which stay as they are), padded to whole TMA rows (`m` of them) and
     extended to the schedule's extent where the family's loads past the rows are not zeros (`bounded`):
-    `(lhs, gather, m, extent)`."""
+    `(lhs, gather, m, extent)`. A table is always extended: its threads read a tile's entries by plain
+    loads, which no TMA bounds (a gathered product's last tile read past an unextended table on a GH200,
+    CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
     row_axis = 1 if transpose_lhs else 0
     walked, axis = (lhs, row_axis) if gather is None else (gather, 0)
     walked = rows_padded(walked, axis, TMA_ROWS)
     m = walked.shape[axis]
     row_tile = tiles.block_m * tiles.cluster
-    extent = m if bounded else -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile)
+    extent = (m if bounded and gather is None else -(-m // row_tile) * row_tile if dense
+              else row_extent(m, row_tile))
     walked = rows_extended(walked, axis, extent)
     return (walked, None, m, extent) if gather is None else (lhs, walked, m, extent)
 
@@ -1532,10 +1540,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
 @tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
                       'prologue_axes', 'exact_sums', 'tail', 'k_major'))
 def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
-                      multiprocessors: int, interpret, prologue, prologue_operands: tuple,
-                      prologue_axes: tuple, exact_sums: bool,
-                      tail: tail_of.Tail | None = None, k_major: bool = False,
-                      step_scales: tuple | None = None) -> jax.Array:
+                   multiprocessors: int, interpret, prologue, prologue_operands: tuple, prologue_axes: tuple,
+                   exact_sums: bool, tail=None, k_major: bool = False, step_scales=None) -> jax.Array:
     """Dew: `tgmm`'s product at a tile `tiles.warpgroups` consumer roles compute, each its share of the depth
     by all the columns, one MMA a step (two: CUTLASS's cooperative sm90 schedule), on its instruction
     family's bundle (`family_of`), its streams running across the persistent loop's tiles where the family
@@ -1609,8 +1615,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                     hook = (None if prologue is None
                             else (prologue, prologue_axes, stepped, fixed, fixed_refs, read_refs))
                     return _staged_halves(family, [slots[name] for name in names], (index, *group),
-                                          (mine_depth, mine_columns), hook,
-                                          halves)
+                                          (mine_depth, mine_columns), hook, halves)
 
                 # An empty group's tile reads none and stores zeros.
                 scaling = _tgmm_scaling(step_scales is not None, mine_depth)
@@ -1647,8 +1652,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
         jax.ShapeDtypeStruct((multiprocessors, 2, consumers, *part), jnp.float32),)
     kernel = family.kernel(body, out_type=(out_type, *workspace),
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
-                           consumers=consumers,
-                           interpret=interpret, approx_math=False, name="dew_tgmm",
+                           consumers=consumers, interpret=interpret, approx_math=False, name="dew_tgmm",
                            resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands,
                                                    out_type))
