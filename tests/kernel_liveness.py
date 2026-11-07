@@ -633,6 +633,15 @@ class _Pass:
     def _streamed(self, op, name: str) -> bool:
         if not _elementwise(op, name):
             return False
+        dependencies = {a for operand in op.operands
+                        for a in self.atoms.of.get(operand, ()) if a is not None}
+        runs = {self.run[p] for p in self._read(op.operands) if p in self.run}
+        # Materialize growing expressions instead of retaining all their leaves
+        # through later consumers. Within one product run its accumulator leaves
+        # must coexist anyway; keep its epilogue deferred so it needs no extra
+        # output tile beside those already held to the run's last product.
+        if len(runs) != 1 and len(dependencies) > len(self._lanes(op.results[0].type)):
+            return False
         if self.compiler is not None and not self.compiler.streams_transcendentals:
             assembly = (ir.StringAttr(op.attributes["asm_string"]).value
                         if "asm_string" in op.attributes else "")
