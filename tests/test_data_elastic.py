@@ -732,6 +732,22 @@ def test_a_ramped_elastic_read_reads_one_readers_steps_and_resumes_on_another_co
             whole[step][at] for index in range(resumed) for at in range(index, len(whole[step]), resumed)]
 
 
+def test_a_ramped_elastic_read_that_keeps_its_short_last_batch_is_refused_where_it_reaches_it():
+    """A ramp over an elastic read that ends keeping its short last batch, filled, is refused where it
+    reaches that batch, each reader marking its own share of the batch's real records and none their
+    count, which a ramp step's end on every reader needs; one that drops it ramps to its end."""
+    ramp = Ramp(start=4, increment=4, samples=16)
+
+    def read(drop: bool):
+        chain = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(30)))).batch(
+            BATCH, drop_remainder=drop).elastic()
+        return ramped(compile(chain, loading=READ, seed=3), ramp).train(DataPartition(0, 2))
+
+    assert sum(len(batch["id"]) for batch in read(drop=True)) == 24 // 2
+    with pytest.raises(ValueError):
+        list(read(drop=False))
+
+
 @dataclasses.dataclass(frozen=True)
 class Fetched:
     """A record as a live fetch returns it, which may differ between reads (`Volatile`)."""
