@@ -38,6 +38,25 @@ def test_only_a_weight_read_once_through_its_cast_is_copied():
     assert paths == {("once",): jnp.dtype(jnp.bfloat16), ("rematted",): jnp.dtype(jnp.bfloat16)}
 
 
+def test_a_users_primitive_named_as_a_cast_is_read_as_its_own():
+    """A primitive of a user's that takes the name of JAX's cast (`convert_element_type`) and none of its
+    parameters is read as its own, not the cast its name spells (`dew.nn.programs.named`): a weight it
+    reads is not copied narrower, where reading its parameters as a cast's raised KeyError (row 4094)."""
+    from jax.extend import core as jcore
+    from jax.interpreters import mlir
+
+    halved = jcore.Primitive("convert_element_type")
+    halved.def_impl(lambda value: value * 0.5)
+    halved.def_abstract_eval(lambda value: value)
+    mlir.register_lowering(halved, mlir.lower_fun(lambda value: value * 0.5, multiple_results=False))
+
+    def loss(params, x):
+        return (halved.bind(params["w"]) * x).sum()
+
+    params = {"w": jnp.ones((4,), jnp.float32)}
+    assert narrowed_paths(loss, params, jnp.ones((4,), jnp.float32)) == {}
+
+
 def test_a_scan_copies_its_stacked_layers_not_its_constants():
     """A scan over stacked layers hands each iteration its own slice, whose
     cotangent it stacks, so the stack can be read through a copy; a weight

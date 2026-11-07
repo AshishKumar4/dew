@@ -98,18 +98,35 @@ def _jax_own() -> Mapping[jcore.Primitive, str]:
     """JAX's own operations by their objects: every primitive `jax.lax`, `jax.lax.linalg` and
     `jax.extend.core.primitives` export (the random operations' `random_seed`, `random_split`,
     `random_fold_in`, `random_bits` and `random_gamma` among them, and the sum JAX's derivatives add with,
-    `add_any`), and the three its public random functions bind that no module of JAX's exports
-    (`random_wrap`, `random_unwrap`, `random_clone`), read off a trace of them once asked."""
+    `add_any`), and those its public functions bind that no module of JAX's exports, read off a trace of
+    them once asked: its random functions' `random_wrap`, `random_unwrap` and `random_clone`, a ragged
+    product's `ragged_dot_general`, a copy's `copy_p`, and its callbacks' and foreign calls'
+    `pure_callback`, `io_callback`, `debug_callback` and `ffi_call`."""
     def keyed(seed_words):
         # A key of its own implementation, whichever the process's default is (`jax_default_prng_impl`).
         key = jax.random.wrap_key_data(seed_words, impl="threefry2x32")
         return jax.random.key_data(jax.random.clone(key))
 
+    def bound(rows, groups):
+        shape = jax.ShapeDtypeStruct((), jax.numpy.float32)
+        products = jax.lax.ragged_dot(rows, rows.T[None], groups)
+        jax.debug.callback(lambda value: None, products)
+        called = jax.pure_callback(lambda value: value, shape, products.sum())
+        written = io_callback(lambda value: value, shape, called)
+        foreign = jax.ffi.ffi_call("dew_named", shape)(written)
+        return jax.numpy.copy(foreign)
+
+    from jax.experimental import io_callback
+
+    float32 = jax.numpy.float32
     traced = jax.make_jaxpr(keyed)(jax.ShapeDtypeStruct((2,), jax.numpy.uint32)).jaxpr
+    held = jax.make_jaxpr(bound)(jax.ShapeDtypeStruct((2, 2), float32),
+                                 jax.ShapeDtypeStruct((1,), jax.numpy.int32)).jaxpr
     exported = (primitive for module in (jax.lax, jax.lax.linalg, jcore.primitives)
                 for primitive in vars(module).values() if isinstance(primitive, jcore.Primitive))
     return {primitive: primitive.name
-            for primitive in (*exported, *(equation.primitive for equation in traced.eqns), ad.add_jaxvals_p)}
+            for primitive in (*exported, *(equation.primitive for equation in (*traced.eqns, *held.eqns)),
+                              ad.add_jaxvals_p)}
 
 
 def jax_name(primitive) -> str | None:
