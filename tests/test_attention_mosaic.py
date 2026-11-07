@@ -2121,10 +2121,11 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
 
 @INTERPRETS
 @pytest.mark.parametrize("call", ["full", "causal"])
-def test_a_deterministic_backward_in_one_launch_holds_check_1_interpreted(call, with_deterministic_ops):
-    """The backward under --xla_gpu_deterministic_ops on a full or causal call, its one launch's adds each
-    in its turn (`Family.ticketed`: dQ's in its key tiles' order, grouped dK's and dV's in their query
-    heads'), its gradients the reference's (check 1), under the interpreter, whose programs run in turn."""
+def test_a_deterministic_backward_holds_check_1_interpreted(call, with_deterministic_ops):
+    """The backward under --xla_gpu_deterministic_ops on a full or causal call, at the tiles it derives
+    there: no launch's programs add across programs (row 4732: none waits on another), a key head's query
+    heads' dK and dV summed in their order; its gradients the reference's (check 1), under the
+    interpreter."""
     _check_backward(call, SHAPES["interpreted"], form=None, interpret=True)
 
 
@@ -2132,8 +2133,8 @@ def test_a_deterministic_backward_in_one_launch_holds_check_1_interpreted(call, 
 @pytest.mark.parametrize("width", [64, 128])
 def test_a_deterministic_backward_compiles_spill_free_as_its_model_decides(width, with_deterministic_ops):
     """The backward under --xla_gpu_deterministic_ops at its derived tiles of a causal call `width` wide,
-    its adds ordered across programs by semaphores (`Family.ticketed`), lowered and compiled by ptxas for an
-    H100 on this CPU: within its shared memory, spilling nothing, its register model's decision ptxas's."""
+    lowered and compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing, its
+    register model's decision ptxas's."""
     test_the_backward_compiles_spill_free_as_its_model_decides(generation_name="sm90", width=width,
                                                                accurate=False, hooks="none")
 

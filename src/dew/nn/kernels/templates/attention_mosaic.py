@@ -1100,9 +1100,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     them): its queries, keys, values and output cotangent, its spans' arrays, its score hook's parameters, its
     initial state (`Initial`, or None) and a training forward's residuals (`forward`'s). Returns its
     gradients (`Gradients`). Its config comes from the family's facts and the call's extents (`derived`: one
-    launch for a fast-form call whose score hook takes no parameters, deterministic mode's a full or causal
-    one's, two for the accurate form and a call whose hook does),
-    legal within the device's block and a consumer's registers (`legal`)."""
+    launch for a fast-form call whose score hook takes no parameters, two in deterministic mode, for the
+    accurate form and for a call whose hook does), legal within the device's block and a consumer's
+    registers (`legal`)."""
 
     HOOKS = ("score_mod",)
     DIFFERENTIATED = True
@@ -1177,14 +1177,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         if (config.fused and (self.accurate or hooked or sixteen)) or not super().legal(ba, config, target):
             return False
         family = bundle_of(config, dtype)
-        # Deterministic mode's one launch orders its adds by turns (`Family.ticketed`): each query tile's dQ
-        # adds come from its key tiles counted from the first, which a full or causal call's walk keeps (a
-        # program's consumers walk their first key tile's readers, which every earlier key tile reads too);
-        # queries first, each consumer its own keys, on a family that waits across programs.
-        if config.fused and deterministic_ops_requested() and not (
-                self.form in ("full", "causal") and family is not None and family.fixes_up
-                and config.queries_first and not (config.shared_keys or config.shared_dq)
-                and (ba.arguments["interpret"] or self._all_resident(ba, config, target))):
+        # Deterministic mode takes no one launch: its programs add into dQ (and grouped dK and dV) across
+        # programs, whose fixed order would wait on programs an ordinary launch need not hold resident
+        # (row 4732: a ticket spins on a predecessor another stream's kernel keeps off the
+        # multiprocessors). Its two launches' sums are each program's own, a key head's query heads'
+        # summed in their order in XLA.
+        if config.fused and deterministic_ops_requested():
             return False
         if (self.score_mod is not None and family is not None
                 and min(config.block_q, config.block_k) < family.role_rows):
@@ -1242,11 +1240,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         8192, under a causal window of 4096 at 8192 0.65; width 64's 8 heads over 2 0.56 to 0.88, 16 over
         16 under the window 0.54; check 1 over documents and a window at 1 x 2048; of every call measured,
         row 3171's toy one alone the slower, 1 x 1024 over three short documents and a window of 256,
-        1.38 times: 20 us a step); in deterministic mode (`deterministic_ops_requested`) only a full or
-        causal call's, queries first on a layout whose consumers feed their rings, every add across programs
-        in a fixed order (`Family.ticketed`); otherwise (the accurate form, a hook with parameters, a
-        width no fused launch holds) two launches, the dQ launch then the keys-first dK/dV one, in a fixed
-        order."""
+        1.38 times: 20 us a step); otherwise (deterministic mode, `deterministic_ops_requested`; the
+        accurate form, a hook with parameters, a width no fused launch holds) two launches, the dQ launch
+        then the keys-first dK/dV one, in a fixed order."""
         family = self._family(ba, target)
         if family is None:
             return None
@@ -1261,25 +1257,20 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The dK/dV launch's consumers a backward's at most (`BACKWARD_CONSUMERS`), whatever its layout's.
         dkv = ({"dkv_family": fed[0].name, "dkv_consumers": min(fed[0].consumers, BACKWARD_CONSUMERS)}
                if fed else {})
-        deterministic = deterministic_ops_requested()
         found = []
-        if not deterministic:
-            # Legal where the form, the hooks, the widths and the registers allow (`legal`): of the one
-            # launch keys first and queries first, the larger query tile (`_derived`'s order).
-            for shared in [*({**dkv, "staged_logits": staged} for staged in (False, True) if dkv), {}]:
-                def fused(rows: int, walked: int, consumers: int, shared=shared) -> BackwardTiles:
-                    return BackwardTiles(walked, rows, 2, consumers, fused=True, family=family.name, **shared)
+        # Legal where the form, the hooks, the widths, the registers and the mode allow (`legal`): of the
+        # one launch keys first and queries first, the larger query tile (`_derived`'s order).
+        for shared in [*({**dkv, "staged_logits": staged} for staged in (False, True) if dkv), {}]:
+            def fused(rows: int, walked: int, consumers: int, shared=shared) -> BackwardTiles:
+                return BackwardTiles(walked, rows, 2, consumers, fused=True, family=family.name, **shared)
 
-                if config := _derived(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
-                                      overlapped=False):
-                    found.append(config)
+            if config := _derived(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
+                                  overlapped=False):
+                found.append(config)
         # Queries first on the layout whose consumers feed their rings, each consumer its own keys over
         # the query stream it feeds (FlashAttention 3's CTA), at the layout's consumers, whom no
         # producer's warpgroup shares the registers with (ET-FFED3-h100, the fused launch: 2.40 against
         # 2.71 ms causal and 4.32 against 5.54 full at Qwen3-8B's widths, 0.47 against 0.59 at width 64).
-        # Deterministic mode's one launch, every add across programs in its turn (`Family.ticketed`,
-        # FlashAttention 3's deterministic backward); else the two launches below, each program's sums its
-        # own.
         for layout in fed:
             def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
@@ -1297,7 +1288,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # one key block, each its share of the columns (FlashAttention 3's width 256: ET-COOP1-h100,
         # 0.68 ms against the two launches' 1.30 at Qwen3-8B's heads 256 wide, causal; where the sums
         # fit, sharing cost 9% at width 128 and 46% at 64, ET-COOP2-h100).
-        for layout in fed if not deterministic else ():
+        for layout in fed:
             def sharing(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name,
                                      shared_keys=True)
@@ -1367,22 +1358,6 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return max(resources.shared_bytes(layout, launch_scope(layout, allocations, reducing(
             layout, tiles.consumers, self.score_reduces), reduces=reduces))
             for layout, tiles, allocations, reduces in launches)
-
-    def _all_resident(self, ba: tokamax.BoundArguments, config: BackwardTiles,
-                      target: generation.GpuTarget) -> bool:
-        """Whether every program of the fused launch at `config` is resident at once (spec §6: a launch whose
-        programs wait on earlier turns, `Family.ticketed`, runs only so): its grid's programs, a query head's
-        key blocks each, within the multiprocessors times the programs one holds at its registers
-        (`Family.programs`) and its shared memory (row 4732)."""
-        query, key = ba.arguments["query"], ba.arguments["key"]
-        family = bundle_of(config, query.dtype)
-        if family is None or not target.multiprocessors:
-            return False
-        programs = query.shape[0] * query.shape[2] * -(-key.shape[1] // (config.consumers * config.block_k))
-        resident = family.programs(config.consumers, self.registers(ba, config))
-        if target.shared_limit:
-            resident = min(resident, max(1, target.shared_limit // self.staged_bytes(ba, config, target)))
-        return programs <= target.multiprocessors * resident
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:
         # None on a family that budgets none (`Family.budgets_registers`), which holds every config.
