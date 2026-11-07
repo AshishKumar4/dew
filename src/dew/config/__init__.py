@@ -398,6 +398,9 @@ class SourceOptions:
     scan_layers: bool = False
     """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
     (`Pretrained.load`'s `scan_layers`): a step's program grows with the period, not the depth."""
+    packed_experts: bool = False
+    """An MXFP4 source's routed experts served as their codes, NVFP4 banks the expert layers multiply
+    as they are (`Pretrained.load`'s `packed_experts`, row 4516): its experts' memory a quarter of bf16's."""
     param_dtype: str | None = None
     """The dtype the source's parameters are stored in, its checkpoint's own as 'auto'; None stores a
     source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
@@ -423,7 +426,7 @@ class SourceOptions:
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
                 "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers,
-                "step": self.step, "ema": self.ema}
+                "packed_experts": self.packed_experts, "step": self.step, "ema": self.ema}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -444,6 +447,7 @@ class SourceBuild(TypedDict, total=False):
     modeling_overrides: Mapping[str, object] | None
     dex: DifferentialExtension | None
     scan_layers: bool
+    packed_experts: bool
     step: int | str | None
     ema: bool | None
 
@@ -1240,10 +1244,12 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers",)
+    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers", "packed_experts")
     """The model and source fields, by name, that say how a model's layers execute and not what they
     compute or store: a decoder's runs under one scan or a layer at a time hold the same layers on disk
-    (`layers_N`) and compute the same step, so a run resumes under either (`check_resume`)."""
+    (`layers_N`) and compute the same step, and a source's experts packed or decoded hold the same values
+    (its MXFP4 codes, which an export writes back alike), so a run resumes under either
+    (`check_resume`)."""
 
     BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,

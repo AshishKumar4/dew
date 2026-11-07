@@ -100,6 +100,27 @@ def test_mxfp4_decodes_into_its_kept_dtype_as_float32_then_a_cast_does(param_dty
     np.testing.assert_array_equal(decoded.view(np.uint8), expected.view(np.uint8))
 
 
+@pytest.mark.parametrize("spread", [0, 17, 18])
+def test_mxfp4_experts_reexpress_as_nvfp4_exactly_within_e4m3s_powers(spread):
+    """An MXFP4 bank's experts as NVFP4's parts with no value decoded (`mxfp4_tensor_powers`,
+    `mxfp4_as_nvfp4`): each value its E2M1 nibble's times its 16-value block's E4M3 scale times its expert's
+    power of two, exactly the MXFP4 decode, where an expert's group powers spread by at most E4M3's 17 (an
+    all-zero group's 0x00 byte none), a slice of its experts its own; past it, none."""
+    rng = np.random.default_rng(0x4516)
+    blocks = rng.integers(0, 256, (3, 5, 4, codecs.GROUP // 2), dtype=np.uint8)
+    scales = (100 + rng.integers(0, spread + 1, (3, 5, 4))).astype(np.uint8)
+    scales[:, 0, 0], scales[:, 0, 1] = 100, 100 + spread
+    blocks[1, 2, 3], scales[1, 2, 3] = 0, 0
+    powers = codecs.mxfp4_tensor_powers(scales)
+    if spread > 17:
+        assert powers is None
+        return
+    assert powers is not None
+    nibbles, block, tensor = codecs.mxfp4_as_nvfp4(blocks[1:], scales[1:], powers[1:])
+    values = codecs.E2M1[nibbles] * np.repeat(block.astype(np.float32), 16, axis=1) * tensor[:, None, None]
+    np.testing.assert_array_equal(values, codecs.dequantize_mxfp4(blocks[1:], scales[1:]))
+
+
 def test_a_group_rounding_past_the_largest_power_of_two_is_refused():
     """3e38 has mantissa fraction 0.76 over 2 ** 127, so it rounds up to
     2 ** 128, past float32, whose exponent byte would be E8M0's NaN."""

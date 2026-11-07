@@ -601,17 +601,26 @@ def per_shard(kernel: str) -> None:
 
 
 def parameter_path(path) -> Suffix:
-    """The parameter's own path: the trailing run of dict keys under a leaf.
+    """The parameter's own path: the trailing run of dict keys under a leaf, and where the leaf is a field
+    of a registered dataclass held in that run (a packed bank's, `dew.nn.kernels.gemm.NvFp4`: its leaves
+    its fields), the field's name last.
 
     An optimizer state nests a copy of the parameter tree inside its own
-    structure, so what identifies a parameter is where its path ends.
+    structure, so what identifies a parameter is where its path ends; an attribute before the run (a
+    train state's `params`, an optimizer state's `mu`) is the container's, not the parameter's.
     """
+    def named(entry) -> bool:
+        return isinstance(entry, jax.tree_util.DictKey) and isinstance(entry.key, str)
+
+    field = ()
+    if len(path) > 1 and isinstance(path[-1], jax.tree_util.GetAttrKey) and named(path[-2]):
+        field, path = (path[-1].name,), path[:-1]
     names = []
     for entry in reversed(path):
-        if not isinstance(entry, jax.tree_util.DictKey) or not isinstance(entry.key, str):
+        if not named(entry):
             break
         names.append(entry.key)
-    return tuple(reversed(names))
+    return (*reversed(names), *field)
 
 
 _BOXED: contextvars.ContextVar[Mapping[Suffix, LogicalAxes]] = contextvars.ContextVar(
