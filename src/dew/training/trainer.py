@@ -85,7 +85,7 @@ from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
 from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
-from dew.training._candidates import candidate_for, lowered_for, prepared_for
+from dew.training._candidates import Stepping, candidate_for, lowered_for, prepared_for
 from dew.training._fit import (
     Emptied,
     FitPlan,
@@ -478,6 +478,13 @@ class Trainer(Generic[Loss, Effects]):
             return self.device_mesh
         from dew.distributed.host import companion_mesh
         return companion_mesh(self.device_mesh)
+
+    def _stepping(self) -> Stepping[Loss, Effects]:
+        """What a fit search's candidates read of this trainer beside its public fields, as it stands
+        (`dew.training._candidates.Stepping`)."""
+        return Stepping(self, self._loss_shape, self._staging, self._initialize_accumulation,
+                        self._model_batch, self._model_shapes, self._step_body, self._fetched, self._prefetch,
+                        self._examples, self._traced_on, self._rows, self._split)
 
     @functools.cached_property
     def _staging(self) -> StageLocal:
@@ -950,8 +957,11 @@ class Trainer(Generic[Loss, Effects]):
         no memory, a compile-only GPU's, holds `capacity` bytes, as a step compiled ahead states them.
         """
         if (target := self.lower_for) is not None:
-            # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
-            raise Lowered(target, *routed(lambda: lowered_for(self, state, batch, target)))
+            # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`); it lowers at
+            # the base rung.
+            self._at_base_rung(batch)
+            raise Lowered(target, *routed(lambda: lowered_for(self._stepping(), state, batch, target,
+                                                              self._narrow)))
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         # A state pools its windows' microbatches where it holds a window, or saved between updates, where
         # its checkpoint holds none (`dew.state.without_empty_window`), at a split past one.
@@ -1055,9 +1065,9 @@ class Trainer(Generic[Loss, Effects]):
 
         def lower(split: int, narrow: bool, footprint: Footprint | None = None, lowering=True) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
-            return candidate_for(self, state, batch, schedule, placement, replicated, split, narrow,
-                                   recorded_launches(recorded, rung), lowering=lowering, capacity=capacity,
-                                   footprint=footprint)
+            return candidate_for(self._stepping(), state, batch, schedule, placement, replicated, split,
+                                 narrow, recorded_launches(recorded, rung), lowering=lowering,
+                                 capacity=capacity, footprint=footprint)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1593,7 +1603,7 @@ class Trainer(Generic[Loss, Effects]):
         them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
         micro = microbatch_shapes(split_fields(batch)[0], split)
         with self._traced_on(self.device_mesh) as schedule:
-            _, _, whole = prepared_for(self, state, micro, schedule, split, narrow=False)
+            _, _, whole = prepared_for(self._stepping(), state, micro, schedule, split, narrow=False)
         return self._validated(whole, capacity)[1]
 
     def _fitting(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:
