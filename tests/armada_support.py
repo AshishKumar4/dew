@@ -1,5 +1,5 @@
-"""The tools of tests/test_armada_ci.py, tests/test_armada_reuse.py and tests/test_armada_recorder.py: Dew's
-CI on armada (tools/armada/ci.py) run on small test files written into a checkout of their own."""
+"""The tools of the armada CI test modules (tests/test_armada_*.py): Dew's CI on armada
+(tools/armada/ci.py) run on small test files written into a checkout of their own."""
 
 import json
 import re

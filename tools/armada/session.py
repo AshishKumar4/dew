@@ -9,6 +9,7 @@ installed."""
 import ast
 import functools
 import os
+import re
 from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
 
@@ -55,10 +56,76 @@ def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
 
 
 def pytest_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """What CI's pytest runs under: this process's environment, `environ` over it, the Hub closed, and
-    tools/armada on the path, where the plugins a task loads (split.py, executed.py) import from."""
+    """What CI's pytest runs under: this process's environment but what pytest reads as its own arguments
+    (`UNKEYED`), `environ` over it, the Hub closed, and tools/armada on the path, where the plugins a task
+    loads (split.py, executed.py) import from: what a run selects and loads is its command's alone, which
+    every row's key holds (row 2558: an inherited PYTEST_ADDOPTS could reuse a green row its run would not
+    give)."""
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
-    return {**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path}
+    inherited = {name: value for name, value in os.environ.items() if name not in UNKEYED}
+    return {**inherited, **environ, **CLOSED_HUB, "PYTHONPATH": path}
+
+
+UNKEYED = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS")
+"""The variables pytest reads as arguments and plugins to load, which a supervisor's environment may carry
+and no row's key holds: a task's pytest runs without them (`pytest_environment`)."""
+
+
+SHARDS = {"check1_shards": "seeds", "shards": "units"}
+"""The marks of a site too long for one task (pyproject.toml's markers), each by the count it declares:
+`check1_shards(seeds=S, per_task=P)` on a test whose `assert_as_exact` sites (tests/reference_error.py)
+declare S seeds, which check 1's two stages draw (1 + REDRAW) times over; and `shards(units=N,
+per_task=P)` on a test whose work is N units of its own, split the same way (a witness's items). CI runs
+either as armada's map and judge (ci.py's `site_entries`): map tasks of P units each over the units its
+stages or its work take, and one judge."""
+
+SITE = re.compile(r"(?P<test>(?:\w+\.)*test\w*)(?:\.draws-(?P<start>\d+)-(?P<stop>\d+))?")
+"""A check-1 site's group in its rows' names (ci.py's `row`), which its tasks' split carries: its test's name
+in its file (ci.py's `sites`), its judge's, whose row is the site's verdict; or that and the seeds one of its
+map tasks draws, `<test>.draws-<start>-<stop>`."""
+
+
+def selected(command: list[str], network: bool, whole: bool = False, release: bool = False,
+             site: bool = False) -> list[str]:
+    """CI's pytest `command` (`pytest_run`), or with `network` the same selecting the network-marked tests
+    alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on the
+    whole suite's run (`whole`: DEW_WHOLE_SUITE, CI's schedule and its whole dispatch), whatever the cache's
+    policy: a policy-off train runs every file, never a whole-suite cell (the maintainer, 2026-10-28: train
+    250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks run in
+    their own tasks alone (`release`), every one whatever else marks it, under a requirement the suite's
+    environment lacks (ci.py's `release_plan`), and on no other run, the network lane's among them. A site
+    marked one of `SHARDS` runs in its own tasks alone (`site`: its map tasks and its judge, ci.py's
+    `site_entries`), and every other run sets it aside. This module is every row's key's (ci.py's `SHARED`),
+    so a change to what a run selects re-keys every row (row 2558)."""
+    at = command.index(SELECTION[1])
+    if release:
+        chosen = "release_env"
+    elif network:
+        chosen = "network and not release_env"
+    else:
+        chosen = (SELECTION[1] + " and not release_env" + ("" if whole else " and not whole_suite")
+                  + ("" if site else "".join(f" and not {kind}" for kind in SHARDS)))
+    return [*command[:at], chosen, *command[at + 1:]]
+
+
+def selection(tests: list[str], split: str, release: str = "") -> list[str]:
+    """pytest's arguments that select `tests` as a CI task does: one group of a split file (`split`,
+    split.py), a release check's tests (`release`, release.py), or a check-1 site's test alone (`split` its
+    group, `SITE`)."""
+    site = SITE.fullmatch(split)
+    grouping = (["-p", "split", f"--ci-group={split}"] if split and not site else []) + (
+        ["-p", "release", f"--ci-release={release}"] if release else [])
+    named = [f"{name}::{site['test'].replace('.', '::')}" for name in tests] if site else tests
+    return [*named, *grouping]
+
+
+def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
+    """CI's pytest `run` over `tests`, with the plugin that records what ran (executed.py), as `selection`
+    selects them. A release check's pytest runs with its requirement over the suite's environment, whose
+    torch and jax it keeps: uv's overlay."""
+    command = [*run, "-p", "executed", *selection(tests, split, release)]
+    return ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
+            *command[1:]] if release else command
 
 
 MARKS = ("gpu",)

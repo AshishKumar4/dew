@@ -363,6 +363,29 @@ def mtp_depth(directory, *, experts):
 GLM_MOE_DSA = FIXTURES / "glm-moe-dsa-tiny"
 
 
+def test_the_glm_moe_dsa_references_selections_are_its_function_not_a_tie_rules():
+    """transformers' GLM-5 indexers select every query's keys, on the fixture's ids and on prompts drawn
+    from its tokens, with no tie at their top-k cut (`dsa_support.tied_cuts`), so a check of Dew against
+    them compares the two implementations' selections rather than two tie rules: Dew chooses the lower
+    key index among equal scores, torch's topk no order. Its eight indexer heads put an exact 0 score at
+    2^-8 a key; at four, 26 to 30 queries a prompt were cut among ties (row 4703)."""
+    import torch
+    from dsa_support import indexer_rankings, tied_cuts
+    from transformers import AutoModelForCausalLM
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaIndexer
+
+    reference = AutoModelForCausalLM.from_pretrained(GLM_MOE_DSA, dtype=torch.float32,
+                                                     local_files_only=True).eval()
+    ids = np.load(GLM_MOE_DSA / "input_ids.npy")
+    prompts = [ids, *(np.random.default_rng([241, seed]).choice(np.unique(ids), size=ids.shape)
+                      for seed in range(16))]
+    with indexer_rankings(reference, GlmMoeDsaIndexer) as taken, torch.no_grad():
+        for prompt in prompts:
+            reference(input_ids=torch.from_numpy(prompt.astype(np.int64)))
+    assert taken
+    assert tied_cuts(taken) == 0
+
+
 FP8_TENSORS = {'quant_method': 'compressed-tensors', 'format': 'float-quantized', 'ignore': [],
                'config_groups': {'group_0': {'targets': ['Linear'], 'weights': {
                    'num_bits': 8, 'type': 'float', 'strategy': 'tensor', 'symmetric': True,

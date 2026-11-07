@@ -610,23 +610,26 @@ def test_a_stage_names_the_dials_the_block_supports(rng):
     assert not jnp.allclose(projected, output(use_projection=True, norm_epsilon=1.0), atol=1e-5)
 
 
-@pytest.mark.parametrize("dtype", [None, jnp.float32, jnp.bfloat16])
-def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, rng):
-    """An unchanged stage inherits the model dtype, or fp32 when both leave it unset."""
+@pytest.mark.parametrize("dtype, inputs", [(None, jnp.float32), (jnp.float32, jnp.float32),
+                                           (jnp.bfloat16, jnp.bfloat16), (None, jnp.float64)],
+                         ids=["unset", "float32", "bfloat16", "unset-float64"])
+def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, inputs, rng):
+    """An unchanged stage inherits the model dtype, or, when both leave it unset, at least fp32 of its
+    input's: a float64 run attends in float64, as FlaxDiff's float64 twin does."""
     from dew.nn.attention_blocks import stage_attention
 
-    expected_dtype = dtype or jnp.float32
+    expected_dtype = dtype or inputs
     stage = Stage(heads=2)
-    block = stage_attention(stage, 8, "reference", dtype, None, "attention")
-    explicit = stage_attention(
-        Stage(heads=2, dtype=expected_dtype), 8, "reference", dtype, None, "attention")
-    x = jnp.ones((1, 4, 8), expected_dtype)
-    variables = block.init(rng, x)
-    output = block.apply(variables, x)
-
-    assert stage.dtype is None and stage.force_fp32_for_softmax is True
-    assert output.dtype == expected_dtype
-    np.testing.assert_array_equal(output, explicit.apply(variables, x))
+    with jax.enable_x64(new_val=inputs == jnp.float64):
+        block = stage_attention(stage, 8, "reference", dtype, None, "attention")
+        explicit = stage_attention(
+            Stage(heads=2, dtype=expected_dtype), 8, "reference", dtype, None, "attention")
+        x = jnp.ones((1, 4, 8), inputs)
+        variables = block.init(rng, x)
+        output = block.apply(variables, x)
+        assert stage.dtype is None and stage.force_fp32_for_softmax is True
+        assert output.dtype == expected_dtype
+        np.testing.assert_array_equal(output, explicit.apply(variables, x))
 
 
 GROUP_NORM_SEEDS = 32

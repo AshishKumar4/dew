@@ -18,17 +18,20 @@
 #   PRIORITY         the jobs' armada priority (none: armada's default)
 #   DEW_TEST_CACHE   the test cache's policy (tools/armada/ci.py policy; `off` runs every file)
 #   DEW_WHOLE_SUITE  1 for the whole suite: the whole_suite cells, every file on the newest Python, and the release
-#                    checks after it (tools/armada/ci.py `selected`, `plan`, `release-plan`)
+#                    checks after it (tools/armada/session.py `selected`, ci.py `plan`, `release-plan`)
 #   GANGLESS         1 to run no gangs (a base/kernels push and a base/<producer> promote: main's trains run them)
 #   POOL             the suite's pool (none: .armada.json's), and BACKGROUND, 1 for a run that takes a bounded share
 #                    of the fleet with a longer deadline
 #   PROVEN           non-empty where the commit was proven green already: nothing runs
-#   OUT              where the clients' logs and the jobs' ids (jobs.txt) are kept (default: a new directory)
+#   OUT              where the clients' logs, the jobs' ids (jobs.txt) and the gangs' outcome (gangs.outcome,
+#                    success or failure, absent where no gang ran) are kept (default: a new directory)
 set -u
 sha=$1
 armada=${ARMADA:-armada}
 out=${OUT:-$(mktemp -d)}
 mkdir -p "$out"
+# The gangs' outcome is this run's alone, and none where no gang runs (GANGLESS, PROVEN).
+rm -f "$out/gangs.outcome"
 priority=${PRIORITY:+--priority=$PRIORITY}
 echo "the test cache's policy: ${DEW_TEST_CACHE:-}"
 # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell reaches it and it cancels
@@ -49,7 +52,7 @@ if [ -z "${PROVEN:-}" ] && [ -z "${GANGLESS:-}" ]; then
     --pool="$(echo "$items" | python3 -c 'import json, sys; print(sum(gang["gang"] for gang in json.load(sys.stdin)))')" \
     --deadline=$side --gang-start-timeout=300 $priority --label="${LABEL:-$sha}" -- python3 tools/armada/ci.py pytest \
     --python="$(tr -d '\n' < .python-version)" --report=/tmp/dew-gang.xml \
-    -- -k "{select}" --basetemp=/tmp/dew-gang tests/test_multihost.py > "$out/gangs.log" 2>&1 &
+    -- -s -k "{select}" --basetemp=/tmp/dew-gang tests/test_multihost.py > "$out/gangs.log" 2>&1 &
   gangs=$!
 fi
 # Its own deadline sits above what every file takes on its containers when no row is cached: 2700 s; a cold suite
@@ -91,7 +94,9 @@ if [ -n "${DEW_WHOLE_SUITE:-}" ]; then
   fi
 fi
 if [ -n "${gangs:-}" ]; then
-  wait "$gangs" || failed=1
+  # The gangs' own outcome beside the logs (gangs.outcome), apart from the suite's: the land queue's CI reads it
+  # as a job of its own, so a round whose suite rows prove flaky publishes only with the gangs green (row 4034).
+  if wait "$gangs"; then echo success > "$out/gangs.outcome"; else echo failure > "$out/gangs.outcome"; failed=1; fi
   echo "--- the multi-host gangs"
   cat "$out/gangs.log"
   # A red gang's logs, every rank's and attempt's with each one's relay (armada's GET /jobs/<id>/tasks/<i>/runs, and

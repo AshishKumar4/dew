@@ -14,8 +14,10 @@ JAX's own key of each program and its flags.
 JAX keeps a program as one file, `<key>-cache`, in `jax_compilation_cache_dir`, and with no
 `jax_compilation_cache_max_size` (Dew sets none) it neither evicts nor stamps them
 (jax/_src/lru_cache.py in jax 0.11.2), so the files a directory gains while a file's tests run are
-the programs they compiled. The programs they only read are not seen, so a program another
-file's bundle brought in joins this file's bundle only where it is compiled under it. Each pytest
+the programs they compiled, which a watch of the directory reports as they arrive
+(tools/armada/watched.py's `Writes`), so no switch of bundle lists it. The programs they only read
+are not seen, so a program another file's bundle brought in joins this file's bundle only where it
+is compiled under it. Each pytest
 worker that keeps a bundle has a directory of its own (conftest), so the files a worker's bundle
 gains are its own whole writes, never another worker's half-written one.
 
@@ -38,6 +40,7 @@ does not take the remote back, and the uploads still queued are dropped unsent. 
 background thread, and the process waits up to `DRAIN_SECONDS` for them at exit.
 """
 
+import contextlib
 import importlib.util
 import itertools
 import logging
@@ -63,6 +66,10 @@ _HOST = importlib.util.spec_from_file_location(
     "armada_host", Path(__file__).resolve().parents[1] / "tools" / "armada" / "host.py")
 HOST = importlib.util.module_from_spec(_HOST)
 _HOST.loader.exec_module(HOST)  # the host's CPU class, which keys a bundle (tools/armada/host.py)
+_WATCHED = importlib.util.spec_from_file_location(
+    "armada_watched", Path(__file__).resolve().parents[1] / "tools" / "armada" / "watched.py")
+WATCHED = importlib.util.module_from_spec(_WATCHED)
+_WATCHED.loader.exec_module(WATCHED)  # inotify's one reader (tools/armada/watched.py's `Writes`)
 MAX_BYTES = r2.MAX_BYTES
 """The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
 SIBLINGS = 3
@@ -73,6 +80,8 @@ GROUP = re.compile(r"^(?P<path>.+?)/(?P<index>\d+)-of-(?P<count>\d+)(?P<rest>(?:
 """A split group's bundle: its file, its group G of N (`bundle`) and any worker after it."""
 SUFFIX = "-cache"
 """What JAX's cache names a program's file after its key (jax/_src/lru_cache.py)."""
+STAGING = ".staging"
+"""The directory within the cache where a restored program is written before it is linked in whole."""
 UNREACHABLE = (OSError, r2.R2Error)
 """A request the Worker did not answer as asked (`r2.R2Error`), or a local read or write of the cache
 directory that fails (an OSError)."""
@@ -95,7 +104,16 @@ class RemoteCache:
         sealing; held across no request."""
         self.file: str | None = None
         self.seen: set[str] | None = None
-        """The programs in the directory when the current bundle's run began or last moved on."""
+        """The programs in the directory when the current bundle's run began or last moved on: listed once,
+        then kept by what arrives in it (`writes`)."""
+        # The directory the watch watches, there before it (conftest's `enable_compilation_cache` makes it; a
+        # caller that names a new one has it made here). One that cannot be made (a file in its place) cannot
+        # be watched: the remote is left alone.
+        with contextlib.suppress(OSError):
+            self.directory.mkdir(parents=True, exist_ok=True)
+        self.writes = WATCHED.Writes(str(self.directory))
+        """What arrives in the directory, JAX's programs and the bundles' own (watched.py's `Writes`): a
+        bundle's switch lists no directory of hundreds of thousands of programs (row 3496)."""
         self.written: dict[str, list[str]] = {}
         """The programs compiled while each bundle's tests ran, in the order they appeared."""
         self.fetched: dict[str, list[str]] = {}
@@ -116,6 +134,11 @@ class RemoteCache:
         """The programs the remote's bundles put in the directory, and the bundles it took."""
         self.bytes_fetched = self.bytes_uploaded = 0
         """The bundles' bytes read and sent, which the summary reports."""
+        if not self.writes.watching:
+            # No program a run compiles could be told from the rest without listing the directory at every
+            # switch: the task compiles without the remote.
+            self.given_up = True
+            logger.warning("the shared XLA cache cannot watch %s; compiling without it", self.directory)
 
     @property
     def available(self) -> bool:
@@ -142,13 +165,19 @@ class RemoteCache:
 
     def _moved_on(self) -> None:
         """The programs the directory gained since the current bundle's run began or last moved on,
-        written to its account (under `state`)."""
+        written to its account (under `state`): those that arrived in it (`writes`), the directory listed
+        again only where the watch's queue overflowed meanwhile."""
+        arrived = self.writes.gained()
         if self.file is None or self.seen is None:
             return
-        programs = self._programs()
+        if arrived is None:
+            programs = self._programs()
+            fresh, self.seen = programs - self.seen, programs
+        else:
+            fresh = {name.removesuffix(SUFFIX) for name in arrived if name.endswith(SUFFIX)} - self.seen
+            self.seen |= fresh
         written = self.written.setdefault(self.file, [])
-        written += sorted(programs - self.seen - set(written))
-        self.seen = programs
+        written += sorted(fresh - set(written))
 
     def opened(self, file: str) -> None:
         """Bundle `file` in the local cache, and the programs compiled from here on its."""
@@ -159,7 +188,8 @@ class RemoteCache:
                 if file != self.file:
                     self._moved_on()
                     self.file = file
-                    self.seen = self._programs()
+                    if self.seen is None:
+                        self.seen = self._programs()
                 if file in self.held:
                     return
                 self.held[file] = set()
@@ -244,9 +274,13 @@ class RemoteCache:
         return entries
 
     def _seeded(self, key: str, value: bytes) -> bool:
-        """`value` as program `key`'s file, written to a name of its own and linked in whole, so a
-        reader sees all of it or none; False, writing nothing, where the directory has it already."""
-        handle, staged = tempfile.mkstemp(prefix=".", suffix=".partial", dir=self.directory)
+        """`value` as program `key`'s file, written to a name of its own beside the directory's programs (its
+        STAGING, which the watch does not see, so a restored program is one event, not two) and linked in
+        whole, so a reader sees all of it or none; False, writing nothing, where the directory has it
+        already."""
+        staging = self.directory / STAGING
+        staging.mkdir(exist_ok=True)
+        handle, staged = tempfile.mkstemp(prefix=".", suffix=".partial", dir=staging)
         try:
             with os.fdopen(handle, "wb") as written:
                 written.write(value)
@@ -329,6 +363,7 @@ class RemoteCache:
         while (self.uploads.unfinished_tasks and self.uploader.is_alive()
                and time.monotonic() - began < seconds):
             time.sleep(0.1)
+        self.writes.close()
 
 
 def bundle(node: str, group: str | None, worker: str | None) -> str:

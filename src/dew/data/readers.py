@@ -14,7 +14,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew import _position
-from dew._records import json_value, record
+from dew._records import record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
     Closeable,
@@ -32,7 +32,8 @@ from dew.data.dataset import (
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import COUNTERS, Plan, earlier_position
-from dew.data.storage import MIRRORED, carried_mirrors, mirror_metrics, without_mirrors
+from dew.data.shared import SharedMapping
+from dew.data.storage import MIRRORED, PositionText, carried_mirrors, mirror_metrics
 
 READER_FIELDS = (EXAMPLES_CONSUMED, VALID_ROWS)
 """A batch's fields its reader owns, which a host step after the batch neither reads nor writes
@@ -237,6 +238,11 @@ class _PerShare(Forwarding):
         self._saved: Mapping[str, object] | None = None
         self._state: Mapping[str, object] | None = None
         self._statistics = _PublishedCounts()
+        # Its plan's record, which no read moves, held as a shared mapping (`SharedMapping`), its parts each
+        # written once; its positions' text, each member's written once while its positions hold it
+        # (`PositionText`).
+        self._plan_record = SharedMapping.of(plan.record())
+        self._position_text = PositionText()
 
     def _forwarded(self) -> pygrain.DatasetIterator[Batch] | None:
         return self._read
@@ -279,12 +285,9 @@ class _PerShare(Forwarding):
             state = self._reader().get_state()
             self._publish(state)
         # The position alone: the loading workers' mirror counters it carried are this read's metrics, not
-        # its place (`without_mirrors`), so every reader of an elastic read saves one position.
-        saved = {"dew_data_plan": self._plan.record(), "counters": COUNTERS, "iterator": state}
-        # A mix's captured positions are shared mappings (`SharedMapping`), written as the records they
-        # read as.
-        return json.dumps(without_mirrors(json_value({_position.REPLICATED: saved} if self._replicated
-                                                     else saved, "data position"))).encode()
+        # its place (`PositionText` empties them), so every reader of an elastic read saves one position.
+        saved = {"dew_data_plan": self._plan_record, "counters": COUNTERS, "iterator": state}
+        return self._position_text({_position.REPLICATED: saved} if self._replicated else saved)
 
     def set_state(self, state: bytes) -> None:
         held = _position.replicated(state)

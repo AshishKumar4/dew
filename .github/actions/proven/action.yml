@@ -17,18 +17,17 @@ runs:
         GH_TOKEN: ${{ github.token }}
         WORKFLOW: ${{ inputs.workflow }}
       run: |
-        # A pull request's run tested a merge, not this commit; a base/<producer> promote's (ci/base-*) ran no
-        # gangs, which proves the commit for no other run.
+        # A pull request's run tested a merge, not this commit; a push to base/kernels ran no gangs, which proves the
+        # commit for no other run.
         run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$GITHUB_SHA&status=success" \
-          --jq '[.workflow_runs[] | select(.event != "pull_request" and (.head_branch | test("^ci/base-") | not))][0].id // empty')
+          --jq '[.workflow_runs[] | select(.event != "pull_request" and .head_branch != "base/kernels")][0].id // empty')
         if [ -n "$run" ]; then
           echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"
         elif [ "$GITHUB_REF" = refs/heads/main ]; then
           # Main moves only to a tip the land queue graded green, on its first round or on a red whose rows its
-          # regrade passed and recorded as flaky; it posts that proof (context land-queue) before main moves, as
-          # the train's own run, red on such a row, proves nothing here (the maintainer, 2026-10-27: train
-          # 229's main push re-ran the suite for 11 minutes and held the next train's test job). A lane's push
-          # reads no status.
+          # regrade passed and recorded as flaky; the hub's mirror posts that proof (context land-queue) as it
+          # pushes main (the maintainer, 2026-10-27: train 229's main push re-ran the suite for 11 minutes and
+          # held the next train's test job). A lane's push reads no status.
           run=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/statuses" \
             --jq '[.[] | select(.context == "land-queue" and .state == "success")][0].id // empty')
           if [ -n "$run" ]; then echo "graded green by the land queue (commit status $run)"; fi

@@ -1412,8 +1412,8 @@ def test_a_cooldown_branch_ends_a_schedules_stage_where_a_run_decayed_there_does
         [optax.constant_schedule(peak), optax.linear_schedule(peak, 0.0, 4)], [2]))
     decayed = RecordingTracker()
     run(decaying, 6, decayed)
-    committed = list(itertools.accumulate(scalars["train/tokens"] for _, scalars in decayed.scalars
-                                          if "train/tokens" in scalars))
+    committed = list(itertools.accumulate(scalars["train/committed_tokens"] for _, scalars in decayed.scalars
+                                          if "train/committed_tokens" in scalars))
     assert committed[1] < 50 <= committed[-1], "the branch's steps cross the stage's end"
     finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
     assert cooled == {2: finals[-1]}
@@ -1455,8 +1455,8 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
     tracker = RecordingTracker()
     scheduled = token_trainer(tmp_path / "scheduled", tracker, accumulation)
     whole = parameters(scheduled.fit(data, steps=8, log_every=1))
-    committed = list(itertools.accumulate(scalars["train/tokens"] for _, scalars in tracker.scalars
-                                          if "train/tokens" in scalars))
+    committed = list(itertools.accumulate(scalars["train/committed_tokens"] for _, scalars in tracker.scalars
+                                          if "train/committed_tokens" in scalars))
     step = next(index + 1 for index, tokens in enumerate(committed) if tokens >= 50)
     assert 1 < step < 8
     phased = phases((first, step), (second, None)).batch(8)
