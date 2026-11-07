@@ -202,7 +202,7 @@ def taken(region: Attention) -> bool:
     from dew.nn.kernels import generation
 
     shapes = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in region.operands]
-    with generation.routes() as found:
+    with generation.routes(alone=True) as found:
         jax.eval_shape(written(region), *shapes)
     return any(route.choice == "attention" and route.kernel not in KEPT for route in found)
 

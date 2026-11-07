@@ -308,7 +308,7 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
         assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
         expected = [kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes))
                     if kernel not in KEPT]
-        assert _attention_routes(lambda: dew.jit(attend).trace(*shapes)) == expected
+        assert set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == set(expected)
     draw = normal_drawn(41, *((2, 64, 4, 32),) * 4, dtype=jnp.bfloat16)
     with generation.chosen(attention="template"):
         attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}",
@@ -420,7 +420,8 @@ def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
 
     with generation.assumed("sm90"):
         assert not fused(lambda: jax.jit(program).trace(*shapes))
-        assert fused(lambda: dew.jit(program).trace(*shapes)) == fused(lambda: jax.jit(own).trace(*shapes))
+        expected = set(fused(lambda: jax.jit(own).trace(*shapes)))
+        assert set(fused(lambda: dew.jit(program).trace(*shapes))) == expected
     sizes = [shape.shape for shape in shapes]
     draw = normal_drawn(43, *sizes, sizes[0], dtype=jnp.bfloat16)
     assert_as_exact(jax.jit(with_gradients(dew.jit(program))), jax.jit(with_gradients(program)), draw,

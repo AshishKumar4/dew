@@ -2019,10 +2019,12 @@ class Transport[Allocated, Opened](abc.ABC):
             pl.when(program != first)(lambda: left(partials))
             pl.when(program == first)(lambda: left(opening))
             last = arrived(ready.at[gathered - 1], gathered - first)
-            # The first program's partial its own value where it arrives last, so the running value keeps
-            # its accumulator's layout whichever program merges.
-            first_partial = jax.tree.map(lambda own, left: jnp.where(program == first, own, left), summed,
-                                         read(opening, first))
+            # The first program's partial its own value where it arrives last, read back where another
+            # does, a splat predicate's select keeping the running value in the merger's own layout
+            # (an implicit broadcast lowers in no warpgroup semantics).
+            first_partial = jax.tree.map(
+                lambda own, left: jnp.where(jnp.full(own.shape, program == first), own, left), summed,
+                read(opening, first))
             pl.when(last == 1)(lambda: combined(first_partial))
 
 
