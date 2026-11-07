@@ -40,7 +40,7 @@ from ..kv_cache import cache_at_layer, cache_from_layer
 from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
-from .decoder_block import DecoderBlock, RematPolicy
+from .decoder_block import REMAT_POLICIES, DecoderBlock, RematPolicy
 from .layer_names import array_rows, group_layers, group_name, stage_count
 from .layer_plan import LayerSpec, run_period
 
@@ -406,7 +406,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                 store.update(written)
         elif _updates_in_backward(run, specs[first], train=train, decode=decode, fetching=fetching,
                                   periodic=periodic, store=store, inputs=inputs):
-            x = _updated_in_backward(run, x, attention_metadata=attention_metadata)
+            x = _updated_in_backward(run, x, attention_metadata=attention_metadata, remat=remat)
         else:
             # A longer run's layers share keys or own them, so they only read the store: a provider
             # is always a run of one (`run_stack`).
@@ -465,9 +465,16 @@ def _updates_in_backward(run: nn.Module, spec: LayerSpec, *, train: bool, decode
     return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates"))
 
 
-def _updated_in_backward(run: nn.Module, x, *, attention_metadata):
+_KEPT_WITHOUT_A_RUNG = REMAT_POLICIES['minimal_with_scan_and_conv']
+"""What a run updating in its backward keeps of a layer whose block names no rung: every named residual
+(its attention's, its scan's and conv's, its MLP's), recomputing the values between them as XLA's fusions
+of a layer at a time do, so its stacked residuals hold no more than that loop's (row 4098)."""
+
+
+def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematPolicy | None):
     """A scanned run as `dew.nn.in_backward.scanned_run` computes it: each layer the run's own module
-    applied on its row of the run's weights, its dropout drawn from a key of its own."""
+    applied on its row of the run's weights, its dropout drawn from a key of its own, under the layer's
+    rung, or where it names none what a layer at a time keeps (`_KEPT_WITHOUT_A_RUNG`)."""
     held = run.variables
     current = in_backward.plan()
     assert current is not None
@@ -476,10 +483,13 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata):
     keys = jax.random.split(run.make_rng("dropout"), count) if run.has_rng("dropout") else None
     alone = run.clone(parent=None)
 
-    def layer(weights_i, carry, key, metadata):
+    def applied(weights_i, carry, key, metadata):
         rngs = None if key is None else {"dropout": key}
         return alone.apply({"params": weights_i}, carry, train=True, decode=False, kv_store=None,
                            per_layer_input=None, attention_metadata=metadata, rngs=rngs)
+
+    layer = applied if remat is not None else jax.checkpoint(
+        applied, policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
 
     return in_backward.scanned_run(
         run.path, layer, weights, held.get(in_backward.MASTERS),

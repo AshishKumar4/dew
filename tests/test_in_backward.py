@@ -99,6 +99,7 @@ def test_a_scanned_steps_runs_update_in_their_backward_and_train():
     moments, advances the optimizer's count once, and its loss falls."""
     run = trainer(decoder(scan=True), ADAMW)
     state, _, _ = run.place()
+    before = jax.device_get(state.variables["params"]["stages"])
     batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
     step = run.compile(state, batch)
     losses, moved = [], state
@@ -106,7 +107,7 @@ def test_a_scanned_steps_runs_update_in_their_backward_and_train():
         moved, loss, *_ = step(moved, batch)
         losses.append(float(loss))
     assert losses[-1] < losses[0], losses
-    before, after = (jax.device_get(held.variables["params"]["stages"]) for held in (state, moved))
+    after = jax.device_get(moved.variables["params"]["stages"])
     pairs = zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True)
     assert all(not np.array_equal(old, new) for old, new in pairs)
     assert int(jax.device_get(moved.updates)) == 3
