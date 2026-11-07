@@ -42,14 +42,15 @@ XLA's."""
 CASTS = frozenset({"convert_element_type"})
 
 
+WIDENINGS = frozenset({("bfloat16", "float32"), ("float16", "float32"), ("bfloat16", "float64"),
+                       ("float16", "float64"), ("float32", "float64")})
+"""The float casts that keep every value: a wider exponent range and a longer significand at once (bfloat16 to
+float16 keeps neither: its range past 65504 is lost)."""
+
+
 def _widening(source: np.dtype, target: np.dtype) -> bool:
-    """A float cast to a float of at least as many bits: every value kept."""
-    return _floating(source, target) and target.itemsize >= source.itemsize
-
-
-def _floating(source: np.dtype, target: np.dtype) -> bool:
-    """A cast between floats (Flax's sum widened, then narrowed back to the weights' dtype)."""
-    return all(jnp.issubdtype(dtype, jnp.floating) for dtype in (source, target))
+    """A float cast that keeps every value (`WIDENINGS`), or none."""
+    return source == target or (np.dtype(source).name, np.dtype(target).name) in WIDENINGS
 
 
 class Attention(NamedTuple):
@@ -163,9 +164,10 @@ class _Graph:
         return atom
 
     def excluding(self, atom, dtype) -> bool:
-        """Whether `atom` is a constant scalar no logit of `dtype` lies under: -inf, or a sentinel at least
-        half `dtype`'s most negative finite value (jax's and Flax's `finfo.min` fills), whose exponential
-        beside any finite logit's is zero."""
+        """Whether `atom` is a constant scalar a fill or a maximum's initial value excludes with: -inf, or a
+        sentinel at least half `dtype`'s most negative finite value (jax's and Flax's `finfo.min` fills).
+        The written call and the program agree while every visible logit lies above the fill, as jax's and
+        Flax's own fills assume: a visible logit near `finfo.min` would weigh as a masked one there."""
         value = self.constant(atom)
         if value is None or np.ndim(value) != 0:
             return False
@@ -232,7 +234,7 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
         # The weights cast once, to the values' dtype, as both spellings narrow them for the product.
         cast_to = np.dtype(eqns[reader].outvars[0].aval.dtype)
         if not _floating(np.dtype(weights.aval.dtype), cast_to):
-            return None
+            return None  # the weights rounded once to the values' dtype: the product's operand, as written
         places.append(reader)
         weights = eqns[reader].outvars[0]
         if len(graph.readers[weights]) != 1:
@@ -325,8 +327,8 @@ def _back_to_rows(eqns, chain: list[int], labels: list[int], value, axis: int) -
 
 def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int | None:
     """The place of the division of the exponential (no cast between) by its sum over `axis` (the sum read
-    from the exponential widened, and narrowed back to its dtype, as Flax's), broadcast back to its own rows
-    (`_back_to_rows`)."""
+    from the exponential widened, `WIDENINGS`, and narrowed back to exactly its dtype, as Flax's, nothing
+    below it), broadcast back to its own rows (`_back_to_rows`)."""
     eqns = graph.jaxpr.eqns
     for reader in sorted(graph.readers[exponential]):
         if jax_name(eqns[reader].primitive) != "div":
@@ -335,12 +337,18 @@ def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int
         if numerator is not exponential:
             continue
         chain: list[int] = []
-        atom = graph.uncast(denominator, chain, _floating)
+        held = np.dtype(exponential.aval.dtype)
+
+        def back(source: np.dtype, target: np.dtype, held=held) -> bool:
+            # The sum narrowed back to exactly the exponential's dtype from a widening of it, or kept.
+            return target == held and _widening(held, source)
+
+        atom = graph.uncast(denominator, chain, back)
         broadcast = graph.made(atom, "broadcast_in_dim")
         if broadcast is None:
             continue
         chain.append(broadcast)
-        summed = graph.made(graph.uncast(eqns[broadcast].invars[0], chain, _floating), "reduce_sum")
+        summed = graph.made(graph.uncast(eqns[broadcast].invars[0], chain, back), "reduce_sum")
         if summed is None or tuple(eqns[summed].params["axes"]) != (axis,):
             continue
         widened: list[int] = []

@@ -254,11 +254,12 @@ def test_a_plain_programs_attention_under_a_mask_of_its_inputs_stays_as_written(
         assert not _attention_routes(lambda: dew.jit(input_masked).trace(*shapes))
 
 
-def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False):
+def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None):
     """Causal softmax attention as a program writes it out (its products as einsums, a causal where, the
     safe softmax), each keyword a way it computes something other than attention: a finite fill keeping the
-    future keys' weight, logits truncated through `logits_cast`, a maximum's initial value above the logits,
-    each row divided by another row's sum (heads and rows swapped in its broadcast)."""
+    future keys' weight, logits truncated or narrowed through `logits_cast`, a maximum's initial value above
+    the logits, each row divided by another row's sum (heads and rows swapped in its broadcast), the sum
+    narrowed through `sum_cast` (to float16, where 65536 keys' sum overflows)."""
     def attend(q, k, v):
         s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
         if logits_cast is not None:
@@ -266,6 +267,8 @@ def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows
         s = jnp.where(jnp.tril(jnp.ones(s.shape[-2:], bool)), s, fill)
         e = jnp.exp(s - jax.lax.stop_gradient(jnp.max(s, -1, keepdims=True, initial=initial)))
         total = jnp.sum(e, -1)
+        if sum_cast is not None:
+            total = total.astype(sum_cast).astype(total.dtype)
         if other_rows:
             total = jax.lax.broadcast_in_dim(total, (*e.shape[:-1], 1), (0, 2, 1))
         else:
@@ -277,11 +280,13 @@ def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows
 @pytest.mark.parametrize(("variant", "options"), [("attention", {}), ("finite fill", {"fill": 0.0}),
                                                   ("truncated logits", {"logits_cast": jnp.int32}),
                                                   ("initial above", {"initial": 1e30}),
-                                                  ("another row's sum", {"other_rows": True})])
+                                                  ("another row's sum", {"other_rows": True}),
+                                                  ("logits narrowed", {"logits_cast": jnp.float16}),
+                                                  ("sum narrowed", {"sum_cast": jnp.float16})])
 def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
     """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100; written out with
-    any step computing otherwise (a finite fill, truncated logits, an initial maximum above the logits, a
-    row normalized by another's sum), it stays as written, XLA's."""
+    any step computing otherwise (a finite fill, truncated or narrowed logits, an initial maximum above the
+    logits, a row normalized by another's sum, a sum narrowed past its range), it stays as written, XLA's."""
     import dew
 
     shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), jnp.bfloat16),) * 3
