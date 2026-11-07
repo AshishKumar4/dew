@@ -1816,10 +1816,14 @@ FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name i
                  for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)
                  for hooks in BACKWARD_HOOKS if hooks != "none"]
 FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
+FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
+FORWARD_GATE += [(generation_name, width, training, "none", jnp.float16) for generation_name in GATED
+                 for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
 split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set
-beside the walk's), and a softcap's inference forward 256 wide (Gemma's)."""
+beside the walk's), a softcap's inference forward 256 wide (Gemma's), all in bf16, and fp16's inference and
+training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes)."""
 
 
 @COMPILES_ON_CPU
@@ -2001,19 +2005,20 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("generation_name", "width", "training", "hooks"), FORWARD_GATE)
-def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks):
+@pytest.mark.parametrize(("generation_name", "width", "training", "hooks", "dtype"), FORWARD_GATE)
+def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks,
+                                                              dtype):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
-    wide under the score hook `hooks` names, lowered and compiled by ptxas for `generation_name` on this CPU
-    (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
-    model's decision ptxas's (`mosaic_failures`)."""
+    wide under the score hook `hooks` names, in `dtype`, lowered and compiled by ptxas for `generation_name`
+    on this CPU (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its
+    register model's decision ptxas's (`mosaic_failures`)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
-    query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
+    query = jax.ShapeDtypeStruct((1, queries, 4, width), dtype)
+    key = jax.ShapeDtypeStruct((1, queries, 2, width), dtype)
     hooked = _gated_hooks(hooks, queries, width)
 
     def forward(query, key, value):
