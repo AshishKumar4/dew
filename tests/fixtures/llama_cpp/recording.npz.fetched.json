@@ -1,0 +1,9 @@
+{
+ "bytes": 4193191,
+ "license": "MIT",
+ "path": "recordings/6dbaa5f47b53a80fafc6993db0ee8b09a36245a58951a30acc53f2d7aeb67330.npz",
+ "reference": "ggml-org/llama.cpp 7fe450e19305b828c199d602c23a8337aaa1f03b (v0.5.0)",
+ "repo": "dewml/fixtures",
+ "revision": "cef121d64d35aec76e7e6120a571a1ff89aa354b",
+ "sha256": "6dbaa5f47b53a80fafc6993db0ee8b09a36245a58951a30acc53f2d7aeb67330"
+}
