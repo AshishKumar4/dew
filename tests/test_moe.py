@@ -436,6 +436,34 @@ def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
                     "packed experts", seeds=8, truth_fn=lambda *inputs: layer(None).apply(dense, *inputs))
 
 
+def test_a_scanned_runs_stacked_packed_banks_are_read_at_its_layer_as_that_layers_banks():
+    """An expert projection over a stack of three layers' packed NVFP4 banks read in place at a traced layer
+    (`Layered`, the banked decode of a scanned packed load: row 4861) is, bit for bit, the projection over
+    that layer's bank alone, its gathered rows read gathered and the output scattered to its slots alike."""
+    from packed_experts import packed_banks
+
+    from dew.nn.kernels import gemm
+    from dew.nn.moe import Gathered, Layered, expert_projection
+
+    banks = [packed_banks(4, 256, 128, seed)[0] for seed in range(3)]
+    stack = jax.tree.map(lambda *fields: jnp.stack([jnp.asarray(field) for field in fields]), *banks)
+    sizes = jnp.asarray([5, 0, 7, 4], jnp.int32)
+    rng = np.random.default_rng(4861)
+    tokens = jnp.asarray(rng.standard_normal((12, 256)), jnp.bfloat16)
+    rows = jnp.asarray(rng.permutation(16) % 12, jnp.int32)
+    slots = jnp.asarray(rng.permutation(16), jnp.int32)
+    inputs = Gathered(tokens, rows, slots)
+
+    def project(kernel):
+        return expert_projection(inputs, kernel, sizes, jnp.bfloat16, "auto", None, scatter=slots)
+
+    for layer, bank in enumerate(banks):
+        assert isinstance(bank, gemm.NvFp4)
+        got = jax.jit(project)(Layered(stack, jnp.asarray(layer)))
+        want = jax.jit(project)(jax.tree.map(jnp.asarray, bank))
+        assert np.asarray(got).tobytes() == np.asarray(want).tobytes(), layer
+
+
 def test_packed_banks_decode_into_the_parameters_an_export_writes():
     """A served layer's packed banks decoded for an export or a merge (`quantization.decoded_expert_banks`):
     each its values exactly, as the layer's `params` under its name, and the bank gone from `QUANTIZATION`;
