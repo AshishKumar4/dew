@@ -783,9 +783,8 @@ def test_a_remat_policy_changes_no_gradient(policy):
     wide = layer.clone(dtype=jnp.float64)
 
     def truth(params, x, one):
-        # The float64 layer's rule is the portable math, which the port chosen above refuses.
-        with generation.chosen(gated_delta_rule="xla"):
-            return with_gradients(lambda params, x: jnp.sum(wide.apply(params, x) ** 2))(params, x, one)[1]
+        # The float64 layer's rule is the portable math, the one a float64 call takes.
+        return with_gradients(lambda params, x: jnp.sum(wide.apply(params, x) ** 2))(params, x, one)[1]
 
     assert_as_exact(remat_grad, reference_grad, draw, "remat policy gradient",
                     seeds=REMAT_SEEDS, truth_fn=jax.jit(truth))

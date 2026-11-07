@@ -13,9 +13,11 @@ The native transformer takes channels-last latents and Dew's model time,
 which is the timestep the source's pipeline passes, and returns the flow the
 source returns. Dew in float32 is held to tests/reference_error.py's rule,
 within twice the reference's own RMS distance from float64. Observed on CPU
-(Dew's RMS error over the reference's): published forward 1.01, gradients
-1.01; variant forward 0.96, gradients 0.99; in bfloat16, 1.26 and 0.99
-against the source's own bfloat16 run. The truth is float64 throughout:
+(Dew's RMS error over the reference's, Diffusers 0.39.0's recording): the
+forward 1.02 published and 1.01 variant; in bfloat16, 1.18 and 1.13 against
+the source's own bfloat16 run. The variant names `qk_norm` None, which
+Diffusers norms across heads from 0.35.0 on as Dew does (`WanTransformer`).
+The truth is float64 throughout:
 Dew run in float64 with a float64 rotary table lands 3e-16 (RMS) from it.
 
 The pipeline walk composes the UMT5 encoder, the transformer, UniPC and the
