@@ -1248,8 +1248,8 @@ class MosaicTgmm(_Mosaic):
         """Whether the call's last wave runs balanced over the programs (`tail.balanced`), which it
         takes no split beside: a dense one, not of exact sums, on a family that fixes a tile up across
         programs, its tail balanced."""
-        family = mosaic_gpu.family_of(tile, ba.arguments['tokens'].dtype)
-        if not (ba.arguments['dense'] and not ba.arguments['exact_sums'] and family.fixes_up):
+        if not (ba.arguments['dense'] and not ba.arguments['exact_sums']
+                and mosaic_gpu.fixes_up(tile, ba.arguments['tokens'].dtype)):
             return False
         depth, _, width = self._generated_extents(ba)
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']

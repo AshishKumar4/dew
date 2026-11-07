@@ -783,7 +783,7 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
                 update("traced", constant.shape, str(constant.dtype))
             else:
                 value = _host(constant)
-                update("constant", str(jnp.asarray(constant).dtype), value.shape, str(value.dtype))
+                update("constant", str(_held_dtype(constant)), value.shape, str(value.dtype))
                 digest.update(np.ascontiguousarray(value).tobytes())
 
     def walk(jaxpr: jax_core.Jaxpr) -> None:
@@ -824,10 +824,20 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
 def _host(value) -> np.ndarray:
     """An array constant's values on the host, as `program` reads them: a typed random key by its key data
-    (its dtype names its implementation; no key converts to NumPy itself)."""
+    (its dtype names its implementation; no key converts to NumPy itself), extracted on this host
+    (`programs.on_host`), whatever mesh the launch's trace holds."""
     if isinstance(value, jax.Array) and jnp.issubdtype(value.dtype, jax.dtypes.prng_key):
-        return np.asarray(jax.random.key_data(value))
+        with programs.on_host():
+            return np.asarray(jax.random.key_data(value))
     return np.asarray(value)
+
+
+def _held_dtype(value) -> np.dtype:
+    """The dtype an array constant takes in a program (a NumPy array's canonical one: float64 is float32
+    without x64), read without making an array of it."""
+    if isinstance(value, jax.Array):
+        return value.dtype
+    return jax.dtypes.canonicalize_dtype(np.asarray(value).dtype)
 
 
 def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:

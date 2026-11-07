@@ -19,7 +19,7 @@ import numpy as np
 from jax.extend import core as jcore
 
 from dew.algebra import terms
-from dew.nn.programs import host_evaluated, jax_name
+from dew.nn.programs import host_evaluated, jax_name, on_host
 
 
 def canonical(closed: jcore.ClosedJaxpr) -> jcore.ClosedJaxpr:
@@ -263,8 +263,16 @@ def _broadcast(value, shape: tuple[int, ...], squeezed: dict[int, jax.Array]):
     kept = [axis for axis, size in enumerate(jnp.shape(value)) if size != 1]
     targets = [axis for axis, size in enumerate(shape) if size != 1]
     at = {axis: place for place, axis in enumerate(targets)}
-    return jax.lax.broadcast_in_dim(_squeeze(value, squeezed), tuple(shape[axis] for axis in targets),
-                                    tuple(at[axis] for axis in kept))
+    with _beside(value):
+        return jax.lax.broadcast_in_dim(_squeeze(value, squeezed), tuple(shape[axis] for axis in targets),
+                                        tuple(at[axis] for axis in kept))
+
+
+def _beside(value) -> contextlib.AbstractContextManager:
+    """Where an operation on `value` runs: a constant's on this host (`programs.on_host`), a constant a normal
+    form builds beside a traced equation computed where nothing places it on the trace's mesh (a
+    compile-only GPU's, whose devices run nothing here); a traced value's in its trace."""
+    return contextlib.nullcontext() if isinstance(value, jax.core.Tracer) else on_host()
 
 
 def _squeeze(value, squeezed: dict[int, jax.Array]):
@@ -385,7 +393,8 @@ def _converted(value, dtype, widened: dict[int, jax.Array]):
     source = widened.get(id(value))
     if source is not None and jnp.result_type(source) == dtype:
         return source
-    cast = jax.lax.convert_element_type(value, dtype)
+    with _beside(value):
+        cast = jax.lax.convert_element_type(value, dtype)
     if cast is not value and jnp.issubdtype(dtype, jnp.floating) and jnp.issubdtype(jnp.result_type(value),
                                                                                     jnp.floating) and (
             jnp.finfo(dtype).nmant > jnp.finfo(jnp.result_type(value)).nmant

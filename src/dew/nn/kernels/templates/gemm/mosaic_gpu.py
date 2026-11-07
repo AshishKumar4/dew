@@ -633,7 +633,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     # matrix, one accumulator, a tile a program.
     # An exact sum's order is its contract, which a tile summed across programs reassociates.
     tail = None
-    if (dense and paired is None and tiles.cluster == 1 and family_of(tiles, lhs.dtype).fixes_up
+    if (dense and paired is None and tiles.cluster == 1 and fixes_up(tiles, lhs.dtype)
             and not exact_sums and not tiles.raster):
         tail = balanced_tail(tiles, (-(-m // tiles.block_m), n // block_n), k // block_k,
                              (lhs.dtype.itemsize, rhs.dtype.itemsize), generation.gpu_target(),
@@ -1606,7 +1606,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     order = jnp.argsort(-group_num_blocks).astype(jnp.int32)
     tail = None
     # An exact sum's order is its contract, which a tile summed across programs reassociates.
-    if dense and family_of(tiles, lhs.dtype).fixes_up and not exact_sums:
+    if dense and fixes_up(tiles, lhs.dtype) and not exact_sums:
         tail = balanced_tail(tiles, (-(-m // block_m), n // block_n), -(-k // block_k),
                              (lhs.dtype.itemsize, rhs.dtype.itemsize), generation.gpu_target(),
                              multiprocessors)
@@ -1972,6 +1972,15 @@ def step_seconds(tiles: Tiles, target) -> float | None:
     (`handoff_steps`) price their walks in; None where the target states no rate."""
     rate = unit_cost.rates(target, device=False)[0]
     return None if rate is None else 2 * tiles.block_m * tiles.block_n * tiles.block_k / rate
+
+
+def fixes_up(tiles: Tiles, dtype) -> bool:
+    """Whether a tile's steps may be walked by several programs at `tiles`, each leaving its partial and the
+    last to arrive adding them (`mosaic.Family.fixed_up`): its family's, where its consumers hold the tile's
+    accumulator in registers, which `fixed_up` leaves and adds whole; not tcgen05's, whose accumulator stays
+    in tensor memory (`Issuer.tensor_columns`), read out a chunk of columns at a time."""
+    family = family_of(tiles, dtype)
+    return family.fixes_up and not family.tensor_columns(tiles.block_n, 1)
 
 
 def balanced_tail(tiles: Tiles, grid: tuple[int, int], steps: int, itemsizes: tuple[int, int], target,
