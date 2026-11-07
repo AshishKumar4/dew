@@ -579,7 +579,8 @@ def test_a_derived_footprint_traces_its_loss_once():
     """The derivation reads a loss's pullback residuals and its gradient program's peak from one trace of
     its forward and backward (row 2440): the loss runs once as it is traced, where it ran once for each,
     and each term is what tracing it alone derives."""
-    from dew.training.footprint import LOWERED, Peak, _residuals, bounded_below, derived_terms
+    from dew.training.compiled_program import LOWERED
+    from dew.training.footprint import Peak, _residuals, bounded_below, derived_terms
 
     traced = []
     weights = jax.ShapeDtypeStruct((64, 32), jnp.float32)

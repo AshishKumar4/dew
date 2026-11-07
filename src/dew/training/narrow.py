@@ -41,7 +41,7 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.batch import FROZEN, Variables, merge, select
-from dew.nn.programs import CALLS
+from dew.nn.programs import CALLS, named
 
 _PASSED_THROUGH = CALLS - {"custom_jvp_call", "custom_vjp_call"}
 """The calls whose program a narrowed operand reaches as it is (`_inner`): every call (`CALLS`) but a custom
@@ -53,7 +53,7 @@ def _inner(eqn, index: int):
     """The callee jaxpr of `eqn` and the variable it binds the `index`th
     operand to, where the callee sees each iteration's own slice or the
     operand itself; else None."""
-    name = eqn.primitive.name
+    name = named(eqn.primitive)
     inner = eqn.params.get("jaxpr", eqn.params.get("call_jaxpr"))
     if inner is None or name not in (*_PASSED_THROUGH, "scan") or index >= len(inner.invars):
         return None
@@ -93,11 +93,11 @@ def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
     if not _read_once(var, jaxpr):
         return None
     eqn, index = _uses(var, jaxpr)[0]
-    if eqn.primitive.name == "convert_element_type":
+    if named(eqn.primitive) == "convert_element_type":
         dtype = jnp.dtype(eqn.params["new_dtype"])
         narrower = jnp.issubdtype(dtype, jnp.floating) and dtype.itemsize < var.aval.dtype.itemsize
         return dtype if narrower else None
-    if eqn.primitive.name in _STACKING and len(eqn.outvars) == 1:
+    if named(eqn.primitive) in _STACKING and len(eqn.outvars) == 1:
         stacked = eqn.outvars[0]
         operands = [operand for operand in eqn.invars if isinstance(operand, core.Var)]
         sized = [operand.aval for operand in operands if isinstance(operand.aval, ShapedArray)]

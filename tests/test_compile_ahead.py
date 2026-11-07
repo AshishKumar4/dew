@@ -43,6 +43,106 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, 
                    layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, inspection=inspection)
 
 
+def test_a_program_compiled_ahead_runs_in_place_of_compiling():
+    """A program compiled ahead over its arguments' shapes runs where a call of it lowers that program
+    (`dew.nn.kernels.options.taking`, by its digest): the call compiles nothing and answers as the program
+    compiled for it does; a call of another program compiles its own (Main 11-07: a run compiled ahead
+    compiled its placement on the GPU)."""
+    from dew.nn.kernels.options import owned_program, program_digest, taking
+
+    devices = jax.devices()[:1]
+    placed = jax.sharding.SingleDeviceSharding(devices[0])
+    built = owned_program(lambda values: values * 2 + 1, out_shardings=placed)
+    shapes = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed)
+    lowered = built.lower(shapes)
+    compiled = lowered.compile()
+    loads = []
+
+    def loaded():
+        loads.append(True)
+        return compiled
+
+    values = jax.device_put(jnp.arange(4, dtype=jnp.float32), placed)
+    with taking({program_digest(lowered): loaded}), Compiles(None) as compiles:
+        answered = owned_program(lambda values: values * 2 + 1, out_shardings=placed)(values)
+    assert [program.name for program in compiles.programs if program.kind == "compiled"] == []
+    assert loads == [True]
+    np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
+    with taking({program_digest(lowered): loaded}), Compiles(None) as compiles:
+        owned_program(lambda values: values * 3, out_shardings=placed)(values)
+    assert [program.kind for program in compiles.programs].count("compiled") == 1
+
+
+def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_where_handed():
+    """A program called within `collecting` over shapes compiles there, keyed by its program's digest, and
+    answers with its results' shapes, running nothing; handed to a call of the program over arrays of those
+    shapes (`taking`), its executable runs in place of compiling: how a run compiled ahead compiles what
+    its steps run on their results, called as the run calls it (row 4752)."""
+    from dew.nn.kernels.options import collecting, owned_program, taking
+
+    placed = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    values = jax.device_put(np.arange(4, dtype=np.float32), placed)
+    with collecting() as collected, Compiles(None) as compiles:
+        shapes = owned_program(lambda values: values * 2 + 1)(jax.ShapeDtypeStruct((4,), jnp.float32,
+                                                                                    sharding=placed))
+    assert (shapes.shape, shapes.dtype, shapes.sharding) == ((4,), jnp.float32, placed)
+    assert len(collected) == [program.kind for program in compiles.programs].count("compiled") == 1
+    handed = {digest: lambda executable=executable: executable for digest, executable in collected.items()}
+    with taking(handed), Compiles(None) as compiles:
+        answered = owned_program(lambda values: values * 2 + 1)(values)
+    assert [program.kind for program in compiles.programs].count("compiled") == 0
+    np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
+
+
+def test_two_calls_whose_texts_agree_as_jax_prunes_an_unread_argument_each_take_their_own_executable():
+    """Two calls of one program whose lowered texts agree only as JAX prunes an argument neither reads,
+    held in other trees (a step's commit with its sample's summaries and without), compile apart while
+    collecting and each runs its own executable where handed (`program_digest` keys the trees too; row
+    4752's review: the second overwrote the first, whose call it then refused)."""
+    from dew.nn.kernels.options import collecting, owned_program, taking
+
+    placed = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    shape = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed)
+
+    def counted(values, unread):
+        return values + 1
+
+    with collecting() as collected:
+        owned_program(counted)(shape, None)
+        owned_program(counted)(shape, {"summaries": shape})
+    assert len(collected) == 2
+    values = jax.device_put(np.arange(4, dtype=np.float32), placed)
+    handed = {digest: lambda executable=executable: executable for digest, executable in collected.items()}
+    with taking(handed), Compiles(None) as compiles:
+        bare = owned_program(counted)(values, None)
+        held = owned_program(counted)(values, {"summaries": values})
+    assert [program.kind for program in compiles.programs].count("compiled") == 0
+    np.testing.assert_array_equal(np.asarray(bare), np.asarray(held))
+
+
+def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_its_own(tmp_path):
+    """A run whose checkpoint holds a part-filled accumulation window compiles its step ahead: the state it
+    resumes holds its window, so it builds none ahead, and its count of microbatches, a shape there, is
+    never read (row 4752's review: it was read as a number and compiling ahead raised TypeError)."""
+    from dew.checkpoints import Checkpoints
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    def accumulating(**mesh):
+        model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
+        return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), **mesh,
+                       layout=Layout(min_shard=TINY_SHARD), accumulation=2,
+                       checkpoints=Checkpoints(str(tmp_path / "run")))
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    run = accumulating()
+    run.fit(batch, steps=1, checkpoint_every=1)
+    run.checkpoints.wait()
+    assert run.checkpoints.accumulation_template(1) is not None
+    ahead = compile_ahead(accumulating(mesh=MeshSpec().build(compile_only_gpus("sm90", 1))), batch,
+                          capacity=2**30)
+    assert ahead.starts
+
+
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
     """A compile-only GPU with stated memory takes the run's own fit search, whose one fitting
     program is the saved executable, not another compile outside the report. The report records
@@ -57,6 +157,9 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert tuple(trainer.device_mesh.devices.flat) == compile_only_gpus("sm90", 1, 2**30)
     assert trainer.state_mesh is trainer.device_mesh and trainer.state_mesh is not original_state_mesh
     assert compiles.count == 1
+    # Its fresh state's build and placement compiled beside the step, for a run handed it to compile none of
+    # it on its GPU (`AheadOfTime.starts`).
+    assert ahead.starts
     plan = record(ahead.plan, "plan")
     (probe,) = listed(plan["probes"], "probes", read=record, what="probes")
     assert probe["fits"] is True and probe["temp"] == ahead.temp_bytes
@@ -98,6 +201,35 @@ def admitted(tmp_path_factory):
 
 
 @pytest.mark.shared_setup("admitted")
+def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_over_its_own_gpus(tmp_path):
+    """A host's GPUs, serialized as their topology (`get_attached_topology(...).serialize()`, here of
+    compile-only H100s at a stated 40 GiB) and read back elsewhere (`host_gpus`), are the GPUs XLA compiles
+    for: a program compiled over them keys the persistent cache with the host's own platform version and
+    topology fingerprint, as over the devices serialized, where a canonical target of the generation
+    (`compile_only_gpus`, its memory unstated) keys another entry."""
+    from jax._src import cache_key, compiler
+    from jax.experimental import topologies
+
+    from dew.training.ahead import compile_only_gpus, host_gpus
+
+    host = compile_only_gpus("sm90", 2, 40 * 2**30)
+    serialized = tmp_path / "topology.bin"
+    serialized.write_bytes(topologies.TopologyDescription(list(host)).serialize())
+
+    def key(devices) -> str:
+        lowered = jax.jit(lambda x: x * 2 + 1).trace(jax.ShapeDtypeStruct(
+            (8, 128), jnp.float32, sharding=jax.sharding.SingleDeviceSharding(devices[0]))).lower()
+        backend = devices[0].client
+        options = compiler.get_compile_options(num_replicas=1, num_partitions=1,
+                                               device_assignment=[[devices[0]]], backend=backend)
+        return cache_key.get(lowered.compiler_ir("stablehlo"), np.array(devices[:1]), options, backend)
+
+    read = host_gpus("sm90", serialized, 2)
+    assert [device.device_kind for device in read] == [device.device_kind for device in host]
+    assert key(read) == key(host)
+    assert key(read) != key(compile_only_gpus("sm90", 2))
+
+
 def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
     plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""
@@ -320,6 +452,8 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
     was compiled for, refuses to load it, and a run reproducing it derives its launches for its GPU only on
     one of as many multiprocessors, as a balanced tail's grid past the GPU's residency can wait on a
     program that never starts (row 3606)."""
+    import pickle
+
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
     ahead = compile_ahead(fine_tune(MeshSpec(fsdp=2).build(compile_only_gpus("sm80", 2))),
@@ -329,6 +463,13 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
     assert loaded == ahead
     with pytest.raises(ValueError):
         loaded.loaded()
+    # A step saved before steps carried their start's programs is refused as it loads, never an
+    # AttributeError as its run places its state.
+    earlier = dataclasses.replace(ahead)
+    vars(earlier).pop("starts")
+    (tmp_path / "earlier.dew-aot").write_bytes(pickle.dumps(earlier))
+    with pytest.raises(ValueError):
+        AheadOfTime.load(tmp_path / "earlier.dew-aot")
     assert loaded.derived_for(loaded.target) == loaded.target
     fewer = dataclasses.replace(loaded.target, multiprocessors=loaded.target.multiprocessors - 6)
     with pytest.raises(ValueError):
@@ -616,8 +757,9 @@ def test_a_decision_runs_step_compiled_ahead_is_the_program_its_run_lowers_as_fi
     from run_kinds import decision
 
     from dew.decision.config import DecisionRunConfig
+    from dew.nn.kernels.options import program_digest
     from dew.training._lowering import Lowered
-    from dew.training.ahead import AheadOfTime, CompiledAhead, program_of
+    from dew.training.ahead import AheadOfTime, CompiledAhead
 
     path = tmp_path / "ahead.dew-aot"
     stated = ["--trainer.checkpoint-dir", str(tmp_path / "runs"), *CLOCKED]
@@ -631,7 +773,7 @@ def test_a_decision_runs_step_compiled_ahead_is_the_program_its_run_lowers_as_fi
                                      default=decision(tmp_path, drawn=False))
     with pytest.raises(Lowered) as lowered:
         lowering.run()
-    assert program_of(lowered.value.lowered) == AheadOfTime.load(path).program
+    assert program_digest(lowered.value.lowered) == AheadOfTime.load(path).program
 
 
 def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other(tmp_path):
