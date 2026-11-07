@@ -1387,14 +1387,10 @@ def test_a_width_split_backward_writes_its_score_parameters_gradients_once_inter
     _check_hooked_backward(hooks, form="accurate-halves", interpret=True, width=128)
 
 
-@lowers("sm90")
-@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
-@pytest.mark.parametrize("call", ["causal", "causal-documents-window", "runs-documents-valid"])
-def test_the_launches_lower_for_an_h100(call, accurate):
-    """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them: a
-    causal call, a spans one of documents, whose programs read its block map and ids, and one over a
-    decision row's runs, whose programs read each run's bounds; the forward under every hook too, whose
-    programs read each kind of parameter and the initial state."""
+def _lowered_call(call: str) -> tuple:
+    """A lowering test's call form `call` as abstract operands: its spans, its query and key `[B, S, H, 128]`
+    bf16 and a training forward's residuals' shapes, the compiled shape's causal call or a template core
+    case's (`CASES`, `RUN_CASES`) over four query heads and two key heads."""
     if call == "causal":
         rows, tokens, heads, kv_heads = SHAPES["compiled"]
         spans = template.spans(tokens, tokens, rows, causal=True)
@@ -1407,7 +1403,20 @@ def test_the_launches_lower_for_an_h100(call, accurate):
     rows_shape = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
     others = jax.ShapeDtypeStruct((rows, heads, tokens, 128), jnp.float32)
     split = template.Split(others, rows_shape, rows_shape, rows_shape)
-    residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32), split)
+    anchors = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32)
+    return spans, q, kv, (rows_shape, rows_shape, anchors, split)
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("call", ["causal", "causal-documents-window", "runs-documents-valid"])
+def test_the_launches_lower_for_an_h100(call, accurate):
+    """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them: a
+    causal call, a spans one of documents, whose programs read its block map and ids, and one over a
+    decision row's runs, whose programs read each run's bounds; the forward under every hook too, whose
+    programs read each kind of parameter and the initial state."""
+    spans, q, kv, residuals = _lowered_call(call)
+    tokens = q.shape[1]
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     score_mod, kinds, draw_hooks = score_hooks(FORWARD_HOOKS["all"][0], tokens, tokens, 128)
     params, initial = draw_hooks(0)
@@ -1431,18 +1440,7 @@ def test_the_launches_lower_for_a_v5e(call):
     """The forward, the training forward and the backward on a v5e's MXU (`mosaic_tpu.MXU`, the route's Mosaic
     mainloop on a TPU) lower for a TPU on this CPU, Pallas TPU's Mosaic lowering, as a TPU compiles them: a
     causal call and a spans one of documents under a window, whose programs read its block map and ids."""
-    if call == "causal":
-        rows, tokens, heads, kv_heads = SHAPES["compiled"]
-        spans = template.spans(tokens, tokens, rows, causal=True)
-    else:
-        (tokens, _), rows, heads, kv_heads = core_geometry(CASES[call]), ROWS, 4, 2
-        spans = template.spans(tokens, tokens, rows, **arguments(CASES[call]))
-    q = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16)
-    kv = jax.ShapeDtypeStruct((rows, tokens, kv_heads, 128), jnp.bfloat16)
-    rows_shape = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
-    others = jax.ShapeDtypeStruct((rows, heads, tokens, 128), jnp.float32)
-    split = template.Split(others, rows_shape, rows_shape, rows_shape)
-    residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32), split)
+    spans, q, kv, residuals = _lowered_call(call)
     # An abstract mesh of one v5e device, which Pallas TPU's lowering reads its target from on any host.
     device = AbstractDevice(device_kind=generation.gpu_target("v5e").device_kind, num_cores=1, platform="tpu")
     mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
