@@ -8,6 +8,8 @@ MFU. Rematerialization belongs only to the separate HLO hardware count.
 
 import math
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Self
 
 import numpy as np
 from flax import linen as nn
@@ -57,6 +59,32 @@ def counted_flops(module: nn.Module | Counted, lengths: np.ndarray) -> float:
         raise ValueError(f"{type(module).__name__}.model_flops returned {count}, "
                          "not finite nonnegative FLOPs")
     return count
+
+
+@dataclass(frozen=True)
+class ConditionWork:
+    """A condition encoder's forward FLOPs and the sequence its denoiser reads.
+
+    The output lengths may differ from encoded input (system prompts
+    cropped, CLIP and T5 concatenated, or visible zero tokens retained).
+    Keeping both under the encoder makes its geometry the encode contract.
+    """
+
+    flops: float
+    lengths: np.ndarray
+    spans: np.ndarray
+    features: int
+    pooled_features: int | None = None
+    time_ids: int | None = None
+
+    @classmethod
+    def of_tokens(cls, tower: Counted, tokens: Mapping[str, np.ndarray], features: int) -> Self:
+        """The work of a `tower` that reads each row's unmasked `tokens` and hands its denoiser the
+        whole fixed-length sequence, `features` wide: its FLOPs over the real tokens, their lengths,
+        and spans of the token budget."""
+        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
+        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
+        return cls(counted_flops(tower, lengths), lengths, spans, features)
 
 
 def parameter_flops(module: nn.Module | CountedParameters, lengths: np.ndarray) -> float:

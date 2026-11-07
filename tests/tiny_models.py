@@ -12,10 +12,10 @@ from architecture_cases import CASES as ARCHITECTURE_CASES
 from flax import linen as nn
 from tiny_configs import COMPOSITES, FRAMES, LM, PER_ARCH, RES, TINY
 
-from dew.diffusion.process import DenoisingCondition
 from dew.interop.hf_decoders import translate_config
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.dit import TextContext
+from dew.nn.inputs import DenoisingCondition
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.registry import models, resolve_dtype

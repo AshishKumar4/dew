@@ -27,10 +27,10 @@ from interop_support import assert_transformer_exports, extract_fixture, fixture
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
-from dew.diffusion.process import DenoisingCondition
 from dew.interop.autoencoders.flux2 import load_flux2_vae
 from dew.interop.diffusion import component_tensors, flux2_fields, flux2_path
 from dew.nn.backbones.flux2 import Flux2Transformer
+from dew.nn.inputs import DenoisingCondition
 from dew.nn.scan_orders import pixel_shuffle
 
 ROOT = Path(__file__).resolve().parents[1]

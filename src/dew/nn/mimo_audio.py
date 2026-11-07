@@ -10,7 +10,6 @@ over each group of `group_size` code frames. The codes come from `dew.nn.quantiz
 
 import dataclasses
 import functools
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -34,9 +33,6 @@ from .mlp import GatedMLP
 from .norms import LayerNorm, RMSNorm
 from .quantizers import residual_quantize
 from .vision import TowerBase, TowerGeometry
-
-if TYPE_CHECKING:
-    from dew.data.processors import LogMel
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,14 +60,6 @@ class MiMoAudioTokenizer:
     swa_per_block: int = 2
     rope_theta: float = 10000.0
     codebook_size: tuple[int, ...] = (1024, 1024, 256) + (128,) * 17
-
-    def mel(self) -> "LogMel":
-        """The log mel frames the encoder reads: torchaudio's MelSpectrogram at the tokenizer's rate,
-        window and hop with magnitudes, floored at 1e-7 (MiMo-Audio-Tokenizer's `mel_spectrogram`)."""
-        from dew.data.processors import LogMel
-
-        return LogMel(self.sampling_rate, self.nfft, self.hop_length, self.window_size, self.n_mels,
-                      self.fmin, self.fmax)
 
     def windowed(self, index: int) -> bool:
         """Whether layer `index` keeps a window of keys (AudioTokenizerEncoder's attn_window_sizes)."""

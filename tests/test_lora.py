@@ -42,10 +42,10 @@ from torch_layout import node
 from dew import lora
 from dew.batch import FROZEN, merge, thaw, unboxed
 from dew.data.dataset import Loader
-from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
+from dew.nn.inputs import DenoisingCondition
 from dew.nn.sharding import ADAPTER_RANK, boxed, boxed_axes, declared_axes, drawn_axes, parameter_path
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
