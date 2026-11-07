@@ -445,7 +445,9 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
     launch = grouped_matmul.MosaicPackedGmm()
 
     def decoded(words, scales):
-        return NvFp4(words, scales, jnp.ones((words.shape[0],), jnp.float32)).decoded()
+        # The bank's matrices, a dense call's one alone (`gemm`'s dense matrix is `[depth, width]`).
+        matrices = NvFp4(words, scales, jnp.ones((words.shape[0],), jnp.float32)).decoded()
+        return matrices[0] if dense else matrices
 
     def forward(rows, words, scales, sizes):
         out = mosaic_gpu.gmm(rows, words, sizes, tiles=tile, transpose_rhs=True, out_dtype=jnp.float32,
@@ -465,7 +467,8 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         return tuple(leaves[index] for index in live)
 
     def portable(rows, words, scales, sizes):
-        return grouped_matmul.xla_ragged_dot(rows, decoded(words, scales), sizes,
+        matrices = decoded(words, scales)
+        return grouped_matmul.xla_ragged_dot(rows, matrices if not dense else matrices[None], sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
 
