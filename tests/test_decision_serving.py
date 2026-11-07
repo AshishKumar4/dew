@@ -220,67 +220,61 @@ def test_a_saved_run_records_its_widths_and_a_server_of_it_compiles_its_passes_u
     assert not ScoringServer.from_task(*before.scoring()).programs
 
 
-def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(decide, caplog):
+def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(decide):
     """A scoring server (`ScoringServer.from_task`) over a task whose budget declares the questions and
     options a pass pads to (`Budget`), the run's widest, compiles every pass's program up front, a few
     shapes the task declares once (`Decide.pass_shapes`): a few row counts at each of the layout's
     lengths. Then requests of every length, question and option count, alone and together, compile no
     forward while it serves; a server that compiled none up front compiles them as they come, which
-    the same log shows (ledger 2033)."""
-    import logging
-
+    the same count shows (ledger 2033), as JAX's compile events name the forward's program (`Compiles`,
+    A31: not its log's wording)."""
     from test_decision_batches import CASES
 
     from dew.decision.task import Budget
+    from dew.telemetry.compiles import Compiles
 
     bodies = [*CASES.values(), {**REQUEST, "state": REQUEST["state"] * 6}]
     single = {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
 
     def compiled_while_serving(server: ScoringServer) -> list[str]:
-        caplog.clear()
-        with caplog.at_level(logging.WARNING):
+        # The forward's own programs (`Decide._forward`, jitted as logits); a host-side pad is not one.
+        with Compiles("logits") as compiles:
             for batch in (bodies, [single]):
                 futures = [server.submit(body) for body in batch]
                 server.run()
                 for future in futures:
                     future.result()
-        # The forward's own programs (`Decide._forward`, jitted as jit(logits)); a host-side pad is not one.
-        return [record.getMessage() for record in caplog.records
-                if record.getMessage().startswith("Compiling jit(logits)")]
+        return [program.where for program in compiles.programs if program.kind == "compiled"]
 
-    with jax.log_compiles():
-        # A width of its own, so the cold server compiles programs the declared one has not.
-        cold = replace(decide, budget=Budget(options=24))
-        assert compiled_while_serving(ScoringServer(*cold.scoring(), rows=64))
-        declared = replace(decide, budget=Budget(options=16))
-        server = ScoringServer.from_task(*declared.scoring())
-        assert server.programs == declared.pass_shapes
-        assert len(set(server.programs)) == len(server.programs) <= 16
-        assert not compiled_while_serving(server)
+    # A width of its own, so the cold server compiles programs the declared one has not.
+    cold = replace(decide, budget=Budget(options=24))
+    assert compiled_while_serving(ScoringServer(*cold.scoring(), rows=64))
+    declared = replace(decide, budget=Budget(options=16))
+    server = ScoringServer.from_task(*declared.scoring())
+    assert server.programs == declared.pass_shapes
+    assert len(set(server.programs)) == len(server.programs) <= 16
+    assert not compiled_while_serving(server)
 
 
-def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decide, caplog):
+def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decide):
     """`Decide`'s call over requests scores them in the passes a scoring server runs (`RowScoring`, one
     path for a call and a server, ledger 2514): over a task whose budget declares its widths, after its
     passes' programs compile up front (`compile_scoring`), requests of every length, question and option
     count compile no forward, and each is answered as its lone call answers it, in the fields a padded
     pass cannot move."""
-    import logging
-
     from test_decision_batches import CASES
 
     from dew.decision import Question
     from dew.decision.task import Budget
+    from dew.telemetry.compiles import Compiles
 
     declared = replace(decide, budget=Budget(options=16))
     declared.compile_scoring()
     requests = [(body["state"], {name: Question.from_wire(wire) for name, wire in body["questions"].items()})
                 for body in [*CASES.values(), REQUEST]]
-    with jax.log_compiles(), caplog.at_level(logging.WARNING):
-        caplog.clear()
+    with Compiles("logits") as compiles:
         together = declared(requests)
-        compiled = [record.getMessage() for record in caplog.records
-                    if record.getMessage().startswith("Compiling jit(logits)")]
+    compiled = [program.where for program in compiles.programs if program.kind == "compiled"]
     assert not compiled, compiled
     def discrete(answers) -> dict:
         # The fields a padded pass cannot move (tests/test_decision_batches.py's `DISCRETE`).
@@ -293,30 +287,18 @@ def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decid
 
 def test_a_tasks_scoring_plan_is_built_by_its_first_call_and_held_by_the_rest(decide):
     """A task's calls score over its one scoring plan (`RowScoring`: its passes' shapes, each pass
-    length's window bounds and its packs), which its first call builds and the rest read, where a plan
-    rebuilt each call laid its probe rows out and bounded every ladder length again (ledger 2590)."""
-    import dataclasses
-
+    length's window bounds and its packs, and the programs it holds), which its first call builds and the
+    rest read: a later call traces no program, where a plan rebuilt each call built its programs again
+    with its probe rows and bounds (ledger 2590), and answers as the first did. Counted at JAX's trace
+    events (`Compiles`), not by a layout that counts its own calls (A32)."""
     from dew.decision import Question
+    from dew.telemetry.compiles import Compiles
 
-    bounded: list[int] = []
-
-    class Counted(type(decide.layout)):
-        """The task's own layout, counting the window bounds it is asked for."""
-
-        def bounds(self, *args, **kwargs):
-            bounded.append(self.max_len)
-            return super().bounds(*args, **kwargs)
-
-    stated = {field.name: getattr(decide.layout, field.name) for field in dataclasses.fields(decide.layout)
-              if field.init}
-    task = replace(decide, layout=Counted(**stated))
     questions = {name: Question.from_wire(wire) for name, wire in REQUEST["questions"].items()}
-    first = task(REQUEST["state"], questions)
-    assert bounded, "the first call bounds its passes' windows"
-    bounded.clear()
-    again = task(REQUEST["state"], questions)
-    assert not bounded, bounded
+    first = decide(REQUEST["state"], questions)
+    with Compiles(None) as compiles:
+        again = decide(REQUEST["state"], questions)
+    assert [program.name for program in compiles.programs] == []
     for name, answer in again.items():
         np.testing.assert_array_equal(answer.probabilities, first[name].probabilities)
 
