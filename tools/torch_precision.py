@@ -120,6 +120,25 @@ def widened_softmax():
         yield
 
 
+NATIVE = (*((torch.Tensor, name, inspect.getattr_static(torch.Tensor, name))
+             for name in ("float", "to", "type", "softmax")),
+          *((torch, name, getattr(torch, name))
+            for name in ("arange", "linspace", "tensor", "full", "zeros", "ones", "empty")),
+          (torch.nn.functional, "softmax", torch.nn.functional.softmax))
+"""torch's own casts, constructors and softmax, as the process imported them: every one `float64` replaces."""
+
+
+@contextlib.contextmanager
+def native():
+    """torch as published within the block, inside `float64`: its own casts, constructors and softmax
+    (`NATIVE`), float32 the default dtype. A discrete function a reference defines in float32, a
+    quantizer's codes and scales, runs so inside the float64 truth, as widening it would change it
+    (compressed-tensors' input QDQ cast its codes and restored its scales through a widened `Tensor.to`,
+    1.6e-7 RMS from Dew's float64 run, ledger 4741); its caller widens what it returns."""
+    with replaced(*NATIVE), default_dtype(torch.float32):
+        yield
+
+
 @contextlib.contextmanager
 def float64():
     """A model built and run in float64: `widened` and `widened_softmax` together."""
