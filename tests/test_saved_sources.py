@@ -62,6 +62,30 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
         load_diffusion_source(str(source))
 
 
+def test_a_decision_run_starts_from_a_saved_chat_backbone_decision_run(tmp_path, monkeypatch):
+    """A decision run over a chat backbone and its tokenizer (Qwen 3.5's, its rows laid out over its chat
+    tokens), saved, is a source a second decision run names (`--pretrained <run>`): the second trains
+    on from the first's final weights, its record names the run and step it read, and its task loads
+    and answers (the flow a run from a finished chat-format run takes, which a release's Laya-only
+    layout refused: "Laya's layout is a MarkerLayout over a Hugging Face tokenizer")."""
+    from run_kinds import QWEN_TINY
+
+    from dew.decision import Choice, Decide
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    first = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN_TINY))
+    trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
+    state, _ = trained(run, tmp_path, "second", trainer={"checkpoint_final": True})
+    assert int(state.step) == 1
+    recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
+    assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
+    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    assert np.isclose(float(np.sum(answer.probabilities)), 1.0)
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_run_whose_mixture_no_family_writes_exports_and_loads_back_answering_as_its_run(tmp_path):
     """A language model run whose decoder routes one layer of two through a mixture of experts exports
