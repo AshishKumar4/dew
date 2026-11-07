@@ -694,6 +694,40 @@ def test_the_tuners_group_sizes_route_every_row(groups):
     assert sizes.sum() == 300 and (sizes >= 0).all() and (groups == 1 or sizes[0] == 0), sizes
 
 
+def test_a_ragged_products_portable_route_places_its_output_on_an_explicit_mesh():
+    """XLA's ragged products (`grouped_matmul.xla_ragged_dot`, and `gemm.gemm_t`'s portable route a fused
+    producer's analysis replays) of rows an Explicit data axis splits, as a device step's are
+    (test_device_image_augmentation): JAX infers no placement for a ragged dot, so each states its own
+    (`grouped_matmul.ragged_placement`): the forward's rows split as the tokens' are, the kernel gradient's
+    sum over the split rows whole; a replicated operand on that mesh, placed too. Integers, so each value is
+    the unplaced program's bit for bit."""
+    from dew.distributed.placement import MeshSpec
+
+    rng = np.random.default_rng(23)
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(64, 32)), jnp.float32)
+    kernel = jnp.asarray(rng.integers(-3, 4, size=(2, 32, 16)), jnp.float32)
+    cotangent = jnp.asarray(rng.integers(-3, 4, size=(64, 16)), jnp.float32)
+    sizes = jnp.asarray([40, 24], jnp.int32)
+
+    def products(tokens, cotangent):
+        return (grouped_matmul.xla_ragged_dot(tokens, kernel, sizes, preferred_element_type=jnp.float32),
+                gemm.gemm_t(tokens, cotangent, sizes, out_dtype=jnp.float32))
+
+    expected = jax.jit(products)(tokens, cotangent)
+    mesh = MeshSpec(explicit=("data",)).build(jax.devices()[:8])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+        forward, gradient = jax.jit(products)(jax.device_put(tokens, rows), jax.device_put(cotangent, rows))
+        assert jax.typeof(forward).sharding.spec[0] == "data"
+        assert all(entry is None for entry in jax.typeof(gradient).sharding.spec)
+        whole = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        replicated = jax.jit(products)(jax.device_put(tokens, whole), jax.device_put(cotangent, whole))
+    np.testing.assert_array_equal(np.asarray(forward), np.asarray(expected[0]))
+    np.testing.assert_array_equal(np.asarray(gradient), np.asarray(expected[1]))
+    for got, want in zip(replicated, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 @pytest.mark.parametrize("scattered", [False, True])
 def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order(scattered):
     """`gemm.gemm`'s `gather` (row 1376) on a CPU (XLA's program): the projection of `tokens[gather]`, its
