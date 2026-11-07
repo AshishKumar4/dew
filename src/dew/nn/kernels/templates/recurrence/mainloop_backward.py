@@ -967,7 +967,8 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: Call):
                 column_lo_ref, taken_ref, dl_ref, *, streams, staging, landing):
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        (staged,) = staging
+        # The square's operand and, where a chunk is wider than a key block, the blocks' apart.
+        square, blocked = staging[0], staging[-1]
         views = stream_views(lower=held.views(a_ref, row, chunk, h * chunk, chunk),
                              keys=given.views(k_ref, row, chunk, h // call.group * width, width),
                              values=given.views(v_ref, row, chunk, h * value_width, value_width),
@@ -981,7 +982,7 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: Call):
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             beta = family.rows_of(beta_ref.at[h, span])
-            issue = Issuer(call, dict.fromkeys(("inverse_t", "inverse_dx", "inverse_l"), staged))
+            issue = Issuer(call, {"inverse_t": square, "inverse_l": square, "inverse_dx": blocked})
             d_l = algebra.system_gradient(
                 stream_tile(slots, "lower", held), functools.partial(column, "keys", given),
                                           width // call.block,
@@ -1011,7 +1012,8 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: Call):
                          grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
                          work=work,
-                         held=held_tiles, staging=staging_tiles(held, (chunk, chunk)),
+                         held=held_tiles,
+                         staging=staging_tiles(held, *dict.fromkeys(((chunk, chunk), (chunk, call.block)))),
                          landing={"square": held.landing(chunk, chunk)})(a, k, v, dw, du, hi, lo, beta, hi,
                                                                          lo,
                                                                          taken)

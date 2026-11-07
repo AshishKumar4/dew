@@ -55,8 +55,8 @@ from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, template
 
-(CHUNK,) = template.CHUNKS
-"""The chunk every call's tiles take (`template.CHUNKS`' one), the witnessed launches'."""
+CHUNK = template.FLA_CHUNK
+"""The chunk the witnessed launches take (fla's, every bundle's narrowest, `template.chunks`)."""
 LOG2E = recurrence_algebra.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
 """How far a position's prefix `hi + lo` (`recurrence_algebra.prefix`) lies from its exact `log2(e)

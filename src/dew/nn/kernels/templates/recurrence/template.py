@@ -29,9 +29,14 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import base, bundles, mosaic, report, resources
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
 
-CHUNKS = (64,)
-"""The tokens a chunk a call's tiles may take, widest first (`Mosaic.derived`'s first rule): fla's 64, one
-consumer role's rows on every family (`Family.role_rows`)."""
+FLA_CHUNK = 64
+"""fla's tokens a chunk, every call's narrowest (`chunks`)."""
+
+
+def chunks(family: mosaic.Family) -> tuple[int, ...]:
+    """The tokens a chunk a call's tiles may take on `family`'s bundle, widest first (`Mosaic.derived`'s first
+    rule): a consumer role's rows where its products issue more natively (`Family.role_rows`), then fla's."""
+    return tuple(sorted({family.role_rows, FLA_CHUNK}, reverse=True))
 
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
@@ -358,7 +363,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
         (docs/design/kernel-templates.md §7; no candidate space, no ranking: each rule gives way from the
         widest value block to the next narrower where it does not hold), each rule naming the fact it reads:
-        - chunk, the widest of `CHUNKS` at which the rules below find tiles (`Tiles.chunk`);
+        - chunk, the widest the bundle offers (`chunks`) at which the rules below find tiles and, where any
+          chunk's do, the fast backward holds (`Tiles.chunk`);
         - value block, in steps of the narrowest a staged operand block takes (`Family.narrowest_columns`)
           dividing the padded values: the widest legal (`legal`: every launch's shared memory within a block
           of the device and its registers within a thread's, `registers`), then the widest at which the
@@ -396,8 +402,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
         tiles the spilling kernels ran at down to their next narrower value block: the training call's where
         they are the fast backward's alone, else both, a forward launch running at the training call's tiles
         and, where they differ, at the forward's (`Tiles.forward`)."""
-        return next((tiles for chunk in CHUNKS if (tiles := self._chunked(ba, target, chunk)) is not None),
-                    None)
+        family = bundle(target, _dtype(ba))
+        if family is None:
+            return None
+        found = [tiles for chunk in chunks(family) if (tiles := self._chunked(ba, target, chunk)) is not None]
+        return next((tiles for tiles in found if self._backward_holds(ba, tiles, target)),
+                    found[0] if found else None)
 
     def _chunked(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int
                  ) -> mainloop.Tiles | None:

@@ -35,7 +35,7 @@ from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
 from dew.nn.kernels.templates import bundles, mosaic_sm100
-from dew.nn.kernels.templates.recurrence import mainloop, template
+from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
 from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
 
@@ -216,26 +216,37 @@ def test_tcgen05s_chunks_train_as_wgmma_does_interpreted(case):
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-@pytest.mark.parametrize('family', ['wgmma', 'tcgen05'])
+@pytest.mark.parametrize('family', ['wgmma', 'mma.sync'])
 @pytest.mark.parametrize('case', ['one sequence', 'a decay a key dimension'])
 def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
-    """The template's training step at 128 tokens a chunk (`Tiles.chunk`) on wgmma's and tcgen05's bundles,
-    interpreted, on par from float64 with the same tiles at 64 (check 1, the truth the recurrence a token at
-    a time in float64): its output, final memory and every operand's gradient in bf16 (row 4770)."""
+    """The template's forward and fast backward (`chunk_forward.kept_forward`,
+    `mainloop_backward.kept_backward`) at 128 tokens a chunk (`Tiles.chunk`), interpreted on wgmma's and
+    mma.sync's bundles, on par from float64
+    with the same launches at 64 (check 1, the truth the recurrence a token at a time in float64): the output,
+    final memory and every operand's gradient in bf16 (row 4770). Neither bundle's rule takes 128 itself
+    (`template.chunks`: their roles' rows are 64), and the backward's launches at 128 pass a GPU's shared
+    memory (`backward_holds`), so the launches are called as the rule calls them."""
     hooks, dtype = case_hooks(case), jnp.bfloat16
+    bundle = {'wgmma': bundles.INTERPRETED, 'mma.sync': bundles.of('sm80', jnp.bfloat16)}[family]
     (sample, _) = drawn(dtype, 0, **geometry(case))
-    bundle = {'wgmma': bundles.INTERPRETED, 'tcgen05': mosaic_sm100.CHUNKS}[family]
-    target = generation.gpu_target({'wgmma': 'sm90', 'tcgen05': 'sm100'}[family])
-    tiles = template.MOSAIC.derived(template_call(sample, hooks), target)
+    tiles = template.MOSAIC.derived(template_call(sample, hooks), generation.gpu_target('sm90'))
     assert tiles is not None
 
     def at(chunk):
-        def rule(given):
-            return template.mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta,
-                                        given.state, tiles=dataclasses.replace(tiles, chunk=chunk),
-                                        family=bundle, delta=hooks.delta, scale=given.key.shape[-1] ** -0.5,
-                                        floor=hooks.floor, bound=hooks.inverse_bound, rounded=True)
-        return jax.jit(with_gradients(rule))
+        common = {'tiles': dataclasses.replace(tiles, chunk=chunk), 'family': bundle, 'interpret': True,
+                  'delta': hooks.delta, 'floor': hooks.floor, 'rounded': True}
+
+        def trained(given, cotangent):
+            operands = (given.query, given.key, given.value, given.log_decay, given.beta, given.state)
+            out, final, (inverse, kept) = chunk_forward.kept_forward(*operands, **common)
+            grads, _ = mainloop_backward.kept_backward(*operands, *cotangent, inverse=inverse, kept=kept,
+                                                       **common)
+            # Its gradients of the operands, the skip's last beside them none.
+            names = ('query', 'key', 'value', 'log_decay', 'beta', 'state')
+            return (out, final), dataclasses.replace(given, **{
+                name: grad.astype(operand.dtype)
+                for name, grad, operand in zip(names, grads[:len(names)], operands, strict=True)})
+        return jax.jit(trained)
 
     assert_as_exact(at(128), at(64), functools.partial(drawn, dtype, **geometry(case)),
                     f'128-token chunks training on {family}, {case}', seeds=8,
