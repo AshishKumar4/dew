@@ -14,8 +14,10 @@ JAX's own key of each program and its flags.
 JAX keeps a program as one file, `<key>-cache`, in `jax_compilation_cache_dir`, and with no
 `jax_compilation_cache_max_size` (Dew sets none) it neither evicts nor stamps them
 (jax/_src/lru_cache.py in jax 0.11.2), so the files a directory gains while a file's tests run are
-the programs they compiled. The programs they only read are not seen, so a program another
-file's bundle brought in joins this file's bundle only where it is compiled under it. Each pytest
+the programs they compiled, which a watch of the directory reports as they arrive
+(tools/armada/watched.py's `Writes`), so no switch of bundle lists it. The programs they only read
+are not seen, so a program another file's bundle brought in joins this file's bundle only where it
+is compiled under it. Each pytest
 worker that keeps a bundle has a directory of its own (conftest), so the files a worker's bundle
 gains are its own whole writes, never another worker's half-written one.
 
@@ -63,6 +65,10 @@ _HOST = importlib.util.spec_from_file_location(
     "armada_host", Path(__file__).resolve().parents[1] / "tools" / "armada" / "host.py")
 HOST = importlib.util.module_from_spec(_HOST)
 _HOST.loader.exec_module(HOST)  # the host's CPU class, which keys a bundle (tools/armada/host.py)
+_WATCHED = importlib.util.spec_from_file_location(
+    "armada_watched", Path(__file__).resolve().parents[1] / "tools" / "armada" / "watched.py")
+WATCHED = importlib.util.module_from_spec(_WATCHED)
+_WATCHED.loader.exec_module(WATCHED)  # inotify's one reader (tools/armada/watched.py's `Writes`)
 MAX_BYTES = r2.MAX_BYTES
 """The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
 SIBLINGS = 3
@@ -95,7 +101,11 @@ class RemoteCache:
         sealing; held across no request."""
         self.file: str | None = None
         self.seen: set[str] | None = None
-        """The programs in the directory when the current bundle's run began or last moved on."""
+        """The programs in the directory when the current bundle's run began or last moved on: listed once,
+        then kept by what arrives in it (`writes`)."""
+        self.writes = WATCHED.Writes(str(self.directory))
+        """What arrives in the directory, JAX's programs and the bundles' own (watched.py's `Writes`): a
+        bundle's switch lists no directory of hundreds of thousands of programs (row 3496)."""
         self.written: dict[str, list[str]] = {}
         """The programs compiled while each bundle's tests ran, in the order they appeared."""
         self.fetched: dict[str, list[str]] = {}
@@ -116,6 +126,11 @@ class RemoteCache:
         """The programs the remote's bundles put in the directory, and the bundles it took."""
         self.bytes_fetched = self.bytes_uploaded = 0
         """The bundles' bytes read and sent, which the summary reports."""
+        if not self.writes.watching:
+            # No program a run compiles could be told from the rest without listing the directory at every
+            # switch: the task compiles without the remote.
+            self.given_up = True
+            logger.warning("the shared XLA cache cannot watch %s; compiling without it", self.directory)
 
     @property
     def available(self) -> bool:
@@ -142,10 +157,14 @@ class RemoteCache:
 
     def _moved_on(self) -> None:
         """The programs the directory gained since the current bundle's run began or last moved on,
-        written to its account (under `state`)."""
+        written to its account (under `state`): those that arrived in it (`writes`), the directory listed
+        again only where the watch's queue overflowed meanwhile."""
+        arrived = self.writes.gained()
         if self.file is None or self.seen is None:
             return
-        programs = self._programs()
+        programs = self._programs() if arrived is None else self.seen | {
+            name.removesuffix(SUFFIX) for name in arrived
+            if name.endswith(SUFFIX) and not name.startswith(".")}
         written = self.written.setdefault(self.file, [])
         written += sorted(programs - self.seen - set(written))
         self.seen = programs
@@ -159,7 +178,8 @@ class RemoteCache:
                 if file != self.file:
                     self._moved_on()
                     self.file = file
-                    self.seen = self._programs()
+                    if self.seen is None:
+                        self.seen = self._programs()
                 if file in self.held:
                     return
                 self.held[file] = set()
