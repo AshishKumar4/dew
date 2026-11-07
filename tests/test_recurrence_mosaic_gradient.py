@@ -15,8 +15,8 @@ import numpy as np
 import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
-from reference_error import with_gradients
-from test_recurrence_chunk import chunk_on
+from reference_error import assert_as_exact, with_gradients
+from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -186,6 +186,28 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     the_template_is_as_exact_as_fla(rule, recorded_site(case, dtype),
                                     label=f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}',
                                     under=under)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+@pytest.mark.parametrize('case', ['one sequence', 'a decay a key dimension'])
+def test_tcgen05s_chunks_train_as_wgmma_does_interpreted(case):
+    """The template's training step on a B200's bundle (tcgen05's 64-row products into tensor memory read back
+    in the WGMMA layout, `mosaic_sm100.CHUNKS`, interpreted: Mosaic GPU's interpreter models tensor memory and
+    tcgen05's products) on par from float64 with the same call on wgmma's bundle (check 1, the truth the
+    recurrence a token at a time in float64): its output, final memory and every operand's gradient in
+    bf16 (row 4747). Wgmma's arm is held to recorded fla-core
+    (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
+    hooks, dtype = case_hooks(case), jnp.bfloat16
+
+    def on(target: str):
+        def run(given, cotangents):
+            with generation.assumed(target):
+                return with_gradients(functools.partial(chunk_on, 'mosaic_gpu', hooks))(given, cotangents)
+        return jax.jit(run)
+
+    assert_as_exact(on('sm100'), on('sm90'), functools.partial(drawn, dtype, **geometry(case)),
+                    f'tcgen05 chunks training, {case}', seeds=8,
+                    truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
 
 
 def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
