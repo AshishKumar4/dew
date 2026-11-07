@@ -225,6 +225,43 @@ def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike, dtype: DTypeLike = np
     return decoded
 
 
+E4M3_POWERS = (-9, 8)
+"""The powers of two float8_e4m3fn holds exactly, its least subnormal's to the largest below 448."""
+
+
+def mxfp4_as_nvfp4(blocks: ArrayLike, scales: ArrayLike) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Packed MXFP4 [expert, output, group, 16] blocks and their E8M0 scales as NVFP4's parts, exactly: each
+    expert's E2M1 codes' values `[expert, input, output]` float32, each sixteen inputs' E4M3 scale `[expert,
+    input / 16, output]` (a 32-value group's power of two, twice) and each expert's float32 tensor scale
+    `[expert]`, a power of two `2**k` that takes the expert's block powers into E4M3's (`E4M3_POWERS`), which
+    `dew.nn.kernels.gemm.NvFp4.of` packs: every value its code times its block's scale times its expert's, the
+    MXFP4 value. None where an expert's powers (an all-zero group's none) spread past E4M3's 17, its tensor
+    scale would pass float32's normal range or a group's scale is the NaN byte, or the load reads no values:
+    such a bank stays dequantized (`dequantize_mxfp4`)."""
+    blocks, scales = _mxfp4_arrays(blocks, scales)
+    codes = _bytes(blocks, _CODE_DTYPES)
+    stored = _bytes(scales, (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu)))
+    if not (unread.valued(codes) and unread.valued(stored)):
+        return None
+    exponents = stored.astype(np.int32) - 127
+    experts, outputs, groups, _ = codes.shape
+    values = _E2M1_BYTES[codes].reshape(experts, outputs, groups * GROUP).swapaxes(1, 2)
+    held = (codes != 0).any(-1)
+    low, high = E4M3_POWERS
+    top = np.where(held, exponents, np.iinfo(np.int32).min).max(axis=(1, 2))
+    bottom = np.where(held, exponents, np.iinfo(np.int32).max).min(axis=(1, 2))
+    top, bottom = np.where(held.any(axis=(1, 2)), top, high), np.where(held.any(axis=(1, 2)), bottom, high)
+    power = top - high
+    # The NaN scale byte 0xff decodes to no value NVFP4 holds.
+    if ((top - bottom) > high - low).any() or (power < -126).any() or (power > 127).any() or (
+            held & (exponents == 128)).any():
+        return None
+    local = np.where(held, exponents - power[:, None, None], low)
+    block = np.ldexp(np.float32(1), local).astype(ml_dtypes.float8_e4m3fn)
+    block = np.repeat(block.swapaxes(1, 2), GROUP // 16, axis=1)
+    return values.astype(np.float32), block, np.ldexp(np.float32(1), power).astype(np.float32)
+
+
 def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     """[expert, input, output] weights to packed [expert, output, group, 16] blocks and E8M0 scales.
 
