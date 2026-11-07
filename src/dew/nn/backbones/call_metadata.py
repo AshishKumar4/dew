@@ -63,7 +63,8 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
         routed = model.mixture is not None and model.mixture.routing_block is not None
         positions = None if coordinates is None else coordinates.positions
         check_tree(tree, tokens.shape[1], decode=decode, ordered=model.engram is not None or routed,
-                   positioned=positions is not None or rotary_positions is not None)
+                   positioned=positions is not None or rotary_positions is not None,
+                   entered=coordinates is not None and coordinates.entered is not None)
     engram_ids = (None if model.engram is None else model.engram_hashes(tokens, coordinates, decode,
                                                                       media_mask))
     if context is not None and context.segments is not None:
