@@ -710,18 +710,20 @@ def _from_tree_record(recorded: JSON):
 
 
 def _table_record(table: Mapping[str, np.ndarray]) -> JSON:
-    return {name: {"dtype": str(np.asarray(value).dtype), "shape": list(np.shape(value)),
-                   "hex": np.ascontiguousarray(value).tobytes().hex()} for name, value in table.items()}
+    """A position table as the JSON a holder hands every process (`_from_holder`): the bytes the artifact
+    codec encodes a mapping of arrays in (`dew.data.sources.codec`), each array's dtype, shape and bytes
+    its own, as hex (A10: a second array record beside the codec)."""
+    from dew.data.sources.codec import encode
+
+    return encode(dict(table)).hex()
 
 
 def _from_table_record(recorded: JSON) -> dict[str, np.ndarray]:
-    table = {}
-    for name, value in record(recorded, "table").items():
-        entry = record(value, name)
-        flat = np.frombuffer(bytes.fromhex(_records.text(entry["hex"], "hex")),
-                             np.dtype(_records.text(entry["dtype"], "dtype")))
-        table[name] = flat.reshape(_records.integers(entry["shape"], "shape"))
-    return table
+    """The position table `_table_record` recorded."""
+    from dew.data.sources.codec import decode
+
+    table = record(decode(bytes.fromhex(_records.text(recorded, "table"))), "table")
+    return {name: np.asarray(value) for name, value in table.items()}
 
 
 class _RankedSteps(preservation.PreservationPolicy):
