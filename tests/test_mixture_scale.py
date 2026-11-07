@@ -346,6 +346,38 @@ def test_a_packed_mixture_resumes_at_the_document_that_did_not_fit(stop, by):
         resumed.close()
 
 
+class Listed:
+    """A parent read in order on the caller's thread alone, counting its own reads: no prefetch reads
+    ahead of what asks it."""
+
+    def __new__(cls, count: int):
+        import grain.python as pygrain
+
+        class Iterator(pygrain.DatasetIterator):
+            def __init__(self):
+                super().__init__()
+                self.next, self.reads = 0, 0
+
+            def __next__(self):
+                if self.next >= count:
+                    raise StopIteration
+                self.next, self.reads = self.next + 1, self.reads + 1
+                return {"id": self.next - 1}
+
+            def get_state(self):
+                return {"next": self.next}
+
+            def set_state(self, state):
+                self.next = state["next"]
+
+        class Dataset(pygrain.IterDataset):
+            def __iter__(self):
+                self.last = Iterator()
+                return self.last
+
+        return Dataset()
+
+
 @pytest.mark.parametrize("stop", [5, 31, 32, 100])
 def test_a_streamed_window_shuffle_reads_each_window_as_the_one_before_is_given(stop):
     """A streamed read's window shuffle (`WindowShuffle`) gives Grain's order and saves Grain's position
@@ -354,25 +386,21 @@ def test_a_streamed_window_shuffle_reads_each_window_as_the_one_before_is_given(
     before is given, one record a record given, where Grain read a window whole as its first record was
     asked (row 4740: a 16k-record window 9.8 s, the step that asked it stalled)."""
     import grain.experimental as gx
-    import grain.python as pygrain
 
     from dew.data.ordering import WindowShuffle
 
     window = 32
-
-    def parent():
-        return pygrain.MapDataset.source(Counted(0, 1000)).to_iter_dataset()
-
-    ours, theirs = iter(WindowShuffle(parent(), window=window, seed=3)), iter(
-        gx.WindowShuffleIterDataset(parent(), window_size=window, seed=3))
+    listed = Listed(1000)
+    ours = iter(WindowShuffle(listed, window=window, seed=3))
+    theirs = iter(gx.WindowShuffleIterDataset(Listed(1000), window_size=window, seed=3))
+    parent = listed.last
     reads = []
     for _ in range(stop):
-        Counted.reads = 0
+        before = parent.reads
         assert next(ours) == next(theirs)
-        reads.append(Counted.reads)
+        reads.append(parent.reads - before)
     assert ours.get_state() == theirs.get_state()
-    assert reads[0] >= window and max(reads[window:], default=0) <= 1, reads
-    resumed = iter(WindowShuffle(parent(), window=window, seed=3))
+    assert reads[0] == window and max(reads[window:], default=0) <= 1, reads
+    resumed = iter(WindowShuffle(Listed(1000), window=window, seed=3))
     resumed.set_state(ours.get_state())
-    assert ([int(record["id"]) for record in itertools.islice(resumed, 3 * window)]
-            == [int(record["id"]) for record in itertools.islice(theirs, 3 * window)])
+    assert list(itertools.islice(resumed, 3 * window)) == list(itertools.islice(theirs, 3 * window))
