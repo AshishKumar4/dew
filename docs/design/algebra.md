@@ -870,9 +870,10 @@ class Derived(NamedTuple):           # dew.algebra.forms
     finish: Callable                 # (state, operands) -> the outputs the walk reduces
     mapped: Callable                 # a tile's outputs along the walked axis; a scan's (prepared, state)
     report: Mapping                  # what the derivation decoupled and its rounding class
-    backward: Callable | None = None # a scan's chunk adjoint; a reduction's backward is a declaration of its own
+    backward: Callable | None = None # a scan's chunk adjoint, its replay's derivative; a reduction's backward is a declaration of its own
     prepare: Callable = ...          # a tile's values that read no state, for every tile at once
     slots: Callable | None = None    # a reduction's carried states' roles (max, sum, contraction) and shapes
+    replay: Callable | None = None   # a scan's chunk walked token by token: (outputs, state leaving) from (chunk, h)
 
 def derive(declaration: Reduction, *, accurate: bool, saturation: Saturation) -> Derived: ...
 def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int = FORMS_HELD) -> Derived: ...
@@ -890,7 +891,11 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
     log-sum-exp and moment merges;
   - `linear_scan`: a token's algebra over its state and its affine forms; the chunk's identities, compact
     WY, the state-space dual, a solve's inverse by doubling or its substitution, and a solve's linearity.
-    A scan's adjoint is its forms' derivative;
+    A scan's adjoint is its token update's, replayed per chunk (the owner, 2026-11-07): from each chunk's
+    entering state, a checkpoint a chunk, its tokens walked by the update's affine parts and differentiated,
+    each token's state cotangent erased before its decay's is formed. Forward mode and every higher order
+    take the same replay; the forward's value stays the forms'. The forms' own derivative cancelled
+    independently rounded inverse, decay and readout paths (row 1966);
   - no `error_free` set: the accurate numerics admit only exact rewrites, so a compensated form is the
     declaration's own numerics (`Reduction.exponential`, `rescale`: the natural exponent through
     `two_product` and `2**k`) or the mainloop's own step over the derived parts (`Derived.step`'s `stepped`:
