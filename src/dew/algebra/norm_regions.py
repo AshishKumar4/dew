@@ -110,8 +110,9 @@ def _rms(graph: Graph, place: int) -> Norm | None:
     epsilon, mean = _constant_beside(graph, eqns[added].invars)
     if epsilon is None:
         return None
+    # The mean, its kept axis laid before or after its division (`jnp.mean`'s keepdims after the sum).
     mean = _unkept(graph, graph.uncast(mean, places, widening), places)
-    scaled, inverse_width = graph.made(mean, "div"), None
+    scaled = graph.made(mean, "div")
     if scaled is not None:
         summed, width = eqns[scaled].invars
         width = graph.constant(width)
@@ -121,7 +122,9 @@ def _rms(graph: Graph, place: int) -> Norm | None:
             return None
         inverse_width, summed = _constant_beside(graph, eqns[scaled].invars)
         width = None if inverse_width is None else 1 / inverse_width
-    reduced = graph.made(summed, "reduce_sum")
+    if summed is None:
+        return None
+    reduced = graph.made(_unkept(graph, graph.uncast(summed, places, widening), places), "reduce_sum")
     if width is None or np.ndim(width) != 0 or reduced is None:
         return None
     places += [scaled, reduced]
@@ -208,8 +211,8 @@ def _weighted(graph: Graph, normed, places: list[int]) -> tuple[jcore.Var | None
         if name == "convert_element_type" and not cast:
             cast = True
         elif name == "mul" and weight is None:
-            other = next(var for var in eqn.invars if var is not atom)
-            found = _row_weight(graph, other, atom.aval.shape[-1], places)
+            other = next((var for var in eqn.invars if var is not atom), None)
+            found = None if other is None else _row_weight(graph, other, atom.aval.shape[-1], places)
             if found is None:
                 break
             weight, offset = found
