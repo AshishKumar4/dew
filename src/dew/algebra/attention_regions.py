@@ -170,7 +170,7 @@ class _Graph:
         if value is None or np.ndim(value) != 0:
             return False
         value = float(value)
-        return value == -math.inf or value <= 0.5 * float(np.finfo(dtype).min)
+        return value == -math.inf or value <= 0.5 * float(jnp.finfo(dtype).min)
 
     def constant(self, atom):
         """`atom`'s value where no input of the program makes it (literals and iotas through any equation
