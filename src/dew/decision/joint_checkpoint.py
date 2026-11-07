@@ -13,7 +13,6 @@ read and written.
 import json
 import re
 from collections.abc import Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import jax
@@ -21,10 +20,14 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew._files import write_atomically
 from dew.batch import unboxed
+from dew.decision.calibration import Calibration
+from dew.decision.formats import beyond_default
 from dew.decision.laya import IN_PROJ
-from dew.decision.layout import DecisionInputs
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, write_file
+from dew.decision.layout import DecisionInputs, Layout
+from dew.interop.releases import HeadFiles
+from dew.interop.safetensors_io import LazyTensors
 from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
@@ -147,25 +150,16 @@ def head_tensors(params: Mapping[str, object]) -> LazyTensors[np.ndarray]:
                         for name, layout in layouts.items()}, lambda name: layouts[name].export(variables))
 
 
-def export(bundle: "PretrainedDecision", variables: Mapping[str, object] | None = None
-           ) -> Mapping[str, np.ndarray]:
-    """Every tensor of the joint-head release `save` writes: the backbone's under their checkpoint names
-    and the head's under the release's (`joint_head.safetensors`), with `variables` in place of the
-    backbone's."""
-    from dew.decision.sources import joined_release
-
-    return joined_release(bundle.backbone().export(variables), head_tensors(bundle.head_variables["params"]),
-                          "model.safetensors and joint_head.safetensors")
+def head_files(bundle: "PretrainedDecision") -> HeadFiles:
+    """The joint head in its release (`dew.decision.formats`): its sizes (`joint_head_config.json`) and its
+    tensors under the release's names (`joint_head.safetensors`), beside the backbone's standard checkpoint
+    and tokenizer."""
+    sizes = json.dumps({name: getattr(bundle.head, name) for name in SIZES}, indent=1) + "\n"
+    return HeadFiles(head_tensors(bundle.head_variables["params"]), HEAD_WEIGHTS,
+                     files={HEAD_CONFIG: lambda path: write_atomically(str(path), sizes)})
 
 
-def save(bundle: "PretrainedDecision", directory: str | Path, *,
-         max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-    """Write a joint-head release, which `Pretrained.load` reads back: the held native backbone
-    as a standard checkpoint with its tokenizer, and beside it the head's sizes
-    (`joint_head_config.json`) and tensors under the release's names (`joint_head.safetensors`)."""
-    root = Path(directory)
-    bundle.backbone().save(root, max_shard_size=max_shard_size)
-    bundle.decision_tokenizer.save_pretrained(root)
-    sizes = {name: getattr(bundle.head, name) for name in SIZES}
-    (root / HEAD_CONFIG).write_text(json.dumps(sizes, indent=1) + "\n")
-    write_file(head_tensors(bundle.head_variables["params"]), root / HEAD_WEIGHTS, {"format": "pt"})
+def stated(bundle: "PretrainedDecision") -> tuple[Layout, None, Calibration | None]:
+    """What the joint release states beside its files: the layout its rows are laid out by, which the head's
+    files state none of, and a calibration, which they hold none of."""
+    return bundle.layout, None, beyond_default(bundle.calibration)
