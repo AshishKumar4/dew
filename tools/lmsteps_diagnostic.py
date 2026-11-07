@@ -122,6 +122,7 @@ for mode,a,b in [('pooled',ours.mean(axis=1),theirs.mean(axis=1)),('steps',ours.
         if count<2*n: break
         if all(_sized(a[t:t+n,k],b[t:t+n,k]) for t in [0,n] for k in range(a.shape[1])):
             found=n;break
-    print('K SIZE '+json.dumps(dict(mode=mode,seeds=found)),flush=True)
+    print('K SIZE '+json.dumps(dict(mode=mode,seeds=found,batch=batch,steps=steps)),flush=True)
     for k in range(a.shape[1]):
-        print('K POOL '+json.dumps(dict(mode=mode,k=k,ratio=float(np.sqrt(a[:,k].sum()/b[:,k].sum())),interval=_interval(a[:,k],b[:,k]))),flush=True)
+        if mode=="pooled":
+            print('K POOL '+json.dumps(dict(mode=mode,k=k,ratio=float(np.sqrt(a[:,k].sum()/b[:,k].sum())),interval=_interval(a[:,k],b[:,k]))),flush=True)
