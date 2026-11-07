@@ -258,8 +258,8 @@ def test_a_tied_weights_cast_twice_and_held_by_a_barrier_holds_one_cast():
     for the head are one cast, as XLA computes equal casts once (`HloCSE`), held in one buffer the barrier
     and the head share: one bf16 copy of the weights where the derivation held two (Qwen3.5-4B's fused
     tiled head, 1.18 GiB, row 4089)."""
-    from dew.training.compiled_program import compiled
-    from dew.training.footprint import deduplicated, peak_bytes
+    from dew.training.compiled_program import compiled, deduplicated
+    from dew.training.footprint import peak_bytes
 
     # Weights read untransposed, so no layout of theirs is a product's to fold.
     weights = jax.ShapeDtypeStruct((1024, 4096), jnp.float32)
@@ -284,8 +284,7 @@ def test_two_callbacks_of_one_factory_are_each_their_own():
     lowers each to a custom call of its own host callback's index (`emit_python_callback`,
     jax/_src/callback.py), and two closures of one factory share the module and qualified name their
     parameters are keyed by (`parameter_key`), so each callback holds its own result (review of row 4089)."""
-    from dew.training.compiled_program import compiled
-    from dew.training.footprint import deduplicated
+    from dew.training.compiled_program import compiled, deduplicated
 
     def scaled(scale):
         def callback(rows):
@@ -359,7 +358,8 @@ def test_a_tied_embeddings_gradient_holds_its_heads_product_alone():
     in the product's buffer (`CanShareOperandBufferWithUser`), so the gradient holds what the product
     alone does, where the derivation held the product, the scatter and their sum (Qwen3.5-4B's step under
     'full', 7.1 GiB against XLA's 4.4 at its end: row 4089)."""
-    from dew.training.footprint import peak_bytes, simplified
+    from dew.training.compiled_program import simplified
+    from dew.training.footprint import peak_bytes
 
     vocab, width, tokens = 4096, 256, 512
     shapes = (jax.ShapeDtypeStruct((tokens,), jnp.int32), jax.ShapeDtypeStruct((tokens, width), jnp.float32),
@@ -388,7 +388,8 @@ def test_a_gradient_added_to_a_zero_carry_holds_the_gradient_alone():
     `AlgebraicSimplifierVisitor::HandleAdd`): a tiled head of one tile adds its weight gradient to its
     loop's zero carry, which its body runs inline, and holds the gradient alone, where the derivation held
     the sum beside it (row 4089)."""
-    from dew.training.footprint import peak_bytes, simplified
+    from dew.training.compiled_program import simplified
+    from dew.training.footprint import peak_bytes
 
     shapes = (jax.ShapeDtypeStruct((512, 4096), jnp.float32), jax.ShapeDtypeStruct((512, 256), jnp.float32))
 
@@ -415,7 +416,8 @@ def test_a_scatter_whose_updates_read_its_base_holds_them_apart():
     into it (`CanEmitInputFusedScatter`, xla/service/gpu/gpu_fusible.cc): a product scattered into itself
     through a view holds the product and the scatter's result, and one scattered into itself ten times
     over holds the updates' ten copies beside them (review of row 4089)."""
-    from dew.training.footprint import peak_bytes, simplified
+    from dew.training.compiled_program import simplified
+    from dew.training.footprint import peak_bytes
 
     size = 4096 * 256
     shapes = (jax.ShapeDtypeStruct((512, size // 256), jnp.float32),
@@ -461,7 +463,8 @@ def test_a_loops_carry_summed_with_a_product_holds_no_product_beside_it():
     head's weight gradient adding each tile's product to its loop's carry holds what a loop writing each
     product into its carry holds, where the derivation held each tile's product beside the carry
     (Qwen3.5-4B's step under 'full' at two microbatches, 2.37 GiB a tile: row 4089)."""
-    from dew.training.footprint import peak_bytes, simplified
+    from dew.training.compiled_program import simplified
+    from dew.training.footprint import peak_bytes
 
     width, vocab, tokens, tiles = 256, 4096, 512, 4
     shapes = (jax.ShapeDtypeStruct((tiles, tokens, width), jnp.float32),
@@ -491,7 +494,8 @@ def test_a_products_operand_computed_from_a_held_value_frees_it():
     weight gradient reading the logits' cotangent, computed from the logits a recomputed head holds,
     holds what one reading a cotangent held itself holds, where the derivation held the logits and the
     cotangent at once (Qwen3.5-4B's step at four microbatches, 0.95 GiB over XLA's 7.42: row 4089)."""
-    from dew.training.footprint import peak_bytes, simplified
+    from dew.training.compiled_program import simplified
+    from dew.training.footprint import peak_bytes
 
     tokens, width, vocab = 256, 512, 4096
     shapes = (jax.ShapeDtypeStruct((tokens, width), jnp.float32),
@@ -521,7 +525,8 @@ def test_a_gemm_writes_in_its_bias_only_where_it_is_its_one_reader():
     """A GEMM computing a sum writes in its bias only where it is the bias's one reader, whatever read the
     bias before it (`FuseMatrixBiasAdd`'s `can_overwrite_bias`): a bias a reduction read first is held
     beside the sum, one matrix more than where the GEMM reads it alone (review of row 4089)."""
-    from dew.training.footprint import peak_bytes, simplified
+    from dew.training.compiled_program import simplified
+    from dew.training.footprint import peak_bytes
 
     square = jax.ShapeDtypeStruct((512, 512), jnp.float32)
 

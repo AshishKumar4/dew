@@ -813,18 +813,29 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
     from dew.training.distributed import start_lowered
     from dew.training.narrow import narrowed
 
-    lowered = []
+    lowerings: list[Callable[[], jax.stages.Lowered]] = []
     if start.resume is None and not trainer.host_master:
         key = jax.ShapeDtypeStruct(start.key.shape, start.key.dtype)
-        lowered.append(start_lowered(trainer._staged_start, start.initializer, key, start.abstract,
-                                     start.shardings, start.through, trainer.device_mesh))
+        lowerings.append(lambda: start_lowered(trainer._staged_start, start.initializer, key, start.abstract,
+                                               start.shardings, start.through, trainer.device_mesh))
     candidate = planned.candidate
     if candidate.copies:
         # The variables as the run's first step holds them, placed as its start placed them.
         variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
                                                                              sharding=sharding),
                                  start.abstract.variables, start.shardings.variables)
-        lowered.append(owned_program(lambda variables: narrowed(variables, candidate.copies),
-                                     *trainer.objective.towers(),
-                                     out_shardings=candidate.shardings.compute).lower(variables))
-    return {program_digest(each): Executable.of(report.compiled(each)) for each in lowered}
+        lowerings.append(lambda: owned_program(lambda variables: narrowed(variables, candidate.copies),
+                                               *trainer.objective.towers(),
+                                               out_shardings=candidate.shardings.compute).lower(variables))
+
+    def kept(lower: Callable[[], jax.stages.Lowered]) -> tuple[str, Executable]:
+        # A program a refused launch's config relowers is keyed by the program it compiled, as the run's
+        # compile point lowers it past the refusals the step carries (`OuterProgram.compiled`).
+        lowered = [lower()]
+
+        def relower() -> jax.stages.Lowered:
+            lowered.append(lower())
+            return lowered[-1]
+        executable = report.compiled(lowered[0], relower=relower)
+        return program_digest(lowered[-1]), Executable.of(executable)
+    return dict(map(kept, lowerings))
