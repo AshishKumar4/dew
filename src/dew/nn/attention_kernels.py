@@ -463,7 +463,7 @@ TEMPLATE_SUPPORTS = (
 """The attention template's requirements (`attention_route.attend`, the 'template' kernel): one dtype of fp32,
 bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
-starts, block groups, sinks, a softcap, and probability dropout off a GPU or over bf16 operands on one
+starts, block groups, sinks, a softcap, and probability dropout off a GPU or over 16-bit operands on one
 (`attention_route.drops`). A call
 on a GPU or a TPU runs it by default, where its cell's declared old route does not take the call
 (`_attention_preferred`, `DECLARED`), and anywhere a call names it (`implementation='template'`, or
