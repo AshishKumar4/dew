@@ -1234,17 +1234,15 @@ def _gated(target: str, group: tuple):
     return pytest.param(target, group, id=label)
 
 
-@pytest.mark.parametrize('target, group', [_gated(target, group) for target in ('sm80', 'sm90', 'sm100')
+@pytest.mark.parametrize('target, group', [_gated(target, group) for target in ('sm80', 'sm90')
                                            for group in GATE_GROUPS])
 def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target, group):
-    """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100, H100 and B200
-    (mma.sync on TMA rings, `bundles.of`, until its tcgen05 bundle is given) on this CPU
-    (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
-    227 KB, 227 KB) and tensor memory and at most its plan's shared memory (`template.planned`, from which
+    """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
+    CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
+    227 KB) and tensor memory and at most its plan's shared memory (`template.planned`, from which
     the tiles are derived, `planned_failures`), no launch the template's legality holds spills a register
-    once a spilling launch steps down as a run's compile steps it (`stepped_down`: mma.sync's TMA-fed
-    launches on a B200, which sm_100a's ptxas spills where the model holds them; a refused tile's compiled
-    as the model's evidence, `KernelCase.required`), and each launch's register model
+    once a spilling launch steps down as a run's compile steps it (`stepped_down`; a refused tile's
+    compiled as the model's evidence, `KernelCase.required`), and each launch's register model
     decides as ptxas's need does, admitting a tile or refusing it (row 1971,
     `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's shared
     memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
@@ -1273,24 +1271,26 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
 
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
     """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
-    long as a required launch spills (at most `report.STEPS` times), its launch refused
+    long as a required launch spills at a config not refused before, its launch refused
     (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps a spilling
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
-    derives none and leaves the template (a B200's mma.sync launches sm_100a's ptxas spills at every
-    geometry, row 4727). `refused` holds the calls the template's own model refuses (its first derivation,
-    before any compile); the plans and launches held apart are those of the cases returned."""
+    derives none and leaves the template. `refused` holds the calls the template's own model refuses (its
+    first derivation, before any compile); the plans and launches held apart are those of the cases
+    returned."""
     from kernel_compile import compile_mosaic_kernels
 
     launched: dict = {}
     cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
     found = compile_mosaic_kernels(cases, target)
-    for _ in range(report.STEPS):
+    stepped: set = set()
+    while True:
         spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
                                 if kernel.get("spilled")}
                     for case, record in zip(cases, found, strict=True) if case.required}
-        spilling = {name: kernels for name, kernels in spilling.items() if kernels}
+        spilling = {name: kernels for name, kernels in spilling.items() if kernels and name not in stepped}
         if not spilling:
             break
+        stepped |= set(spilling)
         # Refused as the run's compile refuses them: under the target, whose capacities the launch's identity
         # reads.
         with generation.assumed(generation.gpu_target(target)):

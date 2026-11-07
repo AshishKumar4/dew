@@ -2,10 +2,11 @@
 A run's compile (`compiled`, owner 10-29, bible §6) reads each kernel's registers a thread and its stack
 frame from the binary its executable carries (`binaries`): a launch whose kernel spills is refused
 (`refused`) and its program lowered again, where the launch's derivation takes the next config by its own
-rule, until none spills or the launch has none left (`settled`), each such refusal a model miss (`misses`). The CPU suite's compile gate reads the binaries too,
-beside the resource estimate Pallas prints as it lowers a kernel and the PTX Mosaic prints as it compiles
-one, whose registers and spills ptxas states at the GPU's own compile (tests/kernel_compile.py). Each
-kernel's name carries the launch that traced it (`named`), so a binary names its launch and its config."""
+rule, until none spills or the launch has none left (`settled`), each such refusal a model miss (`misses`).
+The CPU suite's compile gate reads the binaries too, beside the resource estimate Pallas prints as it lowers
+a kernel and the PTX Mosaic prints as it compiles one, whose registers and spills ptxas states at the GPU's
+own compile (tests/kernel_compile.py). Each kernel's name carries the launch that traced it (`named`), so a
+binary names its launch and its config."""
 
 import contextlib
 import contextvars
@@ -475,21 +476,15 @@ def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
     return settled(lowered, options, relower, attempted(lowered, options) if first is None else first)
 
 
-STEPS = 8
-"""The most times a program is lowered again past its launches' spills (`settled`): each step refuses at least
-one config a launch derived, so a launch steps through its legal configs, every composition its device has
-among them (`bundles.groups`), until one spills nothing or none is left; a bound on the compiles a program
-takes, as each relowering compiles it whole."""
-
-
 def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
             relower: Callable[[], jax.stages.Lowered], first: Attempt) -> jax.stages.Compiled:
     """The program kept of `lowered`'s first compile (`first`), read through its kernels' binaries
     (`binaries`): where a kernel of a template's launch spills, that launch's config is refused (`refused`),
     the miss recorded (`misses`, logged), and the program `relower`ed and compiled, again for as long as a
-    launch spills (at most `STEPS` times); `relower` traces afresh, so each refused launch's derivation takes
-    the next config by its own rule, and a launch whose every legal config spilled derives none, its call
-    taking the next route (it leaves the template only so). The last compile's own spills are recorded,
+    launch spills at a config not yet refused; `relower` traces afresh, so each refused launch's derivation
+    takes the next config by its own rule, through every composition its device has (`bundles.groups`), and
+    a launch whose every legal config spilled derives none, its call taking the next route (it leaves the
+    template only so). The last compile's own spills are recorded,
     neither refused nor stepped, so every process derives the program this compile keeps; a relowering whose
     derivations find no config left (`Exhausted`: a launch a call pins) keeps the program before it, its
     misses recorded as not stepped. Refusals commit only as a replacement compiles, so a later process
@@ -504,8 +499,11 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     executable = first.executable
     assert executable is not None
     found = _misses_of(_spilling(lowered, executable))
-    for _ in range(STEPS):
-        refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
+    while True:
+        # Each step refuses a config no step refused before, of the finitely many its launches derive.
+        held = _registry().refused
+        refusals = [(refusal, report.kernel) for refusal, report, _ in found
+                    if refusal is not None and report.kernel not in held.get(refusal, frozenset())]
         if not refusals:
             break
         try:

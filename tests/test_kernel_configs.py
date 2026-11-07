@@ -265,12 +265,13 @@ def _lowering(forward, shapes, traced: list):
 
 @lowers("sm90")
 @pytest.mark.parametrize("exhausted", [False, True])
-def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhausted):
+def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fits(exhausted):
     """A compile that finds a template launch's kernel spilling (`report.compiled`, owner 10-29) refuses that
-    launch's config and lowers once more, where the derivation takes its next tile by its own rule; a
-    kernel spilling again is recorded and not stepped again. A paired SwiGLU forward whose model counts no
-    registers, compiled for a compile-only H100 on this CPU through ptxas. A derivation with no replacement
-    keeps its first program; the refusals saved with that program must derive it again."""
+    launch's config and lowers again, where the derivation takes its next tile by its own rule, for as long
+    as a config not refused before spills; the kept program's own spills are recorded and not stepped. A
+    paired SwiGLU forward whose model counts no registers, compiled for a compile-only H100 on this CPU
+    through ptxas. A derivation with no replacement keeps its first program; the refusals saved with that
+    program must derive it again."""
     from dew.nn.kernels.templates import report
     from dew.training.ahead import compile_only_gpus
 
@@ -290,11 +291,11 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
         assert not refused
         kept = first
     else:
-        first, kept = traced
-        assert kept != first
-        assert [(miss.config, miss.stepped) for miss in misses][:1] == [(first, True)]
-        assert all(miss.config == kept and not miss.stepped for miss in misses[1:])
-        assert [config for _, config, _ in refused] == [first]
+        *stepped, kept = traced
+        assert stepped and kept not in stepped
+        assert [miss.config for miss in misses if miss.stepped] == stepped
+        assert all(miss.config == kept for miss in misses if not miss.stepped)
+        assert {config for _, config, _ in refused} == set(stepped)
     # Another process seeded with the run's refusals (its plan's) derives the tile this compile kept.
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
@@ -384,9 +385,9 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
         finally:
             stop.set()
         other.result()
-    first, kept = traced
-    assert kept != first
-    assert [config for _, config, _ in refused] == [first]
+    *stepped, kept = traced
+    assert stepped and kept not in stepped
+    assert {config for _, config, _ in refused} == set(stepped)
 
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),
