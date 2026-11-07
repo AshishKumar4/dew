@@ -669,10 +669,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # automatic barriers order.
         pass
 
-    def added_settled(self) -> None:
-        # Its adds go from registers (`added`'s `red.global`), none in flight past its issue; the ticket's
-        # GPU-scope release orders them before the next turn.
-        pass
 
 
 @dataclasses.dataclass(frozen=True)
