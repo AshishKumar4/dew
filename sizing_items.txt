@@ -1,0 +1,6 @@
+bare|0|1
+conditioned|0|1
+image|0|1
+bare|0|0
+conditioned|0|0
+image|0|0

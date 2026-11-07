@@ -11,7 +11,7 @@ import torch
 from safetensors.numpy import load_file
 from test_block_diffusion import WORKFLOW,transformers_model,transformers_canvas,dew_canvas
 from interop_support import transformers_arms
-from reference_error import assert_as_exact,as_given
+from reference_error import assert_as_exact,as_given,seeds_for
 from dew.interop import diffusion_gemma as adapter
 from tools.torch_precision import replaced,dtype_widened
 from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
@@ -37,6 +37,9 @@ def draw(seed):
  return (image,canvas,pixels) if kind=='image' else ((prompt,canvas,previous) if kind=='conditioned' else (prompt,canvas))
 start=time.monotonic()
 try:
+ if seeds==0:
+  seeds=seeds_for(reference,draw,'dgemma '+kind,truth_fn=truth,dew_fn=as_given(ours))
+  print('K sized',kind,'fixed',fix,'seeds',seeds,flush=True)
  assert_as_exact(as_given(ours),reference,draw,'dgemma '+kind,seeds=seeds,truth_fn=truth)
  print('K gate',kind,'seeds',seeds,'fixed',fix,'PASS','seconds',time.monotonic()-start)
 except Exception as e:

@@ -1,0 +1,26 @@
+diff --git a/tools/torch_precision.py b/tools/torch_precision.py
+--- a/tools/torch_precision.py
++++ b/tools/torch_precision.py
+@@ -111,6 +111,8 @@ def widened_softmax():
+     """`softmax(..., dtype=torch.float32)`, the pin transformers' eager attention and routers carry, in
+     float64."""
+-    with replaced((torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax))):
++    with replaced(
++        (torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax)),
++        (torch.Tensor, "softmax", dtype_widened(torch.Tensor.softmax))):
+         yield
+ 
+ 
+diff --git a/tests/test_bf16_reference.py b/tests/test_bf16_reference.py
+--- a/tests/test_bf16_reference.py
++++ b/tests/test_bf16_reference.py
+@@ -169,7 +169,8 @@ def denoise(model, variables, prompt, canvas, **conditioning):
+     cache = model.apply({**variables, "cache": cache}, inputs,
+                         method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
+                         mutable=["cache"])[1]["cache"]
+-    return model.apply({**variables, "cache": cache}, canvas, **conditioning).astype(jnp.float32)
++    logits = model.apply({**variables, "cache": cache}, canvas, **conditioning)
++    return logits.astype(jnp.result_type(logits.dtype, jnp.float32))
+ 
+ 
+ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
