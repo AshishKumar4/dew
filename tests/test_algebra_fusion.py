@@ -512,6 +512,10 @@ _named_silu.__name__ = "silu"
 
 
 NEAR_NORMS = {
+    "statistics in bfloat16, the widening dropped": lambda x, w: (
+        x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1e-6) * w.astype(x.dtype)),
+    "the weight applied before the statistic": lambda x, w: (
+        _rows_inverse(x * w.astype(x.dtype))[:, None] * x.astype(jnp.float32)).astype(x.dtype),
     "a SwiGLU whose sigmoid rounds to bfloat16": lambda x, w: jax.nn.silu(x) * (x * w.astype(x.dtype)),
     "columns scaled by the rows' statistics":
         lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[None, :]).astype(x.dtype),
@@ -532,7 +536,8 @@ so every axis has the feature axis's extent)."""
 def test_a_plain_program_near_a_norm_computes_as_written(program):
     """A program whose arithmetic resembles an RMSNorm or SwiGLU without being one (the statistics or the
     weight laid along another axis, a nested program only named silu, a mean scaled by zero, the region's own
-    sum read as its weight, a SwiGLU rounding its sigmoid and each product to bfloat16 where Dew's rounds
+    sum read as its weight, its statistics left in bfloat16, the weight applied to the row before its
+    statistic, a SwiGLU rounding its sigmoid and each product to bfloat16 where Dew's rounds
     once after a float32 activation), compiled through `dew.jit` on an H100, computes what it does as
     written: its output and gradients on par with the program's (check 1), whatever of it the compile point
     writes as Dew's norm (an unweighted RMSNorm inside it, its product with another axis's weight left as
