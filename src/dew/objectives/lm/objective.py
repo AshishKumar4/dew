@@ -127,13 +127,7 @@ from dew.objectives.lm.chunked import (
 )
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.stacking import stacked_scores
-from dew.objectives.routing import (
-    ExpertBalance,
-    RoutedStatistics,
-    apply_routed,
-    reduce_routed,
-    refuse_fixed_router,
-)
+from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -574,7 +568,6 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         self.context = context if capacity is None else min(context, capacity)
         self.use_head(head_chunks, head_tile)
         self.samples = samples
-        refuse_fixed_router(model, balance, self.variables)
         self.balance = balance
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (self.context + 1,), variable_axes=(0,)))
         if samples is not None and samples.max_new_tokens > 0:

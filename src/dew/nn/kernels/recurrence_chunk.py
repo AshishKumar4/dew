@@ -40,7 +40,14 @@ from dew.algebra.scan import RESET_DECAY
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import contracted
 from dew.nn.inputs import cu_seqlens
-from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
+from dew.nn.precision import (
+    FP32_SUMS,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    l2norm,
+    rounds_products,
+)
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
@@ -645,10 +652,12 @@ def _port_precision(case) -> bool:
     """Whether the run's declaration (`dew.nn.precision.effective_precision`) admits a port's products for a
     call of `case.dtype`: a 16-bit call's, exact with fp32 sums, where the declaration takes those
     (`exact_products`); an fp32 call's, TF32 (fla's and mamba_ssm's Triton dots), at no more than the
-    default."""
+    default, or, where the port's kernels interpret off a GPU (not `triton_runs`) and multiply fp32 whole,
+    under a scope that states fp32 sums (`FP32_SUMS`, check 1's arms')."""
     if case.dtype.itemsize == 2:
         return exact_products(None, case.dtype)
-    return asks_default_precision(None, configured=True)
+    return asks_default_precision(None, configured=True) or (
+        jax.config.jax_default_matmul_precision == FP32_SUMS and not triton_runs())
 
 
 _PORT_PRECISION = ("a product precision the run declares that the port's products do not compute: above "

@@ -20,7 +20,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.activations import GatedActivation
 from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops
-from dew.nn.moe import ExpertMLP, chosen_experts, renormalized_softmax
+from dew.nn.moe import ExpertMLP, chosen_experts, fixed_router, renormalized_softmax, weighs_one
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.protocols import Routes
@@ -55,6 +55,9 @@ class Gemma4TextRouter(nn.Module):
         indices = chosen_experts(lambda: jax.lax.top_k(jax.nn.softmax(logits, axis=-1), self.top_k)[1],
                                  (*logits.shape[:-1], self.top_k), routes)
         weights = renormalized_softmax(logits, indices)
+        if weighs_one(self.top_k, normalized=True, single_softmax=self.num_experts == 1):
+            # Its input scale's and projection's scores reach nothing; the per-expert scales still train.
+            fixed_router(self.path, {'scale': scale, 'proj': self.variables['params']['proj']})
         per_expert = self.param('per_expert_scale', declared(nn.initializers.ones, ('exp',)),
                                 (self.num_experts,), jnp.float32)
         return weights * per_expert[indices], indices
@@ -75,7 +78,7 @@ class Gemma4Experts(nn.Module):
     out_features: int
     activation: GatedActivation = 'geglu'
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     norm_eps: float = 1e-6
     scale_offset: bool = False
