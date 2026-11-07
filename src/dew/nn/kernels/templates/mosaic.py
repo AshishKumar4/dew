@@ -892,14 +892,15 @@ class Ring:
     def parts(self, slot, start: int, piece) -> list[tuple]:
         """A piece's copies into `slot`'s rows from `start` (`load`), each a source and its destination: the
         slot's rows as its transforms index them, where they are whole tiles of rows (`TILE_ROWS`) or the slot
-        is plain; else, a row's alone (a gathered stream's, `Rows` of one row), each of its tiles' columns
-        into the slot's physical row at the slot's swizzle. TMA swizzles a row by its shared-memory address
-        (the CUDA programming guide's swizzle pointer offset: a 128-byte-aligned row swizzled as the row of
-        the pattern it lies at), so the row lands as its tile's row does."""
+        is plain; else (`split`), a row's alone (a gathered stream's, `Rows` of one row), each of its tiles'
+        columns into the slot's physical row at its swizzle (`piece_copies` of them). TMA swizzles a row by
+        its address (a 128-byte-aligned row swizzled as the pattern's row it lies at), so it lands as its
+        tile's row."""
         rows, smem = piece.shape[0], self.smem
         match smem.transforms if isinstance(smem, state_types.TransformedRef) else ():
             case (plgpu_core.UnswizzleRef() as unswizzled, plgpu_core.UntilingTransform(tiling=(tile, width)),
-                  ) if rows % tile and isinstance(smem, state_types.TransformedRef):
+                  ) if (isinstance(smem, state_types.TransformedRef)
+                        and split(unswizzled.swizzle, rows)):
                 physical = state_types.TransformedRef(smem.ref, (unswizzled,))
                 return [(piece.at[pl.ds(row, 1), pl.ds(column * width, width)],
                          physical.at[slot, (start + row) // tile, column, pl.ds((start + row) % tile, 1)])
@@ -923,6 +924,21 @@ class Ring:
         it filled last, so no slot is freed (or reallocated) while a consumer still reads it, and every
         release is seen (`drained`)."""
         drained(self.consumed, end, self.stages)
+
+
+def piece_copies(block: tuple, dtype, swizzle: int | None, rows: int) -> int:
+    """`Ring.parts`' copies of a piece of `rows` rows into a slot of `block` at `swizzle`, the arrivals its
+    load barrier takes of it (`ring`'s `copies`): a swizzled tile's columns of each row apart where `split`;
+    else once. Counted apart from `parts`, a 256-deep gathered step's barrier waited forever (row 4516)."""
+    if swizzle is None or not split(swizzle, rows):
+        return 1
+    return rows * (block[1] // swizzle_columns(dtype, swizzle))
+
+
+def split(swizzle: int | None, rows: int) -> bool:
+    """Whether `Ring.parts` copies a piece of `rows` rows apart, a row's tile at a time: rows no whole tiles
+    (`TILE_ROWS`) of a swizzled slot (a stated swizzle of 32 bytes or more; 16 only tiles)."""
+    return swizzle not in (None, UNSWIZZLED) and swizzle >= NARROWEST_SWIZZLE_BYTES and rows % TILE_ROWS != 0
 
 
 def drained(barriers, end, stages: int) -> None:
