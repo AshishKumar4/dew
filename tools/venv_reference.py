@@ -33,6 +33,7 @@ NATIVE = {**{f"{task}-{group}": (task, group) for task in _WORKER.TASKS for grou
 of leaves (tools/native_diffusion_worker.py's `groups`), and the SD pipeline's walk over each source
 scheduler's grid."""
 
+DIFFUSERS = importlib.import_module("reference_releases").tested("diffusers")
 PIPELINES = importlib.import_module("reference_releases").RELEASES["diffusers-pipelines"]
 NATIVE_PIPELINES = (f"huggingface/diffusers {PIPELINES['diffusers']} with huggingface/transformers "
                     f"{PIPELINES['transformers']}")
@@ -90,11 +91,11 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                "reference": "huggingface/diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c",
                                "license": "Apache-2.0", "distribution": ("transformers", "5.17.0")},
          **{f"wan-{case}": {"test": "test_wan_source", "arms": case, "worker": "wan_worker.py",
-                            "reference": "huggingface/diffusers 0.34.0", "license": "Apache-2.0",
-                            "distribution": ("diffusers", "0.34.0")} for case in ("published", "variant")},
+                            "reference": f"huggingface/diffusers {DIFFUSERS}", "license": "Apache-2.0",
+                            "distribution": ("diffusers", DIFFUSERS)} for case in ("published", "variant")},
          **{f"wan-bf16-{case}": {"test": "test_wan_source", "arms": f"bf16/{case}", "worker": "wan_worker.py",
-                                 "reference": "huggingface/diffusers 0.34.0", "license": "Apache-2.0",
-                                 "distribution": ("diffusers", "0.34.0"), "narrow": "bfloat16"}
+                                 "reference": f"huggingface/diffusers {DIFFUSERS}", "license": "Apache-2.0",
+                                 "distribution": ("diffusers", DIFFUSERS), "narrow": "bfloat16"}
             for case in ("published", "variant")},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
