@@ -769,8 +769,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Gathered rows (`gmm_call`'s `gather`) are a ring family's producer's gather, no prologue rewriting
         # them (`mosaic_gpu._gather_refused`).
         gathered = ba.arguments.get('gather') is not None
+        tabled = gathered or ba.arguments.get('scatter') is not None
         return ((jnp.dtype(dtype).itemsize == 2 or self._fp8(ba, dtype, family))
-                and (not gathered or (family.gathers_rows and ba.arguments['hooks'].prologue is None))
+                and (not tabled or family.gathers_rows)
+                and (not gathered or ba.arguments['hooks'].prologue is None)
                 and (family.issues_in_consumers or not prepared)
                 and (family.counts_hooks or not hooked) and (family.counts_sums or not summed))
 
