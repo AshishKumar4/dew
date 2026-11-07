@@ -601,16 +601,20 @@ def per_shard(kernel: str) -> None:
 
 
 def parameter_path(path) -> Suffix:
-    """The parameter's own path: the trailing run of dict keys under a leaf.
+    """The parameter's own path: the trailing run of dict keys under a leaf, a registered dataclass's field
+    names among them (a packed bank's, `dew.nn.kernels.gemm.NvFp4`: its leaves its fields).
 
     An optimizer state nests a copy of the parameter tree inside its own
     structure, so what identifies a parameter is where its path ends.
     """
     names = []
     for entry in reversed(path):
-        if not isinstance(entry, jax.tree_util.DictKey) or not isinstance(entry.key, str):
+        if isinstance(entry, jax.tree_util.GetAttrKey):
+            names.append(entry.name)
+        elif isinstance(entry, jax.tree_util.DictKey) and isinstance(entry.key, str):
+            names.append(entry.key)
+        else:
             break
-        names.append(entry.key)
     return tuple(reversed(names))
 
 

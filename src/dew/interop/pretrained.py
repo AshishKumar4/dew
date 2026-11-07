@@ -82,6 +82,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.kernels.gemm import NvFp4
 from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
@@ -603,10 +604,11 @@ class Pretrained:
                      prediction_depths: int | None, dex: DifferentialExtension | None,
                      precision: Numerics | str | None, scan_layers: bool, packed_experts: bool) -> Self:
         """`load` of a source a family's loader reads, its every option as `load` states it."""
-        if packed_experts and (mesh is not None or layout is not None or scan_layers):
-            # A bank's three leaves place and stack by the dense matrix's axes, which neither reads yet.
-            raise ValueError("packed_experts holds each expert bank on one device unscanned; load it without "
-                             "a mesh, layout or scan_layers")
+        if packed_experts and scan_layers:
+            # A scan stacks a period's layers along a leading axis of each leaf, which a bank's three would
+            # take as its experts' (row 4881).
+            raise ValueError("packed_experts serves each layer's banks apart; scan_layers stacks them, which "
+                             "no bank takes yet (row 4881)")
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
@@ -2303,13 +2305,13 @@ def _translated(config: Mapping[str, object],
     weights decoded, or its expert banks held packed (`packed_experts`, `_packed_banks`), the decoder,
     media wrapper or DiffusionGemma translated and checked against its tree, and any stored input scales
     bound. No processor, generation config or bundle is built."""
-    banks: dict[str, object] = {}
+    banks: dict[str, NvFp4] = {}
     placing, given = streaming, tensors
     if packed_experts:
         tensors, banks = _packed_banks(tensors, config)
         # Its leaves translated as views read when placed, as a streaming load's: the banks' unread leaves
         # are replaced before any is read (`_with_banks`), the rest read below where the load places none.
-        streaming = True
+        streaming = streaming or bool(banks)
     tensors, quantized_tensors, scale_dtype, grid, checked, stored = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
@@ -2350,7 +2352,6 @@ def _translated(config: Mapping[str, object],
     variables = _with_banks(variables, built.layouts, banks)
     if banks and not placing:
         from dew.interop.streaming import SourceLeaf
-        from dew.nn.kernels.gemm import NvFp4
 
         variables = jax.tree.map(lambda leaf: leaf.read() if isinstance(leaf, SourceLeaf) else leaf,
                                  variables, is_leaf=lambda leaf: isinstance(leaf, NvFp4))
@@ -2358,18 +2359,39 @@ def _translated(config: Mapping[str, object],
                        stored)
 
 
+def _bank_axes(table: Mapping[tuple[str, ...], tuple[str | None, ...]], variables: Variables
+               ) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """`table` (a model's drawn axes, `decoder_axes`) with each packed bank's leaves (`_with_banks`) at its
+    dense matrix's axes as the bank lays them out (`quantization.expert_leaf_axes`), by their fields' paths
+    (`dew.nn.sharding.parameter_path`), as placement reads a leaf's."""
+    from dew.quantization import QUANTIZATION, expert_leaf_axes
+
+    banks = {path: bank for path, bank in flatten_dict(
+        dict(variables.get(QUANTIZATION, {})), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()
+        if isinstance(bank, NvFp4)}
+    held = dict(table)
+    for path, bank in banks.items():
+        dense = table.get(("params", *path))
+        if dense is None:
+            continue
+        names = [member.name for member in dataclasses.fields(bank)]
+        for name, axes in zip(names, expert_leaf_axes(bank, dense), strict=True):
+            held[(QUANTIZATION, *path, name)] = axes
+    return held
+
+
 def _packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, object]
-                  ) -> tuple[dict[str, unread.Stored], dict[str, object]]:
+                  ) -> tuple[dict[str, unread.Stored], dict[str, NvFp4]]:
     """`tensors` with each MXFP4 expert bank a load serves packed (`Pretrained.load`'s `packed_experts`)
     taken out of the source's decoding, and those banks by their source names (`dew.nn.kernels.gemm.NvFp4`,
     built on the host, exactly the MXFP4 values: `codecs.mxfp4_as_nvfp4`). In each one's place an unread
     leaf of its decoded shape and dtype, which the decoder's translation binds as it binds a load without
     weights (`unread.Unread`), and `_with_banks` replaces. A bank whose depth is no whole NVFP4 stages
-    (`gemm.NVFP4_STAGE`) or whose experts' group powers span past one tensor scale's reach
-    (`mxfp4_tensor_powers` None) is decoded as the source states it, and named in the load's log, once a
-    load; another source format is refused."""
+    (`gemm.NVFP4_STAGE`), whose experts' group powers span past one tensor scale's reach
+    (`mxfp4_tensor_powers` None), or that holds no experts (a 2-D weight's blocks), is decoded as the source
+    states it, and named in the load's log, once a load; another source format is refused."""
     from dew.interop import codecs
-    from dew.nn.kernels.gemm import NVFP4_STAGE, NvFp4
+    from dew.nn.kernels.gemm import NVFP4_STAGE
 
     quantization = source_quantization(config)
     if quantization is None or quantization is not codecs.MXFP4:
@@ -2378,13 +2400,18 @@ def _packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
     tensors, banks = dict(tensors), {}
     for name in quantization.names(tensors):
         blocks, scales = (tensors[name + suffix] for suffix in codecs.MXFP4_SUFFIXES)
-        experts, outputs, groups, _ = blocks.shape
-        powers = None if groups * codecs.GROUP % NVFP4_STAGE else codecs.mxfp4_tensor_powers(scales)
+        powers = None
+        if len(blocks.shape) != 4:
+            reason = "it holds no experts"
+        elif blocks.shape[2] * codecs.GROUP % NVFP4_STAGE:
+            reason = f"its depth {blocks.shape[2] * codecs.GROUP} is no whole {NVFP4_STAGE}-deep stages"
+        else:
+            powers = codecs.mxfp4_tensor_powers(scales)
+            reason = "its experts' group powers span past one tensor scale's reach"
         if powers is None:
-            _log.warning("packed_experts: %s stays dense: its depth %d is %s", name, groups * codecs.GROUP,
-                         f"no whole {NVFP4_STAGE}-deep stages" if groups * codecs.GROUP % NVFP4_STAGE else
-                         "whole stages, but its experts' group powers span past one tensor scale's reach")
+            _log.warning("packed_experts: %s stays dense: %s", name, reason)
             continue
+        experts, outputs, groups, _ = blocks.shape
         banks[name] = NvFp4.of(*codecs.mxfp4_as_nvfp4(blocks, scales, powers))
         for suffix in codecs.MXFP4_SUFFIXES:
             del tensors[name + suffix]
@@ -2392,7 +2419,7 @@ def _packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
     return tensors, banks
 
 
-def _with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: Mapping[str, object]
+def _with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: Mapping[str, NvFp4]
                 ) -> Variables:
     """`variables` with each packed bank (`_packed_banks`) in `QUANTIZATION` under the path its source name's
     layout binds, the unread leaf there taken out of `params`: a bank its layout reads as it stands, one
@@ -2402,8 +2429,8 @@ def _with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: 
         return variables
     from dew.quantization import QUANTIZATION
 
-    params: dict[tuple, object] = dict(flatten_dict(dict(variables["params"])))
-    held: dict[tuple, object] = dict(flatten_dict(dict(variables.get(QUANTIZATION, {}))))
+    params = dict(flatten_dict(dict(variables["params"])))
+    held = dict(flatten_dict(dict(variables.get(QUANTIZATION, {}))))
     bound = {layout.name: layout for layout in layouts}
     for name, bank in banks.items():
         layout = bound.get(name)
@@ -2584,7 +2611,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     named = generation_config.get("tokenizer_name") if processor is None else None
 
     def bundle[K: Pretrained](kind: type[K]) -> K:
-        return kind(model, placed(variables, axes=decoder_parts.decoder_axes(model)), processor, config,
+        return kind(model, placed(variables, axes=_bank_axes(decoder_parts.decoder_axes(model), variables)),
+                    processor, config,
                     directory, built, generation_config,
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid, quantized_specs=stored,
