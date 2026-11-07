@@ -1,6 +1,7 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
 import functools
+import importlib.util
 import itertools
 import json
 import math
@@ -202,18 +203,21 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
 
 def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_override(ci, tmp_path):
     """`ci.py pytest`, which a lane's targeted run uses (tmp/run_tests.py), runs the tests a CI task would,
-    with the task's own marker selection: a network test is deselected; a `-m` of the caller's own, after
-    the selection, chooses instead. Its exit status is pytest's."""
+    with the task's own marker selection: a network test and a whole_suite cell are deselected; a `-m` of the
+    caller's own, after the selection, chooses instead; with `whole`, as main's whole run selects, its
+    whole_suite cells run, as a bisect of its red runs them (row 4230). Its exit status is pytest's."""
     written(tmp_path, {"test_marked.py": "import pytest\n\ndef test_offline():\n    pass\n\n\n"
-                                         "@pytest.mark.network\ndef test_online():\n    pass\n"})
+                                         "@pytest.mark.network\ndef test_online():\n    pass\n\n\n"
+                                         "@pytest.mark.whole_suite\ndef test_cell():\n    pass\n"})
     interpreter(tmp_path, "3.12")
 
-    def ran(*arguments: str) -> tuple[int, list[str]]:
+    def ran(*arguments: str, whole: bool = False) -> tuple[int, list[str]]:
         report = tmp_path / "report.xml"
-        status = ci.targeted("3.12", ["tests/test_marked.py", *arguments], report)
+        status = ci.targeted("3.12", ["tests/test_marked.py", *arguments], report, whole=whole)
         return status, [case.get("name") for case in ET.parse(report).iter("testcase")]
 
     assert ran() == (0, ["test_offline"])
+    assert ran(whole=True) == (0, ["test_offline", "test_cell"])
     assert ran("-m", "network") == (0, ["test_online"])
     assert ran("-k", "nothing_matches")[0] == 5
 
@@ -1301,6 +1305,68 @@ def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_
         (tmp_path / "tests/test_a.py").write_text(text)
         commit(tmp_path, "the test reads itself")
         assert run() == runs
+
+
+def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(ci, tmp_path, monkeypatch,
+                                                                              cache_worker):
+    """A conftest is keyed by the units each run executed, as any module is (followed.py's `code_unit`): an
+    edit to a fixture no run took reruns nothing, one to the fixture a file's tests took reruns that file
+    alone, and one to a hook every run runs reruns every file (row 4385: every file's key held the whole of
+    tests/conftest.py, so one conftest edit reran the suite)."""
+    counted = "    with open('runs-{0}', 'a') as runs: runs.write('x')\n"
+    written(tmp_path, {
+        "conftest.py": "import pytest\n\n\ndef pytest_configure(config):\n"
+                       "    config.addinivalue_line('markers', 'mine: a mark')\n\n\n"
+                       "@pytest.fixture\ndef base():\n    return 1\n\n\n"
+                       "@pytest.fixture\ndef other():\n    return 2\n",
+        "test_user.py": "def test_user(base):\n" + counted.format("user") + "    assert base\n",
+        "test_none.py": "def test_none():\n" + counted.format("none") + "    assert True\n"})
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    out, names = tmp_path / "verdict.json", ("user", "none")
+
+    def run() -> list[int]:
+        # Each file a task of its own: a task's later files share what its earlier ones ran.
+        for name in names:
+            ci.task("3.12", [f"tests/test_{name}.py"], "", out, 600.0)
+            assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0], name
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in names]
+
+    assert run() == [1, 1]
+    assert run() == [1, 1]
+    conftest = tmp_path / "tests/conftest.py"
+    for old, new, runs in (("return 2", "return 3", [1, 1]), ("return 1", "return 4 - 3", [2, 1]),
+                           ("a mark", "the mark", [3, 2])):
+        conftest.write_text(conftest.read_text().replace(old, new))
+        assert run() == runs, new
+
+
+def test_a_change_to_the_selection_every_task_runs_under_rekeys_every_row_and_its_wording_none(
+        tmp_path, monkeypatch):
+    """Every row's shared key holds the plan's code that decides which tests a row's run holds and how pytest
+    is called (`selected`, `pytest_command`), which a green row's meaning rests on, and nothing of its wording
+    (row 2558: a change to the selection reused rows its run would not give)."""
+    harness = tmp_path / "tools" / "armada"
+    shutil.copytree(Path(__file__).resolve().parents[1] / "tools" / "armada", harness,
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.chdir(tmp_path)
+    source = (harness / "ci.py").read_text()
+
+    def shared_of(text: str) -> str:
+        (harness / "ci.py").write_text(text)
+        spec = importlib.util.spec_from_file_location("ci_copy", harness / "ci.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.shared("3.12")
+
+    head = source.index("def selected(")
+    body = source.index('"""', source.index('"""', head) + 3) + 3
+    worded = source[:head] + source[head:body].replace("CI's pytest", "CI's own pytest", 1) + source[body:]
+    changed = source[:body] + "\n    assert command" + source[body:]
+    assert shared_of(worded) == shared_of(source) != shared_of(changed)
 
 
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
