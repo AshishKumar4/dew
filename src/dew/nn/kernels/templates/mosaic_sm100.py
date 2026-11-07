@@ -705,13 +705,21 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
     and tcgen05's products, so interpreted it runs the same."""
 
     name = "tcgen05.chunks"
-    takes_tf32 = True
+    # Mosaic GPU's tcgen05 lowering takes no TF32 operand ("Unsupported input element type: tf32",
+    # jsf-gate100b): an fp32 product takes bf16 parts.
     takes_fp8 = True
     rows = 64
     role_rows = 64
     widest_product = 256
     operands_in_registers = False
     products_overlap = False  # each product is awaited where its value is read (`summed`)
+
+    def narrowest_columns(self, dtype) -> int:
+        # A 64-row product splits its N columns between two lane groups, each a whole tile of 16 (Mosaic
+        # GPU: "the M or N MMA instruction size was chosen to be 24, which is not a multiple of the tiling of
+        # the non-contracting dimension 16" at 48 columns, and a 16-column one's swizzle past its half's 8,
+        # jsf-gate100b): a staged block's columns step in 32.
+        return max(2 * 16, super().narrowest_columns(dtype))
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...]) -> dict:
         # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
