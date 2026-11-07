@@ -66,6 +66,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "mxfp8": {
         "generation": ("sm100",),
+        "format": ("mxfp8", "nvfp4"),
         "width": ("128", "256"),
         "groups": ("1", "4"),
         "out_dtype": ("float32", "bfloat16"),
@@ -154,8 +155,9 @@ projections with no bias or one; a gate times its multiplier or not (`plain` for
 dtype. The adapted product's (the choice `low_rank`): the GPU; the adapter's rank; a projection with no bias
 or one; the operands' dtype. The blockwise-scaled FP8 product's (the choice `blockwise_fp8`): the GPU (an
 H100's FP8 tensor cores); the columns a column scale covers (a weight block's 128, or one); the groups;
-the output's dtype. The MX product's (the choice `mxfp8`): the GPU (a B200's block-scaled tensor
-cores); the matrix's width; the groups; the output's dtype. The NVFP4 product's (the choice `nvfp4`): the
+the output's dtype. The block-scaled product's (the choices `mxfp8` and `nvfp4_block`): the GPU (a B200's
+block-scaled tensor cores); the block format (MXFP8's E4M3 under E8M0 every 32, NVFP4's E2M1 under E4M3
+every 16); the matrix's width; the groups; the output's dtype. The NVFP4 product's (the choice `nvfp4`): the
 GPU; the matrix's width and depth;
 the output's dtype. The recurrence's (the choices `gated_delta_rule` and `ssd`): the GPU; the form
 (tests/recurrence_matrix.py's `FORMS`); the kernel under test (the template, the portable math and its derived
