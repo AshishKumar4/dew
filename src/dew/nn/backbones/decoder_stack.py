@@ -24,6 +24,7 @@ import numpy as np
 from flax import linen as nn
 from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import Variables, merge, part
@@ -137,7 +138,7 @@ apart per pass (`PassView`)."""
 LAYER_ROWS = 'layer_rows'
 """The collection, and the key within it, under which a one-stage scan's run holds the layers a stage-local
 state keeps on their stored layers, a row each (`StackView.stack`): a frozen base the objective joins into the
-parameters, which each iteration reads where it lies (`_rows_at`), where a stacked copy would hold it twice.
+parameters, which each iteration reads where it lies (`_rows_read`), where a stacked copy would hold it twice.
 The collection holds each run's rows by the collection they join."""
 
 
@@ -162,7 +163,10 @@ def _rows_read(tree, index: jax.Array):
     found = _row_containers(tree)
     branches = [functools.partial(lambda held, offset: [rows[offset] for rows in held], offset=offset)
                 for offset in range(len(found[0][1]))]
-    read = jax.lax.switch(index, branches, [rows for _, rows in found])
+    # Named so the scan's body recomputes them in the backward from the index (`_ROWS_RECOMPUTED`): kept,
+    # each iteration's rows would stack the run a second time among the scan's residuals.
+    read = jax.tree.map(lambda leaf: checkpoint_name(leaf, LAYER_ROWS),
+                        jax.lax.switch(index, branches, [rows for _, rows in found]))
     flat = flatten_dict(tree)
     for (path, _), row in zip(found, read, strict=True):
         flat = {key: value for key, value in flat.items() if key[:len(path) + 1] != (*path, LAYER_ROWS)}
@@ -170,14 +174,15 @@ def _rows_read(tree, index: jax.Array):
     return unflatten_dict(flat)
 
 
-_rows_at = jax.checkpoint(_rows_read, policy=jax.checkpoint_policies.nothing_saveable)
-"""`_rows_read` recomputed in the backward, so a scan keeps the iteration's index of it, not its rows."""
+_ROWS_RECOMPUTED = jax.checkpoint_policies.save_anything_except_these_names(LAYER_ROWS)
+"""What a scanned run's body that reads rows keeps for the backward: all its layer keeps, but the rows it read
+(`_rows_read`), which the backward reads again from the iteration's index."""
 
 
 def _rows_joined(variables: Mapping[str, Mapping], index: jax.Array) -> dict:
-    """A run's variables at an iteration: its rows (`LAYER_ROWS`) read at `index` (`_rows_at`) and joined
+    """A run's variables at an iteration: its rows (`LAYER_ROWS`) read at `index` (`_rows_read`) and joined
     into the collections they belong to, beside those collections' own slices."""
-    read = _rows_at(variables[LAYER_ROWS], index)
+    read = _rows_read(variables[LAYER_ROWS], index)
     return {name: merge(dict(tree), read[name]) if name in read else tree
             for name, tree in variables.items() if name != LAYER_ROWS}
 
@@ -393,15 +398,18 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
 
             repeats = count // len(run.specs) if periodic else count
             # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
-            # reading its row in place into the collections they join (`_rows_joined`); every other
+            # reading its row in place into the collections they join (`_rows_joined`), recomputed in the backward
+            # (`_ROWS_RECOMPUTED`); every other
             # collection scans its stacked layers.
             rows = tuple(run.variables.get(LAYER_ROWS, {}))
             if rows:
                 def scanned(layer, carry, per_layer_input, index, *, scanned=scanned, rows=rows):
-                    read = nn.map_variables(scanned, (LAYER_ROWS, *rows),
-                                            trans_in_fn=functools.partial(_rows_joined, index=index),
-                                            init=False, mutable=False)
-                    return read(layer, carry, per_layer_input)
+                    def read(layer, carry, per_layer_input, index):
+                        return nn.map_variables(scanned, (LAYER_ROWS, *rows),
+                                                trans_in_fn=functools.partial(_rows_joined, index=index),
+                                                init=False, mutable=False)(layer, carry, per_layer_input)
+                    return nn.remat(read, policy=_ROWS_RECOMPUTED, prevent_cse=False)(
+                        layer, carry, per_layer_input, index)
             # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
             # axis, which the run's view cuts off again per layer (`_rows`).
             x, _ = nn.scan(scanned, variable_axes={nn.DenyList(LAYER_ROWS) if rows else True: 0},
@@ -974,7 +982,7 @@ class StackView:
                 runs = {name: with_unstacked_axes(jax.tree.map(_one_stage, run), 1)
                         for name, run in tree['stages'].items()}
                 # The layers it keeps on their stored layers beside its runs (a frozen base the objective
-                # joins into its parameters) are read a row an iteration where they lie (`_rows_at`).
+                # joins into its parameters) are read a row an iteration where they lie (`_rows_read`).
                 outside, rows = self._rowed_runs(collection, {name: value for name, value in tree.items()
                                                               if name != 'stages'})
                 inside[collection] = {**outside, **runs}
