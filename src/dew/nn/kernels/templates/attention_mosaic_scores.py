@@ -106,7 +106,8 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
                  for ref, kind in zip(refs, kinds, strict=True))
 
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords: algebra.Coords, whole,
-                 shape: tuple[int, int], *, masked: bool | None) -> tuple[jax.Array, jax.Array]:
+                 shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False
+                 ) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
     (`_fused_step`'s, `_coop_step`'s): its
     logits from the query slot taken by its power in registers (`_Backward.scaled`) against the resident
@@ -116,7 +117,9 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
     read past them at Qwen3-8B causal) and `coords`, masked where `masked`, or where it is None chosen at run
     time, unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
     (`algebra.value_weights`), a dropping call's dropped (`algebra.drawn`), and its score cotangents through
-    the hook (`gradient.pulled`), one part in the operands' dtype (dK's and dQ's)."""
+    the hook (`gradient.pulled`), one part in the operands' dtype (dK's and dQ's); with `whole_operands`
+    (fp16's, `algebra.running_parts`), both fp32: the normalized weights, dropped, and the scaled
+    cotangents."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held = keys.transpose((1, 0))
@@ -138,6 +141,8 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
                                                      functools.partial(scores, masked=True))
     else:
         exponentials, weights, cotangents = scores(masked=masked)
+    if whole_operands:
+        return weights, cotangents * walk.grad_scale
     part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
                                                          accurate=False))
     return algebra.value_weights(exponentials, weights, do_slot.dtype, walk.dropped), part

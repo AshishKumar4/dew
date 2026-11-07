@@ -476,6 +476,34 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
     _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("drop", [False, True], ids=["plain", "dropping"])
+@pytest.mark.parametrize("call", CALLS)
+def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call, drop):
+    """An fp16 call's backward in the fast form's one launch (row 3886): its weights and score cotangents as
+    two fp16 parts at each walk's running scale (`algebra.running_parts`), dV's and dK's accumulators taken
+    to the new scale as it grows and back at the end, each tile's dQ by its own; every gradient the
+    reference's (check 1), under the interpreter."""
+    _check_backward(call, SHAPES["interpreted"], form="fused", interpret=True, drop=drop, dtype=jnp.float16)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
+    """An fp16 call's backward at its derived tiles of a causal call `width` wide, its one launch's two parts
+    at running scales (`attention_mosaic_fused._sixteen_step`), lowered and compiled by ptxas for an H100 on
+    this CPU: within its shared memory, spilling nothing, its register model's decision ptxas's."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    op, ba, config = _gated_backward("sm90", width, accurate=False, dtype=jnp.float16)
+    assert config.fused, config
+    with generation.assumed("sm90"):
+        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config),
+                                                   _backward_models(op, ba, config))], "sm90")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
 TPU_PASSES = {"fold": {"natural": False}, "natural": {"natural": True},
               "sinks": {"natural": False, "sinks": True},
               "training": {"natural": False, "training": template.Kept.SPLIT}}
@@ -1762,14 +1790,15 @@ def _gated_hooks(hooks: str, queries: int, width: int):
                           initial)
 
 
-def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str = "none"):
+def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str = "none",
+                    dtype=jnp.bfloat16):
     """The resource gate's backward op, bound arguments and derived config: a causal call of 512 queries,
-    four query heads over two key heads `width` wide, bf16, in the form `accurate` names, under the score
-    hook `hooks` names (`_gated_hooks`), for `generation_name`."""
+    four query heads over two key heads `width` wide, in `dtype` (bf16 by default), in the form `accurate`
+    names, under the score hook `hooks` names (`_gated_hooks`), for `generation_name`."""
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
-    query = jnp.zeros((1, queries, 4, width), jnp.bfloat16)
-    key = jnp.zeros((1, queries, 2, width), jnp.bfloat16)
+    query = jnp.zeros((1, queries, 4, width), dtype)
+    key = jnp.zeros((1, queries, 2, width), dtype)
     hooked = _gated_hooks(hooks, queries, width)
     with generation.assumed(generation_name):
         op, args = attention_mosaic._backward_call(query, key, key, spans, hooked, query,
