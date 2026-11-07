@@ -847,10 +847,14 @@ class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
         # A 64-row product reads a transposed operand as two halves of 32 rows and splits its columns
         # between two lane groups, each whole tiles of its swizzle: at 128 bytes the keys' (64, 8) transposed
         # tiling divides no half (Mosaic GPU's layout inference refused a 27B gated delta net's fp32 forward
-        # on a B200; row 4747's debugging at 0e5d3aa9df8: at 64 bytes it lowers and compiles), and a 96-column
-        # operand's halves of 48 no 32-column tile (`right_swizzle`).
+        # on a B200; row 4747's debugging at 0e5d3aa9df8: at 64 bytes it lowers and compiles), a 96-column
+        # operand's halves of 48 no 32-column tile (`right_swizzle`), a role's share of a stream's columns
+        # (the SSD's values two roles read 32 of 64 each) whole tiles of its halves, and a stream read as a
+        # transposed right operand (Kimi delta attention's memories, 32 of their rows its columns) whole
+        # tiles of its narrower side's halves (the debugging's SSD and KDA cases).
         capped = {name: min((swizzles or {}).get(name, resources.widest_swizzle(dtype, shape[-1])),
-                            mosaic.SWIZZLE_BYTES // 2, self.right_swizzle(dtype, shape[-1]))
+                            mosaic.SWIZZLE_BYTES // 2, self.right_swizzle(dtype, shape[-1] // consumers),
+                            self.right_swizzle(dtype, min(shape)))
                   for name, (shape, dtype) in blocks.items() if len(shape) == 2}
         return super().streams(blocks, stages, consumers, multicast, {**(swizzles or {}), **capped}, copies,
                                gathered)
