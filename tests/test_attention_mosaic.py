@@ -1418,6 +1418,32 @@ def test_the_launches_lower_for_an_h100(call, accurate):
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
 
 
+@pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
+def test_the_launches_lower_for_a_v5e(call):
+    """The forward, the training forward and the backward on a v5e's MXU (`mosaic_tpu.MXU`, the route's Mosaic
+    mainloop on a TPU) lower for a TPU on this CPU, Pallas TPU's Mosaic lowering, as a TPU compiles them: a
+    causal call and a spans one of documents under a window, whose programs read its block map and ids."""
+    if call == "causal":
+        rows, tokens, heads, kv_heads = SHAPES["compiled"]
+        spans = template.spans(tokens, tokens, rows, causal=True)
+    else:
+        (tokens, _), rows, heads, kv_heads = core_geometry(CASES[call]), ROWS, 4, 2
+        spans = template.spans(tokens, tokens, rows, **arguments(CASES[call]))
+    q = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((rows, tokens, kv_heads, 128), jnp.bfloat16)
+    rows_shape = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
+    others = jax.ShapeDtypeStruct((rows, heads, tokens, 128), jnp.float32)
+    split = template.Split(others, rows_shape, rows_shape, rows_shape)
+    residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32), split)
+    with generation.assumed("v5e"):
+        for training in (template.Kept.NONE, template.Kept.SPLIT):
+            entry = functools.partial(attention_mosaic.forward, spans=spans, hooks=None, residuals=training)
+            jax.jit(entry).trace(q, kv, kv).lower(lowering_platforms=("tpu",))
+        jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
+            q, k, v, spans, None, dout, residuals=residuals)).trace(q, kv, kv, q, residuals).lower(
+            lowering_platforms=("tpu",))
+
+
 APPROXIMATED_BY_MOSAIC = ("exp", "exp2", "log", "log2", "log1p", "tanh", "logistic", "sin", "cos", "sqrt",
                           "rsqrt")
 """The unary operations whose Mosaic GPU lowering takes `approx_math` (jax's Pallas Mosaic GPU lowering rules

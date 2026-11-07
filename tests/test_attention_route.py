@@ -772,11 +772,30 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
     [requirement] = [requirement for requirement in attention_route.MAINLOOP.kernel("mosaic").supports
                      if requirement.code == "declined"]
     for triton in (None, spans):
-        route = selection.select(attention_route.MAINLOOP,
-                                 attention_route._Pass(on_gpu=True, mosaic=declined, triton=triton))
+        route = selection.select(attention_route.MAINLOOP, attention_route._Pass(
+            on_gpu=True, on_mosaic=True, mosaic=declined, triton=triton))
         assert route.kernel != "mosaic"
         assert (route.refusal.code, route.refusal.detail, route.refusal.row) == (
             "registers", declined.detail, requirement.row)
     [refused] = attention_route.MAINLOOP.kernel("triton").failed(
-        attention_route._Pass(on_gpu=True, mosaic=None, triton=spans))
+        attention_route._Pass(on_gpu=True, on_mosaic=True, mosaic=None, triton=spans))
     assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
+
+
+@pytest.mark.parametrize("differentiated", [False, True], ids=["inference", "training"])
+def test_a_call_only_spans_express_holds_no_dense_mask(differentiated):
+    """A causal call of block groups (Gemma 4's images, a decision row's blocks), which only spans express
+    (`AttentionCase.spans_only`), runs where its visibility stays spans, its forward and its training alike:
+    its compiled program's temporaries hold less than one `[S, S]` mask of bytes, where the reference path's
+    dense mask and logits hold `B H S S` fp32 (rows 1495, 1953)."""
+    tokens, heads, width = 2048, 4, 64
+    query, key, value = (jnp.ones((1, tokens, h, width), jnp.bfloat16) for h in (heads, 2, 2))
+    groups = jnp.repeat(jnp.arange(tokens // 128, dtype=jnp.int32), 128)[None]
+
+    def attended(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, block_groups=groups)
+
+    step = jax.grad(lambda *operands: attended(*operands).astype(jnp.float32).sum(),
+                    argnums=(0, 1, 2)) if differentiated else attended
+    compiled = jax.jit(step).lower(query, key, value).compile()
+    assert compiled.memory_analysis().temp_size_in_bytes < tokens * tokens
