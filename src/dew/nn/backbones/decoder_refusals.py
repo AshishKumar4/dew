@@ -8,9 +8,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..mixer_base import MixerBase
+    from ..mixer_base import MixerBase, MixerContext
     from .causal_transformer import CausalTransformer
-    from .layer_plan import LayerSpec
 
 
 def mixed_admission(decoder: CausalTransformer) -> str | None:
@@ -27,8 +26,7 @@ def mixed_admission(decoder: CausalTransformer) -> str | None:
                 "every slot's tokens does not seat")
     if decoder.position_embedding == "learned" or decoder.engram is not None or decoder.hash_layers:
         return "a learned position embedding, n-gram or hash routing reads beyond the token"
-    return _layer(decoder, lambda mixer, spec, index: mixer.mixed_refusal(decoder.mixer_context(
-        spec.kind, spec.layer_type, spec.kv_shared, spec.dex, decoder._dex_start(index), spec.routed)))
+    return _layer(decoder, lambda mixer, context: mixer.mixed_refusal(context))
 
 
 def generation(decoder: CausalTransformer) -> str | None:
@@ -72,15 +70,14 @@ def packed_cache(decoder: CausalTransformer) -> str | None:
     reads the n-grams before a token by place, across a document's start."""
     if decoder.engram is not None:
         return "Engram's n-gram lookback, which reads across a cached row's documents"
-    return _layer(decoder, lambda mixer, spec, index: mixer.packed_cache_refusal())
+    return _layer(decoder, lambda mixer, _: mixer.packed_cache_refusal())
 
 
-def _layer(decoder: CausalTransformer, refused: Callable[[MixerBase, LayerSpec, int], str | None]
+def _layer(decoder: CausalTransformer, refused: Callable[[MixerBase, MixerContext], str | None]
            ) -> str | None:
-    """The first of the decoder's layers whose mixer `refused(mixer, spec, index)` refuses, as "layer i:
-    why", or None."""
-    types, default = decoder.per_layer_types, decoder.layer_mixer
-    for index, spec in enumerate(decoder._layer_specs(types, decoder.layer_kinds(types), default)):
-        if (refusal := refused(spec.kind.mixer or default, spec, index)) is not None:
+    """The first of the decoder's layers whose mixer, over the context it is built with, `refused`
+    (`CausalTransformer.layer_mixers`), as "layer i: why", or None."""
+    for index, (mixer, context) in enumerate(decoder.layer_mixers()):
+        if (refusal := refused(mixer, context)) is not None:
             return f"layer {index}: {refusal}"
     return None

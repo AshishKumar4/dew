@@ -2422,6 +2422,14 @@ class CausalTransformer(LinearProducts):
         return fixed_router_owners(self)
 
     @nn.nowrap
+    def layer_mixers(self) -> tuple[tuple[MixerBase, MixerContext], ...]:
+        """Each layer's mixer and the context it is built with, in order (`decoder_refusals`)."""
+        types, default = self.per_layer_types, self.layer_mixer
+        return tuple((spec.kind.mixer or default, self.mixer_context(
+            spec.kind, spec.layer_type, spec.kv_shared, spec.dex, self._dex_start(index), spec.routed))
+            for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)))
+
+    @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
         """Why a serving step's mixed call cannot admit this decoder (`decoder_refusals.mixed_admission`)."""
         return decoder_refusals.mixed_admission(self)
