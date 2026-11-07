@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 from flax import struct
 from jax import lax
@@ -10,6 +9,7 @@ from jax import lax
 from dew.diffusion.schedules import expand
 from dew.diffusion.schedules.common import ancestral_variance
 from dew.nn.precision import divided
+from dew.nn.programs import on_host
 
 from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator, _unit_noise
 
@@ -120,7 +120,7 @@ class Heun:
             return ()
         schedule = _sigma_integrator("Heun's churn", process)
         gamma = min(self.s_churn / (times.shape[0] - 1), 2 ** 0.5 - 1)
-        with jax.ensure_compile_time_eval():
+        with on_host():
             sigmas = schedule.sigmas(jnp.asarray(times[:-1], jnp.float32))
             churned = (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax)
             top = schedule.sigma_range[1]

@@ -215,7 +215,7 @@ def test_what_an_objective_cannot_train_or_sample_is_refused_at_construction(tmp
     (presets.Cosine(), DEIS()),
     (presets.Cosine(), PNDM()),
     (presets.Cosine(), UniPC()),
-    (presets.Cosine(), DPMSolverSDE(seed=3)),
+    (presets.EDM(P_mean=-0.4, P_std=1.0), DPMSolverSDE(seed=3)),
 ], ids=lambda value: type(value).__name__)
 def test_a_sample_compiles_ahead_for_two_gpus_none_attached(preset, solver):
     """The objective's sample program, traced under a mesh of two compile-only GPUs as an evaluation traces
