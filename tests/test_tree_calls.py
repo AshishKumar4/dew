@@ -257,9 +257,12 @@ def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: s
             return jnp.stack(ends, axis=1)
         return each_path
 
+    # One program for every seed's truth, traced in float64 at its first call.
+    wide_paths = decoded(wide)
+
     def truth(params, prompt, block):
         with jax.enable_x64(new_val=True):
             held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
-            return decoded(wide)(held, prompt, block)
+            return wide_paths(held, prompt, block)
 
     assert_as_exact(tree_logits, decoded(model), draw, label, seeds=64, truth_fn=truth)
