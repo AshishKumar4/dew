@@ -17,6 +17,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew._records import JSON
+from dew.mesh import EXPERT_AXIS
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
@@ -50,7 +51,7 @@ from ..inputs import (
 from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..mlp import GatedMLP
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP, resolved_dispatch
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
@@ -192,9 +193,10 @@ class Mixture:
     expert width). `shared_gate` adds a learned per-token sigmoid to that
     shared branch (Qwen3.5 MoE). `implementation` names the kernel of
     `moe.expert_projection`. `dispatch` and `capacity_factor` are passed to
-    `moe.expert_dispatch`; `'exchange'` is expert parallelism over an expert
-    mesh axis that divides the expert count. `hash_layers` route by DeepSeek
-    V4's token table, `latent_features` gives Kimi K3's latent MoE, and
+    `moe.expert_dispatch`: `'auto'`, the default, exchanges tokens over an expert
+    mesh axis that divides the expert count and dispatches globally on any other
+    mesh (`moe.resolved_dispatch`); `'exchange'` and `'global'` name one.
+    `hash_layers` route by DeepSeek V4's token table, `latent_features` gives Kimi K3's latent MoE, and
     `media_bias` is DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
     `bias_in_weights` gates on the balancing bias as LLaDA-MoE does, and
     `routing_block` with `block_experts` is LLaDA2.2's block routing.
@@ -229,7 +231,7 @@ class Mixture:
     shared_features: int = 0
     shared_gate: bool = False
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     hash_layers: tuple[int, ...] | None = None
     latent_features: int | None = None
@@ -297,9 +299,10 @@ class Mixture:
     def generation_refusal(self) -> str | None:
         """Why a generation loop cannot run the layers this mixture builds, or None.
 
-        Its exchange dispatch runs a `shard_map`, and a generation loop carries
-        each draw's device checks into the next step's model call, which jax's
-        checkify cannot carry into one (jax-ml/jax#40907). A
+        Its exchange dispatch, named or what `'auto'` resolves to on the mesh in
+        context (`moe.resolved_dispatch`), runs a `shard_map`, and a generation
+        loop carries each draw's device checks into the next step's model call,
+        which jax's checkify cannot carry into one (jax-ml/jax#40907). A
         `dew.inference.serving.Server` step runs the model before it draws, so
         it serves the exchange; `dispatch='global'` computes the same layer.
         This refusal goes once a jax release carries the fix."""
@@ -308,26 +311,13 @@ class Mixture:
                     "decode step, holding one token of its block, cannot: the step's routing would differ "
                     "from the full forward's. Generate by refining whole sequences (dew.diffusion.discrete) "
                     "or route without blocks")
-        if self.dispatch != 'exchange':
+        shards = jax.sharding.get_abstract_mesh().shape.get(EXPERT_AXIS, 1)
+        if resolved_dispatch(self.dispatch, self.experts, shards) != 'exchange':
             return None
         return ("generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
                 "which carries each draw's device checks into the next step's model call, fails on a "
                 "check that reaches a shard_map. Serve the model with dew.inference.serving.Server, or "
                 "generate with the mixture's dispatch='global', the same layer")
-
-    @property
-    def fixed_weights(self) -> bool:
-        """Whether a token's expert weight is fixed whatever its router scores: one expert's softmax score
-        renormalized over itself (`top_k=1` with `norm_topk_prob`, as a parallel or GPT OSS router does
-        too), which is 1, so a model's loss reaches the router through none of its outputs, only through a
-        balance loss or a z-loss (`dew.objectives.routing.refuse_fixed_router`)."""
-        return (self.top_k == 1 and self.norm_topk_prob and self.score_function == 'softmax'
-                and not self.bias_in_weights and not self.weight_sum_min)
-
-    def router_scope(self, activation: GatedActivation | str) -> str:
-        """The scope its router's score projection takes in its layer: GPT OSS's (its `activation`
-        'swigluoai') and a parallel mixture's (Gemma 4's) `router`, any other's `SparseMLP.gate`."""
-        return 'router' if activation == 'swigluoai' or self.parallel else 'gate'
 
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
               dense: Callable[..., nn.Module], norm_eps: float, scale_offset: bool = False,

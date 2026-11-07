@@ -37,7 +37,7 @@ callers add flags and absent values.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, Self, runtime_checkable
 
 import jax
@@ -96,7 +96,6 @@ __all__ = [
     "DecoderTraining",
     "Decoding",
     "DenoisingModel",
-    "ExpertRouted",
     "Exposing",
     "Generating",
     "HiddenStates",
@@ -108,6 +107,7 @@ __all__ = [
     "Logits",
     "LogitsFromHidden",
     "Looping",
+    "MediaWrapper",
     "ModelKwarg",
     "OutputTable",
     "Predicting",
@@ -566,6 +566,18 @@ class CountedDecisions(Protocol):
 
 
 @runtime_checkable
+class MediaWrapper(Protocol):
+    """A multimodal wrapper: media towers and their projectors around the language model it holds
+    (`language_model`), its release a wrapper of its `family`'s (`dew.interop.wrappers`)."""
+
+    @property
+    def language_model(self) -> nn.Module: ...
+
+    @property
+    def family(self) -> str: ...
+
+
+@runtime_checkable
 class HiddenStates(Protocol):
     """A token model's `[B, S, features]` final states, the head's input."""
 
@@ -906,16 +918,6 @@ class RoutesBySite(Protocol):
 
     @property
     def routed_sites(self) -> frozenset[str]: ...
-
-
-@runtime_checkable
-class ExpertRouted(Protocol):
-    """A model that may route tokens to experts: the routers among its own whose expert weights are fixed
-    whatever they score (`dew.nn.backbones.decoder_block.Mixture.fixed_weights`), each by name and whether
-    a parameter, by its path in the model's own tree, is its, which no term of a plain loss reaches
-    (`dew.objectives.routing.refuse_fixed_router`)."""
-
-    def fixed_routers(self) -> Mapping[str, Callable[[tuple[str, ...]], bool]]: ...
 
 
 def routed_children(children: Mapping[str, object]) -> dict[str, tuple[str, ...]]:
