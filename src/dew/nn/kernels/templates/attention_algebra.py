@@ -1797,9 +1797,11 @@ def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
     """`x` (fp32) times the power of two that puts its largest magnitude at 2^14, fp32, and that power's
     negated exponent, which takes a product of it back (`_fp16_scaled` before its rounding); with `rows`, a
     power a row (its exponents `[rows]`), which a product of the rows (`a @ b`) takes back a row of its own
-    (`restored`): a tile's whole largest is a reduction to a scalar, which a tensor-core mainloop's lowering
-    has no form of (Mosaic GPU's: "Scalars must be represented by non-vector types", ET-FP16-h100)."""
-    top = jnp.max(jnp.abs(x), axis=-1) if rows else jnp.max(jnp.abs(x))
+    (`restored`). A tile's whole largest is its rows' largest reduced again, two reductions of one axis
+    each, which Mosaic GPU lowers in every family's accumulator layout where one reduction of both axes
+    does not ("Scalars must be represented by non-vector types", ET-EDGE16D's tile arm; FS-REDUCESCALAR5)."""
+    largest = jnp.max(jnp.abs(x), axis=-1)
+    top = largest if rows else jnp.max(largest)
     exponent = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
     # A GPU's approximate log2 flushes a subnormal largest to zero, its exponent -inf: scaled by 2^381
     # (`power2`'s reach) the part passed fp32's largest and its remainder was inf - inf, NaN (row 4464, an
