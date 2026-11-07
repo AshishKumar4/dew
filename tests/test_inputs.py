@@ -40,8 +40,8 @@ def test_row_plan_preserves_resident_rows_padding_and_random_keys():
 def test_a_seeds_key_is_jaxs_own_and_compiles_nothing(wide, offset):
     """A run's seed's key is the one JAX makes of it (`jax.random.key`), word for word, with x64 on and
     off and under a configured seed offset (`jax_random_seed_offset`), made on the host: no program
-    compiles for it, as a run compiled ahead compiles none on its devices (Main 11-07: the seed's two
-    programs compiled on the GPU)."""
+    compiles for it, as a run compiled ahead compiles none of its start on its devices (Main 11-07: the
+    seed's two programs compiled on the GPU)."""
     import jax
     from jax.experimental import disable_x64, enable_x64
 

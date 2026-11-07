@@ -973,8 +973,8 @@ def host_rows(leaf: jax.typing.ArrayLike, rows: int | None) -> np.ndarray:
 def request_key(key: int | jax.Array | None) -> jax.Array:
     """Normalize an integer seed or a single JAX key to one typed PRNG key. A seed's key under JAX's
     threefry implementation, the default, is its words as JAX derives them (`seeded_words`), wrapped
-    on the host, so making it compiles no program: a run compiled ahead compiles none on its devices
-    (`dew.training.ahead`)."""
+    on the host, so making it compiles no program: a run compiled ahead compiles none of its start on its
+    devices (`dew.training.ahead`)."""
     if key is None or isinstance(key, bool):
         raise ValueError("key must be an integer seed or a single JAX PRNG key")
     if isinstance(key, (int, np.integer)):
