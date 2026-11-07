@@ -68,6 +68,15 @@ def _halves(key_width: int, interpret: bool) -> int:
     return 2 if whole and not interpret else 1
 
 
+def _joining(halves: int, block: "_Block") -> tuple:
+    """The shared memory and barriers two halves join their sums through (`_Halves.joined_sums`); none for
+    one."""
+    if halves == 1:
+        return ()
+    return (plgpu.SMEM((2, halves, block.heads, block.columns), jnp.float32),
+            plgpu.Barrier(num_arrivals=halves, num_barriers=2))
+
+
 def serves(hooks: recurrence.Hooks, operands: recurrence.Step) -> bool:
     """Whether a token of `hooks` and `operands` steps here (`fits`); a one-tap conv's is taken before any
     launch (`recurrence.step`)."""
@@ -106,7 +115,11 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
 
     def entry(active_ref, *refs):
         inputs = dict(zip(names, refs[:len(names)], strict=True))
-        state_out, *moved, out_ref, vectors, exchanged, partials, joined = refs[len(names):]
+        moving = 1 if hooks.conv is not None else 0
+        state_out, *rest = refs[len(names):]
+        moved, (out_ref, vectors, exchanged) = rest[:moving], rest[moving:moving + 3]
+        joining = rest[moving + 3:]
+        partials, joined = joining if joining else (None, None)
         half = lax.axis_index("wg") if halves > 1 else 0
         _program(hooks, inputs, active_ref, state_out, moved[0] if moved else None, out_ref,
                  (vectors, exchanged.at[half], _Halves(halves, half, partials, joined)), block=block,
@@ -122,8 +135,7 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
                              interpret=interpret, family=family.name, name="recurrence_step",
                              scratch=(plgpu.SMEM((block.heads, 3, key_width), jnp.float32),
                                       plgpu.SMEM((halves, 2, scan.THREADS // scan.WARP), jnp.float32),
-                                      plgpu.SMEM((2, halves, block.heads, block.columns), jnp.float32),
-                                      plgpu.Barrier(num_arrivals=halves, num_barriers=2)))
+                                      *_joining(halves, block)))
     state_out, *moved, out = launched(active, *given.values())
     return out, moved[0] if moved else None, state_out
 
