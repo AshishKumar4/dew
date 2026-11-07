@@ -863,11 +863,11 @@ class Ring:
         into the slot's physical row at the slot's swizzle. TMA swizzles a row by its shared-memory address
         (the CUDA programming guide's swizzle pointer offset: a 128-byte-aligned row swizzled as the row of
         the pattern it lies at), so the row lands as its tile's row does."""
-        rows = piece.shape[0]
-        match self.smem.transforms if isinstance(self.smem, state_types.TransformedRef) else ():
+        rows, smem = piece.shape[0], self.smem
+        match smem.transforms if isinstance(smem, state_types.TransformedRef) else ():
             case (plgpu_core.UnswizzleRef() as unswizzled, plgpu_core.UntilingTransform(tiling=(tile, width)),
-                  ) if rows % tile:
-                physical = state_types.TransformedRef(self.smem.ref, (unswizzled,))
+                  ) if rows % tile and isinstance(smem, state_types.TransformedRef):
+                physical = state_types.TransformedRef(smem.ref, (unswizzled,))
                 return [(piece.at[pl.ds(row, 1), pl.ds(column * width, width)],
                          physical.at[slot, (start + row) // tile, column, pl.ds((start + row) % tile, 1)])
                         for row in range(rows) for column in range(self.block[1] // width)]

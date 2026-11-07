@@ -750,7 +750,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                 return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation)
             return run
 
-        primal = 'template' if template_infers(query.shape[-1], causal) else 'xla'
+        primal = 'template' if template_infers(query.dtype, query.shape[-1], causal) else 'xla'
         return _read_nothing(forward_differentiable(ran(primal), ran('xla'), query, key, value, bias, sinks,
                                                     primal_alone=True), live)
     if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu', 'template'):
@@ -925,8 +925,6 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    and jnp.shape(bias)[0] in (1, query.shape[0]) and jnp.shape(bias)[1] in (1, query.shape[2])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
         dense_bias=bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1,
-        row_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1
-                  and jnp.shape(bias)[0] > 1),
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
@@ -1025,7 +1023,7 @@ def _masked_kernel(implementation: AttentionImpl, named: str | None, query, key,
     it on (`attention_kernels.XLA_SUPPORTS`). A mask the call hands cuDNN as its dense bias (`as_bias`, as
     jax's cuDNN path takes a mask, `combine_bias_and_mask`) is that bias to the selector, its rows' own;
     any other an arbitrary mask (`AttentionCase.mask`), which cuDNN is measured slower at."""
-    form = {"bias": True, "dense_bias": True, "row_bias": True} if as_bias else {"mask": True}
+    form = {"bias": True, "dense_bias": True} if as_bias else {"mask": True}
     case = dataclasses.replace(
         attention_case(query, key, dtype=dtype, precision=precision,
                        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,

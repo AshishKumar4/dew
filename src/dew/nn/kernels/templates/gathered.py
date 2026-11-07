@@ -71,7 +71,9 @@ def barrier_of(memref) -> mgpu_utils.BarrierRef:
     """The mbarrier at a one-entry shared memref of `uint64` (`Ring`'s), as Mosaic GPU's
     lane-level barrier: its arrivals and parity waits, no phases tracked."""
     i32 = mgpu_ir.IntegerType.get_signless(32)
-    return mgpu_utils.BarrierRef(mgpu_utils.memref_ptr(memref), mgpu_utils.c(0, i32), None, 1)
+    # No phases tracked: its waits name their parity (`wait_parity`), so the phases word is never read.
+    zero = mgpu_utils.c(0, i32)
+    return mgpu_utils.BarrierRef(mgpu_utils.memref_ptr(memref), zero, zero, 1)
 
 
 def splat_value(array):

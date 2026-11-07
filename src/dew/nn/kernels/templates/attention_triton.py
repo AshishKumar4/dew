@@ -154,11 +154,11 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
                     interpret: bool, guard: str):
     """The forward's Triton mainloop: one program a query block and head walks the key tiles its form
     gives it (every tile, the causal diagonal's, or the spans' block map), issuing the tile's two
-    products and calling the algebra between them (`attention_algebra`). Under headroom
-    (`algebra.Forward.headroom`) the plain launch (`guard` 'flag') also writes which of its rows'
-    weighted values overflowed, and a second launch (`guard` 'rewalk', the plain launch's outputs its
-    own) walks again, each row shifting as it needs, only the programs one of whose rows did; the plain
-    walk itself is unchanged (`guard` 'none' where no row can overflow)."""
+    products and calling the algebra between them (`attention_algebra`), under the default's guards over
+    whole launches (`algebra.walked_launches`): the plain launch (`guard` 'flag') also writes each row's
+    running maximum and whether its weighted values overflowed, and a guarded launch (`guard` 'rewalk')
+    reads the rows to walk again, each shifting as it needs, walking only the programs one of whose rows
+    is; 'none' where the call's form takes no guard."""
     refs = list(refs)
     spans = bounds = ids = None
     if spec.form == "spans":
@@ -173,14 +173,11 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     score_refs = [refs.pop(0) for _ in score_kinds]
     output_refs = [refs.pop(0) for _ in output_kinds]
     initial_refs = [refs.pop(0) for _ in range(3 if initial else 0)]
-    flags_ref = refs.pop(0) if guard == "rewalk" else None
-    if guard == "rewalk":
-        # The plain launch's outputs enter as inputs aliased to this launch's outputs, which follow them
-        # one for one (`input_output_aliases`); the program writes the outputs and reads no input of them.
-        aliased = len(refs) // 2
-        refs = refs[aliased:]
+    live_ref = refs.pop(0) if guard == "rewalk" else None
     out_ref, *residual_refs = refs
-    flag_ref = residual_refs.pop() if guard == "flag" else None
+    # A plain launch's rows' running maxima and overflows follow its outputs.
+    flag_refs = residual_refs[-2:] if guard == "flag" else []
+    residual_refs = residual_refs[:len(residual_refs) - len(flag_refs)]
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
     first_query = pl.program_id(0) * block_q
@@ -188,16 +185,16 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     query = query_ref[...]
     q_pos = first_query + jnp.arange(block_q)[:, None]
 
-    def keys_at(index) -> algebra.Keys:
-        # A key tile's logits; its values load where the step calls for them, after the softmax, where
-        # jax's mha loads them.
+    def keys_at(form: algebra.Forward, index) -> algebra.Keys:
+        # A key tile's logits in `form` (the call's, or the fold's rewalk's); its values load where the step
+        # calls for them, after the softmax, where jax's mha loads them.
         tile = pl.ds(index * block_k, block_k)
         coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :],
                                 None if spans is None else (spans,),
                                 None if ids is None else (ids[0], ids[1][tile]))
         params = tuple(_tile_param(ref, kind, head, q_pos, tile)
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
-        logits = algebra.modify(spec, kernel_dot(query, key_ref[tile, :].T, interpret), coords, params)
+        logits = algebra.modify(form, kernel_dot(query, key_ref[tile, :].T, interpret), coords, params)
         values = algebra.Operand((block_k, value_ref.shape[-1]), value_ref.dtype, lambda: value_ref[tile, :])
         return algebra.Keys(coords, logits, values, functools.partial(kernel_dot, interpret=interpret))
 
@@ -208,46 +205,48 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     resumed = (initial_refs[0][...], initial_refs[1][...], initial_refs[2][...]) if initial else None
     training = residuals is Kept.SPLIT
 
-    def walk(live=None):
-        # The plain walk where `live` is None, else the guarded one, those rows shifting.
-        return program.walk(spec, lo, hi, keys_at, rows, resumed, block_q, value_ref.shape[-1], live=live,
-                            training=training)
+    def walk(form: algebra.Forward, live):
+        # The walk in `form`: the plain one where `live` is None, else the guarded one, those rows shifting.
+        return program.walk(form, lo, hi, functools.partial(keys_at, form), rows, resumed, block_q,
+                            value_ref.shape[-1], live=live, training=training)
 
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
-    finished = functools.partial(program.finished, spec, keys_at=keys_at, rows=rows, bounds=(lo, hi),
-                                 resumed=resumed, training=training, output_mod=output_mod,
-                                 output_params=output_params)
-    written = functools.partial(_written, rows=rows, out_ref=out_ref, residual_refs=residual_refs,
-                                flag_ref=flag_ref, residuals=residuals, finished=finished)
 
-    if flags_ref is None:
-        written(walk())
+    def finished(form: algebra.Forward, carry):
+        # A walk's outputs in `form` (`program.finished`): the normalized output, its maximum and
+        # denominator, and a training walk's (`Kept.SPLIT`) anchors and split sums.
+        return program.finished(form, carry, keys_at=functools.partial(keys_at, form), rows=rows,
+                                bounds=(lo, hi), resumed=resumed, training=training, output_mod=output_mod,
+                                output_params=output_params)
+
+    def written(walked):
+        if flag_refs:
+            # A training walk's weighted values are its split sums joined, where they overflow.
+            if isinstance(walked, algebra.Partial):
+                state, weighted = walked, walked.acc
+            else:
+                state, weighted = walked[0], algebra.joined(walked, rows).acc
+            flag_refs[0][...] = state.m
+            flag_refs[1][...] = algebra.overflowed(weighted).astype(jnp.float32)
+        out, m, denominator, *kept = finished(spec, walked)
+        out_ref[...] = out.astype(out_ref.dtype)
+        if residuals is not Kept.NONE:
+            residual_refs[0][...] = m
+            residual_refs[1][...] = denominator
+        for ref, part in zip(residual_refs[2:7], kept, strict=True):
+            ref[...] = part
+
+    if live_ref is None:
+        written(walk(spec, None))
         return
-    live = flags_ref[...] > 0
+    live = live_ref[...] > 0
 
     @pl.when(jnp.max(live.astype(jnp.int32)) > 0)
     def _():
-        # Only a program one of whose rows overflowed walks again: each of those rows shifts as it needs,
-        # every other row's bits the plain walk's (`algebra.room`).
-        written(walk(live))
-
-
-def _written(walked, *, rows, out_ref, residual_refs, flag_ref, residuals: Kept, finished: Callable):
-    """A forward walk's output and residuals written: which rows overflowed where the launch flags them, its
-    outputs (`program.finished`: the normalized output, its maximum and denominator, and a training walk's,
-    `Kept.SPLIT`, anchors and split sums), `Kept.OUTPUT` the first three alone, the plain walk's."""
-    split = residuals is Kept.SPLIT
-    if flag_ref is not None:
-        weighted = algebra.joined(walked, rows).acc if split else walked.acc
-        flag_ref[...] = algebra.overflowed(weighted).astype(jnp.float32)
-    out, m, denominator, *kept = finished(walked)
-    out_ref[...] = out.astype(out_ref.dtype)
-    if residuals is not Kept.NONE:
-        residual_refs[0][...] = m
-        residual_refs[1][...] = denominator
-    for ref, part in zip(residual_refs[2:7], kept, strict=True):
-        ref[...] = part
+        # Only a program one of whose rows walks again does: each of those rows shifts as it needs; every
+        # other row's outputs are the plain launch's (`_fwd`'s `kept`).
+        written(walk(spec, live))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -334,33 +333,42 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
                                self.score_mod, self.natural, algebra.headroom(value.dtype), initial,
                                compensated=algebra.compensates(value.dtype), prescale=power)
         kernel = functools.partial(
-            _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
-            initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
-            interpret=interpret)
+            _forward_kernel, score_kinds=self.score_kinds, output_kinds=self.output_kinds, initial=initial,
+            residuals=residuals, output_mod=self.output_mod, block_k=block_k, interpret=interpret)
         launch = functools.partial(
             launches.pallas_call, grid=(queries // block_q, batch, heads), interpret=interpret,
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages))
-        if not spec.headroom:
-            out = launch(functools.partial(kernel, guard="none"), in_specs=in_specs, out_specs=out_specs,
-                         out_shape=out_shape, name=report.named("attention_forward"))(*arrays)
-            return (tuple(out) if residuals is not Kept.NONE else out[0]), None
-        # The plain launch writes which rows overflowed; the second, issued only where one did, walks again
-        # only the programs with one, its outputs the plain launch's (`_forward_kernel`): ordinary inputs
-        # take the one launch and a check.
-        flagged = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
-        *out, flags = launch(functools.partial(kernel, guard="flag"), in_specs=in_specs,
-                             out_specs=[*out_specs, per_row], out_shape=[*out_shape, flagged],
-                             name=report.named("attention_forward"))(*arrays)
-        first = len(arrays) + 1
+        rowed = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
 
-        def rewalked(out):
-            return tuple(launch(functools.partial(kernel, guard="rewalk"),
-                                in_specs=[*in_specs, per_row, *out_specs], out_specs=out_specs,
-                                out_shape=out_shape, name=report.named("attention_forward_headroom"),
-                                input_output_aliases={first + index: index for index in range(len(out))},
-                                )(*arrays, flags, *out))
+        def launched(form: algebra.Forward, live: jax.Array | None, into=None):
+            # The call in `form` (`algebra.walked_launches`' launch): plain, its outputs, its rows' running
+            # maxima and overflows; with `live`, those rows walked again, the other rows' outputs unwritten.
+            del into
+            if live is None:
+                *out, maxima, over = launch(
+                    functools.partial(kernel, spec=form, guard="flag"), in_specs=in_specs,
+                    out_specs=[*out_specs, per_row, per_row], out_shape=[*out_shape, rowed, rowed],
+                    name=report.named("attention_forward"))(*arrays)
+                return tuple(out), maxima, over > 0
+            out = launch(functools.partial(kernel, spec=form, guard="rewalk"), in_specs=[*in_specs, per_row],
+                         out_specs=out_specs, out_shape=out_shape,
+                         name=report.named("attention_forward_headroom"))(*arrays, live.astype(jnp.float32))
+            return tuple(out), None, None
 
-        out = jax.lax.cond(jnp.max(flags) > 0, rewalked, lambda out: out, tuple(out))
+        def kept(live: jax.Array, guarded: tuple, plain: tuple) -> tuple:
+            # The guarded launch's outputs at its rows `live` `[B, H, Qp]`, the plain one's elsewhere: the
+            # output's rows lie `[B, Qp, H, Dv]`, every residual's `[B, H, Qp, ...]`.
+            masks = [jnp.swapaxes(live, 1, 2)[..., None],
+                     *(live.reshape(live.shape + (1,) * (array.ndim - 3)) for array in guarded[1:])]
+            return tuple(jnp.where(mask, ours, theirs) for mask, ours, theirs in zip(masks, guarded, plain,
+                                                                                   strict=True))
+
+        if spec.headroom or spec.reaches:
+            out = algebra.walked_launches(spec, launched, kept)
+        else:
+            out = launch(functools.partial(kernel, spec=spec, guard="none"), in_specs=in_specs,
+                         out_specs=out_specs, out_shape=out_shape,
+                         name=report.named("attention_forward"))(*arrays)
         return (tuple(out) if residuals is not Kept.NONE else out[0]), None
 
     GENERATES = True
@@ -548,12 +556,12 @@ def _issued(a: jax.Array, b: jax.Array, *, interpret: bool) -> jax.Array:
     one narrowed by its parts, each scaled into the other's range and taken back after its product
     (`algebra.cotangent_product`: a cotangent past a 16-bit dtype's largest stays finite), as the hand steps
     narrowed theirs; the accurate form issues its parts, each of the other's dtype already."""
-    dot = functools.partial(kernel_dot, interpret=interpret)
-    if interpret:
+    def dot(x: jax.Array, y: jax.Array) -> jax.Array:
+        if not interpret:
+            return kernel_dot(x, y, interpret=False)
         # The CPU runs no 16-bit product into fp32 of a transposed tile (XLA's DotThunk, as the forms' rows
         # walk forms them): its operands taken to fp32, where 16-bit products are exact, summed in fp32.
-        def dot(x, y):
-            return interpreted_dot(x.astype(jnp.float32), y.astype(jnp.float32))
+        return interpreted_dot(x.astype(jnp.float32), y.astype(jnp.float32))
     if jnp.dtype(a.dtype).itemsize > jnp.dtype(b.dtype).itemsize:
         return algebra.cotangent_product(a, b, dot, accurate=False)
     return dot(a, b.astype(a.dtype))
