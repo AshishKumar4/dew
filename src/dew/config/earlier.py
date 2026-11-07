@@ -12,9 +12,13 @@ from dew.data import records
 from dew.nn.precision import Numerics, numerics_of
 from dew.registry import from_record, models, objectives
 
-CHAINS = ("data", "validation")
-"""A run's fields that hold chains, which its record writes through the data's codec
-(`dew.config._chain_record`)."""
+
+def _chains() -> tuple[str, ...]:
+    """The run's fields that hold chains today (`dew.config.CHAINS`), which an earlier record's chains are
+    read under: read where `earlier_run` runs, as `dew.config` imports this module."""
+    from dew.config import CHAINS
+
+    return CHAINS
 
 
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -37,7 +41,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     (ledger 1552)."""
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(record))))
     earlier = earlier_option_text(earlier_tokenizer_positions(earlier))
-    return records.earlier_chains(earlier_data_plan(earlier), CHAINS)
+    return records.earlier_chains(earlier_data_plan(earlier), _chains())
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -70,11 +74,11 @@ def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 DECISION_OBJECTIVE = "dew.decision.objective:DecisionObjective"
+"""The decision objective's import path, as a saved run's record names its objective
+(`ObjectiveConfig.name`)."""
 
 CAUSAL_TOKENIZER = "dew.objectives.world_model:CausalTokenizer"
 """Dreamer 4's tokenizer's import path, as a saved run's record names its model (`ModelConfig.name`)."""
-"""The decision objective's import path, as a saved run's record names its objective
-(`ObjectiveConfig.name`)."""
 
 
 def _earlier_default(record: Mapping[str, object], field: str, kinds: registry.Aliases, path: str,

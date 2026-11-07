@@ -52,7 +52,7 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON, duration, is_share, recorded_duration
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
-from dew.config.earlier import CHAINS, earlier_option_writing, earlier_run
+from dew.config.earlier import earlier_option_writing, earlier_run
 from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
@@ -1041,6 +1041,10 @@ def _routed(saved: Mapping[str, object], unseeded: str) -> Iterator[None]:
         named = registry.class_record(saved)
         recorded = named is not None and _reads_back(named[1])
         raise refused.routed(recorded=recorded, unseeded=unseeded) from None
+
+
+CHAINS = ("data", "validation")
+"""A run's fields that hold chains, which its record writes through the data's codec (`_chain_record`)."""
 
 
 def _reads_back(fields: Mapping[str, object]) -> bool:
