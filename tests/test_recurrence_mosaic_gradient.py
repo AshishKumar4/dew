@@ -224,8 +224,8 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
     mma.sync's bundles, on par from float64
     with the same launches at 64 (check 1, the truth the recurrence a token at a time in float64): the output,
     final memory and every operand's gradient in bf16 (row 4770). No rule derives 128 at the scoreboard's
-    geometries, whose launches at 128 pass a GPU's resources (`template.chunks`' candidates, jsf-chunkchoice),
-    so the launches are called as the rule calls them."""
+    geometries, whose launches at 128 pass a GPU's resources (`template.chunk_of`'s step down,
+    jsf-chunkchoice), so the launches are called as the rule calls them."""
     hooks, dtype = case_hooks(case), jnp.bfloat16
     bundle = {'wgmma': bundles.INTERPRETED, 'mma.sync': bundles.of('sm80', jnp.bfloat16)}[family]
     (sample, _) = drawn(dtype, 0, **geometry(case))
