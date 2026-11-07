@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from port_support import row_names_port
 from reference_error import (
     PRECISION,
     as_given,
@@ -38,11 +39,6 @@ pytestmark = pytest.mark.kernel
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 INTERPRETED = jax.default_backend() != "gpu"
 SEEDED = FIXTURES / "ssd_mamba_ssm_seeded.npz"
-
-
-def row_names_port(*, port: bool = True):
-    """Choose the port for the scan where `port`, else XLA; off a GPU the port's kernels interpret."""
-    return generation.chosen(ssd="pallas" if port else "xla")
 
 
 SHARDED_SEEDS = 256
@@ -224,10 +220,10 @@ def test_the_port_takes_widths_padded_to_powers_of_two():
         ends = [(0, wide - size) for wide, size in zip(widths, t.shape[-len(widths):], strict=True)]
         return jnp.pad(t, [(0, 0)] * (t.ndim - len(widths)) + ends)
 
-    with row_names_port():
+    with row_names_port("ssd", "pallas"):
         got = jax.jit(through(16, starts, dy, dfinal))(x, dt, A, B, C, D, h0)
     wide = (padded(x, 32), dt, A, padded(B, 32), padded(C, 32), D, padded(h0, 32, 32))
-    with row_names_port():
+    with row_names_port("ssd", "pallas"):
         want = jax.jit(through(16, starts, padded(dy, 32), padded(dfinal, 32, 32)))(*wide)
     cut = {"y": (..., slice(20)), "final": (..., slice(20), slice(24)), "x": (..., slice(20)),
            "B": (..., slice(24)), "C": (..., slice(24)), "h0": (..., slice(20), slice(24))}
@@ -257,7 +253,7 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype):
 
     def on(*, port):
         def run(params, x, cotangent):
-            with row_names_port(port=port):
+            with row_names_port("ssd", "pallas", port=port):
                 return forward(layer)(params, x, cotangent)
         return without_ynn(run)
 
@@ -267,7 +263,7 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype):
 
     @as_given
     def truth(params, x, cotangent):
-        with jax.enable_x64(new_val=True), row_names_port(port=False):
+        with jax.enable_x64(new_val=True), row_names_port("ssd", "pallas", port=False):
             return wide(*widened((params, x, cotangent)))
 
     def draw(seed):
@@ -306,7 +302,7 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
 
     @jax.jit
     def exact(*operands):
-        with row_names_port(port=False):
+        with row_names_port("ssd", "pallas", port=False):
             return wide(*operands)
 
     def spec(rank: int, axes: tuple[int, ...]):
@@ -318,6 +314,6 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
              spec(4, rows + heads), spec(4, rows + heads), spec(1, (0,) if heads else ()),
              spec(4, rows + ((1,) if heads else ()))]
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    with row_names_port():
+    with row_names_port("ssd", "pallas"):
         assert_runs_per_shard(run, draw, specs, mesh, f"ssd split over {axis}", seeds=SHARDED_SEEDS,
                               truth_fn=exact)

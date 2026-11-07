@@ -21,13 +21,12 @@ no term to a sum over the classes.
 
 from __future__ import annotations
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import optax
 from jax.custom_derivatives import SymbolicZero
 
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.precision import at_least_fp32
 
 __all__ = ["brier", "cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative",
@@ -57,12 +56,12 @@ def probabilities(logits: jax.Array, where: jax.Array | None = None) -> jax.Arra
     return _probabilities(widened(logits, where))
 
 
-@jax.custom_jvp
-def _probabilities(logits: jax.Array) -> jax.Array:
+def _softmax(logits: jax.Array) -> jax.Array:
+    """The softmax over the last axis, its tangent `probabilities`' (`_probabilities`, a protected span,
+    `dew.nn.derivatives.declared_tangent`: the most probable class's term is summed from the others')."""
     return jax.nn.softmax(logits, axis=-1)
 
 
-@_probabilities.defjvp
 def _probabilities_tangent(primals, tangents):
     (logits,), (d_logits,) = primals, tangents
     probability = _probabilities(logits)
@@ -70,6 +69,10 @@ def _probabilities_tangent(primals, tangents):
     top = jax.nn.one_hot(jnp.argmax(probability, axis=-1), logits.shape[-1], dtype=bool)
     rest = jnp.sum(jnp.where(top, 0.0, tangent), axis=-1, keepdims=True)
     return probability, jnp.where(top, -rest, tangent)
+
+
+_probabilities = contracted("test_the_categorical_losses_hold_every_order")(
+    declared_tangent(Protected(), _softmax, _probabilities_tangent))
 
 
 def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -118,19 +121,17 @@ def label_logit(logits: jax.Array, labels: jax.Array) -> jax.Array:
         logits, jnp.clip(labels, 0, columns - 1)[..., None], axis=-1)[..., 0], 0.0)
 
 
-@jax.custom_jvp
-def label_terms(logits: jax.Array, labels: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _label_terms(logits: jax.Array, labels: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Each row's label cross entropy over the last axis and its log partition, of logits taken as they
     are (`widened` by the callers): the one rule of the family for both, whose derivatives are the
     label's (`label_derivative`) and the row's probabilities, the probabilities taken once from the
-    row's partition (`partition`). `cross_entropy` and the whole-logits head
-    (`dew.objectives.lm.chunked.logits_cross_entropy`) read it. A label outside the row
-    (`label_logit`) takes the log partition, its derivative the probabilities."""
+    row's partition (`partition`), a protected span (`label_terms`, `dew.nn.derivatives.declared_tangent`).
+    `cross_entropy` and the whole-logits head (`dew.objectives.lm.chunked.logits_cross_entropy`) read it.
+    A label outside the row (`label_logit`) takes the log partition, its derivative the probabilities."""
     peak, mass, _ = partition(logits)
     return target_loss(peak, mass, label_logit(logits, labels)), peak + jnp.log(mass)
 
 
-@label_terms.defjvp
 def _label_terms_tangent(primals, tangents):
     logits, labels = primals
     losses, log_partition = label_terms(logits, labels)
@@ -138,6 +139,10 @@ def _label_terms_tangent(primals, tangents):
     probability = shifted / mass[..., None]
     return (losses, log_partition), (jnp.sum(label_derivative(probability, labels) * tangents[0], axis=-1),
                                      jnp.sum(probability * tangents[0], axis=-1))
+
+
+label_terms = contracted("test_the_label_terms_hold_every_order")(
+    declared_tangent(Protected(), _label_terms, _label_terms_tangent))
 
 
 def label_entry(share: jax.Array, others: jax.Array) -> jax.Array:
@@ -174,15 +179,12 @@ def soft_cross_entropy(logits: jax.Array, targets: jax.Array, where: jax.Array |
 
 
 def _soft_value(logits: jax.Array, targets: jax.Array) -> jax.Array:
+    """`-sum_k t_k log p_k` over the last axis, a class of no target mass adding nothing; `_soft_loss`
+    declares its derivative in the logits `soft_cross_entropy`'s (a protected span,
+    `dew.nn.derivatives.declared_tangent`)."""
     return -jnp.sum(jnp.where(targets > 0, targets * jax.nn.log_softmax(logits, axis=-1), 0.0), axis=-1)
 
 
-@jax.custom_jvp
-def _soft_loss(logits: jax.Array, targets: jax.Array) -> jax.Array:
-    return _soft_value(logits, targets)
-
-
-@functools.partial(_soft_loss.defjvp, symbolic_zeros=True)
 def _soft_loss_tangent(primals, tangents):
     logits, targets = primals
     d_logits, d_targets = tangents
@@ -208,6 +210,10 @@ def _soft_loss_tangent(primals, tangents):
     return value, tangent + jnp.sum(derivative * d_logits, axis=-1)
 
 
+_soft_loss = contracted("test_the_categorical_losses_hold_every_order")(
+    declared_tangent(Protected(), _soft_value, _soft_loss_tangent, symbolic_zeros=True))
+
+
 def kl_divergence(logits: jax.Array, reference: jax.Array, where: jax.Array | None = None) -> jax.Array:
     """`KL(q || p)` over the last axis, `p` the categorical of `logits` and `q` that of the `reference`
     logits (Optax's `kl_divergence` of the two), the classes `where` excludes adding no term.
@@ -222,6 +228,9 @@ def kl_divergence(logits: jax.Array, reference: jax.Array, where: jax.Array | No
 
 
 def _divergence_value(logits: jax.Array, reference: jax.Array, where: jax.Array | None) -> jax.Array:
+    """Optax's `KL(q || p)` over the last axis, the classes `where` excludes adding no term; `_divergence`
+    declares its derivative in the logits `kl_divergence`'s (a protected span,
+    `dew.nn.derivatives.declared_tangent`)."""
     log_p, q = jax.nn.log_softmax(logits, axis=-1), jax.nn.softmax(reference, axis=-1)
     if where is None:
         return optax.kl_divergence(log_p, q)
@@ -230,12 +239,6 @@ def _divergence_value(logits: jax.Array, reference: jax.Array, where: jax.Array 
     return optax.kl_divergence(jnp.where(where, log_p, 0.0), jnp.where(where, q, 1.0), where=where)
 
 
-@jax.custom_jvp
-def _divergence(logits: jax.Array, reference: jax.Array, where: jax.Array | None) -> jax.Array:
-    return _divergence_value(logits, reference, where)
-
-
-@functools.partial(_divergence.defjvp, symbolic_zeros=True)
 def _divergence_tangent(primals, tangents):
     logits, reference, where = primals
     d_logits, d_reference, _ = tangents
@@ -247,6 +250,10 @@ def _divergence_tangent(primals, tangents):
     if isinstance(d_logits, SymbolicZero):
         return value, tangent
     return value, tangent + jnp.sum(_divergence_derivative(logits, reference) * d_logits, axis=-1)
+
+
+_divergence = contracted("test_the_categorical_losses_hold_every_order")(
+    declared_tangent(Protected(), _divergence_value, _divergence_tangent, symbolic_zeros=True))
 
 
 def _divergence_derivative(logits: jax.Array, reference: jax.Array) -> jax.Array:

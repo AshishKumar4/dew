@@ -496,8 +496,9 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
         return logits, with_attention_terms(grads, carried(variables))
 
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
-    # another order than the rows alone.
-    initialized = jax.jit(objective.init)
+    # another order than the rows alone. Drawn unboxed: the terms read an attention's kernels as arrays
+    # (`AttentionTerms`), which an init can box with their logical axes (row 4465).
+    initialized = jax.jit(lambda key: nn.unbox(objective.init(key)))
     # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
     # (`terms`), so each arm's rounding of them is on par, on every backend.
     assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),), "packed window",

@@ -14,6 +14,7 @@ import pytest
 from flax import linen as nn
 from flax.core import freeze as frozen_dict
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
+from placement_parity import layouts_agree, widened_start, x64
 from steady_state import steady_state
 from test_training_transactions import SHORT_SCALE, Terms, Tiny, batches
 
@@ -53,31 +54,20 @@ def equal(left, right):
         np.testing.assert_array_equal(a, b, err_msg=path)
 
 
-FUSED_PER_STEP = 8
-"""Multiply-adds a step's optimizer may fuse per element on a GPU or a TPU,
-where the CPU rounds the product and the sum apart: Adam's two moments,
-AdamW's decay, the parameter update and the EMA, one each, and up to three
-units in the last place the global clip's scale moves by, the sum of five
-squares. Each fusion moves a value by at most one unit in its last place."""
+def compiled_for(make):
+    """A trainer `make(layout)` builds for each layout and precision, and its step compiled once over the
+    first call's `data`, each call placing the trainer's start afresh, a float64 truth's the float32
+    run's own widened (`widened_start`)."""
+    held = {}
 
-
-def platforms_agree(resident, host, steps: int):
-    """The resident layout's state and the host layout's after `steps`
-    optimizer steps, the host's run on the CPU: bitwise when the accelerator
-    is the CPU too. Elsewhere the resident optimizer runs where XLA fuses
-    multiply-adds, so a floating leaf is held to FUSED_PER_STEP ulps a step
-    of its own magnitude, and every other leaf (counts, steps, keys) is exact.
-    A leaf lost or reset at the boundary is wrong in its leading digits."""
-    if jax.default_backend() == "cpu":
-        equal(resident, host)
-        return
-    for path, a, b in _leaves(resident, host):
-        if not np.issubdtype(a.dtype, np.floating):
-            np.testing.assert_array_equal(a, b, err_msg=path)
-            continue
-        bound = FUSED_PER_STEP * steps * float(np.finfo(a.dtype).eps)
-        np.testing.assert_allclose(b, a, rtol=bound, atol=bound * float(np.max(np.abs(a), initial=0.0)),
-                                   err_msg=path)
+    def placed(layout, data):
+        key = (layout, x64())
+        if key not in held:
+            trainer = make(layout)
+            held[key] = trainer, trainer.compile(widened_start(trainer), data)
+        trainer, step = held[key]
+        return widened_start(trainer), step
+    return placed
 
 
 def close(left, right, bound=STREAMED_BOUND):
@@ -125,42 +115,55 @@ def centered():
                     {"first": "a", "second": "b"}),
 ], ids=["global-clip-scheduled-adam", "cross-leaf-mean", "masked-partition-state"])
 def test_complete_optimizer_tree_crosses_the_execution_boundary(optimizer):
-    data = {"small": jnp.asarray(.5), "large": jnp.asarray(40.)}
-    states = []
-    for layout in (DEVICE, HOST):
-        trainer = Trainer(Coupled(), optimizer, key=jax.random.key(4), layout=layout)
-        state, _, _ = trainer.place()
-        step = trainer.compile(state, data)
+    placed = compiled_for(lambda layout: Trainer(Coupled(), optimizer, key=jax.random.key(4), layout=layout))
+
+    def run(layout, small, large):
+        data = {"small": jnp.asarray(small), "large": jnp.asarray(large)}
+        state, step = placed(layout, data)
         for _ in range(3):
             state, *_ = step(state, data)
-        states.append(state)
-    platforms_agree(*states, steps=3)
+        return state
+
+    def draw(seed):
+        """A small and a large gradient, the large past the global clip's bound."""
+        rng = np.random.default_rng([127, seed])
+        return np.float32(rng.uniform(.1, 1.)), np.float32(rng.uniform(10., 80.))
+
+    layouts_agree(run, draw, "three updates across the execution boundary", HOST, DEVICE)
 
 
 @pytest.mark.parametrize("composite", [False, True])
 def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, composite):
     data = batches()
-    states = []
-    for layout in (DEVICE, HOST):
-        trainer = Trainer(
-            Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-            accumulation=2, dynamic_scale=SHORT_SCALE, layout=layout)
-        state, _, _ = trainer.place()
-        step = trainer.compile(state, data[0])
-        prefix, *_ = step(state, data[0])
+    placed = compiled_for(lambda layout: Trainer(
+        Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
+        accumulation=2, dynamic_scale=SHORT_SCALE, layout=layout))
+
+    def run(layout, *microbatches):
+        state, step = placed(layout, microbatches[0])
+        prefix, *_ = step(state, microbatches[0])
         # the step consumes the state
         prefix_params = jax.tree.map(np.asarray, prefix.variables)
-        rejected, _, _, _, accepted, _ = step(prefix, data[1])
+        rejected, _, _, _, accepted, _ = step(prefix, microbatches[1])
         assert not bool(accepted)
         # The rejection drops its window (`dropped_window`); the next two microbatches make the update.
         equal(prefix_params, rejected.variables)
         assert int(rejected.microstep) == 0
-        state, *_ = step(rejected, data[2])
-        state, *_ = step(state, data[3])
+        state, *_ = step(rejected, microbatches[2])
+        state, *_ = step(state, microbatches[3])
         assert int(state.updates) == 1
         assert float(state.variables["stats"]["seen"]) == 3
-        states.append(state)
-    platforms_agree(*states, steps=1)
+        return state
+
+    def draw(seed):
+        """The four microbatches, their targets drawn; the second's loss stays not finite."""
+        rng = np.random.default_rng([162, seed])
+        return tuple({**batch, "y": batch["y"] + jnp.asarray(rng.uniform(-.5, .5, batch["y"].shape),
+                                                               jnp.float32)}
+                     for batch in data)
+
+    layouts_agree(run, draw, "an accumulation window replayed across the execution boundary", HOST,
+                  DEVICE)
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(
@@ -178,7 +181,7 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
     resumed, *_ = resumed_step(restored, data[1])
     resumed, *_ = resumed_step(resumed, data[2])
     resumed, *_ = resumed_step(resumed, data[3])
-    equal(resumed, states[1])
+    equal(resumed, run(HOST, *data))
 
 
 def test_decoder_scan_training_keeps_the_original_logical_state():

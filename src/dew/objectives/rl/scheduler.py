@@ -143,11 +143,12 @@ from dataclasses import dataclass, field
 from typing import ClassVar, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
+from dew._cleanup import attempted
 from dew._coordination import agreed, agreed_count, from_every_process
-from dew.batch import Batch, Variables
-from dew.cleanup import attempted
+from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import DataPartition, Loader, tapped
 from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
@@ -193,9 +194,10 @@ class Publisher(Protocol):
     """Serves the trainer's weights to the rollout engines.
 
     `load(variables, version)` makes the engines serve `variables` under
-    `version`, and the `version` property is the version they serve now. A
-    `RolloutServer` is a publisher, and so is an engine fleet's publish
-    sequence.
+    `version`, and the `version` property is the version they serve now,
+    below zero while they serve none (`NativeRolloutServer.deferred`), which
+    the first call loads whatever `sync_every` says. A `RolloutServer` is a
+    publisher, and so is an engine fleet's publish sequence.
     """
 
     @property
@@ -270,12 +272,17 @@ class _Group:
     latencies: list[float] = field(default_factory=list)
     failures: Counter[int] = field(default_factory=Counter)
     abandoned: bool = False
+    real: bool = True
+    """Whether its task comes of a real row of its batch, not a repeat that fills the batch out
+    (`VALID_ROWS`), which is neither admitted nor trained on."""
 
 
 @dataclass
 class _Entry:
     serial: int
     tasks: tuple[Task, ...]
+    real: tuple[bool, ...]
+    """Which of `tasks` come of real rows of the batch (`real_rows`)."""
     groups: list[_Group] = field(default_factory=list)
     complete: list[_Group] = field(default_factory=list)
     packs: _Entry | None = None
@@ -291,6 +298,20 @@ class _Tally:
     cut: int = 0
     uniform: int = 0
     """Complete groups left out whose returns all agreed (`RolloutScheduler.varied`)."""
+
+
+def real_rows(batch: Batch, tasks: Sequence[Task]) -> tuple[bool, ...]:
+    """Which of a batch's `tasks`, one a row, come of its real rows: those its `VALID_ROWS` marks, every
+    one where it marks none. A batch filled out with repeats of its own rows (`FilledBatch`, a stream's
+    last partial batch) marks them, and their tasks are drawn where a collection draws every row together,
+    but none is admitted or trained on (ledger 4408)."""
+    if VALID_ROWS not in batch:
+        return (True,) * len(tasks)
+    marked = tuple(bool(valid) for valid in np.asarray(batch[VALID_ROWS], bool).reshape(-1))
+    if len(marked) != len(tasks):
+        raise ValueError(f"a batch marking its real rows ({len(marked)}) maps each row to a task, not "
+                         f"{len(tasks)}")
+    return marked
 
 
 def _done(session: Session) -> Future[Session]:
@@ -330,7 +351,8 @@ class Synchronous:
         """Nothing is published: the collector draws from the snapshot itself."""
 
     def entries(self, batch: Batch, tasks_of: Callable[[Batch], Sequence[Task]]) -> list[_Entry]:
-        entry = _Entry(self._serial, tuple(tasks_of(batch)))
+        tasks = tuple(tasks_of(batch))
+        entry = _Entry(self._serial, tasks, real_rows(batch, tasks))
         self._serial += 1
         return [entry]
 
@@ -352,11 +374,16 @@ class Synchronous:
                                  f"not {samples}")
             entry.groups.append(_Group(task, f"{entry.serial}/{row}", [
                 _Sample(index, 0, snapshot.updates, _done(session), began)
-                for index, session in enumerate(sessions)]))
+                for index, session in enumerate(sessions)], real=entry.real[row]))
 
     def redrawn(self, group: _Group, sample: _Sample, cause: str) -> None:
         """None: the draw was one program every process entered, which no process reruns alone."""
         return
+
+    def waited(self, pending: Callable[[], Sequence[Future[Session]]]) -> None:
+        """Return once `pending` gives none, at once: every collected session is finished."""
+        while live := pending():
+            wait(live, return_when=FIRST_COMPLETED)
 
     def cancel(self, samples: Sequence[_Sample]) -> None:
         """Nothing runs: every collected session is finished."""
@@ -433,7 +460,7 @@ class Asynchronous:
         assert self._tasks_of is not None, "tasks() names the conversion before its stream opens"
         tasks = tuple(self._tasks_of(batch))
         with self._lock:
-            self._registered.append(_Entry(self._serial, tasks))
+            self._registered.append(_Entry(self._serial, tasks, real_rows(batch, tasks)))
             self._serial += 1
 
     def begin(self, snapshot: Snapshot, partition: DataPartition) -> None:
@@ -451,8 +478,8 @@ class Asynchronous:
                  for word in np.asarray(jax.device_get(jax.random.key_data(snapshot.key))).reshape(-1)]
         self._key = functools.reduce(jax.random.fold_in, (*words, partition.index), jax.random.key(0))
         self._submissions = 0
-        updates = snapshot.updates
-        if 0 <= updates - self.weights.version < self.sync_every:
+        updates, served = snapshot.updates, self.weights.version
+        if served >= 0 and 0 <= updates - served < self.sync_every:
             return
         self.weights.load(snapshot.variables, updates)
         if self.weights.version != updates:
@@ -482,9 +509,11 @@ class Asynchronous:
         if entry.groups:
             return
         for row, task in enumerate(entry.tasks):
-            group = _Group(task, f"{entry.serial}/{row}")
+            group = _Group(task, f"{entry.serial}/{row}", real=entry.real[row])
             entry.groups.append(group)
-            self._submit(group, [(index, 0) for index in range(samples)])
+            # A repeat that fills the batch out draws nothing: no process draws its rows with another.
+            if group.real:
+                self._submit(group, [(index, 0) for index in range(samples)])
 
     def _submit(self, group: _Group, samples: Sequence[tuple[int, int]]) -> None:
         """Submit `(index, attempt)` samples of one group under the served
@@ -511,6 +540,19 @@ class Asynchronous:
 
     def stale(self, sample: _Sample, updates: int) -> bool:
         return updates - sample.submitted > self.lag
+
+    def waited(self, pending: Callable[[], Sequence[Future[Session]]]) -> None:
+        """Return once `pending`, read afresh as rollouts finish, gives none. Every process calls it at
+        each admission, a share's later reader with nothing pending: Dew's own server over a mesh of
+        several processes is stepped there, by every process together (`NativeRolloutServer.waited`);
+        any other source's rollouts finish on their own."""
+        from dew.inference.rollouts import NativeRolloutServer
+
+        if isinstance(self.weights, NativeRolloutServer):
+            self.weights.waited(pending)
+            return
+        while live := pending():
+            wait(live, return_when=FIRST_COMPLETED)
 
     def rescore(self, variables: Variables, packed: Mapping[str, np.ndarray], progress: Progress
                 ) -> np.ndarray:
@@ -610,6 +652,8 @@ class RolloutScheduler:
         self.generation_batches = generation_batches
         self.metrics: dict[str, float] = {}
         self._branch: str | None = None
+        self._owned: tuple[Callable[[], None], ...] = ()
+        """What it built itself and closes at its end (`served`'s source and server)."""
 
     @property
     def draws_further(self) -> bool:
@@ -647,6 +691,59 @@ class RolloutScheduler:
                    else None, generation_batches=generation_batches)
 
     @classmethod
+    def served(cls, objective: GRPOObjective, reward: Reward, *, tasks: int, slots: int,
+               decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids),
+               groups: int = 4, max_new_tokens: int = 32, estimator: str = "group", truncation: str = "score",
+               sampling: Sampling | None = None, ahead: int = 1, max_lag: int = 1, sync_every: int = 1,
+               page_size: int | None = None,
+               log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
+               overlong: tuple[int, int] | None = None, admit: int | None = None,
+               generation_batches: int = 1) -> RolloutScheduler:
+        """Draw `groups` completions of each of a batch's `tasks` prompt rows ahead of the trainer from
+        Dew's own server over `objective`'s policy, `slots` rows decoding at once, and train on them
+        (`Asynchronous` over a `PromptSource` of a `NativeRolloutServer`, its first weights the run's
+        first snapshot's): `ahead` batches submitted before the trainer reads them, a rollout at most
+        `max_lag` updates behind it, the weights pushed every `sync_every` updates, each version drawn
+        at the run's progress at its updates (`LMObjective.policy`). The proximal policy is rescored
+        under the trainer's weights, so a `max_lag` above 0 needs `objective.behavior_importance`. A
+        reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s.
+        With `page_size` the server pages its cache in pages of that many slots and shares prompt pages,
+        so a group's samples of one prompt prefill it once (`dew.inference.pages.Pages.waits`). A run over
+        several processes serves from one server over its mesh, each process's rows seated on its own
+        devices, which every process steps together as it admits each call's groups and reloads at each
+        push (`NativeRolloutServer.waited`): its draws run between the trainer's steps, not beside them."""
+        from dew.inference.rollouts import NativeRolloutServer
+        from dew.inference.serving import Server
+        from dew.nn.kv_cache import KVCache
+        from dew.nn.protocols import Layered
+
+        from .sources import PromptSource
+
+        drawing = objective.sampled(Sampling() if sampling is None else sampling)
+        width = objective.seq_len + 1
+
+        def built(variables: Variables, version: int) -> Server:
+            policy = objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32)))
+            if page_size is None:
+                return Server.from_task(policy, slots=slots, capacity=width)
+            # The policy's own cache layout, its format kept, in pages.
+            declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
+            return Server.from_task(policy, slots=slots, capacity=width, prefix_cache=True,
+                                    kv_cache=dataclasses.replace(declared, page_size=page_size))
+
+        server = NativeRolloutServer.deferred(built, drawing)
+        source = PromptSource(server, reward, decode=decode, max_new_tokens=max_new_tokens)
+        acquisition = Asynchronous(source, server, objective, width=width, rows=tasks * groups, ahead=ahead,
+                                   max_lag=max_lag, sync_every=sync_every)
+        scheduler = cls(acquisition, tasks=prompt_tasks, groups=groups, estimator=estimator,
+                        truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
+                        reference=objective if objective.reward_kl > 0 else None,
+                        generation_batches=generation_batches)
+        # The source and the server it built end with it: the reward pool, then the engine.
+        scheduler._owned = (source.close, server.close)
+        return scheduler
+
+    @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
                  max_prompt_tokens: int, max_new_tokens: int, max_turns: int, sampling: Sampling,
                  groups: int = 2, credit: str = "session", record: EpisodeRecorder | None = None,
@@ -663,9 +760,16 @@ class RolloutScheduler:
         batch ahead of the step; synchronously, `dataset` itself."""
         return self.acquisition.tasks(dataset, self.tasks_of)
 
-    def close(self) -> None:
-        """Cancel every rollout in flight. The caller closes the source; this method does not."""
+    def cancel(self) -> None:
+        """Cancel every rollout in flight, as a branch's end does; what it serves from stays up."""
         self.acquisition.close()
+
+    def close(self) -> None:
+        """Cancel every rollout in flight, and end what it built itself (`served`'s source and server);
+        a source its caller built, its caller closes."""
+        self.cancel()
+        for close in self._owned:
+            close()
 
     @contextlib.contextmanager
     def branch(self, name: str) -> Iterator[None]:
@@ -684,10 +788,10 @@ class RolloutScheduler:
             yield
         except BaseException as failure:
             # The branch's failure stays the one raised; a cancellation's is noted on it.
-            attempted([("cancelling the branch's rollouts", self.close)], primary=failure)
+            attempted([("cancelling the branch's rollouts", self.cancel)], primary=failure)
             raise
         else:
-            self.close()
+            self.cancel()
         finally:
             self.metrics, self.log, self._branch = metrics, log, branch
 
@@ -786,36 +890,44 @@ class RolloutScheduler:
         group.live.clear()
 
     def _target(self, home: _Entry) -> int:
-        """The groups a call admits: `admit`, or every task of its step's batch (`home`)."""
-        return len(home.groups) if self.admit is None else min(self.admit, len(home.groups))
+        """The groups a call admits: `admit`, or every task of its step's batch (`home`), of those that
+        come of its real rows (`real_rows`)."""
+        real = sum(group.real for group in home.groups)
+        return real if self.admit is None else min(self.admit, real)
 
     def _admit(self, entry: _Entry, updates: int, tally: _Tally) -> None:
         """Wait until the call's first entry holds its `_target` complete groups that fit, or `entry`
         has none left to complete, then cancel the rest of `entry`'s."""
         home = entry.packs or entry
         target = self._target(home)
+
+        def pending() -> list[Future[Session]]:
+            # The futures the admission waits on, none once it holds its target or has nothing to complete.
+            pending = [group for group in entry.groups
+                       if group.real and not group.abandoned and len(group.done) < self.groups]
+            for group in pending:
+                self._harvest(entry, group, updates, tally)
+            pending = [group for group in pending if not group.abandoned and len(group.done) < self.groups]
+            if len(home.complete) >= target or not pending:
+                return []
+            return [sample.future for group in pending for sample in group.live]
+
         try:
-            while True:
-                pending = [group for group in entry.groups
-                           if not group.abandoned and len(group.done) < self.groups]
-                for group in pending:
-                    self._harvest(entry, group, updates, tally)
-                pending = [
-                    group for group in pending if not group.abandoned and len(group.done) < self.groups
-                ]
-                if len(home.complete) >= target or not pending:
-                    break
-                live = [sample.future for group in pending for sample in group.live]
-                wait(live, return_when=FIRST_COMPLETED)
+            self.acquisition.waited(pending)
         finally:
-            leftover = [sample for group in entry.groups for sample in group.live]
+            # A repeat's samples, drawn with the batch's real rows where a collection draws them all, count
+            # as none of its draws.
+            leftover = [sample for group in entry.groups if group.real for sample in group.live]
             tally.cancelled += len(leftover)
             self.acquisition.cancel(leftover)
             for group in entry.groups:
                 group.live.clear()
 
     def _admitted_groups(self, home: _Entry, tally: _Tally, drawn: int) -> list[_Group]:
-        """The call's admitted groups, its first `_target` complete ones; refused where none completed."""
+        """The call's admitted groups, its first `_target` complete ones, none for a batch of no real row
+        (a pool's share whose stream ran out); refused where none completed."""
+        if not self._target(home):
+            return []
         if not home.complete and tally.uniform:
             raise RuntimeError(
                 f"no group of batch {home.serial} varied: the members of each of the {tally.uniform} "
@@ -893,6 +1005,8 @@ class RolloutScheduler:
                 self.acquisition.open(pending, self.groups + self.oversample, keyed)
             if admitting:
                 self._admit(opened[0], snapshot.updates, tally)
+            else:
+                self.acquisition.waited(list)
 
         def short() -> bool:
             return admitting and len(home.complete) < self._target(home)
@@ -904,7 +1018,10 @@ class RolloutScheduler:
 
         opened: Sequence[_Entry] = entries
         while True:
-            admission = functools.partial(admitted, opened, drawn) if acquiring else list
+            # A share's later reader admits nothing, and waits with every process on a server they step
+            # together (`Asynchronous.waited`).
+            admission = (functools.partial(admitted, opened, drawn) if acquiring
+                         else functools.partial(self.acquisition.waited, list))
             _within(mesh, "rollout admission", admission)
             if drawn == self.generation_batches or not agreed_count("rollout draw", short, bool)[1]:
                 break
@@ -941,12 +1058,10 @@ class RolloutScheduler:
         each first reader's rollouts repacked with each call's penalty (`reference_penalties`), which
         its share's later readers take from it. `rollouts` is None on a later reader."""
         assert self.reference is not None
-        from dew.training.transaction import with_ema
-
-        frozen = with_ema(state.variables, state.ema)
-        if frozen is None:
+        if state.ema is None:
             raise ValueError("the rewards' reference penalty reads the frozen starting policy, and the "
                              "state holds none; build it from the objective that names the penalty")
+        frozen = state.averaged
         # At the progress the proximal column is read at, so the penalty is nil where the weights are alike.
         reference = scored_rows(self.reference, frozen, packed, Progress(state.updates))
         shaping = (None if rollouts is None else

@@ -34,7 +34,7 @@ import grain.python as pygrain
 
 from dew._records import json_value, record
 from dew.data.completion import cuts
-from dew.data.dataset import Records, SourceSlice
+from dew.data.dataset import Records
 from dew.data.pipeline import (
     TOKEN_FIELDS,
     Artifact,
@@ -77,8 +77,27 @@ from dew.data.pipeline import (
     runs,
     with_children,
 )
-from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
-from dew.data.sources.base import READS, SAME_ROWS, Read, Source, View, _consumed, beneath, materialized
+from dew.data.plan import (
+    FILE_SHARDS,
+    Manifest,
+    StepIdentity,
+    _changed,
+    _semantic,
+    filled_version,
+    identified,
+    streams_parquet,
+)
+from dew.data.sources.base import (
+    READS,
+    SAME_ROWS,
+    Read,
+    Selection,
+    Source,
+    View,
+    _consumed,
+    beneath,
+    materialized,
+)
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
 
@@ -92,6 +111,10 @@ _STAGES = get_args(Stage.__value__)
 class _Provisionable(Protocol):
     def can_provision(self, read: Read) -> bool: ...
     def provision(self) -> Source: ...
+    def preparation_bytes(self) -> int | None:
+        """The bytes preparing reads, as the store states them before any read, None where it states none
+        (row 4118)."""
+        ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,6 +132,10 @@ class _ConcatenationPreparers:
         for preparer in self.preparers:
             preparer.provision()
         return self.concatenation
+
+    def preparation_bytes(self) -> int | None:
+        sizes = [preparer.preparation_bytes() for preparer in self.preparers]
+        return None if None in sizes else sum(size for size in sizes if size is not None)
 
 
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
@@ -164,16 +191,24 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
     from dew.data.holdout import SelectedGeneration
     from dew.data.lowering import prepared_rows
 
-    held = source.records(read) if read == "memory" else None
-    metadata = source.metadata()
-    if held is None or not measuring:
-        return held, metadata
+    if read != "memory":
+        return None, source.metadata()
     store = _store(source)
-    if isinstance(store, SelectedGeneration):
-        store = store.whole
-    # A records holdout reads its part of the whole store's records, which it keeps.
-    rows = (held if store is source else held.source if isinstance(held, SourceSlice)
-            else whole(store) if whole is not None else store.records(read))
+    views = list(beneath(source, SAME_ROWS))[:-1]
+    parts = [view for view in views if isinstance(view, Selection)]
+    if measuring and whole is not None and views and len(parts) == len(views):
+        # Parts of one store measured over it whole take their parts of the one read of it (`whole`).
+        rows = whole(store)
+        held = functools.reduce(lambda records, part: part.part(records), reversed(parts), rows)
+    else:
+        held = source.records(read)
+        measured = store.whole if isinstance(store, SelectedGeneration) else store
+        rows = (held if measured is source or not measuring else whole(measured) if whole is not None
+                else measured.records(read))
+    # Its metadata after its read, which states what a read infers (a decision table's options).
+    metadata = source.metadata()
+    if not measuring:
+        return held, metadata
     return held, {**metadata, **{each.measure.fact: each.measure(prepared_rows(rows, each.before))
                                  for each in measuring}}
 
@@ -188,7 +223,7 @@ def _measures(stages: Sequence[Stage]) -> tuple[Measuring, ...]:
     return tuple(found.values())
 
 
-def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
+def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read, version: int) -> Manifest:
     """The manifest of what a cache after `prefix` over `source` holds, as a
     publication records it (`dew.data.compile.publish`): the source as `read`
     consumes it, and the configured steps bound to the facts it states."""
@@ -197,7 +232,7 @@ def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Man
     if any(isinstance(stage, Configured) for stage in prefix):
         stated = _stated(consumed, read, _measures(prefix))[1]
         pipeline = _configured(pipeline, stated, read, stated=stated)
-    return _cache_manifest(consumed, pipeline.stages, read)
+    return _cache_manifest(consumed, pipeline.stages, read, version)
 
 
 def _in_place(generation: Generation, source: Source | Mixture | Phases,
@@ -236,7 +271,9 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     if unkeyed:
         return None, (f"steps ({', '.join(unkeyed)} bind to one run's facts or have no "
                       "identity='name@version', which no generation holds)",)
-    changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read).semantic())
+    # Keyed as the fill was, by the shards it numbered its rows by (`filled_version`).
+    version = filled_version(fill)
+    changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read, version).semantic())
     if changed:
         return None, changed
     if not selections:
@@ -252,7 +289,7 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     placing: Read = ("streamed" if read == "streamed"
                      else "indexed" if placed.supports("indexed") else "memory")
     if (placing == "streamed" and any(isinstance(selection, RecordSlice) for selection in selections)
-            and not placed.manifest().index_ordered):
+            and not placed.manifest(version).index_ordered):
         raise ValueError(
             f"a records holdout numbers its inputs by index, and generation {generation.url} numbers them by "
             f"the shards a stream of {placed.describe()} read, which it doesn't state is the index order; "
@@ -593,12 +630,12 @@ def _manifest(
     return Manifest.of(snapshot, steps, ran=ran, fill=fill)
 
 
-def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
-    """The key of a cache of `prefix` over `source`: the source's content and the record steps,
-    without the views of its inputs (`_VIEWS`), which order or select what it holds and make none of
-    it. A store given no name states no content (`Manifest.exact`), and its cache would serve any
-    other's rows."""
-    manifest = _cache_key(source, prefix, read)
+def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read, version: int) -> Manifest:
+    """The key of a cache of `prefix` over `source` read by data plan `version`: the source's content and
+    the record steps, without the views of its inputs (`_VIEWS`), which order or select what it holds and
+    make none of it. A store given no name states no content (`Manifest.exact`), and its cache would serve
+    any other's rows."""
+    manifest = _cache_key(source, prefix, read, version)
     if manifest is None:
         raise ValueError(f"a cache keys its store's content, which {source.describe()} doesn't "
                          "state: name it (from_grain(..., identity=), from_iter(..., identity=), "
@@ -606,8 +643,10 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Mani
     return manifest
 
 
-def _cache_key(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest | None:
-    """`_cache_manifest`, or None where `source` states no content of its own to key."""
+def _cache_key(source: Source, prefix: Sequence[Stage], read: Read, version: int) -> Manifest | None:
+    """`_cache_manifest`, or None where `source` states no content of its own to key. A stream's fill
+    numbers its rows by its shards, which a Parquet store's are its files from `FILE_SHARDS` and its row
+    groups before (`filled_version`), so the two fill caches of their own."""
     stated = source.fingerprint()
     if not identified(json_value(stated, "source")):
         return None
@@ -615,7 +654,9 @@ def _cache_key(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest 
         stated,
         (source,),
         tuple(_identity(stage, cache=True) for stage in _cache_steps(prefix)),
-        fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed"},
+        fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed",
+              **({"shards": "files"} if read == "streamed" and version >= FILE_SHARDS
+                 and streams_parquet(json_value(stated, "source")) else {})},
     )
 
 
@@ -739,9 +780,10 @@ def _external(stage: Stage) -> bool:
 def _volatile(stage: Stage) -> bool:
     """Whether `stage` reads what may change between reads (a step that says it is `Volatile`, as a
     live fetch does), so neither a cache nor a second reader may stand for it: the one test the
-    cache prefix and the plan read."""
-    return (isinstance(stage, (Map, MapWithIndex)) and isinstance(stage.step, Volatile)
-            and stage.step.volatile)
+    cache prefix and the plan read, of whatever step the stage runs (`runs`), a predicate, an
+    expansion or a random step's as a map's (row 4120)."""
+    ran = runs(stage)
+    return ran is not None and isinstance(ran.step, Volatile) and ran.step.volatile
 
 
 def _drops(stage: Stage) -> bool:
@@ -1149,4 +1191,10 @@ def _refusal(source: Source, read: Read, *, provision: bool) -> str:
             return view.refusal
     if provision:
         return "its store takes no such read, and provisioning prepared none"
-    return "provision the named artifact with dew data provision or provision=True"
+    preparer = _provisioner(source, read)
+    if preparer is None:
+        # Nothing prepares this read of it (a Hub split with no Parquet or JSON files streams none).
+        return f"its store holds nothing a {read} read takes, and no preparation makes it: read it otherwise"
+    size = preparer.preparation_bytes()
+    stated = "its size not stated" if size is None else f"{size / 2**20:.1f} MiB to read"
+    return f"provision the named artifact ({stated}) with dew data provision or provision=True"

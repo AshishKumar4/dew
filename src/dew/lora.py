@@ -33,6 +33,8 @@ kernels.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import json
@@ -48,18 +50,29 @@ from typing import ClassVar, NotRequired, Protocol, TypedDict, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn
+from flax import linen as nn, traverse_util
 from flax.core import meta
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew._cache import INTERCEPTED
 from dew._records import finite
-from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw, unboxed
-from dew.cache import INTERCEPTED
+from dew.batch import (
+    FROZEN,
+    Path,
+    Variables,
+    freeze,
+    leaves_by_path,
+    merge as overlay,
+    part,
+    select,
+    thaw,
+    unboxed,
+)
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
-from dew.nn.backbones.layer_names import group_layers, stored_layers
+from dew.nn.backbones.layer_names import Deferred, deferred, group_layers, stored_layers
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.dropout import Dropout
 from dew.nn.flops import (
@@ -515,7 +528,7 @@ class Adapter:
         merged: dict = {}
         for path, target in self.targets.items():
             node = _node(variables, path)
-            kernel = _updated(node["kernel"], node["lora_A"], node["lora_B"], self.scale(target))
+            kernel = _merged(node["kernel"], node["lora_A"], node["lora_B"], self.scale(target))
             _insert(merged, (*path, "kernel"), kernel)
         dropped = {(*path, factor) for path in self.targets for factor in FACTORS}
         return select(overlay(variables, merged), lambda path: path not in dropped)
@@ -529,7 +542,8 @@ class Adapter:
         A pipeline source, whose weights are named under several components, gets the
         Diffusers file with each component's PEFT config in its header.
         """
-        variables = thaw(stored_layers(self.model, variables))
+        # Its factors by their layers' names, a banked store's rows read home as they are written.
+        variables = thaw(stored_layers(self.model, variables, banks=True))
         components = _components(self.layouts)
         names = {layout.paths[0][:-1]: name for name, layout in self.layouts.items()
                  if layout.paths[0][-1] == "kernel"}
@@ -559,6 +573,131 @@ class Adapter:
                    {"format": "pt", DIFFUSERS_METADATA: json.dumps(metadata, indent=2, sort_keys=True)})
 
 
+@dataclass(frozen=True, eq=False)
+class AdapterSet:
+    """Several adapters of one model, served over its one copy of the base weights by name: each row of a
+    call runs under its own adapter, which the call names (`apply(..., adapters=rows)`, `rows` `[B]` int32
+    holding each row's place in `names`, -1 for the base model alone), as vLLM and S-LoRA serve many
+    adapters over one base and one cache, and a request names its adapter (`dew.inference.Server.submit`).
+
+    Each target's factors stack along an adapter axis, before the factor's own axes, each adapter's rank
+    zero-padded to the largest, which adds exact zeros, and its scale held apart (`_Bound.scales`); an
+    adapter that leaves a target be holds zero factors and a zero scale there. `model` is the base adapted
+    to every adapter's targets at once, and `variables` holds the base weights under `FROZEN` and the
+    stacked factors under `params`. A set serves; train or save each adapter on its own (`Adapter`).
+    """
+
+    model: nn.Module
+    variables: Variables
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """The adapters, in the order a row's index names them (the call's `adapters`)."""
+        return adapter_names(self.model)
+
+    def index(self, name: str | None) -> int:
+        """The place of the adapter `name` in `names`; -1, the base model alone, for None."""
+        if name is None:
+            return -1
+        if name not in self.names:
+            raise ValueError(f"this adapter set holds no adapter named {name!r}: it holds "
+                             f"{', '.join(self.names)}")
+        return self.names.index(name)
+
+    @classmethod
+    def load(cls, model: nn.Module, variables: Variables,
+             adapters: str | FilePath | Mapping[str, str | FilePath], *,
+             layouts: Mapping[str, WeightLayout] | None = None) -> AdapterSet:
+        """The set of the adapters `adapters` names over `model` and its `variables` (`LoRA.load` each):
+        a mapping from each adapter's name to its PEFT directory or Diffusers file, or a directory whose
+        subdirectories each hold one PEFT adapter, named as they are."""
+        if not isinstance(adapters, Mapping):
+            root = FilePath(adapters)
+            adapters = {held.name: held for held in sorted(root.iterdir()) if (held / PEFT_WEIGHTS).is_file()}
+            if not adapters:
+                raise FileNotFoundError(f"{root} holds no subdirectory with a PEFT adapter ({PEFT_WEIGHTS})")
+        return cls.of({name: LoRA.load(model, variables, path, layouts=layouts)
+                       for name, path in adapters.items()})
+
+    @classmethod
+    def of(cls, adapters: Mapping[str, Adapter]) -> AdapterSet:
+        """The set of `adapters`, each bound over the same base model and weights, by name: the set runs
+        every adapter's factors over the first's other variables (its base's weights, and what an adapter
+        trains beside its factors, a cross-attention block), so an adapter whose other variables differ
+        from the first's, which would run over another base than its own, is refused (ledger 4494)."""
+        if not adapters:
+            raise ValueError("an adapter set holds an adapter or more")
+        names = tuple(adapters)
+        first = adapters[names[0]]
+        base = unadapted(first.model)
+        if any(unadapted(adapter.model) != base for adapter in adapters.values()):
+            raise ValueError("an adapter set's adapters are bound over one base model")
+        kept = _beside_factors(first.variables)
+        for name in names[1:]:
+            held = _beside_factors(adapters[name].variables)
+            if held.keys() != kept.keys() or not all(_same(held[path], kept[path]) for path in kept):
+                raise ValueError(f"adapter {name!r} is bound over other weights than {names[0]!r}'s, and an "
+                                 f"adapter set runs every adapter over one base's")
+        weights = unboxed(thaw(first.variables))
+        factors = {name: leaves_by_path(adapter.variables["params"]) for name, adapter in adapters.items()}
+        paths = sorted({path for adapter in adapters.values() for path in adapter.targets})
+        stacked, scales, targets = {}, {}, {}
+        for path in paths:
+            held = {name: adapter.targets[path] for name, adapter in adapters.items()
+                    if path in adapter.targets}
+            rank = max(target.rank for target in held.values())
+            some = factors[next(iter(held))]
+            a, b = some[(*path[1:], "lora_A")], some[(*path[1:], "lora_B")]
+            # The axes before a factor's own: a scanned run's layers.
+            lead = a.ndim + b.ndim - 2 - len(_kernel_shape(weights, path))
+            for factor, axis, shape in (("lora_A", a.ndim - 1, a.shape), ("lora_B", lead, b.shape)):
+                leaves = [_rank_padded(factors[name].get((*path[1:], factor)) if name in held else None,
+                                       axis, shape, rank) for name in names]
+                stacked[(*path[1:], factor)] = jnp.stack(leaves, axis=lead)
+            scales[path] = tuple(_scale(held[name], adapters[name].rslora) if name in held else 0.0
+                                 for name in names)
+            targets[path] = Target(rank, float(rank))
+        # What the first adapter's tree trains besides its factors (a cross-attention block) stays.
+        trained = {**traverse_util.flatten_dict(first.variables["params"]), **stacked}
+        layouts = {name: layout for adapter in adapters.values() for name, layout in adapter.layouts.items()}
+        model = _adapted(base, _Bound(targets, layouts=layouts, names=names, scales=scales))
+        return cls(model, {**first.variables, "params": traverse_util.unflatten_dict(trained)})
+
+
+def _beside_factors(variables: Variables) -> Mapping[tuple[str, ...], object]:
+    """Every leaf of `variables` but an adapter's low-rank factors (`FACTORS`), by its collection and path,
+    a trainer's split of them whole again (`thaw`), so adapters over one base split apart compare alike."""
+    return {(collection, *path): leaf for collection, tree in thaw(variables).items()
+            for path, leaf in leaves_by_path(tree).items() if path[-1] not in FACTORS}
+
+
+def _same(leaf, other) -> bool:
+    """Whether two variables' leaves are one: the same node, or nodes of one structure (a quantized kernel's
+    values and scales) whose arrays are of one shape, dtype and values."""
+    if leaf is other:
+        return True
+    (ours, structure), (theirs, held) = jax.tree.flatten(leaf), jax.tree.flatten(other)
+    return structure == held and all(
+        np.shape(a) == np.shape(b) and jnp.result_type(a) == jnp.result_type(b)
+        and bool(jnp.array_equal(a, b)) for a, b in zip(ours, theirs, strict=True))
+
+
+def _rank_padded(leaf: jax.Array | None, axis: int, shape: tuple[int, ...], rank: int) -> jax.Array:
+    """A factor of an adapter set's adapter (`AdapterSet.of`), its rank `axis` zero-padded to `rank`; zeros
+    of a factor shaped as `shape` at that rank where the adapter leaves the target be."""
+    if leaf is None:
+        return jnp.zeros((*shape[:axis], rank, *shape[axis + 1:]), FACTOR_DTYPE)
+    widths = [(0, 0)] * leaf.ndim
+    widths[axis] = (0, rank - leaf.shape[axis])
+    return jnp.pad(leaf, widths)
+
+
+def adapter_names(model: nn.Module) -> tuple[str, ...]:
+    """The adapters an adapter set's model serves by name (`AdapterSet.names`); none for any other model."""
+    adapted = type(model)
+    return adapted._dew_lora_bound.names if isinstance(adapted, AdaptedClass) else ()
+
+
 def _refuse_unadaptable(model: nn.Module) -> None:
     """Refuse a model already adapted, and an NNX model behind Flax's bridge,
     whose `nnx.Linear` makes no `Dense` call the branch could join: its
@@ -574,6 +713,19 @@ def _refuse_unadaptable(model: nn.Module) -> None:
 
 def _scale(target: Target, rslora: bool) -> float:
     return target.alpha / (math.sqrt(target.rank) if rslora else target.rank)
+
+
+def _merged(kernel, a, b, scale: float) -> jax.Array | Deferred:
+    """`_updated`, or over leaves an export reads as it writes them (a bank's rows, `stored_layers`) the
+    merge it builds as it writes it (`Deferred`)."""
+    if not any(deferred(leaf) for leaf in (kernel, a, b)):
+        return _updated(kernel, a, b, scale)
+
+    def built() -> jax.Array:
+        read = [jnp.asarray(np.asarray(leaf)) for leaf in (kernel, a, b)]
+        return _updated(read[0], read[1], read[2], scale)
+
+    return Deferred(kernel.shape, kernel.dtype, built)
 
 
 def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax.Array:
@@ -597,7 +749,7 @@ def _targets_under(targets: Mapping[Path, Target], path: Path) -> bool:
     return any(target[:len(held)] == held for target in targets for held in paths)
 
 
-def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
+def _target_at[T](targets: Mapping[Path, T], path: Path) -> T | None:
     """Return the target a module path names, seen through the stack that runs
     it: a scanned run's module `layers_3_7` stands for layers 3 through 7,
     whose targets must agree, since the run's kernels share one stacked
@@ -618,7 +770,7 @@ def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
     return None
 
 
-def _stored_target(targets: Mapping[Path, Target], root: Path, path: Path) -> Target | None:
+def _stored_target[T](targets: Mapping[Path, T], root: Path, path: Path) -> T | None:
     """The target of the module at `path` below `root`, a pipeline stage's layer standing for each
     stored layer it runs (`stored_paths`), whose targets must agree, since the stages run one program
     over one stacked factor pair."""
@@ -643,6 +795,30 @@ class _Bound:
     dropout: float = 0.0
     layouts: Mapping[str, WeightLayout] = dataclasses.field(default_factory=dict)
     bases: Mapping[str, AdapterBase] = dataclasses.field(default_factory=dict)
+    names: tuple[str, ...] = ()
+    """An adapter set's adapters (`AdapterSet`), whose factors each target stacks; none for one adapter."""
+    scales: Mapping[Path, tuple[float, ...]] = dataclasses.field(default_factory=dict)
+    """A set's scale of each target, adapter by adapter, zero where an adapter leaves the target be."""
+
+
+_SELECTED: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_lora_selected",
+                                                                             default=None)
+
+
+@contextlib.contextmanager
+def _selected_rows(rows: jax.Array | None) -> Iterator[None]:
+    """Each row of a call to an adapter set's model under its own adapter (`AdapterSet`), as the call names
+    them (its `adapters`), for the adapted projections the call reaches (`_Branch`): entered by the
+    model's `apply` around the call it runs, so the rows are the call's own, traced where it is traced.
+    None names none."""
+    if rows is None:
+        yield
+        return
+    token = _SELECTED.set(rows)
+    try:
+        yield
+    finally:
+        _SELECTED.reset(token)
 
 
 @dataclass(frozen=True)
@@ -695,6 +871,10 @@ class _Branch:
             target = _stored_target(self.targets, root, (*module.path, name))
             if target is None:
                 return kernel
+            if self.bound.names:
+                raise ValueError(f"{'/'.join((*root, *module.path, name))} multiplies by a kernel merged "
+                                 "with its adapter's update, one kernel for every row; an adapter set adds "
+                                 "each row's own, so serve this model one adapter at a time")
             child = getattr(module, name)
             a, b = (meta.unbox(child.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
             return _updated(kernel, a, b, _scale(target, self.rslora))
@@ -724,14 +904,45 @@ class _Branch:
         # The branch drops out its input when the forward carries the
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
+        if self.bound.names:
+            rows, scale = self._selected(module, x)
+            # A row of the base model alone computes with any adapter's factors and keeps the base's output.
+            own = jnp.maximum(rows, 0)
+            per_row = (-1, *(1,) * (output.ndim - 1))
+            adapted = output + _low_rank(module, x, a[own], b[own], scale[own].reshape(per_row), axes,
+                                         rowwise=True)
+            return jnp.where((rows >= 0).reshape(per_row), adapted, output)
         if self.dropout and module.has_rng("dropout"):
             x = Dropout(self.dropout, deterministic=False)(x)
-        x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
-        hidden = float32_dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
-                                     precision=module.precision)
-        delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
-                                    precision=module.precision)
-        return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
+        return output + _low_rank(module, x, a, b, _scale(target, self.rslora), axes, rowwise=False)
+
+
+    def _selected(self, module: nn.Module, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """An adapter set's rows at `module` (`AdapterSet`), as the call names them (`_selected_rows`), and
+        the target's scale, adapter by adapter: each row of `x` runs its own adapter's factors."""
+        where = "/".join((*self.root, *module.path))
+        rows = _SELECTED.get()
+        if rows is None:
+            raise ValueError(f"{where} adds each row's adapter of a set, and this call names none: name each "
+                             "row's adapter as its `adapters` (`apply(..., adapters=rows)`)")
+        if x.shape[0] != rows.shape[0]:
+            raise ValueError(f"{where} receives {x.shape[0]} rows, not the {rows.shape[0]} the call's "
+                             "adapters name, so its rows' adapters are unknown")
+        return rows, jnp.asarray(_stored_target(self.bound.scales, self.root, module.path), jnp.float32)
+
+
+def _low_rank(module: nn.Module, x: jax.Array, a: jax.Array, b: jax.Array, scale: float | jax.Array,
+              axes: tuple[int, ...], *, rowwise: bool) -> jax.Array:
+    """The adapter's update at `module`: `x` through the factors `a` and `b`, contracted over `axes`, in
+    at least float32 at the module's precision, times `scale`. `rowwise` factors carry each row of `x`'s
+    own on a leading axis (an adapter set's, `[B, *in, r]` and `[B, r, *out]`), and `scale` each row's."""
+    batch = ((0,), (0,)) if rowwise else ((), ())
+    x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
+    hidden = float32_dot_general(x, a, ((axes, tuple(range(int(rowwise), len(axes) + int(rowwise)))), batch),
+                                 precision=module.precision)
+    delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (int(rowwise),)), batch),
+                                precision=module.precision)
+    return jnp.asarray(scale, delta.dtype) * delta
 
 
 def _refusing_counts(model: nn.Module, base: type[nn.Module], *protocols) -> type[nn.Module]:
@@ -891,8 +1102,9 @@ def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
         def _dew_wrapper() -> AdapterRecord:
             return _record(bound)
 
-        def apply(self, variables, *args, **kwargs):
-            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
+        def apply(self, variables, *args, adapters: jax.Array | None = None, **kwargs):
+            # An adapter set's call names each row's adapter (`AdapterSet`), which its projections read.
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch), _selected_rows(adapters):
                 return super().apply(thaw(variables), *args, **kwargs)
 
         def init_with_output(self, *args, **kwargs):
@@ -1400,4 +1612,5 @@ class AdaptedClass(Protocol):
     _dew_lora_bound: ClassVar[_Bound]
 
 
-__all__ = ["Adapter", "AdapterRecord", "LoRA", "PeftConfig", "Target", "unadapted"]
+__all__ = ["Adapter", "AdapterRecord", "AdapterSet", "LoRA", "PeftConfig", "Target", "adapter_names",
+           "unadapted"]

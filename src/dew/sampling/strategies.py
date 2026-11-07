@@ -59,6 +59,10 @@ class DecoderState:
     """The rows whose last step crossed that change and rebuilt every cache from the history, the
     prediction depths' reseeded as a prefill seeds them (`text.decode_ops`); None where no row can
     cross."""
+    adapters: jax.Array | None = None
+    """Each row's adapter of an adapter set's model (`dew.lora.AdapterSet`), its place in the set's names,
+    -1 for the base model alone, which every forward of the row names as its call's `adapters` field
+    (`text.prefill_state`); None for a model of no set."""
 
 
 
@@ -124,7 +128,7 @@ class DecodeOps:
     reindex: Reindex
     verify: Verify | None = None
     propose: Propose | None = None
-    embed: Callable[[jax.Array], jax.Array] | None = None
+    embed: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None
     depths: int = 0
     record: Record | None = None
     draft: DraftBlock | None = None
@@ -935,7 +939,7 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
         # last emitted slot, the target's own state first; a row that
         # emitted nothing keeps what it had.
         replayed, carried = reseed(
-            ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
+            ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted, following.adapters),
             stretch, base, last, prior_tokens=step.total())
 
         def kept(fresh, held):

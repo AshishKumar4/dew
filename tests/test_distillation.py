@@ -26,7 +26,6 @@ import optax
 import pytest
 from flax import linen as nn
 from flax.traverse_util import unflatten_dict
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import TEXT_KEY
@@ -212,7 +211,49 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
         return {metric: np.float64({**terms, "loss": loss}[name]) for metric, name in named.items()}
 
     assert_as_exact(dew, reference, drawn_parameters(params), f"{kind} distillation terms",
-                    seeds=DISTILLATION_SEEDS["terms"], truth_fn=lambda params: reference(params, "float64"))
+                    seeds=DISTILLATION_SEEDS["terms"],
+                    truth_fn=as_given(lambda params: reference(params, "float64")))
+
+
+@pytest.mark.parametrize("kind", ["cosine", "l2"])
+def test_a_float64_distillation_computes_its_terms_in_float64(kind):
+    """A distillation of float64 models computes every term in float64: its loss and terms within
+    float64 rounding of the reference transcription in float64 on the same models' float64 forwards
+    (`assert_computes_the_oracle`), where a term narrowed to fp32 would sit fp32's rounding away."""
+    from reference_error import assert_computes_the_oracle
+
+    from tools.distillation_reference import dew_outputs
+
+    arrays = fixture()
+    _, params = fixture_objective(arrays, feature_loss=kind)
+    ids = jnp.asarray(arrays["tokens"][:, :-1])
+    named = {"loss": "loss", "ce": "hard_loss", "distill/soft_loss": "soft_loss", "distill/kl": "kl_div_at_T",
+             "distill/feature": "feature", "distill/teacher_loss": "teacher_loss"}
+    student_model, teacher_model = (model.clone(dtype=jnp.float64) for model in models())
+    with jax.enable_x64(new_val=True):
+        wide = widened(params)
+        student = LMObjective(student_model, SEQ, pad_id=META["pad_id"], ema_decay=None,
+                              variables=widened(tree(arrays, "student/")))
+        teacher = LMObjective(teacher_model, SEQ, ema_decay=None, variables=widened(tree(arrays, "teacher/")))
+        objective = DistillationObjective(student, teacher, alpha=META["alpha"],
+                                          temperature=META["temperature"], beta=META["beta"],
+                                          features=[tuple(pair) for pair in META["pairs"]], feature_loss=kind)
+        loss, aux = jax.jit(objective.scalar_loss)(wide, fixture_batch(arrays), step_at())
+        ran = {metric: np.float64({**aux.metrics, "loss": loss}[metric]) for metric in named}
+        outputs = student_forward(wide=True)(wide["params"], ids)
+        logits, states = dew_outputs(teacher_model, wide[TEACHER], ids, [layer for layer, _ in META["pairs"]])
+        held = (np.asarray(logits), np.stack([np.asarray(state) for state in states]))
+    reference_loss, terms, _ = reference_run(arrays, kind, outputs, held, "float64", cotangents=False)
+    oracle = {metric: np.float64({**terms, "loss": reference_loss}[name]) for metric, name in named.items()}
+    # The longest chain of roundings a term goes through: each teacher layer's attention, projections and
+    # MLP (its sequence, twice its width and its MLP's width), the head over the vocabulary, a paired
+    # state's projection and distance over the widest width, and the mean over the batch's positions.
+    layers, width = META["teacher"]["num_layers"], META["teacher"]["emb_features"]
+    roundings = (layers * (SEQ + 2 * width + META["teacher"]["mlp_features"]) + META["teacher"]["vocab_size"]
+                 + 2 * width + ids.size)
+    for metric in named:
+        assert_computes_the_oracle(ran[metric], oracle[metric], f"{kind} {metric} in float64",
+                                   roundings=roundings)
 
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
@@ -246,12 +287,6 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
     assert_as_exact(dew, pulled, drawn_parameters(params), f"{kind} student gradient",
                     seeds=DISTILLATION_SEEDS["gradient"],
                     truth_fn=as_given(lambda params: pulled(params, "float64")))
-    # The fixture's own draw: the student's logits as near its float64 forward as the fixture's,
-    # which the reference generator wrote from the same forward.
-    outputs = student_forward(wide=False)(params["params"], ids)
-    with jax.enable_x64(new_val=True):
-        wide_logits = np.asarray(student_forward(wide=True)(widened(params["params"]), ids)[0])
-    assert_as_exact_as_the_reference(np.asarray(outputs[0]), arrays["student_logits"], wide_logits, "logits")
     truth = pulled(params)
     assert jax.tree.structure(dew(params)) == jax.tree.structure(truth)
     assert all(float(np.abs(leaf).max()) > 0 for leaf in jax.tree.leaves(truth))

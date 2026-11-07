@@ -3,8 +3,10 @@
 import argparse
 import contextlib
 import http.server
+import itertools
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -29,7 +31,7 @@ READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ
 
 def keeping_picks() -> str:
     """This process's XLA flags without the cuda lane's deterministic-ops flag: a process keeps and
-    measures picks only without it (`dew.cache.keeps_picks`)."""
+    measures picks only without it (`dew._cache.keeps_picks`)."""
     return without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
 
 
@@ -118,10 +120,17 @@ def worker_env(devices: int) -> dict[str, str]:
             "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
 
 
+def owned(command: Sequence[str], environment: Mapping[str, str]) -> subprocess.Popen[str]:
+    """`command` from the checkout under `environment`, its output piped, as a group its owner holds
+    (tools/armada/child_groups.py's `start`): its lifeline kills it as its owner dies, however it dies."""
+    return groups.start(command, cwd=REPO_ROOT, env=dict(environment), stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True)
+
+
 def start_process(command: Sequence[str], devices: int, *,
                   environment: Mapping[str, str] | None = None) -> subprocess.Popen[str]:
-    return groups.start(command, cwd=REPO_ROOT, env={**worker_env(devices), **(environment or {})},
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    """`command` as an owned group (`owned`) on `devices` CPU devices (`worker_env`)."""
+    return owned(command, {**worker_env(devices), **(environment or {})})
 
 
 def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
@@ -212,15 +221,26 @@ def run_worker(mode: str, out: Path, **flags) -> dict:
 def run_pool(mode: str | Path, directory: Path, processes: int, *, timeout: float = 600,
              start: Callable[..., subprocess.Popen[str]] = spawn, **flags) -> list[dict]:
     """Launch each rank and return reports in rank order, retaining all failure logs."""
-    directory.mkdir(parents=True, exist_ok=True)
-    coordinator = f"127.0.0.1:{free_port()}"
-    outs = [directory / f"process{index}.json" for index in range(processes)]
-    with ProcessGroup() as pool:
-        for index, out in enumerate(outs):
-            pool.running.append(start(mode, out, processes=processes, process_id=index,
-                                      coordinator=coordinator, **flags))
-        return [report_of(process, out, timeout=timeout, pool=pool.running)
-                for process, out in zip(pool.running, outs, strict=True)]
+    return run_pools((mode, directory, processes, flags), timeout=timeout, start=start)[0]
+
+
+def run_pools(*pools: tuple[str | Path, Path, int, Mapping], timeout: float = 600,
+              start: Callable[..., subprocess.Popen[str]] = spawn) -> list[list[dict]]:
+    """Each pool `(mode, directory, processes, flags)` launched at once, each its own coordinator, and
+    each one's reports in rank order (`run_pool`): runs that read nothing of one another's, as a resumed
+    run and the run nobody stopped that it is compared with, take the longer one's time, not the sum."""
+    with ProcessGroup() as group:
+        launched = []
+        for mode, directory, processes, flags in pools:
+            directory.mkdir(parents=True, exist_ok=True)
+            coordinator = f"127.0.0.1:{free_port()}"
+            outs = [directory / f"process{index}.json" for index in range(processes)]
+            for index, out in enumerate(outs):
+                group.running.append(start(mode, out, processes=processes, process_id=index,
+                                           coordinator=coordinator, **flags))
+            launched.append((group.running[-processes:], outs))
+        return [[report_of(process, out, timeout=timeout, pool=group.running)
+                 for process, out in zip(started, outs, strict=True)] for started, outs in launched]
 
 
 def assert_exits_cleanly(program: str) -> None:
@@ -234,7 +254,7 @@ def assert_exits_cleanly(program: str) -> None:
 
 def dew_train(directory, environment: Mapping[str, str], *arguments: str) -> None:
     """`dew train *arguments` run from `directory` in `environment`, as a user types it; it must succeed."""
-    finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
+    finished = subprocess.run([sys.executable, "-m", "dew._cli.main", "train", *arguments],
                               cwd=directory, env=environment, capture_output=True, text=True, timeout=900)
     assert finished.returncode == 0, f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}"
 
@@ -246,6 +266,21 @@ def logged_losses(run_directory) -> list[float]:
 
     reports = LocalTracker(Path(run_directory) / "tracking").scalars()
     return [values["train/loss"] for _, values in reports if "train/loss" in values]
+
+
+def raised(done: subprocess.CompletedProcess) -> dict[str, list[str]]:
+    """The errors the processes of `done` ended with, by type, each with its messages: every traceback's
+    closing line (Python's `Type: message` after its frames, a chained error's cause among them), read from
+    stdout and stderr with a rank's `[N] ` prefix (`dew launch`'s) taken off; none where no traceback was
+    printed. A refusal's test reads its error here, where its exit status alone a crash would pass."""
+    lines = [re.sub(r"^\[\d+\] ", "", line) for line in (done.stdout + "\n" + done.stderr).splitlines()]
+    found: dict[str, list[str]] = {}
+    for previous, line in itertools.pairwise(lines):
+        named, _, message = line.partition(": ")
+        # An error's type, a class's name (`ValueError`, `dew.mesh.LayoutRefused`), at the line's start.
+        if previous.startswith("  ") and re.fullmatch(r"(\w+\.)*[A-Z][a-z]\w*", named):
+            found.setdefault(named, []).append(message)
+    return found
 
 
 def running(pid: int) -> bool:

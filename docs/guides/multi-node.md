@@ -19,7 +19,35 @@ Every node runs the same script, and each copy is one process of a `jax.distribu
 | A Cloud TPU VM worker | The program itself, in place | The TPU metadata server, read by JAX |
 | Anywhere, with `--tpu NAME` | One process on every worker of the TPU, through gcloud | The TPU metadata server, read by JAX |
 
-Without `--hosts`, `--hostfile` or `--tpu`, `dew launch` uses JAX's own cluster detection (`jax._src.clusters`) to find out where it is running, so it recognizes the same Slurm, Open MPI, Cloud TPU, GKE and Kubernetes environments that `jax.distributed.initialize` does. A flag that names hosts or TPUs takes precedence over what it detects. Add `--dry-run` to see what it would run.
+Without `--hosts`, `--hostfile` or `--tpu`, `dew launch` reads where it is running from `dew.clusters`, the same environments `prepare_process` joins: Open MPI, Slurm, Cloud TPU and Kubernetes, in the order `jax.distributed.initialize` detects them. A flag that names hosts or TPUs takes precedence over what it detects. Add `--dry-run` to see what it would run.
+
+## Your own scheduler
+
+`dew launch` is not required. A scheduler that starts one copy of your script per process, and tells each copy its place, needs only `prepare_process`. It finds the scheduler among `dew.clusters.ENVIRONMENTS` on its own (`dew launch`'s pool, Open MPI, Slurm, Cloud TPU, Kubernetes), and you can name the scheduler instead with `prepare_process(cluster=...)`, which joins its pool whatever `multi_host` would detect. A scheduler Dew does not know is a small class of your own: a `name`, `detected()`, which is whether this process runs under it, and `joining()`, which returns a `dew.clusters.Joining` with the coordinator's address, the pool's process count, this process's rank and, if it says so, the accelerators it takes on its host:
+
+```python
+import dataclasses, os
+
+from dew.clusters import Joining
+from dew.training.runtime import prepare_process
+
+
+@dataclasses.dataclass(frozen=True)
+class MyScheduler:
+    name = "my scheduler"
+
+    def detected(self) -> bool:
+        return "MY_RANK" in os.environ
+
+    def joining(self) -> Joining:
+        return Joining(os.environ["MY_COORDINATOR"], int(os.environ["MY_WORLD_SIZE"]),
+                       int(os.environ["MY_RANK"]), detection="deactivate")
+
+
+prepare_process(cluster=MyScheduler())
+```
+
+`detection="deactivate"` says the environment states the pool whole, so JAX detects nothing more. A scheduler JAX detects itself is named there instead (`"slurm"`, `"ompi"`, `"gcetpu"`, `"gketpu"`), and JAX fills every field left None, as the built-in environments leave every fact to JAX.
 
 ## dew launch
 
@@ -233,7 +261,7 @@ Each fsdp group spans the two hosts of its replica. With `--mesh '{"fsdp": 2}'` 
 
 On a GPU run, the tests marked `mesh(devices=2)` take one GPU per process.
 
-`tools/layout_parity.py` runs every layout of every model family against one device, in one process or under `dew launch`. It holds the first step's loss and each gradient leaf to the one-device reference by the floor judge by default, each within a factor of the reference's own deviation, and by check 1 with `--seeds N`, over the model's N draws of its batch, the step computed in float64 the truth, every arm drawing and starting from the reference's own values, and it compares the devices' FLOPs with one device's FLOPs split evenly. A layout that Dew refuses by design, such as a stage axis over a DiT, raises `dew.mesh.LayoutRefused` with the reason and a layout that does run. The tool lists those rows separately, and it exits nonzero on a mismatch, an inconclusive judgment, repeated work or another error. With `--seeds N`, `--prepare` computes each model's one-device reference and float64 anchor on every draw into a `--references` directory in a one-device job, so a later check-1 run of the layouts on every device does not compute them itself.
+`tools/layout_parity.py` runs every layout of every model family against one device, in one process or under `dew launch`. It holds the first step's loss and each gradient leaf to the one-device reference by check 1 over the model's `--seeds N` draws of its batch (`--seeds 0` runs each layout once), the step computed in float64 the truth, every arm drawing and starting from the reference's own values, and it compares the devices' FLOPs with one device's FLOPs split evenly. A layout that Dew refuses by design, such as a stage axis over a DiT, raises `dew.mesh.LayoutRefused` with the reason and a layout that does run. The tool lists those rows separately, and it exits nonzero on a mismatch, an inconclusive judgment, repeated work or another error. With `--seeds N`, `--prepare` computes each model's one-device reference and float64 anchor on every draw into a `--references` directory in a one-device job, so a later check-1 run of the layouts on every device does not compute them itself.
 
 ## Tested configurations
 

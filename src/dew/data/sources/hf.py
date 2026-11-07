@@ -99,7 +99,7 @@ class HF(Dataset):
             raise ValueError(f"{self.describe()} is an IterableDataset, read only as a stream")
         return arrow_rows(self.dataset)
 
-    def manifest(self) -> ShardManifest:
+    def manifest(self, version: int) -> ShardManifest:
         from datasets import Dataset as Arrow
 
         if isinstance(self.dataset, Arrow):
@@ -114,11 +114,11 @@ class HF(Dataset):
         return tuple(_HFShard(f"{name}/shards-{count}/{index}", name, count=count, index=index)
                      for index in range(count))
 
-    def _read_shard(self, shard: Shard) -> grain.IterDataset:
+    def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         from datasets import Dataset as Arrow
 
         if isinstance(self.dataset, Arrow):
-            return arrow_rows(self.dataset).to_iter_dataset()
+            return arrow_rows(self.dataset).to_iter_dataset(options)
         if not isinstance(shard, _HFShard):
             raise ValueError("a Hugging Face stream needs its own shard descriptor")
         return _Streamed(_undecoded(self.dataset), shard)

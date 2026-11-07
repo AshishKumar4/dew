@@ -11,7 +11,9 @@ import json
 import math
 import os
 import posixpath
+import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import PurePosixPath
@@ -23,6 +25,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
+import pyarrow.parquet as pq
 from fsspec.spec import AbstractFileSystem
 from fsspec.utils import infer_compression
 from gcsfs import GCSFileSystem
@@ -49,18 +52,21 @@ from dew.data.storage import (
 from .base import Read, Shard, ShardManifest, preparing, url_label
 from .index import ArrayIndex
 
-type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
+type Format = Literal[
+    "jsonl", "json", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"
+]
 
 
 def _format(url: str) -> Format:
-    inferred = _inferred(url)
+    inferred = inferred_format(url)
     if inferred is None:
         raise ValueError(f"source {url!r} needs format=; a URL does not declare its record format")
     return inferred
 
 
 _SUFFIXES: dict[Format, tuple[str, ...]] = {
-    "jsonl": (".jsonl", ".jsonl.gz", ".jsonl.zst"),
+    "jsonl": (".jsonl", ".jsonl.gz", ".jsonl.zst", ".jsonl.bz2", ".jsonl.xz"),
+    "json": (".json", ".json.gz", ".json.zst", ".json.bz2", ".json.xz"),
     "text": (".txt",),
     "csv": (".csv",),
     "parquet": (".parquet",),
@@ -85,7 +91,7 @@ def declared_format(value: str, store: str) -> Format:
     raise ValueError(f"{store} declares record format {value!r}, none of {', '.join(FORMATS)}")
 
 
-def _inferred(url: str) -> Format | None:
+def inferred_format(url: str) -> Format | None:
     """The record format a URL's suffix declares, or None where it declares none: a directory's too,
     spelled with a trailing separator or without."""
     name = PurePosixPath(url).name.lower()
@@ -181,10 +187,44 @@ def _mount_root(paths: Sequence[str]) -> str:
     return posixpath.dirname(paths[0]) if len(set(paths)) == 1 else posixpath.commonpath(paths)
 
 
-def _fragment_rows(fragment) -> int:
-    if isinstance(fragment, ds.ParquetFileFragment):
-        return sum(group.num_rows for group in fragment.row_groups)
-    return fragment.count_rows()
+_FOOTER_THREADS = 32
+"""The files whose footers a source reads at once to count its pieces (`Files._pieces`): footers are small
+reads that wait on the store, so they overlap; 200 of FineWeb-Edu's Hub files' took 62 s one at a time
+and 9 s 32 at a time (row 2402)."""
+
+_FOOTERS_HELD = 4
+"""The files whose parsed footers a process keeps for reading their row groups (`_Footers`): a reader reads
+a file's row groups one after another, so the file it reads and the few its interleave holds open."""
+
+
+class _Footers:
+    """The files a process read its pieces of last, each a fragment holding its parsed footer, so the
+    row groups read one after another of one file read its footer once (`_FOOTERS_HELD`). Each process
+    makes its own: a pickled source carries none."""
+
+    def __init__(self) -> None:
+        self._held: dict[int, ds.ParquetFileFragment] = {}
+        self._lock = threading.Lock()
+
+    def __reduce__(self):
+        return _Footers, ()
+
+    def fragment(self, source: Files, number: int) -> ds.ParquetFileFragment:
+        """File `number` of `source`, its footer read."""
+        with self._lock:
+            held = self._held.pop(number, None)
+            if held is not None:
+                self._held[number] = held
+                return held
+        listed = source._listed_files[number]
+        opened = listed.format.make_fragment(listed.path, listed.filesystem,
+                                             partition_expression=listed.partition_expression)
+        opened.ensure_complete_metadata()
+        with self._lock:
+            self._held[number] = opened
+            while len(self._held) > _FOOTERS_HELD:
+                del self._held[next(iter(self._held))]
+        return opened
 
 
 def _open_lines(opened: BinaryIO, path: str):
@@ -603,7 +643,7 @@ class Files(Dataset):
             return False
         if self.kind in ("arrow", "parquet"):
             return True
-        if self.kind == "webdataset":
+        if self.kind in ("webdataset", "json"):
             return False
         # Found once, kept: an index provisioned since a miss is looked for again (`provision` clears it).
         if self.__dict__.get("indexes_present"):
@@ -632,13 +672,16 @@ class Files(Dataset):
         return (read == "indexed" and self.where is None
                 and self.kind in ("array_record", "jsonl", "text", "csv"))
 
+    def preparation_bytes(self) -> int:
+        """The files' bytes, which an offset index or an ArrayRecord's count reads whole."""
+        return sum(integer(self._header(url)["size"], "file bytes") for url in self.paths)
+
     def provision(self) -> Files:
         if self.kind == "array_record":
             return self._provision_arrayrecord()
         if self.kind not in ("jsonl", "text", "csv"):
             raise ValueError(f"{self.describe()} has no provisionable offset index")
-        stores = [Store(url, self.storage_options).resolve() for url in self.paths]
-        preparing(self, sum(fs.size(path) or 0 for fs, path in stores), "an offset index beside each file")
+        preparing(self, self.preparation_bytes(), "an offset index beside each file")
         for url in self.paths:
             with _open_lines(self._opened(url), url) as file:
                 names = _header(file) if self.kind == "csv" else None
@@ -703,8 +746,12 @@ class Files(Dataset):
         if self.kind == "files":
             return self._projected(_Paths(self.paths))
         if read == "memory" and self.kind != "array_record":
-            # Each shard as its reader reads it: an Arrow fragment as `where` filters it, a file's lines.
-            return tuple(row for shard in self.manifest().shards for row in self._read_shard(shard))
+            from dew.data.plan import FILE_SHARDS
+
+            # Each shard as its reader reads it: an Arrow file or a Parquet one's row groups as `where`
+            # filters them, a file's lines; each file's footer read as its rows are.
+            shards = self.manifest(FILE_SHARDS).shards
+            return tuple(row for shard in shards for row in self._read_shard(shard))
         if self.kind in ("parquet", "arrow"):
             rows = _ArrowRecords(self)
         elif self.kind == "array_record":
@@ -803,24 +850,70 @@ class Files(Dataset):
             )
 
     @cached_property
-    def fragments(self):
+    def _listed_files(self) -> tuple[ds.FileFragment, ...]:
+        """The files Arrow reads, each a fragment with the partition its path places it in, none of their
+        footers read."""
         if not self.paths:
             return ()
         with self._versions_held(self.paths):
-            return tuple(
-                piece
-                for fragment in self.arrow.get_fragments()
-                for piece in (fragment.split_by_row_group() if self.kind == "parquet" else (fragment,))
-            )
+            return tuple(self.arrow.get_fragments())
 
-    def manifest(self) -> ShardManifest:
-        """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a
-        fill keyed by a shard's rows finds them wherever the files are mounted."""
+    @cached_property
+    def _footers(self) -> _Footers:
+        return _Footers()
+
+    @cached_property
+    def _pieces(self) -> _Pieces:
+        """The pieces a read takes of the files: each Parquet row group, or each Arrow file whole, with its
+        rows. Each Parquet file's footer is read for its row groups' counts alone, the files' at once, and
+        none kept: FineWeb-Edu's default configuration holds 1.8 million row groups in 2410 files, whose
+        row groups' fragments held 9 MB a file (row 2402)."""
+        listed = self._listed_files
+        if self.kind != "parquet":
+            rows = [fragment.count_rows() for fragment in listed]
+            return _Pieces(np.arange(len(listed), dtype=np.int32), np.zeros(len(listed), np.int32),
+                           np.asarray(rows, np.int64))
+        with self._versions_held(self.paths), ThreadPoolExecutor(
+                min(_FOOTER_THREADS, max(1, len(listed)))) as reads:
+            counts = [np.zeros(0, np.int64), *reads.map(_group_rows, listed)]
+        return _Pieces(np.repeat(np.arange(-1, len(listed), dtype=np.int32), [len(each) for each in counts]),
+                       np.concatenate([np.arange(len(each), dtype=np.int32) for each in counts]),
+                       np.concatenate(counts))
+
+    def _fragment_table(self, fragment: ds.Fragment) -> pa.Table:
+        """`fragment`'s rows as this store reads them, its schema, columns and filter, its file held at
+        its version through the read (`_versions_held`): a row group's (`_ParquetRows`) and a piece's
+        (`_ArrowFragment`) alike."""
+        held = (self._arrow_files[2][fragment.path],) if self._versioned else ()
+        # Kept once its file is found at its version after the read too, as the hold ends.
+        with self._versions_held(held):
+            return fragment.to_table(schema=self.arrow.schema,
+                                     columns=list(self.columns) if self.columns is not None else None,
+                                     filter=self.where)
+
+    def _piece(self, index: int) -> ds.Fragment:
+        """Piece `index` of the files (`_pieces`) as a fragment Arrow reads: a Parquet row group of its file,
+        whose footer this process holds while it reads the file (`_Footers`), or an Arrow file."""
+        number, group = int(self._pieces.files[index]), int(self._pieces.groups[index])
+        if self.kind != "parquet":
+            return self._listed_files[number]
+        return self._footers.fragment(self, number).subset(row_group_ids=[group])
+
+    def manifest(self, version: int) -> ShardManifest:
+        """The files' shards at data plan `version`, each named by its file's place (`_places`) and where in
+        it it starts, so a fill keyed by a shard's rows finds them wherever the files are mounted: a Parquet
+        store's its files from `dew.data.plan.FILE_SHARDS` (`_by_file`), its row groups before it."""
+        from dew.data.plan import FILE_SHARDS
+
+        if self.kind == "parquet" and version >= FILE_SHARDS:
+            return self._by_file()
         shards = []
         if self.kind in ("parquet", "arrow"):
-            for number, fragment in enumerate(self.fragments):
-                rows = None if self.where is not None else _fragment_rows(fragment)
-                name = self._shard_name(fragment.path)
+            pieces = self._pieces
+            names = [self._shard_name(fragment.path) for fragment in self._listed_files]
+            for number in range(len(pieces.rows)):
+                rows = None if self.where is not None else int(pieces.rows[number])
+                name = names[pieces.files[number]]
                 shards.append(Shard(f"{name}:{number}", name, number, number + 1, rows))
         elif self.kind == "array_record":
             shards.extend(Shard(self._shard_id(number, url, 0), url) for number, url in enumerate(self.paths))
@@ -845,6 +938,48 @@ class Files(Dataset):
         divisible = self.kind in ("jsonl", "text") and not any(
             infer_compression(url.lower()) for url in self.paths)
         return ShardManifest(tuple(shards), self._read_shard, self._subdivided if divisible else None)
+
+    def _by_file(self) -> ShardManifest:
+        """A Parquet store's files as its shards (`dew.data.plan.FILE_SHARDS`), each read row group by row
+        group as its reader reaches them, its footer read as it opens (`_ParquetRows`): no footer read before
+        the first record, where its row groups as shards read every file's first (FineWeb-Edu's default
+        configuration's 2410, 196 s: row 4131), as Grain's and `datasets`' Parquet streams read file by file.
+        Each file's rows are counted from its footer where a read needs them (`ShardManifest.sized`), unless
+        `where` filters them, and its row groups are its shards where readers and workers outnumber its
+        files (`_row_groups`)."""
+        shards = tuple(Shard(name, name, number) for number, name in enumerate(
+            self._shard_name(fragment.path) for fragment in self._listed_files))
+        return ShardManifest(shards, self._read_shard, self._row_groups,
+                             counted=None if self.where is not None else self._file_rows, fixed_parts=True)
+
+    def _row_groups(self, count: int) -> tuple[Shard, ...]:
+        """A Parquet store's row groups as its shards, read by more readers and workers (`count`) than its
+        files (`_by_file`): every file's footer read, each row group a shard of its rows (`_pieces`), as many
+        as the store holds, which `count` past them refuses (`dew.data.shards`)."""
+        pieces = self._pieces
+        names = [self._shard_name(fragment.path) for fragment in self._listed_files]
+        return tuple(Shard(f"{names[pieces.files[number]]}:{number}", names[pieces.files[number]], number,
+                           number + 1, None if self.where is not None else int(pieces.rows[number]))
+                     for number in range(len(pieces.rows)))
+
+    def _file_rows(self, reads: int) -> tuple[int, ...]:
+        """The rows of each of a Parquet store's files, read once for the store: from its row groups' counts
+        where a read counted them (`_pieces`), else from its footers, `reads` read at once (a read's
+        `Loading.threads`), kept for every read after (`sized`'s callers: a bound, a placed read, a pass's
+        count, a publication)."""
+        held = self.__dict__.get("_file_counts")
+        if held is not None:
+            return held
+        listed = self._listed_files
+        if "_pieces" in self.__dict__:
+            counts = np.bincount(self._pieces.files, weights=self._pieces.rows, minlength=len(listed))
+            held = tuple(int(count) for count in counts)
+        else:
+            with self._versions_held(self.paths), ThreadPoolExecutor(
+                    min(max(reads, 1), max(1, len(listed)))) as pool:
+                held = tuple(int(groups.sum()) for groups in pool.map(_group_rows, listed))
+        self.__dict__["_file_counts"] = held
+        return held
 
     def _subdivided(self, count: int) -> tuple[Shard, ...]:
         """The JSON-lines or text files cut into `count` parts, for a streamed read with more
@@ -888,14 +1023,17 @@ class Files(Dataset):
                              "read it with fewer")
         return tuple(shards)
 
-    def _read_shard(self, shard: Shard) -> grain.IterDataset:
+    def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
+        if self.kind == "parquet" and shard.stop is None:
+            # A file (`_by_file`), where a row group is a piece of the files (`_pieces`).
+            return _ParquetFile(self, shard.start)
         if self.kind in ("parquet", "arrow"):
-            return grain.MapDataset.source(_ArrowFragment(self, shard.start)).to_iter_dataset()
-        rows = self._shard_rows(shard)
+            return grain.MapDataset.source(_ArrowFragment(self, shard.start)).to_iter_dataset(options)
+        rows = self._shard_rows(shard, options)
         return rows if self.columns is None else rows.map(_Columns(self.columns, self.describe())).map(
             Fields(self.columns))
 
-    def _shard_rows(self, shard: Shard) -> grain.IterDataset:
+    def _shard_rows(self, shard: Shard, options: grain.ReadOptions | None) -> grain.IterDataset:
         if self.kind == "array_record":
             from .records import ArrayRecords
 
@@ -906,13 +1044,13 @@ class Files(Dataset):
                     record_codec=self.committed is not None and self.committed.get("codec") == 1,
                     declared=(self._declared_objects.get(shard.uri),),
                 )
-            ).to_iter_dataset()
+            ).to_iter_dataset(options)
         if self.kind == "webdataset":
             from .webdataset import TarRows
 
             return TarRows(shard.uri, self.storage_options, self._declared_objects.get(shard.uri))
         if self.kind == "files":
-            return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset()
+            return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset(options)
         return _Lines(self, shard)
 
     def locality(self) -> tuple[tuple[int, ...], bool]:
@@ -921,7 +1059,7 @@ class Files(Dataset):
             fs, _ = Store(url, self.storage_options).resolve()
             remote |= not (local(fs) or in_memory(fs))
         if self.kind in ("parquet", "arrow") and self.where is None:
-            return tuple(_fragment_rows(fragment) for fragment in self.fragments), remote
+            return tuple(int(rows) for rows in self._pieces.rows), remote
         if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
             indexed = _IndexedLines(self)
             if self.index is None:
@@ -981,11 +1119,10 @@ class Files(Dataset):
                 for name, feature in features.items()
                 if isinstance(feature, Mapping) and feature.get("_type") == "ClassLabel"
             }
-            counts = (
-                {"rows": sum(_fragment_rows(fragment) for fragment in self.fragments)}
-                if self.where is None
-                else {}
-            )
+            # A Parquet store's rows a read counts from its files' footers where it needs them
+            # (`ShardManifest.sized`), which no fact a store states is found by (row 4131).
+            counted = self.where is None and self.kind == "arrow"
+            counts = {"rows": int(self._pieces.rows.sum())} if counted else {}
             # Rows with no counted targets column hold no count of Dew's (`CountRule`).
             rules = {} if "_dew_valid_targets" in self.arrow.schema.names else {"count_rules": []}
             return {"class_names": names, **counts, **rules}
@@ -1000,10 +1137,14 @@ class Files(Dataset):
             with self._versions_held(self.paths):
                 return self.arrow.to_table(columns=["length"])["length"].to_numpy()
         if self.index:
-            with io.BytesIO(Store(self.index, self.storage_options).read()) as file:
-                index = np.load(file, allow_pickle=False)
-                if index.dtype.names and "length" in index.dtype.names:
-                    return index["length"]
+            # The index as the offset reader reads it (`ArrayIndex`), held to its producer's declaration;
+            # its length column copied out before the index lets its file go (row 4144).
+            index = ArrayIndex(self.index, self.storage_options, self._declared_index(self.index))
+            try:
+                names = index.values.dtype.names
+                return np.array(index.values["length"]) if names and "length" in names else None
+            finally:
+                index.close()
         return None
 
 
@@ -1038,21 +1179,78 @@ class _Paths:
 
 
 @dataclass(frozen=True)
+class _Pieces:
+    """The pieces a read takes of a Parquet or Arrow source's files (`Files._pieces`), one entry each: its
+    file's number, its row group's in the file, and its rows."""
+
+    files: np.ndarray
+    groups: np.ndarray
+    rows: np.ndarray
+
+
+def _group_rows(fragment: ds.FileFragment) -> np.ndarray:
+    """The rows of each row group of the Parquet file `fragment` names, read off its footer alone."""
+    with fragment.filesystem.open_input_file(fragment.path) as opened:
+        footer = pq.read_metadata(opened)
+    return np.asarray([footer.row_group(group).num_rows for group in range(footer.num_row_groups)], np.int64)
+
+
+class _ParquetFile(grain.IterDataset):
+    """File `number` of a Parquet store, its shard (`Files._by_file`), read row group by row group
+    (`_ParquetRows`)."""
+
+    def __init__(self, source: Files, number: int):
+        super().__init__()
+        self.source, self.number = source, number
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _ParquetRows(self.source, self.number)
+
+
+class _ParquetRows(grain.DatasetIterator):
+    """A Parquet file's rows in order, one row group's table held at a time, its footer read as it opens
+    (`_Footers`), each row group read as `where` filters it; its position the row group it reads and the
+    rows of it read, which a restore reads that row group again to go on from."""
+
+    def __init__(self, source: Files, number: int):
+        super().__init__()
+        self.source, self.number = source, number
+        self.fragment = source._footers.fragment(source, number)
+        self.groups = self.fragment.num_row_groups
+        self.group, self.row, self.table = 0, 0, None
+
+    def __next__(self) -> Batch:
+        while self.group < self.groups:
+            if self.table is None:
+                self.table = self._read(self.group)
+            if self.row < self.table.num_rows:
+                self.row += 1
+                return self.table.slice(self.row - 1, 1).to_pylist()[0]
+            self.group, self.row, self.table = self.group + 1, 0, None
+        raise StopIteration
+
+    def _read(self, group: int) -> pa.Table:
+        return self.source._fragment_table(self.fragment.subset(row_group_ids=[group]))
+
+    def get_state(self) -> dict[str, int]:
+        return {"group": self.group, "row": self.row}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        group, row = state.get("group"), state.get("row")
+        if not isinstance(group, int) or not isinstance(row, int) or not 0 <= group <= self.groups or row < 0:
+            raise ValueError(f"invalid Parquet file position {dict(state)!r} for file {self.number} of "
+                             f"{self.source.describe()}")
+        self.group, self.row, self.table = group, row, None
+
+
+@dataclass(frozen=True)
 class _ArrowFragment:
     source: Files
     index: int
 
     @locked_cached_property
     def table(self) -> pa.Table:
-        fragment, source = self.source.fragments[self.index], self.source
-        held = (source._arrow_files[2][fragment.path],) if source._versioned else ()
-        # Kept once its file is found at its version after the read too, as the hold ends.
-        with source._versions_held(held):
-            return fragment.to_table(
-                schema=self.source.arrow.schema,
-                columns=list(self.source.columns) if self.source.columns is not None else None,
-                filter=self.source.where,
-            )
+        return self.source._fragment_table(self.source._piece(self.index))
 
     def __len__(self) -> int:
         return self.table.num_rows
@@ -1067,7 +1265,7 @@ class _ArrowFragment:
 class _ArrowRecords:
     def __init__(self, source: Files):
         self.source = source
-        self.ranges = Ranges(tuple(_fragment_rows(fragment) for fragment in source.fragments))
+        self.ranges = Ranges(tuple(int(rows) for rows in source._pieces.rows))
 
     @cached_property
     def _group(self):
@@ -1206,6 +1404,8 @@ class _Lines(grain.IterDataset):
         self.shard = shard
 
     def __iter__(self) -> grain.DatasetIterator:
+        if self.source.kind == "json":
+            return _json_records(self.source, self.shard)
         return _LineIterator(self.source, self.shard)
 
 
@@ -1213,13 +1413,13 @@ class _LineIterator(grain.DatasetIterator):
     # Whether `file` is open: an iterator whose opening failed has nothing to close.
     _opened = False
 
-    def __init__(self, source: Files, shard: Shard):
+    def __init__(self, source: Files, shard: Shard, kind: Format | None = None):
         super().__init__()
-        self.source, self.shard = source, shard
+        self.source, self.shard, self.kind = source, shard, kind or source.kind
         self.compression = infer_compression(shard.uri.lower())
         self.file = _open_lines(source._opened(shard.uri), shard.uri)
         self._opened = True
-        self.names = _header(self.file) if source.kind == "csv" else None
+        self.names = _header(self.file) if self.kind == "csv" else None
         if self.names is None and shard.start:
             begin = _line_start(self.file, shard.start, shard.stop)
             if shard.stop is not None and begin >= shard.stop:
@@ -1230,11 +1430,11 @@ class _LineIterator(grain.DatasetIterator):
                     "shard_bytes of at least its longest record, or provision it (`dew data "
                     "provision`) to read it record by record")
             self.file.seek(begin)
-        self.records = _lines(source.kind, self.file, self.names, shard.stop)
+        self.records = _lines(self.kind, self.file, self.names, shard.stop)
 
     def __next__(self) -> Batch:
         line, _, _ = next(self.records)
-        return _decoded(self.source.kind, line)
+        return _decoded(self.kind, line)
 
     def get_state(self) -> dict[str, int]:
         return {"offset": self.file.tell()}
@@ -1249,8 +1449,40 @@ class _LineIterator(grain.DatasetIterator):
             self.file = _open_lines(self.source._opened(self.shard.uri), self.shard.uri)
         _seek_lines(self.file, offset)
         # The records read on from the restored offset, after a pass that read them all too.
-        self.records = _lines(self.source.kind, self.file, self.names, self.shard.stop)
+        self.records = _lines(self.kind, self.file, self.names, self.shard.stop)
 
     def close(self) -> None:
         if self._opened:
             self.file.close()
+
+
+def _json_records(source: Files, shard: Shard) -> grain.DatasetIterator:
+    """A JSON file's records, as `datasets` reads a JSON file: the items of the array it holds, read whole
+    (`_JsonArray`), or else each line's object, as JSON lines (`_LineIterator`) (row 2402)."""
+    with _open_lines(source._opened(shard.uri), shard.uri) as file:
+        # The first byte of the value the file holds, past the whitespace before it.
+        while (head := file.read(1)) and head.isspace():
+            pass
+        if head == b"[":
+            return _JsonArray(json.loads(head + file.read()))
+    return _LineIterator(source, shard, "jsonl")
+
+
+class _JsonArray(grain.DatasetIterator):
+    """The items of a JSON file's array, its position the items read."""
+
+    def __init__(self, array: list[Batch]):
+        super().__init__()
+        self.array, self.read = array, 0
+
+    def __next__(self) -> Batch:
+        if self.read >= len(self.array):
+            raise StopIteration
+        self.read += 1
+        return self.array[self.read - 1]
+
+    def get_state(self) -> dict[str, int]:
+        return {"read": self.read}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self.read = integer(state["read"], "JSON array items read")

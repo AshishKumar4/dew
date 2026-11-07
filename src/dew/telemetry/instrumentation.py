@@ -18,8 +18,10 @@ import math
 import re
 import sys
 import threading
+import weakref
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import jax
 import numpy as np
@@ -178,11 +180,15 @@ class _Instruction:
     """Its metadata's `op_name source_file:line`, interned: a module repeats
     each a great many times."""
     buffers: tuple[int, ...] = ()
-    """A collective's result, each array's bytes (`_buffers`); empty for any other op."""
+    """A collective's or a custom call's result, each array's bytes (`_buffers`); empty for any other op."""
     shapes: tuple[tuple[int, ...], ...] = ()
-    """A collective's result, each array's dimensions, as `buffers` sizes them; empty for any other op."""
+    """A collective's or a custom call's result, each array's dimensions, as `buffers` sizes them; empty
+    for any other op."""
     groups: tuple[tuple[int, ...], ...] = ()
     """A collective's device groups (`_groups`); empty for any other op."""
+    arrays: tuple[str, ...] = ()
+    """A collective's or a custom call's result, each array's element type, as `shapes` holds its
+    dimensions: a cuBLAS call's `s8` workspace beside its product; empty for any other op."""
 
 
 @dataclass
@@ -293,12 +299,13 @@ def _parse(text: str | Iterable[str]) -> tuple[dict[str, _Computation], str | No
         traced = tuple(sys.intern(f"{op_name} {file}:{line}".strip() if file else op_name)
                        for op_name, file, line in _TRACED.findall(metadata) if op_name)
         moved = collective(match.group('op'))
-        buffers = _buffers(match.group('shape')) if moved else ()
-        shapes = tuple(tuple(int(d) for d in each.split(',') if d)
-                       for _, each, _ in _ARRAY.findall(match.group('shape'))) if moved else ()
-        computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes,
-                                                      recomputed, traced, buffers, shapes,
-                                                      _groups(attributes) if moved else ())
+        sized = moved or match.group('op') == 'custom-call'
+        arrays = _ARRAY.findall(match.group('shape')) if sized else []
+        computation.instructions[name] = _Instruction(
+            match.group('op'), dims, operands, attributes, recomputed, traced,
+            _buffers(match.group('shape')) if sized else (),
+            tuple(tuple(int(d) for d in each.split(',') if d) for _, each, _ in arrays),
+            _groups(attributes) if moved else (), tuple(element for element, _, _ in arrays))
         if stripped.startswith('ROOT'):
             computation.root = name
         literal = _INTEGER.match(match.group('rest'))
@@ -495,10 +502,10 @@ class HloInstruction:
     """Its calls per call of the module, as `hlo_flops` weighs them: a loop
     body's trip count, every branch of a conditional once."""
     buffers: tuple[int, ...]
-    """A collective's result, each array's bytes: an async pair's `-done` holds
+    """A collective's or a custom call's result, each array's bytes: an async pair's `-done` holds
     what moved, its `-start` what it read as well. Empty for any other op."""
     shapes: tuple[tuple[int, ...], ...]
-    """A collective's result, each array's dimensions, as `buffers` sizes them."""
+    """A collective's or a custom call's result, each array's dimensions, as `buffers` sizes them."""
     groups: tuple[tuple[int, ...], ...]
     """A collective's device groups, each the positions in the module's device assignment that
     take part together; empty where every device does, and for any other op (`_groups`)."""
@@ -506,6 +513,9 @@ class HloInstruction:
     """Its result's element type as HLO names it (`f32`, `bf16`); empty where its result is a tuple."""
     dims: tuple[int, ...]
     """Its result's dimensions: a tuple's first array's."""
+    arrays: tuple[str, ...] = ()
+    """A collective's or a custom call's result, each array's element type, as `shapes` holds its
+    dimensions: a cuBLAS call's `s8` workspace beside its product."""
 
 
 def reported_instruction(expression: str) -> HloInstruction | None:
@@ -567,7 +577,7 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
                                          reads, flops, weights.get(called_as, 0.0), instruction.buffers,
                                          instruction.shapes, instruction.groups, computation.elements[name],
-                                         instruction.dims)
+                                         instruction.dims, instruction.arrays)
     computations.clear()
     return found
 
@@ -854,6 +864,36 @@ class StepFlops:
 
 NO_FLOPS = StepFlops(0.0, 0.0)
 """The FLOPs of no step, where an interval's sum starts."""
+
+
+class CompiledMemory(NamedTuple):
+    """A compiled step's memory as XLA analyses it (`Compiled.memory_analysis`), each in bytes: its
+    arguments', its outputs', the outputs aliasing a donated argument, its temporaries' and its code's."""
+
+    argument: int
+    output: int
+    alias: int
+    temp: int
+    generated_code: int
+
+
+_ANALYSED: weakref.WeakKeyDictionary[jax.stages.Compiled, CompiledMemory | None] = (
+    weakref.WeakKeyDictionary())
+
+
+def compiled_memory(executable: jax.stages.Compiled) -> CompiledMemory | None:
+    """`executable`'s memory as XLA analyses it, None where its backend states none, read once an
+    executable: the planner's probe and forecast, the step's headroom and the run's record
+    (`dew.training.memory`), a step compiled ahead, and a GPU program's admission to the host's
+    communicators (`dew.communicators`, its code's bytes) each read one compiled step, and each read walked
+    its program again (0.2 to 0.5 s of a CPU U-Net step's, row 3763)."""
+    if executable not in _ANALYSED:
+        stats = executable.memory_analysis()
+        _ANALYSED[executable] = None if stats is None else CompiledMemory(
+            int(stats.argument_size_in_bytes), int(stats.output_size_in_bytes),
+            int(stats.alias_size_in_bytes), int(stats.temp_size_in_bytes),
+            int(stats.generated_code_size_in_bytes))
+    return _ANALYSED[executable]
 
 
 def step_flops(compiled: jax.stages.Compiled) -> StepFlops | None:

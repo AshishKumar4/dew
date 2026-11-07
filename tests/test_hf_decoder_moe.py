@@ -17,7 +17,7 @@ from interop_support import (
     transformers_arms,
     transformers_model,
 )
-from model_support import decode_steps, flat_tree, stepped_outputs
+from model_support import decode_steps, flat_tree, prediction_logits, stepped_outputs
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -346,8 +346,7 @@ def mtp_depth(directory, *, experts):
     assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == experts
 
     def depth_logits(held):
-        hidden = model.apply(held, ids, method=CausalTransformer.hidden_states)
-        return np.asarray(model.apply(held, hidden, ids, method=CausalTransformer.mtp_logits)[0])
+        return np.asarray(prediction_logits(model, held, ids))
 
     logits, reference = depth_logits(variables), np.load(directory / "mtp_logits.npy")
     difference = float(np.max(np.abs(logits - reference)))
@@ -402,6 +401,218 @@ def test_a_family_reads_quantized_weights_through_the_shared_codec(tmp_path, nam
     loads = (fp32_decoder(tmp_path / 'quantized'), fp32_decoder(tmp_path / 'dense'))
     logits = [np.asarray(model.apply(variables, ids)) for model, variables in loads]
     np.testing.assert_array_equal(*logits)
+
+
+KIMI_K25_MEDIA = {"image": ((1, 6, 4), (3,)), "video": ((2, 4, 4), (2,))}
+"""Each Kimi K2.5 media site's item grid `(t, h, w)` in 2-pixel patches and where its placeholder run
+starts: an image of 6 merge blocks, and a two-frame video whose frames pool into 4 (`sd2_tpool`)."""
+
+KIMI_K25_MEDIA_SEEDS = 8
+"""The media sites' declared check-1 seeds, sized by `seeds_for` on armada paired with Dew's arm: 8 for
+each site (22 s the image's, 14 s the video's)."""
+
+
+def kimi_k25_media_case(site):
+    """Check 1's arms for Kimi K2.5 whole over a row a drawn image, or a drawn video's frames, fill (row
+    855): Dew's bundle (`Pretrained.load`: MoonViT, its patch merger, the decoder), its processor reading
+    the fields transformers' processor gives (`Processor.from_hf`: the placeholder run as long as the
+    item's merged blocks, its patches `[N, 3, 2, 2]` with their grid), and transformers' own
+    Kimi_K25ForConditionalGeneration over the same checkpoint, in float32 and as its float64 twin
+    (`transformers_arms`); each draw's tokens redrawn until the decoder's routing clears its margin."""
+    import selection_margins
+    import torch
+    from transformers import Kimi_K25ForConditionalGeneration
+
+    from dew.nn.inputs import ModelInputs
+
+    grid, starts = KIMI_K25_MEDIA[site]
+    config = fixture_config("kimi-k25-tiny")
+    token = config["image_token_id" if site == "image" else "video_token_id"]
+    count = grid[1] * grid[2] // 4
+    ids_shape = np.load(KIMI_K25 / "input_ids.npy")[:1].shape
+    pixels, grids = ("pixel_values", "image_grid_thw") if site == "image" else (
+        "pixel_values_videos", "video_grid_thw")
+
+    def draw(seed):
+        rng = np.random.default_rng([0x855, len(site), seed])
+        ids = rng.integers(0, min(config["image_token_id"], config["video_token_id"]) - 8, ids_shape)
+        for start in starts:
+            ids[0, start:start + count] = token
+        patches = rng.normal(size=(int(np.prod(grid)), 3, 2, 2)).astype(np.float32)
+        return ids.astype(np.int32), patches
+
+    source = Pretrained.load(KIMI_K25, dtype="float32", attention_impl="reference")
+    model, variables = source.model, source.variables
+
+    def batch(ids, patches):
+        fields = source.processor.from_hf({"input_ids": ids, pixels: patches, grids: np.asarray([grid])})
+        inputs = ModelInputs(jnp.asarray(ids), fields.token_fields, fields.conditioning)
+        return inputs.tokens, inputs.kwargs()
+
+    @as_given
+    def dew(ids, patches):
+        tokens, fields = batch(ids, patches)
+        return np.asarray(model.apply(variables, tokens, **fields))
+
+    network = Kimi_K25ForConditionalGeneration.from_pretrained(
+        str(KIMI_K25), dtype=torch.float32, local_files_only=True, experts_implementation="eager")
+    network.set_attn_implementation("eager")
+
+    def logits(network, ids, patches):
+        dtype = next(network.parameters()).dtype
+        if site == "image":
+            return network(input_ids=ids, **{pixels: patches.to(dtype), grids: torch.tensor([grid])}).logits
+        # transformers 5.17 splits a video's projected tokens by t·h·w/4 where its tower pools the frames (row
+        # 4368) to h·w/4 (`get_image_features`), so its forward refuses a clip of more than one frame: its own
+        # tower, projector and decoder, placed as its forward places them (`Kimi_K25Model.forward`: the
+        # placeholders read token 0, then the projected tokens scattered over them).
+        inner, placed = network.model, ids == token
+        embeds = inner.get_input_embeddings()(ids.masked_fill(placed, 0))
+        tower = inner.vision_tower(patches.to(dtype), grid_thw=torch.tensor([grid])).pooler_output
+        projected = inner.mm_projector(tower).squeeze(1).to(embeds.dtype)
+        embeds = embeds.masked_scatter(placed[..., None], projected)
+        return network(inputs_embeds=embeds).logits
+
+    reference, truth = transformers_arms(network.eval(), logits)
+    # The decoder's routing over the row with its media, as the compared runs route it.
+    captured = selection_margins.capture(model, lambda module, tokens, fields: module(tokens, **fields))
+    decoder = translate_config(config)
+
+    def clears(drawn):
+        selections = captured(variables, *batch(*drawn))
+        return (selection_margins.margin(decoder, selections, f"kimi-k25 {site}", stable=False)
+                > selection_margins.MARGIN)
+    return dew, reference, selection_margins.clearing(draw, clears), truth
+
+
+@pytest.mark.parametrize("site", sorted(KIMI_K25_MEDIA))
+def test_kimi_k25_reads_its_media_whole_on_par_with_transformers(site):
+    """Kimi K2.5 loads whole (row 855): its MoonViT, attending over an item's every frame, its frames pooled,
+    its patch merger and the decoder compute transformers' logits over a row a drawn image or a drawn
+    video fills, on par with transformers' own model from its float64 twin (check 1)."""
+    dew, reference, draw, truth = kimi_k25_media_case(site)
+    assert_as_exact(dew, reference, draw, f"kimi-k25 {site}", seeds=KIMI_K25_MEDIA_SEEDS, truth_fn=truth)
+
+
+@pytest.mark.parametrize("kind", ["image", "video"])
+def test_kimi_k25_reads_raw_media_through_its_processor_as_its_fields(kind):
+    """Kimi K2.5's raw media reach the model through the checkpoint's own processor (transformers'
+    Kimi_K25Processor, its tiny patches and merge): Dew's call (`Processor.__call__`) gives the inputs its
+    processed fields give (`Processor.from_hf`), whose logits the media sites hold by check 1, and the
+    model's logits over them are those inputs' bit for bit (row 855's review)."""
+    from transformers import AutoProcessor
+
+    from dew.nn.inputs import ModelInputs
+
+    source = Pretrained.load(KIMI_K25, dtype="float32", attention_impl="reference")
+    rng = np.random.default_rng(855)
+    picture = (rng.random((12, 8, 3)) * 255).astype(np.uint8)
+    # A clip of two frames at two a second, which its processor samples by its own fps.
+    media = {"images": [picture]} if kind == "image" else {
+        "videos": [np.stack([picture, picture[::-1]])],
+        "video_metadata": [{"total_num_frames": 2, "fps": 2.0, "duration": 1.0}]}
+    text = "w5 " + ("<|media_pad|>" if kind == "image" else "<|kimi_k25_video_placeholder|>") + " w7"
+    called = source.processor(text, **media)
+    fields = AutoProcessor.from_pretrained(str(KIMI_K25), local_files_only=True)(
+        text=text, return_tensors="np", **media)
+    given = source.processor.from_hf(dict(fields))
+
+    def logits(inputs: ModelInputs):
+        return np.asarray(source.model.apply(source.variables, inputs.tokens, **inputs.kwargs()))
+
+    np.testing.assert_array_equal(np.asarray(called.tokens), np.asarray(given.tokens))
+    np.testing.assert_array_equal(logits(called), logits(given))
+
+
+def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
+    """Kimi K2.5's release ships its own processor (KimiK25Processor and its vision processor at 4d01dfe,
+    the source's code), whose public call takes `medias` and keeps one placeholder an image (row 4367): a
+    load that trusts the source's code reads raw images through it (`Processor.media`), over a row of one
+    image and a row of two of other sizes, as the release lays them out: each row's tokens the release's,
+    each placeholder expanded to as many as the release's own count of its image's tokens
+    (`media_tokens_calculator`), and the images' patches and grids its own, in order. A chat over an image
+    part, under the release's own template, reads it as the call over the text the template writes does.
+    The model reads them: its logits are finite and another image changes them."""
+    import json
+    import shutil
+
+    from PIL import Image
+    from tool_support import run_from
+    from transformers import AutoProcessor
+
+    from dew.nn.inputs import pad_token_rows
+
+    source = tmp_path / "source"
+    shutil.copytree(KIMI_K25, source)
+    # The release's own processor in place of transformers' (its processor_config.json), at the fixture's
+    # tiny patches, merge and patch budget.
+    tiny = json.loads((source / "processor_config.json").read_text())["image_processor"]
+    (source / "processor_config.json").unlink()
+    with run_from("remote_code_reference", "tools") as reference:
+        files = reference.PROCESSORS["kimi-k25-tiny"][2]
+        for file in files:
+            shutil.copy(reference.release_file("kimi-k25-tiny", file), source / file)
+    released = json.loads((source / "preprocessor_config.json").read_text())
+    side = tiny["size"]["max_height"] // tiny["patch_size"]
+    released["media_proc_cfg"].update(patch_size=tiny["patch_size"], merge_kernel_size=tiny["merge_size"],
+                                      in_patch_limit=tiny["max_patches"], in_patch_limit_each_frame=None,
+                                      patch_limit_on_one_side=side)
+    (source / "preprocessor_config.json").write_text(json.dumps(released))
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    release = AutoProcessor.from_pretrained(str(source), trust_remote_code=True, local_files_only=True)
+    assert type(release).__name__ == "KimiK25Processor"
+    rng = np.random.default_rng(4367)
+    images = [(rng.random(shape) * 255).astype(np.uint8) for shape in ((12, 8, 3), (8, 16, 3), (10, 10, 3))]
+    rows = ["w5 <|media_pad|> w7", "<|media_pad|> w2 w3 <|media_pad|>"]
+    called = loaded.processor(rows, images=images)
+    image_id = fixture_config("kimi-k25-tiny")["image_token_id"]
+    expanded, pixels, grids = [], [], []
+    # The release's call reads PIL images (its `_to_pil`), as Dew hands it the arrays.
+    pictures = [Image.fromarray(image) for image in images]
+    for row, taken in zip(rows, ([pictures[0]], pictures[1:]), strict=True):
+        theirs = release(medias=[{"type": "image", "image": image} for image in taken], text=row,
+                         return_tensors="np")
+        ids = np.asarray(theirs["input_ids"]).reshape(-1)
+        repeats = np.ones(ids.shape, np.int64)
+        repeats[ids == image_id] = [
+            release.media_processor.media_tokens_calculator({"type": "image", "image": image})
+            for image in taken]
+        expanded.append(np.repeat(ids, repeats))
+        pixels.append(np.asarray(theirs["pixel_values"]))
+        grids.append(np.asarray(theirs["grid_thws"]))
+    tokenizer = release.tokenizer
+    padded, fields = pad_token_rows(expanded, pad_id=tokenizer.pad_token_id,
+                                    padding_side=tokenizer.padding_side)
+    given = loaded.processor.from_hf({"input_ids": padded, **fields, "pixel_values": np.concatenate(pixels),
+                                      "image_grid_thw": np.concatenate(grids)})
+    np.testing.assert_array_equal(np.asarray(called.tokens), np.asarray(given.tokens))
+    for kind, ours, theirs in (("token", called.token_fields, given.token_fields),
+                               ("conditioning", called.conditioning, given.conditioning)):
+        assert sorted(ours) == sorted(theirs), kind
+        for name in theirs:
+            np.testing.assert_array_equal(np.asarray(ours[name]), np.asarray(theirs[name]), err_msg=name)
+
+    # Dew's spelling of an image part and the release's two (its template's and its call's `image_url`).
+    for part in ({"type": "image", "image": images[1]}, {"type": "image_url", "image_url": pictures[1]},
+                 {"type": "image", "image_url": images[1]}):
+        messages = [{"role": "user", "content": [part, {"type": "text", "text": "w5"}]}]
+        chatted = loaded.processor.chat(messages)
+        written = loaded.processor.reference.apply_chat_template(messages, tokenize=False,
+                                                                 add_generation_prompt=True)
+        direct = loaded.processor(written, images=[images[1]])
+        np.testing.assert_array_equal(np.asarray(chatted.tokens), np.asarray(direct.tokens))
+        np.testing.assert_array_equal(np.asarray(chatted.conditioning["pixel_values"]),
+                                      np.asarray(direct.conditioning["pixel_values"]))
+        assert np.count_nonzero(np.asarray(chatted.tokens) == image_id) == \
+            release.media_processor.media_tokens_calculator({"type": "image", "image": pictures[1]})
+
+    def logits(images):
+        inputs = loaded.processor(rows, images=images)
+        return np.asarray(loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs()))
+
+    first = logits(images)
+    assert np.isfinite(first).all()
+    assert not np.array_equal(first, logits([images[0][::-1], *images[1:]]))
 
 
 def test_kimi_k25_text_only_placeholders_match_reference():

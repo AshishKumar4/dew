@@ -188,7 +188,7 @@ for checkpoint in trainer.checkpoints.kept():
 
 A recorded run states the same choices in its `TrainerConfig`. A run's command line stops it on a plateau of a metric named as `--trainer.best` names one, `trainer.stop:plateau --trainer.stop.metric val/loss --trainer.stop.evals 3`, ends it on the best model with `--trainer.restore-best`, and writes the local tier beside the persistent checkpoints with `--trainer.local-directory /scratch/run --trainer.local-every 5%`; `dew train run.json --set trainer.restore_best=True` sets them in a saved run. `dew export run_dir out --step best` (or `--step best:val/clip_score`) exports the step a ranking chose.
 
-`Best(fid, weights_only=True)` writes only the parameters, the EMA and the counters for a winner that falls between checkpoint steps. Such a snapshot is for inference, and a full-state restore refuses it; `restore_best=True` reads it as the model state it holds. When a winner falls on a full-checkpoint step, the one full save also serves the best tracker, so nothing is written twice. Latest-N retention counts only full states, so a small inference snapshot cannot replace the state a run resumes from.
+`Best(fid, weights_only=True)` writes only the parameters, the EMA and the counters for a winner that falls between checkpoint steps. Such a snapshot is for inference, and a full-state restore refuses it; `restore_best=True` reads it as the model state it holds. When a winner falls on a full-checkpoint step, the one full save also serves the best tracker, so nothing is written twice, and once the step is no longer one of the latest, only its model stays. Latest-N retention counts only full states, so a small inference snapshot cannot replace the state a run resumes from.
 
 With several validation splits, each split has an explicit reader name, given as its key in `validation`, and a metric selector has to name its split. A callable uses `(split, metric)` keys.
 
@@ -220,7 +220,9 @@ trainer.fit(data, steps=100_000, checkpoint_every=timedelta(minutes=15))
 
 `Keep.every` retains steps divisible by that period. `Keep.interval` retains checkpoints at least that much wall time apart, starting with the oldest saved step. It sets the spacing between kept checkpoints and does not mean "keep every checkpoint older than this age". `Keep.where` is a predicate over a checkpoint's step and metrics, and it can only be set in code. Its records accept metric objects as keys as well as stored names, and with several splits you write `c.metrics["flowers", fid]`. A checkpoint missing the score is not selected by the predicate.
 
-The checkpointer keeps the union of these policies, the latest full states, all best-K sets and the post-hoc snapshots. Directory names stay step numbers. Scores are in the metadata and in `kept()`, so a reader never has to parse them out of a name.
+`Keep(..., weights_only=True)` keeps the steps `every`, `interval` and `where` select, once they are no longer among the `latest`, as their model alone: the counters, the variables and the EMA, which an evaluation, an export or `dew.pipeline` reads, without the optimizer state and data position only a resume reads. The latest steps stay whole, so the run still resumes from them, and an archive of a long run holds one weights-sized tree per kept step instead of its whole state. `kept()` reports such a step as `kind="weights"`, and a resume refuses it.
+
+The checkpointer keeps the union of these policies, the latest full states, all best-K sets and the post-hoc snapshots. Each step keeps what its reasons need and no more: a step kept only for a weights-only rule keeps its model, and a post-hoc snapshot kept for nothing else keeps its profiles. A step is cut to that only after the save that changed its reasons has committed, as Orbax deletes a step no rule keeps only then, so a failed save leaves every step as it was. Directory names stay step numbers. Scores are in the metadata and in `kept()`, so a reader never has to parse them out of a name.
 
 Ranking reads the finished evaluation scalars on the host and transfers no parameters. All trackers share the same evaluation, and a step that enters several best-K sets still requests one save. A weights-only winner is small because it leaves out the optimizer state and the data position.
 
@@ -254,7 +256,7 @@ The planes are computed on the devices that hold the EMA. So a save holds one mo
 
 You usually pick an EMA's length before training and judge it afterwards. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) lets you pick it after training. Setting `OptimConfig.ema_profiles`, for example to `(0.05, 0.10)`, wraps the optimizer in `dew.optim.power_profiles`. That keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state, so the profiles are sharded, placed and saved with that state.
 
-A snapshot is the ordinary checkpoint itself, which Orbax's public preservation policy keeps even after `keep` would prune it. The state and the averages go into one atomic save, so an interrupted save cannot publish a state without its profiles.
+A snapshot is the ordinary checkpoint itself, saved in one atomic step, so an interrupted save cannot publish a state without its profiles. Its averages are an Orbax item of their own. Once `keep` no longer keeps the step for a resume or its model, only that item stays, so the retained snapshots of a long run hold the averages alone. Under DiLoCo the profiles are each group's, since the run's optimizer is the groups' inner one, and `posthoc_ema` returns the groups' mean of each group's own reconstruction.
 
 <!-- not run: a fragment of a long diffusion run; its trainer, data, metrics and directory are the run's -->
 ```python
@@ -269,7 +271,7 @@ averaged = checkpoints.posthoc_ema(0.07, step=40000)
 
 The accuracy depends on how many snapshots there are. In a 96-step CPU run tracking 0.05 and 0.10, I rebuilt an average of 0.07 and compared it with one tracked directly, on weights of scale 2. From snapshots every 4 steps the two differed by at most 1.2e-7, from every 8 steps by 4.8e-7, and from every 16 steps by 5.7e-6. For comparison, the tracked 0.05 average was 1.3e-4 from the directly tracked 0.07.
 
-Each profile holds one more copy of the weights in memory, and retaining whole checkpoints costs disk. With fp32 weights, an ordinary EMA, fp32 Adam moments, two power profiles and no accumulation buffers, a 176M model holds six weight-sized trees per snapshot, about 4.2 GB before compression. A 1.35M-update run saving every 10k updates keeps 135 snapshots, about 570 GB raw. Keeping only the two averages would take about 190 GB. A separate checkpoint manager for the averages added blocking setup and a gap between commits, though, so Dew keeps the state and the profiles in one atomic checkpoint. With empty `ema_profiles`, the ordinary `keep` policy applies.
+Each profile holds one more copy of the weights in memory. With fp32 weights, an ordinary EMA, fp32 Adam moments, two power profiles and no accumulation buffers, a 176M model holds six weight-sized trees per snapshot, about 4.2 GB before compression. A 1.35M-update run saving every 10k updates keeps 135 snapshots: about 570 GB raw as whole steps, about 190 GB as the two averages each older snapshot keeps. A separate checkpoint manager for the averages added blocking setup and a gap between commits, so the averages stay an item of the same atomic step. With empty `ema_profiles`, the ordinary `keep` policy applies.
 
 In paired, interleaved CPU saves of an 8.4M-parameter fp32 tree, the same state blocked for a median of 14.9 ms with snapshot retention and 15.2 ms without it, over six warmed pairs. A snapshot transfers and serializes no extra parameter bytes. On an NVIDIA A100 at integration commit `f41039b9`, with JAX 0.11.2 and 175.6M fp32 parameters, snapshot retention also added no measured blocking cost. The full state held weights, EMA, Adam moments and two power profiles. The variants were interleaved for five saves each, and the table gives medians of attempts 1 to 4. I did not time restores for this comparison.
 
@@ -286,7 +288,7 @@ A scheduler stops a job with SIGTERM and kills it after a grace period, such as 
 
 If nothing catches `Preempted`, the program exits with status 143, the status for SIGTERM, so the scheduler sees a stopped job and not a finished one. A Kubernetes pod failure policy can ignore that code. Run the same command again to resume from the checkpoint.
 
-On a GPU, `--xla_gpu_deterministic_ops=true` orders the reductions, so a resumed run can match the uninterrupted one to the bit. With jax 0.11.2 it also stops XLA timing GEMM and convolution kernels at compile time ([XLA's determinism notes](https://openxla.org/xla/determinism)): each takes the first configuration that compiles, so a resumed process compiles the same kernels. XLA would take a pick stored in its per-fusion cache over that one, and Dew's Pallas kernels the picks stored beside it over their heuristic configurations, so a run under deterministic ops reads neither (`dew.cache.keeps_picks`), and another run measuring kernels into the same cache between the two leaves them as they were. Deterministic ops also take Triton out of XLA's GEMM configurations while XLA still fuses dots for Triton, and a dot cuBLAS cannot take back fails to compile ("No supported config found", as the mean-flow hybrid DiT's jvp dot over a concatenation does); `--xla_gpu_enable_triton_gemm=false` beside it keeps every dot a cuBLAS call. Dew's CUDA test lane also turns autotuning off (`--xla_gpu_autotune_level=0`), so eight processes sharing one GPU choose no configuration, but a run does not need it, and it leaves cuBLAS and cuDNN calls with the configuration they were emitted with, which cuDNN refuses for an fp8 convolution on an H100.
+On a GPU, `--xla_gpu_deterministic_ops=true` orders the reductions, so a resumed run can match the uninterrupted one to the bit. With jax 0.11.2 it also stops XLA timing GEMM and convolution kernels at compile time ([XLA's determinism notes](https://openxla.org/xla/determinism)): each takes the first configuration that compiles, so a resumed process compiles the same kernels. XLA would take a pick stored in its per-fusion cache over that one, and Dew's Pallas kernels the picks stored beside it over their heuristic configurations, so a run under deterministic ops reads neither, and another run measuring kernels into the same cache between the two leaves them as they were. Deterministic ops also take Triton out of XLA's GEMM configurations while XLA still fuses dots for Triton, and a dot cuBLAS cannot take back fails to compile ("No supported config found", as the mean-flow hybrid DiT's jvp dot over a concatenation does); `--xla_gpu_enable_triton_gemm=false` beside it keeps every dot a cuBLAS call. Dew's CUDA test lane also turns autotuning off (`--xla_gpu_autotune_level=0`), so eight processes sharing one GPU choose no configuration, but a run does not need it, and it leaves cuBLAS and cuDNN calls with the configuration they were emitted with, which cuDNN refuses for an fp8 convolution on an H100.
 
 Two runs of a CIFAR-10 LADD distillation with deterministic ops alone differed from an uninterrupted run at one step, by 3.5e-14 in the patch convolution's gradient, and Adam grew that difference to 8e-6. They ran while deterministic runs still read stored picks, and whether that was the cause is not known. 20 fresh processes training a DiT with deterministic ops alone all agreed to the bit, and `tests/test_trainer.py` holds two processes of one to the bit with another run measuring kernels into their cache between them.
 
@@ -304,13 +306,13 @@ import tensorflow_datasets as tfds
 from google.colab import drive
 
 import dew
-from dew.cache import enable_compilation_cache
 from dew.data import TFDS, presets
+from dew.training import prepare_process
 
 drive.mount("/content/drive")
 root = "/content/drive/MyDrive/runs/flowers"
 
-enable_compilation_cache(f"{root}/xla")                      # compiled steps and the GPU's kernel picks
+prepare_process(compilation_cache_dir=f"{root}/xla")        # compiled steps and the GPU's kernel picks
 # Prepared on the first runtime; a later one finds it there and prepares nothing.
 tfds.builder("oxford_flowers102", data_dir=f"{root}/data").download_and_prepare(file_format="array_record")
 train = TFDS("oxford_flowers102", path=f"{root}/data")
@@ -366,22 +368,24 @@ A committed step can still be removed by the run's retention (`keep`) before the
 
 ## Reading a checkpoint with Orbax alone
 
-A step directory is an ordinary Orbax checkpoint of one PyTree item, so Orbax opens it without Dew:
+A step directory is an ordinary Orbax checkpoint of PyTree items, so Orbax opens it without Dew. `model` holds the counters, the variables and the EMA; `profiles` holds the post-hoc EMA averages, where the run keeps them; and `resume` holds every other field a resume reads. A step kept for some readers alone holds their items (`projected.json` beside them lists them), and a step an earlier Dew wrote, or a mapping saved in a train state's place, is one item, `default`:
 
 <!-- not run: a fragment; the directory is a run's -->
 ```python
 import orbax.checkpoint as ocp
 
-manager = ocp.CheckpointManager(directory, item_handlers=ocp.PyTreeCheckpointHandler())
+items = ("model", "resume")
+manager = ocp.CheckpointManager(directory, item_handlers={name: ocp.PyTreeCheckpointHandler() for name in items})
 step = manager.latest_step()
-tree = manager.restore(step, args=ocp.args.PyTreeRestore())
+read = manager.restore(step, args=ocp.args.Composite(**{name: ocp.args.PyTreeRestore() for name in items}))
+tree = {name: value for item in items for name, value in dict(read[item]).items()}
 custom = manager.metadata(step).custom_metadata
 ```
 
-`tree` holds, by name, the train-state fields a checkpoint persists (`dew.state.CHECKPOINTED`) and, when the data iterator reported one, `position`; Orbax returns `key` as a typed PRNG key. Two things in it are Dew's encodings, each named in `custom`:
+`tree` holds, by name, the train-state fields a checkpoint persists (`dew.state.CHECKPOINTED`) and, when the data iterator reported one, `position`; Orbax returns `key` as a typed PRNG key. Where the run keeps post-hoc EMA profiles, their averages are the `profiles` item's `averages`, and the optimizer state at `custom["profiles"]["at"]` holds none in their place. Two things in it are Dew's encodings, each named in `custom`:
 
-- An EMA leaf whose path `custom["ema_deltas"]` lists holds byte planes (above): the average's bits are its weight's bits XOR the planes' bytes, plane `k` shifted left by `8 * k`, read as unsigned integers of the weight's width.
-- A collection of the variables or the EMA other than `params` lives in the run's `frozen/` store, one Orbax PyTree checkpoint per content digest; `custom["frozen"]` maps each tree's collection names to their digests, and `ocp.PyTreeCheckpointer().restore(directory / "frozen" / digest)` reads one.
+- An EMA leaf whose path `custom["deltas"]["ema"]` lists holds byte planes (above): the average's bits are its weight's bits XOR the planes' bytes, plane `k` shifted left by `8 * k`, read as unsigned integers of the weight's width. A DiLoCo run's groups keep their own EMA beside their own weights, under `inner`, listed as `custom["deltas"]["inner/ema"]`. A step an earlier Dew wrote lists the EMA's alone, as `custom["ema_deltas"]`.
+- A collection of the variables or the EMA other than `params` lives in the run's `frozen/` store, one Orbax PyTree checkpoint per content digest; `custom["frozen"]` maps each tree's collection names to their digests, a DiLoCo group's trees named `inner/variables` and `inner/ema`, and `ocp.PyTreeCheckpointer().restore(directory / "frozen" / digest)` reads one.
 
 `Checkpoints.restore` reads all of this into a template's dtypes and placements, so a Dew run resumes through it; Orbax alone suits inspecting a run or carrying its weights elsewhere.
 
@@ -399,6 +403,6 @@ The first time a pool uses `Checkpoints`, process 0 writes a file into the direc
 
 ## Limits
 
-Resume with the same model, optimizer, accumulation length and scaler configuration the run trained with. The trainer refuses a different accumulation length. When the loss scaler rejects a step's gradients, the attempt still counts, and the accumulation records, optimizer state, EMA and mutable contributions accepted before it stay as they were. Restoring keeps the scaler's streak of finite steps and its scale, including a partially filled window. If the checkpoint has already reached the target step, resuming reads no data and does no evaluation, compilation or saving.
+Resume with the same model, optimizer, accumulation length and scaler configuration the run trained with. The trainer refuses a different accumulation length. When the loss scaler rejects a step's gradients, the attempt still counts and its whole accumulation window is dropped, as torch's AMP skips the whole update: the window's accepted microbatches go with it and the next microbatch begins a window ([core API: accumulation](../reference/core-api.md)). The committed optimizer state and EMA are those of the last update, and the mutable collections the window's microbatches wrote keep what they wrote. Restoring keeps the scaler's streak of finite steps and its scale, including a partially filled window. If the checkpoint has already reached the target step, resuming reads no data and does no evaluation, compilation or saving.
 
 Deterministic CPU tests cover checkpoints taken in the middle of a window and after rejected attempts, including composite replay. They do not cover cross-host recovery on GPU or TPU, or replaying the side effects of external rollouts. The per-fit counter that stops a run after repeated non-finite losses is not checkpointed. A training checkpoint without the step counters and accumulation fields cannot resume through this interface, but its parameters can still be loaded alone.

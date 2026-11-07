@@ -7,16 +7,20 @@ bytes are read back through the released reader, transformers'
 `convert_moe_packed_tensors`.
 """
 
+import functools
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import encoded_form
+from reference_error import assert_as_exact
 
 from dew.interop.codecs import MXFP4, dequantize_mxfp4, quantize_mxfp4
+from dew.nn.activations import quick_gelu, swiglu_clamped
 from dew.nn.fake_quant import E2M1
-from dew.nn.gpt_oss import GptOssMLP
+from dew.nn.gpt_oss import GptOssExperts, GptOssMLP
 
 FIXTURES = Path(__file__).parent / "fixtures" / "gpt_oss"
 
@@ -59,6 +63,68 @@ def test_biased_interleaved_experts_match_reference():
     np.testing.assert_allclose(run(params), arrays["output"], atol=1.6e-4, rtol=0)
     params["experts"]["down_proj_bias"] = jnp.zeros_like(params["experts"]["down_proj_bias"])
     assert float(jnp.max(jnp.abs(run(params) - arrays["output"]))) > 0.5
+
+
+EXPERTS = {"tokens": 8, "hidden": 16, "intermediate": 24, "experts": 4}
+"""A small GPT-OSS expert layer, every expert routed."""
+
+
+def _experts_draw(seed: int):
+    """Tokens of one row each (every expert's slots its one product), the gate-up bias zero and the down bias
+    bf16 values a small `delta` from cancelling each expert's down product: a sum whose rounding the down
+    projection's bias meets after its product's own where the bias is added past the product's rounding."""
+    rng = np.random.default_rng(seed + 9100)
+    hidden, intermediate, experts = EXPERTS["hidden"], EXPERTS["intermediate"], EXPERTS["experts"]
+    x = jnp.asarray(np.tile(rng.normal(size=(1, hidden)), (EXPERTS["tokens"], 1)), jnp.float32)
+    weights = jnp.asarray(rng.uniform(.1, .9, size=(EXPERTS["tokens"], 2)), jnp.bfloat16)
+    indices = jnp.asarray(np.stack([np.arange(EXPERTS["tokens"]) % experts,
+                                    (np.arange(EXPERTS["tokens"]) + 1) % experts], -1), jnp.int32)
+    gate_up = rng.normal(scale=hidden ** -.5, size=(experts, hidden, 2 * intermediate))
+    params = {"gate_up_proj": jnp.asarray(gate_up, jnp.float32),
+              "gate_up_proj_bias": jnp.zeros((experts, 2 * intermediate), jnp.float32),
+              "down_proj": jnp.asarray(rng.normal(size=(experts, intermediate, hidden)), jnp.float32),
+              "down_proj_bias": jnp.zeros((experts, hidden), jnp.float32)}
+    products = jnp.stack([_expert_slots(x, jnp.full_like(indices, e), params, down=jnp.float64)[0, 0]
+                          for e in range(experts)])
+    delta = rng.normal(scale=1e-2, size=products.shape) * np.abs(np.asarray(products))
+    params["down_proj_bias"] = jnp.asarray(jnp.asarray(-products + delta, jnp.bfloat16), jnp.float32)
+    return x, weights, indices, params
+
+
+def _expert_slots(x, indices, params, *, down=jnp.float32, compute=jnp.bfloat16):
+    """Each slot's expert output as GPT-OSS computes it, each projection's operands rounded to `compute`,
+    summed in fp32 and its bias added before one rounding to `compute`; the down projection summed in `down`
+    (float64 for the truth, on the activations the layer rounds)."""
+    def operand(value, wide):
+        return value.astype(compute).astype(wide)
+
+    rows = jnp.broadcast_to(x[:, None], (*indices.shape, x.shape[-1]))
+    projected = (jnp.einsum("tkh,tkhn->tkn", operand(rows, jnp.float32),
+                            operand(params["gate_up_proj"], jnp.float32)[indices])
+                 + operand(params["gate_up_proj_bias"], jnp.float32)[indices]).astype(compute)
+    gate, up = swiglu_clamped(projected[..., ::2], projected[..., 1::2], 7.0)
+    activated = (up + 1) * quick_gelu(gate)
+    out = (jnp.einsum("tkn,tknh->tkh", activated.astype(down), operand(params["down_proj"], down)[indices])
+           + operand(params["down_proj_bias"], down)[indices])
+    return out if down == jnp.float64 else out.astype(compute)
+
+
+def test_expert_biases_are_added_before_the_products_one_rounding():
+    """GPT-OSS's experts add each projection's bias to its fp32 sums before their one rounding to bf16
+    (the GEMM template's epilogue, row 3963), on par with that program (check 1) where the down bias nearly
+    cancels its product, truth the down projection in float64 on the activations both round alike. Added
+    after the product's rounding, the bias meets that rounding's error at the product's scale."""
+    module = GptOssExperts(EXPERTS["hidden"], EXPERTS["intermediate"], EXPERTS["experts"], dtype=jnp.bfloat16)
+
+    def dew(x, weights, indices, params):
+        return jnp.asarray(module.apply({"params": params}, x, weights, indices))
+
+    def plain(x, weights, indices, params, *, down=jnp.float32):
+        slots = _expert_slots(x, indices, params, down=down)
+        return jnp.sum(slots * weights[..., None].astype(slots.dtype), axis=-2)
+
+    assert_as_exact(jax.jit(dew), jax.jit(plain), _experts_draw, "GPT-OSS expert biases", seeds=8,
+                    truth_fn=functools.partial(plain, down=jnp.float64))
 
 
 def test_a_mixture_builds_gpt_oss_experts_wherever_a_layer_routes():
@@ -217,7 +283,7 @@ def test_pack_mxfp4_writes_back_the_recorded_stems_and_nothing_else():
 
     unpacked = MXFP4.dequantize(tensors)
     assert set(unpacked) == {stem, *untouched}
-    packed = MXFP4.requantize(unpacked, (stem,))
+    packed = encoded_form(MXFP4, unpacked, (stem,))
     assert set(packed) == set(tensors)
     for name, value in untouched.items():
         assert packed[name] is value

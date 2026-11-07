@@ -116,41 +116,24 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
 
 def assert_transformers_reads(export, model, variables, reference):
     """transformers' DiffusionGemmaForBlockDiffusion loads `export` with a
-    clean report, and its bare and self-conditioned logits on the fixture's
-    prompt and canvas, in fp32 and float64, hold Dew's (`model` on
-    `variables`) to tests/reference_error.py's rule. Returns its fp32 model."""
-    import torch
-    from one_draw import assert_as_exact_as_the_reference
-    from test_block_diffusion import prefill
+    clean report, and Dew's bare and self-conditioned canvas logits (`model`
+    on `variables`) are as exact as its float32 run against its float64 run
+    over drawn prompts, canvases and previous logits of the fixture's shapes
+    (check 1, test_block_diffusion's `assert_canvas_logits`). Returns its
+    fp32 model."""
+    from test_block_diffusion import assert_canvas_logits, canvas_draw
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
-    from tools.torch_precision import float64
-
-    def theirs(dtype):
-        loaded, report = DiffusionGemmaForBlockDiffusion.from_pretrained(
-            str(export), dtype=dtype, local_files_only=True, output_loading_info=True,
-            experts_implementation="eager")
-        assert not any(report.values()), report
-        loaded = loaded.eval()
-        loaded.set_attn_implementation("eager")
-        prompt, canvas = (torch.from_numpy(reference[key]) for key in ("prompt", "canvas"))
-        previous = torch.from_numpy(reference["previous"]).to(dtype)
-        with torch.no_grad():
-            bare = loaded(input_ids=prompt, decoder_input_ids=canvas).logits
-            conditioned = loaded(input_ids=prompt, decoder_input_ids=canvas,
-                                 self_conditioning_logits=previous).logits
-        return loaded, bare.numpy(), conditioned.numpy()
-
-    loaded, bare, conditioned = theirs(torch.float32)
-    with float64():
-        _, bare_f64, conditioned_f64 = theirs(torch.float64)
-    cache = prefill(model, variables, reference["prompt"])
-    ours_bare = model.apply({**variables, "cache": cache}, reference["canvas"])
-    ours_conditioned = model.apply({**variables, "cache": cache}, reference["canvas"],
-                                   self_conditioning_logits=reference["previous"])
-    assert_as_exact_as_the_reference(np.asarray(ours_bare), bare, bare_f64, "bare")
-    assert_as_exact_as_the_reference(np.asarray(ours_conditioned), conditioned, conditioned_f64,
-                                     "conditioned")
+    loaded, report = DiffusionGemmaForBlockDiffusion.from_pretrained(
+        str(export), local_files_only=True, output_loading_info=True, experts_implementation="eager")
+    assert not any(report.values()), report
+    loaded = loaded.float().eval()
+    loaded.set_attn_implementation("eager")
+    vocab = loaded.config.text_config.vocab_size
+    for previous in (False, True):
+        assert_canvas_logits(model, variables, loaded, canvas_draw(
+            reference["prompt"], reference["canvas"], vocab, previous=previous),
+            "conditioned" if previous else "bare")
     return loaded
 
 
@@ -227,6 +210,11 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
         return np.asarray(bundle.model.apply({**bundle.variables, "cache": cache}, reference["canvas"]))
 
     np.testing.assert_array_equal(logits(again), logits(exported))
+    # Loaded stating no dtype, it computes in the run's own, its decoder's (row 4314).
+    stated = exported.model.dtype
+    computed = np.dtype(stated) if stated is not None else np.result_type(*(
+        leaf.dtype for leaf in jax.tree.leaves(exported.variables["params"])))
+    assert np.dtype(Pretrained.load(str(tmp_path / "export")).model.dtype) == computed
 
     # The run's task (its process, canvas budget and pad id) is the export's,
     # in a generation config transformers' own class reads.

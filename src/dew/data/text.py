@@ -27,9 +27,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_chec
 import grain.python as grain
 import numpy as np
 
+from dew._files import published
 from dew.data.pipeline import TOKEN_FIELDS, Rejected
 from dew.data.tokens import chunk_table
-from dew.files import published
 
 if TYPE_CHECKING:
     from datatrove.pipeline.filters.base_filter import BaseFilter
@@ -399,7 +399,7 @@ def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
     import shutil
     import tempfile
 
-    from dew.cache import dew_cache_dir
+    from dew._cache import dew_cache_dir
 
     root = Path(dew_cache_dir(), "tokenizers")
     root.mkdir(parents=True, exist_ok=True)
@@ -677,7 +677,7 @@ class Classifier(Curated):
         which holds a local path's first bytes too."""
         from datatrove.io import cached_asset_path_or_download
 
-        from dew.files import write_atomically
+        from dew._files import write_atomically
 
         source = Path(self.model)
         if not source.is_file():
@@ -722,7 +722,7 @@ class Decontaminated(Curated):
         from datatrove.utils.hashes.xxhash import xxhash64
         from datatrove.utils.text import ngrams, simplify_text
 
-        from dew.files import write_atomically
+        from dew._files import write_atomically
 
         # DataTrove's default hash, xxhash at 64 bits, which the filter hashes each n-gram with.
         config = NGramsDecontConfig(n_grams=self.n)
@@ -804,14 +804,16 @@ def near_duplicates_removed(records: Callable[[], Iterator[Batch]],
 
 
 def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "text", eos: bool = True,
-                  rows_per_shard: int = 100_000, read: Read = "streamed", provision: bool = False
-                  ) -> Mapping[str, object]:
+                  rows_per_shard: int = 100_000, read: Read = "streamed", provision: bool = False,
+                  plan_version: int | None = None) -> Mapping[str, object]:
     """`dataset`'s documents in `field` tokenized by `tokenizer` and written to `url` as a committed
     token store (ArrayRecord shards, each record a document's ids under "text", its manifest naming
     the tokenizer, vocabulary and EOS), which `dew.data.sources.TokenFiles(url)` reads back and
-    `presets.lm(ds, None, ...)` packs. Each document is ended by the tokenizer's EOS with `eos`.
-    Returns the store's manifest."""
+    `presets.lm(ds, None, ...)` packs. Each document is ended by the tokenizer's EOS with `eos`, read by
+    data plan `plan_version` (`dew.data.plan.PLAN_VERSIONS`; this Dew's where None). Returns the
+    store's manifest."""
     from dew.data.compile import iterate
+    from dew.data.plan import PLAN_VERSIONS
     from dew.data.sinks import export
 
     # One step, so the manifest describes the resolution of the tokenizer that encoded the rows
@@ -821,8 +823,10 @@ def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "t
     vocabulary = step.vocabulary
     metadata = {"token_store": True, "tokenizer": tokenizer, "vocab_size": vocabulary.vocab_size,
                 "dtype": "int32", "eos_id": vocabulary.eos_id if eos else None}
-    return export(iterate(documents, read=read, provision=provision), url, format="array_record",
-                  rows_per_shard=rows_per_shard, metadata=metadata, length_field="text")
+    version = PLAN_VERSIONS[-1] if plan_version is None else plan_version
+    return export(iterate(documents, read=read, provision=provision, plan_version=version), url,
+                  format="array_record", rows_per_shard=rows_per_shard, metadata=metadata,
+                  length_field="text")
 
 
 def train_tokenizer(dataset: Dataset, base: str, path: str, *, vocab_size: int, field: str = "text",

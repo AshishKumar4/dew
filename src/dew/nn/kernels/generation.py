@@ -40,10 +40,10 @@ class Assumption:
 
 def assumption() -> Assumption | None:
     """The device `assumed` stands in for in this thread, None outside it: one value, which JAX's trace
-    and compile caches key on (`dew.cache.KERNEL_ASSUMED`) and every choice reads."""
-    from dew import cache
+    and compile caches key on (`dew._cache.KERNEL_ASSUMED`) and every choice reads."""
+    from dew import _cache
 
-    return cache.KERNEL_ASSUMED.value
+    return _cache.KERNEL_ASSUMED.value
 
 
 @contextlib.contextmanager
@@ -54,14 +54,14 @@ def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     a CPU (`dew.training._lowering`). Given a target's facts (a GPU no row names, its multiprocessors,
     shared memory, clock and bandwidth its own), `gpu_target` answers with them, so every launch is sized
     and costed by them alone. None assumes nothing. JAX keys its trace and compile caches on the device
-    assumed (`dew.cache.KERNEL_ASSUMED`), so a function jitted for one traces again for another."""
-    from dew import cache
+    assumed (`dew._cache.KERNEL_ASSUMED`), so a function jitted for one traces again for another."""
+    from dew import _cache
 
     if isinstance(generation, GpuTarget):
         value = Assumption(generation.generation, generation, _facts(generation))
     else:
         value = None if generation is None else Assumption(generation)
-    with cache.KERNEL_ASSUMED(value):
+    with _cache.KERNEL_ASSUMED(value):
         yield
 
 
@@ -78,14 +78,15 @@ def _facts(value: Hashable | Mapping | list) -> Hashable:
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode',
-                      'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
-                      'grouped_matmul', 'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm',
-                      'selective_scan', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
-"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`)."""
+CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode', 'delta_gates', 'gate_up',
+                     'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'narrow_copies',
+                     'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
+"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`): every one a
+selector serves (`selection.Op`, which refuses a choice this does not hold as it is built) or a site reads
+(`chosen_kernel`, likewise)."""
 
 
-def _named(choices: Iterable[str]) -> None:
+def known_choices(choices: Iterable[str]) -> None:
     """Refuse any of `choices` that `CHOICES` does not hold, naming every one it holds."""
     if unknown := set(choices) - CHOICES:
         raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
@@ -97,23 +98,23 @@ def chosen(**kernels: str) -> Iterator[None]:
     """Within the block, a choice named in `kernels` runs that kernel whatever its selector would
     take, for an A/B of two kernels or a test of a kernel the selector does not take on this device.
     Nested blocks keep the outer block's other choices and restore its choices on exit. JAX keys its
-    trace and compile caches on the choices (`dew.cache.KERNEL_CHOICES`), so a function jitted
+    trace and compile caches on the choices (`dew._cache.KERNEL_CHOICES`), so a function jitted
     outside the block traces again within it."""
-    from dew import cache
+    from dew import _cache
 
-    _named(kernels)
-    with cache.KERNEL_CHOICES(tuple(sorted({**dict(cache.KERNEL_CHOICES.value), **kernels}.items()))):
+    known_choices(kernels)
+    with _cache.KERNEL_CHOICES(tuple(sorted({**dict(_cache.KERNEL_CHOICES.value), **kernels}.items()))):
         yield
 
 
 def numerics() -> Numerics:
     """The run's numerics in effect (`run_precision`), the defaults outside any: JAX keys its trace and
-    compile caches on them (`dew.cache.NUMERICS`), so a function jitted under one run's traces again
+    compile caches on them (`dew._cache.NUMERICS`), so a function jitted under one run's traces again
     under another's."""
-    from dew import cache
+    from dew import _cache
     from dew.nn.precision import Numerics
 
-    held = cache.NUMERICS.value
+    held = _cache.NUMERICS.value
     return Numerics() if held is None else held
 
 
@@ -126,10 +127,10 @@ def run_precision(policy: Numerics) -> Iterator[None]:
     among them, which reads them here (`numerics`, the one seam of a run's forms). The dtypes are the
     model's and the optimizer's own fields, which the run sets from the numerics: a bf16 operand has
     lost its bits before any product reads it, whatever its precision."""
-    from dew import cache
+    from dew import _cache
     from dew.nn.precision import configured_precision
 
-    with configured_precision(policy.matmul), cache.NUMERICS(policy):
+    with configured_precision(policy.matmul), _cache.NUMERICS(policy):
         yield
 
 
@@ -300,25 +301,12 @@ class Measured:
     the plateau a long transfer reaches, below what the memory clock and bus give; `launch`, the seconds a
     kernel launch adds to a program that runs kernels one after another; and `handoff`, a GPU-scope semaphore
     signal another program of the same launch waits on, where the part's ring families fix tiles up across
-    programs (the balanced tail's partials). None where not measured.
-
-    The latencies a kernel's synchronization and loads meet on the part's die, in its clock's cycles: a
-    block's mbarrier arrival observed by another of its warps (`barrier_cycles`), a cluster's
-    (`cluster_barrier_cycles`), a shared-memory load's use (`shared_cycles`), a hit in the near half of the
-    L2 (`l2_cycles`) and a GPU-scope acquire-release fence (`fence_cycles`); and the device-memory bytes a
-    second that 16-byte asynchronous copies of scattered 128-byte rows reach (`gather_bytes_per_second`),
-    below the stream's plateau. The algebra's cost model prices by them (`dew.algebra.cost`)."""
+    programs (the balanced tail's partials). None where not measured."""
 
     fixed: float
     bytes_per_second: float
     launch: float | None = None
     handoff: float | None = None
-    barrier_cycles: float | None = None
-    cluster_barrier_cycles: float | None = None
-    shared_cycles: float | None = None
-    l2_cycles: float | None = None
-    fence_cycles: float | None = None
-    gather_bytes_per_second: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -369,10 +357,21 @@ class GpuTarget:
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
+    late_weight_gradients: bool = False
+    """Whether XLA's schedule of a training step for this GPU runs its weight gradients after the whole
+    backward where the step's head takes its gradient a tile at a time, unfused, holding the products'
+    operands to then, as the derivation runs them (`dew.training.footprint.sunk`): an H100's every one, a
+    B200's and a B300's some, which running every one there bounds from above (row 3341's calibration,
+    compile-only, `TARGETS`' comments)."""
     step_seconds: float | None = None
     """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
     predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
     GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
+    kernel_step_seconds: float | None = None
+    """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
+    step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
+    measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
+    none was."""
 
     @property
     def architecture(self) -> Architecture:
@@ -441,6 +440,13 @@ class GpuTarget:
         return self.memory_bandwidth if part is None else part.bytes_per_second
 
     @property
+    def fixed_seconds(self) -> float | None:
+        """The seconds a kernel's stream spends before its bytes arrive, its launch and first byte, measured
+        on the part (`Measured.fixed`); None where no one measured it."""
+        part = self.part
+        return None if part is None else part.fixed
+
+    @property
     def launch_seconds(self) -> float | None:
         """The seconds a kernel launch adds to a program of kernels one after another, measured on the part
         (`Measured.launch`); None where no one measured it."""
@@ -495,7 +501,7 @@ class GpuTarget:
 # RTX PRO 6000 Blackwell Server 188, from NVIDIA's architecture whitepapers and datasheets.
 # Boost clock (MHz) and memory bandwidth (GB/s) of each canonical device, from the same datasheets:
 # A100 SXM4 80GB 1410/2039, A10 1695/600, L4 2040/300, H100 SXM 1830/3350, RTX PRO 6000 Blackwell
-# Server 2617/1792. The rates, latencies and L2 a family shares are `architecture`'s.
+# Server 2617/1597. The rates, latencies and L2 a family shares are `architecture`'s.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -531,11 +537,12 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
               memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
+              # and 225.25).
+              kernel_step_seconds=225.3e-9,
               # tools/device_facts.py on an A100-SXM4-40GB: its stream FS-DEVICEFACTS2-a100's (1.555 TB/s by
-              # its clocks), its launch FS-DEVICEFACTS4-a100's; its die's shared-memory and near-L2 latencies
-              # an A100 PCIe's (GA100), Luo et al. 2025, arXiv:2501.12084, Tables 3 and 4.
-              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6, shared_cycles=29,
-                                                          l2_cycles=208)}),
+              # its clocks), its launch FS-DEVICEFACTS4-a100's.
+              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               # The RTX A6000's 154.8 TF dense (its datasheet's 309.7 with sparsity; the RTX PRO Blackwell
               # architecture whitepaper's Table 4), a real one's other facts its driver's (`runtime_facts`).
@@ -556,45 +563,57 @@ TARGETS = {target.generation: target for target in (
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
               clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6,
+              # A step whose head takes its gradient in the backward a tile at a time, unfused, compiled for
+              # an H100: Qwen3.5-4B's at 2 x 4096 tokens under 'full' holds 36.6 GiB of temporaries, 29
+              # layers' four [8192, 9216] product operands at its peak and no layer's gradient, its weight
+              # gradients run after the backward; Qwen3.5-0.8B's at 8 x 3072, 32.1. For an A100 they hold
+              # 10.8 and 8.5, each layer's weight gradient run in its backward, and the 0.8B's 8.6 for an
+              # RTX PRO 6000 (row 3341's calibration, compile-only; an L4's attention kernel compiles
+              # for none).
+              late_weight_gradients=True,
+              # In-kernel: a dependent lane reduction's 142.7 ns on an H100 80GB HBM3 (FS-STEP-SECONDS1-h100,
+              # its two rounds 142.72 and 142.61).
+              kernel_step_seconds=142.7e-9,
               # tools/device_facts.py on an H100 SXM and a GH200: their streams FS-DEVICEFACTS2-h100's and
               # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
               # replay (judge-facts.md:3-18).
               # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie),
               # its hand-off 0.695 us in both; its launch fit no line (negative slopes).
-              # The GH100 die's shared-memory and near-L2 latencies an H800 PCIe's (Luo et al. 2025,
-              # arXiv:2501.12084, Tables 3 and 4); the H200's the kernel challenge's calibration on the
-              # judge's H200 (h200-lean calibration/params.md, lines 39, 49, 59, 66, 67 and 71: the shared
-              # load, the near L2 hit at 260 to 280, the cp.async gather at two blocks a multiprocessor, the
-              # mbarrier arrival in a block and across a cluster, the GPU-scope acquire-release fence).
-              measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6,
-                                                          shared_cycles=29, l2_cycles=258),
-                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6, shared_cycles=29,
-                                                     l2_cycles=258),
-                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
-                                                       shared_cycles=29, l2_cycles=258),
-                        'NVIDIA H200': Measured(2.81e-6, 4.617e12, barrier_cycles=65,
-                                                cluster_barrier_cycles=395, shared_cycles=28, l2_cycles=270,
-                                                fence_cycles=274, gather_bytes_per_second=3.80e12)}),
+              measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6),
+                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6),
+                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6),
+                        'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
-              clock_hz=1965e6, memory_bandwidth=8e12),
+              clock_hz=1965e6, memory_bandwidth=8e12,
+              # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
+              # a B200 holds 22.9 GiB of temporaries, against 5.6 with the head fused: some of its weight
+              # gradients run after the backward, which the derivation bounds from above by running all
+              # there (43.4 derived; 8.5 with each in its layer's backward), row 3341's calibration,
+              # compile-only.
+              late_weight_gradients=True),
     # Blackwell Ultra, datasheet alone and unmeasured, a compile-only sm103 device's facts: 160 SMs and
     # 8 TB/s (NVIDIA, "Inside NVIDIA Blackwell Ultra"), HGX B300's 2.25/4.5 PF dense bf16/fp8 a GPU (the
     # HGX table's sparse figures halved over 8 GPUs). No source states its clock: B200's, which steers
     # only XLA's own fusions in a compile-only target; a B300 run reads its own (`runtime_facts`).
     GpuTarget('sm103', 'NVIDIA B300', 227 * 1024,
               dense_peaks={'NVIDIA B300': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=160,
-              clock_hz=1965e6, memory_bandwidth=8e12),
+              clock_hz=1965e6, memory_bandwidth=8e12,
+              # The B200's step above compiled for a B300 holds 13.9 GiB, 5.6 with the head fused: some
+              # weight gradients late, bounded from above as on a B200 (row 3341's calibration).
+              late_weight_gradients=True),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
               # The Server Edition's 1.597 TB/s (NVIDIA's RTX PRO 6000 Blackwell Server Edition page and
               # datasheet); 1.792 TB/s is the Workstation part's (the RTX PRO Blackwell architecture
               # whitepaper, p.12).
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
-              step_seconds=3.68e-6),
+              # In-kernel: a dependent lane reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68
+              # and 137.66).
+              step_seconds=3.68e-6, kernel_step_seconds=137.7e-9),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
@@ -722,9 +741,9 @@ def _shared_memory(device) -> int | None:
 def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
     """The visible GPU `ordinal`'s multiprocessor clock and device-memory bandwidth (twice the memory
     clock times the bus's bytes, as CUDA's deviceQuery derives it), which jax's Device does not carry,
-    from the CUDA driver (`dew.devices.gpu_attribute`), read once a process; none where no
+    from the CUDA driver (`dew._devices.gpu_attribute`), read once a process; none where no
     driver loads."""
-    from dew.devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
+    from dew._devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
 
     clock, memory_clock, bus = (gpu_attribute(ordinal, attribute)
                                 for attribute in (CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH))
@@ -832,10 +851,10 @@ def _resolved(device, generation: str, real: bool) -> GpuTarget:
 def chosen_kernel(choice: str, default: str) -> str:
     """The kernel `chosen` names for `choice` within its block, else `default`: a choice a site decides
     without a selector (the attention template's form, a step's narrow copies)."""
-    from dew import cache
+    from dew import _cache
 
-    _named((choice,))
-    return dict(cache.KERNEL_CHOICES.value).get(choice, default)
+    known_choices((choice,))
+    return dict(_cache.KERNEL_CHOICES.value).get(choice, default)
 
 
 
@@ -864,7 +883,7 @@ class Route:
 
 
 class _Routes:
-    """The routes a `routes` block collected; hashed by identity, as `dew.cache.KERNEL_ROUTES` keys
+    """The routes a `routes` block collected; hashed by identity, as `dew._cache.KERNEL_ROUTES` keys
     on it."""
 
     def __init__(self) -> None:
@@ -875,12 +894,12 @@ class _Routes:
 def routes() -> Iterator[list[Route]]:
     """Collect every `Route` a dispatch reports while code runs or traces in the block, in order: what
     a step's trace within `assumed(target)` on a CPU shows of that target's kernels. Each block is a
-    fresh collection JAX keys its traces on (`dew.cache.KERNEL_ROUTES`), so a function traced before
+    fresh collection JAX keys its traces on (`dew._cache.KERNEL_ROUTES`), so a function traced before
     traces, and reports, again; a block nested in another reports to both."""
-    from dew import cache
+    from dew import _cache
 
     collected = _Routes()
-    with cache.KERNEL_ROUTES((*cache.KERNEL_ROUTES.value, collected)):
+    with _cache.KERNEL_ROUTES((*_cache.KERNEL_ROUTES.value, collected)):
         yield collected.found
 
 
@@ -903,13 +922,13 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     `kernel`; `ran` is what this host executes, `kernel` by default. Every `routes` block open records it.
     A call off its preferred kernel is logged once a process for each kernel and refusal at INFO, naming
     both and the refusal's reason; one that runs the preferred kernel logs nothing."""
-    from dew import cache
+    from dew import _cache
 
-    _named((choice,))
+    known_choices((choice,))
     generation = device_generation()
-    preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
+    preferred = preferred or dict(_cache.KERNEL_CHOICES.value).get(choice) or kernel
     found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)
-    for collected in cache.KERNEL_ROUTES.value:
+    for collected in _cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail
     if preferred != kernel and (choice, kernel, detail) not in _logged:
@@ -946,6 +965,9 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     import jax
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
+    from dew.nn.derivatives import contracted
+
+    @contracted("test_an_embedding_lookup_holds_every_order")
     @jax.custom_jvp
     def produced(*operands):
         return forward(*operands)
@@ -956,6 +978,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
         return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
 
+    @contracted("test_an_embedding_lookup_holds_every_order")
     @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
     def pulled(saved, operands, cotangent, live):
         arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
@@ -973,6 +996,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
 
+    @contracted("test_an_embedding_lookup_holds_every_order")
     @jax.custom_jvp
     def bounded(*operands):
         return forward(*operands)[0] if primal is None else primal(*operands)

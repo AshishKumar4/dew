@@ -19,7 +19,6 @@ import numpy as np
 import optax
 import pytest
 from interop_support import gemma_features
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
@@ -39,25 +38,69 @@ def _audio(kind):
     model = config.build().clone(precision=jax.lax.Precision.HIGHEST)
     tensors = load_file(str(path / "projector.safetensors"))
     if kind == "gemma3n":
+        # As the wrapper builds its audio embedder (`hf_decoders._wrapper_audio`): its features unscaled.
         projector = Gemma3nProjector(config.hidden_size, 32, vocab_size=record["vocab_size"],
                                            vocab_offset=record["vocab_offset"], norm_eps=config.rms_norm_eps,
-                                           precision=jax.lax.Precision.HIGHEST)
-        method = projector.soft_embeddings
+                                           precision=jax.lax.Precision.HIGHEST, scales_soft=False)
         projector_variables = {"params": translate_gemma3n_projector_weights(tensors)[0]}
     else:
         projector = Gemma4Projector(text_width=32, norm_eps=config.rms_norm_eps,
                                           precision=jax.lax.Precision.HIGHEST)
-        method = projector.__call__
         projector_variables = {"params": translate_gemma4_projector_weights(tensors)[0]}
-    return path, config, variables, model, projector, method, projector_variables
+    return path, config, variables, model, projector, projector_variables
 
 
 @pytest.fixture(params=("gemma3n", "gemma4"), scope="module")
 def audio(request):
     return _audio(request.param)
 
+BF16_TOWER_SEEDS = 64
+"""Gemma 4's bf16 audio tower's declared check-1 seeds, sized by `seeds_for` paired."""
+
+
+def assert_bf16_tower_on_par(path, model, variables, features, real):
+    """Dew's bf16 Gemma 4 audio tower on par with transformers' own bf16 tower over drawn input features at
+    the fixture's mask (check 1), real frames alone, the truth the reference's float64 twin."""
+    import torch
+    from safetensors.torch import load_file as load_torch
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
+
+    from tools.audio_reference import audio_config as reference_config
+    from tools.torch_precision import float64_twin, widened
+
+    config = reference_config("gemma4")
+    config._attn_implementation = "sdpa"
+    tower = Gemma4AudioModel(config).eval()
+    tower.load_state_dict(load_torch(str(path / "encoder.safetensors")))
+    wide = float64_twin(tower, lambda: Gemma4AudioModel(config).eval())
+    narrow = tower.to(torch.bfloat16)
+    mask = torch.from_numpy(np.asarray(features["input_features_mask"]))
+    narrow_model, held = model.clone(dtype=jnp.bfloat16), jnp.asarray(real)[..., None]
+
+    def lowered(drawn):
+        # A padded frame is zero in every arm: its output is no frame's.
+        found = narrow_model.apply(variables, drawn, features["input_features_mask"]).features
+        return jnp.where(held, found.astype(jnp.float32), 0)
+
+    shape = np.asarray(features["input_features"]).shape
+
+    def draw(seed):
+        return (np.random.default_rng([0xA0D, seed]).standard_normal(shape).astype(np.float32),)
+
+    def reference(tower, dtype, context):
+        @as_given
+        def run(drawn):
+            with context(), torch.no_grad():
+                found = tower(torch.from_numpy(drawn).to(dtype), mask).last_hidden_state
+            return np.where(real[..., None], found.double().numpy(), 0.0)
+        return run
+
+    assert_as_exact(lowered, reference(narrow, torch.bfloat16, contextlib.nullcontext), draw, "bf16 encoded",
+                    seeds=BF16_TOWER_SEEDS, truth_fn=reference(wide, torch.float64, widened))
+
+
 def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
-    path, config, variables, model, projector, method, projector_variables = audio
+    path, config, variables, model, projector, projector_variables = audio
     data = np.load(path / "reference.npz")
     preprocessor = json.loads((path / "preprocessor_config.json").read_text())
     kind = "gemma3n_audio" if isinstance(config, Gemma3nAudio) else "gemma4_audio"
@@ -68,7 +111,7 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
     encoded = jax.jit(model.apply)(variables, **features)
     np.testing.assert_array_equal(encoded.mask, data["valid"])
     np.testing.assert_allclose(encoded.features, data["encoded"], rtol=0, atol=1e-4)
-    projected = projector.apply(projector_variables, encoded.features, method=method)
+    projected = projector.apply(projector_variables, encoded.features)
     np.testing.assert_allclose(projected, data["projected"], rtol=0, atol=1e-4)
     assert encoded.mask.dtype == jnp.bool_
     assert encoded.features.dtype == jnp.float32
@@ -81,15 +124,13 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
         assert np.max(np.abs(np.asarray(changed.features) - data["encoded"])) > 1e-3
         # The loaded FP32 bounds clamp in the operand's dtype, as torch.clamp
         # does, so a bf16 tower stays bf16 through every clipped map, and its
-        # output is as near the float32 tower's as the reference's bf16 tower.
-        lowered, state = jax.jit(lambda variables: model.clone(dtype=jnp.bfloat16).apply(
+        # output is on par with the reference's bf16 tower over drawn features
+        # (check 1, the truth the reference's float64 twin).
+        _, state = jax.jit(lambda variables: model.clone(dtype=jnp.bfloat16).apply(
             variables, **features, capture_intermediates=lambda module, _: isinstance(module, AudioLinear)))(
             variables)
         assert {leaf.dtype for leaf in jax.tree.leaves(state["intermediates"])} == {jnp.dtype(jnp.bfloat16)}
-        real = np.asarray(data["valid"], bool)
-        truth = np.asarray(data["encoded"], np.float64)[real]
-        assert_as_exact_as_the_reference(np.asarray(lowered.features, np.float32)[real],
-                                         data["encoded_bf16"][real], truth, "bf16 encoded")
+        assert_bf16_tower_on_par(path, model, variables, features, np.asarray(data["valid"], bool))
 
 
 BLOCK_SEEDS = 8
@@ -164,7 +205,7 @@ def encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
     puts such a producer above every frame subsample, which the encoder's
     former `mask[:, ::stride]` did not survive. Run with JAX_PLATFORMS=cuda.
     """
-    path, _, variables, model, _, _, _ = audio
+    path, _, variables, model, _, _ = audio
     data = np.load(path / "reference.npz")
 
     @jax.jit
@@ -179,14 +220,14 @@ def encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
 
 
 def test_audio_input_gradients_and_sgd_step_match_reference(audio):
-    path, _, variables, model, projector, method, projector_variables = audio
+    path, _, variables, model, projector, projector_variables = audio
     data = np.load(path / "reference.npz")
     state = {"encoder": variables["params"], "projector": projector_variables["params"]}
 
     def forward(params, inputs):
         encoded = model.apply({**variables, "params": params["encoder"]}, inputs,
                                data["input_features_mask"])
-        return projector.apply({"params": params["projector"]}, encoded.features, method=method)
+        return projector.apply({"params": params["projector"]}, encoded.features)
 
     def loss(variables, inputs):
         return jnp.mean(forward(variables, inputs) * data["coefficient"])
@@ -203,7 +244,7 @@ def test_audio_input_gradients_and_sgd_step_match_reference(audio):
 
 
 def test_audio_mask_and_feature_shape_are_part_of_the_contract(audio):
-    _, config, variables, model, _, _, _ = audio
+    _, config, variables, model, _, _ = audio
     features = (
         config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
     )
@@ -216,7 +257,7 @@ def test_audio_mask_and_feature_shape_are_part_of_the_contract(audio):
 
 
 def test_audio_weight_loading_refuses_unknown_or_missing_computation(audio):
-    path, config, _, _, _, _, _ = audio
+    path, config, _, _, _, _ = audio
     tensors = load_file(str(path / "encoder.safetensors"))
     first = next(iter(tensors))
     incomplete = dict(tensors)
@@ -238,7 +279,7 @@ def test_audio_weight_loading_refuses_unknown_or_missing_computation(audio):
 
 def test_audio_weight_paths_round_trip_every_checkpoint_tensor(audio):
     """The canonical mapper resolves each source tensor to its loaded leaf."""
-    path, config, variables, _, _, _, _ = audio
+    path, config, variables, _, _, _ = audio
     tensors = load_file(str(path / "encoder.safetensors"))
     for name, tensor in tensors.items():
         leaf = variables

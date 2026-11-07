@@ -37,14 +37,14 @@ callers add flags and absent values.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
-from flax.typing import PrecisionLike, VariableDict
+from flax.typing import Dtype, PrecisionLike, VariableDict
 from jax.typing import DTypeLike
 
 from dew.batch import Coordinates
@@ -96,6 +96,7 @@ __all__ = [
     "DecoderTraining",
     "Decoding",
     "DenoisingModel",
+    "ExpertRouted",
     "Exposing",
     "Generating",
     "HiddenStates",
@@ -266,6 +267,15 @@ class OutputTable:
 
 
 @runtime_checkable
+class ComputesIn(Protocol):
+    """A model that states the dtype it computes in (`dtype`), a field of its own or its decoder's
+    (DiffusionGemma's); None computes in its parameters' dtype."""
+
+    @property
+    def dtype(self) -> Dtype | None: ...
+
+
+@runtime_checkable
 class ReadsTrain(Protocol):
     """A module whose call takes `train`, for a stochastic layer of its own (a token mixer's or a
     feed-forward's dropout, a vision tower's drop path): its owner passes `train` where `reads_train`
@@ -352,6 +362,22 @@ class Logits(Protocol):
     """A token model's `[B, S, vocab]` fp32 logits over the whole sequence."""
 
     def logits(self, tokens: jax.Array, *, train: bool = False, **fields: ModelKwarg) -> jax.Array: ...
+
+
+_FORWARDLESS = frozenset(nn.Module.__mro__)
+"""Flax's module base and its own bases, whose methods are no model's forward (`forward_method`)."""
+
+
+def forward_method(model: nn.Module, output: str) -> str | None:
+    """The method a caller reads `model`'s `output` by (`logits`, `hidden_states`): the model's own method
+    of that name where the model has one, its class's or one it exposes (a bridge's `__getattr__` over
+    the module it wraps), else its own forward (`__call__`), so a native Flax module whose call returns
+    that output is read as it is, with no method that only forwards to it (row 171); None where it has
+    neither. Flax's own module classes declare no forward of a model's."""
+    if callable(getattr(model, output, None)):
+        return output
+    declared = [vars(klass) for klass in type(model).__mro__ if klass not in _FORWARDLESS]
+    return "__call__" if any(callable(names.get("__call__")) for names in declared) else None
 
 
 @runtime_checkable
@@ -649,6 +675,15 @@ class CacheCapacity(Protocol):
 
 
 @runtime_checkable
+class BankedStacks(Protocol):
+    """A model whose stacks of like layers a store may hold banked, each run's layers one array under the
+    run's name (`layers_3_7`, `dew.inference.banks`): where in `store` each stack lies and the runs it is
+    banked by (`DecoderBank`)."""
+
+    def bank_sites(self, store: VariableDict) -> tuple[DecoderBank, ...]: ...
+
+
+@runtime_checkable
 class StagedStacks(Protocol):
     """A model whose stacks of like layers a pipeline over the stage axis runs: where in `store`, the
     variables a stage-local state is made from, each stack's run lies and how the pipeline over
@@ -721,10 +756,10 @@ class CrossAttending(Protocol):
 
 @runtime_checkable
 class Scanning(Protocol):
-    """A decoder whose like layers, and those repeating one period, run under flax's scan or the plain
-    loop (`CausalTransformer.scan_layers`): CausalTransformer, and a wrapper over one."""
+    """A decoder whose like layers, and those repeating one period, can run under flax's scan
+    (`CausalTransformer.scan_layers`): CausalTransformer, and a wrapper over one."""
 
-    def with_scanned_layers(self, *, scanned: bool = True) -> Self: ...
+    def with_scanned_layers(self) -> Self: ...
 
 
 @runtime_checkable
@@ -871,6 +906,48 @@ class RoutesBySite(Protocol):
 
     @property
     def routed_sites(self) -> frozenset[str]: ...
+
+
+@runtime_checkable
+class ExpertRouted(Protocol):
+    """A model that may route tokens to experts: the routers among its own whose expert weights are fixed
+    whatever they score (`dew.nn.backbones.decoder_block.Mixture.fixed_weights`), each by name and whether
+    a parameter, by its path in the model's own tree, is its, which no term of a plain loss reaches
+    (`dew.objectives.routing.refuse_fixed_router`)."""
+
+    def fixed_routers(self) -> Mapping[str, Callable[[tuple[str, ...]], bool]]: ...
+
+
+def routed_children(children: Mapping[str, object]) -> dict[str, tuple[str, ...]]:
+    """Those of a composite's named `children` that route over experts (`RoutesExperts`), by name, each with
+    its routed sites' paths below the composite: its name, or a composed child's (`RoutesBySite`) sites
+    below its name."""
+    return {name: (tuple(f'{name}/{site}' for site in sorted(child.routed_sites))
+                   if isinstance(child, RoutesBySite) else (name,))
+            for name, child in children.items() if isinstance(child, RoutesExperts) and child.routes_experts}
+
+
+def partitioned_routes(routed: Mapping[str, tuple[str, ...]], records, covered: jax.Array | None
+                       ) -> dict[str, tuple]:
+    """A composite's routing replay, `records` beside their `covered` tokens, as each routed child's own
+    (`routed_children`), by its name: a leaf site's record, or a composed child's records by their paths
+    below it, each beside the coverage as it is. `records` is a layer's one record, which replays its
+    one routed site, or records keyed by site path (`dew.nn.inputs.LayerInputs.experts`); a record for
+    several sites, or one that names not every routed site, raises `ValueError`. The one partition a
+    decoder's layer (its mixer and its feed-forward) and a parallel mixer (its branches) make."""
+    if records is None:
+        return {}
+    sites = [site for paths in routed.values() for site in paths]
+    if not isinstance(records, Mapping):
+        if len(sites) != 1:
+            raise ValueError(f"a layer's one routing record replays one routed site, and sites "
+                             f"{sorted(sites)} route; key the record by site path")
+        records = {sites[0]: records}
+    if missing := sorted(set(sites) - set(records)):
+        raise ValueError(f"the routing record names {sorted(records)}, not the routed sites {missing}")
+    return {name: (records[name] if paths == (name,)
+                   else {site[len(name) + 1:]: records[site] for site in paths}, covered)
+            for name, paths in routed.items()}
 
 
 @runtime_checkable

@@ -273,6 +273,7 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
         # Both arms are Dew's programs, each compiled once as the gate compiles two Dew arms (row 1801).
         compiled = without_ynn(committed(step))
 
+        @as_given
         def on_mesh(variables, state, tokens, key):
             variables, tokens = place(variables, tokens)
             with staged():

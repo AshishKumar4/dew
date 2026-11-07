@@ -307,7 +307,8 @@ class WrapperFields(AudioFields):
     text: DecoderFields
     tower: Mapping[str, object] | None
     projector: Mapping[str, object] | None
-    image_token_id: int
+    image_token_id: int | None
+    """None for a bundle without a vision tower, whose config may state none (MiMo-V2.6 with audio alone)."""
     tokens_per_image: int | None
     video_token_id: int | None
     extra_placeholder_ids: tuple[int, ...]
@@ -318,6 +319,17 @@ class WrapperFields(AudioFields):
     text_unprefixed: NotRequired[tuple[str, ...]]
     """The prefixes (past `model.`) under which a release saved before transformers nested its language
     model keeps that model's modules at the top (Qwen2.5-VL-7B's `model.layers.*`), routed into it."""
+
+
+def folder_config(folder: str) -> str:
+    """The key a bundle's source config holds `folder`'s config.json under
+    (`DecoderFamily.wrapper_folders`)."""
+    return f"{folder}/config.json"
+
+
+def folder_name(folder: str, name: str) -> str:
+    """The name a bundle's tensors hold `folder`'s tensor `name` under (`DecoderFamily.wrapper_folders`)."""
+    return f"{folder}/{name}"
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
@@ -1312,6 +1324,22 @@ def prediction_path(name: str, prefix: str, index: int | str | None, declared: i
     return None if path is None else (path[0], f'{prefix}_{depth}', 'block', *path[2:])
 
 
+def prediction_name(dew_name: str, prefix: str, leaves: Mapping[str, tuple[str, ...]],
+                    block: Callable[[tuple[str, ...]], str | None]) -> tuple[int, str | None]:
+    """`prediction_path` backwards: the depth of `dew_name`, a leaf of prediction depth (or drafting
+    stage) `{prefix}_{d}` by its dotted path, and its tensor's name past its depth's stem, which the
+    family composes: its own leaf's in `leaves`, or its block's, which `block` names from the leaf's
+    path inside the block as the trunk's layer 0's (None for a leaf its release stores none of)."""
+    first, *rest = dew_name.split('.')
+    depth = int(first.removeprefix(f'{prefix}_'))
+    own = {path: name for name, path in leaves.items()}.get(tuple(rest))
+    if own is not None:
+        return depth, own
+    if not rest or rest[0] != 'block':
+        raise ValueError(f"{dew_name!r} is no parameter of a {prefix} depth")
+    return depth, block(tuple(rest[1:]))
+
+
 PREDICTION_INPUTS: Mapping[str, tuple[str, ...]] = {
     'enorm.weight': ('enorm', 'scale'), 'hnorm.weight': ('hnorm', 'scale'),
     'eh_proj.weight': ('eh_proj', 'kernel')}
@@ -1678,6 +1706,15 @@ def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
         if len(parts) == 3 and module == 'self_attn' and leaf == 'sinks':
             # A layer's learned sink logits, which `dew_path` reads under this name (`_V4_TENSORS`).
             return f'model.layers.{index}.self_attn.sinks'
+        types = config.get('layer_types')
+        if (module == 'self_attn' and types is not None
+                and _records.strings(types, 'layer_types')[int(index)] == 'linear_attention'):
+            # Qwen3.5's delta net under its own name, as `dew_path` reads it (`_LINEAR_PROJECTIONS`).
+            tail = tuple(parts[2:])
+            if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'kernel':
+                return f'model.layers.{index}.linear_attn.{tail[0]}.weight'
+            if tail in _LINEAR_LEAVES:
+                return f'model.layers.{index}.linear_attn.' + '.'.join(tail)
         theirs = {ours: hf for hf, ours in _norm_names(sandwich_norms).items()}
         if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
             return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
@@ -1708,6 +1745,13 @@ class Packed:
     chunks: Callable[[Mapping[str, object]], int] | None = None
     """Config-derived count of the runs the parts are interleaved in, as in
     MiMo-V2.6's fused qkv, pre-sharded over its key heads."""
+    owner: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None
+    """The geometry `widths` and `chunks` read for the tensor of a name: the model's, or the layer's that
+    holds it where its own differs (a MiMo-V2 prediction layer's kind). None reads the model's."""
+
+    def _geometry(self, name: str, config: Mapping[str, object] | None) -> Mapping[str, object] | None:
+        """The config `widths` and `chunks` read for tensor `name` (`owner`)."""
+        return config if self.owner is None or config is None else self.owner(name, config)
 
     @property
     def viewed(self) -> bool:
@@ -1723,6 +1767,7 @@ class Packed:
         stored = tensor if self.transpose is None else tensor.transpose(self.transpose)
         if (self.widths is not None or self.chunks is not None) and config is None:
             raise ValueError(f'{name} needs translated geometry to split its projections')
+        config = self._geometry(name, config)
         axis = self.axis % stored.ndim
         runs = 1 if self.chunks is None or config is None else self.chunks(config)
         if runs < 1 or stored.shape[axis] % runs:
@@ -1753,6 +1798,7 @@ class Packed:
         transpose = tuple(order[k] for k in back)
         if self.chunks is not None and config is None:
             raise ValueError(f'{name} needs translated geometry to interleave its projections')
+        config = self._geometry(name, config)
         runs = None if self.chunks is None or config is None else self.chunks(config)
         return WeightLayout(name, tuple(path for part in parts for path in part.paths),
                             tuple(shape[k] for k in back),
@@ -1940,16 +1986,18 @@ def _key_run_widths(config: Mapping[str, object]) -> tuple[int, int, int]:
             _records.integer(config.get('value_head_dim') or head_dim, 'value_head_dim'))
 
 
-def grouped_qkv(name: str) -> tuple[Packed, Packed]:
+def grouped_qkv(name: str, owner: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None
+                ) -> tuple[Packed, Packed]:
     """The weight and bias of a fused q, k and v projection under `name`
     (`.attention.query_key_value`), stored in one run a key head, each run
     its group's query rows, then its key's and its value's. GPT-NeoX's and
     BLOOM's per-head interleave is the run of a model whose every head keys
     itself, Falcon-7B's and GPTBigCode's multi-query [q | k | v] the one run
     of one key head, and MiMo-V2.6's fused qkv the run vLLM pre-shards it in
-    (`_shard_fp8_qkv_proj`)."""
+    (`_shard_fp8_qkv_proj`), a layer's runs its own geometry where `owner` gives one (`Packed.owner`)."""
     weight, bias = (Packed(f'{name}.{leaf}', tuple(f'.self_attn.{part}.{leaf}' for part in _QKV), 0,
-                           widths=_key_run_widths, chunks=_key_runs) for leaf in ('weight', 'bias'))
+                           widths=_key_run_widths, chunks=_key_runs, owner=owner)
+                    for leaf in ('weight', 'bias'))
     return weight, bias
 
 
@@ -2064,6 +2112,11 @@ class DecoderFamily:
     """Reads a media bundle released under the family's own model_type, which
     keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
+    wrapper_folders: tuple[str, ...] = ()
+    """Folders of a bundle that each hold a media component of its own, its config.json and its weights,
+    which the release's code loads beside the model (MiMo-V2.6's `audio_tokenizer`): a load reads each
+    folder's config into the source's under `<folder>/config.json` and its tensors as `<folder>/<name>`
+    (`folder_config`, `folder_name`), and a save writes them back into the folder."""
     wrapper_media_suffixes: tuple[str, ...] = ()
     """Suffixes of a bundle's decoder tensors that serve its media alone, which its language model read
     as its text checkpoint drops (`hf_decoders.language_model_names`): V4.1's routers' image-span bias."""
@@ -2075,6 +2128,12 @@ class DecoderFamily:
     aliases: Mapping[str, str] = field(default_factory=dict)
     """The config class's `attribute_map`: another spelling of a field, read as that field before
     `defaults` fill what neither spells."""
+    prediction_counts: tuple[str, ...] = ('num_nextn_predict_layers',)
+    """The fields the family's config counts its multi-token prediction depths by, as its config class
+    names them; an alias that spells one (`aliases`) counts it too (`kept_depths`)."""
+    whole_drafter: Callable[[Mapping[str, object], int], dict] | None = None
+    """Where the family's prediction stages draft as one (DSpark's), the fields a config keeping `kept`
+    of them states differently (`kept_depths`): the drafter whole or, at 0, none."""
     release_code: SourceCode | None = None
     """The release whose own code is the family's reference, where transformers has no class for it:
     a model exported natively (`PretrainedDecoder.from_model`) writes its `auto_map` and its modules,
@@ -2111,6 +2170,19 @@ class DecoderFamily:
     wrapper's text config (Kimi K2.5's, through DeepSeek V3's reader, and K3's, through the reader
     Kimi Linear shares), or a config of the mixture-of-experts LLaDA sources, whose model_type 'llada'
     also names the dense one."""
+
+    def kept_depths(self, config: Mapping[str, object], kept: int) -> dict:
+        """The fields `config`, one scope of a source's config (its top, or a wrapper's `text_config`),
+        states differently as the config of a checkpoint holding the family's first `kept` prediction
+        depths alone (`Pretrained.load(prediction_depths=)`): each count by the family's spelling, an
+        alias or its default (`prediction_counts`, `aliases`, `defaults`) at most `kept`, and a drafter
+        the family drafts whole kept whole or not at all (`whole_drafter`)."""
+        stated = {**self.defaults, **config}
+        counts = {*self.prediction_counts,
+                  *(alias for alias, name in self.aliases.items() if name in self.prediction_counts)}
+        changed = {name: kept for name in counts
+                   if type(count := stated.get(name)) is int and count > kept}
+        return changed if self.whole_drafter is None else {**changed, **self.whole_drafter(stated, kept)}
 
     def readings(self, tensors: Mapping[str, Stored],
                  config: Mapping[str, object]) -> tuple[Reading, ...]:

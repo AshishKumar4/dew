@@ -17,6 +17,7 @@ import itertools
 import json
 import math
 import threading
+import weakref
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from importlib import import_module
 from pathlib import Path
@@ -528,7 +529,7 @@ class Worker:
     by broadcast from rank 0 into device memory of its own, kept by name."""
 
     def __init__(self, library, ordinal):
-        from dew.devices import primary_context
+        from dew._devices import primary_context
 
         self.nccl = ctypes.CDLL(str(library))
         self.cuda, self.context, _ = primary_context(ordinal)
@@ -803,7 +804,7 @@ def test_an_fp8_sources_push_has_a_collective_for_every_tensor_it_publishes():
     from dew.inference.rollouts import _published
 
     source = Pretrained.load(FP8, dtype="float32")
-    published = _published(source, source.variables, jnp.dtype("bfloat16"), phase="fp8 push gather")
+    published = _published(source, source.variables, jnp.dtype("bfloat16"))
     dtypes = {str(tensor.dtype) for tensor in published.export().values()}
     assert "float8_e4m3fn" in dtypes and dtypes <= _DTYPES.keys(), dtypes
 
@@ -867,6 +868,92 @@ def a_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, libr
     received = [(server.seen[4][0], server.seen[4][1]) for server in engines]
     assert all(started < arrived and answered < min(server.seen[5][0] for server in engines)
                for arrived, answered in received)
+
+
+def test_a_push_reads_its_export_a_chunk_ahead_of_what_it_sends():
+    """A push's publication is a table read as it is sent (row 4370): its listing and its chunks come
+    from the tensors' specs before any tensor is read, the first chunk read before the broadcast and
+    released once it has sent (no chunk of it alive by the time the second chunk settles), and
+    the broadcast reads each next chunk on its reader thread while the one before it sends (a read
+    overlapping a send, row 4439: the second chunk's read waits for the first chunk's send to begin, and
+    that send for the read to begin, which a push reading the chunk before or after the send leaves to
+    run out),
+    never a chunk further ahead, so no more than two chunks are resident, and every tensor goes out once,
+    in the listing's order. The publication casts on its devices and gathers nothing whole
+    (`_published`)."""
+    from collections.abc import Mapping
+
+    from jax.sharding import SingleDeviceSharding
+
+    from dew._coordination import byte_groups
+    from dew.inference.nccl import _read_along
+    from dew.inference.rollouts import _published
+    from dew.interop.safetensors_io import tensor_specs
+
+    source = Pretrained.load(FIXTURE, dtype="float32")
+    published = _published(source, source.variables, jnp.dtype("bfloat16"))
+    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(published.variables))
+    exported = published.export()
+    names = sorted(exported)
+    events: list[tuple[str, int]] = []
+    sizes = {name: int(np.prod(spec.shape)) * np.dtype(spec.dtype).itemsize
+             for name, spec in tensor_specs(exported).items()}
+    chunk = max(sizes.values())
+    # The push's own chunking, from the specs alone.
+    chunks = [[names[at] for at in group] for group in byte_groups(names, chunk, nbytes=sizes.__getitem__)]
+    index = {name: number for number, members in enumerate(chunks) for name in members}
+
+    read_began, send_began = threading.Event(), threading.Event()
+    overlapped = []
+
+    class Reading(Mapping):
+        def __getitem__(self, name):
+            if index[name] == 1 and not read_began.is_set():
+                read_began.set()
+                overlapped.append(send_began.wait(timeout=30))
+            events.append(("read", index[name]))
+            return exported[name]
+
+        def __iter__(self):
+            return iter(exported)
+
+        def __len__(self):
+            return len(exported)
+
+    class Recording:
+        def broadcast(self, comm, pointer, size, dtype):
+            sending = len([event for event in events if event[0] == "send"])
+            if sending == 0:
+                send_began.set()
+                overlapped.append(read_began.wait(timeout=30))
+            events.append(("send", sending))
+
+        def ready(self, groups, receives):
+            pass
+
+        def settled(self, groups, receives):
+            events.append(("settled", 0))
+            if len([event for event in events if event[0] == "settled"]) == 2:
+                released.append(all(reference() is None for reference in held))
+
+    push = NCCLPush(source, ("http://replica",), lambda ordinal: Recording(), chunk=chunk)
+    push._groups["http://replica"] = 0
+    target = SingleDeviceSharding(jax.devices()[0])
+    first = [jax.device_put([Reading()[name] for name in chunks[0]], target)]
+    held, released = [weakref.ref(array) for array in first[0]], []
+    push._broadcast(Recording(), target, Reading(), chunks, first, [])
+    assert released == [True] and first == []
+    sent = [event for event in events if event[0] == "send"]
+    assert len(sent) == len(names) and len(chunks) > 2
+    assert overlapped == [True, True]
+    settles = [position for position, event in enumerate(events) if event[0] == "settled"]
+    for number in range(len(chunks) - 2):
+        # Chunk number + 2 is read only once chunk number has settled.
+        first = next(position for position, event in enumerate(events) if event == ("read", number + 2))
+        assert first > settles[number], (number, events)
+    events.clear()
+    _read_along(Reading(), chunks)
+    assert [event[1] for event in events] == [index[name] for members in chunks for name in members]
 
 
 @pytest.mark.parametrize("asked", ["a replica twice", "no library"])

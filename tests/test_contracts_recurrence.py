@@ -10,13 +10,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, forms as algebra_forms, scan
 from dew.nn.kernels import fla_gdn, fla_kda, mamba_ssd, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.kernels.templates import mosaic_sm90
-from dew.nn.kernels.templates.recurrence import mainloop, selective
+from dew.nn.kernels.templates.recurrence import mainloop, selective, template
 
 DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near the largest": 2.0**63,
                     "near the least normal": 2.0**-63}
@@ -169,6 +169,38 @@ def delta_rule_draw(seed: int, scale: float, *, key_heads: int, value_heads: int
     return primals, direction, cotangent
 
 
+@pytest.mark.mesh
+@pytest.mark.parametrize("edge", sorted(EDGES))
+def test_a_split_convs_bias_holds_its_orders(edge):
+    """A conv over a sequence split four ways (`linear.sequence_conv` under `over_sequence`), its replicated
+    bias read through `_shards_summed` (a custom VJP whose backward adds the shards' partial sums in one
+    rounding), on packed rows: the primal and every reverse order finite wherever float64's are normal
+    float32s and the unsplit conv's are, at activations and biases scaled to the edge. Forward mode does
+    not run (`FORWARD_ORDERS`, a custom VJP's)."""
+    from sequence_split_support import SPLIT_ROWS
+
+    from dew.nn.linear import held_conv1d, over_sequence, sequence_conv
+    from dew.training import MeshSpec
+
+    valid, segments = (jnp.asarray(np.broadcast_to(field, (2, 32))) for field in SPLIT_ROWS["packed"])
+    mixed, direction, cotangent = normal_draw(2169, (2, 32, 8), (2, 32, 8), (2, 32, 8), scale=EDGES[edge])
+    taps, bias = normal_draw(2170, (8, 4), (8,))
+    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
+
+    def split(mixed, bias):
+        return over_sequence(lambda mixed, valid, segments, taps, bias: sequence_conv(
+            mixed, taps, bias, segments, valid), 4, (mixed, valid, segments),
+            (taps.astype(mixed.dtype), bias))
+
+    def whole(mixed, bias):
+        return held_conv1d(mixed, taps.astype(mixed.dtype), valid, bias=bias, segments=segments)[0]
+
+    # The mesh set around the contract, whose orders trace the split inside their own programs.
+    with jax.set_mesh(mesh):
+        assert_contract(split, (mixed, bias), (direction, jnp.ones_like(bias)), cotangent,
+                        f"a split conv's bias {edge}", truth_fn=whole, plain_fn=whole, without=FORWARD_ORDERS)
+
+
 # The ports near float32's largest: their reverse derivatives are NaN at entries the recurrence keeps finite,
 # the gated delta rule's where fla's own chunked form keeps them too (ledger 2656).
 @pytest.mark.parametrize("per_key", [False, True], ids=["fla_gdn", "fla_kda"])
@@ -202,7 +234,7 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge):
 # finite (ledger 2656).
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
 def test_the_template_rule_holds_its_orders(edge):
-    """The recurrence template's chunked rule (`recurrence_chunk.mosaic_rule`, a custom VJP over the
+    """The recurrence template's chunked rule (`template.mosaic_rule`, a custom VJP over the
     mainloop's launches, interpreted off a GPU), a 16-bit call with its chunk inverse's declared bound (keys
     of unit norm, sigmoid write gates: its domain), from a zero memory: the primal and reverse derivative of
     the output finite wherever float64 is a normal float32 and the delta rule a token at a time is
@@ -216,7 +248,7 @@ def test_the_template_rule_holds_its_orders(edge):
     (cotangent,) = normal_draw(2665, value.shape)
 
     def rule(*operands):
-        return recurrence_chunk.mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1), bound=1.0)[0]
+        return template.mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1), bound=1.0)[0]
 
     def recurrent(*operands):
         operands = tuple(x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in operands)

@@ -108,11 +108,11 @@ def _reported(generation: str, layers: int = 1, *, scanned: bool = False):
     each call it, its kernels lowered once, `tuning.lowered_once`), unrolled or under a scan (`scanned`, as
     `scan_layers=True` runs a stack of like layers), beside a Triton kernel, lowered on this CPU for
     `generation`'s GPU, with the routes its dispatches reported (`routes`)."""
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
 
     def step(x, w, sizes):
         def layer(x, w, scale):
-            return template.gemm(x * scale, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+            return gemm.gemm(x * scale, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
 
         def loss(x, w):
             if scanned:
@@ -173,14 +173,14 @@ def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(genera
     and compiles, so the compile gate's inventory holds them (`kernel_calls(..., unrun=True)`), and which
     launch none, so the kernel report and the FLOP count leave them out alike, the step's Triton kernel its
     one launch (2958's review: a kernel of no runs once turned a live kernel's stated FLOPs unknown)."""
-    from dew.nn.kernels.templates.gemm import template
+    from dew.nn.kernels import gemm
     from dew.telemetry.instrumentation import hlo_flops
     from dew.training._lowering import kernel_calls
 
     def step(x, w, sizes):
         def body(carry):
             trip, total = carry
-            product = template.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+            product = gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
             return trip + 1, total + product
 
         _, total = jax.lax.while_loop(lambda carry: carry[0] < 0, body, (jnp.int32(0), jnp.float32(0)))
@@ -274,7 +274,7 @@ def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_un
 
 def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
     """The TPU grouped GEMM's two launches, lowered for a TPU on this CPU, state their products'
-    FLOPs (`templates.gemm.cost`), which the kernel report and the FLOP count both read."""
+    FLOPs (`templates.cost.estimate`), which the kernel report and the FLOP count both read."""
     from dew.nn.kernels.templates.gemm import mosaic_tpu
     from dew.telemetry.instrumentation import hlo_flops
 
@@ -620,6 +620,67 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     assert all(elements(on_two) < elements(on_one) for on_two, on_one in pairs), (
         op, [(elements(on_two), elements(on_one)) for on_two, on_one in pairs])
     assert set(COLLECTIVES.findall(text)) <= {"all_reduce"}
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
+    """Row 3963 (kernel-templates.md §3, Appendix C row 10): a grouped product's bias of each group's own,
+    `[G, N]` on the axes `('groups', 'columns')`, lowered for the GPU, reaches the product's launch as
+    `[G, N]`: the launch reads no `[rows, N]` operand, the buffer of each row's bias the epilogue's fusion
+    exists to remove."""
+    from dew.nn.kernels import gemm
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    rows, depth, width, groups = 384, 128, 256, 4
+
+    def biased(x, w, sizes, b):
+        return gemm.gemm(x, w, sizes, epilogue=lambda acc, bias: acc + bias,
+                         epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.bfloat16)
+
+    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+            jax.ShapeDtypeStruct((groups, depth, width), jnp.bfloat16),
+            jax.ShapeDtypeStruct((groups,), jnp.int32), jax.ShapeDtypeStruct((groups, width), jnp.float32))
+    from jax.sharding import AbstractMesh, AxisType
+
+    mesh = gpu_mesh(AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(biased).trace(*args).lower(lowering_platforms=("cuda",))
+    launches = [call.operands for call in custom_calls(lowered)
+                if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
+    assert launches
+    assert all((rows, width) not in operands for operands in launches), launches
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_fused_epilogues_intermediates_never_reach_global_memory(generation):
+    """Row 1705: a grouped product's consumers fused into its epilogue (`fuser.fuse` over
+    `fused_gemm.fusible_gemm`: a SiLU of the scaled product plus a residual, cast to bf16), lowered for the
+    GPU, write only their bf16 result: no `[rows, N]` fp32 value, the product's accumulator or anything the
+    consumers compute from it, is a tensor of the program, so none is ever stored to global memory, and the
+    launch's results are the consumers' output alone."""
+    from jax.experimental.pallas import fuser
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.kernels import fused_gemm
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    rows, depth, width = 384, 128, 256
+
+    def fused(x, w, sizes, residual):
+        product = fused_gemm.fusible_gemm(x, w, sizes)
+        return (jax.nn.silu(product * 2) + residual.astype(jnp.float32)).astype(jnp.bfloat16)
+
+    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+            jax.ShapeDtypeStruct((2, depth, width), jnp.bfloat16), jax.ShapeDtypeStruct((2,), jnp.int32),
+            jax.ShapeDtypeStruct((rows, width), jnp.bfloat16))
+    mesh = gpu_mesh(AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(fuser.fuse(fused)).trace(*args).lower(lowering_platforms=("cuda",))
+    calls = custom_calls(lowered)
+    launches = [call for call in calls if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
+    assert len(launches) == 1, [call.target for call in calls]
+    # No operation materializes the product in float32: the epilogue reads it within the kernel.
+    assert ((rows, width), "f32") not in result_types(lowered)
 
 
 @pytest.mark.parametrize("generation", GPUS)
@@ -1228,10 +1289,36 @@ def test_a_batchs_token_layout_split_over_its_tokens_compiles_no_loop_a_token():
     split = NamedSharding(mesh, PartitionSpec(None, "sequence"))
     shapes = (jax.ShapeDtypeStruct((4, 8192), jnp.int32, sharding=split),
               jax.ShapeDtypeStruct((4, 8192), jnp.bool_, sharding=split))
-    program = jax.jit(layout, in_shardings=(split, split)).lower(*shapes).compile().as_text()
-    assert not re.findall(r"\bwhile\(", program), re.findall(r"known_trip_count[^\n]*", program)[:4]
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    compiled = jax.jit(layout, in_shardings=(split, split)).lower(*shapes).compile()
+    program = hlo_instructions(compiled.as_text())
+    loops = [name for name, instruction in program.items() if instruction.op == "while"]
+    assert not loops, loops
 
 
+
+
+def result_types(lowered: jax.stages.Lowered) -> set[tuple[tuple[int, ...], str]]:
+    """The shape and element type of every array an operation of `lowered`'s StableHLO module results in,
+    its every function's and region's operations included."""
+    from jax.extend.mlir import ir
+
+    found = set()
+
+    def walked(operation) -> None:
+        for result in operation.results:
+            if isinstance(result.type, ir.RankedTensorType):
+                ranked = ir.RankedTensorType(result.type)
+                found.add((tuple(ranked.shape), str(ranked.element_type)))
+        for region in operation.regions:
+            for block in region.blocks:
+                for nested in block.operations:
+                    walked(nested.operation)
+
+    for operation in lowered.compiler_ir("stablehlo").body.operations:
+        walked(operation.operation)
+    return found
 
 
 # ------------------------------------------------------------------ a TPU topology, compiled ahead here
@@ -1340,13 +1427,13 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
 
 def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
     """The executable a TPU topology's compile makes loads onto no client here, so the persistent cache
-    is out of its way (`dew.cache.uncached`): a cache that a program here writes to gains nothing from
+    is out of its way (`dew._cache.uncached`): a cache that a program here writes to gains nothing from
     the topology's compile, and the next program here writes to it again. The trainer is built before
     the cache is read, as its key is drawn by a program of this host's, which the cache keeps (ledger
     3174: alone in its process the test saw that program's entries)."""
     from jax.experimental.compilation_cache import compilation_cache
 
-    from dew.cache import enable_compilation_cache
+    from dew._cache import enable_compilation_cache
     from dew.training.ahead import compile_ahead
 
     monkeypatch.setenv("XLA_FLAGS", os.environ.get("XLA_FLAGS", ""))

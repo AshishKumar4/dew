@@ -13,7 +13,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from check1_wire import CENSUS, staged_units
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     MOST_SEEDS,
@@ -38,7 +39,15 @@ from reference_error import (
 from dew.nn.precision import accumulated
 
 
+@pytest.fixture
+def switched(monkeypatch):
+    """The gate's YNNPACK switch on, whatever the run (a census pass sets `CENSUS`): the switch's own tests
+    hold the switch."""
+    monkeypatch.delenv(CENSUS, raising=False)
+
+
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.usefixtures("switched")
 def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path):
     """Each of tests/ynn_programs.py's programs under `without_ynn` gives, bit for bit, what the same
     program gives jitted in a process whose XLA:CPU runs with every YNNPACK fusion off."""
@@ -53,6 +62,23 @@ def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_of
     with np.load(out) as theirs:
         for name, value in ynn_programs.outputs(without_ynn).items():
             np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_the_census_runs_the_gates_arms_as_xla_cpu_compiles_them_for_users(tmp_path):
+    """Under the census (`CENSUS` set), `without_ynn` compiles a program as plain `jax.jit` does, YNNPACK's
+    fusions on: each of tests/ynn_programs.py's programs gives, bit for bit, what it gives jitted in a
+    process of XLA:CPU's defaults (row 4471)."""
+    import ynn_programs
+    out, ours = tmp_path / "theirs.npz", tmp_path / "ours.npz"
+    subprocess.run([sys.executable, str(Path(ynn_programs.__file__)), str(out)], check=True)
+    census = "import sys, numpy as np, ynn_programs; from reference_error import without_ynn; " \
+        "np.savez(sys.argv[1], **{k: np.asarray(v) for k, v in ynn_programs.outputs(without_ynn).items()})"
+    subprocess.run([sys.executable, "-c", census, str(ours)], check=True,
+                   cwd=Path(ynn_programs.__file__).parent, env={**os.environ, CENSUS: "1"})
+    with np.load(out) as theirs, np.load(ours) as found:
+        for name in theirs:
+            np.testing.assert_array_equal(found[name], theirs[name], err_msg=name)
 
 
 def one_key_draw(seed):
@@ -85,6 +111,7 @@ def written_attention(query, key, value):
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.usefixtures("switched")
 def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them(
         tmp_path, monkeypatch):
     """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
@@ -106,9 +133,24 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
     assert lines[0]["ynn"] is not None
     assert [entry["label"] for entry in SWITCHED] == ["attention over one key"]
     SWITCHED.clear()
+    # An arm declared to vary run to run takes the site's decision as any arm does, through its declaration.
+    from reference_error import run_to_run
+
+    assert_as_exact(run_to_run(pulled_by_itself(xla_attention), "atomic adds"),
+                    pulled_by_itself(written_attention), one_key_draw, "attention over one key, declared",
+                    seeds=16)
+    SWITCHED.clear()
+    # A window loop's paired arms run each window's program, decided at their own calls.
+    from reference_error import over_windows, windows
+
+    assert_as_exact(over_windows(pulled_by_itself(written_attention)),
+                    over_windows(pulled_by_itself(written_attention)), windows(one_key_draw, 3),
+                    "attention over one key, windowed", seeds=8)
+    SWITCHED.clear()
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.usefixtures("switched")
 def test_a_process_whose_xla_refuses_the_ynn_options_moves_no_site_onto_the_fusions(monkeypatch):
     """Where XLA:CPU refuses WITHOUT_YNN's options themselves, a site of two Dew paths raises before
     deciding (`_ynn_option_held`), so it moves onto the fusions and passes nowhere."""
@@ -135,171 +177,6 @@ def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
     dot_fusion = {"xla_cpu_experimental_ynn_fusion_type": "LIBRARY_FUSION_TYPE_DOT"}
     np.testing.assert_array_equal(without_ynn(jnp.dot, compiler_options=dot_fusion)(x, w),
                                   jax.jit(jnp.dot)(x, w))
-
-
-def test_windows_stack_a_sites_own_draws_and_its_arms_take_them_all():
-    """`windows(draw, count)`'s seed `s` is the site's draws of seeds `s * count` on, stacked, and an arm
-    over them, jitted or on the host, gives each window's own output, stacked, as host arrays."""
-    from reference_error import over_windows, windows
-
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return rng.normal(size=(3, 4)).astype(np.float32), np.int32(seed)
-
-    def arm(x, seed):
-        return {"sum": jnp.sum(x, axis=-1) + seed, "x": x}
-
-    stacked = windows(draw, 5)(2)
-    for index in range(5):
-        for got, want in zip(jax.tree.leaves(stacked), jax.tree.leaves(draw(10 + index)), strict=True):
-            np.testing.assert_array_equal(got[index], want)
-    host = over_windows(lambda x, seed: jax.tree.map(np.asarray, arm(x, seed)))
-    for wrapped in (over_windows(jax.jit(arm)), host):
-        found = wrapped(*stacked)
-        assert all(type(leaf) is np.ndarray for leaf in jax.tree.leaves(found))
-        for index in range(5):
-            wanted = jax.tree.leaves(arm(*draw(10 + index)))
-            for got, want in zip(jax.tree.leaves(found), wanted, strict=True):
-                np.testing.assert_array_equal(got[index], np.asarray(want))
-
-
-def test_windows_keep_a_host_draws_dtypes():
-    """A host array of a window keeps its dtype, float16 and int64 alike, as one draw holds it."""
-    from reference_error import windows
-
-    stacked = windows(lambda seed: (np.array([1 / 3], np.float16), np.int64(2**40 + seed)), 2)(0)
-    assert stacked[0].dtype == np.float16 and stacked[1].dtype == np.int64
-    assert stacked[1][1] == 2**40 + 1
-
-
-def test_windows_keep_a_weak_scalars_weak_type():
-    """A weak JAX scalar stays weak, so a float16 arm computes in float16 over windows as over one draw."""
-    from reference_error import over_windows, windows
-
-    draw = windows(lambda seed: (np.array([1 / 3], np.float16), jnp.asarray(1.5)), 2)
-    stacked = draw(0)
-    assert jax.typeof(stacked[1]).weak_type
-    found = over_windows(jax.jit(lambda x, scale: x * scale))(*stacked)
-    assert found.dtype == np.float16
-    np.testing.assert_array_equal(found[0], np.asarray(jnp.asarray(stacked[0][0]) * 1.5))
-
-
-def test_a_looped_host_arm_keeps_its_outputs_dtypes():
-    """A NumPy reference's float64 outputs stay float64."""
-    from reference_error import over_windows
-
-    found = over_windows(lambda x: np.asarray(x, np.float64) * 1.1)(np.ones((2, 3), np.float16))
-    assert found.dtype == np.float64
-
-
-def test_no_windows_are_refused():
-    """A seed of no windows, or an arm given none, is no draw."""
-    from reference_error import over_windows, windows
-
-    with pytest.raises(ValueError):
-        windows(lambda seed: (np.zeros(2),), 0)
-    with pytest.raises(ValueError):
-        over_windows(jax.jit(lambda x: x))(np.zeros((0, 2), np.float32))
-
-
-def test_each_window_runs_one_draws_program_compiled_once():
-    """Each window calls the program one draw compiles, traced once for all of them over host and JAX
-    leaves alike, and never a batched one: an arm whose batching rule computes otherwise gives each
-    window one draw's output."""
-    from reference_error import over_windows, windows
-
-    traces = []
-
-    @jax.custom_batching.custom_vmap
-    def arm(x, y):
-        traces.append((x.shape, y.shape))
-        return x + y
-
-    @arm.def_vmap
-    def batched(axis_size, in_batched, x, y):
-        return x + y + 1, in_batched[0]
-
-    def draw(seed):
-        return np.full(2, seed, np.float32), jnp.full(2, seed, jnp.float32)
-
-    found = over_windows(jax.jit(arm))(*windows(draw, 5)(1))
-    np.testing.assert_array_equal(found, np.repeat(2 * np.arange(5, 10, dtype=np.float32)[:, None], 2, 1))
-    assert traces == [((2,), (2,))]
-
-
-def test_a_without_ynn_arm_runs_over_windows():
-    """A `without_ynn` arm, whose compiler options refuse to be nested on the CPU lane, runs over windows
-    as one draw's program."""
-    from reference_error import over_windows, without_ynn
-
-    x = np.ones((3, 2), np.float32)
-    np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2))(x), x * 2)
-
-
-def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_arm_as_users_run_it():
-    """Check 1 compiles its arms itself (`_arms`): two Dew paths each `without_ynn`, one function as
-    both arms twice (its reference unrewritten), a window loop's arm within it, an arm compiled so already
-    as it is; beside an arm
-    run `as_given` (torch, NumPy, a program of its own), which it never traces, the Dew arm with the
-    fusions, as users run it. A NumPy arm passes `as_given`, and the verdict holds."""
-    from reference_error import _arms, _Windowed, as_given, assert_as_exact, over_windows, without_ynn
-
-    def dew(x):
-        return jnp.asarray(x) * 2
-
-    def written(x):
-        return x + x
-
-    mine, theirs = _arms(dew, written)
-    assert mine.without_ynn and theirs.without_ynn
-    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
-    # One function as both arms compiles twice: the reference runs its programs unrewritten.
-    same, again = _arms(dew, dew)
-    assert same is not again and same.without_ynn and again.without_ynn
-    compiled = without_ynn(dew)
-    assert _arms(compiled, written)[0] is compiled
-    windowed, _ = _arms(over_windows(dew), written)
-    assert isinstance(windowed, _Windowed) and windowed.fn.without_ynn
-
-    host = as_given(lambda x: np.asarray(x) + np.asarray(x))
-    mine, theirs = _arms(dew, host)
-    assert theirs.wrapped is host and not getattr(mine, "without_ynn", False)
-    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
-    def draw(seed):
-        return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
-
-    assert_as_exact(dew, host, draw, "a NumPy arm as given", seeds=8)
-
-
-def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_policy():
-    """An arm the gate would compile that returns NumPy values is refused (a NumPy reference compiled
-    would compute in JAX); passed `as_given` it runs as given. A window loop of a given arm is
-    classified by that arm, so its Dew partner compiles with the fusions as it does without windows.
-    A paired sizing of one function against itself stays paired, its draws from SIZING_FROM on."""
-    from reference_error import SIZING_FROM, _arms, as_given, assert_as_exact, over_windows, seeds_for
-
-    def dew(x):
-        return jnp.asarray(x) * 2
-
-    def numpy(x):
-        return np.asarray(x) * 2
-
-    def draw(seed):
-        return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
-
-    with pytest.raises(TypeError):
-        assert_as_exact(dew, numpy, draw, "a NumPy arm unmarked", seeds=8)
-    assert_as_exact(dew, as_given(numpy), draw, "a NumPy arm as given", seeds=8)
-    windowed, _ = _arms(over_windows(dew), over_windows(as_given(numpy)))
-    assert not getattr(windowed.fn, "without_ynn", False)
-    seen = []
-
-    def drawn(seed):
-        seen.append(seed)
-        return draw(seed)
-
-    seeds_for(dew, drawn, "paired against itself", dew_fn=dew)
-    assert min(seen[1:]) >= SIZING_FROM
 
 
 def test_over_jax_inputs_an_arm_runs_only_compiled_and_a_numpy_one_is_refused_there():
@@ -385,11 +262,16 @@ def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
                         terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
 
 
+def found(failure: GateFailure) -> list[tuple[str, str, float]]:
+    """A gate failure's findings as data: each one's leaf, rule and measure (`Finding`), not its wording."""
+    return [(finding.leaf, finding.rule, finding.measure) for finding in failure.findings]
+
+
 def sharded_site(monkeypatch, root, shards, site):
     """`site()` run as armada runs a sharded site: a map task for each range of `shards` (DRAWS), its
     records under `root` (RECORDS), then their judge (POOL over `root`); what each map task's run
     returned and what the judge's did."""
-    from map_judge import DRAWS, POOL, RECORDS
+    from check1_wire import DRAWS, POOL, RECORDS
 
     drawn = []
     for index, (start, stop) in enumerate(shards):
@@ -440,7 +322,7 @@ def test_a_sharded_sites_map_tasks_size_its_cancelling_rows_and_its_judge_runs_n
                      site(cancelling(split=True, leak=True), "leaked"))
     # The judge, the last to run, ran no truth before it refused.
     assert truths == [], "a judge runs no truth"
-    assert str(pooled.value) == str(whole.value)
+    assert found(pooled.value) == found(whole.value)
 
 
 MIX = np.random.default_rng(2442).standard_normal((4, 4)).astype(np.float32)
@@ -579,7 +461,7 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
         assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16)
     with pytest.raises(GateFailure) as pooled:
         judged(halved, "halved", [(0, 40), (40, 80), (40, 80)])
-    assert str(pooled.value) == str(whole.value)
+    assert found(pooled.value) == found(whole.value)
     with pytest.raises(PoolRefused) as short:
         judged(halved, "halved, short", [(0, 16)])
     with pytest.raises(PoolRefused) as gapped:
@@ -599,7 +481,7 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
     with pytest.raises(GateFailure) as both:
         sharded_site(monkeypatch, tmp_path / "both stages", [(0, 16), (16, 56), (56, 80)],
                      lambda: assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16))
-    assert str(both.value) == str(whole.value)
+    assert found(both.value) == found(whole.value)
     monkeypatch.delenv(LATER)
     # Two tests' sites of one label, their records under one pool: each judge pools its own test's alone.
     def as_test(test, dew, *, records=None, pool=None):
@@ -865,9 +747,9 @@ def test_an_arm_compiled_outside_the_gates_policy_is_refused():
 def test_a_float64_truth_runs_as_one_compiled_program():
     """The gate compiles a JAX truth (`_truth_program`) from its first call on, never running it eagerly, so
     a seed's truth is the same whichever seed a process draws first, and its values are the eager truth's
-    own. A NumPy truth (it cannot be traced, and returns host values) runs as given, and so do a truth
-    `as_given`, one compiled already and a window loop's by its own; a check over a compiled truth judges
-    as over the eager one."""
+    own. A truth doing host work fails at its first call unless its site states it (`as_given`, ledger 3198);
+    a truth `as_given`, one compiled already and a window loop's by its own run as they are; a check over a
+    compiled truth judges as over the eager one."""
     from arm_arithmetic import Truth
     from reference_error import _truth_program, _Windowed, as_given, over_windows
 
@@ -884,13 +766,11 @@ def test_a_float64_truth_runs_as_one_compiled_program():
         assert calls == [True]
         np.testing.assert_array_equal(first["y"], later["y"])
         np.testing.assert_allclose(first["y"], truth(x, w)["y"], rtol=1e-14)
-        numpy = _truth_program(lambda x, w: {"y": np.asarray(x) @ np.asarray(w)})
-        numpy(x, w)
-        assert numpy.run.wrapped is numpy.fn
-        # A truth that widens its inputs on the host and returns JAX values fails at its first call.
-        hosted = _truth_program(lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64)))
-        with pytest.raises(jax.errors.TracerArrayConversionError):
-            hosted(x, w)
+        # A truth that does host work, NumPy's or a widening on the host, fails at its first call, unstated.
+        for hosted in (lambda x, w: {"y": np.asarray(x) @ np.asarray(w)},
+                       lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64))):
+            with pytest.raises(jax.errors.TracerArrayConversionError):
+                _truth_program(hosted)(x, w)
     # A truth run as given, or compiled already, is itself, its programs unrewritten.
     given = as_given(truth)
     assert _truth_program(given).wrapped is given and _truth_program(_product).wrapped is _product
@@ -900,6 +780,7 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     assert_as_exact(_reordered, _product, _draw, "a compiled truth", seeds=8, truth_fn=truth)
 
 
+@pytest.mark.usefixtures("switched")
 def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm(monkeypatch):
     """Beside another Dew arm, an arm of Dew's own programs (`dew_programs`) runs with Dew's compile
     seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam
@@ -1095,8 +976,6 @@ def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     assert distance(dew, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(dew, reference, truth, "small row")
-    with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"rows": dew}, {"rows": reference}, {"rows": truth})
 
 
 def test_a_row_that_cancels_is_held_to_what_it_sums():
@@ -1118,10 +997,10 @@ def test_a_row_that_cancels_is_held_to_what_it_sums():
         return truth + noise
 
     reference, further = rounded(), rounded(10.0)
-    assert_leaves_as_exact({"dq": rounded()}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+    assert_as_exact_as_the_reference(rounded(), reference, truth, "dq", terms=terms)
     assert distance(further, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"dq": further}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+        assert_as_exact_as_the_reference(further, reference, truth, "dq", terms=terms)
 
 
 def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
@@ -1368,6 +1247,20 @@ def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
     assert raised.type is GateFailure
 
 
+@pytest.mark.parametrize("shape", [(), (3,), (2, 3)], ids=["scalar", "vector", "matrix"])
+def test_check_one_holds_dew_exact_where_the_reference_is_exact_below_squares_float64_holds(shape):
+    """A float64 reference exact on a truth of 1e-200, and a Dew arm that returns zero there: Dew's error
+    squares to zero in float64 and was read as exact (row 4498); it misses the exact reference, so the
+    site fails, at a leaf of every rank."""
+    def draw(seed):
+        return (np.full(shape, 1e-200 * (1 + seed)),)
+
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(as_given(lambda x: {"y": np.zeros_like(x)}), as_given(lambda x: {"y": x}), draw,
+                        "below squares", seeds=8, truth_fn=as_given(lambda x: {"y": x}))
+    assert raised.type is GateFailure
+
+
 @pytest.mark.parametrize("rank", [1, 2])
 def test_check_one_fails_a_value_that_is_not_finite(rank):
     """A NaN in Dew's leaf fails, whatever the pooled errors would read, a vector's (which has no rows
@@ -1485,7 +1378,7 @@ def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
                                         summary=True, start=256)
     seeds = int(recorded["site.seeds"])
     assert seeds >= 256
-    assert len(recorded["site.input_digest"]) == (1 + REDRAW) * seeds
+    assert len(recorded["site.input_digest"]) == staged_units(seeds)
     drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
                                                 truth_fn=product)
     assert_as_exact(lambda index, inputs: product(inputs), reference, drawn, "larger backend",
@@ -2020,7 +1913,8 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     block of SKETCH_BLOCK summed from its other end as another host may; a
     truth recomputed far past float64's range is refused, not passed on an infinite bound; and an empty
     leaf's evidence is exact, its reference's dtype kept."""
-    from reference_error import SKETCH, _sign_bits, leaf_summary, sketch_rounding, truth_sketch
+    from reference_error import leaf_summary
+    from truth_sketch import SKETCH, _sign_bits, sketch_rounding, truth_sketch
 
     rng = np.random.default_rng(7)
     truth = rng.normal(size=4096)
@@ -2148,7 +2042,7 @@ def test_a_truths_sketch_is_its_exact_signed_sums_within_its_rounding(size):
     bit for bit where they do not)."""
     import math
 
-    from reference_error import SKETCH, _sign_bits, sketch_rounding, truth_sketch
+    from truth_sketch import SKETCH, _sign_bits, sketch_rounding, truth_sketch
 
     rng = np.random.default_rng(size)
     values = rng.standard_normal(size) * 10.0 ** rng.uniform(-30, 30, size)
@@ -2288,6 +2182,7 @@ def rounded_apart(arm: int, factor: float = 1.0, *, every: int = 1):
     return run
 
 
+@as_given
 def exact_value(x, scale, sizes):
     return np.asarray(x, np.float64)
 
@@ -2367,6 +2262,7 @@ def stacked_arm(arm: int, factor: float = 1.0, every: int = 0):
     return run
 
 
+@as_given
 def exact_rows(x, scale, sizes):
     return {"rows": np.asarray(x, np.float64)}
 
@@ -2409,23 +2305,31 @@ def bits_apart():
     return as_given(product)
 
 
-@pytest.mark.parametrize(("backend", "deterministic", "refused"), [
-    ("gpu", False, False), ("gpu", True, True), ("cpu", False, True)])
+@pytest.mark.parametrize(("backend", "deterministic", "declared", "refused"), [
+    ("gpu", False, False, False), ("gpu", True, False, True), ("cpu", False, False, True),
+    ("gpu", True, True, False), ("cpu", False, True, True)])
+@pytest.mark.parametrize("windowed", [False, True], ids=["one draw", "windowed"])
 def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
-        monkeypatch, request, backend, deterministic, refused):
+        monkeypatch, request, backend, deterministic, declared, refused, windowed):
     """Check 1 replays a site's arms on their first draw and requires their outputs again bit for bit only
     where the run promises a repeat (`_repeat_promised`, ledger 2842): on a GPU by default, whose reductions
     add with atomics in arrival order, an arm whose last bits move is not refused; on a GPU in deterministic
-    mode (`with_deterministic_ops`), and on a CPU, it is (`UnpairedDraw`)."""
-    from reference_error import UnpairedDraw
+    mode (`with_deterministic_ops`), and on a CPU, it is (`UnpairedDraw`). An arm declared to vary run to run
+    (`run_to_run`, row 4448) is judged by each draw's one run on a GPU in deterministic mode too, and held
+    to its repeat on a CPU, whose interpreted programs are functions of their inputs; through a window loop
+    (`over_windows`) and a null run's unrewritten reference alike."""
+    from reference_error import UnpairedDraw, over_windows, run_to_run, windows
 
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
     request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
     label = f"bits apart on a {backend}" + (", deterministic" if deterministic else "")
+    arm = run_to_run(bits_apart(), "atomic adds") if declared else bits_apart()
+    truth, draw = jnp.matmul, a_product_draw
+    if windowed:
+        # Three windows a draw, so a rerun's calls alternate out of phase with the first run's.
+        arm, truth, draw = over_windows(arm), over_windows(jnp.matmul), windows(a_product_draw, 3)
     if refused:
         with pytest.raises(UnpairedDraw):
-            null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
+            null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
     else:
-        null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
-
-
+        null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)

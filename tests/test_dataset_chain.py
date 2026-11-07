@@ -5,13 +5,14 @@ import dataclasses
 import hashlib
 import itertools
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import grain.python as grain
 import numpy as np
 import pytest
-from data_support import Questioned, WideDraw
+from data_support import LATEST, Questioned, WideDraw
 from sampling_gate import assert_draws_as_declared
 
 from dew.batch import EXAMPLES_CONSUMED
@@ -20,7 +21,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Pipeline, Rejected
-from dew.data.plan import Manifest
+from dew.data.plan import PLAN_VERSIONS, Manifest
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -319,7 +320,7 @@ def fetched_generation(chain, directory):
     source = prepared.source
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
-    manifest = _cache_manifest(source, prepared.stages, "indexed")
+    manifest = _cache_manifest(source, prepared.stages, "indexed", PLAN_VERSIONS[-1])
     stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:
@@ -720,7 +721,7 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
     stream = datasets.IterableDataset.from_generator(hf_file_rows, gen_kwargs={"shards": [str(path)]})
     source = from_hf(stream, identity="cached-counting@1")
     cache, key = Cache((tmp_path / "cache").as_uri()), Manifest(source.fingerprint())
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key))
     actual = []
     for index in range(shares):
@@ -888,6 +889,33 @@ def test_a_bounded_mixtures_member_counts_resume_as_the_uninterrupted_read_count
     assert _member_counts([*batches, *after], expected) == _member_counts([*batches, *again], statistics)
 
 
+def test_a_streamed_position_an_earlier_dew_saved_in_its_shards_interleave_resumes():
+    """A streamed mix's position Dew saved on main before a pass of one shard at a time read its shards one
+    after another (`shards._Sequential`), its shards' rows in Grain's interleave of one place at a time:
+    it resumes there, read as the sequential reader's position, and the read gives the batches main gave
+    after it, on the threads the sequential reader holds, no shard read on one of its own (row 4079)."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    saved = json.loads((Path(__file__).parent / "fixtures" / "interleaved_shard_position.json").read_text())
+    assert "iterators_in_use" in saved["state"]
+    left = Memory([{"id": np.int32(index)} for index in range(1, 13)], shard_rows=4).named("left")
+    right = Memory([{"id": np.int32(index)} for index in range(101, 113)], shard_rows=4).named("right")
+    data = compile(mix([left, right]).batch(2), read="streamed",
+                   loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        assert [np.asarray(batch["id"]).tolist() for batch in itertools.islice(stream, 3)] == saved["before"]
+        assert "iterators_in_use" not in stream.get_state().decode()
+        threads = threading.active_count()
+        stream.set_state(saved["state"].encode())
+        resumed = [np.asarray(batch["id"]).tolist() for batch in itertools.islice(stream, 8)]
+        assert resumed == saved["after_ids"]
+        assert threading.active_count() <= threads and "iterators_in_use" not in stream.get_state().decode()
+    finally:
+        stream.close()
+
+
 @pytest.mark.parametrize("native", [False, True])
 def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_its_clock(native):
     """The streamed read of the resume test above, behind a Grain step of the mixture's own that keeps
@@ -915,10 +943,13 @@ def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_
     for name, members in (("left", range(1, 13)), ("right", range(101, 113))):
         assert statistics[f"data/rows/{name}"] == sum(identity in since and identity % 3 != 2
                                                       for identity in members), name
-    # The refusals it counted under the mixture before it was saved stay its own; none since.
+    # The refusals it counted under the mixture before it was saved stay its own; none since. The saved
+    # position is read as a resume reads it (`earlier_position`).
     from dew.data.mixing import state_counts
+    from dew.data.plan import earlier_position
 
-    before = state_counts(json.loads(recorded["state"])["iterator"])["mixture"].rejected["third question"]
+    _, iterator = earlier_position(json.loads(recorded["state"]), data.plan)
+    before = state_counts(iterator)["mixture"].rejected["third question"]
     assert statistics["data/rejected/mixture/third question"] == before
 
 
@@ -1069,10 +1100,10 @@ class Keep:
         return row
 
 
-def test_show_prints_the_chain_as_written_then_the_records_and_leaves_a_reader_where_it_was(capsys):
-    """`show` prints the store and each verb as the chain wrote it, a preset's expanded steps and
-    a verb that drops or expands records under its own name, then the first records as a reader
-    makes them; a reader open beside it reads on as one never shown would."""
+def test_show_leaves_a_reader_where_it_was():
+    """`show` of a chain, a preset's expanded steps and a verb that drops or expands records among them,
+    reads its first records from a reader of its own: a reader open beside it reads on as one never shown
+    would (18:00 audit, row 4644: what it prints is for a person, not a contract)."""
     from dew.data import presets
 
     pictures = Memory([{"image": np.full((8, 8, 3), index, np.uint8), "label": index % 2}
@@ -1083,26 +1114,14 @@ def test_show_prints_the_chain_as_written_then_the_records_and_leaves_a_reader_w
     try:
         next(reader)
         chain.show(count=1)
+        Memory(rows("a", 4)).named("a").flat_map(Twice(), batched=True, batch_size=2).filter_map(
+            Keep()).loading(READ).show(count=1)
         rest, expected = next(reader), (next(untouched), next(untouched))[1]
         for name in expected:
             np.testing.assert_array_equal(np.asarray(rest[name]), np.asarray(expected[name]))
     finally:
         reader.close()
         untouched.close()
-    lines = capsys.readouterr().out.splitlines()
-    written = [line.strip() for line in lines[:6]]
-    assert written[0].startswith("Memory")
-    assert [line.split("(")[0] for line in written[1:]] == [
-        ".filter_map", ".map", ".random_map", ".batch", ".map"]
-    assert "DecodeImage" in written[1] and "Resize" in written[2] and "AugmentationKey" in written[3]
-    assert written[4] == ".batch(2)" and "DeviceAugment" in written[5] and "device" in written[5]
-    assert "uint8[2, 4, 4, 3]" in "".join(lines[6:])
-
-    grouped = Memory(rows("a", 4)).named("a").flat_map(Twice(), batched=True, batch_size=2)
-    grouped.filter_map(Keep()).loading(READ).show(count=1)
-    lines = capsys.readouterr().out.splitlines()
-    assert lines[1].strip() == ".flat_map(Twice(), batched=True, batch_size=2)"
-    assert lines[2].strip().startswith(".filter_map(Keep")
 
 
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():

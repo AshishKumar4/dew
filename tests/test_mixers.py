@@ -38,7 +38,6 @@ from dew.nn.memory import Gate, InContextMemory, MLPMemory
 from dew.nn.mixer_base import MLP_RESIDUALS, MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
-from dew.nn.mixers.parallel import ParallelMixer
 from dew.registry import mixers, models
 
 VOCAB = 37
@@ -264,25 +263,26 @@ SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_
          "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
          "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64,
          "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
-"""Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
-documents run alone compared with themselves resolve PARITY in every logit and parameter gradient (on
-armada). Mamba2's 8 heads of 32 over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a
-seed, where its defaults (128 heads of 64 over 128) took 256 at 30 minutes a run. Kimi delta attention's
-heads are 32 wide (`KIND_FIELDS`): at 16 the reference compared with itself did not resolve within 2048
-seeds, one seed carrying up to 68% of a leaf's summed error, near-collinear keys' erases in fp32; at 32 it
-carries at most 5%. 16 is no path of its own: the portable math this site runs has no width-specific code,
-and the port pads every key width below 64 to 64 (`recurrence_chunk._blocked_rule`), which
-tests/test_fla_gdn.py's any-width site holds at 32. The packed row no longer runs a 16-wide Kimi layer or
-Mamba2's defaults (128 heads of 64 over a state of 128 in 256-token chunks, where these documents sit in
-one chunk); the scan's packed resets within a chunk stay held by tests/test_mamba2.py and
-tests/test_mamba_ssd.py at their own geometries. Lightning attention runs 8 heads of 16 in 64-token chunks
-(`KIND_FIELDS`): at the model's 4 heads, of 8, 16 or 32 channels, the reference compared with itself did
-not resolve within 512 seeds (2048 at 8); at 8 or 16 heads of 16, or 4 of 64, it resolves at 64. Kimi delta
-attention's 64 are sized paired (`seeds_for` with the packed row as its Dew arm, on armada, ledger 2828):
-compared with themselves its documents alone take 512."""
+"""Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` per kind (on armada): the
+fewest for which documents run alone compared with themselves resolve PARITY in every logit and parameter
+gradient, or for a kind so stated, paired with the packed row (ledger 2889). Mamba2's 8 heads of 32 over a
+state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a seed, where its defaults (128 heads of
+64 over 128) took 256 at 30 minutes a run. Kimi delta attention's heads are 32 wide (`KIND_FIELDS`): at 16
+the reference compared with itself did not resolve within 2048 seeds, one seed carrying up to 68% of a
+leaf's summed error, near-collinear keys' erases in fp32; at 32 it carries at most 5%. 16 is no path of
+its own: the portable math this site runs has no width-specific code, and the port pads every key width
+below 64 to 64 (`recurrence_chunk._blocked_rule`), which tests/test_fla_gdn.py's any-width site holds at
+32. The packed row no longer runs a 16-wide Kimi layer or Mamba2's defaults (128 heads of 64 over a state
+of 128 in 256-token chunks, where these documents sit in one chunk); the scan's packed resets within a
+chunk stay held by tests/test_mamba2.py and tests/test_mamba_ssd.py at their own geometries. Lightning
+attention runs 8 heads of 16 in 64-token chunks (`KIND_FIELDS`): at the model's 4 heads, of 8, 16 or 32
+channels, the reference compared with itself did not resolve within 512 seeds (2048 at 8); at 8 or 16
+heads of 16, or 4 of 64, it resolves at 64. Kimi delta attention's 64 are sized paired (`seeds_for` with
+the packed row as its Dew arm, on armada, ledger 2828): compared with themselves its documents alone take
+512."""
 
 
-SHARDED = {"kimi_delta_attention", "mamba2", "memory"}
+SHARDED = {"gated_delta_net", "kimi_delta_attention", "mamba2", "memory"}
 """The kinds whose packed rows' draws run as armada's map tasks (`check1_shards`), each a test of its own."""
 
 
@@ -290,6 +290,13 @@ SHARDED = {"kimi_delta_attention", "mamba2", "memory"}
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """`assert_packs_as_alone` over every mixer in the registry but the sharded ones (`SHARDED`)."""
     assert_packs_as_alone(kind)
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=128)
+def test_a_packed_row_of_gated_delta_net_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over the gated delta net, whose 512 seeds took 39 s of 96 on armada's CI
+    CPU and 128 s in train 580's CI: CI draws them in map tasks of 128 (ledger 4039)."""
+    assert_packs_as_alone("gated_delta_net")
 
 
 @pytest.mark.check1_shards(seeds=64, per_task=8)
@@ -446,7 +453,7 @@ def test_no_token_reaches_another_document(kind):
 
 POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "attention_sinks": True,
                  "value_scale": 0.5, "key_multiplier": 0.5, "o_proj_bias": True,
-                 "attention_dropout_rate": 0.1}
+                 "attention_dropout_rate": 0.1, "wide_logits": True}
 """A value each attention policy (`MixerContext.policies`) asks with."""
 
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}
@@ -457,36 +464,93 @@ ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "lightning_
 """The registry's kinds that mix tokens without attention, whose layers' attention policies are not theirs."""
 
 
-@pytest.mark.parametrize("kind", sorted(mixers.paths))
+POLICY_DTYPES = {"force_fp32_for_softmax": jnp.bfloat16, "wide_logits": jnp.bfloat16}
+"""The policies whose arithmetic shows in narrow inputs alone: a softmax, or logits, formed in bfloat16."""
+
+
+@pytest.mark.parametrize("kind", sorted(set(mixers.paths) - ATTENDS_NOTHING))
 @pytest.mark.parametrize("policy", sorted(POLICY_VALUES))
-def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kind, policy):
-    """A layer asking an attention policy builds a mixer that takes it, as an argument or in the
-    context it holds (`CausalSelfAttention.ctx`), or refuses it by name; no attention-family kind
-    builds without it. A parallel layer's every branch that attends takes it."""
-    if kind in ATTENDS_NOTHING:
-        pytest.skip(f"{kind} attends nothing")
-    context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=64, max_seq_len=32,
-                           **KIND_CONTEXT.get(kind, {}))
+def test_every_attention_mixer_computes_or_refuses_each_policy_it_is_asked(kind, policy):
+    """A layer asking an attention policy builds a mixer that computes it, or refuses it by name
+    (`MixerRefused`); no attention-family kind computes without it (row 4425). A block of the mixer asked
+    gives another output than the block not asked over the same weights where both hold them, a bias or a
+    sink the policy adds set off zero, trained where the policy reads training (attention dropout) and in
+    bfloat16 where it changes a narrow input's arithmetic (`POLICY_DTYPES`), and its gradient is finite,
+    reaching every weight the policy adds. A parallel layer computes it in its branch that attends."""
+    dtype = POLICY_DTYPES.get(policy, jnp.float32)
+    # The test decoder's geometry (`TINY`), which each kind's fields are sized for (`KIND_FIELDS`).
+    context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32,
+                           dtype=dtype, **KIND_CONTEXT.get(kind, {}))
     asked = dataclasses.replace(context, **{policy: POLICY_VALUES[policy]})
     assert asked.policies()[policy] and not context.policies()[policy]
     value = mixers.build(kind, **KIND_FIELDS.get(kind, ({}, {}))[0])
-    value.build(context)
+    plain = value.build(context)
     try:
-        factory = value.build(asked)
-    except ValueError as refused:
-        assert policy in str(refused)
+        taken = value.build(asked)
+    except MixerRefused as refused:
+        assert policy in refused.names
         return
-    attending = (factory,)
-    if isinstance(value, ParallelMixer):
-        nothing = tuple(mixers[name] for name in ATTENDS_NOTHING)
-        branches = zip(value.branches, factory.keywords["branches"], strict=True)
-        attending = tuple(built for branch, (_, built, *_) in branches
-                          if not isinstance(branch.mixer, nothing))
-    assert attending
-    for built in attending:
-        held = built.keywords.get("ctx")
-        taken = built.keywords.get(policy) if held is None else getattr(held, policy)
-        assert taken == POLICY_VALUES[policy]
+    plain_block, asked_block = (DecoderBlock(mixer=factory, feedforward=None, emb_features=32,
+                                             wiring=BlockWiring(), dtype=dtype) for factory in (plain, taken))
+    x = jax.random.normal(jax.random.key(1), (2, 8, 32), dtype)
+    weights = plain_block.init(jax.random.key(0), x)
+    drawn = asked_block.init(jax.random.key(0), x)
+    shared = dict(jax.tree_util.tree_leaves_with_path(weights))
+    added = [path for path, _ in jax.tree_util.tree_leaves_with_path(drawn) if path not in shared]
+    variables = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: shared[path] if path in shared else leaf + jnp.asarray(0.5, leaf.dtype), drawn)
+    train = policy == "attention_dropout_rate"
+    rngs = {"dropout": jax.random.key(2)}
+
+    def output(block, variables):
+        return block.apply(variables, x, train=train, rngs=rngs)
+
+    assert not np.array_equal(np.asarray(output(asked_block, variables), np.float32),
+                              np.asarray(output(plain_block, weights), np.float32))
+    gradient = jax.grad(lambda held: jnp.sum(jnp.square(output(asked_block, held).astype(jnp.float32))))(
+        variables)
+    leaves = dict(jax.tree_util.tree_leaves_with_path(gradient))
+    assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in leaves.values())
+    assert all(np.any(np.asarray(leaves[path], np.float32)) for path in added)
+
+
+def test_wide_logits_reach_the_reference_attention_and_are_refused_elsewhere():
+    """Wide logits (`MixerContext.wide_logits`, the dispatcher's `wide_logits`) are arithmetic only the
+    reference attention performs (`reference_only`): 'auto' and xla route a call asking them to it, and
+    the dispatcher's output for bf16 inputs is `reference_attention`'s with them, bit for bit, and not its
+    output with logits formed in bf16; a fused kernel a call names refuses them, among its refusals, as
+    does a layer asking them on a cached call, whose kernels form logits in the inputs' dtype (row 4149:
+    the world model's blocks attended so, which the shared mixer had no way to ask)."""
+    from dew.nn.attention import reference_attention, resolve_implementation, scaled_dot_product_attention
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import KernelRefused
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    rng = np.random.default_rng(21)
+    q, k, v = (jnp.asarray(rng.normal(scale=4.0, size=(2, 16, 2, 32)), jnp.bfloat16) for _ in range(3))
+    # The reference route's products as the dispatcher takes them (`attention_route.FORMS`).
+    precision = jax.lax.Precision.HIGHEST if generation.numerics().forms == "accurate" else None
+
+    def through(*, wide):
+        return np.asarray(scaled_dot_product_attention(q, k, v, implementation="reference", wide_logits=wide))
+
+    np.testing.assert_array_equal(
+        through(wide=True), np.asarray(reference_attention(q, k, v, precision=precision, wide_logits=True)))
+    assert not np.array_equal(through(wide=True), through(wide=False))
+    for named in ("auto", "xla"):
+        np.testing.assert_array_equal(np.asarray(scaled_dot_product_attention(
+            q, k, v, implementation=named, wide_logits=True)), through(wide=True), err_msg=named)
+    with pytest.raises(KernelRefused) as refused:
+        resolve_implementation("cudnn", q, k, wide_logits=True)
+    assert "arithmetic" in {refusal.code for refusal in refused.value.refusals}
+    context = MixerContext(emb_features=64, num_heads=2, num_kv_heads=2, head_dim=32, max_seq_len=8,
+                           attention_impl="reference", wide_logits=True)
+    layer = CausalSelfAttention(ctx=context)
+    x = jnp.ones((1, 4, 64))
+    variables = layer.init(jax.random.key(22), x)
+    with pytest.raises(MixerRefused) as refused:
+        layer.apply(variables, x[:, :1], MixerCall(decode=True), mutable=["cache"])
+    assert refused.value.names == ("wide_logits",)
 
 
 def test_a_mixers_refusal_names_its_kind_and_entries_across_a_process_boundary():
@@ -542,7 +606,9 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
     keeps more for a tiny decoder's backward than a policy saving nothing. A recurrence's output is
     both its 'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are
     its port's (`row_names_port`, interpreted off a GPU), named within its rule's declared span
-    (`derivatives.declared_derivative`), whose saved residuals JAX reports as the span's outputs."""
+    (`derivatives.declared_derivative`), whose saved residuals JAX reports as the span's outputs; the
+    port runs at the default product precision its fp32 products are declared at
+    (`recurrence_chunk._port_precision`; the suite's lanes configure 'highest')."""
     from jax.ad_checkpoint import print_saved_residuals
 
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -562,8 +628,9 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
         print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
         return capsys.readouterr().out
 
-    nothing = saved(())
-    assert [name for name in value.marks() or () if saved((name,)) == nothing] == []
+    with jax.default_matmul_precision("default"):
+        nothing = saved(())
+        assert [name for name in value.marks() or () if saved((name,)) == nothing] == []
 
 
 def one_tap(kind):

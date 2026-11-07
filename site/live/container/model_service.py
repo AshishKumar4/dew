@@ -5,13 +5,13 @@ import io
 import json
 import math
 import os
-import queue
 import socket
 import socketserver
 import struct
 import sys
 import threading
 import time
+from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 
 import contract
@@ -120,6 +120,10 @@ def validate(request):
 
 
 class NativeModels:
+    """The pinned models, served by one `dew.inference.Engine`: each text model's `Server` and the
+    text-to-image pipeline's `ScoringServer` (`TextToImage.scoring`), so the engine admits, batches and
+    steps every guest's request and the service only carries them."""
+
     def __init__(self, root=Path("/opt/live")):
         import jax.numpy as jnp
         import numpy as np
@@ -127,7 +131,7 @@ class NativeModels:
 
         import dew
         from dew import sampling
-        from dew.inference import Server
+        from dew.inference import Engine, ScoringServer, Server
         from dew.interop import PretrainedDecoder
         from dew.sampling import CFG, Sampling
 
@@ -136,7 +140,10 @@ class NativeModels:
         self.cfg = CFG
         self.solvers = {name: getattr(sampling, name) for name in contract.SOLVERS}
         self.repo, self.revision = (root / "text-to-image").read_text().strip().split("@")
-        self.pipe = progress.Reporting(dew.pipeline(self.repo, revision=self.revision))
+        self.pipe = dew.pipeline(self.repo, revision=self.revision)
+        # A pass of one request walks with its lone call's own programs: a cell run here draws the pixels
+        # it draws run locally.
+        self.images = ScoringServer.from_task(*self.pipe.scoring(images=1))
         self.text_servers = {}
         for line in (root / "text-models").read_text().split():
             name, _ = line.split("@")
@@ -145,6 +152,8 @@ class NativeModels:
                 **contract.LOADED, "dtype": getattr(jnp, contract.LOADED["dtype"])})
             task = bundle.text_generation(sampling=Sampling(**contract.GREEDY))
             self.text_servers[name] = Server.from_task(task, slots=CAPACITY, capacity=256)
+        self.engine = Engine(self.images, *self.text_servers.values(), name="live-models")
+        self.engine.start()
         print("MODEL_PHASE", time.time(), "warm sample", flush=True)
         self.sample({"repo": self.repo, "revision": self.revision,
                      "prompt": "the northern lights over a frozen lake at night", "negative": "",
@@ -153,10 +162,8 @@ class NativeModels:
                      "guidance": {"scale": 6, "interval": [0.15, 0.9], "rescale": 0}}, lambda *_: None)
         for name in self.text_servers:
             print("MODEL_PHASE", time.time(), "warm text", name, flush=True)
-            warmed = self.text([{"model": name, "prompt": "The capital of France is",
-                                 "tokens": 24, "key": 0}])
-            if isinstance(warmed[0], Exception):
-                raise warmed[0]
+            self.text({"model": name, "prompt": "The capital of France is", "tokens": 24, "key": 0},
+                      lambda *_: None)
 
     def describe(self, request):
         if request["repo"] != self.repo:
@@ -166,22 +173,53 @@ class NativeModels:
         return {"repo": self.repo, "revision": self.revision}
 
     def sample(self, request, emit):
+        """The request's image, as Dew's `pipe(pipe.prepare([prompt], key=prepare_key, steps=prepare_steps,
+        unconditional=negative), key=key, steps=steps, ...)` draws it, each step's preview emitted as the
+        walk runs (`progress.preview_png`), then the decode's."""
+        answer, answered = self._sample(request, emit)
+        return answered(answer.result())
+
+    def text(self, request, emit):
+        """The request's greedy continuation, its text streamed as its tokens arrive."""
+        answer, answered = self._text(request, emit)
+        return answered(answer.result())
+
+    def submitted(self, request, emit):
+        """A validated sample or text request submitted to the engine: its future, and what turns the
+        future's result into the reply, run on the caller's thread, off the engine's."""
+        if request["op"] == "text":
+            return self._text(request, emit)
+        return self._sample(request, emit)
+
+    def _sample(self, request, emit):
+        from dew.inference import ImageRequest
+        from dew.objectives.base import OMITTED
+
         self.describe(request)
-        options = request.get("guidance")
-        guided = ({} if "guidance" not in request else
-                  {"guidance": options if options is None or type(options) in (int, float) else
-                   self.cfg(**{name: tuple(given) if isinstance(given, list) else given
-                               for name, given in options.items()})})
-        inputs = self.pipe.prepare([request["prompt"]], key=request["prepare_key"],
-                                   steps=request["prepare_steps"], unconditional=request["negative"])
-        previous = self.progress._show
-        self.progress._show = lambda report, png=None: emit({"progress": report, "png": png})
-        try:
-            solver = request["solver"]
-            result = self.pipe(inputs, key=request["key"], steps=request["steps"], **guided,
-                               solver=None if solver is None else self.solvers[solver["name"]]()).host()
-        finally:
-            self.progress._show = previous
+        options = request.get("guidance", OMITTED)
+        guidance = (options if options is OMITTED or options is None or type(options) in (int, float) else
+                    self.cfg(**{name: tuple(given) if isinstance(given, list) else given
+                                for name, given in options.items()}))
+        steps = self.pipe.steps if request["steps"] is None else request["steps"]
+        process, times = self.pipe.prepared_process(steps)
+        walked = len(process.times(steps) if times is None else times) - 1
+
+        def stepped(step, rows):
+            emit({"progress": {"step": step, "steps": steps}, "png": self.progress.preview_png(rows[0])})
+            if step == walked:
+                emit({"progress": {"stage": "decode"}, "png": None})
+
+        solver = request["solver"]
+        answer = self.images.submit(ImageRequest(
+            request["prompt"], request["key"], steps=steps, guidance=guidance,
+            solver=None if solver is None else self.solvers[solver["name"]](), negative=request["negative"],
+            prepare_key=request["prepare_key"],
+            prepare_steps=self.pipe.steps if request["prepare_steps"] is None else request["prepare_steps"],
+            on_step=stepped))
+        return answer, self._image_reply
+
+    def _image_reply(self, images):
+        result = images.host()
         if not self.np.isfinite(self.np.asarray(result.images)).all():
             raise ArithmeticError("the sampler returned non-finite pixels")
         encoded = []
@@ -196,47 +234,39 @@ class NativeModels:
                 "shape": list(pixels.shape),
                 "dtype": pixels.dtype.name if pixels.dtype.name == "bfloat16" else pixels.dtype.str}
 
-    def text(self, requests, emitters=None):
-        tickets = []
-        for index, request in enumerate(requests):
-            try:
-                if request["model"] not in self.text_servers:
-                    raise ValueError("the live kernel serves only its pinned text models")
-                server = self.text_servers[request["model"]]
-                ticket = server.submit(request["prompt"], request["tokens"], key=request["key"])
-                if emitters is not None:
-                    def streamed(ticket, server=server, emit=emitters[index]):
-                        decoded = server.processor.decode(self.np.asarray([ticket.tokens], dtype="int32"))[0]
-                        emit({"text": decoded, "first_token_seconds": ticket.first - ticket.submitted})
-                    ticket.add_tokens_callback(streamed)
-                tickets.append(ticket)
-            except Exception as error:
-                tickets.append(error)
-        for server in self.text_servers.values():
-            server.run()
-        return [ticket if isinstance(ticket, Exception) else {"text": ticket.result().text}
-                for ticket in tickets]
+    def _text(self, request, emit):
+        if request["model"] not in self.text_servers:
+            raise ValueError("the live kernel serves only its pinned text models")
+        server = self.text_servers[request["model"]]
+        ticket = server.submit(request["prompt"], request["tokens"], key=request["key"])
+
+        def streamed(ticket):
+            decoded = server.processor.decode(self.np.asarray([ticket.tokens], dtype="int32"))[0]
+            emit({"text": decoded, "first_token_seconds": ticket.first - ticket.submitted})
+
+        ticket.add_tokens_callback(streamed)
+        return ticket, lambda generation: {"text": generation.text}
 
 
 class ModelService(socketserver.ThreadingUnixStreamServer):
+    """Carries guests' requests to the models: one request a guest uid at a time, CAPACITY in all, each
+    answered by the models' engine on its connection's thread."""
+
     daemon_threads = True
 
     def __init__(self, path, models, uids=GUEST_UIDS):
         self.path, self.models, self.uids = Path(path), models, frozenset(uids)
-        self.jobs = queue.Queue(maxsize=CAPACITY)
         self.pending = {}
         self.lock = threading.Lock()
         self.path.unlink(missing_ok=True)
         super().__init__(str(path), ModelRequest)
         os.chmod(path, 0o666)
-        self.worker = threading.Thread(target=self.compute, daemon=True)
-        self.worker.start()
         self.listener = threading.Thread(target=self.serve_forever, daemon=True)
         self.listener.start()
 
     def process_request(self, request, address):
         uid = struct.unpack("3i", request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
-        token = {"queued": False}
+        token = {"submitted": False}
         with self.lock:
             if uid not in self.uids:
                 error = {"name": "PermissionError",
@@ -267,52 +297,25 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
         try:
             super().process_request_thread(request, address)
         finally:
-            if not token["queued"]:
+            # A request the engine holds keeps its guest's admission until the engine settles it
+            # (`submitted`); any other ends with its connection.
+            if not token["submitted"]:
                 self.release(uid, token)
+
+    def submitted(self, uid, future):
+        """`future`, the engine's work for `uid`'s request, holds the guest's admission until it settles,
+        however long its connection waits for it."""
+        token = self.pending[uid]
+        token["submitted"] = True
+        future.add_done_callback(lambda _: self.release(uid, token))
 
     def release(self, uid, token):
         with self.lock:
             if self.pending.get(uid) is token:
                 del self.pending[uid]
 
-    def compute(self):
-        missing = object()
-        held = missing
-        while True:
-            job = self.jobs.get() if held is missing else held
-            held = missing
-            if job is None:
-                return
-            group = [job]
-            request, emit = job
-            try:
-                if request["op"] == "text":
-                    while len(group) < CAPACITY:
-                        try:
-                            following = self.jobs.get_nowait()
-                        except queue.Empty:
-                            break
-                        if following is None or following[0]["op"] != "text":
-                            held = following
-                            break
-                        group.append(following)
-                    results = self.models.text([request for request, _ in group], [emit for _, emit in group])
-                    for result, (_, send) in zip(results, group, strict=True):
-                        if isinstance(result, Exception):
-                            send({"error": {"name": type(result).__name__, "message": str(result)}})
-                        else:
-                            send({"result": result})
-                else:
-                    result = (self.models.describe(request) if request["op"] == "describe" else
-                              self.models.sample(request, emit))
-                    emit({"result": result})
-            except Exception as error:
-                for _, send in group:
-                    send({"error": {"name": type(error).__name__, "message": str(error)}})
-
     def server_close(self):
         self.shutdown()
-        self.jobs.put(None)
         super().server_close()
         self.path.unlink(missing_ok=True)
 
@@ -320,27 +323,29 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
 class ModelRequest(socketserver.StreamRequestHandler):
     def handle(self):
         uid = struct.unpack("3i", self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
-        token = self.server.pending[uid]
-        completed = threading.Event()
+        # One frame at a time, and none after the reply: the engine's progress callbacks and the handler's
+        # reply write under one lock, and the reply ends the connection's output.
+        writing = threading.Lock()
+        ended = False
 
-        def emit(value, release=True):
-            if release and ("result" in value or "error" in value):
-                self.server.release(uid, token)
-            try:
+        def emit(value, *, final=False):
+            nonlocal ended
+            with writing:
+                if ended:
+                    return
+                ended = final
                 try:
-                    line = json.dumps(value, allow_nan=False)
-                except ValueError as error:
-                    # A non-finite number has no JSON form: the client hears so in place of the reply.
-                    why = f"the model's reply holds a non-finite number: {error}"
-                    line = json.dumps({"error": {"name": "ValueError", "message": why}})
-                self.wfile.write(line.encode() + b"\n")
-                self.wfile.flush()
-            except OSError as gone:
-                print(f"a model request's client left before its reply: {gone!r}", file=sys.stderr,
-                      flush=True)
-            finally:
-                if "result" in value or "error" in value:
-                    completed.set()
+                    try:
+                        line = json.dumps(value, allow_nan=False)
+                    except ValueError as error:
+                        # A non-finite number has no JSON form: the client hears so in place of the reply.
+                        why = f"the model's reply holds a non-finite number: {error}"
+                        line = json.dumps({"error": {"name": "ValueError", "message": why}})
+                    self.wfile.write(line.encode() + b"\n")
+                    self.wfile.flush()
+                except OSError as gone:
+                    print(f"a model request's client left before its reply: {gone!r}", file=sys.stderr,
+                          flush=True)
 
         try:
             self.request.settimeout(10)
@@ -348,16 +353,24 @@ class ModelRequest(socketserver.StreamRequestHandler):
             if not raw.endswith(b"\n") or len(raw) > MAX_REQUEST:
                 raise ValueError("the model request is too large")
             request = validate(json.loads(raw))
-            token["queued"] = True
+            if request["op"] == "describe":
+                emit({"result": self.server.models.describe(request)}, final=True)
+                return
+            future, answered = self.server.models.submitted(request, emit)
+            self.server.submitted(uid, future)
             try:
-                self.server.jobs.put_nowait((request, emit))
-            except queue.Full:
-                token["queued"] = False
-                raise
-            if not completed.wait(REQUEST_SECONDS):
-                raise TimeoutError("the shared model did not finish within 90 seconds")
+                result = future.result(REQUEST_SECONDS)
+            except FuturesTimeout:
+                # A request still queued is dropped where the engine would take it; a running one finishes,
+                # and holds the guest's admission until it has.
+                future.cancel()
+                raise TimeoutError("the shared model did not finish within 90 seconds") from None
+            emit({"result": answered(result)}, final=True)
         except Exception as error:
-            emit({"error": {"name": type(error).__name__, "message": str(error)}}, release=False)
+            emit({"error": {"name": type(error).__name__, "message": str(error)}}, final=True)
+        finally:
+            with writing:
+                ended = True
 
 
 if __name__ == "__main__":

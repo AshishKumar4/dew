@@ -13,7 +13,6 @@ import contextlib
 import contextvars
 import dataclasses
 import fnmatch
-import functools
 import re
 from collections.abc import Iterator, Mapping
 
@@ -24,6 +23,7 @@ import numpy as np
 from jax.custom_derivatives import zero_from_primal
 
 from dew.batch import PROBES
+from dew.nn.derivatives import Surrogate, contracted, declared_derivative
 from dew.nn.sharding import in_pipeline_stage
 
 INSPECTED = "inspected"
@@ -165,13 +165,14 @@ def sufficient(values: jax.Array, where: jax.Array | None, histogram: bool,
     return jnp.stack(terms)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(4,))
-def tapped(x: jax.Array, probe: jax.Array, where: jax.Array | None, scale: jax.Array,
-           histogram: bool) -> jax.Array:
+def _passed(x: jax.Array, probe: jax.Array, where: jax.Array | None, scale: jax.Array,
+            histogram: bool) -> jax.Array:
     """`x` itself, its cotangent passed through unchanged, and `probe`'s the sufficient statistics
     (`sufficient`) over `where`'s entries of that cotangent over `scale`, the loss scale its backward was
-    seeded with: a probe's gradient summarizes the loss's cotangent at `x` without a tensor of its size."""
-    del probe, where, scale
+    seeded with: a probe's gradient summarizes the loss's cotangent at `x` without a tensor of its size. A
+    surrogate (`tapped`, `dew.nn.derivatives.declared_derivative`): the probe's gradient is a derivative of
+    Dew's choosing."""
+    del probe, where, scale, histogram
     return x
 
 
@@ -186,7 +187,8 @@ def _tapped_backward(histogram, saved, cotangent):
     return cotangent, terms, zero_from_primal(where), zero_from_primal(scale)
 
 
-tapped.defvjp(_tapped_forward, _tapped_backward)
+tapped = contracted("test_a_probes_tap_holds_its_orders")(
+    declared_derivative(Surrogate(), _passed, _tapped_forward, _tapped_backward, nondiff_argnums=(4,)))
 
 
 @contextlib.contextmanager

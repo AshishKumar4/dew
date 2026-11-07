@@ -135,9 +135,9 @@ from dew.data.pipeline import (
     members_held,
 )
 from dew.data.plan import PLAN_VERSIONS, Manifest
-from dew.data.readers import _FillShare
-from dew.data.shards import bounded as shards_bounded, bounded_places, streamed
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, materialized
+from dew.data.readers import WorkerMirrors, _FillShare
+from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
+from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.sources.urls import Fetch
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
@@ -163,7 +163,8 @@ def _dropping(pipeline: Pipeline, lowering: _Lowering) -> bool:
     """Whether a read can drop records before its batch: a step that drops or expands records, a
     Grain step of the caller's, or a cache read as each input's outputs, in it or in a corpus it
     mixes."""
-    if lowering.cache is not None and not lowering.one_to_one:
+    if lowering.cache is not None and not lowering.one_to_one and not _transparent(pipeline, lowering.cache):
+        # A transparent cache drops what the steps it stands for drop, which the stages below count.
         return True
     if any(_dropping(child, analyzed)
            for child, analyzed in zip(children(pipeline), lowering.children, strict=True)):
@@ -297,8 +298,24 @@ def _outputs(
     targets counted on the row as `recounted` keeps them. A marker passes
     through and a missing row is rejected. `position` is the row's source
     position, as `Pipeline.map_with_index` defines it. When `counts` is given,
-    a chunk expansion counts its document and fan-out as it runs.
+    a chunk expansion counts its document and fan-out as it runs. A step that
+    raises raises its own error, noting the step and the row's source position
+    where the read knows it (row 4117).
     """
+    try:
+        return _made(stage, position, value, rng, counts=counts)
+    except Exception as error:
+        at = position if position is not None else _position(value)
+        error.add_note(f"in data step {_identity(stage).name}"
+                       + ("" if at is None else f", on the record at source position {at}"))
+        raise
+
+
+def _made(
+    stage: Stage, position: int | None, value: Record, rng: np.random.Generator | None,
+    *, counts: CorpusCounts | None,
+) -> tuple[Record, ...]:
+    """`_outputs`' outputs, as its step makes them."""
     if isinstance(value, Rejected):
         return (value,)
     if value is None:
@@ -414,14 +431,15 @@ class _Rest:
 
 @dataclasses.dataclass(frozen=True)
 class _PlacedShards:
-    reader: Callable[[Shard], pygrain.IterDataset]
+    reader: ShardOpener
     starts: Mapping[str, int]
 
-    def __call__(self, shard: Shard) -> pygrain.IterDataset:
-        return self.reader(shard).map_with_index(_Placed(self.starts[shard.id]))
+    def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset:
+        return self.reader(shard, options).map_with_index(_Placed(self.starts[shard.id]))
 
 
-def _positioned(manifest: ShardManifest) -> ShardManifest:
+def _positioned(manifest: ShardManifest, partition: DataPartition, loading: Loading) -> ShardManifest:
+    manifest = cut(manifest.sized(loading.threads), partition=partition, loading=loading)  # Those it reads.
     rows = [shard.rows for shard in manifest.shards if shard.rows is not None]
     if len(rows) != len(manifest.shards):
         raise ValueError("map_with_index over a streamed read needs every shard to state its rows")
@@ -730,16 +748,21 @@ class _ShardSteps:
     flattens the shards where it stands. Rejected rows stay marked for the
     accepting reader after it."""
 
-    reader: Callable[[Shard], pygrain.IterDataset]
+    reader: ShardOpener
     stages: tuple[Map | MapWithIndex | Filter | FlatMap, ...]
     cached: bool
     name: str
     label: str
     loading: Loading
+    transparent: bool = False
+    """Whether its cache is read as the steps it stands for are, an output an input (`_transparent`)."""
 
-    def __call__(self, shard: Shard) -> pygrain.IterDataset:
-        rows = self.reader(shard)
-        rows = gx.FlatMapIterDataset(rows, _CachedOutputs()) if self.cached else rows
+    def __call__(self, shard: Shard, options: pygrain.ReadOptions | None = None) -> pygrain.IterDataset:
+        rows = self.reader(shard, options)
+        if self.cached and self.transparent:
+            rows = rows.map(_CachedOne())
+        elif self.cached:
+            rows = gx.FlatMapIterDataset(rows, _CachedOutputs())
         start = 0
         while start < len(self.stages):
             run = _run(self.stages, start, len(self.stages), marked=True, indexed=False)
@@ -758,6 +781,23 @@ class _CachedOutputs:
         return held if held else (Rejected("empty_expansion"),)
 
 
+def _transparent(pipeline: Pipeline, cache: int) -> bool:
+    """Whether a read takes the cache at `cache` as the steps it stands for read: an automatic cache's,
+    whose steps keep or reject each input, so a position saved with it resumes without it and the
+    reverse, by index and by stream (rows 803, 4217)."""
+    stage = pipeline.stages[cache]
+    return isinstance(stage, Artifact) and stage.automatic
+
+
+class _CachedOne:
+    """What a cache of steps that keep or reject each input holds for one, as the uncached steps make
+    it: its record, or the marker of its rejection; a missing one rejected (`_CachedOutputs`)."""
+
+    def __call__(self, outputs: Record | tuple[Record, ...]) -> Record:
+        (value,) = outputs if isinstance(outputs, tuple) else (outputs,)
+        return Rejected("missing") if value is None else value
+
+
 def _filled(stage: Artifact) -> Cache:
     """The cache an artifact stage fills. A generation is read as a source,
     which `_promoted` puts in its place before anything opens."""
@@ -768,14 +808,13 @@ def _filled(stage: Artifact) -> Cache:
     return stage.cache
 
 
-def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cache, Manifest, _Prefix]:
-    """The cache stage at `at`, the manifest its fill is keyed by and the
-    record steps before it that fill it, from which memory, indexed and
-    streamed reads all open the cache."""
+def _fill(pipeline: Pipeline, source: Source, at: int, read: Read,
+          version: int) -> tuple[Cache, Manifest, _Prefix]:
+    """The cache stage at `at`, its fill's key at plan `version`, and the record steps that fill it."""
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(_cache_steps(prefix))
+    return _filled(artifact), _cache_manifest(source, prefix, read, version), _Prefix(_cache_steps(prefix))
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
@@ -1566,7 +1605,7 @@ class _Build:
             present = _Present.of(records) if _in_memory(keyed) else None
             positions = None if present is None else present.positions
         stored = _cache_inputs(keyed, records)
-        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
+        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read, self.version)
         # Read by input, as the source's own rows are: its missing inputs skipped, as the uncached
         # root skips them, and written by the fill; one record for each input reads by index and in
         # the uncached chain's order, the rest as a stream of each input's outputs.
@@ -1581,6 +1620,14 @@ class _Build:
         view = self.viewed(self.shared(placed, pipeline, partition), pipeline, partition, cache)
         if self.lowering.one_to_one:
             return view, cache + 1, self.dealt(partition, lambda: len(inputs))
+        if _transparent(pipeline, cache):
+            # An automatic cache's maps keep or reject each input, one output an input, a record or its
+            # marker, read as the uncached run's rows are read and dropped (`record_stage`), so a position
+            # either saves resumes in the other, the cache on or off (row 803); a chain's own cache keeps
+            # the form its positions saved.
+            single = _as_iter(view.map(_CachedOne()), self.loading)
+            kept = single if marked else Accepted(single, _name(pipeline), _label(pipeline))
+            return kept, cache + 1, None
         # A fetch with a pool of its own among the cached steps reads that many inputs at once.
         threads = max(self.loading.threads, prefix.threads or 0)
         read = dataclasses.replace(self.loading, threads=threads,
@@ -1606,22 +1653,25 @@ class _Build:
         stages = pipeline.stages
         cache, interleave = self.lowering.cache, self.lowering.interleave
         start = 0 if cache is None else cache + 1
-        shards = source.manifest()
+        transparent = cache is not None and _transparent(pipeline, cache)
+        shards = source.manifest(self.version)
         if cache is not None:
-            filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-            shards = _positioned(shards) if 0 <= last < cache else shards
-            reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads)
+            filled, manifest, prefix = _fill(pipeline, source, cache, self.read, self.version)
+            shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
+            reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads,
+                                     source=source, transparent=transparent)
             shards = dataclasses.replace(shards, reader=reader)
-        shards = _positioned(shards) if last >= start else shards
+        shards = _positioned(shards, partition, self.stream_loading) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
         steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline),
-                            self.stream_loading)
+                            self.stream_loading, transparent)
         shards = dataclasses.replace(shards, reader=steps)
         consumed = start if interleave is None else interleave + 1
         # A shard's stated rows are the examples it holds where the bound is only where nothing before
-        # the bound drops any.
-        dropping = cache is not None or any(_drops(stage) for stage in local)
+        # the bound drops any: a cache's own steps, which its shards' readers run, among them.
+        ran = (*stages[:cache], *local) if cache is not None else local
+        dropping = any(_drops(stage) for stage in ran)
         examples = None if dropping else self.dealt_examples(pipeline, partition, consumed)
         places, held = None, None
         if examples is not None:
@@ -1882,7 +1932,8 @@ class _Build:
         elif isinstance(stage, Workers):
             # A column too small for a shared segment of its own crosses pickled (`SHARED_BYTES`).
             options = gx.DatasetOptions(min_shm_size=SHARED_BYTES)
-            rows = gx.WithOptionsIterDataset(_as_iter(rows, self.loading), options).mp_prefetch(
+            mirrored = WorkerMirrors(_as_iter(rows, self.loading))
+            rows = gx.WithOptionsIterDataset(mirrored, options).mp_prefetch(
                 pygrain.MultiprocessingOptions(
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
                 ),
@@ -1915,7 +1966,7 @@ class _Build:
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
             prefix = pipeline.stages[: pipeline.stages.index(stage)]
-            manifest = _cache_manifest(pipeline.source, prefix, self.read)
+            manifest = _cache_manifest(pipeline.source, prefix, self.read, self.version)
             rows = _filled(stage).mapped(rows, manifest)
         elif not isinstance(stage, Interleave):
             raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} has no lowering here")

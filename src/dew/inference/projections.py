@@ -342,6 +342,7 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     the packed site and not its members alike: a member's product would then find no rule and no
     activation recipe its kernel records (`dew.quantization`'s serving provider), so the group stays
     as the rules name it. A tree that holds no group to split is returned as it is."""
+    from dew.nn.backbones.layer_names import StoredRow
     from dew.quantization import split_columns
 
     spec = _quantization(model)
@@ -355,7 +356,12 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     groups = tuple(group for group in _held_packed(model, whole) if splits(group))
     if not groups:
         return variables
-    split = _held_apart(_split(whole, groups, split_columns), _frozen_split(variables, groups),
+    # A packed leaf an export reads as a bank's row (`stored_layers`) splits into members each read from
+    # the row as it is written (`StoredRow.split`).
+    def parts(leaf, widths: tuple[int, ...]) -> list:
+        return leaf.split(widths) if isinstance(leaf, StoredRow) else split_columns(leaf, widths)
+
+    split = _held_apart(_split(whole, groups, parts), _frozen_split(variables, groups),
                         _flags(variables, groups))
     return freeze(split) if isinstance(variables, FrozenDict) else split
 

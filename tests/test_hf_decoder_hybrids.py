@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import assert_decodes_as_it_scores
-from model_support import flat_tree
+from model_support import flat_tree, prediction_logits
 from test_hf_decoders import fixture_config, fp32_decoder, recorded_logit_difference, scaled_difference
 
 from dew.interop import Pretrained
@@ -188,6 +188,37 @@ def test_qwen35_logits_match_the_reference_implementation():
     assert difference < 5e-4, f"max |logit difference| {difference:.3e}"
 
 
+@pytest.mark.parametrize("fixture", ["qwen35-tiny", "qwen35-moe-native-tiny", "qwen3-next-tiny"])
+@pytest.mark.parametrize("depth", [0, 1], ids=["trunk", "prediction-layer"])
+def test_a_hybrid_qwen_model_written_without_its_source_states_its_fields_and_reloads(fixture, depth,
+                                                                                     tmp_path):
+    """A hybrid Qwen model, Qwen3.5's, Qwen3.5-MoE's or Qwen3-Next's, written from the model alone
+    (`PretrainedDecoder.from_model`, a trained or scratch one holding no source config) states its delta
+    net's geometry, its rotary's fraction, its experts and the layers they route, and its prediction
+    depth, which the generic export writes none of, and writes its delta net's, its experts' and its
+    prediction layer's tensors under their own names (`mtp.*`); so it reloads to its own variables,
+    logits and prediction logits, bit for bit (ledgers 4533, 4562). The prediction layer's case is a
+    scratch model of the fixture's geometry with one, drawn whole."""
+    from dew.interop.pretrained import PretrainedDecoder
+
+    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference", text_only=True)
+    ids = jnp.arange(1, 9, dtype=jnp.int32)[None]
+    model, variables = loaded.model, loaded.variables
+    if depth:
+        model = model.clone(num_nextn_predict_layers=depth)
+        variables = nn.unbox(model.init(jax.random.key(4533), ids))
+    PretrainedDecoder.from_model(model, variables).save(tmp_path / "export")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    assert flat_tree(restored.variables).keys() == flat_tree(variables).keys()
+    for path, leaf in flat_tree(variables).items():
+        np.testing.assert_array_equal(np.asarray(flat_tree(restored.variables)[path]), np.asarray(leaf))
+    np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),
+                                  np.asarray(model.apply(variables, ids)))
+    if depth:
+        np.testing.assert_array_equal(np.asarray(prediction_logits(restored.model, restored.variables, ids)),
+                                      np.asarray(prediction_logits(model, variables, ids)))
+
+
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     """The loaded weights through the cache: a prefill and single-token steps on par with the parallel
     forward at each step's width from float64 over drawn rows (check 1, ledger 2739)."""
@@ -217,19 +248,102 @@ def test_qwen3_next_logits_match_the_reference_implementation():
     assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
-def test_qwen3_next_prediction_layer_matches_the_published_composition():
-    """The mtp.* tensors compose as vLLM's Qwen3NextMultiTokenPredictor does
-    over the trunk's hidden states; the fixture records that composition
-    run on the reference's own decoder layer. Largest observed difference
-    1.8e-05."""
+QWEN3_NEXT_MTP_SEEDS = 256
+"""The prediction depth's declared check-1 seeds against the published composition, sized by `seeds_for`
+on armada paired with Dew's arm (`dew_fn`, 256 in 45 s): the reference compared with itself does not
+resolve PARITY within 512 seeds."""
+
+
+def qwen3_next_mtp_case():
+    """Check 1's arms for Qwen3-Next's prediction depth (row 3912): Dew's first depth's logits over a
+    draw of the fixture's rows (`prediction_logits`), and the published composition's, vLLM's
+    Qwen3NextMultiTokenPredictor over transformers' own decoder layer (tools/qwen_mtp_reference.py's
+    `QwenMTP`) over the actual transformers model's final states and embeddings, loaded from the
+    checkpoint in float32 and as its float64 twin (`transformers_arms`); each draw's tokens redrawn until
+    every routing the trunk and the depth take clears `selection_margins.MARGIN`."""
+    import selection_margins
+    import torch
+    from interop_support import transformers_arms
+    from reference_error import as_given
+    from safetensors.torch import load_file
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from tools.qwen_mtp_reference import QwenMTP, published_mtp_logits
+    from tools.torch_precision import float64
+
+    config = AutoConfig.from_pretrained(QWEN3_NEXT)
+    stored = load_file(str(QWEN3_NEXT / "model.safetensors"))
+
+    def experts(prefix):
+        # The checkpoint's experts one by one, as transformers fuses them on load: each expert's gate
+        # rows over its up rows, then its down map.
+        each = range(config.num_experts)
+        return {f"{prefix}.gate_up_proj": torch.stack([torch.cat([stored[f"{prefix}.{e}.gate_proj.weight"],
+                                                                  stored[f"{prefix}.{e}.up_proj.weight"]])
+                                                       for e in each]),
+                f"{prefix}.down_proj": torch.stack([stored[f"{prefix}.{e}.down_proj.weight"] for e in each])}
+
+    def built(dtype):
+        # The eager experts: transformers' grouped product takes no float64 operands. Its own load fuses
+        # the trunk's experts; the depth, which it does not know, takes the same fusion, held to the
+        # trunk's as transformers loaded it.
+        network = AutoModelForCausalLM.from_pretrained(QWEN3_NEXT, dtype=dtype, attn_implementation="eager",
+                                                       experts_implementation="eager")
+        loaded = network.state_dict()
+        for name, fused in experts("model.layers.0.mlp.experts").items():
+            assert torch.equal(loaded[name], fused.to(dtype)), name
+        held = {name.removeprefix("mtp."): tensor for name, tensor in stored.items()
+                if name.startswith("mtp.") and ".mlp.experts." not in name}
+        held.update({name.removeprefix("mtp."): tensor
+                     for name, tensor in experts("mtp.layers.0.mlp.experts").items()})
+        # The model's own config, which carries the experts' implementation its load was given.
+        network.mtp = QwenMTP(network.config)
+        network.mtp.load_state_dict(held, strict=True)
+        return network.to(dtype).eval()
+
+    def predicted(network, ids):
+        _, logits, admitted, _ = published_mtp_logits(network, {"input_ids": ids,
+                                                                "attention_mask": torch.ones_like(ids)})
+        return logits[admitted]
+
+    with float64():
+        twin = built(torch.float64)
+    reference, truth = transformers_arms(built(torch.float32), predicted, twin=twin)
     model, variables = fp32_decoder(QWEN3_NEXT)
-    ids = jnp.asarray(np.load(QWEN3_NEXT / "input_ids.npy"), jnp.int32)
-    reference = np.load(QWEN3_NEXT / "mtp_reference.npz")
+    compiled = jax.jit(lambda ids: prediction_logits(model, variables, ids))
 
-    hidden = model.apply(variables, ids, method=model.hidden_states)
-    predictions = model.apply(variables, hidden, ids, method=model.mtp_logits)[0]
+    @as_given
+    def dew(ids):
+        logits = np.asarray(compiled(jnp.asarray(ids, jnp.int32)))
+        return logits.reshape(-1, logits.shape[-1])
 
-    assert scaled_difference(np.asarray(predictions), reference["logits"]) < 1e-4
+    shape = np.load(QWEN3_NEXT / "input_ids.npy").shape
+
+    def draw(seed):
+        return (np.random.default_rng([0x3912, seed]).integers(0, config.vocab_size, shape),)
+
+    fields = translate_config(json.loads((QWEN3_NEXT / "config.json").read_text()))
+    # The trunk's routing and the depth's, over the draw the depth's logits are judged on.
+    captured = selection_margins.capture(
+        model, lambda module, ids: module.mtp_logits(module.hidden_and_mtp_inputs(ids)[1], ids)[0])
+
+    def clears(drawn):
+        selections = captured(variables, jnp.asarray(drawn[0], jnp.int32))
+        return selection_margins.margin(fields, selections, "prediction depth", stable=False) > \
+            selection_margins.MARGIN
+    return dew, reference, selection_margins.clearing(draw, clears), truth
+
+
+def test_qwen3_next_prediction_layer_matches_the_published_composition():
+    """The mtp.* tensors compose as vLLM's Qwen3NextMultiTokenPredictor does over the trunk's final states
+    and the next tokens' embeddings: Dew's first prediction depth's logits on par with the published
+    composition's over the actual transformers model at every position, from its float64 twin's (check
+    1, row 3912, ledger 2739)."""
+    from reference_error import assert_as_exact
+
+    dew, reference, draw, truth = qwen3_next_mtp_case()
+    assert_as_exact(dew, reference, draw, "qwen3-next prediction depth", seeds=QWEN3_NEXT_MTP_SEEDS,
+                    truth_fn=truth)
 
 
 def test_the_fused_delta_net_projection_is_read_by_key_head_group():

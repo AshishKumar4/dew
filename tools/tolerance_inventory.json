@@ -6,7 +6,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/interop_support.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/kimi_support.py": {
@@ -30,7 +30,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_adversarial.py": {
-   "comparisons": 6,
+   "comparisons": 4,
    "lane": "Training"
   },
   "tests/test_agentic_losses.py": {
@@ -40,10 +40,6 @@
   "tests/test_alignment.py": {
    "comparisons": 5,
    "lane": "Training"
-  },
-  "tests/test_attention_algebra.py": {
-   "comparisons": 2,
-   "lane": "Kernels"
   },
   "tests/test_attention_masked_rows.py": {
    "comparisons": 1,
@@ -57,12 +53,8 @@
    "comparisons": 3,
    "lane": "Kernels"
   },
-  "tests/test_attention_stability.py": {
-   "comparisons": 1,
-   "lane": "Kernels"
-  },
   "tests/test_audio.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
   "tests/test_audio_condition.py": {
@@ -82,11 +74,11 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_bf16_reference.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_block_diffusion.py": {
-   "comparisons": 7,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_block_sft.py": {
@@ -125,16 +117,12 @@
    "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_dduf.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_decision_joint_checkpoint.py": {
    "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_decision_laya.py": {
-   "comparisons": 4,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_decision_objective.py": {
@@ -154,23 +142,23 @@
    "lane": "Training"
   },
   "tests/test_decision_task.py": {
-   "comparisons": 7,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decode_attention.py": {
-   "comparisons": 9,
+   "comparisons": 1,
    "lane": "Kernels"
   },
   "tests/test_decode_cache.py": {
-   "comparisons": 4,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoder_export.py": {
-   "comparisons": 18,
+   "comparisons": 17,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoding_components.py": {
-   "comparisons": 6,
+   "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_decoding_strategies.py": {
@@ -182,7 +170,7 @@
    "lane": "Training"
   },
   "tests/test_deepseek_v41.py": {
-   "comparisons": 9,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_depthwise_conv.py": {
@@ -193,10 +181,6 @@
    "comparisons": 6,
    "lane": "Training"
   },
-  "tests/test_diffusion_gemma_workflow.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_diffusion_objective.py": {
    "comparisons": 7,
    "lane": "Training"
@@ -206,7 +190,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_distillation.py": {
-   "comparisons": 5,
+   "comparisons": 4,
    "lane": "Training"
   },
   "tests/test_distribution.py": {
@@ -218,11 +202,11 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_edm2.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_end_to_end.py": {
-   "comparisons": 10,
+   "comparisons": 8,
    "lane": "Training"
   },
   "tests/test_engine_replay.py": {
@@ -238,7 +222,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_fid.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Training"
   },
   "tests/test_fla_gdn.py": {
@@ -246,19 +230,15 @@
    "lane": "Recurrence & Dory"
   },
   "tests/test_flaxdiff.py": {
-   "comparisons": 8,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_flaxdiff_family_source.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_flow_grpo.py": {
-   "comparisons": 1,
-   "lane": "Training"
-  },
   "tests/test_flow_matching.py": {
-   "comparisons": 4,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_flux2_source.py": {
@@ -266,7 +246,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_flux_source.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
   "tests/test_gate_findings.py": {
@@ -293,20 +273,12 @@
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_gguf.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_gpt_oss.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_grouped_gemm.py": {
-   "comparisons": 3,
-   "lane": "Kernels"
-  },
   "tests/test_grpo.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_guidance_distillation.py": {
@@ -322,7 +294,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_hybrids.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_moe.py": {
@@ -330,23 +302,15 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 18,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_hf_modernbert.py": {
-   "comparisons": 1,
+   "comparisons": 17,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_qwen35_moe_wrapper.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_host_placement.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_host_training.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_image_metrics.py": {
@@ -354,7 +318,7 @@
    "lane": "Training"
   },
   "tests/test_inference.py": {
-   "comparisons": 11,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_inference_media.py": {
@@ -378,7 +342,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_jit.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_k2_horizon.py": {
@@ -386,7 +350,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kernels.py": {
-   "comparisons": 24,
+   "comparisons": 8,
    "lane": "Kernels"
   },
   "tests/test_kimi_k3.py": {
@@ -422,11 +386,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_lora.py": {
-   "comparisons": 28,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_lora_peft.py": {
-   "comparisons": 4,
+   "comparisons": 25,
    "lane": "Models, Serving & RL"
   },
   "tests/test_lpips.py": {
@@ -438,7 +398,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_masked_diffusion.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_masked_diffusion_export.py": {
@@ -446,7 +406,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_mdlm_reference.py": {
-   "comparisons": 6,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_mesh_axes.py": {
@@ -458,7 +418,7 @@
    "lane": "Training"
   },
   "tests/test_mimo_audio.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_mimo_v2.py": {
@@ -474,7 +434,7 @@
    "lane": "Kernels"
   },
   "tests/test_models.py": {
-   "comparisons": 12,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe.py": {
@@ -490,7 +450,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe_exchange.py": {
-   "comparisons": 7,
+   "comparisons": 6,
    "lane": "Training"
   },
   "tests/test_moe_precision.py": {
@@ -518,7 +478,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_norm_swiglu.py": {
-   "comparisons": 8,
+   "comparisons": 6,
    "lane": "Kernels"
   },
   "tests/test_ollama_interop.py": {
@@ -549,10 +509,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_pipeline_streaming.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_plan.py": {
    "comparisons": 1,
    "lane": "Training"
@@ -577,20 +533,12 @@
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_quantization.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_quantization_sites.py": {
-   "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_quantized.py": {
    "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_source.py": {
-   "comparisons": 10,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_vae.py": {
@@ -611,14 +559,6 @@
   },
   "tests/test_reference_runs.py": {
    "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_reference_trees.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_released_checkpoints.py": {
-   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_reporting.py": {
@@ -646,7 +586,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {
-   "comparisons": 18,
+   "comparisons": 17,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sequence_parallel.py": {
@@ -658,7 +598,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_source_schedulers.py": {
-   "comparisons": 7,
+   "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_speculative.py": {
@@ -698,7 +638,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_tools.py": {
-   "comparisons": 25,
+   "comparisons": 24,
    "lane": "Models, Serving & RL"
   },
   "tests/test_torchax_fallback.py": {
@@ -742,15 +682,11 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_vision.py": {
-   "comparisons": 25,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_vllm_interop.py": {
-   "comparisons": 1,
+   "comparisons": 15,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_source.py": {
-   "comparisons": 12,
+   "comparisons": 11,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_vae.py": {
@@ -770,10 +706,6 @@
    "lane": "Training"
   },
   "tools/check_native_diffusion.py": {
-   "comparisons": 7,
-   "lane": "Models, Serving & RL"
-  },
-  "tools/check_native_diffusion_edges.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
@@ -820,10 +752,6 @@
   "tools/landing_visuals.py": {
    "comparisons": 1,
    "lane": "Training"
-  },
-  "tools/layout_parity.py": {
-   "comparisons": 1,
-   "lane": "Accuracy Gate"
   },
   "tools/lora_reference.py": {
    "comparisons": 3,

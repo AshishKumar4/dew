@@ -22,11 +22,12 @@ import pytest
 from affine_run import FEATURES, Regression
 from export_support import Stalled
 from jax.extend.backend import get_backend
+from process_support import assert_exits_cleanly
 from reference_error import as_given, assert_as_exact, seeds_for
 from sharded import collectives
 from token_support import write_token_corpus
 
-from dew import cache
+from dew import _cache
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
@@ -319,25 +320,17 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
     """The plan is recorded beside the compilation cache, read before the step
     traces, so a restart compiles the recorded candidate first, from the
     cache, and keeps it, with the FLOPs the first run counted for the same
-    executable."""
+    executable. (What the restart's start costs, its executable's text unread among it, the startup
+    benchmark measures.)"""
     whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
     free(monkeypatch, (whole + halves) // 2)
     first = lm()
     trained(first, steps=0)
     free(monkeypatch, LIMIT)
     again = lm()
-    counted = []
-    as_text = jax.stages.Compiled.as_text
-
-    def read_text(executable, *args, **kwargs):
-        counted.append(executable)
-        return as_text(executable, *args, **kwargs)
-
-    monkeypatch.setattr(jax.stages.Compiled, "as_text", read_text)
     trained(again, steps=0)
     assert [probe["split"] for probe in again.plan["probes"]] == [first.plan["split"]]
-    # The executable is the one the first run counted, so its FLOPs are the record's, its text unread.
-    assert counted == [] and again.step_flops == first.step_flops
+    assert again.step_flops == first.step_flops
 
 
 def a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them():
@@ -351,14 +344,14 @@ def a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_th
             lowered.append(seconds)
 
     counts = []
-    settled = cache.KERNEL_TUNES.get_global()
+    settled = _cache.KERNEL_TUNES.get_global()
     jax.monitoring.register_event_duration_secs_listener(lowering)
     try:
         for _ in range(2):
             trained(lm(), steps=0)
             counts.append(len(lowered))
             lowered.clear()
-            changed, settled = cache.KERNEL_TUNES.get_global() != settled, cache.KERNEL_TUNES.get_global()
+            changed, settled = _cache.KERNEL_TUNES.get_global() != settled, _cache.KERNEL_TUNES.get_global()
             assert counts[-1] == 1 + changed
     finally:
         jax.monitoring.unregister_event_duration_listener(lowering)
@@ -401,6 +394,39 @@ def live_executables() -> int:
     return len(get_backend().live_executables())
 
 
+def test_a_plan_search_keeps_the_freeze_a_process_made_before_it():
+    """A plan search raises Python's youngest collection threshold while it runs (`held_objects`) and
+    leaves the permanent generation to the process: one that froze its objects before importing Dew, as one
+    that forks its workers does, has its freeze as it made it after a step planned and compiled, Dew
+    freezing and unfreezing nothing, and its thresholds as they were, in a fresh interpreter (row 3341's
+    review)."""
+    assert_exits_cleanly("""
+import gc
+
+touched = []
+freeze, unfreeze = gc.freeze, gc.unfreeze
+gc.freeze = lambda: touched.append("freeze")
+gc.unfreeze = lambda: touched.append("unfreeze")
+gc.collect()
+freeze()
+thresholds = gc.get_threshold()
+
+import sys
+sys.path.insert(0, "tests")
+from test_plan import BATCH, lm
+
+trainer = lm()
+state, _, _ = trainer.place()
+trainer.compile(state, BATCH)
+assert not touched and gc.get_threshold() == thresholds, (touched, gc.get_threshold())
+from dew.training.planning import held_objects
+with held_objects():
+    assert gc.get_threshold()[0] > thresholds[0]
+assert not touched and gc.get_threshold() == thresholds
+unfreeze()
+""")
+
+
 COST = b"\x0a\x0c\x0a\x01x\x11" + struct.pack("<d", 1.0)
 """A profile of one instruction, `x`, at a microsecond, as XLA's ProfiledInstructionsProto writes it: what
 an NVIDIA GPU's profile holds, which a CPU's compile takes and does not read."""
@@ -412,6 +438,9 @@ def stepped(trainer, steps: int = 3, trials: Callable[[TrainState], Trials] | No
     trials."""
     state, _, _ = trainer.place()
     held = None if trials is None else trials(state)
+    # The garbage of the steps before collected, which the plan search would hold frozen while it runs
+    # (`dew.training.planning.held_objects`) where an executable counted inside it is part of it.
+    gc.collect()
     step = trainer.compile(state, BATCH, held)
     state = state if held is None else held.state
     for _ in range(steps):
@@ -572,6 +601,48 @@ def test_a_run_that_stops_inside_its_profile_window_stops_its_capture_and_report
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
 
 
+def test_a_profile_window_spanning_a_checkpoints_evaluation_holds_the_training_steps_alone(tmp_path):
+    """A window that spans the evaluation a checkpoint's ranking runs (its cadence's, every second step) and
+    the save holds the training steps alone: the work between them runs outside its capture, which
+    starts again at the next step's read, so the window's captures hold its four steps between them, each
+    once, and no evaluation, which a capture marks wherever one runs inside it (`region`); and the run
+    finishes, every checkpoint written. Inside the window an evaluation filled a step profile's capture."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import gzip
+
+    from affine_run import Replaying
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+    from dew.training import ProfileWindow
+    from dew.training.profiling import traced_steps
+
+    def regions(capture):
+        named = set()
+        for trace in capture.glob("plugins/profile/*/*.trace.json.gz"):
+            with gzip.open(trace, "rt") as stream:
+                named.update(event.get("name") for event in json.load(stream)["traceEvents"])
+        return named
+
+    tracker = RecordingTracker()
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+    checkpoints = Checkpoints(str(tmp_path / "run"), keep=3)
+    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                                 tracker=tracker, checkpoints=checkpoints,
+                                 profile=ProfileWindow(str(tmp_path / "trace"), steps=4, warmup=0)))
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    held = {"held": lambda partition: iter([{"text": np.asarray(BATCH["text"])}])}
+    trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1, checkpoint_every=2,
+                validation=held)
+    assert checkpoints.committed() == [2, 4, 6]
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
+    captures = sorted((tmp_path / "trace").glob("capture-*"))
+    assert window.steps == 4 and len(captures) > 1
+    assert sorted(step for capture in captures for step in traced_steps(capture)) == [1, 2, 3, 4]
+    assert all(traced_steps(capture) and "evaluate" not in regions(capture) for capture in captures)
+
+
 def test_a_borrowed_compile_under_autopgle_profiles_beside_the_state_only_where_the_devices_hold_both(
         monkeypatch):
     """Under AutoPGLE a compile given no trials profiles its step on a copy of the state beside the
@@ -623,6 +694,24 @@ def regression_steps(x, *, pgle: bool):
         state, loss, *_ = step(state, batch)
         losses.append(loss)
     return {"loss": jnp.stack(losses), "params": state.variables["params"]}
+
+
+def test_a_compiled_steps_memory_is_xlas_analysis_whoever_reads_it():
+    """A compiled step's memory (`compiled_memory`), which the planner's probe and forecast, the step's
+    headroom and the run's memory record each read, is XLA's analysis of it, the same whoever reads it and
+    whenever (row 4422: a count of the analysis's calls held its cost, which the startup benchmark
+    measures)."""
+    from dew.telemetry.instrumentation import compiled_memory
+
+    rows = regression_rows(0)[0]
+    executable = jax.jit(lambda x: jnp.tanh(x @ x.T).sum(axis=0)).lower(rows).compile()
+    analysis = executable.memory_analysis()
+    read = compiled_memory(executable)
+    assert read is not None
+    assert (read.argument, read.output, read.alias, read.temp) == (
+        analysis.argument_size_in_bytes, analysis.output_size_in_bytes, analysis.alias_size_in_bytes,
+        analysis.temp_size_in_bytes)
+    assert compiled_memory(executable) == read
 
 
 def regression_rows(seed: int) -> tuple[np.ndarray]:
@@ -857,10 +946,12 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
     at a rung where the half rung fits it, and the search asks each split there after it misses. The
-    delta rule runs its port (`chosen`), whatever the generation's row names: the half rung recomputes
-    the memory the port names (`checkpoint_name`), and the portable route, an A10's, names none."""
+    delta rule runs its port (`chosen`), whatever the generation's row names, at the default product
+    precision its fp32 products are declared at (`recurrence_chunk._port_precision`; the suite's lanes
+    configure 'highest'): the half rung recomputes the memory the port names (`checkpoint_name`), and the
+    portable route, an A10's, names none."""
     half = "all_but_delta_memory"
-    with chosen(gated_delta_rule="fla"):
+    with chosen(gated_delta_rule="fla"), jax.default_matmul_precision("default"):
         free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
         trainer = lm(**DELTA)
         state, _, _ = trainer.place()
@@ -872,28 +963,39 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
-    """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
-    fits it in fewer, so the plan is four at no recomputation. The half rung's failed fit probes
-    remain in the record, but no optional full-batch frontier is compiled."""
+    """An A100's plan: no recomputation fits the batch at four microbatches and not in fewer, so the plan
+    is four at no recomputation, which the derivation picks and its one compile confirms (row 3341): no
+    split it refuses, no half rung and no optional full-batch frontier is compiled."""
     free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
-    assert_searched(asked(trainer), (4, None), 2, half="all_but_delta_memory")
+    assert asked(trainer) == [(4, None, True)]
 
 
 def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):
-    """Without a delta rule no rung is a half rung: the search asks the batch whole and the splits
-    that find the fewest microbatches that fit, each at no recomputation, and stops there."""
+    """Without a delta rule no rung is a half rung: where the derivation cannot judge the step (its
+    devices state no memory to judge it against), the search asks the batch whole and the splits that
+    find the fewest microbatches that fit, each at no recomputation, and stops there; where it can, the
+    derivation picks the fewest that fit, four, and its one compile confirms them (row 3341)."""
+    from dew.training.planning import FitSearch
+
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
-    trainer = lm()
-    state, _, _ = trainer.place()
-    trials = Trials(state, BATCH)
-    trainer.compile(state, BATCH, trials)
-    assert_searched(asked(trainer), (4, None), 2)
-    assert all(remat is None for _, remat, _ in asked(trainer))
+    for judging in (False, True):
+        with monkeypatch.context() as unjudged:
+            if not judging:
+                unjudged.setattr(FitSearch, "judging", lambda search: False)
+            trainer = lm()
+            state, _, _ = trainer.place()
+            trials = Trials(state, BATCH)
+            trainer.compile(state, BATCH, trials)
+        if judging:
+            assert asked(trainer) == [(4, None, True)]
+        else:
+            assert_searched(asked(trainer), (4, None), 2)
+            assert all(remat is None for _, remat, _ in asked(trainer))
 
 
 def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():

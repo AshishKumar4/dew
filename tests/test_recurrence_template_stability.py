@@ -1,5 +1,5 @@
 """The recurrence template's stability on the path a call takes: its Mosaic GPU mainloop
-(`recurrence_chunk.mosaic_rule`, the template named to the selectors, `chunk_on('mosaic_gpu', ...)`), forward
+(`template.mosaic_rule`, the template named to the selectors, `chunk_on('mosaic_gpu', ...)`), forward
 and fast backward, over every form the stability suite holds (test_recurrence_stability's `SITES`: the gated
 delta rule a decay a head and a key dimension, a write gate without the delta rule, the gated delta net's
 formed gates and Mamba2's rated decay) under its regimes (`REGIMES`: decays near one and near zero, the
@@ -19,6 +19,7 @@ that grow its tiles most for finiteness, and its fast backward's decay gradient 
 or gradient the template refuses (`Mosaic.eligible`, `Mosaic.trains`) is checked refused and skipped, a
 refusal and not numerical coverage (row 1968: the suite held only the portable arms)."""
 
+import contextlib
 import dataclasses
 import functools
 
@@ -116,10 +117,14 @@ def fla_recorded(hooks) -> bool:
     return hooks.delta and hooks.decay != 'none' and hooks.gates is None
 
 
+@contextlib.contextmanager
 def under(forms: str | None):
-    """The run's numerics under `forms`, the run's own where None."""
+    """The run's numerics under `forms`, the run's own where None; the fast forms at the default product
+    precision they round at (`rounds_products`; the suite's lanes configure 'highest')."""
     numerics = generation.numerics()
-    return generation.run_precision(numerics if forms is None else dataclasses.replace(numerics, forms=forms))
+    with (generation.run_precision(numerics if forms is None else dataclasses.replace(numerics, forms=forms)),
+          jax.default_matmul_precision('default') if forms == 'fast' else contextlib.nullcontext()):
+        yield
 
 
 def template_trains(operands: Chunk, hooks) -> bool:

@@ -16,6 +16,7 @@ import grain.python as grain
 from dew.batch import Batch
 from dew.data.dataset import Loading, Ranges
 from dew.data.declared import Declared, Unmirrored, mirrored
+from dew.data.once import locked_cached_property
 from dew.data.storage import Store, local, on_gcs
 
 from .codec import decode
@@ -241,8 +242,11 @@ class ArrayRecords:
     def ranges(self) -> Ranges:
         return Ranges(self.counts or ())
 
-    @cached_property
+    @locked_cached_property
     def reader(self):
+        """Grain's reader of the shards, made once however many read threads first ask for it at once: each
+        made apart would check, pin and open every shard again (row 803: 83 readers made for a cache's 6
+        shards on 16 threads, its replay 3.8 times slower than on one)."""
         paths = []
         for url, declared in zip(self.urls, self.declared, strict=True):
             if declared is not None:

@@ -19,9 +19,9 @@ from flax.core import meta
 from dew.nn.dense import _plain_dense, intercepted
 from dew.nn.precision import biased, float32_dot_general
 
+from .kernels import gemm
 from .kernels.generation import INHERENT, device_generation
 from .kernels.selection import Kernel, Op, Requirement, select
-from .kernels.templates.gemm import template
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,15 +80,19 @@ def join_case(projections: Sequence[nn.Module]) -> JoinCase:
         held=all(projection.has_variable('params', 'kernel') for projection in projections))
 
 
+DELTA_GATES_FASTER = ("e5198da4e: a gated delta net's b and a, 24,576 tokens, forward and backward 5.44 -> "
+                      "5.29 ms on an A100 40GB and 2.006 -> 1.945 on an H100")
+"""The receipt behind the delta net's gates' joined cells."""
+
 JOINED_FASTER = {
-    'gate_up': {'sm80': "dbf402f36: Qwen3.5-0.8B's packed step, 24,576 tokens, one 1024 -> 7168 GEMM for "
-                        "two 1024 -> 3584 ones, 0.36 ms a layer less on an A100 80GB (forward 1.67 -> 1.54, "
-                        "input gradient 1.55 -> 1.49, weight gradient 1.70 -> 1.51 ms); none on an H100"},
-    'delta_gates': dict.fromkeys(('sm80', 'sm90'), "e5198da4e: a gated delta net's b and a, 24,576 tokens, "
-                                                   "forward and backward 5.44 -> 5.29 ms on an A100 40GB and "
-                                                   "2.006 -> 1.945 on an H100"),
+    ('gate_up', 'sm80'): "dbf402f36: Qwen3.5-0.8B's packed step, 24,576 tokens, one 1024 -> 7168 GEMM for "
+                         "two 1024 -> 3584 ones, 0.36 ms a layer less on an A100 80GB (forward 1.67 -> 1.54, "
+                         "input gradient 1.55 -> 1.49, weight gradient 1.70 -> 1.51 ms); none on an H100",
+    ('delta_gates', 'sm80'): DELTA_GATES_FASTER,
+    ('delta_gates', 'sm90'): DELTA_GATES_FASTER,
 }
-"""Each join's receipts by the device generation it measured faster on."""
+"""Each join's cells, (the join, the device generation it measured faster on) to its receipt: a literal of
+them, which each join's selector reads and thresh's declared-set seam registers (.thresh/thresh.cue)."""
 
 
 def _join(choice: str) -> Op[JoinCase]:
@@ -97,10 +101,14 @@ def _join(choice: str) -> Op[JoinCase]:
     return Op(choice, (Kernel('joined', JOIN_SUPPORTS), Kernel('apart', (), generic=True)),
               lambda case: 'apart',
               declared={(device, 'join'): ('joined', receipt)
-                        for device, receipt in JOINED_FASTER[choice].items()})
+                        for (join, device), receipt in JOINED_FASTER.items() if join == choice})
 
 
-JOINS = {choice: _join(choice) for choice in JOINED_FASTER}
+CHOICES = ('gate_up', 'delta_gates')
+"""The joins layers ask for (`joins`): named apart from their cells, so a join whose every cell is retired
+keeps its selector and runs its projections apart."""
+
+JOINS = {choice: _join(choice) for choice in CHOICES}
 """The join's selector of each choice a layer joins projections for."""
 
 
@@ -130,8 +138,8 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
     biases = (jnp.stack([bias for _, _, bias in promoted], axis=axis + 2) if projections[0].use_bias
               else None)
     dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
-    # One matrix product of the kernels side by side, as a Dense takes its own (`template.dot_general`).
-    y = template.dot_general(float32_dot_general)(inputs, kernel.reshape(kernel.shape[0], -1), dimensions,
+    # One matrix product of the kernels side by side, as a Dense takes its own (`gemm.dot_general`).
+    y = gemm.dot_general(float32_dot_general)(inputs, kernel.reshape(kernel.shape[0], -1), dimensions,
                                                   precision=projections[0].precision)
     y = y.reshape(*y.shape[:-1], *kernel.shape[1:])
     if biases is None:

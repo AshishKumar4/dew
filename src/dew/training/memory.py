@@ -21,10 +21,10 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
+from dew._devices import gpu_free_bytes, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
-from dew.devices import gpu_free_bytes, xla_flag
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
@@ -33,6 +33,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
+from dew.telemetry.instrumentation import compiled_memory
 from dew.training.compiled_program import deviceless
 
 if TYPE_CHECKING:
@@ -110,8 +111,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
 
 
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-                        refusals: list[RuntimeError], *, relower: Callable[[], jax.stages.Lowered]
-                        ) -> jax.stages.Compiled | None:
+                        refusals: list[RuntimeError], *, relower: Callable[[], jax.stages.Lowered],
+                        first: report.Attempt | None = None) -> jax.stages.Compiled | None:
     """Return `program` compiled under `options`, or None if XLA refuses it for memory (`refused_for_memory`).
 
     It compiles through the kernel templates' reports (`report.compiled`): where a launch's kernel
@@ -121,10 +122,10 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
     returning an executable whose memory `step_fits` could read, so the refusal means the step does
     not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
     tokens asked for 38.47G of temporaries next to 31.24G of HBM. Any other
-    compile error is raised.
+    compile error is raised. `first` is its first compile where another thread made it (`report.attempts`).
     """
     try:
-        return report.compiled(program, options, relower=relower)
+        return report.compiled(program, options, relower=relower, first=first)
     except jax.errors.JaxRuntimeError as error:
         if not refused_for_memory(error.error_code_string, str(error)):
             raise
@@ -288,11 +289,10 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     free block that large, not that many free bytes in total (`placeable`). Where
     the allocator `strands_temporaries`, they need room twice.
     """
-    stats = executable.memory_analysis()
+    stats = compiled_memory(executable)
     if stats is None:
         return None
-    return admitted(devices, capacity, stats.argument_size_in_bytes - built,
-                    stats.output_size_in_bytes - stats.alias_size_in_bytes + held, stats.temp_size_in_bytes)
+    return admitted(devices, capacity, stats.argument - built, stats.output - stats.alias + held, stats.temp)
 
 
 MEMORY_STATS = ('bytes_limit', 'bytes_in_use', 'pool_bytes', 'largest_free_block_bytes', 'peak_bytes_in_use')
@@ -437,10 +437,8 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
     each of `devices`' allocator stats and free GPU bytes, in bytes. A step
     the check passed and the devices then refused is read from it, with the
     pool Dew sized for the host's communicators (`dew.communicators.held`)."""
-    stats = executable.memory_analysis()
-    analysis: JSON = None if stats is None else {
-        name: int(getattr(stats, f"{name}_size_in_bytes", 0) or 0)
-        for name in ("argument", "output", "alias", "temp", "generated_code")}
+    stats = compiled_memory(executable)
+    analysis: JSON = None if stats is None else stats._asdict()
     devices_stats: list[JSON] = []
     for device in devices:
         memory = device_memory(device)
@@ -512,15 +510,20 @@ def temporaries_factor(mesh: Mesh, capacity: int | None = None) -> int:
                for device in local)
 
 
-def fits_everywhere(headroom: int | None) -> bool:
-    """Whether every process's headroom is non-negative, with the same answer on every process.
-
-    A process reads only its own devices' memory, so the pool takes the minimum;
-    a process that reports none does not affect the result.
-    """
+def pooled_headroom(headroom: int | None) -> int | None:
+    """The pool's headroom, the same on every process: the tightest any process states of its own devices
+    (`headroom`, a compile's measure or a derivation's judgment), which reads only its own devices' memory;
+    a process that states none does not affect it, and None where none states one."""
     from dew._coordination import from_every_process
 
-    return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
+    return min((value for value in from_every_process(headroom) if value is not None), default=None)
+
+
+def fits_everywhere(headroom: int | None) -> bool:
+    """Whether every process's headroom is non-negative, with the same answer on every process
+    (`pooled_headroom`): a pool where no process states one fits."""
+    pooled = pooled_headroom(headroom)
+    return pooled is None or pooled >= 0
 
 
 def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,

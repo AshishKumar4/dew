@@ -20,6 +20,8 @@ import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.nn.derivatives import contracted
+
 from .attention_kernels import ATTENTION, DECODE, TPU_BACKEND, AttentionCase, decodes
 from .attention_masks import (
     combined_attention_mask,
@@ -55,7 +57,16 @@ from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
-from .precision import asks_default_precision, at_least_fp32, capped_logits, float32_einsum
+from .precision import (
+    asks_default_precision,
+    at_least_fp32,
+    at_precision,
+    capped_logits,
+    configurable_precision,
+    configured_precision,
+    exact_products,
+    float32_einsum,
+)
 from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
@@ -439,7 +450,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation: AttentionImpl = 'auto',
-                                 causal=False, sliding_window=None, mask=None, bias=None,
+                                 causal=False, sliding_window=None, mask=None, bias=None, wide_logits=False,
                                  sinks=None, softcap=None, segment_ids=None, max_segments=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
                                  dropout_rng=None, deterministic=True, key_segment_ids=None,
@@ -459,7 +470,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     the row index, so a decode step against a cache passes `mask` instead.
     `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table).
     `sinks` is one learned value-free logit per query head in the denominator.
-    `softcap` is Gemma 2's tanh on the scaled logits. `segment_ids` `[B, S]`
+    `softcap` is Gemma 2's tanh on the scaled logits. `wide_logits` forms them
+    wide, which the reference alone does (`reference_only`). `segment_ids` `[B, S]`
     keeps each packed document to itself, 0 as padding (`document_mask`), and
     `max_segments`, static, bounds the documents a row holds
     (`Coordinates.max_segments`), which flash's packed sequences need.
@@ -514,7 +526,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         key_value_seq_lengths = key_value_seq_starts = key_valid = key_runs = places = None
         implementation = kernel_for_materialized_mask(
             implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax)
+            force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     if (isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
             and shards > 1):
         # Only a single device's kernels read documents aligned to their last keys; elsewhere they
@@ -536,11 +548,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         causal, sliding_window, segment_ids = False, None, None
         implementation = kernel_for_materialized_mask(
             implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax)
+            force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-        softcap=softcap)
+        softcap=softcap, wide_logits=wide_logits)
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
@@ -654,6 +666,12 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
 
 FORWARD_MODE = contextvars.ContextVar("forward_mode_attention", default=False)
 
+REVERSE_ONLY = ('cudnn', 'triton', 'flash', 'tpu', 'template')
+"""The kernels that define their reverse-mode derivative alone (`jax.custom_vjp`), its backward traced after
+the call: forward mode takes theirs from the reference path (`forward_differentiable`), and a call's stated
+precision is held over that backward (`at_precision`). The others are JAX's own products (xla) or state
+their own (decode), which their tangents and transposes keep."""
+
 
 @contextlib.contextmanager
 def forward_mode_attention():
@@ -678,7 +696,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                      softcap=None, segment_ids=None, max_segments=None, key_value_seq_lengths=None,
                      key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
                      key_runs=None,
-                     places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None):
+                     places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None,
+                     wide_logits: bool = False):
     """Dispatch one whole-sequence attention call to the kernel it names,
     differentiable in forward mode under `forward_mode_attention`.
 
@@ -703,7 +722,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         return decode_attention.grouped_query(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths,
-            key_value_seq_starts=key_value_seq_starts), query, key, value)
+            key_value_seq_starts=key_value_seq_starts, wide_logits=wide_logits), query, key, value)
     lengths = (None if key_value_seq_lengths is None
                else jnp.asarray(key_value_seq_lengths, jnp.int32))
     starts = None if key_value_seq_starts is None else jnp.asarray(key_value_seq_starts, jnp.int32)
@@ -715,18 +734,20 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
         segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths,
         key_value_seq_starts=starts, block_groups=block_groups, image_groups=image_groups,
-        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None).ran
+        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None,
+        wide_logits=wide_logits).ran
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts,
         block_groups=block_groups, image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-        places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed, dropout_places=dropout_places)
+        places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed, dropout_places=dropout_places,
+        wide_logits=wide_logits)
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
                         key_runs=key_runs,
                         places=places)
-    if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu', 'template'):
+    if not FORWARD_MODE.get() or resolved not in REVERSE_ONLY:
         return _read_nothing(call(query, key, value, bias=bias, sinks=sinks, implementation=resolved), live)
 
     def fused(query, key, value, bias, sinks):
@@ -750,6 +771,7 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
     CPU) takes its moving operands alone."""
     from jax.custom_derivatives import SymbolicZero
 
+    @contracted("test_a_fused_attention_call_in_forward_mode_holds_every_order")
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)
@@ -779,7 +801,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                       force_fp32_for_softmax, causal, sliding_window, mask, masked, softcap,
                       segment_ids, max_segments, lengths, starts, block_groups=None, image_groups=None,
                       key_valid=None, key_runs=None, places=None, dropout_rate=0.0, dropout_seed=None,
-                      dropout_places=None):
+                      dropout_places=None, wide_logits: bool = False):
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
@@ -825,7 +847,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
             precision = jax.lax.Precision.HIGHEST
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
-                                   force_fp32_for_softmax=force_fp32_for_softmax,
+                                   force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    dropout_rate=dropout_rate, dropout_seed=dropout_seed,
                                    dropout_places=dropout_places)
 
@@ -833,27 +855,46 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     if implementation not in ('decode', 'template'):
         mask = with_key_starts(mask, starts, key.shape[-3])
         starts = None
-    return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
-                            implementation, softcap=softcap, sinks=sinks,
-                            segment_ids=segment_ids, max_segments=max_segments,
-                            key_value_seq_lengths=lengths, key_value_seq_starts=starts,
-                            block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
-                            key_runs=key_runs,
-                            places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-                            dropout_places=dropout_places)
+
+    def fused(query, key, value, bias, sinks):
+        return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
+                                implementation, softcap=softcap, sinks=sinks,
+                                segment_ids=segment_ids, max_segments=max_segments,
+                                key_value_seq_lengths=lengths, key_value_seq_starts=starts,
+                                block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
+                                key_runs=key_runs,
+                                places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
+                                dropout_places=dropout_places)
+    # A kernel whose products take no precision of their own (jax.nn's xla attention, Pallas dots: the
+    # template's portable mainloop, splash and its flash fallback) multiplies at the call's stated
+    # precision: a reverse-only kernel's backward, traced after the call, held at it too (`at_precision`),
+    # and JAX's own products by the forward's scope alone, which their tangents and transposes keep, so
+    # forward mode differentiates them as written. A stated default is a floor the run's configured
+    # precision meets, and a kernel that states its own keeps it.
+    if implementation in REVERSE_ONLY and not asks_default_precision(precision):
+        return at_precision(precision)(fused)(query, key, value, bias, sinks)
+    with configured_precision(precision):
+        return fused(query, key, value, bias, sinks)
 
 
-def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
+def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits: bool = False) -> bool:
     """Whether a call asks for arithmetic only the reference path performs.
 
-    The three are what every fused kernel's requirements refuse
-    (`attention_kernels`' arithmetic requirement): a matmul precision other
-    than DEFAULT (a higher one, a dot algorithm or a preset of one), a
-    softmax outside fp32, and a compute dtype other than the inputs'.
+    The four are what every fused kernel's requirements refuse
+    (`attention_kernels`' arithmetic requirement): a matmul precision, stated
+    or the run's configured one, that whole products of the query's dtype
+    with fp32 sums do not compute (`exact_products`: a dot algorithm that
+    narrows the operands or widens them; any level, a 16-bit operand's
+    exact products at 'highest' among them) or that no config names (a
+    pair, a dot algorithm: `configurable_precision`), which a fused kernel
+    whose products take none of their own runs at (`_attention_kernel`), a
+    softmax outside fp32, a compute dtype other than the inputs', and logits
+    formed from queries and keys widened to at least fp32 (`wide_logits`).
     """
-    return (not asks_default_precision(precision)
+    return (not exact_products(precision, query.dtype) or not configurable_precision(precision)
             or not force_fp32_for_softmax
-            or (dtype is not None and jnp.dtype(dtype) != query.dtype))
+            or (dtype is not None and jnp.dtype(dtype) != query.dtype)
+            or wide_logits)
 
 
 def _xla_kernel_narrows(query) -> bool:
@@ -873,7 +914,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
                    block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
-                   dropout: bool = False, named: str = 'auto') -> AttentionCase:
+                   dropout: bool = False, wide_logits: bool = False, named: str = 'auto') -> AttentionCase:
     """The `AttentionCase` of a call `scaled_dot_product_attention` takes under the `named`
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
@@ -897,7 +938,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         row_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1
                   and jnp.shape(bias)[0] > 1),
         sinks=sinks is not None, softcap=softcap,
-        arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
+        arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards(), dropout=dropout,
@@ -916,7 +957,7 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                            sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
                            key_value_seq_lengths=None, key_value_seq_starts=None, block_groups=None,
                            image_groups=None, key_valid=None, key_runs=None, places=None,
-                           dropout: bool = False) -> Route:
+                           dropout: bool = False, wide_logits: bool = False) -> Route:
     """The route an `AttentionImpl` takes for this call on this host (`Route.ran` its kernel,
     `Route.forced` what forced it), as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
@@ -935,7 +976,7 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                           key_value_seq_lengths=key_value_seq_lengths,
                           key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                           image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
-                          dropout=dropout, named=implementation)
+                          dropout=dropout, wide_logits=wide_logits, named=implementation)
     if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
         return select(ATTENTION, case, None if implementation == 'auto' else implementation)
     if implementation == 'xla':
@@ -946,7 +987,7 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
 
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,
-                                 force_fp32_for_softmax=True) -> AttentionImpl:
+                                 force_fp32_for_softmax=True, wide_logits: bool = False) -> AttentionImpl:
     """The kernel a call that built an explicit mask runs: a kernel the call names, cuDNN aside, which runs
     the mask as xla does; else the attention selector's (`_masked_kernel`): one a run's context forces
     (`generation.chosen`), else the xla kernel, the reference path where xla hands the call on.
@@ -963,11 +1004,12 @@ def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, d
         return implementation
     return _masked_kernel(implementation, 'xla' if implementation == 'xla' else None, query, key,
                           ('xla', 'reference'), dtype=dtype, precision=precision,
-                          force_fp32_for_softmax=force_fp32_for_softmax)
+                          force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
 
 
 def mask_kernel(implementation: AttentionImpl, query, key, *, as_bias: bool, dtype=None, precision=None,
-                force_fp32_for_softmax=True, softcap=None, sinks: bool = False) -> AttentionImpl:
+                force_fp32_for_softmax=True, softcap=None, sinks: bool = False,
+                wide_logits: bool = False) -> AttentionImpl:
     """The kernel a call that built its mask runs, decided where the call builds it: where the mask suits
     cuDNN's dense bias (`as_bias`: a window's band, a forward-only cache call over several queries) and the
     call chooses ('auto') or names cudnn, cuDNN where it takes the call, then xla (a call cuDNN cannot
@@ -976,16 +1018,17 @@ def mask_kernel(implementation: AttentionImpl, query, key, *, as_bias: bool, dty
     (`generation.chosen`) is taken as forced."""
     if not (as_bias and implementation in ('auto', 'cudnn')):
         return kernel_for_materialized_mask(implementation, query, key, dtype=dtype, precision=precision,
-                                            force_fp32_for_softmax=force_fp32_for_softmax)
+                                            force_fp32_for_softmax=force_fp32_for_softmax,
+                                            wide_logits=wide_logits)
     return _masked_kernel(implementation, None if implementation == 'auto' else implementation, query, key,
                           ('cudnn', 'xla', 'reference'), dtype=dtype, precision=precision,
                           force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-                          as_bias=True)
+                          as_bias=True, wide_logits=wide_logits)
 
 
 def _masked_kernel(implementation: AttentionImpl, named: str | None, query, key,
                    preference: tuple[str, ...], *, dtype, precision, force_fp32_for_softmax, softcap=None,
-                   sinks: bool = False, as_bias: bool = False) -> AttentionImpl:
+                   sinks: bool = False, as_bias: bool = False, wide_logits: bool = False) -> AttentionImpl:
     """The attention selector's kernel for a call of `implementation` with a mask (`selection.selected`,
     reporting nothing: the dispatch that runs it reports its route): `named` where it takes the call, else
     one a run's context forces, else `preference`'s first that takes it, the reference path where xla hands
@@ -996,7 +1039,7 @@ def _masked_kernel(implementation: AttentionImpl, named: str | None, query, key,
     case = dataclasses.replace(
         attention_case(query, key, dtype=dtype, precision=precision,
                        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,
-                       sinks=True if sinks else None, named=implementation),
+                       sinks=True if sinks else None, wide_logits=wide_logits, named=implementation),
         folds=False, **form)
     return attention_implementation(ATTENTION.hosted(selected(ATTENTION, case, named,
                                                               preference=preference).name))

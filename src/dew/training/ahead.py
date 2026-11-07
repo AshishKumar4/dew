@@ -57,9 +57,9 @@ import numpy as np
 from jax.experimental import serialize_executable
 
 from dew import communicators
+from dew._cache import uncached
 from dew._records import JSON, record
 from dew.batch import Batch
-from dew.cache import uncached
 from dew.nn.kernels.generation import (
     GpuTarget,
     assumed,
@@ -74,7 +74,7 @@ from dew.nn.kernels.generation import (
 from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
-from dew.telemetry.instrumentation import StepFlops, step_flops
+from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
@@ -259,6 +259,10 @@ class AheadOfTime:
     """The kernel launch configs its compiles found spilling and refused
     (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
     lowers (`FitSearch`), so its derivations step down as the compile's did and it lowers this program."""
+    substituted: tuple[str, ...] = ()
+    """Each kernel its routes lowered another in place of, as this host lowers no such kernel (`substituted`:
+    FlashAttention without its wheel, cuDNN with no GPU attached): where any, the program is not the one the
+    target's GPU runs, which a measure of the target's compile reads as unsupported (tools/perf_gate.py)."""
 
     @property
     def peak_bytes(self) -> int:
@@ -478,22 +482,31 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     only loads and runs (`AheadPrograms.loaded`, ledger 2716). Arguments and results are placed whole on that
     GPU, whatever the function reads. A function takes and returns arrays (a backward is a program of its own
     over its residuals); one whose program holds arrays it closed over is refused, named, as no executable
-    serializes them."""
+    serializes them. Each is lowered in turn and all compile at once (`report.compiled_at_once`)."""
     target = built_target(generation, multiprocessors)
     devices = compile_only_gpus(generation, multiprocessors=multiprocessors)
     mesh = jax.sharding.Mesh(np.asarray(devices), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-    built = {}
+    lowerings, taken = [], {}
     for name, (function, arguments) in programs.items():
         shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed)
                        for argument in arguments)
-        # Through Dew's compile point, as a run compiles it: a launch whose kernel spills there is derived
-        # again at its next config.
-        program = owned_program(function, out_shardings=placed)
-        with (assumed(target), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)), uncached(),
-              routes() as taken):
-            compiled = program.compiled(*shapes)
-        if missing := substituted(taken):
+
+        def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
+            """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
+            with (assumed(target), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
+                  routes() as routed):
+                program = owned_program(function, out_shardings=placed).lower(*shapes)
+            taken[name] = routed
+            return program
+        lowerings.append((lowered(), None, lowered))
+    # Through Dew's compile point, as a run compiles them, at once (`report.compiled_at_once`): a launch
+    # whose kernel spills there is derived again at its next config.
+    with uncached():
+        executables = report.compiled_at_once(lowerings)
+    built = {}
+    for name, compiled in zip(programs, executables, strict=True):
+        if missing := substituted(taken[name]):
             _log.warning("program %r compiled ahead for %s with kernels this host cannot lower: %s", name,
                          generation, "; ".join(missing))
         try:
@@ -739,7 +752,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         # A resumed run's step compiles at the rung its checkpoint records, as its resume would.
         trainer._resume_rung(trainer.checkpoints.rung(start.resume))
     # A TPU topology's executable loads onto no client here: the persistent cache neither reads an entry
-    # for it nor writes one (`dew.cache.uncached`).
+    # for it nor writes one (`dew._cache.uncached`).
     on = generation if stated is None else stated
     with assumed(on), uncached() if on_tpus else contextlib.nullcontext(), routes() as taken:
         target = gpu_target()
@@ -751,16 +764,15 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
-    memory = compiled.memory_analysis()
+    memory = compiled_memory(compiled)
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), program_of(lowered),
         Executable.of(compiled),
         flops=step_flops(compiled),
-        argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
-        alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
-        code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
+        argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
+        temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices)),
-        refusals=report.refused_launches(), sampled=sampled)
+        refusals=report.refused_launches(), sampled=sampled, substituted=tuple(missing))

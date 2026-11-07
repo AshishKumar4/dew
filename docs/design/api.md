@@ -258,7 +258,7 @@ self.q_proj = Dense(heads * head_dim, kernel_axes=("embed", "heads"), name="q_pr
 self.scale = self.param("scale", declared(nn.initializers.ones, ("embed",)), (width,))
 ```
 
-Each parameter's logical axes are declared where its module draws it, in Flax's own partitioning box (`nn.with_logical_partitioning`; `dew.nn.sharding.declared`, `Dense(kernel_axes=...)`), so a model's `init` returns its parameters boxed, as Flax's partitioning and MaxText read them. A run reads its objective's draw once, traced for its shapes alone, into one table by each parameter's path (`Objective.parameter_axes`); every tree enters Dew plain (`dew.nn.sharding.unboxed`, no constraint applied), and `Layout` and Muon read the run's table. There is no process-wide table of module names: a parameter takes the axes its own module names, whatever another model calls its modules. `tests/test_placement_snapshot.py` holds every parameter of every catalogued model, its optimizer state and EMA beside two, to the placement recorded at the main the declarations moved from.
+Each parameter's logical axes are declared where its module draws it, in Flax's own partitioning box (`nn.with_logical_partitioning`; `dew.nn.sharding.declared`, `Dense(kernel_axes=...)`), so a model's `init` returns its parameters boxed, as Flax's partitioning and MaxText read them. A run reads its objective's draw once, traced for its shapes alone, into one table by each parameter's path (`Objective.parameter_axes`); every tree enters Dew plain (`dew.nn.sharding.unboxed`, no constraint applied), and `Layout` and Muon read the run's table. There is no process-wide table of module names: a parameter takes the axes its own module names, whatever another model calls its modules. `tests/test_placement.py` holds every parameter of every catalogued model, its optimizer state and EMA beside two, to the layout's invariants: each split names only mesh axes its declared axes' rules name, divides its dimension and splits it once; a leaf below the layout's floor stays whole and one a rule can split is split; an undeclared leaf splits its largest dimension fsdp divides; the optimizer state and EMA sit as their parameters do; and a step so placed trains on par with one device, a pipeline's load on the mesh holds its values and the training state's placement.
 
 ### 3.9 Config and CLI
 
@@ -330,7 +330,10 @@ reads a request's answer off its rows' outputs (`answer`). The server runs one p
 waiting rows oldest first, so a request whose rows outrun a pass carries the rest to the next turn.
 It binds each request to the (task, weights) pair that admitted it, so a reload swaps both at once
 for what is submitted after. `Decide.scoring()` gives a decision task as such a task, and
-`Decide.systemone` over a list of bodies is served by the same server.
+`Decide.systemone` over a list of bodies is served by the same server. `TextToImage.scoring()` gives
+a text-to-image task as one too: an `ImageRequest` (prompts, key and its own steps, guidance, solver
+and negatives) is one row, a pass walks requests alike as one program mapped over them, and each
+request draws what its lone call draws under its key.
 
 ## 4. The three examples in this API
 

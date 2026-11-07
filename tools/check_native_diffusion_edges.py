@@ -1,8 +1,7 @@
-"""Native edge checks against diffusers, live: the source's timesteps exactly and its noise tables as
-near float64 as the source's float32 (tools/native_diffusion_edges_reference.py records both), and
-every walk, and the tiny UNet's output and its gradients, in evaluation and in training, on par with
-diffusers' float32 run over drawn inputs, both measured from diffusers' run in float64 (check 1,
-tests/reference_error.py)."""
+"""Native edge checks against diffusers, live: the source's timesteps and its beta tables exactly
+(tools/native_diffusion_edges_reference.py records both), and every walk, and the tiny UNet's output
+and its gradients, in evaluation and in training, on par with diffusers' float32 run over drawn inputs,
+both measured from diffusers' run in float64 (check 1, tests/reference_error.py)."""
 import argparse
 import json
 import sys
@@ -67,9 +66,11 @@ def check_schedule(ref, case):
 
     config = json.loads(str(ref[case + ".config"]))
     policy = SourceSchedule.from_config(config)
-    # The table is a function of the config alone, with no draw to vary: one comparison holds it.
-    assert_as_exact_as_the_reference(policy.betas, ref[case + ".betas"], ref[case + ".betas.fp64"],
-                                     f"{case} betas")
+    # The table is a function of the config alone, with no draw to vary: the source's float32 table to
+    # the bit, or, rescaled for zero terminal SNR, its float64 table rounded once (`published_betas`),
+    # held so by docs/design/testing.md's exact-table rule (row 4569).
+    table = ref[case + (".betas.fp64" if config.get("rescale_betas_zero_snr", False) else ".betas")]
+    np.testing.assert_array_equal(policy.betas, table.astype(np.float32), err_msg=f"{case} betas")
     process, times = policy.sampling(STEPS)
     model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
     expected_times = ref[case + ".times"]
@@ -101,6 +102,7 @@ def check_schedule(ref, case):
 
         return oracle_walk(source.from_config(drawn(jitter)), initial, torch.float32)
 
+    @as_given
     def truth(initial, jitter):
         import torch
 
@@ -148,6 +150,7 @@ def check_unet(directory, case):
 
     reference = torch_arm(source)
 
+    @as_given
     def truth(*inputs):
         with float64():
             return torch_arm(wide)(*inputs)
@@ -167,7 +170,6 @@ def check(directory, case):
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from one_draw import assert_as_exact_as_the_reference
     from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
     parser = argparse.ArgumentParser(description=__doc__)

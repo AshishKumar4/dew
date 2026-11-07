@@ -535,9 +535,11 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
     backward stochastically (`bwd_qtype`, `bwd_stochastic_rounding`) draws its inner steps' rounding
     from its request's own key (`dew.sampling.text.rounding_keys`), Titans' MLP and a linear memory
     whose cache holds the recurrence's state alike: a task call and one live server each repeat a
-    request alike, and another key moves its likelihoods though greedy decoding draws nothing. A row's
-    stream is its own (`test_a_cached_memorys_rounding_is_each_rows_own`). Without the stream the decode
-    raised in Qwix's make_rng (ledger 2020)."""
+    request alike, and another key moves its likelihoods though greedy decoding draws nothing. The
+    server is built with RBG the default and serves outside that context, its streams of the
+    implementation its cache was opened with (3943). A row's stream is its own
+    (`test_a_cached_memorys_rounding_is_each_rows_own`). Without the stream the decode raised in Qwix's
+    make_rng (ledger 2020)."""
     pytest.importorskip("qwix")
     from model_support import Digits
 
@@ -552,7 +554,8 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
                           sampling=Sampling(temperature=0, eos_token_ids=12))
     bound = task.quantized(Quantization(patterns=(INNER,), bwd_qtype="int8",
                                         bwd_stochastic_rounding="uniform"))
-    server = Server.from_task(bound, slots=2, capacity=64)
+    with jax.default_prng_impl("rbg"):
+        server = Server.from_task(bound, slots=2, capacity=64)
 
     def likelihoods(result) -> np.ndarray:
         return np.asarray(result.raw_log_probs)
@@ -763,7 +766,9 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
             climbed.append(stronger)
         return marked, [rung.recompute_record() for rung in climbed]
 
-    with chosen(gated_delta_rule="fla"):
+    # The port at the default product precision its fp32 products are declared at
+    # (`recurrence_chunk._port_precision`; the suite's lanes configure 'highest').
+    with chosen(gated_delta_rule="fla"), jax.default_matmul_precision("default"):
         delta, delta_rungs = kept(layer("delta_rule"))
         quantized, _ = kept(layer("delta_rule"), quantized=True)
     titans, titans_rungs = kept(layer("titans"))

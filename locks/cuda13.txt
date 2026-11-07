@@ -625,7 +625,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post51
+jax==0.12.0.1.post60
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -934,6 +934,8 @@ nvidia-cuda-cupti==13.4.92
     # via jax-cuda13-plugin
 nvidia-cuda-nvcc==13.4.92
     # via jax-cuda13-plugin
+nvidia-cuda-nvdisasm==13.4.92
+    # via dewml (pyproject.toml)
 nvidia-cuda-nvrtc==13.4.92
     # via
     #   jax-cuda13-plugin
@@ -1367,7 +1369,7 @@ pyzmq==27.2.0
     #   ipykernel
     #   jupyter-client
     #   jupyter-server
-qwix==0.1.8.post2
+qwix==0.1.8.post4
     # via
     #   dewml (pyproject.toml)
     #   tokamax

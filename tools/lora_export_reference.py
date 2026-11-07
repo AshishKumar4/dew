@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import json
 import sys
@@ -148,13 +149,13 @@ def digest(path: Path) -> str:
     return hashed.hexdigest()
 
 
-def pipeline_inputs(source: Path, family: str) -> dict[str, np.ndarray]:
-    """Fixed inputs in Dew's layout: a channels-last latent, the model time
-    (a training timestep), a text context, and for FLUX and SD3 a pooled
-    row and FLUX's distilled guidance."""
+def pipeline_inputs(source: Path, family: str, seed: int = 0) -> dict[str, np.ndarray]:
+    """A seed's inputs in Dew's layout (check 1's draw, which the test draws again): a channels-last
+    latent, the model time (a training timestep), a text context, and for FLUX and SD3 a pooled row and
+    FLUX's distilled guidance."""
     component = "unet" if family == "sd" else "transformer"
     config = json.loads((source / component / "config.json").read_text())
-    generator = np.random.default_rng(7)
+    generator = np.random.default_rng([7, seed])
     if family == "sd":
         return {"latent": generator.standard_normal((1, 8, 8, config["in_channels"]), dtype=np.float32),
                 "context": generator.standard_normal((1, 6, config["cross_attention_dim"]), dtype=np.float32),
@@ -239,29 +240,36 @@ def _pipeline(family: str, source: Path, dtype):
     return cls.from_pretrained(source, torch_dtype=dtype, **dict.fromkeys(towers))
 
 
-def pipeline_outputs(family: str, adapter: Path, arrays: Mapping[str, np.ndarray],
-                     wide: bool) -> dict[str, np.ndarray]:
-    """The pipeline's denoiser with the adapter `load_lora_weights` reads,
-    without it, and with it fused into the weights."""
+@contextlib.contextmanager
+def pipeline_outputs(family: str, adapter: Path, *, wide: bool):
+    """A function of a draw's inputs giving the pipeline's denoiser on them with the adapter
+    `load_lora_weights` reads, without it, and with it fused into the weights: the pipelines loaded once
+    for every draw, one adapted and one fused."""
     import torch
     from safetensors.numpy import load_file
 
     from tools.diffusers_consumer import precision
 
     component = "unet" if family == "sd" else "transformer"
+    # The float64 context only while loading and running: the other precision's pipelines run between.
     with source_directory(family) as source, precision(wide):
-        pipe = _pipeline(family, source, torch.float64 if wide else torch.float32)
-        pipe.load_lora_weights(adapter)
-        model = getattr(pipe, component)
-        assert_landed(model, load_file(str(adapter / "pytorch_lora_weights.safetensors")), f"{component}.")
-        with torch.no_grad():
+        pipes = [_pipeline(family, source, torch.float64 if wide else torch.float32) for _ in range(2)]
+        for pipe in pipes:
+            pipe.load_lora_weights(adapter)
+            weights = load_file(str(adapter / "pytorch_lora_weights.safetensors"))
+            assert_landed(getattr(pipe, component), weights, f"{component}.")
+        pipes[1].fuse_lora()
+    model, fused = (getattr(pipe, component) for pipe in pipes)
+
+    def run(arrays):
+        with torch.no_grad(), precision(wide):
             adapted = _prediction(family, model, arrays, wide)
-            pipe.disable_lora()
+            pipes[0].disable_lora()
             plain = _prediction(family, model, arrays, wide)
-            pipe.enable_lora()
-            pipe.fuse_lora()
-            merged = _prediction(family, model, arrays, wide)
-    return {"adapted": adapted, "merged": merged, "base": plain}
+            pipes[0].enable_lora()
+            return {"adapted": adapted, "merged": _prediction(family, fused, arrays, wide), "base": plain}
+
+    yield run
 
 
 def consume() -> None:
@@ -277,22 +285,33 @@ def consume() -> None:
     # Before Diffusers' pipelines: the transformers names they import.
     restore_transformers_names()
 
+    from tools.recorded_references import input_digest, record_case
+
     FIXTURES.mkdir(parents=True, exist_ok=True)
     for name, case in PIPELINES.items():
         adapter = FIXTURES / name
-        with source_directory(case.source) as source:
-            arrays = pipeline_inputs(source, case.source)
-        for precision, wide in (("fp32", False), ("fp64", True)):
-            outputs = pipeline_outputs(case.source, adapter, arrays, wide)
-            arrays.update({f"{precision}.{kind}": value for kind, value in outputs.items()
-                           if kind != "base" or not wide})
+        with (source_directory(case.source) as source,
+              pipeline_outputs(case.source, adapter, wide=False) as narrow,
+              pipeline_outputs(case.source, adapter, wide=True) as wide):
+            movements = {}
+
+            def evaluate(inputs, narrow=narrow, wide=wide, movements=movements):
+                found, truth = narrow(inputs), wide(inputs)
+                # How far the adapter moves the float64 prediction off its base, which the test holds
+                # well above rounding at every recorded seed, or check 1 would hold the base model alone.
+                movements[int(input_digest(inputs))] = np.abs(truth["adapted"] - truth["base"]).max()
+                return ({kind: found[kind] for kind in ("adapted", "merged")},
+                        {kind: truth[kind] for kind in ("adapted", "merged")})
+
+            arrays = record_case("prediction", functools.partial(pipeline_inputs, source, case.source),
+                                 evaluate, store_inputs=False)
+            arrays["prediction.movement"] = np.asarray([movements[int(digest)]
+                                                        for digest in arrays["prediction.input_digest"]])
         meta = {"peft": peft.__version__,
                 "transformers": transformers.__version__, "diffusers": diffusers.__version__,
                 "torch": torch.__version__}
         saved_fixture(FIXTURES / f"{name}.npz", arrays, meta)
-        gap = float(np.abs(arrays["fp32.adapted"] - arrays["fp64.adapted"]).max())
-        moved_by = float(np.abs(arrays["fp32.adapted"] - arrays["fp32.base"]).max())
-        print(f"{name}: fp32 off float64 by {gap:.3g}, the adapter moves the output by {moved_by:.3g}")
+        print(f"{name}: recorded over {int(arrays['prediction.seeds'])} seeds")
 
 
 def export() -> None:

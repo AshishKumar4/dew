@@ -31,11 +31,12 @@ import traceback
 import jax
 import jax.numpy as jnp
 from benchmark_recurrence import SHAPES, operands
-from jax.experimental.mosaic.gpu import profiler
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.options import program
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, recomputing
+from dew.telemetry.benchmark import device_time
+from dew.training.memory import peak_memory_gib
 
 DELTA = ('qwen3.5-27b-gdn', 'qwen3-next-gdn', 'kimi-linear-kda')
 """The delta-rule shapes the template's forward takes: a decay a head (Qwen3.5-27B's and Qwen3-Next's
@@ -53,20 +54,18 @@ KERNELS = 40
 def measured(compiled, args, warmup: int, repeats: int) -> tuple[float, list]:
     """The median of `repeats` calls' device milliseconds after `warmup`, every kernel of a call summed, and
     the heaviest kernels' medians."""
-    cupti = profiler.Cupti(finalize=False)
     times, kernels = [], {}
-    for index in range(warmup + repeats):
-        _, read = cupti.measure(compiled, aggregate=False)(*args)
-        if index < warmup:
-            continue
-        times.append(sum(ms for _, ms in read or []))
-        summed = {}
-        for name, ms in read or []:
-            summed[name] = summed.get(name, 0.0) + ms
-        for name, ms in summed.items():
-            kernels.setdefault(name, []).append(ms)
-    # A finalizing read detaches CUPTI from the process.
-    profiler.Cupti().measure(compiled, aggregate=False)(*args)
+    with device_time() as device:
+        for index in range(warmup + repeats):
+            read = device.kernels(compiled, *args)
+            if index < warmup:
+                continue
+            times.append(sum(ms for _, ms in read))
+            summed = {}
+            for name, ms in read:
+                summed[name] = summed.get(name, 0.0) + ms
+            for name, ms in summed.items():
+                kernels.setdefault(name, []).append(ms)
     top = sorted(((name[:80], round(statistics.median(ms), 4)) for name, ms in kernels.items()),
                  key=lambda item: -item[1])[:KERNELS]
     return statistics.median(times), top
@@ -106,7 +105,8 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
 def rows(name: str, arm: str, dtype, warmup: int, repeats: int, training: bool = False,
          rounds: int = 1) -> list[dict]:
     """The arm's pass at the shape compiled once and timed `rounds` times (`measured`), a row a round: its
-    compile time (the first round's), its program's memory and the device's peak so far."""
+    compile time (the first round's), its program's memory and the device's peak so far, None where its
+    allocator keeps no high-water (`peak_memory_gib`: a missing measurement stays missing, bible §6)."""
     found = []
     base = {'shape': name, 'arm': arm, 'pass': 'training' if training else 'forward',
             'dtype': jnp.dtype(dtype).name, 'device': jax.devices()[0].device_kind}
@@ -120,8 +120,8 @@ def rows(name: str, arm: str, dtype, warmup: int, repeats: int, training: bool =
         for index in range(rounds):
             row = {**base, 'round': index}
             row['ms'], row['kernels'] = measured(compiled, args, warmup, repeats)
-            stats = jax.devices()[0].memory_stats() or {}
-            row['peak_mb'] = round(stats.get('peak_bytes_in_use', 0) / 2**20, 1)
+            peak = peak_memory_gib()
+            row['peak_mb'] = None if peak is None else round(peak * 1024, 1)
             found.append(row)
     except Exception as error:  # an arm's failure is its row's
         found.append({**base, 'error': f"{type(error).__name__}: {str(error)[:2000]}",

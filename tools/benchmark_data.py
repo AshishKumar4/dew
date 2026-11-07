@@ -50,6 +50,9 @@ from absl import flags
 from dew.data import Loading
 from dew.data.dataset import Forwarding
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from receipt_paths import named, recorded
+
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
 
@@ -74,7 +77,7 @@ def flowers(batch: int) -> "Pipeline":
 class Benchmark:
     data: str | None = None
     """The chain to time: a Python file whose `data` is one, a chain's `.json` record, or a store's
-    URL read in batches of `batch` (`dew.cli.main.chain_of`); none times Oxford Flowers (`flowers`)."""
+    URL read in batches of `batch` (`dew._cli.main.chain_of`); none times Oxford Flowers (`flowers`)."""
     batch: int = 32
     """Global batch size, where the chain states none."""
     steps: int = 100
@@ -125,7 +128,7 @@ def benchmark(args: list[str]) -> Benchmark:
 
 
 def main(config: Benchmark) -> None:
-    from dew.cli.main import chain_of
+    from dew._cli.main import chain_of
     from dew.data.compile import compile
 
     chain = flowers(config.batch) if config.data is None else chain_of(config.data, "train")
@@ -687,9 +690,10 @@ def host_facts() -> dict:
     counts and the cgroup files it reads, so an arm's record says why its workers were what they were."""
     import psutil
 
-    from dew.data.dataset import Host, _own_cgroup
+    from dew.data import cgroups
+    from dew.data.dataset import Host
 
-    group = _own_cgroup()
+    group = cgroups.own()
     read = ("cpu.max", "memory.max", "memory.current", "memory.stat")
     files = {name: (group / name).read_text().strip()[:2000] for name in read if (group / name).is_file()}
     host = Host.current()
@@ -785,19 +789,6 @@ def comparison(rows: list[dict]) -> list[dict]:
                if "cold_first_batch_from_open_seconds" in verdict else {})}
         verdicts.append(verdict)
     return verdicts
-
-
-def named(path: Path) -> str:
-    """`path` as a receipt records it: relative to the checkout inside it, by its name outside it, so no
-    receipt names the directories of the host that ran it (bible §2)."""
-    root, whole = Path(__file__).resolve().parents[1], path.resolve()
-    return str(whole.relative_to(root)) if whole.is_relative_to(root) else path.name
-
-
-def recorded(config: object) -> dict:
-    """`config`'s fields as a receipt records them, each path `named`."""
-    return {name: named(value) if isinstance(value, Path) else value
-            for name, value in asdict(config).items()}
 
 
 def recorded_inputs(inputs: dict) -> dict:
@@ -916,10 +907,13 @@ class Caching:
     pixels decoded and resized to 128), a learned tokenizer (`bpe`: a 4,000-token byte-level BPE
     trained here over the documents of 700 words) or a field selection (`fields`). Every pass must read
     each record once, and every arm the records the computed pass read, each its id and a digest of
-    what the map made (`Digest`). It qualifies which steps are `Costly` (`dew.data.pipeline`)."""
+    what the map made (`Digest`). It qualifies which steps are `Costly` (`dew.data.pipeline`). `rejecting`
+    makes the image decode one that drops what does not decode (`filter_map`), which a cache reads back
+    as each input's outputs (row 803)."""
 
     workload: Literal["images", "bpe", "fields"] = "bpe"
-    read: Literal["memory", "indexed"] = "indexed"
+    read: Literal["memory", "indexed", "streamed"] = "indexed"
+    rejecting: bool = False
     records: int = 2000
     batch: int = 32
     output: Path = Path("data-caching.json")
@@ -957,7 +951,7 @@ def caching_chain(config: Caching, directory: Path) -> "tuple[list[dict], Callab
         rows = [{"id": np.int32(index), "image": cv2.imencode(".png", rng.integers(0, 255, (256, 256, 3),
                                                                                 np.uint8))[1].tobytes()}
                 for index in range(config.records)]
-        steps = (images.DecodeImage("image", rejects=False), images.Resize(128))
+        steps = (images.DecodeImage("image", rejects=config.rejecting), images.Resize(128))
     else:
         words = np.asarray(["the", "of", "and", "to", "in", "is", "that", "for", "it", "as", "with",
                             "was", "on", "be", "by", "this", "are", "from", "at", "or", "an", "have",
@@ -982,7 +976,7 @@ def caching_chain(config: Caching, directory: Path) -> "tuple[list[dict], Callab
         record's id and the digest of what they made (`Digest`)."""
         mapped = Pipeline(Memory(rows))
         for step in steps:
-            mapped = mapped.map(step)
+            mapped = mapped.filter_map(step) if step is steps[0] and config.rejecting else mapped.map(step)
         cached = mapped if cache is None else mapped.cache(cache)
         return cached.map(Digest(), identity="digest@1").repeat(1).batch(config.batch, drop_remainder=False)
 

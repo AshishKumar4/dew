@@ -22,9 +22,9 @@ import ml_dtypes
 import numpy as np
 
 from dew._coordination import read_home, writes_weights
+from dew._files import replacing, write_atomically
 from dew._records import JSON
 from dew.batch import unboxed
-from dew.files import replacing, write_atomically
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import ParamTree, insert
 
@@ -364,6 +364,22 @@ class LazyTensors[T: np.ndarray | Unread](Mapping[str, T]):
         return len(self.specs)
 
 
+def joined_tensors(tables: Mapping[str, Mapping[str, Stored]]) -> LazyTensors:
+    """The tensors of `tables` (each named by what it holds: a release's backbone, its readout) as one
+    table by name, each built from its own table as it is read, so a composite export holds no more than
+    its parts do. A name two tables hold is refused before any tensor is read, since one table by name
+    cannot hold both tensors."""
+    owners: dict[str, str] = {}
+    specs: dict[str, jax.ShapeDtypeStruct] = {}
+    for label, table in tables.items():
+        for name, spec in tensor_specs(table).items():
+            if name in owners:
+                raise ValueError(f"{owners[name]} and {label} both name {name}, which one table of "
+                                 "tensors by name cannot hold")
+            owners[name], specs[name] = label, spec
+    return LazyTensors(specs, lambda name: tables[owners[name]][name])
+
+
 def tensor_specs(tensors: Mapping[str, Stored]) -> Mapping[str, jax.ShapeDtypeStruct]:
     """Stored shape and dtype metadata without reading deferred tensor values."""
     return (tensors.specs if isinstance(tensors, LazyTensors)
@@ -398,11 +414,13 @@ def save_sharded(
 
     huggingface_hub's splitter plans the shards from sizes alone, so a
     `LazyTensors` table builds each shard's tensors as that shard is written
-    and the host holds one shard of them at a time. A dense decoder export
-    and a source-layout `Pretrained.export` are such tables. A quantized
-    source's requantization, `PretrainedDecoder.from_model` through the
-    GLM-5-next exporter, and DiffusionGemma's export adapter build their
-    whole table first, and this writer then holds what it is given.
+    and the host holds one shard of them at a time. A dense decoder export,
+    a source-layout `Pretrained.export`, a quantized source's requantization
+    (`SourceQuantization.requantize`, a weight's group at a time) and a
+    composite's tables joined (`joined_tensors`) are such tables.
+    `PretrainedDecoder.from_model` through the GLM-5-next exporter and
+    DiffusionGemma's export adapter build their whole table first, and this
+    writer then holds what it is given.
 
     An export to a directory that holds no weights yet, as `push_to_hub`
     stages one, names its shards as its library does,
@@ -469,7 +487,7 @@ def save_hf_layout(params, config: Mapping[str, object], directory,
     """Write the weights and config.json into `directory`, the layout a Hugging Face style loader reads.
 
     `save_sharded` writes the weights, as one file or as shards of at most
-    `max_shard_size`, and every file is replaced whole (`dew.files.replacing`), so a reader of the
+    `max_shard_size`, and every file is replaced whole (`dew._files.replacing`), so a reader of the
     directory never reads one half written. `params` is a flat table of named tensors, or a tree
     whose '/'-joined paths name them. The config is written as given; Dew
     does not translate its own config vocabulary into anyone else's.

@@ -54,7 +54,7 @@ from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, Sparse
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
-from ..protocols import ProjectionGroup, ReadsTrain, RoutesBySite, RoutesExperts, declared_groups
+from ..protocols import ProjectionGroup, ReadsTrain, declared_groups, partitioned_routes, routed_children
 from ..sharding import RESIDUAL, constrain, declared
 
 if TYPE_CHECKING:
@@ -109,7 +109,7 @@ def gate_flops(specs: Mapping[str, NormSpec] | None, sites, width: int, lengths,
                for site in sites if site in held and norm_gated(held[site], site, routed))
 
 
-def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
+def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float | None,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
                  dtype: Dtype | None, precision: PrecisionLike = None,
                  specs: Mapping[str, NormSpec] | None = None,
@@ -121,7 +121,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
     it runs, its gate's maps at the model's `precision`. 'layer' keeps torch's
     exact variance, the reference decoders' formula; 'fast_layer' is flax's
     E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`), whose mean and square reduce
-    in one pass, which the vision towers run."""
+    in one pass, which the vision towers run. An `epsilon` of None is an RMS
+    norm's input dtype's (`RMSNorm.epsilon`); a layer norm states its own."""
 
     def build(*, name: str) -> nn.Module:
         spec = (specs or {}).get(name, NormSpec())
@@ -135,6 +136,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                 return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, precision=precision, name=name)
             return norm(name=name)
         offset = scale_offset if spec.offset is None else spec.offset
+        if eps is None:
+            raise ValueError(f"{name}, a {kind} norm, states its epsilon; its input dtype's is an RMS norm's")
         if spec.gate_rank is not None:
             raise ValueError(f"{name}, a {kind} norm, takes no gate; a gated norm is an RMS norm's")
         if spec.groups != 1 or (offset and (kind != 'layer' or not spec.scale)):
@@ -311,6 +314,20 @@ class Mixture:
                 "which carries each draw's device checks into the next step's model call, fails on a "
                 "check that reaches a shard_map. Serve the model with dew.inference.serving.Server, or "
                 "generate with the mixture's dispatch='global', the same layer")
+
+    @property
+    def fixed_weights(self) -> bool:
+        """Whether a token's expert weight is fixed whatever its router scores: one expert's softmax score
+        renormalized over itself (`top_k=1` with `norm_topk_prob`, as a parallel or GPT OSS router does
+        too), which is 1, so a model's loss reaches the router through none of its outputs, only through a
+        balance loss or a z-loss (`dew.objectives.routing.refuse_fixed_router`)."""
+        return (self.top_k == 1 and self.norm_topk_prob and self.score_function == 'softmax'
+                and not self.bias_in_weights and not self.weight_sum_min)
+
+    def router_scope(self, activation: GatedActivation | str) -> str:
+        """The scope its router's score projection takes in its layer: GPT OSS's (its `activation`
+        'swigluoai') and a parallel mixture's (Gemma 4's) `router`, any other's `SparseMLP.gate`."""
+        return 'router' if activation == 'swigluoai' or self.parallel else 'gate'
 
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
               dense: Callable[..., nn.Module], norm_eps: float, scale_offset: bool = False,
@@ -663,7 +680,8 @@ class DecoderBlock(nn.Module):
     feedforward: Callable[..., nn.Module] | None
     emb_features: int
     wiring: BlockWiring
-    norm_eps: float = 1e-5
+    norm_eps: float | None = 1e-5
+    """None: each RMS norm's input dtype's (`RMSNorm.epsilon`)."""
     norm_type: Literal['rms', 'layer', 'fast_layer'] = 'rms'
     norm_bias: bool = False
     norms: Mapping[str, NormSpec] | None = None
@@ -789,6 +807,15 @@ class DecoderBlock(nn.Module):
             self.attn_hc = HyperConnection(**sites, name='attn_hc')
             self.ffn_hc = HyperConnection(**sites, name='ffn_hc')
 
+    def _stated_eps(self, where: str) -> float:
+        """The block's epsilon for a part of it that states one (`where`, the attention residuals'
+        unweighted RMS norm, which takes no epsilon of its input's): the block's norms of None take each
+        input's dtype's (`RMSNorm.epsilon`)."""
+        if self.norm_eps is None:
+            raise ValueError(f"{where} states its epsilon; a block whose norms take their input's (norm_eps "
+                             "None) runs none")
+        return self.norm_eps
+
     def setup(self):
         projections = self.projections()
         norm = decoder_norm(
@@ -872,7 +899,8 @@ class DecoderBlock(nn.Module):
                     "attention residuals run Kimi K3's block, a plain pre-norm block whose "
                     "residual is the depth mixture: no output norms, layer scalar, parallel "
                     "branch, altup, laurel, per-layer inputs, hyper-connections or residual multiplier")
-            site = functools.partial(DepthAttention, emb_features=self.emb_features, norm_eps=self.norm_eps)
+            site = functools.partial(DepthAttention, emb_features=self.emb_features,
+                                     norm_eps=self._stated_eps('attention residuals'))
             self.attention_res = site(name='attention_res')
             if self.feedforward is not None:
                 self.mlp_res = site(name='mlp_res')
@@ -1277,30 +1305,15 @@ class DecoderBlock(nn.Module):
         layer's one record, its one routed site."""
         if per_layer_input is None or per_layer_input.experts is None:
             return {}, {}
-        experts, routed = per_layer_input.experts, per_layer_input.routed
-        mixer = isinstance(self.self_attn, RoutesExperts) and self.self_attn.routes_experts
-        if not isinstance(experts, Mapping):
-            if mixer and self.routed:
-                raise ValueError("a layer's one routing record replays one routed site, and this layer "
-                                 "routes in both its mixer and its feed-forward; key the record by site path "
-                                 f"({FEEDFORWARD_ROUTES!r}, {MIXER_ROUTES!r})")
-            record = {"routes": (experts, routed)}
-            return (record if mixer else {}), (record if self.routed else {})
-        sites = ([f"{MIXER_ROUTES}/{site}" for site in self.self_attn.routed_sites]
-                 if isinstance(self.self_attn, RoutesBySite) else [MIXER_ROUTES]) if mixer else []
-        wanted = [*sites, *([FEEDFORWARD_ROUTES] if self.routed else [])]
-        missing = [site for site in wanted if site not in experts]
-        if missing:
-            raise ValueError(f"the routing record names {sorted(experts)}, not this layer's routed sites "
-                             f"{missing}")
-        if not mixer:
-            mixed = {}
-        elif isinstance(self.self_attn, RoutesBySite):
-            below = len(MIXER_ROUTES) + 1
-            mixed = {"routes": ({site[below:]: experts[site] for site in sites}, routed)}
-        else:
-            mixed = {"routes": (experts[MIXER_ROUTES], routed)}
-        return mixed, ({"routes": (experts[FEEDFORWARD_ROUTES], routed)} if self.routed else {})
+        routed = {**routed_children({MIXER_ROUTES: self.self_attn}),
+                  **({FEEDFORWARD_ROUTES: (FEEDFORWARD_ROUTES,)} if self.routed else {})}
+        if not routed:
+            # A dense layer of a routed stack reads none of the stack's record.
+            return {}, {}
+        parts = partitioned_routes(routed, per_layer_input.experts, per_layer_input.routed)
+        mixer, feedforward = ({"routes": parts[site]} if site in parts else {}
+                              for site in (MIXER_ROUTES, FEEDFORWARD_ROUTES))
+        return mixer, feedforward
 
     def _per_layer_residual(self, x, per_layer_input):
         """Gemma 3n/4's per-layer residual (modeling_gemma4.py,

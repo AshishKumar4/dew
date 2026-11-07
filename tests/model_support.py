@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from lane_environment import outside_suite
 from flax import linen as nn
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -27,6 +28,16 @@ from dew.sampling import Sampling
 TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_features": 64, "max_seq_len": 16}
 """A causal transformer 32 wide, two layers of four heads; each test file adds
 its own vocabulary and any field its claim turns on."""
+
+
+def recorded_site(path: Path, site: str, inputs_of, truth_fn):
+    """A summarized recording's `site` at `path` (`tools/recorded_references.record_case`): its draw,
+    recorded reference and truth over its declared seeds, Dew's float64 run `truth_fn` its truth, held to
+    the recording's sketch (`indexed_recording`), and the seed count."""
+    from reference_error import declared_seeds, indexed_recording, recording
+
+    seeds = declared_seeds(path)[site]
+    return (*indexed_recording(recording(path), site, seeds, inputs_of=inputs_of, truth_fn=truth_fn), seeds)
 
 
 def model_draw(model, shape: tuple[int, ...], vocab: int):
@@ -96,6 +107,42 @@ def two_documents(rng: np.random.Generator, rows: int, length: int):
     return coordinates(segments=segments, positions=positions, max_segments=length, right_padded=True, xp=np)
 
 
+def rows_prefill_pause_and_resume(step: Callable, state, alone: Callable, hidden, prefill_valid, schedule):
+    """A cached call's per-row prefill, pause and resume: rows prefilled with unequal real histories
+    (`prefill_valid` over `hidden`'s first tokens, an invalid token overwritten with a value no row may
+    read), then each of `schedule`'s `(index, active)` steps token `index` of the rows `active` marks.
+    `step(state, tokens, valid)` returns the call's outputs and its state after them. Yields each active
+    row's output at its last token beside `alone(history)`, the call over that row's real tokens alone;
+    a paused row's history waits."""
+    width = prefill_valid.shape[1]
+    held = prefill_valid.reshape(prefill_valid.shape + (1,) * (hidden.ndim - 2))
+    actual, state = step(state, jnp.where(held, hidden[:, :width], 50.0), prefill_valid)
+    histories = [hidden[row:row + 1, :width][:, np.asarray(prefill_valid[row])]
+                 for row in range(hidden.shape[0])]
+    for row, history in enumerate(histories):
+        yield actual[row, -1], alone(history)
+    for index, active in schedule:
+        actual, state = step(state, hidden[:, index:index + 1], jnp.asarray(active)[:, None])
+        for row, live in enumerate(active):
+            if live:
+                token = hidden[row:row + 1, index:index + 1]
+                histories[row] = jnp.concatenate([histories[row], token], axis=1)
+                yield actual[row, -1], alone(histories[row])
+
+
+def floating_gradient(call: Callable, variables, cotangent) -> dict:
+    """The gradient of `<call(variables), cotangent>` in every floating parameter of `variables`, by
+    path; integer parameters are held as they are."""
+    flat = flatten_dict(variables["params"])
+    floats = {path: leaf for path, leaf in flat.items() if jnp.issubdtype(leaf.dtype, jnp.inexact)}
+    held = {path: leaf for path, leaf in flat.items() if path not in floats}
+
+    def loss(trained):
+        return jnp.sum(call({**variables, "params": unflatten_dict({**held, **trained})}) * cotangent)
+
+    return jax.grad(loss)(floats)
+
+
 def decode_through(module: nn.Module, variables, hidden, prefill: int):
     """`module` over `hidden` through its decode cache: the call that allocates the cache, then the
     first `prefill` tokens at once, then one token a step. Returns the outputs joined along the
@@ -136,12 +183,6 @@ def as_stepped(forward: Callable[[jax.Array], jax.Array], sequence: jax.Array, p
     """`forward`'s outputs over `sequence` `[B, S, ...]` at the shapes a cached decode computes them
     (`stepped_outputs`)."""
     return stepped_outputs(lambda length: forward(sequence[:, :length]), sequence.shape[1], prefill)
-
-
-def stepped_logits(forward: Callable[[jax.Array], jax.Array], ids: jax.Array, prompt: int) -> jax.Array:
-    """`forward`'s logits over `ids` at the widths a cached decode of a `prompt`-token prefill computes
-    them (`as_stepped`), from position `prompt - 1`: `decode_logits`'s positions."""
-    return as_stepped(forward, ids, prompt)[:, prompt - 1:]
 
 
 def float64_twin(model: nn.Module) -> nn.Module:
@@ -300,105 +341,41 @@ def parameter_loss(objective, variables, batch, step) -> Callable:
 
 
 def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict], dict[str, jax.Array]]:
-    """Dew's forward of `source` (a loaded remote-code release, `Pretrained`) at a recorded `site`
-    (tests/remote_code_draws.py), in float64 with `wide`, the truth its recording is held to: a seed's
-    inputs to its outputs by leaf. `logits` over plain rows; `packed` over a packed row, each document's
-    positions from 0; `decode` through the decode cache in `CHUNKS`; `gradients`, the parameters'
-    gradient of the logits' product with the cotangent, by each parameter's dotted path; `update`, the
-    logits after one SGD step at `RATE` on the rows' next-token cross-entropy; `biased` over left-padded
-    rows, each row's real slots alone (`row0`, `row1`); `image` and `video` over a row whose placeholders
-    its drawn media fill, laid out as the source's processor reads its own processor's fields
-    (`Processor.from_hf`)."""
-    import optax
+    """Dew's forward of `source` (a loaded remote-code release, `Pretrained`) at a recorded `site`, as the
+    site table declares it (tests/remote_code_draws.py's `SITE_FORMS`), in float64 with `wide`, the truth
+    its recording is held to: a seed's inputs to its outputs by leaf, every module it holds widened, a
+    wrapper's decoder beside its towers."""
     from reference_error import widened
-    from remote_code_draws import CHUNKS, DOCUMENTS, PADDED, RATE, positions
+    from remote_code_draws import SITE_FORMS
 
-    from dew.batch import coordinates
-
-    # Every module it holds widened, a wrapper's decoder beside its towers.
     model = float64_twin(source.model) if wide else source.model
     variables = widened(source.variables) if wide else source.variables
-    if site == "packed":
-        segments = np.concatenate([np.full(length, index + 1) for index, length in enumerate(DOCUMENTS)])
-        placed = coordinates(segments=segments[None].astype(np.int32), positions=positions(),
-                             max_segments=len(DOCUMENTS) + 1)
-        return jax.jit(lambda inputs: {"logits": model.apply(variables, inputs["ids"], coordinates=placed)})
-    if site == "decode":
-        made, step = decode_steps(model)
-
-        def decoded(inputs):
-            cache, steps, start = made(variables, inputs["ids"].shape[0]), [], 0
-            for chunk in CHUNKS:
-                logits, cache = step(variables, cache, inputs["ids"][:, start:start + chunk])
-                steps.append(logits)
-                start += chunk
-            return {"logits": jnp.concatenate(steps, axis=1)}
-        return decoded
-    if site == "gradients":
-        def gradients(inputs):
-            def loss(params):
-                logits = model.apply({**variables, "params": params}, inputs["ids"])
-                return jnp.sum(logits * inputs["cotangent"].astype(logits.dtype))
-            return dict(flat_tree(jax.grad(loss)(variables["params"])))
-        return jax.jit(gradients)
-    if site == "update":
-        def updated(inputs):
-            def loss(params):
-                logits = model.apply({**variables, "params": params}, inputs["ids"])
-                return optax.softmax_cross_entropy_with_integer_labels(
-                    logits[:, :-1], inputs["ids"][:, 1:]).mean()
-            params, optimizer = variables["params"], optax.sgd(RATE)
-            steps, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
-            return {"logits": model.apply({**variables, "params": optax.apply_updates(params, steps)},
-                                          inputs["ids"])}
-        return jax.jit(updated)
-    if site == "biased":
-        def biased(inputs):
-            mask = inputs["attention_mask"].astype(bool)
-            logits = model.apply(variables, inputs["ids"], attention_mask=mask)
-            return {"row0": logits[0], "row1": logits[1, PADDED:]}
-        return jax.jit(biased)
-    if site in ("image", "video"):
-        from remote_code_draws import draw
-
-        from dew.nn.inputs import ModelInputs
-
-        # The processor's reading of a draw, the same for every draw of the site, whose placeholders and
-        # grid are fixed (`remote_code_draws.IMAGE_AT`, `IMAGE_GRID`): each patch vector marked by its
-        # index, one past it, where `from_hf` places it, which a traced draw's vectors then fill.
-        template = draw(site, 0, dict(source.config))
-        pixels = "pixel_values" if site == "image" else "pixel_values_videos"
-        count = template[pixels].shape[0]
-        marked = np.broadcast_to(np.arange(1, count + 1, dtype=np.float32)[:, None], template[pixels].shape)
-        layout = source.processor.from_hf({"input_ids": template["ids"], **{
-            name: marked if name == pixels else value for name, value in template.items() if name != "ids"}})
-        places = np.asarray(layout.conditioning["pixel_values"])[..., 0].astype(np.int64)
-
-        def media(inputs):
-            placed = jnp.where((places > 0)[..., None], inputs[pixels][np.maximum(places - 1, 0)], 0)
-            batch = ModelInputs(inputs["ids"], layout.token_fields,
-                                {**layout.conditioning, "pixel_values": placed.astype(inputs[pixels].dtype)})
-            return {"logits": model.apply(variables, batch.tokens, **batch.kwargs())}
-        return jax.jit(media)
-    return jax.jit(lambda inputs: {"logits": model.apply(variables, inputs["ids"])})
+    return SITE_FORMS[site].dew(model, variables, source)
 
 
 def prediction_logits(model, variables, tokens):
     """A causal transformer's multi-token prediction logits for `tokens`: its prediction depth's first, read
-    from its hidden states (`CausalTransformer.mtp_logits`)."""
-    hidden = model.apply(variables, tokens, method=CausalTransformer.hidden_states)
-    return model.apply(variables, hidden, tokens, method=CausalTransformer.mtp_logits)[0]
+    from the depth's own input (`CausalTransformer.hidden_and_mtp_inputs`: the final states, or DeepSeek
+    V4's uncollapsed streams) by `CausalTransformer.mtp_logits`."""
+    _, inputs = model.apply(variables, tokens, method=CausalTransformer.hidden_and_mtp_inputs)
+    return model.apply(variables, inputs, tokens, method=CausalTransformer.mtp_logits)[0]
 
 
 def stepped_decode(model, variables, ids):
     """`ids` decoded a token a call through the cache one token's call allocates, the calls one program
     under a scan: the steps' logits `[B, S, V]` and the cache they leave."""
+    cache = nn.unbox(model.init(jax.random.key(0), ids[:, :1], decode=True))["cache"]
+    return steps_from(model, variables, cache, ids)
+
+
+def steps_from(model, variables, cache, ids):
+    """`ids` decoded a token a call from `cache`, the calls one program under a scan: the steps' logits
+    `[B, S, V]` and the cache they leave."""
     def step(cache, column):
         logits, state = model.apply({**variables, "cache": cache}, column[:, None], decode=True,
                                     mutable=["cache"])
         return state["cache"], logits[:, 0]
 
-    cache = nn.unbox(model.init(jax.random.key(0), ids[:, :1], decode=True))["cache"]
     cache, steps = jax.lax.scan(step, cache, jnp.moveaxis(jnp.asarray(ids), 1, 0))
     return jnp.moveaxis(steps, 0, 1), cache
 
@@ -414,3 +391,15 @@ def moved(tree, key: jax.Array, scale: float):
         (leaf + scale * jax.random.normal(each, leaf.shape)).astype(leaf.dtype)
         if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
         for leaf, each in zip(leaves, keys, strict=True)])
+
+
+def encoded_form(quantization, tensors, names):
+    """Dense `tensors` with each of `names` written in `quantization`'s stored form, as a checkpoint of
+    that format holds them and a test builds one: each weight's stored tensors (`encode`) in its place,
+    every other tensor as it is. A loaded source's export writes them back by `requantize`, which reads
+    the stored tensors' specs from the source."""
+    names = set(names)
+    out = {name: tensor for name, tensor in tensors.items() if name not in names}
+    for name in sorted(names):
+        out.update(quantization.encode(name, np.asarray(tensors[name])))
+    return out

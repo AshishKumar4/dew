@@ -21,6 +21,7 @@ instead, and the prefetch loop reads them during execution.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 import math
 import threading
@@ -39,12 +40,14 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSh
 from jax.typing import DTypeLike
 
 from dew.batch import Variables, merge, without
-from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
+from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.backbones.layer_names import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
 from dew.nn.kernels.options import program
+from dew.nn.protocols import BankedStacks
 
 if TYPE_CHECKING:
+    from dew.checkpoints import Checkpoints
     from dew.distributed.placement import Layout, MeshSpec, Placement
 
 
@@ -77,7 +80,7 @@ class LayerBanks(Protocol):
         """
         ...
 
-    def place(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
+    def place(self, model: BankedStacks, *, mesh: MeshSpec | Mesh | None = None,
               layout: Layout | None = None) -> Variables:
         """Build, from these weights, the banked store that `model`'s runs read.
 
@@ -93,14 +96,20 @@ class LayerBanks(Protocol):
         differently is refused as well, because a bank is one array with one
         sharding. Both checks raise ValueError before anything is read.
         """
-        sites, shapes, _device_mesh, placement, entries = _bank_plan(model, self, mesh, layout)
+        return _stored(self, model, mesh, layout, self.entry, self.bank)
 
-        entry_values = jax.block_until_ready(self.entry(entries)) if entries else {}
-        return merge(entry_values, assembled(sites, lambda site, first, count, _: self.bank(
-            range(first, first + count),
-            _bank_placement(one_layer(placement, first, namespace=site.namespace),
-                            one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
-            namespace=site.namespace)))
+
+def _stored(source: LayerBanks, model: BankedStacks, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+            entry: Callable[[Placement], Variables], bank: Callable[..., Variables]) -> Variables:
+    """`LayerBanks.place` of `source`, its entries read by `entry` and each bank by `bank`."""
+    sites, shapes, _device_mesh, placement, entries = _bank_plan(model, source, mesh, layout)
+
+    entry_values = jax.block_until_ready(entry(entries)) if entries else {}
+    return merge(entry_values, assembled(sites, lambda site, first, count, _: bank(
+        range(first, first + count),
+        _bank_placement(one_layer(placement, first, namespace=site.namespace),
+                        one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
+        namespace=site.namespace)))
 
 
 def one_layer(variables: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
@@ -187,9 +196,10 @@ class CheckpointBanks(LayerBanks):
     one load comes from the same checkpoint. A `directory` without a
     checkpoint raises FileNotFoundError.
 
-    Rows are restored to device memory, where the stacking runs, and the
-    stacked bank goes wherever the store places it. So a load stages one
-    bank's rows and one bank at a time, never the whole model.
+    Each row is restored to device memory and written into its bank, placed
+    where the store places it, before the next is read. So a load holds a
+    bank and one row beside it, never the whole model twice: a stack of one
+    run, a bank of every layer, would otherwise hold its rows beside it.
     """
 
     directory: str
@@ -199,11 +209,9 @@ class CheckpointBanks(LayerBanks):
     """The shape and dtype trees the checkpoint at `step` holds, read once when the source is built."""
 
     def __post_init__(self):
-        from dew.checkpoints import Checkpoints
-        with Checkpoints(self.directory) as checkpoints:
-            step = checkpoints.latest if self.step is None else self.step
-            if step is None:
-                raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+        with self._reader() as checkpoints:
+            # The newest step that holds a model where none is named, one kept for its model alone among them.
+            step = checkpoints.pinned(self.step)
             object.__setattr__(self, "step", step)
             object.__setattr__(self, "stored", checkpoints.stored(step))
 
@@ -213,22 +221,53 @@ class CheckpointBanks(LayerBanks):
         return self.stored["variables"]
 
     def entry(self, placement: Placement) -> Variables:
-        return self._restored(placement)
+        with self._reader() as checkpoints:
+            return self._restored(checkpoints, placement)
 
     def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
-        if len(layers) == 1:
-            return one_layer(self._restored(at_layer(placement, layers[0], namespace=namespace)),
-                             layers[0], namespace=namespace)
-        rows = [one_layer(self._restored(at_layer(_row_placement(placement), index, namespace=namespace)),
-                          index, namespace=namespace) for index in layers]
-        return program(stack_layers, out_shardings=placement)(*rows)
+        with self._reader() as checkpoints:
+            return self._bank(checkpoints, layers, placement, namespace=namespace)
 
-    def _restored(self, placement: Placement) -> Variables:
-        """Restore the variables `placement` names onto its shardings, as every load of a run's
-        variables restores them (`Checkpoints.materialized`)."""
+    def place(self, model: BankedStacks, *, mesh: MeshSpec | Mesh | None = None,
+              layout: Layout | None = None) -> Variables:
+        """`LayerBanks.place`, every entry and bank of the load read through one reader of the run, so the
+        checkpoint's metadata is read once a load, not once a layer."""
+        with self._reader() as checkpoints:
+            return _stored(self, model, mesh, layout, functools.partial(self._restored, checkpoints),
+                           functools.partial(self._bank, checkpoints))
+
+    def _reader(self) -> Checkpoints:
         from dew.checkpoints import Checkpoints
 
+        return Checkpoints(self.directory)
+
+    def _bank(self, checkpoints: Checkpoints, layers: Sequence[int], placement: Placement, *,
+              namespace: tuple[str, ...] = ()) -> Variables:
+        """`bank`, read through `checkpoints`."""
+        if len(layers) == 1:
+            return one_layer(self._restored(checkpoints, at_layer(placement, layers[0], namespace=namespace)),
+                             layers[0], namespace=namespace)
+        def row(index: int) -> Variables:
+            return one_layer(self._restored(checkpoints, at_layer(_row_placement(placement), index,
+                                                                  namespace=namespace)),
+                             index, namespace=namespace)
+
+        # The bank built in device memory, where the rows are, and donated to each write, so a row is all a
+        # write holds beside it; then moved where the store places it, host memory alike.
+        building = _on_device(placement)
+        written = program(_written, donate_argnames=("bank",), out_shardings=building)
+        held = row(layers[0])
+        bank = written(program(_emptied, static_argnames=("count",), out_shardings=building)(
+            held, count=len(layers)), held, 0)
+        del held
+        for at, index in enumerate(layers[1:], start=1):
+            bank = written(bank, row(index), at)
+        return jax.device_put(bank, placement)
+
+    def _restored(self, checkpoints: Checkpoints, placement: Placement) -> Variables:
+        """Restore the variables `placement` names onto its shardings through `checkpoints`, as every load
+        of a run's variables restores them (`Checkpoints.materialized`)."""
         shapes = narrowed(self.shapes(), placement)
         template, placements = {"variables": shapes}, {"variables": narrowed(placement, shapes)}
         if self.ema:
@@ -236,8 +275,7 @@ class CheckpointBanks(LayerBanks):
             if averaged:
                 template["ema"], placements["ema"] = averaged, narrowed(placement, averaged)
         assert self.step is not None
-        with Checkpoints(self.directory) as checkpoints:
-            return checkpoints.materialized(template, placements, step=self.step)
+        return checkpoints.materialized(template, placements, step=self.step)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -362,7 +400,7 @@ class SafetensorsBanks(LayerBanks):
         bank = jax.tree.map(lambda *leaves: np.stack(leaves), *rows)
         return jax.device_put(bank, placement)
 
-    def stream(self, model: BankedModel, *, mesh: MeshSpec | Mesh | None = None,
+    def stream(self, model: BankedStacks, *, mesh: MeshSpec | Mesh | None = None,
                layout: Layout | None = None) -> Variables:
         """Return variables whose decoder layers the banked inference loop reads from disk, on one device.
 
@@ -771,6 +809,27 @@ def narrowed(tree: Mapping, selection: Mapping) -> dict:
     return collected
 
 
+def _emptied(row: Variables, count: int) -> Variables:
+    """A bank of `count` layers like `row`, zero, which `_written` fills a row at a time."""
+    return jax.tree.map(lambda leaf: jnp.zeros((count, *leaf.shape), leaf.dtype), row)
+
+
+def _written(bank: Variables, row: Variables, at: jax.Array) -> Variables:
+    """`bank` with `row` as its layer `at`."""
+    return jax.tree.map(lambda stack, leaf: jax.lax.dynamic_update_index_in_dim(stack, leaf, at, 0),
+                        bank, row)
+
+
+def _on_device(placement: Placement) -> Placement:
+    """A bank's placement in device memory, where its rows are written into it (`_written`)."""
+    def device(target):
+        sharding = target.sharding if isinstance(target, Format) else target
+        assert isinstance(sharding, NamedSharding)
+        return sharding.with_memory_kind("device")
+
+    return jax.tree.map(device, placement)
+
+
 def _row_placement(placement: Placement) -> Placement:
     """Return one layer's shardings out of a bank's: the layer axis dropped, in device
     memory, which is where the rows a bank is stacked out of are read."""
@@ -798,11 +857,7 @@ def _bank_placement(placement: Placement, shapes: Variables, stacked: bool) -> P
     return jax.tree.map(place, placement, shapes)
 
 
-class BankedModel(Protocol):
-    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]: ...
-
-
-def bank_sites(model: BankedModel, store: Variables) -> tuple[DecoderBank, ...]:
+def bank_sites(model: BankedStacks, store: Variables) -> tuple[DecoderBank, ...]:
     """Return the model's declared stacks over `store`, the variables (or their shapes) the banks are
     drawn from, deduplicated by canonical namespace.
 
@@ -902,7 +957,7 @@ def _check_shapes(shapes: Variables, site: DecoderBank) -> None:
                 raise ValueError(f"namespace {site.namespace} layers {first} and {index} "
                                  "must have identical leaf paths, shapes and dtypes within one bank")
 
-def _bank_plan(model: BankedModel, source: LayerBanks, mesh: MeshSpec | Mesh | None,
+def _bank_plan(model: BankedStacks, source: LayerBanks, mesh: MeshSpec | Mesh | None,
                layout: Layout | None):
     """Validate canonical ownership and placement before either loader reads a value."""
     from dew.distributed.placement import (
@@ -968,7 +1023,6 @@ def _check_consumers(placement: Placement, groups: Sequence[tuple[int, int]]) ->
 
 
 __all__ = [
-    "BankedModel",
     "CheckpointBanks",
     "DiskBankStats",
     "HeldBanks",

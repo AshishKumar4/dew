@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import jax
@@ -84,14 +84,7 @@ from ..hyper_connections import (
     first_stream,
     stream_head,
 )
-from ..inputs import (
-    AttentionMetadata,
-    CrossContext,
-    LayerInputs,
-    PredictionPhase,
-    coordinates_of,
-    numbered_blocks,
-)
+from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
 from ..kv_cache import DecodeCursor, KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
@@ -123,6 +116,7 @@ from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts
+from .call_metadata import call_metadata
 from .decoder_block import (
     DECODER_REMAT,
     REMAT_POLICIES,
@@ -152,7 +146,7 @@ from .decoder_stack import (
     split_stages,
     stored_by_stage,
 )
-from .layer_names import group_layers, layer_index
+from .layer_names import fixed_router_owners, group_layers, layer_index
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, run_period, scan_groups
 from .looping import run_loop
 
@@ -663,7 +657,10 @@ class CausalTransformer(LinearProducts):
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
             "precision": self.precision, "dex": dex, "dex_start": dex_start,
             "value_experts": self.value_experts if routed else None,
-            "mixture": self.mixture if routed else None}
+            "mixture": self.mixture if routed else None,
+            # A decoder forms its logits as its kernels do; a block needing them wide asks so itself
+            # (`MixerContext.wide_logits`, the world model's).
+            "wide_logits": False}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -1044,12 +1041,9 @@ class CausalTransformer(LinearProducts):
         """The multi-token prediction depths."""
         if not self.num_nextn_predict_layers:
             return []
-        # Prediction depths mirror whole-sequence hidden states, so their
-        # mixer builds from the full-attention kind where the pattern has
-        # one, else from the first layer's kind; the feed-forward routes
-        # like the last layer's (GLM 4.5 ships its depth with the trunk's
-        # experts) and is dense otherwise.
-        mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
+        # Prediction depths mirror whole-sequence hidden states (`prediction_kind`); the feed-forward
+        # routes like the last layer's (GLM 4.5 ships its depth with the trunk's experts), else dense.
+        mtp_type = self.prediction_kind(types)
         prediction_mixer = kinds[mtp_type].mixer or mixer_spec
         if self.index_share_for_mtp_iteration and not prediction_mixer.shares_prediction_index:
             raise ValueError("index_share_for_mtp_iteration requires a prediction mixer that shares its "
@@ -1166,7 +1160,7 @@ class CausalTransformer(LinearProducts):
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
-                 right_padded: bool = False, coordinates: Coordinates | None = None,
+                 attention_key_valid=None, right_padded: bool = False, coordinates: Coordinates | None = None,
                  conditioning: Mapping[str, jax.Array] | None = None, progress: Progress | None = None):
         # The call's token layout, converted once (`token_coordinates`): the trunk and the
         # prediction depths read its coordinates alone.
@@ -1176,7 +1170,8 @@ class CausalTransformer(LinearProducts):
             tokens, train=train, decode=decode, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
             attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
-            attention_key_runs=attention_key_runs, coordinates=coordinates, conditioning=conditioning,
+            attention_key_runs=attention_key_runs, attention_key_valid=attention_key_valid,
+            coordinates=coordinates, conditioning=conditioning,
             progress=progress)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
@@ -1525,7 +1520,7 @@ class CausalTransformer(LinearProducts):
         does; `layer_state` reads one layer back. Neither is a Flax method, so
         the filter the capture calls on every module runs no module call.
         """
-        return method == "__call__" and (module.name or "").startswith("layers_")
+        return method == "__call__" and group_layers(module.name or "") is not None
 
     layer_collections: ClassVar[tuple[str, ...]] = (_INTERMEDIATES, _FINAL)
     """The collections a reader of layer states opens (`LayerStates`)."""
@@ -1561,7 +1556,7 @@ class CausalTransformer(LinearProducts):
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
                               input_embeddings=None, image_groups=None, block_groups=None,
                               rotary_positions=None, attention_pairwise_mask=None,
-                              attention_key_positions=None, attention_key_runs=None,
+                              attention_key_positions=None, attention_key_runs=None, attention_key_valid=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
                               coordinates: Coordinates | None = None,
                               conditioning: Mapping[str, jax.Array] | None = None,
@@ -1611,10 +1606,10 @@ class CausalTransformer(LinearProducts):
         - `progress` is a training step's (`dew.nn.progress`), which its DEX
           layers anneal over; None is the run's end, outside a training step.
         """
-        attention_metadata = self._attention_metadata(
-            tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
+        attention_metadata = call_metadata(
+            self, tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
             attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
-            whole_blocks=whole_blocks, progress=progress)
+            whole_blocks=whole_blocks, progress=progress, key_valid=attention_key_valid)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1672,74 +1667,6 @@ class CausalTransformer(LinearProducts):
             self.sow('prediction_inputs', 'states', prediction,
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction
-
-    def _attention_metadata(self, tokens, decode: bool, image_groups, block_groups, rotary_positions,
-                            pairwise_mask, key_positions, key_runs, media_mask, admitted=None,
-                            coordinates: Coordinates | None = None,
-                            conditioning: Mapping[str, jax.Array] | None = None, *,
-                            whole_blocks: bool = False, progress: Progress | None = None
-                            ) -> AttentionMetadata | None:
-        """What the layers read beside the residual, None for a call that
-        carries none of it: the tokens' layout `hidden_and_mtp_inputs`
-        converted (`coordinates`), the token ids a hash router selects by,
-        the engram layers' bucket ids, the media mask, which only a model
-        with engram or a router with a media bias reads, and the
-        cross-attention's context."""
-        if conditioning and self.cross_attention is None:
-            raise TypeError(f"this decoder has no cross-attention to read the conditioning "
-                            f"{sorted(conditioning)}")
-        context = CrossContext.from_conditioning(conditioning) if conditioning else None
-        if context is not None and context.embeddings.shape[0] != tokens.shape[0]:
-            raise ValueError(f"a context row per token row, got {context.embeddings.shape[0]} for "
-                             f"{tokens.shape[0]}")
-        if context is not None:
-            # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
-            # a standalone call, and a cached and a full one, project the same values.
-            context = dataclasses.replace(context, embeddings=context.embeddings.astype(self.context_dtype))
-        # A layer whose mixer reads no pairwise mask or key runs refuses one (`MixerCall`).
-        if key_positions is not None and pairwise_mask is None and key_runs is None:
-            raise ValueError("attention_key_positions requires attention_pairwise_mask or "
-                             "attention_key_runs")
-        if pairwise_mask is not None and key_runs is not None:
-            raise ValueError("attention_key_runs and attention_pairwise_mask each name a call's whole "
-                             "visibility; pass one")
-        if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
-            media_mask = None
-        if decode and coordinates is not None and coordinates.max_segments > 1:
-            raise ValueError(
-                "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
-                "call would attend across documents; prefill each document into a row of its own")
-        engram_ids = (None if self.engram is None else self.engram_hashes(tokens, coordinates, decode,
-                                                                          media_mask))
-        if context is not None and context.segments is not None:
-            # A context of several documents is read by the call's tokens of each document alone.
-            if coordinates is None or coordinates.segments is None:
-                raise ValueError("a context of several documents is read by packed rows, which name "
-                                 "their tokens' documents (segment_ids or coordinates)")
-            context = dataclasses.replace(context, queries=coordinates.segments)
-        # A block router's blocks are numbered once for every routed layer.
-        block = None if self.mixture is None else self.mixture.routing_block
-        blocks = None if block is None else numbered_blocks(
-            coordinates_of(None, *tokens.shape[:2]) if coordinates is None else coordinates, tokens.shape[:2],
-            block)
-        if (coordinates is None and image_groups is None and block_groups is None and rotary_positions is None
-                and pairwise_mask is None and key_positions is None and key_runs is None
-                and not self.hash_layers
-                and engram_ids is None and media_mask is None and admitted is None and blocks is None
-                and context is None and (progress is None or progress.updates is None)):
-            return None
-        return AttentionMetadata(
-            coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
-            rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
-            key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
-            media=media_mask,
-            admitted=admitted, blocks=blocks, context=context,
-            # One row's progress apiece, as the metadata's other inputs are held by row, which a
-            # pipeline's microbatches slice (`run_pipeline`).
-            progress=None if progress is None or progress.updates is None else jnp.broadcast_to(
-                jnp.asarray(progress.updates, jnp.int32), tokens.shape[:1]),
-            routing_block=block,
-            whole_blocks=whole_blocks and block_groups is not None)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says (`looping.run_loop`): its block's later
@@ -1806,6 +1733,15 @@ class CausalTransformer(LinearProducts):
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         staged = stored_by_stage(self.variables)
         banked = () if staged else self.banked_collections()
+        allocating = not any(group_layers(name) for name in self.variables.get('cache', {}))
+        if decode and 'params' in banked and allocating:
+            # A decode over a store banked by run keeps the cache its layers allocate banked as the store
+            # keeps the weights, each run's layers one array under the run's name, as the run's scan carries
+            # it: every later call reads and writes it there, where a cache kept a layer at a time is
+            # stacked into the run's bank and cut apart again each call (at Qwen3-30B-A3B's layer shape, 8
+            # layers of 64 rows of 512 slots on an H100, 371 and 317 us a step, OM-1342-cache-base-2474a6e4c).
+            # A cache handed in a layer at a time goes back so.
+            banked = (*banked, 'cache')
         if stages == 1 and staged:
             if span is not None:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a stage-local "
@@ -1973,8 +1909,10 @@ class CausalTransformer(LinearProducts):
         variables = {}
         for collection, tree in self.variables.items():
             if collection in banked:
-                variables[collection] = jax.tree.map(
-                    functools.partial(shapes, drop=stacked), tree[first])
+                # A banked cache holds no entry for a first layer that caches nothing.
+                if first in tree:
+                    variables[collection] = jax.tree.map(
+                        functools.partial(shapes, drop=stacked), tree[first])
                 continue
             held = {}
             if stacked and first in tree:
@@ -2259,10 +2197,9 @@ class CausalTransformer(LinearProducts):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def with_scanned_layers(self, *, scanned: bool = True) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`), or with
-        `scanned` False the plain loop."""
-        return self.clone(scan_layers=scanned)
+    def with_scanned_layers(self) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
+        return self.clone(scan_layers=True)
 
     @nn.nowrap
     def reads_progress(self) -> bool:
@@ -2411,6 +2348,16 @@ class CausalTransformer(LinearProducts):
         built = [(spec.kind.mixer or default, spec.kind.chunk)
                  for spec in self._layer_specs(types, kinds, default)]
         return tuple(chunk for mixer, chunk in built if mixer.reads_blocks)
+
+    @nn.nowrap
+    def prediction_kind(self, types: Sequence[str]) -> str:
+        """A prediction depth's mixer kind: `mtp_layer_type`, else full attention, else the first layer's."""
+        return self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
+
+    @nn.nowrap
+    def fixed_routers(self) -> Mapping[str, Callable[[tuple[str, ...]], bool]]:
+        """Its routers whose weights are fixed, and their parameters (`layer_names.fixed_router_owners`)."""
+        return fixed_router_owners(self)
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:

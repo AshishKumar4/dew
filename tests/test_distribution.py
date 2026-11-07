@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
+from process_support import raised
 
 from dew.distributed.placement import parameter_axes
 from dew.training import MeshSpec
@@ -53,7 +54,7 @@ def start(*arguments: str, devices: int) -> subprocess.Popen:
         env["JAX_PLATFORMS"] = "cpu"
         placement = ["--env", f"XLA_FLAGS=--xla_force_host_platform_device_count={devices}"]
     return subprocess.Popen(
-        [sys.executable, "-m", "dew.cli.main", "launch", *placement, *arguments],
+        [sys.executable, "-m", "dew._cli.main", "launch", *placement, *arguments],
         cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -165,7 +166,9 @@ def test_processes_that_hold_the_same_rows_read_the_same_share(tmp_path, mesh):
 def test_more_replicas_than_hosts_are_refused(tmp_path):
     done = launch("--", sys.executable, str(WORKER), "--out", str(tmp_path / "x.json"),
                   "--mesh", json.dumps({"fsdp": 4, "replicas": 2}), devices=8)
-    assert done.returncode != 0
+    # Refused as the mesh is built (`LayoutRefused`: replicas past the granules), and no record written.
+    assert "dew.mesh.LayoutRefused" in raised(done) and not (tmp_path / "x.json").exists(), (
+        done.stdout + done.stderr)
 
 
 def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
@@ -246,13 +249,26 @@ def test_one_slurm_task_joins_no_pool():
     so the process starts on its own."""
     env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"),
            "JAX_PLATFORMS": "cpu"}
-    program = ("from dew.training.runtime import prepare_process\n"
-               "prepare_process()\n"
-               "import jax\n"
-               "print('processes', jax.process_count())\n")
-    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+    done = subprocess.run([sys.executable, "-c", JOINED], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stdout + done.stderr
+    assert joined(done.stdout) == {"initialized": False, "processes": 1, "rank": 0}, done.stdout
+
+
+JOINED = ("import json\n"
+          "from dew.training.runtime import prepare_process\n"
+          "prepare_process()\n"
+          "import jax\n"
+          "print('JOINED', json.dumps({'initialized': jax.distributed.is_initialized(),\n"
+          "                            'processes': jax.process_count(), 'rank': jax.process_index()}))\n")
+"""A process that prepares itself and reports the pool it joined: whether it initialized JAX's distributed
+runtime, its pool's process count and its own rank (row 4497: an exit status alone said none of it)."""
+
+
+def joined(stdout: str) -> dict:
+    """The pool a `JOINED` program reported."""
+    (line,) = [line for line in stdout.splitlines() if line.startswith("JOINED ")]
+    return json.loads(line.removeprefix("JOINED "))
 
 
 @pytest.mark.mesh(devices=0)
@@ -269,7 +285,7 @@ def test_a_slurm_step_that_leaves_gpus_idle_is_refused_before_it_joins():
                "prepare_process()\n")
     done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=60)
-    assert done.returncode != 0, done.stdout
+    assert "ValueError" in raised(done), done.stdout
 
 
 @pytest.mark.mesh(devices=0)
@@ -286,13 +302,10 @@ def test_an_mpirun_inside_one_slurm_task_forms_its_pool():
            "OMPI_MCA_orte_hnp_uri": "1531576320.0;tcp://127.0.0.1:34911",
            "OMPI_COMM_WORLD_SIZE": "1", "OMPI_COMM_WORLD_RANK": "0",
            "OMPI_COMM_WORLD_LOCAL_RANK": "0", "JAX_COORDINATOR_PORT": str(port)}
-    program = ("from dew.training.runtime import prepare_process\n"
-               "prepare_process()\n"
-               "import jax\n"
-               "print('pool', jax.distributed.is_initialized())\n")
-    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+    done = subprocess.run([sys.executable, "-c", JOINED], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stdout + done.stderr
+    assert joined(done.stdout) == {"initialized": True, "processes": 1, "rank": 0}, done.stdout
 
 
 @pytest.mark.mesh(devices=0)
@@ -328,7 +341,7 @@ def a_launched_process_keeps_every_device_inside_a_slurm_step():
                "import jax\n"
                "print('local devices', jax.local_device_count())\n")
     done = finished(subprocess.Popen(
-        [sys.executable, "-m", "dew.cli.main", "launch", "--processes-per-host", "1", "--",
+        [sys.executable, "-m", "dew._cli.main", "launch", "--processes-per-host", "1", "--",
          sys.executable, "-c", program],
         cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), timeout=300)
     assert done.returncode == 0, done.stdout + done.stderr
@@ -393,7 +406,8 @@ def test_a_pool_forms_and_fails_together_after_orbaxs_public_multihost_loads():
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c",
                   "import orbax.checkpoint.multihost\n"
                   + stepping_pool("raise RuntimeError('injected failure')"), devices=1, timeout=600)
-    assert done.returncode == 1, done.stdout + done.stderr
+    # It ended with rank 1's own failure, past the pool's forming, not with an error of its start.
+    assert "injected failure" in raised(done).get("RuntimeError", []), done.stdout + done.stderr
 
 
 @pytest.mark.mesh(devices=2)
@@ -711,7 +725,8 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
                "    tree[1].delete()\n"
                "coordination.collective_host(tree, phase='t')\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
-    assert done.returncode != 0, done.stdout + done.stderr
+    # Rank 1 ends with its own error, rank 0 with its peer's: neither waits in the gather.
+    assert {"RuntimeError", "dew._coordination.PeerFailure"} <= raised(done).keys(), done.stdout + done.stderr
 
 
 def a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
@@ -851,6 +866,8 @@ def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_
     alone, single = scheduled(tmp_path, {"fsdp": 2}, 1)
     assert pool["partition"] == {"count": 2, "readers": 1} and pool["step"] == 1
     together, reference = every_row(pool), every_row(alone)
+    # The behavior log-probabilities are one sampling program's over one two-device mesh, whichever
+    # processes hold its devices (row 3177).
     for name in ("input_ids", "response_mask", "behavior_log_probs"):
         np.testing.assert_array_equal(together[name], reference[name])
     np.testing.assert_allclose(together["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
@@ -864,10 +881,21 @@ def test_the_global_estimator_whitens_every_share_by_the_whole_batch(tmp_path):
     (`--estimator global`): each process packs its own rows, whitened by the moments of every share
     pooled, so together they hold the advantages one process gives the whole batch, not each share's
     own whitening."""
+    from scheduler_worker import TASKS, reward
+
+    # The bitwise claim below rests on this: every group's rewards are integers, so they centre to
+    # multiples of a half and each share's centred values sum to exactly zero.
+    for task in range(1, TASKS + 1):
+        rewards = [reward(task, sample, "global") for sample in range(2)]
+        assert all(value == int(value) for value in rewards)
     pool, _ = scheduled(tmp_path, {"fsdp": 2}, 2, "--estimator", "global")
     alone, _ = scheduled(tmp_path, {"fsdp": 2}, 1, "--estimator", "global")
     together, reference = every_row(pool), every_row(alone)
     assert np.unique(np.abs(reference["advantages"])).size > 2
+    # Bit for bit by exact arithmetic (row 3177): the worker's rewards, a sample's index times its task's
+    # id, centre to multiples of a half, so each share's mean is 0 and its m2 a multiple of a quarter,
+    # exact, and the shares' merge (`pooled`) and one process's direct moments are the one exact 102/16;
+    # both then round the same square root, epsilon and division of the same values.
     for name in ("input_ids", "response_mask", "advantages"):
         np.testing.assert_array_equal(together[name], reference[name])
 

@@ -15,28 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import psutil
-
-DRAWS = "DEW_CHECK1_DRAWS"
-"""The environment variable that runs every sharded site as one map task: `start:stop`, the units the task
-does (check 1's: its seeds), its records written to RECORDS (`record_units`). The site judges nothing there
-and passes once they are written. Check 1's stages take its declared seeds and REDRAW times as many
-further ones, so its map tasks together draw seeds 0 to (1 + REDRAW) times the declared count."""
-
-RECORDS = "DEW_CHECK1_RECORDS"
-"""The directory a map task (DRAWS) writes its records to, one file a site (`site_id`) and range."""
-
-POOL = "DEW_CHECK1_POOL"
-"""The environment variable that runs every sharded site as the judge of its map tasks (DRAWS): a directory
-whose tree holds their records. The site judges them pooled (`pooled_units`), the same units by the same
-rules as a site that does them itself, and refuses what the pool does not hold."""
-
-
-LATER = "DEW_CHECK1_LATER"
-"""A judge's file to write where its judgement needs the units its pool does not hold yet, from the first it
-does not on (`ask_later`): the plan marks a check-1 site's second-stage map tasks later (tools/armada/ci.py's
-`site_entries`), which armada runs only where the judge's first judgement asks for them, and the judge then
-judges again over all its map tasks (Main, 2026-11-02: those draws were drawn every run and read only where
-the first stage found something). Unset, a judge refuses a short pool (`PoolRefused`)."""
+from check1_wire import DRAWS, LATER, POOL, RECORDS
 
 
 class PoolRefused(AssertionError):
@@ -50,8 +29,9 @@ class PoolRefused(AssertionError):
 
 def drawing() -> bool:
     """Whether this process is a map task (DRAWS): it records a site's units and judges nothing, so a site
-    leaves to its judge the work only a judge reads (its run's own checks beside its draws), which the judge
-    does in full."""
+    that draws alone (`reference_error`'s deferred checks) leaves its judgement to the judge; a site whose
+    tasks run checks of their own beside their draws records each task's word (`record_units`,
+    `test_architectures.assert_fits_as_drawn`), which the judge pools (`sharded`)."""
     return bool(os.environ.get(DRAWS))
 
 
@@ -112,6 +92,22 @@ def record_units(label: str, payload: Callable[[int, int], object], upto: int | 
     _published(path.with_suffix(".seconds.json"), json.dumps(seconds).encode())
     _published(path, pickle.dumps({"site": site, "start": start, "stop": stop, "payload": found}))
     return True
+
+
+def sharded(label: str, payload: Callable[[int, int], object], units: int | None = None, *,
+            upto: int | None = None) -> list | None:
+    """A site's units over armada's map tasks, each `payload(start, stop)`: a map task records its units'
+    (`record_units`, cut at `upto` where a site takes at most that many) and gets None, the judge gets the
+    tasks' payloads in order (`pooled_units`, refused short of `units`), and a run whole gets
+    `[payload(0, units)]`."""
+    if record_units(label, payload, upto=upto):
+        return None
+    pooled = pooled_units(label, units)
+    if pooled is not None:
+        return [found for _, _, found in pooled]
+    if units is None:
+        raise ValueError(f"{label}: a run whole of a sharded site takes its units' count")
+    return [payload(0, units)]
 
 
 def _published(path: Path, data: bytes) -> None:

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
     from dew._records import JSON
     from dew.interop.sources import SourceReference
+    from dew.optim import Optimizer
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
@@ -72,16 +73,13 @@ class Case:
     matmul_precision: str | None = None
     """What every matmul asks XLA for, written into a model that declares
     `precision`; None keeps the model's own."""
-    orders: bool = False
-    """Layout comparisons use 52 exact residual orders against fp64 when True.
-    Other measurements and rows retain their ordinary single-draw path."""
     batch_size: int = 8
     accumulation: int = 1
     """Microbatches of `batch_size` rows the trainer pools into one optimizer
     step; a timed step is one microbatch."""
-    optimizer: str = "adam"
-    """The optimizer the case's trainer steps (`benchmark_models.OPTIMIZERS`): Adam, or AdamW a full
-    fine-tune's."""
+    optimizer: "Optimizer" = "adam"
+    """The optimizer the case's trainer steps, as `dew train` builds it (`dew.optim.OptimConfig`): Adam, or
+    AdamW a full fine-tune's."""
     mesh: dict[str, int] = field(default_factory=dict)
     """`MeshSpec` fields, `{"fsdp": 2, "tensor": 2}`; the empty record is
     data parallelism over every device."""

@@ -19,7 +19,7 @@ from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
 from dew.data import Files
 from dew.data.dataset import Loader
-from dew.diffusion.presets import Flow
+from dew.diffusion.presets import CosineContinuous, CosineGeneral, Exp, Flow
 from dew.optim import ScheduleSpec
 from dew.registry import import_path, record_argument
 from dew.sampling import Heun
@@ -125,7 +125,7 @@ def test_a_point_sets_a_runs_fields_and_its_chains_settings_together():
 def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
     """`dew train run.py` trains a run whose chain holds a step only Python has (a lambda) as the file
     built it, and its run.json says why it can't be rebuilt from the record."""
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     (tmp_path / "unrecorded_run.py").write_text(
         "import dataclasses\n"
@@ -170,8 +170,8 @@ def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import autoencoder_experiment
 
+    from dew._cli.main import main
     from dew.checkpoints import Checkpoints
-    from dew.cli.main import main
 
     out = tmp_path / "profile"
     command = ["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out", str(out)]
@@ -189,7 +189,7 @@ def test_dew_profiles_capture_options_reach_the_capture(tmp_path):
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import autoencoder_experiment
 
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     out = tmp_path / "profile"
     assert main(["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out",
@@ -214,7 +214,7 @@ def test_dew_profile_with_no_output_prepares_its_process_before_naming_its_direc
         "    return dataclasses.replace(built, trainer=trainer)\n")
     root = Path(__file__).resolve().parents[1]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
-    done = subprocess.run([sys.executable, "-m", "dew.cli.main", "profile", str(tmp_path / "dumped.py"),
+    done = subprocess.run([sys.executable, "-m", "dew._cli.main", "profile", str(tmp_path / "dumped.py"),
                            "--warmup", "2", "--steps", "2"],
                           cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
     assert done.returncode == 0, done.stderr[-4000:]
@@ -297,6 +297,23 @@ def test_a_run_config_round_trips_through_its_json_record(name):
     assert RunConfig.read(record).record() == record
     preset = "lm" if name == "lm" else "images"
     assert record["fields"]["data"]["stages"][-1]["pipe"] == f"dew.data.presets:{preset}"
+
+
+@pytest.mark.parametrize("args, preset", [
+    (["preset:cosine_general", "--preset.kappa", "2.0"], CosineGeneral(kappa=2.0)),
+    (["preset:cosine_continuous", "--preset.min-snr-gamma", "5.0"], CosineContinuous(min_snr_gamma=5.0)),
+    (["preset:exp", "--preset.timesteps", "500"], Exp(timesteps=500)),
+], ids=["cosine_general", "cosine_continuous", "exp"])
+def test_flaxdiffs_schedules_are_a_runs_presets_rebuilt_from_its_record(args, preset):
+    """FlaxDiff's tangent grid, continuous cosine and exponential table are a configured run's presets
+    (row 1928): named on the command line, their arguments in the run's record, and the run read back
+    from that record holds the preset they describe, which builds its process (`Preset`)."""
+    config = dataclasses.replace(parse(DiffusionRunConfig, [*args, "--trainer.steps", "5"]),
+                                 data=images_of("tfds://oxford_flowers102", 32))
+    record = json.loads(json.dumps(config.record()))
+    rebuilt = RunConfig.read(record)
+
+    assert config.preset == rebuilt.preset == preset
 
 
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
@@ -521,7 +538,7 @@ def test_a_python_runs_trust_holds_while_its_file_builds_it(tmp_path):
     """`--trust` holds before a Python run's file runs (`run_named`), whether or not its chain is
     recorded: a source the file loads while it builds the run (a source directory beside it, which
     `dew.registry.trusts_source` reads) is trusted there, so its own code runs where its load reads it."""
-    from dew.cli.main import run_named
+    from dew._cli.main import run_named
 
     source = tmp_path / "source"
     source.mkdir()

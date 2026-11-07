@@ -323,27 +323,32 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     latent = jnp.asarray(np.load(source / "sd3_pipeline.npz")["pipeline.x_T"][:1])
     condition = DenoisingCondition(jnp.ones((1, 4, 32), jnp.float32),
                                    jnp.ones((1, 10), jnp.float32))
-    trained = loaded.model.apply({"params": state.variables["params"],
-                                  "buffers": state.variables["buffers"]},
-                                 latent, jnp.asarray([0.5]), condition)
-    reloaded = again.model.apply({"params": again.variables["params"],
-                                  "buffers": again.variables["buffers"]},
-                                 latent, jnp.asarray([0.5]), condition)
+    # The reload builds the trained model, so one compiled forward reads both trees.
+    assert again.model == loaded.model
+    forward = jax.jit(lambda tree: loaded.model.apply(tree, latent, jnp.asarray([0.5]), condition))
+    trained = forward({"params": state.variables["params"], "buffers": state.variables["buffers"]})
+    reloaded = forward({"params": again.variables["params"], "buffers": again.variables["buffers"]})
     np.testing.assert_array_equal(reloaded, trained)
 
     # Diffusers' own classes read the export: every component cleanly, the
     # pipeline whole, and its transformer recomputes the trained forward.
-    from one_draw import assert_as_exact_as_the_reference
+    from diffusion_support import assert_export_recomputes
 
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
+    forward = jax.jit(lambda drawn: loaded.model.apply(
+        {"params": state.variables["params"], "buffers": state.variables["buffers"]}, drawn,
+        jnp.asarray([0.5]), condition))
 
-    def call(model, tensor):
-        output = model(hidden_states=tensor(latent).permute(0, 3, 1, 2),
+    def draw(seed):
+        """A latent of the pipeline's shape, its values drawn."""
+        return (np.random.default_rng([4441, seed]).standard_normal(latent.shape).astype(np.float32),)
+
+    def call(model, tensor, drawn):
+        output = model(hidden_states=tensor(drawn).permute(0, 3, 1, 2),
                        encoder_hidden_states=tensor(condition.context),
                        pooled_projections=tensor(condition.pooled), timestep=tensor([0.5])).sample
         return output.permute(0, 2, 3, 1).numpy()
 
-    assert_as_exact_as_the_reference(np.asarray(trained), consumer.denoiser_prediction(export, call),
-                                     consumer.denoiser_prediction(export, call, wide=True), "trained SD3")
+    assert_export_recomputes(export, forward, call, draw, "trained SD3")

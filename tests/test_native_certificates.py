@@ -18,7 +18,6 @@ rounded to bf16 where fp32 is held, the decay from rounded cumulative sums and a
 boundary."""
 
 import functools
-import itertools
 
 import jax
 import jax.numpy as jnp
@@ -36,22 +35,26 @@ from native_certificates import (
     SUBNORMAL_CASE,
     TF32_SHARES,
     TRUNCATED_SHARE,
-    Terms,
     assert_refused,
+    forward_products,
+    groups,
+    input_gradient_products,
+    kernel_gradient_holds,
+    kernel_gradient_products,
     narrow_partial_ends,
     native_dot_ends,
     native_dot_holds,
     promoted_step_ends,
     promoted_step_holds,
+    rows_products,
     separated,
-    terms,
+    spans,
     tf32_operand,
     truncating_step_ends,
 )
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32, TFLOAT32, Format, truncated
 
-from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates.gemm import template
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.recurrence import mainloop
 
 pytestmark = pytest.mark.gpu(reason="a native kernel, certified on the GPU that compiles it")
@@ -119,39 +122,6 @@ def draw(seed: int, signed: bool, dtype=ml_dtypes.bfloat16):
             held(values((ROWS, WIDTH)) / np.sqrt(WIDTH)))
 
 
-def groups(sizes) -> np.ndarray:
-    """Each row's group."""
-    return np.repeat(np.arange(len(sizes)), sizes)
-
-
-def spans(sizes) -> list[tuple[int, int]]:
-    """Each group's first row and its end."""
-    return list(itertools.pairwise(np.cumsum((0, *sizes)).tolist()))
-
-
-def forward_products(x, w, sizes, fmt: Format = BFLOAT16) -> Terms:
-    """`[rows, width, depth]`: each output element's exact products of operands of `fmt` (`terms`),
-    its row times its group's column."""
-    return terms(lambda x, w: x[:, None, :] * np.swapaxes(w[groups(sizes)], 1, 2), x, w, fmt=fmt)
-
-
-def input_gradient_products(dy, w, sizes, fmt: Format = BFLOAT16) -> Terms:
-    """`[rows, depth, width]`: each input gradient element's exact products, the row's cotangent times its
-    group's matrix row."""
-    return terms(lambda dy, w: dy[:, None, :] * w[groups(sizes)], dy, w, fmt=fmt)
-
-
-def rows_products(x, dy, fmt: Format = BFLOAT16) -> Terms:
-    """`[depth, width, rows]`: the exact products of rows of `x` and of the cotangent `dy` a kernel gradient
-    sums, each element's its rows' column of `x` times theirs of `dy`."""
-    return terms(lambda x, dy: x.T[:, None, :] * dy.T[None, :, :], x, dy, fmt=fmt)
-
-
-def kernel_gradient_products(x, dy, sizes, fmt: Format = BFLOAT16) -> list[Terms]:
-    """Each group's kernel gradient's exact products (`rows_products` of its rows)."""
-    return [rows_products(x[start:end], dy[start:end], fmt) for start, end in spans(sizes)]
-
-
 def kernel_gradient_ends(products: list) -> tuple[np.ndarray, np.ndarray]:
     """`[groups, depth, width]`: the least and the greatest fp32 value of each element of a kernel gradient
     its groups' exact `products` admit (`native_dot_ends`)."""
@@ -165,18 +135,11 @@ def products_apart(declared, given, out) -> np.ndarray:
     return separated(*(native_dot_ends(products, out, flushes=False) for products in (declared, given)))
 
 
-def kernel_gradient_holds(native, products: list, out) -> np.ndarray:
-    """`[groups, depth, width]`: whether each element of a native kernel gradient is a value its group's exact
-    `products` admit (`native_dot_holds`)."""
-    return np.stack([native_dot_holds(each, group, out, flushes=False)
-                     for each, group in zip(native, products, strict=True)])
-
-
 def forward_of(x, w, sizes, out_dtype=jnp.bfloat16, *, dtype=jnp.bfloat16, precision=None) -> np.ndarray:
     """The template's native forward of the rows and matrices in `dtype`, its output in `out_dtype`, its
     product declared at `precision`, traced at JAX's own default precision as a model runs it (`as_run`)."""
     with as_run():
-        return np.asarray(jax.jit(lambda rows: template.gemm(
+        return np.asarray(jax.jit(lambda rows: gemm.gemm(
             rows, jnp.asarray(w, dtype), jnp.asarray(sizes, jnp.int32), out_dtype=out_dtype,
             precision=precision))(jnp.asarray(x, dtype)), np.float64)
 
@@ -191,7 +154,7 @@ def as_run():
 def input_gradient_of(x, w, dy, sizes, *, dtype=jnp.bfloat16) -> np.ndarray:
     """The template's native input gradient of the cotangent in `dtype`, through its own derivative."""
     def pulled(rows, cotangent):
-        _, pull = jax.vjp(lambda rows: template.gemm(rows, jnp.asarray(w, dtype),
+        _, pull = jax.vjp(lambda rows: gemm.gemm(rows, jnp.asarray(w, dtype),
                                                      jnp.asarray(sizes, jnp.int32), out_dtype=dtype),
                           rows)
         return pull(cotangent)[0]
@@ -207,7 +170,7 @@ def kernel_gradient(sizes, out_dtype=jnp.bfloat16, *, dtype=jnp.bfloat16, precis
     `precision` (above the default, an fp32 gradient's exact sums)."""
     def pulled(rows, cotangent):
         matrices = jnp.zeros((len(sizes), rows.shape[1], cotangent.shape[1]), out_dtype)
-        _, pull = jax.vjp(lambda matrices: template.gemm(rows, matrices, jnp.asarray(sizes, jnp.int32),
+        _, pull = jax.vjp(lambda matrices: gemm.gemm(rows, matrices, jnp.asarray(sizes, jnp.int32),
                                                          out_dtype=dtype, precision=precision), matrices)
         return pull(cotangent)[0]
 
@@ -407,7 +370,7 @@ def the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time(kernel, gene
     is the IEEE sum of the one before and the step's own partial, on draws at one scale and falling past the
     first step."""
     def forward(x, w):
-        return template.gemm(x, w, jnp.asarray(SIZES, jnp.int32), out_dtype=jnp.float32, precision="highest")
+        return gemm.gemm(x, w, jnp.asarray(SIZES, jnp.int32), out_dtype=jnp.float32, precision="highest")
 
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         width, _ = depth_step(grouped_matmul.Gmm, forward, jax.ShapeDtypeStruct((ROWS, DEPTH), jnp.bfloat16),

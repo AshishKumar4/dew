@@ -13,7 +13,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew._records import ADDED, integer, record
-from dew.batch import Batch
+from dew.batch import Batch, coordinates
 from dew.data.pipeline import Pack, Rejected, composed, cut_counts
 from dew.data.text import Tokenizer
 from dew.decision.data import Example, GroupedExamples
@@ -93,7 +93,7 @@ class Encoding:
             else None
         )
         return self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
-                                tokens=None if tokens is None else tokens.tolist())
+                                tokens=None if tokens is None else tokens.tolist(), request=example.questions)
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
                  tokens: np.ndarray | None = None, group_of: "GroupOf | None" = None,
@@ -130,15 +130,19 @@ class Encoding:
             if gold is not None:
                 golds[name] = gold
         rows = self._rows(example, asked, rng, tokens)
-        if dropped and any(drawn_refusal(self.layout, row, self.context_length, admitted) is not None
-                           for row in rows):
+        if dropped and (len(rows) != 1 or any(drawn_refusal(self.layout, row, self.context_length, admitted)
+                                              is not None for row in rows)):
             # The added option made a row no run trains on (`Layout.refusal`: unfit, or options a
-            # declared budget left alike), or one whose state it cut further than its count says: this
-            # read lays the questions out as Fit admitted them.
+            # declared budget left alike), one whose state it cut further than its count says, or two of
+            # a row over one state: this read lays the questions out as Fit admitted them.
             asked = {name: example.questions[name] for name in names}
             golds = {name: example.distribution(name) for name in names if name in labels}
             dropped = {}
             rows = self._rows(example, asked, rng, tokens)
+        if len(rows) != 1:
+            # A row over one state that its options' drawn order splits, their lines read as other tokens
+            # (`QuestionLayout.shared_state`), is laid out in their own order, as Fit admitted it.
+            rows = self._rows(example, asked, None, tokens)
         # A run over a backbone that reads no context leaves an example's own context unread.
         rows = with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
                             self.context_length)
@@ -193,8 +197,9 @@ def model_row(encoded: Encoded, width: int, context_length: int | None = None) -
     (`dew.decision.task.Decide`)."""
     row: Batch = {"tokens": np.asarray(encoded.tokens, np.int32),
                   **question_fields(encoded, len(encoded.questions), width, labelled_rows([encoded]))}
-    if encoded.positions is not None and encoded.slots is not None:
+    if encoded.positions is not None:
         row["positions"] = np.asarray(encoded.positions, np.int32)
+    if encoded.slots is not None:
         row["slots"] = np.asarray(encoded.slots, np.int32)
     if encoded.blocks is not None:
         row["blocks"] = np.asarray(encoded.blocks, np.int32)
@@ -405,7 +410,8 @@ class Fit(pygrain.MapTransform):
     def _rows(self, example: Example, asked: Mapping[str, Question]) -> tuple[FittedRow, ...] | Rejected:
         """`example`'s rows of the questions `asked`, as the layout lays them out, or why none fit."""
         state = self.layout.state(self.tokenizer, self.specials, example.state)
-        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state,
+                                request=example.questions)
         # Counted under its reason, as a server counts the request it refuses (`Layout.refusal`); a
         # scored row whose options a declared cut left alike is answered as a server answers it.
         refusals = [self.layout.refusal(row, self.context_length) for row in laid]
@@ -447,8 +453,12 @@ class Fit(pygrain.MapTransform):
             asked[laid.name] = question
         if all(asked[laid.name].options == example.questions[laid.name].options for laid in row.questions):
             return None
-        [augmented] = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
-        return drawn_refusal(self.layout, augmented, self.context_length, row.cuts)
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state,
+                                request=example.questions)
+        if len(laid) != 1:
+            # A row over one state its added options leave no room in (`QuestionLayout.shared_state`).
+            return "unfit"
+        return drawn_refusal(self.layout, laid[0], self.context_length, row.cuts)
 
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
         """Grouped examples' labelled rows, each as an example of its own lays it out (`QuestionRows`
@@ -499,7 +509,7 @@ class Fit(pygrain.MapTransform):
                             if name in example.answers and draws_none(question, fewest) else question)
                      for name in row.names for question in (example.questions[name],)}
             laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked,
-                                    tokens=row.tokens.tolist())
+                                    tokens=row.tokens.tolist(), request=example.questions)
             schemas = sum(len(each.context or ()) for each in laid if each.spans_in_context)
             return sum(len(each.tokens) for each in laid), schemas or row.context
 
@@ -706,6 +716,8 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
     `trained` row carries its gold along its questions; a scored one
     (`model_row`) carries the model's fields alone."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
+    # A row of questions over one state lays each at its own row's positions (`QuestionLayout.shared_state`).
+    positioned = parallel or (isinstance(layout, QuestionLayout) and layout.shared_state is not None)
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
     streamed = layout.attention is not None
     along = tuple((name, bounds.questions) for name in _along(layout, grouped, trained))
@@ -717,7 +729,8 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
     if grouped:
         # A unit of rows packs as one document, one entry a row on an axis of the window's rows.
         along = (*along, ("unit_rows", bounds.segments))
-    fields = ("tokens", *(("positions", "slots") if parallel else ()), *(("blocks",) if blocked else ()),
+    fields = ("tokens", *(("positions",) if positioned else ()), *(("slots",) if parallel else ()),
+              *(("blocks",) if blocked else ()),
               *(("streams",) if streamed else ()), *(("row",) if grouped else ()))
     return Pack(layout.max_len, fields, segments=bounds.segments, along=along)
 
@@ -743,15 +756,15 @@ def _unit_rows(element: Batch, units: np.ndarray, owned: np.ndarray
     """A window's rows, numbered from 1 in the order they stand and 0 for padding, from the packer's
     documents (`units`, `owned` each question's) and each token's and question's row in its unit
     (`row`, `question_row`; a unit of one row where the window holds none); each question's row; and
-    each token's position in its row."""
+    each token's position in its row, as `dew.batch.coordinates` counts a document's tokens."""
     if "row" not in element:
         return units, owned, np.asarray(element["tokens_positions"])
     numbered = _numbered(element, units)
     segments = numbered(units, element["row"])
     owners = numbered(owned, element["question_row"])
-    starts = np.concatenate([[0], np.cumsum(np.bincount(segments)[1:])])
-    positions = np.where(segments > 0, np.arange(len(segments)) - starts[np.maximum(segments - 1, 0)], 0)
-    return segments, owners, positions.astype(np.int32)
+    positions = coordinates(segments=segments[None], xp=np).positions
+    assert positions is not None, "a window's coordinates count its documents' tokens"
+    return segments, owners, np.asarray(positions[0])
 
 
 def _numbered(element: Batch, units: np.ndarray) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
@@ -820,7 +833,7 @@ class PackedRows(pygrain.MapTransform):
         options = np.asarray(element["options"])
         laid = {name: element[name] for name in ("tokens", *_along_fields(element))} | {
             "segments": segments,
-            "positions": element["positions"] if "slots" in element else positions,
+            "positions": element.get("positions", positions),
             "question_rows": owners.astype(np.int32),
             "spans": element["spans"] + moved[:, None],
             "option_spans": element["option_spans"] + (moved[:, None] * options)[..., None],

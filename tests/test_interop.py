@@ -433,8 +433,9 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     exported = Pretrained.from_run(str(run))
     exported.save(destination)
 
+    # The run's own declaration beside the files every reader reads (row 4314).
     assert {entry.name for entry in destination.iterdir()} == {
-        "config.json", "generation_config.json", "model.safetensors"}
+        "config.json", "dew_release.json", "generation_config.json", "model.safetensors"}
     assert json.loads((destination / "generation_config.json").read_text())["tokenizer_name"] == "byte"
     reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
@@ -490,7 +491,7 @@ def test_a_run_trained_in_one_process_exports_from_a_fresh_one(tmp_path):
     trained = subprocess.run([sys.executable, "-c", program, str(tmp_path / "run")],
                              capture_output=True, text=True, env=env, timeout=600)
     assert trained.returncode == 0, trained.stderr[-2000:]
-    exported = subprocess.run([sys.executable, "-m", "dew.cli.main", "export", str(tmp_path / "run"),
+    exported = subprocess.run([sys.executable, "-m", "dew._cli.main", "export", str(tmp_path / "run"),
                                str(tmp_path / "export")],
                               capture_output=True, text=True, env=env, timeout=600)
     assert exported.returncode == 0, exported.stderr[-2000:]
@@ -498,7 +499,7 @@ def test_a_run_trained_in_one_process_exports_from_a_fresh_one(tmp_path):
     assert_transformers_reads_the_run(tmp_path / "export", dew.pipeline(str(tmp_path / "run")),
                                       np.arange(9).reshape(1, 9))
 
-    from dew.cli.main import main
+    from dew._cli.main import main
 
     with pytest.raises(FileNotFoundError):
         main(["export", str(tmp_path / "nothing"), str(tmp_path / "other")])

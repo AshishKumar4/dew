@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -73,12 +75,20 @@ def kept_window(held: Accumulation | None, pending: Accumulation, filled: int | 
 
 
 
-@struct.dataclass
-class Replicas:
-    """DiLoCo's inner copies (`dew.training.diloco`), each replica group's own state stacked on a first
-    axis that the mesh's diloco axis splits: its clocks of accepted microbatches and committed updates,
-    its variables, optimizer state, EMA, loss scale, pooling window and held tokens, each as a
-    `TrainState` field of one run holds them (`REPLICA_FIELDS`)."""
+REPLICA: Mapping[str, bool] = MappingProxyType({"replica": True})
+"""The metadata marking a `TrainState` field each DiLoCo replica holds its own of (`Replicas`): the one
+declaration of the replicas' state, from which `Replicas` and `REPLICA_FIELDS` are made."""
+
+
+class ReplicaState(Protocol):
+    """DiLoCo's inner copies (`dew.training.diloco`) as their readers are typed: each replica group's own
+    state stacked on a first axis that the mesh's diloco axis splits, its clocks of accepted microbatches
+    and committed updates, its variables, optimizer state, EMA, loss scale, pooling window and held
+    tokens, each as a `TrainState` field of one run holds them. `Replicas` is made from the fields
+    `TrainState` marks `REPLICA`, which tests/test_diloco.py holds this view to; it is a dataclass, which
+    `dataclasses.replace` takes."""
+
+    __dataclass_fields__: ClassVar[dict[str, dataclasses.Field[Any]]]
     microstep: jax.Array
     updates: jax.Array
     variables: Variables
@@ -87,10 +97,6 @@ class Replicas:
     scale: DynamicScale | None
     accumulation: Accumulation | None
     deferred: jax.Array | None
-
-
-REPLICA_FIELDS = tuple(field.name for field in dataclasses.fields(Replicas))
-"""The `TrainState` fields each DiLoCo replica holds its own of (`Replicas`)."""
 
 
 @struct.dataclass
@@ -111,27 +117,27 @@ class TrainState:
     checkpoint as the parameters.
     """
     step: jax.Array
-    microstep: jax.Array
-    updates: jax.Array
-    variables: Variables = struct.field(metadata={'variables': True})
-    opt_state: optax.OptState
-    ema: Variables | None = struct.field(metadata={'variables': True})
+    microstep: jax.Array = struct.field(metadata=REPLICA)
+    updates: jax.Array = struct.field(metadata=REPLICA)
+    variables: Variables = struct.field(metadata={'variables': True, **REPLICA})
+    opt_state: optax.OptState = struct.field(metadata=REPLICA)
+    ema: Variables | None = struct.field(metadata={'variables': True, 'averages': 'variables', **REPLICA})
     key: jax.Array
-    scale: DynamicScale | None
+    scale: DynamicScale | None = struct.field(metadata=REPLICA)
     window_size: jax.Array
-    accumulation: Accumulation | None = None
+    accumulation: Accumulation | None = struct.field(default=None, metadata=REPLICA)
     consumed: jax.Array | None = dataclasses.field(default=None, metadata={"optional": True})
     """The source examples the run's dispatched batches consumed, int32, in a run bounded in examples
     (`dew.batch.EXAMPLES_CONSUMED`): each step adds what its microbatch's real rows were the last rows of,
     whether or not the update it joins commits, so the run's schedules and cadences read its progress
     exactly, the same on every process; None in a run counted otherwise, which a checkpoint that holds
     none restores (`OPTIONAL`)."""
-    deferred: jax.Array | None = dataclasses.field(default=None, metadata={"optional": True})
+    deferred: jax.Array | None = dataclasses.field(default=None, metadata={"optional": True, **REPLICA})
     """The real tokens of the calls whose updates the optimizer holds back
     (`dew.held_updates.update_applied`), two uint32 words (`dew.training.model_flops._TokenCount`),
     committed with the update that applies them; None for an optimizer that applies every update, which
     a checkpoint that holds none restores."""
-    inner: Replicas | None = dataclasses.field(default=None, metadata={"optional": True})
+    inner: ReplicaState | None = dataclasses.field(default=None, metadata={"optional": True})
     """DiLoCo's replicas' inner state (`dew.training.diloco`), where the variables, the EMA and the
     optimizer state above are the outer model's and its outer optimizer's; None in a run of one copy,
     which a checkpoint that holds none restores."""
@@ -187,6 +193,24 @@ class TrainState:
         return dataclasses.replace(self, inner=dataclasses.replace(self.inner, accumulation=window))
 
 
+def without_empty_window(state: TrainState) -> TrainState:
+    """`state` as a checkpoint holds it: its window (`window`) left out where it holds no microbatch, at
+    an update's boundary, under DiLoCo every group's. A commit clears every field of the window but its
+    gradient sum, which the next window's first microbatch replaces unread (`dew.training.transaction`),
+    so the empty window a resume allocates (`Trainer._initialize_accumulation`) is the same window, and
+    the sum, a trainable-size float32 tree, is no checkpoint's (row 4309: ~36 GB of a 9B run's ~112 GB).
+    A window part filled is saved whole."""
+    if state.window is None:
+        return state
+    from dew._coordination import collective_host
+
+    size = int(state.window_size)
+    # The groups' clocks are stacked over the groups, which a pool's processes split.
+    clocks = collective_host(state.microstep if state.inner is None else state.inner.microstep,
+                             phase="checkpoint window")
+    return state.with_window(None) if int(jnp.max(jnp.asarray(clocks) % size)) == 0 else state
+
+
 CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
                      if field.metadata.get('checkpointed', True))
 """The train-state fields a checkpoint holds, by their names; a field its
@@ -195,6 +219,19 @@ declaration marks `checkpointed=False` is rebuilt on resume."""
 OPTIONAL = tuple(field.name for field in dataclasses.fields(TrainState) if field.metadata.get('optional'))
 """The checkpointed train-state fields a run may hold none of, as a run on another clock holds no
 examples consumed: a checkpoint that holds none restores None (`dew.checkpoints`), whichever Dew wrote it."""
+
+REPLICA_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
+                       if all(field.metadata.get(key) == value for key, value in REPLICA.items()))
+"""The `TrainState` fields each DiLoCo replica holds its own of, in their order (`REPLICA`)."""
+
+Replicas = struct.dataclass(type("Replicas", (), {
+    "__module__": __name__,
+    "__doc__": "DiLoCo's inner copies (`ReplicaState`), a pytree of the `REPLICA_FIELDS`, each replica "
+               "group's own stacked on a first axis.",
+    "__annotations__": {field.name: field.type for field in dataclasses.fields(TrainState)
+                        if field.name in REPLICA_FIELDS}}))
+"""DiLoCo's inner copies (`ReplicaState`), made as `TrainState` declares the `REPLICA_FIELDS`: a class of
+their annotations alone, which `struct.dataclass` makes the pytree."""
 
 MODEL_STATE = ("step", "microstep", "updates", "variables", "ema")
 """The train-state fields that say which model a step holds, its counters, variables and EMA:
@@ -205,6 +242,13 @@ VARIABLE_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
 """The train-state fields that each hold a variables tree, keyed by collection (`params`,
 `FROZEN`, ...), as their declarations mark them; the optimizer's state mirrors the trained
 parameters' paths instead."""
+
+AVERAGES: Mapping[str, str] = MappingProxyType({
+    field.name: field.metadata['averages'] for field in dataclasses.fields(TrainState)
+    if 'averages' in field.metadata})
+"""Each train-state field that averages another's leaves, by name, to the field it averages: the EMA of
+the variables, which a checkpoint stores as its difference from them (`dew.checkpoints`), the run's and
+each DiLoCo group's."""
 
 
 def drawn_in[LossT, EffectsT](variables: Variables, dtype: DTypeLike | None,

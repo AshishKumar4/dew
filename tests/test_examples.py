@@ -21,7 +21,7 @@ import pytest
 from lane_environment import outside_suite
 from diffusion_stubs import RES, TOKENS, StubText
 from PIL import Image
-from process_support import dew_train, logged_losses
+from process_support import dew_train, logged_losses, raised
 from test_inference import make_run
 from tool_support import load
 
@@ -474,10 +474,10 @@ def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(t
 
 
 def test_evaluate_and_serve_smoke_scores_a_diffusion_run_it_is_pointed_at(tmp_path):
-    """The image half, over the run the diffusion example trains. Both
-    metrics read a committed fixture instead of the checkpoint each default
-    names, so the pair scores with no download: the tiny CLIP, and the FID
-    extractor the smoke passes as `--inception-weights`."""
+    """The image half alone, over the run the diffusion example trains: pointed at a diffusion run and
+    no language run, the smoke scores that run and trains no language model. Both metrics read a
+    committed fixture instead of the checkpoint each default names, so the pair scores with no
+    download: the tiny CLIP, and the FID extractor the smoke passes as `--inception-weights`."""
     images = tmp_path / "images"
     smoke("train_flowers_tpu", images)
 
@@ -488,6 +488,24 @@ def test_evaluate_and_serve_smoke_scores_a_diffusion_run_it_is_pointed_at(tmp_pa
     report = json.loads((tmp_path / "report" / "report.json").read_text())
     assert "clip_score" in report["images"]
     assert report["images"]["fid"] >= 0, "the offline FID did not score"
+    assert "perplexity" not in report and not (tmp_path / "report" / "checkpoints").exists()
+
+
+def test_evaluate_and_serve_refuses_language_options_a_diffusion_run_alone_would_drop(tmp_path):
+    """Pointed at a diffusion run and no language run, the example refuses the options only a language run
+    reads, before it reads either run, rather than leave them out of its report unsaid; the prompt and its
+    length it refuses only where no served endpoint reads them (row 4619)."""
+    example = REPO_ROOT / "examples" / "evaluate_and_serve.py"
+    done = subprocess.run([sys.executable, str(example), "--image-run", str(tmp_path / "none"), "--tasks",
+                           "hellaswag", "--out", str(tmp_path)], cwd=REPO_ROOT,
+                          env=single_device(offline=True), capture_output=True, text=True, timeout=300)
+    assert "ValueError" in raised(done)
+    assert not (tmp_path / "report.json").exists()
+    module = load("evaluate_and_serve", "examples")
+    image = {"image_run": tmp_path / "none", "prompt": "to be", "max_new_tokens": 8}
+    assert module.dropped(module.Config(**image)) == ["--prompt", "--max-new-tokens"]
+    assert module.dropped(module.Config(**image, ollama_host="http://127.0.0.1:9")) == []
+    assert module.dropped(module.Config(**image, run=tmp_path / "language")) == []
 
 
 @pytest.mark.network

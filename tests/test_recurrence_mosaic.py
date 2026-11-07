@@ -33,11 +33,12 @@ from test_recurrence_chunk import (
 )
 
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding, mosaic_rule
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding, recomputed_memory
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
+from dew.nn.kernels.templates.recurrence.template import mosaic_rule
 
 pytestmark = pytest.mark.kernel
 
@@ -191,11 +192,11 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     # The l2 norm takes the queries and keys to fp32 at least before the rule reads them.
     query, key = ((x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in (given.query, given.key))
                   if hooks.l2norm else (given.query, given.key))
+    dtype = jnp.result_type(query, key, given.value)
+    rounded = fast_rounding(dtype) if hooks.rated else chunk_rounding(hooks.delta, dtype)
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
-                                floor=hooks.floor, bound=hooks.inverse_bound,
-                                rounded=fast_rounding() if hooks.rated else chunk_rounding(
-                                    hooks.delta, jnp.result_type(query, key, given.value)))
+                                floor=hooks.floor, bound=hooks.inverse_bound, rounded=rounded)
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
@@ -257,7 +258,8 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     def rule(given: Chunk, max_segments: int | None = None):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
                            tiles=narrowest, starts=given.starts, max_segments=max_segments, scale=hooks.scale,
-                           floor=hooks.floor, bound=hooks.inverse_bound, rounded=forms == 'fast')
+                           floor=hooks.floor, bound=hooks.inverse_bound, rounded=forms == 'fast',
+                           recomputed=recomputed_memory())
 
     return rule
 
@@ -421,7 +423,7 @@ def test_the_template_on_an_unseen_gpu_is_as_exact_as_its_reference():
 def test_the_mosaic_launches_state_their_work(training):
     """A bf16 gated delta rule's forward, or its forward and gradient, through the template, lowered for the
     GPU the test runs on, or off one an H100 (Mosaic GPU lowers no Hopper copy for an A100's device):
-    every launch states its cost (`_kernel`'s, `templates.gemm.cost`), which Dew's FLOP count reads to
+    every launch states its cost (`_kernel`'s, `templates.cost.estimate`), which Dew's FLOP count reads to
     size it (`instrumentation._stated_flops`: no launch unsized, row 1895's kernel report), their products
     together at least the model's recurrent function's (`flops.delta_flops`: the chunked form's preparation
     and inversion are work past it)."""
@@ -892,6 +894,49 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     assert stepped.block_v < first.block_v
     narrower = (stepped.forward or stepped).block_v < first.forward.block_v
     assert narrower == (kernel == 'recurrence_states')
+
+
+def test_a_refusal_under_the_remat_rung_reaches_the_route():
+    """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), a refusal of
+    every tile of the run's training call's launch (its identity as its lowering for an H100 names it,
+    `report.traced`) reaches the selector, which takes another kernel for the call: its bind is the run's
+    launch, the rung's flag resolved alike (`recurrence_chunk.recomputed_memory`); bound as kept, it judged
+    another launch than the run's (row 4133)."""
+    from dew.nn.kernels import recurrence_chunk
+    from dew.training._lowering import kernel_calls
+
+    operands = [jnp.zeros(shape, dtype) for shape, dtype in (
+        ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 2, 64), jnp.bfloat16),
+        ((1, 64, 2), jnp.float32), ((1, 64, 2), jnp.bfloat16))]
+    # The run's call as the chunked op's route makes it (`recurrence_chunk.chunk`'s options).
+    options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'floor': None, 'bound': 1.0,
+               'rounded': True}
+
+    def loss(*given):
+        out, final = recurrence_chunk.template_rule(*given, **options)
+        return out.astype(jnp.float32).sum() + final.sum()
+
+    def selected() -> str:
+        return recurrence_chunk.port_kernel(*operands, bound=1.0, product='training', report=False)
+
+    # The run's rounded products are its declaration's at the default precision (`rounds_products`; the
+    # suite's lanes configure 'highest').
+    with (report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)),
+          jax.default_matmul_precision('default')):
+        target = template.Mosaic.launched()
+        assert selected() == 'mosaic_gpu'
+        training = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+        lowered = training.trace(*operands).lower(lowering_platforms=('cuda',))
+        (identity,) = {report.traced(call.launch).identity for call in kernel_calls(lowered)
+                       if call.kind == 'mosaic_gpu' and call.launch is not None}
+        # The run's launch bound as the run binds it, its identity the lowering's.
+        bound = template.MOSAIC.bind(*operands, None, None, firsts=None, skip=None, recomputed=True,
+                                     **options)
+        assert report._identity(template.MOSAIC, bound) == identity
+        while (tiles := template.MOSAIC.derived(bound, target)) is not None:
+            names = {launch.name for launch in template.MOSAIC._launches(bound, tiles, target, backward=True)}
+            report.refuse([(identity, tiles, names)])
+        assert selected() != 'mosaic_gpu'
 
 
 def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.RegisterModel:

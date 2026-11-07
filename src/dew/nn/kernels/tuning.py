@@ -24,12 +24,12 @@ In a tuning run, `tune` reads a program's launches from a lowering that
 describes them (`launches`), and the pool's process 0 decides every distinct
 launch's config, which the others take exactly, so every process compiles the
 same program: its pick, or the heuristic. With `measure`, on a GPU the
-process has to itself (`dew.cache.measures_picks`), every variant of a launch
+process has to itself (`dew._cache.measures_picks`), every variant of a launch
 without a pick compiles on a thread pool and runs alone, its kernel's device
-time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept;
+time read by CUPTI behind an eviction (`dew.telemetry.benchmark.behind`), and the fastest is kept;
 a win over the derived config is a gap in the derivation, fixed there for
 the whole family, which `gaps` names for maintainers. Picks persist per GPU model, jaxlib and jax beside XLA's
-own (`dew.cache.kernel_picks_path`; Pallas lowers a kernel in jax, which a release moves without jaxlib), in
+own (`dew._cache.kernel_picks_path`; Pallas lowers a kernel in jax, which a release moves without jaxlib), in
 Dew's own JSON (`encoded`, `decoded`), which tokamax's public
 API leaves to its callers. Wall-clock timing is
 `dew.telemetry.benchmark.samples`, which every benchmark tool in Dew measures with.
@@ -72,21 +72,16 @@ from jax._src import config as jax_config
 from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
-from dew import _coordination, _records, cache
+from dew import _cache, _coordination, _records
+from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
-from dew.files import write_atomically
 from dew.nn.kernels.options import owned_program
 
 from . import generation
 from .templates import report
 
 _log = logging.getLogger(__name__)
-
-FLUSH_BYTES = 256 << 20
-"""The bytes read before each timed launch: twice the largest L2 among Dew's
-GPUs (an RTX PRO 6000's 128 MB), so no launch finds its operands in cache,
-as none does in a training step."""
 
 REPEATS = 5
 """The timed launches of each config."""
@@ -171,8 +166,8 @@ def encoded(value: object) -> JSON:
 
 def decoded(value: _records.JSON) -> Rebuilt:
     """What `encoded` wrote, rebuilt. A class it names that this checkout lacks, a dataclass whose
-    stored fields are not this checkout's, or JSON it did not write raises `Unreadable`; whatever the
-    rebuilt classes raise propagates."""
+    stored fields are not this checkout's (but for fields it added with a default, which read as their
+    default), or JSON it did not write raises `Unreadable`; whatever the rebuilt classes raise propagates."""
     if isinstance(value, list):
         return [decoded(element) for element in value]
     if not isinstance(value, dict):
@@ -195,8 +190,11 @@ def decoded(value: _records.JSON) -> Rebuilt:
     if "dataclass" in value:
         cls = _located(_field(_records.text, value.get("dataclass"), "dataclass"))
         fields = value.get("fields")
+        # A field the checkout added with a default reads as that default: the pick was made without it.
         if not dataclasses.is_dataclass(cls) or not isinstance(fields, dict) or set(fields) != {
-                field.name for field in dataclasses.fields(cls) if field.init}:
+                field.name for field in dataclasses.fields(cls) if field.init and (
+                    field.name in fields or (field.default is dataclasses.MISSING
+                                             and field.default_factory is dataclasses.MISSING))}:
             raise Unreadable(f"{cls.__qualname__}'s stored fields are not this checkout's: {fields!r}")
         return cls(**{name: decoded(field) for name, field in fields.items()})
     if "tuple" in value:
@@ -394,7 +392,7 @@ def gaps(device_kind: str) -> list[Gap]:
     """The launches stored for GPUs of `device_kind` under this jax whose derived config lost
     (`Gap`), each named once."""
     found = []
-    ours, _ = _partitioned(cache.kernel_picks_path(device_kind))
+    ours, _ = _partitioned(_cache.kernel_picks_path(device_kind))
     for entry, (ba, timings) in ours:
         derived, fastest = _key(decoded(entry["derived"])), timings.fastest_config
         if fastest == derived:
@@ -514,7 +512,7 @@ class KernelOp(tokamax.Op):
         ba = self.bind(*args, **kwargs)
         config = self.config
         if config is None:
-            if (collected := cache.KERNEL_SEEN.value) is not None:
+            if (collected := _cache.KERNEL_SEEN.value) is not None:
                 collected.found.append((self, self.keyed(ba)))
             config = self._chosen(ba)
             if collected is not None:
@@ -527,7 +525,7 @@ class KernelOp(tokamax.Op):
         # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them; its
         # kernels carry it in their names, so a compile's reports name it (`report.launching`).
         with report.launching(self, ba, config):
-            if cache.KERNEL_LAUNCHES.value:
+            if _cache.KERNEL_LAUNCHES.value:
                 # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
                 # each traced array for its devices (`keyed`).
                 return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *ba.args,
@@ -535,7 +533,7 @@ class KernelOp(tokamax.Op):
             return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
 
     def _chosen(self, ba: tokamax.BoundArguments) -> Hashable:
-        pins = dict(cache.KERNEL_PINS.value)
+        pins = dict(_cache.KERNEL_PINS.value)
         if type(self) in pins:
             pin = self.completed(ba, pins[type(self)])
             # A pin holds for the call's own shapes, as an explicit config does (`__call__`).
@@ -857,32 +855,6 @@ def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct((1 << max(spec.shape[0] - 1, 0).bit_length(), *spec.shape[1:]), spec.dtype)
 
 
-def _kernel_times(cupti, executable, *args) -> list[tuple[str, float]]:
-    """Each kernel's name and device milliseconds over one run of
-    `executable`, read by `cupti` (a mosaic `profiler.Cupti`); none where it
-    launched none."""
-    _, kernels = cupti.measure(executable, aggregate=False)(*args)
-    return kernels if isinstance(kernels, list) else []
-
-
-def _another_subscriber(error: RuntimeError) -> bool:
-    """Whether CUPTI refused the tuner's subscription for another subscriber's, a profile capture or
-    Nsight's: the launch keeps its heuristic until a later compile. Mosaic's profiler raises it as a
-    RuntimeError naming the other subscriber; every other failure is the tuner's to report."""
-    return "another subscriber" in str(error)
-
-
-def _detach(profiler, evicting: jax.stages.Compiled, flush: jax.Array) -> None:
-    """Detach CUPTI from the process with a finalizing read of `evicting`, so a profiler can subscribe
-    after; where one already holds it (`_another_subscriber`), there is nothing of the tuner's to
-    detach."""
-    try:
-        _kernel_times(profiler.Cupti(), evicting, flush)
-    except RuntimeError as error:
-        if not _another_subscriber(error):
-            raise
-
-
 def _resource_exhausted(error: Exception) -> bool:
     """Whether a config failed for a block past the GPU's own resources, the failures a config of a
     launch's space may meet on a GPU it was not declared for: its shared memory as XLA's compile
@@ -914,27 +886,25 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels (Mosaic GPU's profiler's `Cupti`), each run after `FLUSH_BYTES` are
-    read, so every config starts with its operands out of cache."""
-    from jax.experimental.mosaic.gpu import profiler
+    kernels (`dew.telemetry.benchmark.device_time`), each run behind an
+    eviction, so every config starts with its operands out of cache."""
+    from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
-    flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
-    evicting = owned_program(jnp.sum).executable(flush)
+    flush = eviction()
 
     def compiled(config):
         configured = op.replace(config=config)
 
-        def run(flush, arrays):
-            # The launch waits for the flush, which reads the whole buffer through the cache.
-            total, arrays = jax.lax.optimization_barrier((jnp.sum(flush), arrays))
+        def launched(arrays):
             args, kwargs = fill(arrays)
-            return total, configured(*args, **kwargs)
+            return configured(*args, **kwargs)
 
         start = time.perf_counter()
         # A candidate's lowering and its compile timed apart, the compile of its config as it is: a config
-        # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`).
-        lowered = owned_program(run).lower(flush, arrays)
+        # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`). The
+        # launch runs behind the flush, which reads the whole buffer through the cache.
+        lowered = owned_program(behind(launched)).lower(flush, (arrays,))
         middle = time.perf_counter()
         executable = lowered.compile()
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3
@@ -943,41 +913,36 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     read = {}
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
         futures = {config: pool.submit(compiled, config) for config in ba.autotuning_configs}
-    # CUPTI reads every run, the flush's own first, subscribing for each and
-    # unsubscribing after. It takes one subscriber, so where a profile capture
-    # holds it, from the first run or any later one, the launch keeps its
-    # heuristic until a later compile.
-    cupti = profiler.Cupti(finalize=False)
-    flushes: set[str] = set()
+    # CUPTI reads every run, the flush's own first. It takes one subscriber, so
+    # where a profile capture holds it, from the first run or any later one,
+    # the launch keeps its heuristic until a later compile.
     try:
-        flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
-        for config, future in futures.items():
-            try:
-                executable, lowering, compiling = future.result()
-                runs = [_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS)]
-            except jax.errors.JaxRuntimeError as error:
-                if not _resource_exhausted(error):
-                    raise
-                timings[config] = error
-                continue
-            read[config] = runs, lowering, compiling
-    except RuntimeError as error:
-        if not _another_subscriber(error):
-            raise
+        with device_time() as device:
+            for config, future in futures.items():
+                try:
+                    executable, lowering, compiling = future.result()
+                    runs = [device.behind(executable, flush, arrays) for _ in range(REPEATS)]
+                except jax.errors.JaxRuntimeError as error:
+                    if not _resource_exhausted(error):
+                        raise
+                    timings[config] = error
+                    continue
+                except NoKernels as error:
+                    # CUPTI read none of the config's own kernels: its time would read as zero, so no pick.
+                    timings[config] = error
+                    continue
+                read[config] = runs, lowering, compiling
+    except CuptiHeld as error:
         return Timings(dict.fromkeys(ba.autotuning_configs, error))
-    finally:
-        _detach(profiler, evicting, flush)
-    return Timings({**timings, **_benchmarks(read, flushes)})
+    return Timings({**timings, **_benchmarks(read)})
 
 
-def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData]:
-    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out."""
-    benchmarks = {}
-    for config, (runs, lowering, compiling) in read.items():
-        times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
-        benchmarks[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
-                                                   metadata={}, evaluation_times_ms=times)
-    return benchmarks
+def _benchmarks(read: Mapping) -> dict[Hashable, tokamax.BenchmarkData]:
+    """The configs `_measured` timed, each run's time the sum of its own kernels' (`DeviceTime.behind`)."""
+    return {config: tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering, metadata={},
+                                          evaluation_times_ms=tuple(sum(kernel.milliseconds for kernel in run)
+                                                                    for run in runs))
+            for config, (runs, lowering, compiling) in read.items()}
 
 
 def _config(fastest: Timings | None) -> Hashable:
@@ -1048,10 +1013,10 @@ def _stored(path: str) -> list:
 
 def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
     """The picks stored for GPUs of `kind` that this checkout reads (`_read`), by op,
-    none where the process keeps no picks (`dew.cache.keeps_picks`)."""
-    if not cache.keeps_picks():
+    none where the process keeps no picks (`dew._cache.keeps_picks`)."""
+    if not _cache.keeps_picks():
         return {}
-    stored, _ = _read(cache.kernel_picks_path(kind))
+    stored, _ = _read(_cache.kernel_picks_path(kind))
     picks: dict[tuple[tokamax.Op, str], _Picks] = {}
     for op, key, fastest in _kernel_launches(stored):
         picks.setdefault((_identity(op), kind), _Picks())[key] = fastest
@@ -1063,7 +1028,7 @@ def _store(device_kind: str, picks) -> None:
     picks for that model, one writer at a time, a launch's newer timings replacing its older, the
     entries this checkout does not read kept as they are (`_read`). The file is replaced whole
     (`write_atomically`), so no reader on the shared filesystem sees a part of it."""
-    path = cache.kernel_picks_path(device_kind)
+    path = _cache.kernel_picks_path(device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
         stored, foreign = _read(path)
@@ -1076,8 +1041,8 @@ def _store(device_kind: str, picks) -> None:
 def launches() -> Iterator[None]:
     """Each kernel launch traced within carries tokamax's description of
     itself, which `tokamax.autotuning.get_bound_args` reads out of the
-    lowered program (`dew.cache.KERNEL_LAUNCHES`)."""
-    with cache.KERNEL_LAUNCHES(new_value=True):
+    lowered program (`dew._cache.KERNEL_LAUNCHES`)."""
+    with _cache.KERNEL_LAUNCHES(new_value=True):
         yield
 
 
@@ -1094,7 +1059,7 @@ class Seen(list[Launch]):
 
 class _Seen:
     """The launches a lowering traced under `seen` (`Seen`); hashed by identity, as
-    `dew.cache.KERNEL_SEEN` keys on it."""
+    `dew._cache.KERNEL_SEEN` keys on it."""
 
     def __init__(self) -> None:
         self.found = Seen()
@@ -1107,7 +1072,7 @@ def seen() -> Iterator[Seen]:
     (`Seen.taken`), recorded as it traces: a fresh collection each time, so
     a trace cached before traces again."""
     collected = _Seen()
-    with cache.KERNEL_SEEN(collected):
+    with _cache.KERNEL_SEEN(collected):
         yield collected.found
 
 
@@ -1128,12 +1093,12 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     if not generation.triton_runs():
         return lower(), "[]"
     with reading():
-        tuned = cache.KERNEL_TUNES.get_global()
+        tuned = _cache.KERNEL_TUNES.get_global()
         with seen() as found:
             lowered = lower()
         distinct = _distinct(found)
         _settle(distinct, measure=measure)
-        if cache.KERNEL_TUNES.get_global() != tuned:
+        if _cache.KERNEL_TUNES.get_global() != tuned:
             lowered = lower()
     return lowered, dumps_launches([ba for _, ba in distinct])
 
@@ -1179,7 +1144,7 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
             if (fastest := _pick(ba)) is not None:
                 decisions.append((ba, fastest))
                 continue
-            if measure and cache.measures_picks():
+            if measure and _cache.measures_picks():
                 timings = _measured(op, ba)
                 if timings.prune_errors():
                     timed.append((ba, timings))
@@ -1210,7 +1175,7 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
     changed = launched() != traced
     if any(_coordination.from_every_process(changed)):
         # A program lowered again traces again, with the picks it now reads.
-        cache.KERNEL_TUNES.set_global(cache.KERNEL_TUNES.get_global() + 1)
+        _cache.KERNEL_TUNES.set_global(_cache.KERNEL_TUNES.get_global() + 1)
     return sum(_pick(ba) is None for _, ba in found)
 
 
@@ -1220,5 +1185,5 @@ def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
     config where its space at the launch's key holds it, any stored pick
     or heuristic set aside: for the float64 gate at every config of a space,
     and for a lab that times one."""
-    with cache.KERNEL_PINS(tuple(configs.items())):
+    with _cache.KERNEL_PINS(tuple(configs.items())):
         yield

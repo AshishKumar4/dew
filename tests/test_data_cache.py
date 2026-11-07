@@ -15,7 +15,7 @@ import fsspec
 import grain.python as grain
 import numpy as np
 import pytest
-from data_support import Keeps
+from data_support import LATEST, Keeps
 from storage_support import moto_bucket
 
 from dew.data.cache import Abandoned, Cache
@@ -351,7 +351,7 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
 def test_stream_completions_use_physical_shards_and_resume_without_rekeying():
     source = Memory([{"id": index} for index in range(8)], shard_rows=2)
     cache, key = _cache(), _key()
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     reader = cache.streamed(manifest.reader, key)
     for shard in reversed(manifest.shards):
         iterator = iter(reader(shard))
@@ -1220,6 +1220,25 @@ def test_a_streamed_cache_reads_the_generation_published_under_its_key(tmp_path)
     assert republished.calls == []
 
 
+def test_a_streamed_chain_publishes_its_own_cache_once_it_reads_the_store_whole(tmp_path):
+    """A streamed chain's own cache publishes its store's generation once its read has filled every
+    shard, so its next streamed read reads the generation back, running no step (row 4211)."""
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(6)], shard_rows=2)
+    cache = Cache(str(tmp_path / "cache"))
+    filled, reading = Offset(10), Offset(10)
+
+    def values(step: Offset) -> list[int]:
+        rows = iterate(Pipeline(source).map(step).cache(cache), read="streamed")
+        return sorted(int(row["value"]) for row in rows)
+
+    first, again = values(filled), values(reading)
+    assert first == again == [index + 10 for index in range(6)]
+    assert sorted(filled.calls) == list(range(6)) and reading.calls == []
+
+
 def test_a_fill_whose_spool_drops_its_last_shard_reads_on_and_publishes_nothing(tmp_path):
     """A spool too small for the fill's one shard (on_full='stop') stops admitting it: the pass
     reads every row, and the next run, with nothing published, runs the steps again."""
@@ -1390,29 +1409,117 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
     assert generation.outputs(0)[0].reason == "http_404"
 
 
+def _filled_once(cache: Cache, key, source: Memory):
+    """`source`'s first record read through `cache` under `key`, its fill finished and closed."""
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+    try:
+        return rows[0]
+    finally:
+        rows.finish()
+        rows.close()
+
+
 def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_path):
     source = Memory([{"id": 0}])
     cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1)
     first_key, second_key = _key("one"), _key("two")
-    first = cache.mapped(grain.MapDataset.source(source.records("indexed")), first_key)
-    first[0]
-    first.finish()
-    first.close()
+    _filled_once(cache, first_key, source)
     generation = cache.publish(first_key, source)
-    second = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key)
-    second[0]
-    second.finish()
-    second.close()
+    _filled_once(cache, second_key, source)
     assert generation[0] == {"id": 0}
     with pytest.raises(ValueError):
         cache.publish(second_key, source)
     generation.close()
-    retry = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key)
-    retry[0]
-    retry.finish()
-    retry.close()
+    _filled_once(cache, second_key, source)
     assert cache.publish(second_key, source)[0] == {"id": 0}
     assert cache.generation(first_key) is None
+
+
+def test_a_fill_that_evicts_nothing_stops_at_its_roots_free_room_and_keeps_its_generations(tmp_path):
+    """A cache that evicts nothing (a stream's automatic cache, `Cache.evicts`) fills only the room its
+    root has free: past it, an optional one stops admitting and reads on, and the generation another
+    fill published stays read (row 4217)."""
+    source = Memory([{"id": 0}])
+    published = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1)
+    first_key, second_key = _key("one"), _key("two")
+    _filled_once(published, first_key, source)
+    published.publish(first_key, source).close()
+    holding = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, optional=True, evicts=False)
+    assert _filled_once(holding, second_key, source) == {"id": 0}
+    assert holding.generation(second_key) is None
+    assert published.generation(first_key)[0] == {"id": 0}
+
+
+@pytest.mark.parametrize("optional", [True, False], ids=["automatic", "named"])
+def test_a_local_fill_leaves_its_disks_headroom_free_whatever_its_budget(tmp_path, monkeypatch, optional):
+    """A local cache's writes leave `DISK_HEADROOM` free on their disk under any budget (row 4263): on a
+    disk with less spare, a fill writes nothing there, its records are read as computed and no
+    generation is published."""
+    import shutil
+    from collections import namedtuple
+
+    from dew.data.retention import DISK_HEADROOM
+
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(2**40, 2**40, DISK_HEADROOM + 1024))
+    source = Memory([{"id": index} for index in range(4)])
+    cache = Cache(str(tmp_path), shard_bytes=1, optional=optional)
+    filled = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key("full"))
+    assert [filled[index] for index in range(4)] == [{"id": index} for index in range(4)]
+    filled.finish()
+    filled.close()
+    assert cache.generation(_key("full")) is None
+    assert not list(tmp_path.rglob("*.array_record"))
+
+
+@pytest.mark.parametrize("full", ["spool", "disk"])
+def test_an_optional_streamed_fill_with_no_room_stops_once_for_its_key(tmp_path, caplog, monkeypatch, full):
+    """A stream's optional fill that runs out of room, in its spool or on a disk a root that evicts nothing
+    writes to, stops once: its later shards' records are computed and their writers write nothing, so a
+    store of four shards reports the stop as a store of one does, not once a shard (row 4296)."""
+    import logging
+    import shutil
+    from collections import namedtuple
+    from uuid import uuid4
+
+    from dew.data.retention import DISK_HEADROOM
+
+    if full == "disk":
+        usage = namedtuple("usage", "total used free")
+        monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(2**40, 2**40, DISK_HEADROOM))
+
+    def warned(records: int) -> int:
+        source = Memory([{"id": index} for index in range(records)], shard_rows=1)
+        budgets = {"spool_bytes": 1, "keep_local_bytes": 1} if full == "spool" else {"evicts": False}
+        cache = Cache(str(tmp_path / str(records)), shard_bytes=1, optional=True, **budgets)
+        manifest = source.manifest(LATEST)
+        reader = cache.streamed(manifest.reader, _key(f"halted-{uuid4().hex}"), source=source)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="dew.data.cache"):
+            rows = [row for shard in manifest.shards for row in reader(shard)]
+        assert rows == [{"id": index} for index in range(records)]
+        return len([record for record in caplog.records if record.levelno >= logging.WARNING])
+
+    assert warned(4) == warned(1)
+
+
+def test_a_stream_into_a_root_with_room_for_one_shard_seals_it_and_writes_no_more(tmp_path, caplog):
+    """A stream's optional fill into a root that evicts nothing and holds one of its four shards (a shard
+    here is one 128 KiB block) seals that shard's writer, is refused the next, says so once and writes
+    nothing after it, its records read as computed (row 4296)."""
+    import logging
+    from uuid import uuid4
+
+    source = Memory([{"id": index} for index in range(4)], shard_rows=1)
+    cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, optional=True, evicts=False)
+    manifest = source.manifest(LATEST)
+    reader = cache.streamed(manifest.reader, _key(f"one-shard-{uuid4().hex}"), source=source)
+    with caplog.at_level(logging.WARNING, logger="dew.data.cache"):
+        rows = [row for shard in manifest.shards for row in reader(shard)]
+    assert rows == [{"id": index} for index in range(4)]
+    assert len(list(tmp_path.rglob("segments/*/seal.json"))) == 1
+    assert len(list(tmp_path.rglob("shards/*/*.array_record"))) == 1
+    assert len([record for record in caplog.records if record.levelno >= logging.WARNING]) == 1
 
 
 def test_local_retention_counts_what_its_root_holds_once_its_record_passes_the_limit(tmp_path):
@@ -1887,7 +1994,7 @@ def test_a_worker_reads_a_part_of_a_generation_without_its_store():
     generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
     trained, _ = Pipeline(source).holdout(0.25)
     part = _promoted(_tagged(trained).cache(generation)).source
-    assert len(pickle.dumps(part.manifest().reader)) * 100 < len(pickle.dumps(source))
+    assert len(pickle.dumps(part.manifest(LATEST).reader)) * 100 < len(pickle.dumps(source))
 
 
 @pytest.mark.parametrize("store", ["grain", "arrow"])

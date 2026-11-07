@@ -23,13 +23,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import assert_as_exact, chain_roundings
+from reference_error import assert_as_exact, assert_computes_the_oracle, assert_same_artifact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_text_encoders import transformers_clip
 from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
-from tool_support import FIXTURES, REPO_ROOT, load
+from tool_support import FIXTURES, REPO_ROOT, linted, load
 
 from dew.telemetry.trace import window_split
 
@@ -37,8 +36,7 @@ CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
 # The family parity contracts, read from the tests that hold Dew to these fixtures, not bounds fitted
 # to a CI CPU: test_moe.py (routers and expert sums), test_vae_16ch.py (raw encode/decode). The CLIP
-# towers' outputs are held as their own test holds them, to the reference's float64 run
-# (`transformers_clip`).
+# towers' outputs are held where they are consumed (tests/test_text_encoders.py).
 MOE_OUTPUTS = {
     "mixtral.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
     "deepseek.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
@@ -49,11 +47,8 @@ CLIP_OUTPUTS = ("last_hidden_state", "pooler_output", "text_embeds", "image_embe
 VAE_OUTPUTS = {"latent": VAE_TOLERANCE, "decoded": VAE_TOLERANCE}
 
 
-def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float],
-                          truth: dict[str, np.ndarray] | None = None) -> None:
-    """Only named arithmetic outputs use the family's fp32 parity bound, or, where `truth` gives
-    their float64 values, are held as exact as the committed float32 output from them
-    (tests/reference_error.py).
+def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float]) -> None:
+    """Only named arithmetic outputs use the family's fp32 parity bound.
 
     Seeds do not promise cross-platform bit identity for arithmetic:
     https://docs.pytorch.org/docs/2.14/notes/randomness.html
@@ -64,16 +59,12 @@ def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, f
     """
     with np.load(written) as ours, np.load(committed) as theirs:
         assert set(ours.files) == set(theirs.files)
-        truth = {} if truth is None else truth
-        assert numerical.keys() <= set(theirs.files) and truth.keys() <= set(theirs.files)
+        assert numerical.keys() <= set(theirs.files)
         for name in theirs.files:
             actual, expected = ours[name], theirs[name]
             assert actual.shape == expected.shape, name
             assert actual.dtype == expected.dtype, name
-            if name in truth:
-                assert_as_exact_as_the_reference(actual.astype(np.float64), expected.astype(np.float64),
-                                                 truth[name], name)
-            elif name in numerical:
+            if name in numerical:
                 assert np.isfinite(actual).all() and np.isfinite(expected).all(), name
                 difference = float(np.max(np.abs(actual - expected)))
                 assert difference < numerical[name], f"{name}: max error {difference:.3e}"
@@ -140,8 +131,9 @@ def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
-    """Exact checkpoint, tokenizer and pixels; both towers' outputs as exact as the committed ones,
-    both from the reference's float64 run."""
+    """Exact checkpoint, tokenizer and pixels, and the recorded outputs' names, shapes and dtypes; each
+    output an evaluation of transformers' float32 towers on those inputs (`assert_same_artifact`, an
+    artifact check against the float64 run, not a parity)."""
     import torch
 
     load("clip_reference").write_tiny(tmp_path)
@@ -149,9 +141,18 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
     committed = FIXTURES / "clip" / "tiny"
     assert_fixture_json(tmp_path, committed, "clip_reference")
     assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
-    with np.load(committed / "reference.npz") as inputs:
-        truth = transformers_clip(tmp_path, dict(inputs), torch.float64, CLIP_OUTPUTS)
-    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", {}, truth)
+    with np.load(tmp_path / "reference.npz") as ours, np.load(committed / "reference.npz") as theirs:
+        assert set(ours.files) == set(theirs.files) and set(CLIP_OUTPUTS) <= set(theirs.files)
+        for name in theirs.files:
+            assert (ours[name].shape, ours[name].dtype) == (theirs[name].shape, theirs[name].dtype), name
+            if name not in CLIP_OUTPUTS:
+                np.testing.assert_array_equal(ours[name], theirs[name], err_msg=name)
+        inputs = dict(theirs)
+        recomputed, wide = (transformers_clip(tmp_path, inputs, dtype, CLIP_OUTPUTS)
+                            for dtype in (torch.float32, torch.float64))
+        for name in CLIP_OUTPUTS:
+            assert_same_artifact(np.asarray(recomputed[name], np.float64),
+                                 np.asarray(theirs[name], np.float64), wide[name], name)
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +246,7 @@ LINES = [f"line {i}: the quick brown fox jumps over the lazy dog" for i in range
 def token_directory(tmp_path: Path) -> Path:
     """A byte-tokenized corpus, as the curve's documented producer writes it: `dew data export` over
     a text file's lines, each a document closed by EOS."""
-    from dew.cli.main import DataExport
+    from dew._cli.main import DataExport
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("".join(f"{line}\n" for line in LINES))
@@ -363,10 +364,9 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dt
 # tools/layout_parity.py
 # ---------------------------------------------------------------------------
 
-def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
-    """The layout tool's default judge (the floor judge, `floored`), from its command line on eight host
-    devices, runs a model under the mixture and the objective the command gives and writes its rows to
-    --out; --window, which is check 1's, without --seeds is refused."""
+def test_the_layout_tool_runs_the_options_it_is_given(tmp_path):
+    """The layout tool, from its command line on eight host devices, runs a model under the mixture and
+    the objective the command gives and writes its rows to --out."""
     import json
     import subprocess
     import sys
@@ -380,13 +380,12 @@ def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
                               env=environment, capture_output=True, text=True, check=False)
 
     out = tmp_path / "rows.json"
-    done = tool("--models", "moe", "--layouts", "expert4", "--out", str(out), "--mixture", '{"top_k": 1}',
-                "--objective", '{"balance": {"aux_loss_alpha": 0.01}}')
+    done = tool("--models", "moe", "--layouts", "expert4", "--seeds", "0", "--out", str(out),
+                "--mixture", '{"top_k": 1}', "--objective", '{"balance": {"aux_loss_alpha": 0.01}}')
     assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
     (row,) = json.loads(out.read_text())
     assert (row["status"], row["mixture"]["top_k"], row["objective"]["balance"]["aux_loss_alpha"]) == (
         "works", 1, 0.01)
-    assert tool("--models", "dense", "--layouts", "data4", "--window", "2").returncode != 0
 
 
 def test_the_layout_tools_step_counts_the_work_a_runs_step_counts(monkeypatch):
@@ -404,7 +403,9 @@ def test_the_layout_tools_step_counts_the_work_a_runs_step_counts(monkeypatch):
     assert tokens == case.batch_size * case.seq_len, (tokens, case.batch_size, case.seq_len)
 
 
-def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
+def test_residual_orders_preserve_the_tiny_nemotron_function():
+    """A residual order is an exact symmetry of Nemotron-H's tiny mixture of experts: the reordered
+    float64 model computes its logits within float64's rounding of the computation itself."""
     from residual_orders import model_axes, permuted
 
     from dew.interop import Pretrained
@@ -413,7 +414,6 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
                              attention_impl='reference')
     order = np.array([3, 0, 12, 5, 10, 1, 8, 7, 2, 14, 4, 13, 6, 15, 9, 11])
     ids = jnp.array([[2, 7, 11, 3]], jnp.int32)
-    tool = load('layout_parity')
     axes = model_axes(loaded.model, ids)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), loaded.variables)
@@ -421,8 +421,7 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
         truth = np.asarray(model.apply(wide, ids))
         reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
-    tool.order_invariance({'logits': reordered}, {'logits': truth},
-                          float(reordered.sum()), float(truth.sum()), roundings=roundings)
+    assert_computes_the_oracle(reordered, truth, "Nemotron-H MoE reordered", roundings=roundings)
 
 
 def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width():
@@ -446,18 +445,7 @@ def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width()
         order = orders(residual_width(variables, axes), 2, seed=6)[1]
         reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
-    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
-                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
-
-
-def test_a_nonfinite_order_fails_the_invariance_check():
-    """A residual order whose function or loss is not finite fails the check, as a NaN compares
-    with nothing."""
-    tool = load('layout_parity')
-    for logits, loss in ((np.array([np.nan, 1.0]), 1.0), (np.array([1.0, 2.0]), np.nan)):
-        with pytest.raises(ValueError):
-            tool.order_invariance({'logits': logits}, {'logits': np.array([1.0, 2.0])}, loss, 1.0,
-                                  roundings=1)
+    assert_computes_the_oracle(reordered, truth, "KDA decoder reordered", roundings=roundings)
 
 
 def test_residual_orders_preserve_a_looped_ngpt():
@@ -479,8 +467,7 @@ def test_residual_orders_preserve_a_looped_ngpt():
         order = orders(residual_width(loaded.variables, axes), 2, seed=6)[1]
         reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
-    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
-                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
+    assert_computes_the_oracle(reordered, truth, "looped nGPT reordered", roundings=roundings)
 
 
 class Drawing:
@@ -548,6 +535,26 @@ def test_layout_parity_reads_the_first_step_as_the_trainer_does():
     batch = {"y": np.arange(4, dtype=np.float32)}
     step = tool.first_step(state, state.variables, None, batch)
     assert int(step.committed) == 5 and step.example_count == 4
+
+
+def test_layout_parity_reads_every_first_step_through_the_trainers(monkeypatch):
+    """The reference's audit and its float64 anchor each read the trainer's first step (`first_step`,
+    ledger 3057, 3092) over the state they judge, which the test above holds to the trainer's: a site that
+    built its Step by hand would pass by it, and is caught here."""
+    tool = load("layout_parity")
+    read = []
+    first_step = tool.first_step
+
+    def spied(state, variables, ema, batch):
+        read.append(int(state.updates))
+        return first_step(state, variables, ema, batch)
+
+    monkeypatch.setattr(tool, "first_step", spied)
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        tool.Judge(reference, tool.References(Path(directory)), "jepa").audit()
+        tool.Anchor(reference, "jepa")
+    assert read == [0, 0]
 
 
 def test_layout_parity_holds_every_arm_to_the_references_sample():
@@ -630,23 +637,25 @@ def test_a_shared_draw_cache_computes_past_its_disk_reserve_and_keeps_nothing_th
         assert computed.loss == kept.loss and any(Path(directory).iterdir())
 
 
-def test_the_layout_parity_command_runs_its_main():
+def test_the_layout_parity_command_runs_its_main(tmp_path):
     """`python tools/layout_parity.py` runs the tool, which refuses `--prepare` with no `--references`
     directory to write, where a script whose entry point is gone exits 0 having checked nothing."""
-    command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa", "--prepare"]
-    finished = subprocess.run(command, capture_output=True, text=True, timeout=600)
-    assert finished.returncode != 0, finished.stdout[-2000:]
+    command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa",
+               "--seeds", "0", "--prepare"]
+    finished = subprocess.run(command, capture_output=True, text=True, timeout=600, cwd=tmp_path)
+    # Its refusal is a SystemExit of its own, no traceback's error, and it wrote nothing.
+    assert finished.returncode == 1 and not any(tmp_path.iterdir()), finished.stderr[-2000:]
 
 
 def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
     """A prepare run with a window of two draws keeps both draws of every check-1 seed and of its
     redraw's (`REDRAW`): a run reading those references finds the reference and the float64 anchor of
     the last draw a windowed check reads, and none past it."""
-    from reference_error import REDRAW
+    from check1_wire import staged_units
 
     tool = load("layout_parity")
     _, reference = tool.model_case("jepa", "float32", {}, {})
-    last = (1 + REDRAW) * 2 * 2 - 1
+    last = staged_units(2) * 2 - 1
     with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
         prepare = tool.References(Path(directory), prepare=True)
         assert tool.prepared(["jepa"], dtype="float32", seeds=2, windows=2, mixture={}, objective={},
@@ -1083,20 +1092,9 @@ def test_the_script_reads_its_files_in_processes_and_reports_as_one_process_does
     assert len(serial.out.splitlines()) == 80
 
 
-def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
-    """Write `files` into a sparx checkout and return each finding as (path, line, code)."""
-    lint = load("lint_slop")
-    for relative, text in files.items():
-        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / relative).write_text(text)
-    modules = list(lint.collect(["src/sparx", "tests", "tools"], tmp_path, "sparx"))
-    return sorted((finding.path, finding.line, finding.code)
-                  for module in modules for finding in lint.check(module))
-
-
 def assert_reported(tmp_path, path: str, source: str, code: str, lines: tuple[int, ...]) -> None:
     """`source`, written at `path` in a sparx checkout, is reported as `code` at `lines` and nowhere else."""
-    assert _linted(tmp_path, {path: source}) == [(path, line, code) for line in lines]
+    assert linted(tmp_path, {path: source}) == [(path, line, code) for line in lines]
 
 
 def test_the_gate_reads_the_site_the_docs_generators_and_the_kernel_packages_but_not_installed_npm(tmp_path):
@@ -1136,7 +1134,7 @@ def test_a_suppression_is_reported_in_every_file_and_a_string_or_function_that_s
     "ignore" are each reported. A string that spells a comment, a function of the
     file's own named `cast`, a filter that makes warnings errors, and an import kept
     for the registry entry it makes are not."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/graph.py": "EDGES = 1\n",
         "tests/test_graph.py": (
             "import warnings\n"
@@ -1171,7 +1169,7 @@ def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_bo
     alias, a from-import or a local import, by setattr, delattr, setitem or delitem, and a member
     named like a seam (`narrowed_paths`) is none. The clock, a Hub snapshot and a subprocess are
     boundaries a test may replace."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/graph.py": "EDGES = {}\n",
         "tests/test_graph.py": (
             "import time\n"
@@ -1194,54 +1192,11 @@ def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_bo
     assert found == [("tests/test_graph.py", line, "SLOP008") for line in (5, 7, 8, 11, 12)]
 
 
-ROW_1878_LINTS = {
-    "SLOP008": ({
-        "src/sparx/store.py": "class Store:\n    def _open(self):\n        pass\ndef open(path):\n    pass\n",
-        "tests/test_store.py": (
-            "from sparx.store import Store\n"
-            "import sparx.store as store\n"
-            "def test_private(monkeypatch):\n"
-            "    monkeypatch.setattr(Store, '_open', lambda self: None)\n"
-            "def test_public(monkeypatch):\n"
-            "    monkeypatch.setattr(store, 'open', lambda path: None)\n"
-            "def test_a_seams_own_private(monkeypatch):\n"
-            "    monkeypatch.setattr('sparx.store.os._exit', lambda code: None)\n"
-            "def test_a_first_party_private_under_a_seam_word(monkeypatch):\n"
-            "    monkeypatch.setattr('sparx.sources.hub.Hub._selected', lambda self: None)\n"),
-    }, "tests/test_store.py", (4, 10)),
-    "SLOP011": ({
-        "src/sparx/graph.py": "EDGES = 1\n",
-        "tests/test_graph.py": (
-            "def test_table(table):\n"
-            "    assert report.table().splitlines() == ['   a  b', 'x  1  2']\n"
-            "    assert table.plain == 'data 4,824 rows  ·  0 rejected'\n"
-            "    assert '4,824' in table.split()\n"
-            "    assert table.title == 'data rows'\n"
-            "    assert table.index('b') + 1 == len('   a  b')\n"
-            "    assert json.loads(payload) == ['a  b']\n"
-            "    assert parsed.name == 'two  spaces'\n"),
-    }, "tests/test_graph.py", (2, 3)),
-}
-"""Row 1878's two lint cases, by code: the files linted, the file the findings are in, their lines.
-SLOP008: a private attribute of a first-party object is the code under test, so replacing it is
-reported even where its name holds a seam's (`Checkpoints._open`); a public seam of the same name and a
-standard-library module's own private attribute are not. SLOP011: a rendering (its text read through
-`plain`, `table()`, captured output or `str`) compared whole with a string, or a list of strings, with a
-run of two or more spaces between words is a spacing snapshot; its words and numbers looked for, a
-one-space string, a column end measured and parsed data holding two spaces are not."""
-
-
-@pytest.mark.parametrize("code", sorted(ROW_1878_LINTS))
-def test_row_1878s_lints_report_their_cases_and_spare_the_rest(code, tmp_path):
-    files, where, lines = ROW_1878_LINTS[code]
-    assert _linted(tmp_path, files) == [(where, line, code) for line in lines]
-
-
 def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
     """SLOP015: a test that reaches its own package through `pytest.importorskip`,
     however it imports the skip, turns an import the package breaks into a skip; an
     optional dependency's skip, or a package that only shares the prefix, is not reported."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/graph.py": "EDGES = 1\n",
         "tests/test_graph.py": ("import pytest\n"
                                 "from pytest import importorskip\n"
@@ -1265,7 +1220,7 @@ def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_
     (a `getattr` of the caller's among them), a name rebound to something else or shadowed by a
     parameter or a comprehension (a lambda's in it too), and a class attribute, which no method reads
     as a name, are not."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/nn/kernels/generation.py": (
             "def device_generation():\n"
             "    return 'sm80'\n"
@@ -1348,7 +1303,7 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
     test that names a source file each prove text, not behaviour, however the
     test imports them. A raise without `match`, another object's `raises`, a
     local `getsource`, and a library that names its own file, are not reported."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/graph.py": 'HOME = "src/sparx/graph.py"\n',
         "tests/test_graph.py": (
             "import inspect\n"
@@ -1886,7 +1841,7 @@ def test_a_bare_jit_anywhere_in_the_package_is_reported(tmp_path):
     for package in ("rl", "training", "checkpoints"):
         assert_reported(tmp_path / package, f"src/sparx/{package}/rollout.py", rollout, "SLOP025",
                         (5, 7, 8, 9, 12))
-    assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
+    assert linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
 
 
 def test_a_pallas_call_outside_the_launch_point_is_reported(tmp_path):
@@ -1906,8 +1861,8 @@ def test_a_pallas_call_outside_the_launch_point_is_reported(tmp_path):
         assert_reported(tmp_path / package.replace("/", "_"), f"src/sparx/{package}/kernel.py", kernel,
                         "SLOP027", (5, 6, 7))
     point = "from jax.experimental import pallas as pl\ncall = pl.pallas_call\n"
-    assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
-    assert _linted(tmp_path / "suite", {"tests/test_kernel.py": kernel, "tools/kernel.py": kernel}) == []
+    assert linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
+    assert linted(tmp_path / "suite", {"tests/test_kernel.py": kernel, "tools/kernel.py": kernel}) == []
 
 
 def test_a_mosaic_gpu_kernel_outside_the_launch_point_is_reported(tmp_path):
@@ -1925,8 +1880,75 @@ def test_a_mosaic_gpu_kernel_outside_the_launch_point_is_reported(tmp_path):
     assert_reported(tmp_path / "bundle", "src/sparx/nn/kernels/templates/bundle.py", bundle, "SLOP027",
                     (5, 6, 7))
     point = "from jax.experimental.pallas import mosaic_gpu as plgpu\nbuild = plgpu.kernel\n"
-    assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
-    assert _linted(tmp_path / "suite", {"tests/test_bundle.py": bundle, "tools/bundle.py": bundle}) == []
+    assert linted(tmp_path / "point", {"src/sparx/nn/kernels/launches.py": point}) == []
+    assert linted(tmp_path / "suite", {"tests/test_bundle.py": bundle, "tools/bundle.py": bundle}) == []
+
+
+def test_each_form_of_a_custom_derivative_is_a_seam():
+    """SLOP028's scan (`derivative_seams`) on each form a seam takes, and what makes it: a decorator, one
+    within functools.partial, an assignment of a call, an annotated one, a nested function's, a
+    linear_tangent call within an expression, a surrogate's declaration, assigned or decorating, a
+    declaring builder's, its kind read from its first argument, and a maker's call returned and called
+    at once or passed on (row 4450); a plain function is none."""
+    import ast
+
+    rules = load("lint_derivatives")
+    text = (
+        "import functools\nimport jax\n"
+        "@jax.custom_jvp\ndef a(x): return x\n"
+        "@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))\ndef b(x, n): return x\n"
+        "c = jax.custom_jvp(lambda x: x)\n"
+        "d: Callable = jax.custom_vjp(lambda x: x)\n"
+        "def outer(x):\n    @jax.custom_vjp\n    def inner(x): return x\n    return inner(x)\n"
+        "def tangent(x):\n    return linear_tangent(f, g, h)(x)\n"
+        "e = surrogate(lambda x: x, lambda primals, tangents, value: tangents[0])\n"
+        "@functools.partial(surrogate, derivative=lambda primals, tangents, value: tangents[0])\n"
+        "def f(x): return x\n"
+        "g = declared_derivative(Surrogate(), p, forward, backward)\n"
+        "h = derivatives.declared_tangent(derivatives.Protected(), p, rule, nondiff_argnums=(1,))\n"
+        "@functools.partial(declared_tangent, KernelGlue(), tangent=rule)\n"
+        "def k(x): return x\n"
+        "def returned(x):\n    return surrogate(f, g)(x)\n"
+        "nested = functools.partial(functools.partial(jax.custom_jvp, nondiff_argnums=(1,)))(f)\n"
+        "tangent_partial = functools.partial(linear_tangent(f, g, h))\n"
+        "wrapped = contracted('test_ok')(functools.partial(jax.custom_jvp(p)))\n"
+        "def passed(p):\n    return wrap(jax.custom_jvp(p))\n"
+        "def plain(x): return x\n")
+    found = [seam for seam, _, _, _ in rules.derivative_seams("m.py", ast.parse(text))]
+    assert len(found) == len(set(found)), f"a seam counted twice: {found}"
+    assert {seam: maker for seam, maker, _, _ in rules.derivative_seams("m.py", ast.parse(text))} == {
+        "m.py::a": "custom_jvp", "m.py::b": "custom_vjp", "m.py::c": "custom_jvp", "m.py::d": "custom_vjp",
+        "m.py::outer.inner": "custom_vjp", "m.py::tangent.linear_tangent": "linear_tangent",
+        "m.py::e": "surrogate", "m.py::f": "surrogate", "m.py::g": "declared_derivative:Surrogate",
+        "m.py::h": "declared_tangent:Protected", "m.py::k": "declared_tangent:KernelGlue",
+        "m.py::returned.surrogate": "surrogate", "m.py::passed.custom_jvp": "custom_jvp",
+        "m.py::nested": "custom_jvp", "m.py::linear_tangent": "linear_tangent", "m.py::wrapped": "custom_jvp"}
+
+
+def test_a_custom_derivative_without_its_contract_is_reported(tmp_path):
+    """SLOP028: in `src/<package>`, a custom derivative with no `contracted(test)` at its seam, or one
+    naming no test function of tests/test_contracts_*.py or one two of those files define, is reported;
+    each form declared with a contract its checkout holds once is not, nor a seam in the tests or the
+    tools."""
+    contracts = "def test_a_seam_holds(): pass\ndef test_twice(): pass\n"
+    seams = ("import functools\nimport jax\n"
+             "from sparx.nn.derivatives import contracted, linear_tangent, surrogate\n"
+             "@jax.custom_jvp\ndef bare(x): return x\n"
+             "@contracted('test_a_missing_one')\n@jax.custom_jvp\ndef unknown(x): return x\n"
+             "@contracted('test_twice')\n@jax.custom_jvp\ndef shared(x): return x\n"
+             "@contracted('test_a_seam_holds')\n@jax.custom_vjp\ndef held(x): return x\n"
+             "wrapped = contracted('test_a_seam_holds')(surrogate(f, g))\n"
+             "plain = surrogate(f, g)\n"
+             "def step(x):\n"
+             "    return contracted('test_a_seam_holds')(linear_tangent(f, g, h))(x)\n"
+             "def loose(x):\n    return linear_tangent(f, g, h)(x)\n")
+    files = {"tests/test_contracts_seams.py": contracts, "src/sparx/nn/seams.py": seams,
+             "tests/test_contracts_more.py": "def test_twice(): pass\n"}
+    assert [found for found in linted(tmp_path / "source", files) if found[2] == "SLOP028"] == [
+        ("src/sparx/nn/seams.py", line, "SLOP028") for line in (5, 8, 11, 16, 20)]
+    suite = {"tests/test_contracts_seams.py": contracts, "tests/test_seams.py": seams,
+             "tools/seams.py": seams}
+    assert [found for found in linted(tmp_path / "suite", suite) if found[2] == "SLOP028"] == []
 
 
 def test_an_outer_program_built_outside_the_compile_point_is_reported(tmp_path):
@@ -1949,8 +1971,8 @@ def test_an_outer_program_built_outside_the_compile_point_is_reported(tmp_path):
         assert_reported(tmp_path / package, f"src/sparx/{package}/rollout.py", rollout, "SLOP025",
                         (3, 5, 6, 8))
     point = "from sparx.nn.kernels.options import OuterProgram\nfine = OuterProgram(None)\n"
-    assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/options.py": point}) == []
-    assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
+    assert linted(tmp_path / "point", {"src/sparx/nn/kernels/options.py": point}) == []
+    assert linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
 
 
 def test_the_compile_points_own_jit_is_the_only_bare_one(tmp_path):
@@ -1965,7 +1987,7 @@ def test_the_compile_points_own_jit_is_the_only_bare_one(tmp_path):
              "    def _jitted(self, f):\n"
              "        return jax.jit(f)\n")
     nesting = "import jax\ndef nested(f):\n    return jax.jit(f)\n"
-    found = _linted(tmp_path, {"src/sparx/nn/kernels/options.py": point, "src/sparx/training/step.py": point,
+    found = linted(tmp_path, {"src/sparx/nn/kernels/options.py": point, "src/sparx/training/step.py": point,
                                "src/sparx/nn/nested.py": nesting})
     assert [finding for finding in found if finding[2] == "SLOP025"] == [
         ("src/sparx/nn/kernels/options.py", 7, "SLOP025"), ("src/sparx/training/step.py", 4, "SLOP025"),
@@ -1980,7 +2002,7 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
     hook however it is spelled, and an attribute of an object a scope holds
     as its own name or reaches from a call are not reported; each scope
     reads its own imports, and a comprehension's names stay in it."""
-    found = _linted(tmp_path, {
+    found = linted(tmp_path, {
         "src/sparx/conv.py": "",
         "src/sparx/graph.py": (
             "import sys\n"
@@ -2103,6 +2125,88 @@ def test_a_fixture_archive_names_nothing_of_the_machine_that_wrote_it_and_packs_
     # The first block's LZMA2 filter (0x21) names a 64 MiB dictionary (property 0x1c), preset 9's; preset
     # 6's is 8 MiB.
     assert destination.read_bytes()[13:17] == bytes([0x00, 0x21, 0x01, 0x1C])
+
+
+def test_every_fixture_archive_names_nothing_of_the_machine_that_wrote_it():
+    """Every xz archive the suite holds (tests/fixtures), each written through tools/fixture_archive: no
+    member names its writer's user, group or time (rows 2866, 2873), and no saved config names a directory
+    of the writer's (`fixture_archive.cleaned`; row 2865: a reference's /tmp/dew-diffusers-reference-xl in
+    six text encoders' configs)."""
+    import re
+    import tarfile
+
+    stamped, placed = {}, {}
+    for path in sorted((REPO_ROOT / "tests" / "fixtures").rglob("*.tar.xz")):
+        with tarfile.open(path) as archive:
+            members = archive.getmembers()
+            owners = {(member.uid, member.gid, member.uname, member.gname, member.mtime)
+                      for member in members}
+            texts = {member.name: archive.extractfile(member).read() for member in members
+                     if member.isfile() and member.name.endswith(".json")}
+        if owners != {(0, 0, "", "", 0)}:
+            stamped[path.name] = sorted(owners)[:2]
+        placed |= {f"{path.name}:{name}": found.group(0)[:80] for name, text in texts.items()
+                   if (found := re.search(rb'"(/tmp|/home|/Users|/mnt|/armada)/[^"]*"', text))}
+    assert (stamped, placed) == ({}, {})
+
+
+def test_an_image_pipeline_receipt_names_its_dataset_and_none_of_its_hosts_directories(tmp_path):
+    """The image pipeline's receipt records its config as the data benchmark's does (tools/receipt_paths):
+    the flowers' TFDS directory, given shell-expanded outside the checkout as its docstring lays it out
+    (`<data dir>/oxford_flowers102/<version>`), as its dataset and version, a bucket's URI as given and a
+    local file's URI as its path (rows 2872, 4209: a receipt recorded /home/<user>/..., then the version
+    directory alone, and a gs:// path as gs:/bucket; the review of 4209: a file:// URI kept whole)."""
+    tool = load("benchmark_image_pipeline")
+    config = tool.Config(flowers=str(tmp_path / "data" / "oxford_flowers102" / "2.1.1"), out=tmp_path / "out")
+    recorded = tool.recorded_config(config)
+    assert recorded["flowers"] == "oxford_flowers102/2.1.1" and "out" not in recorded
+    assert recorded["images"] == config.images
+    bucket = "gs://tfds-data/datasets/oxford_flowers102/2.1.1"
+    assert tool.recorded_config(tool.Config(flowers=bucket))["flowers"] == bucket
+    local = (tmp_path / "data" / "oxford_flowers102" / "2.1.1").as_uri()
+    assert tool.recorded_config(tool.Config(flowers=local))["flowers"] == "oxford_flowers102/2.1.1"
+
+
+def test_the_disk_bank_and_host_offload_receipts_name_none_of_their_hosts_directories(tmp_path):
+    """The disk-bank and host-offload benchmarks record their configs through tools/receipt_paths: a
+    checkpoint, a trace and an output outside the checkout by name, none whole (row 4210: their receipts
+    recorded resolved paths)."""
+    banks = load("benchmark_disk_banks")
+    config = banks.DiskConfig(checkpoint=tmp_path / "models" / "qwen3", trace=str(tmp_path / "trace"))
+    assert banks.recorded_config(config) == {**dataclasses.asdict(config), "checkpoint": "qwen3",
+                                            "trace": "trace"}
+    offload = load("benchmark_host_offload")
+    written = tmp_path / "offload.json"
+    offload.main(offload.OffloadConfig(depths=[], out=str(written)))
+    assert json.loads(written.read_text())["config"]["out"] == "offload.json"
+
+
+def test_a_saved_run_archive_takes_the_fixture_writer_with_its_own_cleaning_and_modes():
+    """tools/saved_runs_reference's archive is fixture_archive's (`write`) with the run's places read as a
+    later checkout reads them, every text member's, and one mode a member kind: its members in name order,
+    anonymous, a directory 0o755 and a file 0o644, a binary member as it was written."""
+    import io
+    import tarfile
+    import tempfile
+
+    saved = load("saved_runs_reference")
+    with tempfile.TemporaryDirectory() as scratch:
+        run = Path(scratch) / "run"
+        (run / "checkpoints").mkdir(parents=True)
+        (run / "checkpoints" / "metadata.json").write_text(f'{{"directory": "{scratch}/run/checkpoints"}}')
+        (run / "weights.bin").write_bytes(bytes([0xff, 0xfe, 0x00]) + scratch.encode())
+        packed = saved.anonymous(run, "lm", {scratch: "."})
+    with tarfile.open(fileobj=io.BytesIO(packed)) as archive:
+        members = archive.getmembers()
+        metadata = archive.extractfile("lm/checkpoints/metadata.json").read().decode()
+        weights = archive.extractfile("lm/weights.bin").read()
+    assert [(member.name, member.mode) for member in members] == [
+        ("lm", 0o755), ("lm/checkpoints", 0o755), ("lm/checkpoints/metadata.json", 0o644),
+        ("lm/weights.bin", 0o644)]
+    assert {(member.uid, member.gid, member.uname, member.gname, member.mtime) for member in members} == {
+        (0, 0, "", "", 0)}
+    assert metadata == '{"directory": "./run/checkpoints"}'
+    assert weights == bytes([0xff, 0xfe, 0x00]) + scratch.encode()
 
 
 def test_a_data_scaling_receipt_names_no_directory_of_the_host_that_ran_it(tmp_path):

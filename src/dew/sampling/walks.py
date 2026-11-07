@@ -13,7 +13,7 @@ from jax.typing import ArrayLike
 from dew.diffusion.discrete import DiscreteDenoiser
 from dew.diffusion.process import Denoiser
 from dew.nn.autoencoders import AutoEncoder
-from dew.sampling.guidance import Guidance, Walk, guidance_modules, pair_of
+from dew.sampling.guidance import Guidance, Walk, pair_of
 from dew.sampling.solvers import RowKeys, RowSolver, Solver
 
 
@@ -199,21 +199,27 @@ def _stepped(solver: Solver, key: jax.Array | RowKeys, index: jax.Array) -> Call
 def sampling_modules(model: nn.Module, guidance: Guidance | None,
                      autoencoder: AutoEncoder | None) -> tuple[nn.Module, ...]:
     """Every network a walk of `model` under `guidance` that `autoencoder` decodes runs: the
-    denoiser, an autoguide (`guidance_modules`) and the autoencoder's towers (`AutoEncoder.towers`,
+    denoiser, an autoguide (`Guidance.modules`) and the autoencoder's towers (`AutoEncoder.towers`,
     none for a network-free one), which the program that walks it compiles for (`compiler_options`), a
     task's and an objective's alike."""
-    return (model, *guidance_modules(guidance), *(() if autoencoder is None else autoencoder.towers()))
+    return (model, *(() if guidance is None else guidance.modules()),
+            *(() if autoencoder is None else autoencoder.towers()))
 
 
-def walk_and_decode(denoise: Denoiser, autoencoder: AutoEncoder | None, params, x_T: jax.Array, *,
-                    solver: Solver, guidance: Guidance | None, key: jax.Array, times, final_denoise: bool,
-                    initial=None, decode: bool = True) -> tuple[jax.Array | None, jax.Array]:
+def walk_and_decode[StateT](denoise: Denoiser, autoencoder: AutoEncoder | None, params, x_T: jax.Array, *,
+                            solver: Solver[StateT], guidance: Guidance | None, key: jax.Array, times,
+                            final_denoise: bool, initial: StateT | None = None, decode: bool = True,
+                            record: Callable[[jax.Array, StateT, jax.Array], None] | None = None
+                            ) -> tuple[jax.Array | None, jax.Array]:
     """`denoise`'s reverse walk from `x_T`: the images, the latents it reaches decoded by
     `autoencoder` (its weights `params["autoencoder"]`) and clipped to [-1, 1] (None without
     `decode`), and the latents. The one sampling program a task (`dew.inference.TextToImage`) and an
-    objective's evaluation and preview (`DiffusionObjective.evaluate`) run."""
-    latents = sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times,
-                     initial=initial, final_denoise=final_denoise)
+    objective's evaluation and preview (`DiffusionObjective.evaluate`) run. `record`, where given, reads
+    each step as `sample`'s does, for its effects alone (a served request's stream)."""
+    latents = (sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times, initial=initial,
+                      final_denoise=final_denoise) if record is None else
+               sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times, initial=initial,
+                      final_denoise=final_denoise, record=record)[0])
     if not decode:
         return None, latents
     images = autoencoder.decode(params["autoencoder"], latents) if autoencoder is not None else latents

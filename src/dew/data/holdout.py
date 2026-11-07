@@ -15,6 +15,7 @@ from dew.batch import Batch
 from dew.data.dataset import Records
 from dew.data.generation import Generation, RowId, _GenerationSource, _row_key, _shard_inputs, _source_ids
 from dew.data.pipeline import Dataset, Pipeline, with_stores
+from dew.data.plan import filled_version
 from dew.data.sources.base import (
     Read,
     Rows,
@@ -66,10 +67,14 @@ class RecordSlice(View[Source]):
         return _selected(self.source, "slice", {"slice": [self.start, self.stop]})
 
     def records(self, read: Read):
-        from dew.data.dataset import SourceSlice
+        return self.part(self.source.records(read))
 
-        records = self.source.records(read)
-        return SourceSlice(records, *self.bounds(len(records)))
+    def part(self, records: Records) -> Records:
+        """Its part of `records`, its source's: a Grain slice of them (row 4145)."""
+        import grain.python as grain
+
+        start, stop = self.bounds(len(records))
+        return grain.MapDataset.source(records)[start:stop]
 
     def admits(self, position: int, row: Batch | bytes | None) -> bool:
         """Whether the record at `position` among its source's is in this slice."""
@@ -93,7 +98,7 @@ class RecordSlice(View[Source]):
         lengths = self.source.lengths()
         return None if lengths is None else lengths[self.start : self.stop]
 
-    def manifest(self) -> ShardManifest:
+    def manifest(self, version: int) -> ShardManifest:
         raise ValueError(self.refusal)
 
 
@@ -145,11 +150,14 @@ class HashPart(View[Source]):
         return _selected(self.source, "hash", part)
 
     def records(self, read: Read):
+        return self.part(self.source.records(read))
+
+    def part(self, records: Records) -> Records:
+        """Its part of `records`, its source's: those whose identity it holds."""
         import grain.python as grain
 
-        rows = self.source.records(read)
-        keys = tuple(index for index in range(len(rows)) if self.keeps(rows[index]))
-        return grain.MapDataset.source(keys).map(_SelectedRow(rows))
+        keys = tuple(index for index in range(len(records)) if self.keeps(records[index]))
+        return grain.MapDataset.source(keys).map(_SelectedRow(records))
 
     def keeps(self, row: Batch | bytes | None) -> bool:
         """Whether this part holds `row`: one that is there, its identity in the part."""
@@ -165,19 +173,19 @@ class HashPart(View[Source]):
     def lengths(self) -> np.ndarray | None:
         return None
 
-    def manifest(self) -> ShardManifest:
+    def manifest(self, version: int) -> ShardManifest:
         """The source's shards, each read through the hash. Which of a shard's rows the hash keeps
         is known only once they are read, so no shard states its rows; the rows it keeps stream in
         the order its source's do, which is its index order where theirs is (`records`)."""
-        manifest = self.source.manifest()
+        manifest = self.source.manifest(version)
         subdivide = manifest.subdivide
         return ShardManifest(_unsized(manifest.shards), functools.partial(self._reader, manifest),
                              None if subdivide is None else functools.partial(_unsized_parts, subdivide),
                              index_ordered=manifest.index_ordered)
 
-    def _reader(self, manifest: ShardManifest, shard: Shard):
+    def _reader(self, manifest: ShardManifest, shard: Shard, options=None):
         # The other part's rows are no rejection, as a memory read holds none of them.
-        return manifest.reader(shard).filter(self.keeps)
+        return manifest.reader(shard, options).filter(self.keeps)
 
 
 def _unsized(shards: Sequence[Shard]) -> tuple[Shard, ...]:
@@ -252,6 +260,13 @@ class SelectedGeneration(View[Source]):
     source: Source
     placing: Read
 
+    @property
+    def _filled(self) -> int:
+        """The plan version whose shards the generation's fill numbered a stream's rows by
+        (`filled_version`)."""
+        dependency = self.generation.manifest["dependency"]
+        return filled_version(dependency.get("fill", {}) if isinstance(dependency, Mapping) else {})
+
     def label(self) -> str:
         return self.selections[0].label()
 
@@ -271,6 +286,12 @@ class SelectedGeneration(View[Source]):
 
         return _provisioner(self.source, self.placing) is not None
 
+    def preparation_bytes(self) -> int | None:
+        from dew.data.analysis import _provisioner
+
+        preparer = _provisioner(self.source, self.placing)
+        return None if preparer is None else preparer.preparation_bytes()
+
     def provision(self) -> SelectedGeneration:
         from dew.data.analysis import _provisioner
 
@@ -284,7 +305,7 @@ class SelectedGeneration(View[Source]):
     def records(self, read: Read) -> Records:
         return _Placed(self.generation, self._dense).rows()
 
-    def manifest(self) -> ShardManifest:
+    def manifest(self, version: int) -> ShardManifest:
         # A worker reads the placed rows alone (`_Placed`), not the store that placed them.
         return _indexed_manifest(self, self.generation.url, 4096, _Placed(self.generation, self._dense))
 
@@ -359,10 +380,10 @@ class SelectedGeneration(View[Source]):
             inputs: Iterator[tuple[RowId, Batch | bytes | None]] = (
                 (index, records[index] if hashed else None) for index in range(len(records)))
         elif hashed:
-            manifest = self.source.manifest()
+            manifest = self.source.manifest(self._filled)
             inputs = (pair for shard in manifest.shards for pair in _shard_inputs(manifest, shard))
         else:
-            inputs = ((row_id, None) for row_id in _source_ids(self.source, streamed=True))
+            inputs = ((row_id, None) for row_id in _source_ids(self.source, self._filled, streamed=True))
         reached = [0] * len(inner)
         for row_id, row in inputs:
             admitted = True
@@ -389,5 +410,5 @@ class _Placed:
 
         return grain.MapDataset.source(self.indices).map(_SelectedRow(self.generation))
 
-    def __call__(self, shard: Shard):
-        return self.rows()[shard.start : shard.stop].to_iter_dataset()
+    def __call__(self, shard: Shard, options=None):
+        return self.rows()[shard.start : shard.stop].to_iter_dataset(options)

@@ -27,6 +27,7 @@ from steady_state import guarded, steady_state
 from tool_policy import ToolPolicy
 
 from dew.inference import RunProcessor, TextGeneration
+from dew.inference.banks import HeldBanks
 from dew.inference.loading import place
 from dew.inference.serving import Server
 from dew.interop.decoder_parts import decoder_axes
@@ -34,7 +35,7 @@ from dew.mesh import BATCH_AXES
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import MixerCall
-from dew.nn.kv_cache import KVCache
+from dew.nn.kv_cache import POOLED, KVCache, leaf_name, row_axis
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.protocols import held_groups
@@ -735,16 +736,25 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
         np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
 
 
-def hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
-    """Qwen3.5's stack at toy size: two gated-delta-net layers, whose recurrent memory and conv
-    tail are each row's own state, and one full-attention layer, whose keys a paged server pages."""
+DELTA_NET = {"linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
+             "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}
+"""`hybrid_model`'s gated delta net's fields."""
+
+THIN_DELTA_NET = {"linear_num_key_heads": 1, "linear_num_value_heads": 1, "linear_key_head_dim": 4,
+                  "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2}
+"""A delta net of one 4-by-4 value head and a two-tap convolution: a row state of 224 bytes, under half
+a page of four tokens' keys (512 bytes), so a host tier holds more states than pages."""
+
+
+def hybrid_model(vocab_size: int = VOCAB, width: int = 16, delta_net: dict = DELTA_NET) -> CausalTransformer:
+    """Qwen3.5's stack at toy size: two gated-delta-net layers (`delta_net`'s fields), whose recurrent
+    memory and conv tail are each row's own state, and one full-attention layer, whose keys a paged server
+    pages."""
     return CausalTransformer(
         vocab_size=vocab_size, emb_features=width, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
         mlp_features=2 * width, max_seq_len=128, dtype="float32",
         layer_types=("linear_attention",) * 2 + ("full_attention",),
-        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
-            "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
-            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}})
+        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": delta_net}}})
 
 
 def parallel_hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
@@ -810,9 +820,25 @@ WIDE_HYBRID = HybridSite(vocab=512, width=64, budget=16, seeds=256)
 users' are (ledger 1698) leave their scores' paired ratio unresolved within 512 seeds, which 512 words, 64
 wide and 16 draws a request resolve at 256 (armada, rows/1698-serving-hybrid)."""
 NARROW_HYBRID, NARROW_HYBRID_TAILED = HybridSite(seeds=256), HybridSite(seeds=512)
+SHORT_HYBRID = HybridSite(seeds=256, budget=4)
+"""NARROW_HYBRID's model drawing 4 tokens a request, so a request of 7 to 9 prompt tokens holds 3 or 4
+pages and a pool of 6 or 8 runs the segment's host cases."""
 """The sites at 256 words, 16 wide and 8 draws, sized paired by `seeds_for` on armada (11-03, at
 0fccb01d79): every-page's and restores-past-admission's resolve at 256, evicted's and
 one-entry-booked-twice's at 512."""
+
+
+SEGMENT_HOST = {"slots": 2, "admission": 2, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 2,
+                "prefix_states": 4}
+"""A pool whose host tier keeps a segment's pages: two rows at once over 6 pages of 4 tokens, 2 host slots
+and 4 states."""
+
+SEGMENT = (Served(12, shared=6), Served(12, flipped=(7,), shared=6), Served(12, flipped=(6,), shared=6))
+"""A segment of 6 tokens three prompts declare shared (a decision's state, each question past it its own
+request), ending inside their second page: past it they differ before any kept page boundary, so each
+later one reads the first's first page and its segment's 2 tokens of the second, copied into its own,
+starting from the state kept at the segment's end (`dew.inference.pages.segment_hash`); asked at once,
+the later ones wait for the first to write it."""
 
 
 @pytest.mark.parametrize("requests, options, hits, rounds, site", [
@@ -820,8 +846,27 @@ one-entry-booked-twice's at 512."""
       Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
     ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None, WIDE_HYBRID),
     ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, NARROW_HYBRID),
-    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID)],
-    ids=["by-default", "in-pieces", "every-page", "restores-past-admission"])
+    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID),
+    ((Served(12), Served(12, flipped=(0,)), Served(12)),
+     {"slots": 1, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 8, "prefix_states": 4},
+     (0, 0, 8), None, NARROW_HYBRID),
+    ((Served(9), Served(12, flipped=(0,)), Served(12, flipped=(0, 1)), Served(9)),
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
+      "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
+    ((Served(9), Served(9, flipped=(0,)), Served(9)),
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 6,
+      "prefix_states": 1}, (0, 0, 8), None, NARROW_HYBRID),
+    (SEGMENT, {}, (0, 6, 12), None, NARROW_HYBRID),
+    (SEGMENT, {}, (12,), (3,), NARROW_HYBRID),
+    ((Served(7, shared=6), Served(7, flipped=(0,)), Served(7, flipped=(0, 1)),
+      Served(7, flipped=(6,), shared=6), Served(7, shared=6)), SEGMENT_HOST, (0, 0, 12), (1, 2, 2),
+     SHORT_HYBRID),
+    ((Served(9, flipped=(0,)), Served(7, shared=6), Served(9, flipped=(0, 1)),
+      Served(7, flipped=(6,), shared=6), Served(9, flipped=(0,))),
+     {**SEGMENT_HOST, "kv_cache": KVCache(page_size=4, pages=8)}, (0, 0, 6, 14), (1, 1, 2, 1), SHORT_HYBRID)],
+    ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host",
+         "from-one-host-slot", "a-state-from-the-host", "a-shared-segment", "a-shared-segment-asked-at-once",
+         "a-segment-uploaded-and-copied-at-once", "a-segment-copied-into-a-spilled-page"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
@@ -857,8 +902,21 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     store of one entry evicts the first prompt's state for the next one's and its reuse with it. Two
     prompts admitted together into a store of one entry keep one state, the later booking's, which the
     next round's repeat of it reads; two repeats seated together each restore their state, past the
-    one prompt piece a call admits. Each request draws what it draws alone and scores it as a full
-    forward does (check 1)."""
+    one prompt piece a call admits. A pool of six pages with a host tier spills the first prompt's pages
+    while another prompt runs, its state kept in a store of four entries, and its repeat reads its pages
+    back (a pool without the tier reads none: its other prompt takes the pages); in a pool of eight pages
+    two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
+    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back;
+    a store of one entry sends a prompt's state to the host tier when another prompt's takes the entry,
+    and its repeat reads it back with its pages (`dew.inference.pages.States`; a tier holds as many states
+    as its host pages' bytes, one in six pages' here). A segment three prompts
+    declare shared, ending inside a page (`SEGMENT`), is read by each later one from the state kept at
+    its end, its last page copied into the prompt's own, one a round or all asked at once. With a host
+    tier (`SEGMENT_HOST`): a segment two other prompts spill to the host, its page named by the segment
+    alone, comes back for two prompts seated together, the first uploading it and the second copying it
+    from there after the upload lands; and a prompt copying a segment into a page the pool reclaims from
+    a cached prefix spills that prefix first, which its repeat reads back. Each request draws what it
+    draws alone and scores it as a full forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
     # measure: at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
     model = hybrid_model(vocab_size=site.vocab, width=site.width)
@@ -869,10 +927,87 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
                            seeds=(site.seeds, site.seeds))
 
 
+@pytest.mark.parametrize("host_pages", [1, 5, 6, 40])
+def test_a_hybrid_servers_host_states_fit_the_bytes_of_its_host_pages(host_pages):
+    """A hybrid server keeps as many row states on the host as the bytes of its `host_pages` pages hold
+    (ledger 4602): a state is a whole recurrent memory and conv tail, here several pages' bytes, so
+    `host_pages` states would take several times the host memory it names. Each group's state slots,
+    times one entry's bytes in the server's own store, are within its host pages' bytes in the server's
+    own pool, and one more would not be."""
+    server = Server.from_task(hybrid_task(), **{**HYBRID_SHARED, "host_pages": host_pages,
+                                                 "prefix_states": 2})
+    part = server.rows.pages[0]
+    assert part.states is not None
+    leaves = jax.tree_util.tree_leaves_with_path(server._states)
+    entry = sum(leaf.nbytes // leaf.shape[row_axis(path)] for path, leaf in leaves)
+    # The pool's leaves hold their pages on their second axis, heads first (`_pages_axis`).
+    pool = [(path, leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(server.cache)
+            if leaf_name(path) in POOLED]
+    page = sum(leaf.nbytes // leaf.shape[row_axis(path) + 1] for path, leaf in pool)
+    budget = part.host * page
+    assert part.states.host.slots * entry <= budget < (part.states.host.slots + 1) * entry
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
+    """A hybrid stack whose row state is smaller than a page keeps more states on the host than pages
+    (`THIN_DELTA_NET`: four states in two pages' bytes), each in its own slot: three prompts send
+    their states there as a store of one entry gives way, the third to the slot past the pages' count,
+    and their repeats read each back with its own prefix (ledger 4602's review), each request drawing
+    what it draws alone and scoring it as a full forward does (check 1)."""
+    model = hybrid_model(256, delta_net=THIN_DELTA_NET)
+    # It draws greedily to its budget alone, no end token, as the check scores every draw.
+    task = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
+                          sampling=Sampling(temperature=0, pad_token_id=0))
+    requests = (Served(9), Served(9, flipped=(0,)), Served(9, flipped=(0, 1)), Served(9, flipped=(0, 2)),
+                Served(9, flipped=(0, 1)), Served(9, flipped=(0,)))
+    serving = {**HYBRID_SHARED, "slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8),
+               "host_pages": 2, "prefix_states": 1}
+    server = Server.from_task(task, **serving)
+    assert server.rows.pages[0].states.host.slots == 4
+    assert_served_as_exact(task, requests, "thin hybrid host states", serving=serving,
+                           rounds=(1,) * len(requests), budget=8, seeds=(256, 256))
+
+
+def test_a_one_tap_convolutions_empty_state_fits_any_host_tier():
+    """A one-tap short convolution keeps an empty conv tail beside paged attention, a row state of no
+    bytes: a server of it builds, its state host tier as many slots as the pages' (ledger 4602's review),
+    with no host tier and with one."""
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2, head_dim=8,
+        mlp_features=32, max_seq_len=128, dtype="float32", layer_types=("conv", "full_attention"),
+        kinds={"conv": {"mixer": {"class": "short_conv", "fields": {"conv_L_cache": 1}}}})
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    task = TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+    for host_pages in (0, 3):
+        server = Server.from_task(task, **{**HYBRID_SHARED, "host_pages": host_pages})
+        part = server.rows.pages[0]
+        assert part.states is not None and part.states.host.slots == part.host == host_pages
+
+
+def test_a_shared_segment_is_refused_where_no_server_keeps_it_or_it_splits_its_prompt():
+    """A declared shared segment (`Server.submit`'s `shared`) is kept by a paged server with a prefix cache
+    alone and holds some of the prompt's tokens but not its last: a dense server's, an empty one and a
+    whole prompt are refused."""
+    bound = hybrid_task()
+    prompt = np.arange(1, 9, dtype=np.int32)
+    with pytest.raises(ValueError):
+        Server.from_task(bound, slots=2, capacity=64).submit(prompt, 2, key=0, shared=4)
+    server = Server.from_task(bound, **HYBRID_SHARED)
+    for shared in (0, 8):
+        with pytest.raises(ValueError):
+            server.submit(prompt, 2, key=0, shared=shared)
+
+
 def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
-    server = Server.from_task(bound, slots=slots, capacity=128, admission=admission, **options)
+    return served_by(Server.from_task(bound, slots=slots, capacity=128, admission=admission, **options))
+
+
+def served_by(server):
+    """`served_alongside`'s requests through `server`; returns the server and the tickets."""
     tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
@@ -904,6 +1039,127 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
         assert_same_generation(ticket.result(), lone)
     # "1234567" keeps its last token to prefill: one full page of four is shared.
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+
+
+def test_a_host_tier_reads_back_a_prefix_whose_upload_reclaims_the_last_device_pages():
+    """A pool of two pages and one host slot: a prompt's one shared page goes to the slot when another
+    prompt's two named pages take the pool, and the first prompt reads it back while its fresh pages reclaim
+    the other prompt's, which the full slot cannot keep: its upload reads the slot as the spill left it. A
+    reserve released before its copies are made leaves its upload's page cached, and a prompt that takes
+    that page back finds the slot still holding the first prompt's page, not the device page the upload
+    never wrote (`dew.inference.pages.Pages`, ledger 874)."""
+    from dew.inference.pages import Pages
+
+    pages = Pages(2, 4, prefix_cache=True, host=1)
+    first, other = np.arange(1, 6), np.arange(20, 28)
+
+    def ran(prompt):
+        held, prefilled, _, _ = pages.reserve(prompt, 8)
+        pages.publish(prompt, held)
+        pages.release(held)
+        return held, prefilled
+
+    def spilled():
+        held, _ = ran(first)
+        ran(other)
+        assert pages.drained().spills == [(held[0], 0)]
+
+    spilled()
+    held, prefilled, _, _ = pages.reserve(first, 8)
+    owed = pages.drained()
+    assert (prefilled, owed.spills, owed.uploads) == (4, [], [(0, held[0])])
+    pages.release(held)
+    spilled()
+    held, prefilled, _, _ = pages.reserve(first, 8)
+    assert prefilled == 4
+    pages.release(held)
+    pages.reserve(other, 8)
+    owed = pages.drained()
+    assert (owed.spills, owed.uploads, pages.shared(first)) == ([], [], [-1])
+
+
+@pytest.mark.distributed
+def test_a_pooled_servers_host_tier_reads_each_processs_prefix_back_from_its_own_slots(tmp_path):
+    """One server over a mesh that spans two processes, a group of rows a process, with a host tier: each
+    process's prompt is cached, its group's pages taken by two other prompts, which spill the prompt's pages
+    to the process's host slots, and served again, reading them back into fresh pages; every request draws
+    what one process serving them all draws, and each process reads its prompt's 8 tokens from its slots
+    (ledger 874)."""
+    from pathlib import Path
+
+    from process_support import run_pool, run_worker
+
+    worker = Path(__file__).with_name("serving_worker.py")
+    reports = run_pool("pooled_host_tier", tmp_path / "pool", 2, script=worker, devices=1, fsdp_size=2,
+                       timeout=300)
+    single = run_worker("pooled_host_tier", tmp_path / "single.json", script=worker, fsdp_size=1, devices=1)
+    assert {**reports[0]["drawn"], **reports[1]["drawn"]} == single["drawn"]
+    assert [report["shared"] for report in reports] == [8, 8]
+
+
+@pytest.mark.parametrize("host_pages, hits", [(0, 0), (1, 4), (8, 8)], ids=["device", "one-slot", "host"])
+def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits):
+    """A prefix cache of eight pages of four tokens, one slot: a prompt's two shared pages are cached as it
+    ends, then two other prompts take the pool's pages and it reclaims them. With a host tier the reclaimed
+    pages go to host memory and the prompt again reads its 8 tokens back from there, or its first 4 where
+    one host slot keeps the page reclaimed last; without one it prefills them again. Every request draws
+    what its lone call draws (ledger 874); a hybrid stack's host tier is `assert_reads_a_shared_prefix`'s
+    `from-the-host` and `from-one-host-slot` sites, judged by check 1."""
+    bound = task(Sampling(temperature=1.0))
+    shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
+    requests = [shared, *others, shared]
+    alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
+    server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
+                              kv_cache=KVCache(page_size=4, pages=8), host_pages=host_pages)
+    drawn = []
+    for index, held in enumerate(requests):
+        ticket = server.submit(held, budget, key=index)
+        server.run()
+        drawn.append(ticket.result())
+    assert server.prefix_hits == hits
+    for generation, lone in zip(drawn, alone, strict=True):
+        assert_same_generation(generation, lone)
+
+
+def test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaimed():
+    """`test_a_host_tier_keeps_prefix_pages_the_pool_reclaims`'s host case over a banked store, whose paged
+    pool holds its run's layers first (`dew.nn.kv_cache.row_axis`): the reclaimed pages go to host memory
+    a page at a time, every layer of each, and come back into fresh pages where the prompt reads its 8
+    tokens, every request drawing what its lone call draws."""
+    bound = banked_task(Sampling(temperature=1.0))
+    shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
+    requests = [shared, *others, shared]
+    alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
+    server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
+                              kv_cache=KVCache(page_size=4, pages=8), host_pages=8)
+    drawn = []
+    for index, held in enumerate(requests):
+        ticket = server.submit(held, budget, key=index)
+        server.run()
+        drawn.append(ticket.result())
+    assert "layers_0_3" in server.cache and server.prefix_hits == 8
+    for generation, lone in zip(drawn, alone, strict=True):
+        assert_same_generation(generation, lone)
+
+
+def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alone():
+    """Four samples of one prompt and another prompt behind them, submitted together to a paged server with
+    a prefix cache: the first sample writes the prompt's full pages, the other three wait and read them
+    once written, as vLLM shares a running prompt's blocks, while the other prompt seats past them at
+    once, so 3 x 16 of the 19-token prompt's tokens come from shared pages; each request draws under its
+    own key what its lone call draws (ledger 1423)."""
+    bound = task(Sampling(temperature=1.0))
+    prompt, other, budget = "1234567812345678912", "9876543", 6
+    requests = [prompt] * 4 + [other]
+    alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
+    server = Server.from_task(bound, slots=4, capacity=128, admission=4,
+                              kv_cache=KVCache(page_size=4, pages=64), prefix_cache=True)
+    tickets = [server.submit(held, budget, key=index) for index, held in enumerate(requests)]
+    server.run()
+    assert server.prefix_hits == 3 * 16
+    assert tickets[4].admitted <= tickets[1].admitted
+    for ticket, lone in zip(tickets, alone, strict=True):
+        assert_same_generation(ticket.result(), lone)
 
 
 @pytest.mark.parametrize("prefix_cache", [False, True], ids=["unshared", "prefix"])
@@ -954,7 +1210,8 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     budgets beside one another, seated mid-flight, ending inside a call, and every request draws what its
     lone task call draws, greedy or sampled, the sampled ones under counter-based row keys too, as the
     RBG implementation keys them (3617: every row's own stream, whatever slot it sits in, where vmap would
-    draw them all from the first). Speculation over paged or chunked rows is refused by name, and so is a
+    draw them all from the first), served outside the context that made RBG the default, as an engine's
+    thread serves it (3943). Speculation over paged or chunked rows is refused by name, and so is a
     reload with a row running, whose next block would open on the old weights' logits."""
     model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=1)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
@@ -963,7 +1220,8 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     with contextlib.nullcontext() if keys is None else jax.default_prng_impl(keys):
         alone = [bound(prompt, budget, key=index)
                  for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-        server, tickets = served_alongside(bound, decode_steps=decode_steps)
+        server = Server.from_task(bound, slots=4, capacity=128, admission=2, decode_steps=decode_steps)
+    server, tickets = served_by(server)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
     for options in ({"kv_cache": KVCache(page_size=16, pages=12)}, {"chunk": 3}):
@@ -973,6 +1231,284 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     server.step()
     with pytest.raises(ValueError):
         server.reload(params)
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
+def test_a_server_over_a_pool_draws_what_each_request_draws_alone(tmp_path, paged):
+    """One server over a mesh that spans two processes, each seating and reading its own groups of rows and
+    the pool stepping it together, each step's admission, captures and restores agreed: a round of
+    requests on the second process alone, then one on both with the widest on the second, serves every
+    request what one process serving them all draws, over a dense cache and a hybrid stack's paged one
+    sharing prompt pages and the recurrent states kept at them; and an engine, which steps one process's
+    kinds, refuses the pooled server (ledger 1423)."""
+    from pathlib import Path
+
+    from process_support import run_pool, run_worker
+
+    worker = Path(__file__).with_name("serving_worker.py")
+    reports = run_pool("pooled_server", tmp_path / "pool", 2, script=worker, devices=2, fsdp_size=4,
+                       paged=paged or None, timeout=300)
+    single = run_worker("pooled_server", tmp_path / "single.json", script=worker, fsdp_size=1, devices=1,
+                        paged=paged or None)
+    assert {**reports[0]["drawn"], **reports[1]["drawn"]} == single["drawn"]
+    assert [report["engine"] for report in (*reports, single)] == ["refuses it", "refuses it", "takes it"]
+    # The last process's second round read its first round's prefix pages and the states kept at them.
+    assert (reports[1]["shared"] > 0) == paged
+
+
+def drawn_adapter(model, variables, module: str, key: int, layouts=None):
+    """A rank-2 adapter of `module` over `model`, its B drawn from `key` (its init holds B at zero, which
+    adapts nothing), as the adapter-set sites draw each of theirs."""
+    from dew.lora import LoRA
+
+    adapter = LoRA(rank=2, modules=(module,)).apply(model, variables, key=key, layouts=layouts)
+    factors = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                            if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+        adapter.variables["params"])
+    return dataclasses.replace(adapter, variables={**adapter.variables, "params": factors})
+
+
+def test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_rows_adapter():
+    """A speculating server (`Speculative`) over an adapter set whose adapters adapt the stream's input
+    map (`project_in`, which reseeding a block's prediction depths reads, `DecodeOps.embed`) draws each
+    request at zero temperature as the greedy walk under its own adapter, or the base, each block's
+    reseeding under the row's adapter (row 4222's review)."""
+    from dew.lora import AdapterSet
+    from dew.sampling import Sampling, Speculative
+
+    model = decoder().clone(max_seq_len=32, num_nextn_predict_layers=1, embedding_features=8)
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+
+    adapters = AdapterSet.of({"first": drawn_adapter(model, params, "project_in", 1),
+                              "second": drawn_adapter(model, params, "project_in", 2)})
+    served = TextGeneration(adapters.model, adapters.variables, RunProcessor(Digits()),
+                            sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+    server = Server.from_task(served, slots=3, capacity=32)
+    prompts, names = ([1, 2, 3], [7, 8, 9], [4, 5, 6]), ("first", None, "second")
+    tickets = [server.submit(np.asarray([prompt]), 6, key=0, adapter=name)
+               for prompt, name in zip(prompts, names, strict=True)]
+    server.run()
+    walks = []
+    for ticket, prompt, index in zip(tickets, prompts, (0, -1, 1), strict=True):
+        walked = np.asarray([prompt], np.int32)
+        for _ in range(6):
+            scores = adapters.model.apply(adapters.variables, jnp.asarray(walked),
+                                          adapters=jnp.asarray([index], jnp.int32))[:, -1]
+            walked = np.concatenate([walked, np.asarray(scores).argmax(-1)[:, None].astype(np.int32)], axis=1)
+        held = ticket.result().host()
+        # The prompt and the response it drew, which an end of sequence may stop short of six.
+        drawn_to = 3 + int(np.asarray(held.lengths)[0])
+        np.testing.assert_array_equal(np.asarray(held.tokens)[0, :drawn_to], walked[0, :drawn_to])
+        walks.append(walked[0, 3:])
+    # The adapters move the walk: the rows' adapters are what the draws read.
+    assert len({tuple(walk) for walk in walks}) > 1
+
+
+@pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])
+def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
+    """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT
+    adapter (rank 8 over q and v, with an alpha pattern) and one of rank 2 over q alone, saved side by side
+    and loaded by directory. Requests naming either adapter, or none, share the server's steps and its
+    one copy of the base, and each draws what a task over its adapter alone (or the base) draws, on par
+    with that task against its float64 twin (check 1), over a dense cache and over a paged one sharing
+    prompt pages, where one prompt under two adapters shares none (ledger 870). An adapter bound over
+    other weights than the set's base is refused, which the set would run over the first's (ledger
+    4494)."""
+    from pathlib import Path
+
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+    fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
+                        layouts=decoder.layouts)
+    drawn = LoRA(rank=2, modules=("q_proj",)).apply(decoder.model, decoder.variables, key=0,
+                                                       layouts=decoder.layouts)
+    # Its B starts at zero; a draw of its own moves the model.
+    factors = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (jax.random.normal(jax.random.key(len(path)), leaf.shape, leaf.dtype) * 0.5
+                            if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+        drawn.variables["params"])
+    second = dataclasses.replace(drawn, variables={**drawn.variables, "params": factors})
+    fixture.save(fixture.variables, tmp_path / "set" / "fixture")
+    second.save(second.variables, tmp_path / "set" / "second")
+    adapters = AdapterSet.load(decoder.model, decoder.variables, tmp_path / "set", layouts=decoder.layouts)
+    assert adapters.names == ("fixture", "second")
+    # An adapter over other weights than the set's base would run over the first adapter's: refused.
+    moved = jax.tree.map(lambda leaf: leaf * 0.5, decoder.variables)
+    elsewhere = LoRA(rank=2, modules=("q_proj",)).apply(decoder.model, moved, key=0, layouts=decoder.layouts)
+    with pytest.raises(ValueError):
+        AdapterSet.of({"fixture": fixture, "elsewhere": elsewhere})
+    sampling = Sampling(temperature=1.0)
+    served = dataclasses.replace(decoder, model=adapters.model, variables=adapters.variables
+                                 ).text_generation(sampling=sampling)
+    alone = {name: dataclasses.replace(decoder, model=adapter.model, variables=adapter.variables
+                                       ).text_generation(sampling=sampling)
+             for name, adapter in (("fixture", fixture), ("second", second))} | {
+                 None: decoder.text_generation(sampling=sampling)}
+    prompts = ([1, 5, 9, 13, 2], [2, 4], [7, 7, 7, 3, 1], [1, 5, 9, 13, 2], [1, 5, 9, 13, 2])
+    names = ("fixture", "second", None, "second", "fixture")
+    server = Server.from_task(served, slots=4, capacity=64, admission=2, kv_cache=cache,
+                              prefix_cache=cache is not None)
+
+    def draw(seed):
+        return (np.arange(len(prompts)) + len(prompts) * seed,)
+
+    @as_given
+    def through_the_server(keys):
+        tickets = [server.submit(np.asarray([prompt]), 6, key=int(key), adapter=name)
+                   for prompt, name, key in zip(prompts, names, keys, strict=True)]
+        server.run()
+        return tuple(drawn_of(ticket.result()) for ticket in tickets)
+
+    def drawn_of(generation):
+        """A draw's tokens and the likelihoods its adapter gave them, which a wrong adapter moves."""
+        held = generation.host()
+        return held.tokens, held.raw_log_probs
+
+    def by_itself(dtype):
+        @as_given
+        def drawn_alone(keys):
+            out = []
+            for prompt, name, key in zip(prompts, names, keys, strict=True):
+                task = alone[name]
+                if dtype == "float64":
+                    task = dataclasses.replace(task, model=task.model.clone(dtype=jnp.float64),
+                                               variables=widened(task.variables))
+                with jax.enable_x64(new_val=dtype == "float64"):
+                    out.append(drawn_of(task(np.asarray([prompt]), 6, key=int(key))))
+            return tuple(out)
+
+        return drawn_alone
+
+    label = "served adapter set"
+    count = seeds_for(by_itself("float32"), draw, label, truth_fn=by_itself("float64"),
+                      dew_fn=through_the_server)
+    assert_as_exact(through_the_server, by_itself("float32"), draw, label, seeds=count,
+                    truth_fn=by_itself("float64"))
+
+
+def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own():
+    """An adapter set of two adapters over different layers of one decoder, one over layer 0's q and one
+    over layer 1's: each layer's update is its own adapter's or none, and each row's logits are those of
+    its adapter alone, on par with that adapter against its float64 twin (check 1). A scanned stack, which
+    runs its like layers under one factor pair, refuses layers whose adapters differ, as it refuses one
+    adapter's uneven targets (test_lora's test_the_branch_reaches_every_layer_of_a_scanned_run)."""
+    from pathlib import Path
+
+    from arm_arithmetic import widened
+    from reference_error import as_given, assert_as_exact, seeds_for
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet
+
+    decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
+                              dtype="float32", attention_impl="reference")
+
+    def drawn(layer: int, key: int):
+        return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
+                             layouts=decoder.layouts)
+
+    first, second = drawn(0, 1), drawn(1, 2)
+    adapters = AdapterSet.of({"first": first, "second": second})
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), (2, 5), 1, 30),)
+
+    @as_given
+    def served(tokens):
+        return np.asarray(adapters.model.apply(adapters.variables, jnp.asarray(tokens),
+                                               adapters=jnp.asarray([0, 1], jnp.int32)))
+
+    def alone(dtype):
+        @as_given
+        def logits(tokens):
+            rows = []
+            for row, adapter in enumerate((first, second)):
+                model, variables = adapter.model, adapter.variables
+                if dtype == "float64":
+                    model, variables = model.clone(dtype=jnp.float64), widened(variables)
+                with jax.enable_x64(new_val=dtype == "float64"):
+                    rows.append(np.asarray(model.apply(variables, jnp.asarray(tokens)))[row])
+            return np.stack(rows)
+
+        return logits
+
+    label = "adapter set over different layers"
+    count = seeds_for(alone("float32"), draw, label, truth_fn=alone("float64"), dew_fn=served)
+    assert_as_exact(served, alone("float32"), draw, label, seeds=count, truth_fn=alone("float64"))
+
+
+def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
+    """A row naming no adapter of a set (-1 in the call's `adapters`) takes no branch: beside a row whose
+    adapter's factors overflow its update to inf, its logits are the base model's, bit for bit."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet, LoRA
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+    fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
+                        layouts=decoder.layouts)
+    huge = dataclasses.replace(fixture, variables={**fixture.variables, "params": jax.tree.map(
+        lambda leaf: leaf * 1e30, fixture.variables["params"])})
+    adapters = AdapterSet.of({"huge": huge})
+    tokens = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8]], jnp.int32)
+    served = adapters.model.apply(adapters.variables, tokens, adapters=jnp.asarray([0, -1], jnp.int32))
+    base = decoder.model.apply(decoder.variables, tokens)
+    assert not np.isfinite(np.asarray(served[0])).all()
+    np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
+
+
+def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():
+    """An adapter set's decode carries each row's adapter in its state (`DecoderState.adapters`, int32):
+    four prompts prefilled under the set's two adapters and the base (-1), their rows reordered,
+    duplicated and one dropped (`DecodeOps.reindex`, as a fork of a row's draws moves them) and advanced a
+    token, each row's logits are those of its prompt prefilled in that place under its own adapter and
+    advanced alike, bit for bit (row 4222)."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import AdapterSet
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prefill_state
+
+    decoder = Pretrained.load(Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny",
+                              dtype="float32", attention_impl="reference")
+
+    def drawn(layer: int, key: int):
+        return drawn_adapter(decoder.model, decoder.variables, f"layers.{layer}.self_attn.q_proj", key,
+                             layouts=decoder.layouts)
+
+    adapters = AdapterSet.of({"first": drawn(0, 1), "second": drawn(1, 2)})
+    model, variables = adapters.model, adapters.variables
+    prompts = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8], [3, 7, 11, 15], [6, 2, 9, 4]], jnp.int32)
+    rows = np.asarray([0, 1, -1, 1], np.int64)
+    order = jnp.asarray([2, 0, 0, 3], jnp.int32)
+    following, active = jnp.asarray([17, 19, 21, 23], jnp.int32), jnp.ones((4,), bool)
+    ops = decode_ops(model, variables, 0, None)
+
+    def advanced(tokens, held):
+        return ops.advance(prefill_state(model, variables, ModelInputs(tokens), ops, adapters=held)[0],
+                           following, active)
+
+    state = prefill_state(model, variables, ModelInputs(prompts), ops, adapters=rows)[0]
+    assert state.adapters is not None and state.adapters.dtype == jnp.int32
+    moved = ops.reindex(state, order)
+    assert moved.adapters is not None and moved.adapters.tolist() == [-1, 0, 0, 1]
+    stepped = ops.advance(moved, following, active)
+    expected = advanced(prompts[order], rows[np.asarray(order)])
+    np.testing.assert_array_equal(np.asarray(stepped.logits), np.asarray(expected.logits))
+    # The rows' adapters change what they compute: the base row's prompt under the first adapter differs.
+    under = advanced(prompts[order], np.asarray([0, 0, 0, 1]))
+    assert not np.array_equal(np.asarray(under.logits[0]), np.asarray(stepped.logits[0]))
 
 
 @pytest.mark.mesh(devices=4)
@@ -1029,6 +1565,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
                                           lone.raw_log_probs[0, lone.lengths[0]:])
         return likelihoods(rows_served)
 
+    @as_given
     def truth(seed):
         """The float64 model's raw log-likelihood of each lone row's tokens, teacher-forced."""
         bound, alone, _ = drawn(int(seed))
@@ -1049,6 +1586,18 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
                     lambda seed: (np.int32(seed),), f"a server on {mesh}", seeds=MESH_SEEDS, truth_fn=truth)
 
 
+def expert_generation(dispatch: str, params, *, layers: int) -> TextGeneration:
+    """A greedy task over a decoder of `layers` layers whose mixture of four experts dispatches as
+    `dispatch`, over `params`, or drawn weights where None."""
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=layers, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=128, dtype="float32",
+                              mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
+    if params is None:
+        params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    return TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("decode_steps", [1, 4])
 @pytest.mark.parametrize("dispatch", ["global"])
@@ -1062,14 +1611,7 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     TextGeneration, whose loop carries each draw's checks into the next
     step's model call, refuses the exchange."""
     def generation(dispatch, params):
-        model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                  mlp_features=32, max_seq_len=128, dtype="float32",
-                                  mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
-        if params is None:
-            params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
-        return TextGeneration(
-            model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_token_ids=EOS)
-        )
+        return expert_generation(dispatch, params, layers=1)
 
     lone = generation("global", None)
     alone = [lone(prompt, budget, key=index)
@@ -1084,6 +1626,140 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
 
+
+def banked_task(sampling: Sampling, *, layers: int = 4, devices: int = 1) -> TextGeneration:
+    """A scanned MoE decoder's task over a banked store (`dew.inference.banks.HeldBanks.place`, the run's
+    `layers` weights one array a leaf, `layers_0_3`), on one device, as the task's lone calls run (a mesh
+    over the suite's devices splits the slots), or on a mesh of the last `devices` rows' devices."""
+    def routed(*, scanned: bool) -> CausalTransformer:
+        return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=layers, num_heads=2,
+                                 head_dim=8, mlp_features=32, max_seq_len=128, dtype="float32",
+                                 scan_layers=scanned, mixture=Mixture(experts=4, top_k=2))
+
+    scanned = routed(scanned=True)
+    weights = routed(scanned=False).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    mesh = MeshSpec(fsdp=devices).build(jax.devices()[-devices:] if devices > 1 else jax.devices()[:1])
+    banked = HeldBanks(weights).place(scanned, mesh=mesh)
+    return TextGeneration(scanned, banked, RunProcessor(Digits()), sampling=sampling)
+
+
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+                         ids=["dense", "paged"])
+def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_task_draws(options):
+    """A scanned MoE decoder over a banked store keeps its resident cache banked as its weights are, the
+    run's layers one array under the run's name, which every step reads and writes where it lies: an
+    admitted prompt lands in its row of every layer of it, dense or paged, and each row draws what the task
+    over the same store draws alone."""
+    bound = banked_task(Sampling(temperature=0, eos_token_ids=EOS))
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(bound, **options)
+    assert "layers_0_3" in server.cache and not any(f"layers_{index}" in server.cache for index in range(4))
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_banked_server_over_row_groups_seats_its_paged_prompts_in_every_layer_of_their_rows():
+    """A banked server whose slots split into two row groups, paged, prefills its prompts in a forward of
+    their own (`mixed_refusal`): each piece's page table and cursor land in its row of every layer of the
+    run's bank, its rows past the layers (`dew.nn.kv_cache.row_axis`), and each row draws what the task
+    over the one-device store draws alone."""
+    sampling = Sampling(temperature=0, eos_token_ids=EOS)
+    lone = banked_task(sampling)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(banked_task(sampling, devices=2),
+                                       kv_cache=KVCache(page_size=16, pages=12))
+    assert server.groups == 2 and server.mixed_refusal is not None and "layers_0_3" in server.cache
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_banked_server_that_prefills_on_a_mesh_of_its_own_moves_its_rows_past_the_banks_layers():
+    """A banked server that prefills on a mesh of its own, its bank three layers deep, which the decoding
+    mesh's two row groups do not divide: the prefilled rows move onto the decoding rows rows first, a bank's
+    past its layers moved before them (`dew.inference.serving_kernel._rows_first`), not split on the
+    layers, and every request draws what the task over the one-device store draws alone."""
+    sampling = Sampling(temperature=0, eos_token_ids=EOS)
+    lone = banked_task(sampling, layers=3)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server = Server.from_task(banked_task(sampling, layers=3, devices=2), slots=4, capacity=128, admission=2,
+                              prefill_mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
+    server, tickets = served_by(server)
+    assert "layers_0_2" in server.cache
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+
+
+@pytest.mark.distributed
+def test_a_pooled_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_process_draws(tmp_path):
+    """A server over two processes that decodes on a mesh of each process's first device and prefills on a
+    mesh of each process's second: the weights, each admission and its prefilled rows move between the two
+    meshes over the pool's hosts, and every request draws what one process serving them all draws, decoding
+    on one device and prefilling on another (ledger 875)."""
+    from pathlib import Path
+
+    from process_support import run_pool, run_worker
+
+    worker = Path(__file__).with_name("serving_worker.py")
+    reports = run_pool("pooled_prefill_apart", tmp_path / "pool", 2, script=worker, devices=2, timeout=300)
+    single = run_worker("pooled_prefill_apart", tmp_path / "single.json", script=worker, devices=2)
+    assert {**reports[0]["drawn"], **reports[1]["drawn"]} == single["drawn"]
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("decoding", [2, 1, 0], ids=["two", "one", "unmeshed"])
+def test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws(decoding):
+    """Disaggregated serving: the prompts prefill on two devices of their own and their rows' decoder state
+    moves to the decoding devices, a mesh of two or of one or one device with no mesh, where they decode;
+    every request, a prompt arriving while others decode among them, draws what its lone call draws, and
+    a reload reaches the prefill mesh's copy as the decoding one's (ledger 875)."""
+    from dew.training import Layout, MeshSpec
+
+    devices = jax.devices()[:4]
+    bound = task(Sampling(temperature=1.0))
+    layout = Layout(min_shard=1, tolerance=1.0)
+    with boxed(decoder_axes(bound.model)):
+        decoded = (place(bound.variables, MeshSpec(fsdp=decoding).build(devices[4 - decoding:]), layout)
+                   if decoding else jax.device_put(bound.variables, jax.devices()[0]))
+    served = dataclasses.replace(bound, variables=decoded)
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    # Two devices apart from the decoding ones.
+    prefilling = MeshSpec(fsdp=2).build(devices[:2] if decoding else devices[1:3])
+    server = Server.from_task(served, slots=4, capacity=128, admission=2, prefill_mesh=prefilling)
+    server, tickets = served_by(server)
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+    moved = jax.tree.map(lambda leaf: leaf * 0.5, bound.variables)
+    server.reload(moved)
+    ticket = server.submit(PROMPTS[0], BUDGETS[0], key=0)
+    server.run()
+    assert_same_generation(ticket.result(), dataclasses.replace(bound, variables=moved)(
+        PROMPTS[0], BUDGETS[0], key=0))
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_server_on_an_expert_and_stage_mesh_exchanges_its_experts_and_runs_its_stack_whole():
+    """A mixture whose dispatch exchanges tokens over the expert axis, placed on a mesh with a pipeline's
+    stage axis beside it, and built and stepped inside that training mesh's scope: the server decodes its
+    stack whole while the expert axis stays in context for the exchange (`dew.nn.sharding.whole`), and
+    serves what the global dispatch draws alone on one device (ledger 1817)."""
+    lone = expert_generation("global", None, layers=2)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    spec = MeshSpec(expert=2, stage=2)
+    with boxed(decoder_axes(lone.model)):
+        placed = place(lone.variables, spec, Layout(min_shard=1, tolerance=1.0))
+    served = expert_generation("exchange", placed, layers=2)
+    with jax.set_mesh(spec.build()):
+        _, tickets = served_alongside(served, slots=8, admission=8)
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
 
 
 class UserDecoder(nn.Module):

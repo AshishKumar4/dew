@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import tokamax
 
-from dew.devices import deterministic_ops_requested
+from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra, cost, mosaic, resources
@@ -327,13 +327,13 @@ class MosaicForward(_Mainloop[Tiles]):
         Its natural rewalk's tiles derived again (`_relaunched`); `config` itself where no smaller tile
         holds, or the part's stream is unmeasured."""
         query, value = ba.arguments["query"], ba.arguments["value"]
-        rate, part = target.memory_rate, target.part
-        if not (streams(query, target) and rate and part and target.multiprocessors):
+        rate, fixed = target.memory_rate, target.fixed_seconds
+        if not (streams(query, target) and rate and fixed and target.multiprocessors):
             return config
         family = bundle_of(config, query.dtype)
         itemsize = jnp.dtype(query.dtype).itemsize
         per_key = sum(_width(array.shape[3], family, query.dtype) for array in (query, value)) * itemsize
-        in_flight = rate / target.multiprocessors * part.fixed
+        in_flight = rate / target.multiprocessors * fixed
         for extent in reversed(extents(family, query.dtype, config.block_k)):
             candidate = dataclasses.replace(config, block_k=extent)
             if config.stages * extent * per_key >= in_flight and self._launch_legal(ba, candidate, target):

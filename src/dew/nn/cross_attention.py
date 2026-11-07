@@ -119,7 +119,8 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
 
     `table` gives each token's row of the model's own table at its stream's width (`stream_embeddings`);
     `backbone` the
-    model's final states over each context alone (`HiddenStates`), its real tokens one document, with
+    model's final states over each context alone (its `hidden_states`, or a native module's own forward:
+    `dew.nn.protocols.forward_method`), its real tokens one document, with
     the weights of the model's own pass, an adapter's included, at the run's `progress` where the model
     reads it (`dew.nn.progress`). Where the model trains nothing but its
     cross-attention blocks (`crosses_alone`), which a pass without a context runs none of, that pass
@@ -129,7 +130,7 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
     refused (TypeError), as is a backbone pass over one without final states; another encoder is
     refused (ValueError)."""
     from dew.batch import thaw
-    from dew.nn.protocols import CrossAttending, HiddenStates
+    from dew.nn.protocols import CrossAttending, forward_method
 
     if not isinstance(model, CrossAttending) or model.cross_attention is None:
         raise TypeError(f"a context is read by cross-attention layers, which a {type(model).__name__} "
@@ -138,14 +139,15 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
     if encoder == "table":
         states = model.apply(whole, tokens, method="stream_embeddings")
     elif encoder == "backbone":
-        if not isinstance(model, HiddenStates):
-            raise TypeError(f"a context's own pass reads final states, which a {type(model).__name__} "
-                            "does not give (HiddenStates)")
+        method = forward_method(model, "hidden_states")
+        if method is None:
+            raise TypeError(f"a context's own pass reads final states, and a {type(model).__name__} "
+                            "declares no hidden_states and no forward")
         real = jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]
         documents = real.astype(jnp.int32) if segments is None else jnp.where(real, segments, 0)
         laid = coordinates(segments=documents, max_segments=max_segments if segments is not None else 1,
                            right_padded=True)
-        states = model.apply(whole, tokens, train=train, coordinates=laid, method="hidden_states", rngs=rngs,
+        states = model.apply(whole, tokens, train=train, coordinates=laid, method=method, rngs=rngs,
                              **progressed(model, progress))
         if crosses_alone(variables.get("params", {})):
             states = jax.lax.stop_gradient(states)

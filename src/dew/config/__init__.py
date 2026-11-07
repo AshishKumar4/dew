@@ -46,18 +46,19 @@ from etils import epath
 
 import dew.io
 from dew import _records, registry, training
+from dew._cache import dew_cache_dir
+from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same
+from dew._files import write_atomically
 from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
-from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
-from dew.data.dataset import Loader, Ramp, Reader, ramped
+from dew.data.dataset import Closeable, Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.data.plan import PLAN_VERSIONS, SCHEDULE, PlanOrderChanged
 from dew.distributed.placement import Layout, MeshSpec
-from dew.files import write_atomically
 from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
@@ -95,7 +96,7 @@ from dew.training.diloco import DiLoCo
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Split, Summary
 from dew.training.inspection import Inspection
-from dew.training.profiling import ProfileReport, ProfileWindow
+from dew.training.profiling import ProfileReport, ProfileWindow, RunProfile
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
 from dew.training.selection import Best
@@ -572,9 +573,15 @@ class TrainerConfig:
     multiple of `mesh.stage`; unset feeds one a stage."""
     layout: Layout = dataclasses.field(default_factory=Layout)
     profile: ProfileWindow | None = None
-    """One profiler window: the steps to trace, the warmup before them and the output directory.
-
-    Unset traces nothing.
+    """One profiler window: the steps to trace, the warmup before them and the output directory, in place
+    of the run's own (`run_profile`). Unset traces the run's own window alone.
+    """
+    run_profile: RunProfile | None = dataclasses.field(default_factory=RunProfile)
+    """The run's own profile window, every run's by default: two of its steps traced once ten have run
+    past its first compile, kept with its records (`window`), its trace and manifest alone, where the
+    process can take a capture (`dew.training.profiling.capturable`): a capture's fixed cost, about a
+    second on a CPU host whatever its steps (row 4112), a run of minutes does not see, and a run shorter
+    than its warmup takes none. A `profile` the run names replaces it; None traces none of its own.
     """
     compilation_cache_dir: str | None = None
     """The directory of JAX's persistent compilation cache, so a restart skips recompiling the step.
@@ -600,7 +607,7 @@ class TrainerConfig:
     """Extra XLA_FLAGS for this run, appended to the environment by `prepare_process`.
 
     `dew train` sets them in XLA_FLAGS before the process loads jaxlib, so they hold
-    for every runtime XLA loads (`dew.devices.hold_xla_flags`); `prepare_process`
+    for every runtime XLA loads (`dew._devices.hold_xla_flags`); `prepare_process`
     appends them before JAX opens a backend, unproven where jaxlib has loaded.
     Library users set XLA_FLAGS before the process starts to make them certain;
     docs/performance.md records what was measured.
@@ -750,6 +757,18 @@ class TrainerConfig:
         """The directory of the run `name`'s checkpoints and record, in `checkpoint_dir`."""
         return os.path.join(self.checkpoint_dir, name)
 
+    def window(self, directory: str, name: str) -> ProfileWindow | None:
+        """The profile window the run `name` under `directory` traces: `profile` as it names it, or else its
+        own (`run_profile`) kept with the run's local records (`local_records`: its directory's `profile`,
+        or Dew's cache for a run in a bucket) where the process can take a capture (`capturable`), none
+        where it cannot; none where the run traces none. A trainer is given a window naming its directory
+        alone (row 4246)."""
+        from dew.training.profiling import capturable
+
+        if self.profile is not None or self.run_profile is None:
+            return self.profile
+        return self.run_profile.window(local_records(directory, name, "profile")) if capturable() else None
+
     def checkpoints(self, name: str, directory: str | None = None) -> Checkpoints:
         """The checkpoints of the run `name` in `checkpoint_dir` (`directory`), or in `directory` where
         given (a saved run read where it lies), keeping `keep`, with its local tier under `name` in
@@ -826,43 +845,55 @@ class TrainerConfig:
         return dataset.epoch_steps(window=self.accumulation)
 
 
-def _local_tracker(directory: str, name: str):
-    """Return the journal directory for a run, beside its checkpoints where it can be.
+def local_records(directory: str, name: str, kind: str) -> str:
+    """Where the run `name` under `directory` keeps its local records of `kind` (its journal, `tracking`,
+    or its profile's capture, `profile`), beside its checkpoints where it can be.
 
-    A bucket URI is not a directory this process can write journals into, so a
-    remote run journals under Dew's cache (`dew_cache_dir`), keyed by the run name and
-    a digest of the bucket path.
+    A bucket URI is not a directory this process can write into, so a remote run keeps them under Dew's
+    cache (`dew_cache_dir`), keyed by the run name and a digest of the bucket path.
     """
     if "://" not in directory:
-        return LocalTracker(os.path.join(directory, "tracking"))
-    return LocalTracker(os.path.join(dew_cache_dir(), "tracking",
-                                     _artifact_name(name) + "-"
-                                     + hashlib.sha256(directory.encode()).hexdigest()[:12]))
+        return os.path.join(directory, kind)
+    return os.path.join(dew_cache_dir(), kind,
+                        _artifact_name(name) + "-" + hashlib.sha256(directory.encode()).hexdigest()[:12])
 
 
-def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | None) -> None:
-    """Close `tracker` on every rank and agree on the outcome, then close `checkpoints`, even where
-    the tracker's close failed.
+def _local_tracker(directory: str, name: str):
+    """Return the journal of a run, kept where its local records are (`local_records`)."""
+    return LocalTracker(local_records(directory, name, "tracking"))
+
+
+def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | None,
+            rollout: Closeable | None = None) -> None:
+    """Close `rollout` (what it runs beside the trainer: a served policy's engine, a reward pool), then
+    `tracker` on every rank and agree on the outcome, then `checkpoints`, each even where one before it
+    failed.
 
     `primary` is the exception the run is already unwinding with, if any. A
     close that fails is noted on it rather than replacing it, since the run's
     own failure is the one a caller wants; without one, the first failure is
-    raised with the other noted on it.
+    raised with the others noted on it.
     """
+    closes = [*([] if rollout is None else [("closing the rollout", rollout.close)]),
+              *([] if tracker is None else
+                [("closing the tracker", functools.partial(tracker.__exit__, type(primary), primary, None))])]
     error = None
     try:
-        if tracker is not None:
-            tracker.__exit__(type(primary), primary, None)
+        attempted(closes)
     except BaseException as failure:
         error = failure
     failed = None
     try:
-        agree_process_phase(error, phase="tracker close")
+        agree_process_phase(error, phase="run close")
     except BaseException as failure:
         if primary is None:
             failed = failure
         else:
-            primary.add_note(f"Tracker close failed: {failure!r}")
+            primary.add_note(f"Closing the run failed: {failure!r}")
+            if error is not None and failure is error:
+                # This process's own: the closes it came from, as `attempted` noted each with its step.
+                for note in error.__notes__:
+                    primary.add_note(note)
     raised = primary if primary is not None else failed
     if checkpoints is not None:
         checkpoints.__exit__(None if raised is None else type(raised), raised, None)
@@ -1047,13 +1078,17 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record that states no data plan version (`RunConfig.data_plan`): it was written
-    before the field, under version 8, which read a mixture's corpora shuffled by one seed in one
-    permutation, so it reads by 8 (row 3840). Carried to 1.0 (ledger 1552)."""
+    """A saved run's record that states no data plan version (`RunConfig.data_plan_version`): one a Dew
+    wrote while the field was `data_plan` states it there, None where the run was trained in Python,
+    which that Dew compiled at version 9; one written before either, under version 8, which read a
+    mixture's corpora shuffled by one seed in one permutation, reads by 8 (row 3840). Carried to 1.0
+    (ledger 1552)."""
     named = registry.class_record(record)
-    if named is None or named[0] not in registry.runs or "data_plan" in named[1]:
+    if named is None or named[0] not in registry.runs or "data_plan_version" in named[1]:
         return record
-    return {**record, "fields": {**named[1], "data_plan": 8}}
+    fields = {name: value for name, value in named[1].items() if name != "data_plan"}
+    landed = named[1].get("data_plan", 8)
+    return {**record, "fields": {**fields, "data_plan_version": 9 if landed is None else landed}}
 
 
 def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1082,11 +1117,11 @@ def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoint
     if named is None or "option_text" not in named[1] or named[1]["option_text"] is not None:
         return record
     from dew.decision.layout import Layout, layout_writing
-    from dew.inference.tasks import earlier_shapes
+    from dew.inference.tasks import saved_artifact
 
     step = checkpoints.latest
-    artifact = None if step is None else checkpoints.artifact(step)
-    laid = earlier_shapes(artifact).get("layout") if isinstance(artifact, Mapping) else None
+    artifact = None if step is None else saved_artifact(checkpoints, step)
+    laid = None if artifact is None else artifact.get("layout")
     if not isinstance(laid, Mapping):
         return record
     writing = layout_writing(registry.from_record(Layout, laid))
@@ -1134,15 +1169,29 @@ EARLIER_CAPTURE = ("host_tracer_level", "python_tracer_level", "activity_cap")
 
 def earlier_profile(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record whose trainer's profile window states its capture's options as its own fields
-    (`EARLIER_CAPTURE`), with them its capture's, as it captured with them. A window that states its
-    capture beside them is as it was, its fields refused by name. Carried to 1.0 (ledger 1552)."""
+    (`EARLIER_CAPTURE`), with them its capture's, as it captured with them; and one saved before a run's
+    own window was its `run_profile` (row 4255): its window naming no directory (PF01 to train 610's) as
+    its `run_profile`, its steps, warmup and capture kept, and no window at all as none of its own, as it
+    traced none. A window that states its capture beside them is as it was, its fields refused by name.
+    Carried to 1.0 (ledger 1552)."""
     fields = record.get("fields")
     trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
     inner = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else None
     window = inner.get("profile") if isinstance(inner, Mapping) else None
     stated = window.get("fields", window) if isinstance(window, Mapping) else None
-    if (not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(inner, Mapping)
-            or not isinstance(window, Mapping) or not isinstance(stated, Mapping) or "capture" in stated
+    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(inner, Mapping):
+        return record
+    own_window = isinstance(stated, Mapping) and stated.get("directory", "") is None
+    if "run_profile" not in inner and "profile" in inner and (window is None or own_window):
+        # Saved before a run's own window was its `run_profile`: no window traced none, and a window
+        # naming no directory was the run's own, its steps, warmup and capture its own's (its reports
+        # none, a run's own window's trace and manifest alone).
+        own = ({name: stated[name] for name in ("steps", "warmup", "capture") if name in stated}
+               if isinstance(stated, Mapping) else None)
+        inner = {**inner, "profile": None, "run_profile": own}
+        trainer = {**trainer, "fields": inner} if "fields" in trainer else inner
+        return {**record, "fields": {**fields, "trainer": trainer}}
+    if (not isinstance(window, Mapping) or not isinstance(stated, Mapping) or "capture" in stated
             or not set(EARLIER_CAPTURE) & set(stated)):
         return record
     capture = {name: stated[name] for name in EARLIER_CAPTURE if name in stated}
@@ -1386,12 +1435,12 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan")
+    BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
     whose resolution a later Dew, or a later state of what it reads, may change: the storage of the
     source it reads (`SourceOptions.param_dtype`), the step of a saved Dew run it starts from, which
     that run's later checkpoints move (`with_pinned_run`), the data plan version its order is read by
-    (`data_plan`), and in a kind of run that adds them its own
+    (`data_plan_version`), and in a kind of run that adds them its own
     (a decision run's option text). A run that leaves one None and resumes a saved run under its name
     takes the saved run's value (`resumed`), so running the same command again resumes what it trained;
     one it sets is its own, and a resume refuses it where it differs (`check_resume`). A saved run whose
@@ -1415,10 +1464,12 @@ class RunConfig:
     stage or the training batch."""
     data_seed: int = 0
     """The seed of the data's order and of its random steps."""
-    data_plan: int | None = None
-    """The data plan version the run reads its order by (`dew.data.plan.PLAN_VERSIONS`): None for this
-    Dew's, which its record holds resolved (`pinned`), so a resume reads the order it read whatever a
-    later Dew's is (`BUILT`); a saved run that recorded none read by version 8 (`earlier_data_plan`)."""
+    data_plan_version: int | None = None
+    """The data plan version the run reads its order by (`dew.data.plan.PLAN_VERSIONS`): None for the
+    saved run's it resumes, or else this Dew's, which `resumed` resolves on every path a run trains by and
+    its record holds, so a resume reads the order it read whatever a later Dew's is (`BUILT`); a saved run
+    that recorded none read by version 8, and one that recorded a `data_plan` of None by 9
+    (`earlier_data_plan`)."""
     source: SourceOptions = dataclasses.field(default_factory=SourceOptions)
     """What the run builds of the source it starts from (`--source.text-only`,
     `--source.prediction-depths`), where it starts from one (`pretrained`)."""
@@ -1756,14 +1807,10 @@ class RunConfig:
         record = json.loads((path if named_file else path / RUN_FILE).read_text())
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)
-        held = earlier_run(record)
-        run = cls.read(held, trust=trust)
-        # Its checkpoints' tiers as the run kept them, under the directory it was saved in.
-        saved = str(path.parent if named_file else path)
-        name = run.trainer.name or os.path.basename(saved.rstrip("/"))
-        with run.trainer.checkpoints(name, directory=saved) as checkpoints:
-            settled = earlier_option_writing(held, checkpoints)
-        return run if settled is held else cls.read(settled, trust=trust)
+        # A field its record left to its checkpoints (`earlier_option_writing`) is read where the run resumes
+        # (`resumed`, `check_resumed`), its process prepared: `dew train run.json` reads the run first, before
+        # a pool of processes is joined, which no device opened before may be (train 589's review).
+        return cls.read(earlier_run(record), trust=trust)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
@@ -1792,22 +1839,29 @@ class RunConfig:
         names what it started from and is what it loads."""
         return self.resumed().pinned().build_run()
 
-    def resumed(self) -> Self:
-        """This run with each field it leaves None for its build to resolve (`BUILT`) at the value the
-        saved run it resumes under its name recorded, read as every earlier shape of a saved run is
-        (`earlier_run`); itself where it resumes none (`TrainerConfig.resumes`) or leaves none to its
-        build."""
+    def resumed(self, paths: Sequence[str] | None = None) -> Self:
+        """This run with each field it leaves None for its build to resolve (`BUILT`, or those of them
+        `paths` names) at the value the saved run it resumes under its name recorded, read as every
+        earlier shape of a saved run is (`earlier_run`), and its data plan version, where it resumes no
+        run that recorded one, this Dew's (`PLAN_VERSIONS`): the one place a run's version is resolved,
+        on each path a run trains by (`prepare`, and `readied`, which a run trained in Python reaches
+        alone), before its data compiles or its record is written. Its other fields as they are where it
+        resumes no run (`TrainerConfig.resumes`) or leaves none to its build."""
         trainer = self.trainer
-        unset = [path for path in self.BUILT if _holds(self, path) and _recorded_at(self, path) is None]
-        if not unset or trainer.name is None or trainer.resume == "never" or not trainer.resumes():
-            return self
-        with trainer.checkpoints(trainer.name) as checkpoints:
-            saved = self._saved_record(trainer.directory(trainer.name), checkpoints)
-        recorded = None if saved is None else self._saved_as(saved)
-        if recorded is None:
-            return self
-        # A field of a record the saved run held none of (a teacher it had not) takes nothing.
-        return self.override({path: _recorded_at(recorded, path) for path in unset if _holds(recorded, path)})
+        built = self.BUILT if paths is None else paths
+        unset = [path for path in built if _holds(self, path) and _recorded_at(self, path) is None]
+        run = self
+        if unset and trainer.name is not None and trainer.resume != "never" and trainer.resumes():
+            with trainer.checkpoints(trainer.name) as checkpoints:
+                saved = self._saved_record(trainer.directory(trainer.name), checkpoints)
+            recorded = None if saved is None else self._saved_as(saved)
+            # A field of a record the saved run held none of (a teacher it had not) takes nothing.
+            if recorded is not None:
+                run = self.override({path: _recorded_at(recorded, path) for path in unset
+                                     if _holds(recorded, path)})
+        if "data_plan_version" in built and run.data_plan_version is None:
+            run = dataclasses.replace(run, data_plan_version=PLAN_VERSIONS[-1])
+        return run
 
     def build_run(self) -> Prepared:
         """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
@@ -1870,12 +1924,15 @@ class RunConfig:
                                validation: Dataset | Mapping[str, Dataset | Entry] | None,
                                ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
-        stages, `data_seed` and `data_plan`, the training read bounded to `trainer.examples` where the run
-        counts them, or to `trainer.epochs` passes over its source examples where its read has no record
-        count, so its length is read off the loader this returns."""
+        stages, `data_seed` and `data_plan_version`, the training read bounded to `trainer.examples` where
+        the run counts them, or to `trainer.epochs` passes over its source examples where its read has no
+        record count, so its length is read off the loader this returns."""
+        # At the version `resumed` resolves (itself where `prepare` or `readied` resolved it; a run built
+        # alone, `build_run`, resolves it here), which it always states.
+        planned = self.resumed(("data_plan_version",)).data_plan_version
+        assert planned is not None
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
-                      examples=self.trainer.examples, epochs=self.trainer.epochs,
-                      plan_version=PLAN_VERSIONS[-1] if self.data_plan is None else self.data_plan)
+                      examples=self.trainer.examples, epochs=self.trainer.epochs, plan_version=planned)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -1894,13 +1951,9 @@ class RunConfig:
     def pinned(self) -> Self:
         """This run with its Hub sources named at the commits they resolve to now, as its record names
         them and `prepare` loads them: here an imported adapter's (`LoRA.resolved`); a kind of run pins
-        its own sources beside it. Its data plan version is this Dew's where it names none
-        (`data_plan`). Itself where nothing is left to pin."""
+        its own sources beside it. Itself where nothing is left to pin."""
         lora = None if self.lora is None else self.lora.resolved()
-        plan = PLAN_VERSIONS[-1] if self.data_plan is None else self.data_plan
-        if lora == self.lora and plan == self.data_plan:
-            return self
-        return dataclasses.replace(self, lora=lora, data_plan=plan)
+        return self if lora == self.lora else dataclasses.replace(self, lora=lora)
 
     def with_pinned_run(self, pretrained: str | None) -> Self:
         """This run with the checkpoint it reads of the saved Dew run it starts from (`pretrained`, a
@@ -2009,11 +2062,22 @@ class RunConfig:
         its steps; its trunk quantized where it asks; its record naming the run's directory and its
         optimizer's groups (`grouped`)."""
         self.check_process()
-        dataset, held = self.compiled(objective.data(), dataset, validation)
+        # Its data plan version resolved before its data compiles and its record is written, a run trained
+        # in Python reaching `readied` alone, as the run it trains under `name` reads it (train 589's
+        # review): a loader compiled already reads by its own plan's version, which it records.
+        named = dataclasses.replace(self, trainer=dataclasses.replace(self.trainer, name=name))
+        plan = dataset.plan if isinstance(dataset, Loader) else None
+        if plan is not None and self.data_plan_version not in (None, plan.version):
+            raise ValueError(f"the run reads by data plan version {self.data_plan_version}, and the loader "
+                             f"it is given was compiled at {plan.version}; compile the loader at the run's "
+                             "version (`compile(..., plan_version=...)`), or leave the run's to the loader")
+        planned = (named.resumed(("data_plan_version",)) if plan is None
+                   else dataclasses.replace(named, data_plan_version=plan.version))
+        dataset, held = planned.compiled(objective.data(), dataset, validation)
         # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
-        suites = self.suites(dataset, held, metrics)
-        sized, dataset, steps = self.trainer.resolved(dataset)
-        run = dataclasses.replace(self, trainer=sized)
+        suites = planned.suites(dataset, held, metrics)
+        sized, dataset, steps = planned.trainer.resolved(dataset)
+        run = dataclasses.replace(planned, trainer=sized)
         if run.trainer.quantization is not None:
             quantize_trunk(objective, run.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.
@@ -2070,7 +2134,7 @@ class RunConfig:
                 # Shown under its own name where one is given, kept under the run's either way.
                 wandb_tracker = WandbTracker(
                     trainer.wandb.project, name if trainer.wandb.name is None else trainer.wandb.name,
-                    entity=trainer.wandb.entity, offline=trainer.wandb.offline)
+                    entity=trainer.wandb.entity, offline=trainer.wandb.offline, shared=trainer.wandb.shared)
             checkpoints = trainer.checkpoints(name)
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
@@ -2079,7 +2143,8 @@ class RunConfig:
             # and the rest are fit's arguments or built the checkpoints and the tracker.
             ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
             built = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
-                               profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead)
+                               profile=trainer.window(checkpoints.directory, name),
+                               lower_for=trainer.lower_for, ahead=ahead)
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
@@ -2125,7 +2190,8 @@ class RunConfig:
             return state
 
         finally:
-            _closed(tracker, checkpoints, sys.exception())
+            _closed(tracker, checkpoints, sys.exception(),
+                    rollout if isinstance(rollout, Closeable) else None)
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
                                          steps: int | None, rollout: Rollout | None,

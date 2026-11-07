@@ -52,11 +52,12 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
+from dew.optim import OptimConfig
 from dew.registry import models, projectors, read_arguments, resolve_dtype, towers
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.ahead import step_batch
+from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus, step_batch
 from dew.training.planning import Trials
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
@@ -273,24 +274,35 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     return objective
 
 
-OPTIMIZERS = {"adam": optax.adam, "adamw": optax.adamw}
-"""A case's optimizer by name (`Case.optimizer`), each at a learning rate."""
-
-
 def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
-                  optimizer: optax.GradientTransformation | None = None) -> Trainer:
+                  optimizer: optax.GradientTransformation | None = None,
+                  ahead: AheadOfTime | None = None) -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
-    checkpoints, on the case's device order. A case measures its own batch,
-    so the step reads it whole and climbs the remat ladder where it must."""
+    checkpoints, on the case's device order, stepping the optimizer `dew train`
+    builds for the case's at 1e-4 (`OptimConfig.build`). A case measures its own
+    batch, so the step reads it whole and climbs the remat ladder where it must.
+    `ahead`, its step compiled ahead (`ahead_of`), runs as its first step where it
+    is that program, so the GPU compiles nothing for it."""
     trainer = Trainer(
-        build_objective(case, attention_impl), optimizer or OPTIMIZERS[case.optimizer](1e-4),
+        build_objective(case, attention_impl),
+        optimizer or OptimConfig(optimizer=case.optimizer, learning_rate=1e-4).build(None),
         key=jax.random.key(0),
         **trainer_mesh(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
-        accumulation=case.accumulation, split=1, checkpoints=None, tracker=None)
+        accumulation=case.accumulation, split=1, checkpoints=None, tracker=None, ahead=ahead)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
         trainer.device_mesh = trainer.mesh.build([by_id[index] for index in case.device_order])
     return trainer
+
+
+def ahead_of(case: Case, generation: str, capacity: int,
+             attention_impl: AttentionImpl = 'auto') -> AheadOfTime:
+    """Case `case`'s step planned and compiled ahead of its run for one compile-only GPU of the CUDA
+    `generation` holding `capacity` bytes (`dew.training.ahead.compile_ahead`), on any host: what a GPU
+    node's prepare hands its run (`build_trainer`'s `ahead`), and what perf_gate's compile rows time."""
+    trainer = build_trainer(case, attention_impl)
+    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, 1, capacity)))
+    return compile_ahead(trainer, global_batch(case), capacity)
 
 
 def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> ModelInputs:

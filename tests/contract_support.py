@@ -1,8 +1,8 @@
 """The derivative contracts' harness (ledger 2641): each custom-derivative seam's orders (`orders`), the
 contract a seam is held to (`assert_contract`), the draws at float32's exponent edges (`EDGES`,
 `normal_draw`) and the orders a seam may not take (`FORWARD_ORDERS`, `REVERSE_ONLY` and the rest). The
-contracts themselves are tests/test_contracts_*.py, one an owning area, and tests/test_derivative_seams.py
-holds every seam to one.
+contracts themselves are tests/test_contracts_*.py, one an owning area, and each seam names its own at
+the seam (`dew.nn.derivatives.contracted`, held by tools/lint_slop.py's SLOP028).
 
 Float-range and nested-derivative contracts of Dew's custom-derivative seams (ledger row 2283, theme
 G12): each seam's primal, its forward and reverse derivatives, a forward derivative of its gradient and a
@@ -139,7 +139,8 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
         broken = []
         for index, (value, truth, plainly) in enumerate(zip(values, jax.tree.leaves(truths[name]), plains,
                                                             strict=True)):
-            if not np.issubdtype(value.dtype, np.inexact):
+            # JAX's dtype lattice, which holds bfloat16 (ml_dtypes' is no NumPy inexact type).
+            if not jnp.issubdtype(value.dtype, jnp.inexact):
                 continue
             kept = normal_float32(truth) & np.isfinite(truth)
             if plainly is not None:
@@ -160,7 +161,14 @@ EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.
 pairs) reach float32's largest or its least normal."""
 
 
-def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
-    """Standard normal float32 arrays of `shapes` at `scale`, from `seed`."""
+def normal_draw(seed, *shapes, scale: float = 1.0, dtype=jnp.float32) -> tuple:
+    """Standard normal arrays of `shapes` at `scale` in `dtype`, from `seed` (a seed, or a site's salt and
+    a seed: NumPy's `SeedSequence` entropy)."""
     rng = np.random.default_rng(seed)
-    return tuple(jnp.asarray(rng.standard_normal(shape) * scale, jnp.float32) for shape in shapes)
+    return tuple(jnp.asarray(rng.standard_normal(shape) * scale, dtype) for shape in shapes)
+
+
+def normal_drawn(salt: int, *shapes, dtype=jnp.float32):
+    """A check-1 draw (`draw(seed)`) of standard normal arrays of `shapes` in `dtype`, a site's `salt`
+    keeping its stream apart (`normal_draw`)."""
+    return lambda seed: normal_draw([salt, seed], *shapes, dtype=dtype)

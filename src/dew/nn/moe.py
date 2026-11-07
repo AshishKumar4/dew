@@ -35,12 +35,12 @@ from jax.sharding import PartitionSpec as P
 from dew.batch import leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels import generation
-from .kernels.templates.gemm import template
+from .kernels import gemm, generation
 from .precision import (
     at_least_fp32,
     capped_logits,
@@ -192,6 +192,19 @@ def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Ar
     else:
         direction = jnp.sign(jnp.sum(counts) / counts.size - counts)
     return jnp.asarray(rate) * direction
+
+
+def sqrt_softplus(logits: jax.Array) -> jax.Array:
+    """DeepSeek V4's score, `sqrt(softplus(logits))`, the plain formula wherever `exp(logits)` is above its
+    dtype's epsilon, and below it its tail `exp(logits / 2)`, which the formula equals there to within
+    the epsilon: where softplus underflows, the plain formula's derivative, `sqrt`'s at zero, is infinite
+    and an unselected expert's zero cotangent made the router's gradient NaN; a selected expert far down
+    the tail keeps its score where the plain formula rounded it to zero. Each branch reads only the
+    logits its side takes, so neither's derivative is evaluated past its range."""
+    tail = jnp.log(jnp.finfo(logits.dtype).eps)
+    below = logits < tail
+    plain = jnp.sqrt(jax.nn.softplus(jnp.where(below, tail, logits)))
+    return jnp.where(below, jnp.exp(jnp.minimum(logits, tail) / 2), plain)
 
 
 class Router(nn.Module):
@@ -415,7 +428,7 @@ class Router(nn.Module):
         if self.score_function == 'softmax':
             return jax.nn.softmax(logits, axis=-1)
         if self.score_function == 'sqrtsoftplus':
-            return jnp.sqrt(jax.nn.softplus(logits))
+            return sqrt_softplus(logits)
         return jax.nn.sigmoid(logits)
 
     def group_mask(self, selection):
@@ -464,18 +477,6 @@ class Router(nn.Module):
         return flat.reshape(selection.shape)
 
 
-def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
-    """Expert-major biases in compute dtype, with master-precision cotangent sums.
-
-    Out-of-range IDs are transport padding, contributing neither a value
-    nor a gradient. Promotion before gathering prevents a bf16 scatter-add
-    or scan carry from rounding partial bias gradients.
-    """
-    work = jnp.result_type(bias.dtype, dtype, jnp.float32)
-    values = jnp.asarray(rounded_operand(bias, dtype)).astype(work)
-    return values.at[expert_ids].get(mode='fill', fill_value=0).astype(dtype)
-
-
 BANKED_EXPERTS = 'banked_experts'
 """The collection a run over a bank in device memory hands its experts' kernels in: each `ExpertLinear`'s
 kernel the bank's whole `[layers, experts, in, out]` and the layer read (`experts_apart`, `at_iteration`),
@@ -484,7 +485,7 @@ read where it lies (`Layered`)."""
 
 class Layered(struct.PyTreeNode):
     """An expert kernel read in place from a bank: the run's stack `[layers, experts, in, out]` and the
-    layer read, which the GEMM template reads where it lies (`template.gemm`'s `layer`) rather than as a
+    layer read, which the GEMM template reads where it lies (`gemm.gemm`'s `layer`) rather than as a
     slice copied out a layer at a time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on
     an H100)."""
 
@@ -537,7 +538,7 @@ def at_iteration(variables: Mapping[str, Mapping], layer: jax.Array) -> dict:
 
 def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
-                      precision: PrecisionLike) -> jax.Array:
+                      precision: PrecisionLike, bias: jax.Array | None = None) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
@@ -548,16 +549,21 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     split width rounds no partial sum. The tangent is `dx @ Q(kernel) + Q(x) @
     dkernel` with `Q` the rounded operands: a kernel gradient keeps the master
     dtype, an input gradient its input's, both accumulating over the widest of
-    the compute, input and kernel dtypes, whatever the placement.
+    the compute, input and kernel dtypes, whatever the placement. `bias`, each
+    expert's `[experts, out]` where given, is added to its rows' fp32 sums
+    before their one rounding (the template's epilogue, which reads it at each
+    row's expert: row 3963), rounded to the compute dtype as an operand is, its
+    gradient summed over each expert's rows in at least fp32 before it meets
+    the bias's own dtype.
 
     Every implementation runs the GEMM template
-    (`dew.nn.kernels.templates.gemm.template.gemm`), which selects each of its
+    (`dew.nn.kernels.gemm.gemm`), which selects each of its
     launches where it runs (`grouped_matmul.GROUPED`: the template's kernels on
     a GPU, an old route on a declared cell, XLA's program off a GPU and on a
     call no launch takes, each route reported with its reason) and holds the
     law in every differentiation mode; 'xla' names XLA's ragged dot for every
     launch (`generation.chosen`), and 'auto' and 'pallas' alike leave the
-    choice to the template. `generation.chosen(grouped_matmul=...)` names a
+    choice to the gemm. `generation.chosen(grouped_matmul=...)` names a
     kernel, a launch's name raising where it cannot run the call
     (`selection.KernelRefused`). A CPU process runs XLA's program: a test
     interprets the kernels by calling the template's interpreter itself. XLA's
@@ -567,20 +573,34 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
     measures it against float64 sums and three Adam steps on every expert/fsdp
     layout.
     """
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
-    compute = canonicalize_dtype(x, stack, dtype=dtype)
+    compute = canonicalize_dtype(x, stack, *(() if bias is None else (bias,)), dtype=dtype)
     with _named(implementation):
-        return template.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
-                             layer=layer)
+        return gemm.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
+                         layer=layer, **_biased(bias, compute))
+
+
+def _biased(bias: jax.Array | None, compute) -> dict:
+    """The template's epilogue adding each expert's bias to its rows' sums (`expert_projection`): the bias
+    rounded to `compute` as an operand is, held in at least fp32, so its gradient sums each expert's rows so
+    before it meets the bias's dtype (`rounded_operand`)."""
+    if bias is None:
+        return {}
+    work = jnp.result_type(bias.dtype, compute, jnp.float32)
+    held = jnp.asarray(rounded_operand(bias, compute)).astype(work)
+    return {'epilogue': _plus_bias, 'epilogue_operands': ((held, ('groups', 'columns')),)}
+
+
+def _plus_bias(acc: jax.Array, bias: jax.Array) -> jax.Array:
+    """An expert's rows' sums plus its bias, before their one rounding (`_biased`)."""
+    return acc + bias
 
 
 def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Array | Layered,
                        group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
                        precision: PrecisionLike) -> tuple[jax.Array, jax.Array]:
     """`expert_projection` of the same rows through two expert matrices of one shape (a gate's and an up
-    projection's), as one paired product (`template.gemm`'s `paired`): a launch that takes the pair reads
+    projection's), as one paired product (`gemm.gemm`'s `paired`): a launch that takes the pair reads
     the rows once for both, and the call hands the two products on apart where its launch takes none
     (`grouped_matmul._takes_pair`), each under `expert_projection`'s law. On an H100 the pair took 0.79
     to 1.0 of the two products' time at the routings of DeepSeek-V3, Qwen3-30B-A3B and GPT-OSS-20B, its
@@ -592,16 +612,16 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
     if isinstance(first, Layered) or isinstance(second, Layered):
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
                 expert_projection(x, second, group_sizes, compute, implementation, precision))
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     with _named(implementation):
-        return template.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
+        return gemm.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
                              out_dtypes=(compute, compute), precision=precision, paired=second)
 
 
 def _named(implementation: str) -> contextlib.AbstractContextManager:
     """The launch choice an expert projection's `implementation` names: XLA's ragged dot for 'xla', the
-    template's own for 'auto' and 'pallas' (`expert_projection`)."""
+    template's own for 'auto' and 'pallas' (`expert_projection`); any other name is refused."""
+    if implementation not in GROUPED_MATMULS:
+        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     return generation.chosen(grouped_matmul='xla') if implementation == 'xla' else contextlib.nullcontext()
 
 
@@ -687,16 +707,16 @@ def expert_dispatch[Parameters](
     holds them as the residual stream does, so each device runs its own rows
     through every expert on device-local rows, as the Pallas kernels need
     (MaxText's `sparse_matmul_route_and_compute`). `'exchange'` is expert
-    parallelism with the expert axis manual: each device trades buckets of its
-    slots with the shards owning their experts in `all_to_all` rounds
-    (`_exchange_shard`), keeping every slot; rows the batch axes do not divide
-    are padded. Parameters enter in their stored shards and are gathered
-    inside, so gradients leave reduce-scattered.
+    parallelism with the expert axis manual: each device sends each shard
+    owning experts its slots' rows in one `ragged_all_to_all` and takes them
+    back in another (`_exchange_shard`), keeping every slot; rows the batch axes
+    do not divide are padded. Parameters enter in their stored shards and are
+    gathered inside, so gradients leave reduce-scattered.
 
     `capacity_factor` drops as GShard and MaxText do (`capacity_positions`),
-    the same slots under either dispatch and placement, and the exchange then
-    needs one round. Parameters take part in at least fp32, so gradients sum
-    across devices and rounds in fp32 and meet the master dtype once.
+    the same slots under either dispatch and placement, and bounds what a shard
+    receives. Parameters take part in at least fp32, so gradients sum across
+    devices in fp32 and meet the master dtype once.
     """
     if dispatch not in EXPERT_DISPATCHES:
         raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {dispatch!r}")
@@ -728,13 +748,15 @@ def expert_dispatch[Parameters](
     return _stored_primal(run, x, indices, parameters, input_weights)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(0,))
-def _stored_primal(run, x, indices, parameters, input_weights):
+def _stored(run, x, indices, parameters, input_weights):
     """`run` over the parameters as stored, and differentiated over them at
-    least fp32 (`_widened`), so a gradient summed across devices or over
-    the exchange's rounds meets the master dtype once, after the sum. A
-    forward that nothing differentiates, serving above all, reads the
-    stored kernels: widened, every layer's experts were copied to fp32 in
+    least fp32 (`_widened`), so a gradient summed across devices meets the
+    master dtype once, after the sum: a
+    kernel's glue (`_stored_primal`, `dew.nn.derivatives.declared_tangent`),
+    the whole expert layer, which the algebra pass rewrites as any other math
+    around its launches (a protected span would hold every MoE layer out of
+    the pass). A forward that nothing differentiates, serving above all, reads
+    the stored kernels: widened, every layer's experts were copied to fp32 in
     the step, 14.35 GiB of live temporaries for gpt-oss-20b served over an
     expert axis of four RTX 3090s."""
     return run(x, indices, parameters, input_weights)
@@ -785,7 +807,9 @@ def _stored_primal_jvp(run, primals, tangents):
                    tuple(directions[index] for index in live))
 
 
-_stored_primal.defjvp(_stored_primal_jvp, symbolic_zeros=True)
+_stored_primal = contracted("test_a_stored_expert_primal_holds_every_order")(
+    declared_tangent(KernelGlue(), _stored, _stored_primal_jvp, nondiff_argnums=(0,),
+                     symbolic_zeros=True))
 
 
 def _dispatched[Parameters](
@@ -914,86 +938,63 @@ def _exchange_shard[Parameters](
     """Run one device's share of `expert_dispatch`'s exchange, inside its
     shard_map.
 
-    The device sorts its slots by expert and sends each shard one bucket in a
-    first round. Dropless, the bucket is its balanced share, and what a skewed
-    routing leaves follows in later rounds of the same size, as many as the
-    expert axis's maximum needs. Under a capacity the first bucket holds what
-    the device's sequences can keep for one peer and nothing is left over. The
-    later rounds run in a checkpointed scan, which recomputes rather than keeps
-    their intermediates, so they are as few as the bucket size allows. They are
-    in the compiled program whether or not a routing needs them, so a static
-    count of a dropless step's FLOPs reads them (moe_grpo on four expert shards
-    1.10 of one device's global dispatch, 1.00 under a capacity of 2).
+    The device sorts its slots by expert and sends each shard its run of them
+    in one `ragged_all_to_all`, the shard projects what every device sent it,
+    grouped by its experts, and a second one brings each row back where it was
+    sent from: XLA's own collective, each row moved once, whatever the routing's
+    skew. Every device learns the whole exchange's counts, each device's slots for
+    each expert, from one gather of its own (`all_gather`), and so where its rows
+    land on each shard, where theirs come back, and each received row's expert,
+    as a device sends a shard its rows expert by expert. A shard receives at most
+    every device's slots dropless, or what a capacity lets each device's sequences
+    keep for it, the receiving buffer's static size.
     """
     top_k = indices.shape[-1]
     tokens = x.reshape(-1, x.shape[-1])
     slots, per_shard = indices.size, num_experts // shards
-    if capacity is None:
-        first = -(-slots // shards)
-    else:
-        first = min(slots, math.prod(indices.shape[:-2]) * per_shard * capacity)
+    # The most slots one device sends one shard.
+    most = slots if capacity is None else min(slots, math.prod(indices.shape[:-2]) * per_shard * capacity)
     order = jnp.argsort(indices.ravel())
     experts = indices.ravel()[order]
-    sizes = jnp.bincount(experts // per_shard, length=shards + 1)[:shards]
-    starts = jnp.cumsum(sizes) - sizes
     rows = order // top_k
-    scales = None if input_weights is None else input_weights.ravel()[order]
-
-    def exchange_round(offset: jax.Array | int) -> tuple[jax.Array, jax.Array]:
-        """Send each shard its `first` slots from `offset` on, project them
-        there, and bring them back.
-
-        The rows are gathered from the tokens themselves, through the
-        sort's index. Returns the returned rows and the slot each belongs
-        at, in token order; padding's lies past the end, so the caller's
-        scatter drops it.
-        """
-        offsets = offset + jnp.arange(first)
-        valid = offsets[None, :] < sizes[:, None]
-        addresses = jnp.minimum(starts[:, None] + offsets, slots - 1)
-        send = jnp.where(valid[..., None], tokens[rows[addresses]], 0)
-        if scales is not None:
-            send = send * scales[addresses][..., None].astype(send.dtype)
-        ids = jnp.where(valid, experts[addresses] % per_shard, per_shard)
-        received = jax.lax.all_to_all(send, EXPERT_AXIS, 0, 0, tiled=True).reshape(
-            -1, tokens.shape[-1])
-        received_ids = jax.lax.all_to_all(ids, EXPERT_AXIS, 0, 0, tiled=True).ravel()
-        permutation = jnp.argsort(received_ids)
-        groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
-        computed = project(received[permutation], groups, received_ids[permutation], parameters)[
-            jnp.argsort(permutation)]
-        computed = jnp.where((received_ids < per_shard)[:, None], computed, 0)
-        returned = jax.lax.all_to_all(computed.reshape(shards, first, -1),
-                                     EXPERT_AXIS, 0, 0, tiled=True)
-        # Every real slot has one writer across all rounds.
-        return returned, jnp.where(valid, order[addresses], slots)
-
-    returned, targets = exchange_round(0)
-    # A projection's rows may be wider or narrower than the tokens' (MoVA's values).
-    combined = jnp.zeros((slots, returned.shape[-1]), output_dtype).at[targets].set(
-        returned, mode='drop')
-    if capacity is None and slots > first:
-        rounds = -(-(slots - first) // first)
-        needed = jax.lax.pmax(jnp.max(-(-jnp.maximum(sizes - first, 0) // first)), EXPERT_AXIS)
-        later = jax.checkpoint(exchange_round)
-
-        def step(out: jax.Array, iteration: jax.Array) -> tuple[jax.Array, None]:
-            """Scan one later round into the output rows; the carry is
-            those rows. The scan's length is static, and the rounds past
-            `needed` keep the carry unchanged."""
-            def active(out: jax.Array) -> jax.Array:
-                returned, targets = later((iteration + 1) * first)
-                return out.at[targets].set(returned, mode='drop')
-            return jax.lax.cond(iteration < needed, active, lambda out: out, out), None
-
-        combined, _ = jax.lax.scan(step, combined, jnp.arange(rounds))
-    return combined.reshape(*indices.shape, combined.shape[-1])
+    send = tokens[rows]
+    if input_weights is not None:
+        send = send * input_weights.ravel()[order][:, None].astype(send.dtype)
+    # Every device's slots for every expert, `[sender, expert]` (a dropped slot's sentinel expert sorts last
+    # and is sent to no shard), its slots for every shard, `[sender, receiver]`, and where each run starts on
+    # its sender and lands on its receiver: after the runs every earlier device sends the same receiver.
+    counts = jax.lax.all_gather(jnp.bincount(experts, length=num_experts + 1)[:num_experts].astype(jnp.int32),
+                                EXPERT_AXIS, tiled=False)
+    table = counts.reshape(shards, shards, per_shard).sum(-1)
+    me = jax.lax.axis_index(EXPERT_AXIS)
+    sent_from = jnp.cumsum(table, axis=1) - table
+    landed_at = jnp.cumsum(table, axis=0) - table
+    received_from = table[:, me]
+    received = jax.lax.ragged_all_to_all(
+        send, jnp.zeros((shards * most, tokens.shape[-1]), send.dtype), sent_from[me], table[me],
+        landed_at[me], received_from, axis_name=EXPERT_AXIS)
+    # A received row's expert on this shard, each sender's run its experts' counts in order; the buffer past
+    # what arrived holds the sentinel.
+    mine = jax.lax.dynamic_slice_in_dim(counts, me * per_shard, per_shard, axis=1)
+    received_ids = jnp.repeat(jnp.tile(jnp.arange(per_shard, dtype=experts.dtype), shards), mine.ravel(),
+                              total_repeat_length=shards * most)
+    received_ids = jnp.where(jnp.arange(shards * most) < received_from.sum(), received_ids, per_shard)
+    permutation = jnp.argsort(received_ids)
+    groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
+    computed = project(received[permutation], groups, received_ids[permutation], parameters)[
+        jnp.argsort(permutation)]
+    computed = jnp.where((received_ids < per_shard)[:, None], computed, 0).astype(output_dtype)
+    # Each sender's rows back where it sent them from: this shard's runs, each where it landed here.
+    returned = jax.lax.ragged_all_to_all(
+        computed, jnp.zeros((slots, computed.shape[-1]), output_dtype), landed_at[:, me], received_from,
+        sent_from[:, me], table[me], axis_name=EXPERT_AXIS)
+    # The rows in slot order; a dropped slot's, sent nowhere, stays zero.
+    return returned[jnp.argsort(order)].reshape(*indices.shape, returned.shape[-1])
 
 
 def _widened[Tree](parameters: Tree) -> Tree:
     """Floating parameters at least fp32, so a cotangent summed across
-    devices or over the exchange's rounds is summed before its master dtype
-    rounds it."""
+    devices is summed before its master dtype rounds it."""
     def widen(leaf):
         if jnp.issubdtype(leaf.dtype, jnp.floating):
             return leaf.astype(at_least_fp32(leaf.dtype))

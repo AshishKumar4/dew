@@ -18,6 +18,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from data_support import LATEST
 from storage_support import moto_bucket
 from token_support import export_byte_tokens
 
@@ -60,7 +61,7 @@ def test_a_shard_replaced_under_its_exports_manifest_is_refused_where_it_is_read
 
         def rows(source):
             if read == "streamed":
-                manifest = source.manifest()
+                manifest = source.manifest(LATEST)
                 return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
             records = source.records("indexed")
             return [records[index]["id"] for index in range(len(records))]
@@ -99,7 +100,7 @@ def test_a_declared_line_file_replaced_under_its_facts_is_refused_where_it_is_re
     def rows():
         source = Files((root.url,), format="jsonl", index=index, file_info=facts)
         if read == "streamed":
-            manifest = source.manifest()
+            manifest = source.manifest(LATEST)
             return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
         records = source.records("indexed")
         return [records[position]["id"] for position in range(len(records))]
@@ -131,7 +132,7 @@ def test_a_declared_archive_replaced_under_its_facts_is_refused_where_it_is_read
 
     def rows():
         files = Files((root.url,), format="webdataset", file_info=facts)
-        return list(files.manifest().reader(files.manifest().shards[0]))
+        return list(files.manifest(LATEST).reader(files.manifest(LATEST).shards[0]))
 
     assert rows() == [{"__key__": "0", "txt": b"held"}]
     root.write(archive("swap"))
@@ -263,6 +264,42 @@ def test_a_declared_offset_index_replaced_under_its_facts_is_refused_where_it_is
         records[0]
 
 
+def test_a_declared_index_with_lengths_replaced_under_its_facts_is_refused_where_its_lengths_are_read():
+    """An index holding its records' lengths beside their offsets, read under facts its publisher declared,
+    gives its lengths as declared, and replaced by another valid index is refused (`Replaced`) where its
+    lengths are read, as where its offsets are (row 4144)."""
+    import numpy as np
+
+    def published(lengths: list[int]) -> tuple[Store, Store]:
+        rows = Store(f"memory://declared-lengths-{uuid4().hex}/rows.jsonl")
+        rows.write(b"".join(b'{"id":%d}\n' % length for length in lengths))
+        Files(rows.url).provision()
+        index = Store(rows.url.removesuffix(".jsonl") + ".index.npy")
+        offsets = np.load(io.BytesIO(index.read()), allow_pickle=False)
+        held = np.zeros(len(offsets), [*offsets.dtype.descr, ("length", "<u4")])
+        for name in offsets.dtype.names:
+            held[name] = offsets[name]
+        held["length"] = lengths
+        written = io.BytesIO()
+        np.save(written, held, allow_pickle=False)
+        index.write(written.getvalue())
+        return rows, index
+
+    def declared(lengths: list[int]):
+        root, index = published(lengths)
+        facts = {store.url: {"bytes": len(store.read()), "sha256": hashlib.sha256(store.read()).hexdigest()}
+                 for store in (root, index)}
+        return Files((root.url,), format="jsonl", index=index.url, file_info=facts), index
+
+    files, _ = declared([3, 5, 7])
+    assert files.lengths().tolist() == [3, 5, 7]
+    replaced, index = declared([3, 5, 7])
+    _, other = published([4, 4, 4])
+    index.write(other.read())
+    with pytest.raises(Replaced):
+        replaced.lengths()
+
+
 def test_an_indexed_reader_holds_the_declared_file_it_checked(tmp_path):
     """An indexed reader of a local file its publisher declared checks it once, as it first reads it, and
     reads every later record from the file it checked: a file put in its place since (a rename over it)
@@ -349,7 +386,7 @@ def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named
     # Its manifest read, none of its files yet, as a run's identity is taken before its reads.
     assert source.committed is not None
     branch["main"] = "1" * 40
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     assert [row["id"] for part in manifest.shards for row in manifest.reader(part)] == [0, 1]
 
 
@@ -359,7 +396,7 @@ def test_a_declaration_without_a_digest_or_a_version_is_refused_where_it_is_read
     root = Store(f"memory://undeclared-{uuid4().hex}/rows.jsonl")
     root.write(b'{"id":0}\n')
     source = Files((root.url,), format="jsonl", file_info={root.url: {"bytes": len(root.read())}})
-    manifest = source.manifest()
+    manifest = source.manifest(LATEST)
     with pytest.raises(ValueError):
         list(manifest.reader(manifest.shards[0]))
 
@@ -436,7 +473,7 @@ def test_an_http_line_file_read_on_its_published_etag_is_refused_once_replaced()
 
         def rows():
             source = Files((location,), format="jsonl", file_info=facts, storage_options=options)
-            manifest = source.manifest()
+            manifest = source.manifest(LATEST)
             return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
 
         assert rows() == [0, 1]
@@ -457,7 +494,7 @@ def test_a_version_only_array_record_shard_is_refused_where_its_reader_needs_its
         url = root.child(entry["path"]).url
         source = Files((url,), format="array_record", storage_options=options,
                        file_info={url: {"bytes": entry["bytes"], "stored": entry["stored"]}})
-        manifest = source.manifest()
+        manifest = source.manifest(LATEST)
         with pytest.raises(ValueError):
             list(manifest.reader(manifest.shards[0]))
 

@@ -97,6 +97,8 @@ class DecisionModel(HeadedModel):
         def applied(*args, **kwargs) -> tuple[jax.Array, Variables]:
             out = self.backbone.apply(backbone, *args, mutable=list(opened) or False, **kwargs)
             return out if opened else (out, {})
+        # The backbone's final states: its `hidden_states`, or a native encoder's own forward.
+        states_method = self.states_method
         laid = inputs.coordinates()
         # A row in blocks is read by the backbone's attention whole within each block, on the kinds
         # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
@@ -129,8 +131,8 @@ class DecisionModel(HeadedModel):
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)
                     kwargs["conditioning"] = {**held, **conditioning}
-                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked,
-                                            **stepped)
+                return getattr(module, states_method)(rows.tokens, train=train, coordinates=laid, **kwargs,
+                                                      **blocked, **stepped)
             states, sown = applied(inputs, media, rngs=rngs, method=read_media)
             return _array(states), spanned, sown
         if inputs.streams is not None:
@@ -140,13 +142,13 @@ class DecisionModel(HeadedModel):
             # Each token reads the streams its record says, as runs over its document's (`stream_runs`).
             runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
             states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
-                                   attention_key_positions=inputs.positions, method="hidden_states",
+                                   attention_key_positions=inputs.positions, method=states_method,
                                    conditioning=conditioning, rngs=rngs, **stepped)
             return _array(states), spanned, sown
         if inputs.slots is None:
             def read(module, tokens):
-                return module.hidden_states(tokens, train=train, coordinates=laid, conditioning=conditioning,
-                                            **blocked, **stepped)
+                return getattr(module, states_method)(tokens, train=train, coordinates=laid,
+                                                      conditioning=conditioning, **blocked, **stepped)
             states, sown = applied(inputs.tokens, rngs=rngs, method=read)
             return _array(states), spanned, sown
         if blocked:
@@ -156,7 +158,7 @@ class DecisionModel(HeadedModel):
         causal = isinstance(self.backbone, TokenModel) and self.backbone.causal
         runs = key_runs(inputs.slots, inputs.segments, inputs.options.shape[-1], causal=causal)
         states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
-                               attention_key_positions=inputs.positions, method="hidden_states",
+                               attention_key_positions=inputs.positions, method=states_method,
                                conditioning=conditioning, rngs=rngs, **stepped)
         return _array(states), spanned, sown
 
@@ -173,10 +175,21 @@ class DecisionModel(HeadedModel):
                         rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
                         opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
         """The option logits (`logits`), and what the row's pass sowed into the `opened` collections
-        (`dew.objectives.base.Step.sown`)."""
+        (`dew.objectives.base.Step.sown`): the backbone's, and the attention logit maxima (`qk`) of the
+        backbone and the head each under its own parameters' name, which each applies apart, so a
+        QK-Clip finds every layer's maxima where it finds its weights (row 1608)."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
                                            progress=progress, opened=opened)
         head = thaw(part(variables, "head"))
+        clipped = "qk" in opened
+        head_sown: dict = {}
+
+        def applied(*args, **kwargs) -> jax.Array:
+            if not clipped:
+                return _array(self.head.apply(head, *args, **kwargs))
+            out, held = self.head.apply(head, *args, mutable=["qk"], **kwargs)
+            head_sown.update(held)
+            return _array(out)
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
         # them. A head that pools none reads a question in its context through the cross-attention alone.
         spans = spanned if self.head.pools_spans else None
@@ -187,15 +200,16 @@ class DecisionModel(HeadedModel):
             # A head drawn from the vocabulary rows reads no table after its draw.
             table = None if self.head.draws_from_rows else self.output_table(variables)
             logits = _array(
-                self.head.apply(head, states, inputs, table, tied=tied, train=train, rngs=rngs)
+                applied(states, inputs, table, tied=tied, train=train, rngs=rngs)
                 if spans is None else
-                self.head.apply(head, states, inputs, table, tied=tied, spanned=spans, train=train,
-                                rngs=rngs))
+                applied(states, inputs, table, tied=tied, spanned=spans, train=train, rngs=rngs))
         else:
             table = self.table(variables) if self.head.reads_table else None
             logits = _array(
-                self.head.apply(head, states, inputs, table, train=train, rngs=rngs) if spans is None
-                else self.head.apply(head, states, inputs, table, spanned=spans, train=train, rngs=rngs))
+                applied(states, inputs, table, train=train, rngs=rngs) if spans is None
+                else applied(states, inputs, table, spanned=spans, train=train, rngs=rngs))
+        if clipped:
+            sown = {**sown, "qk": {"backbone": sown.get("qk", {}), "head": head_sown.get("qk", {})}}
         return jnp.where(inputs.options, logits, -jnp.inf), sown
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,

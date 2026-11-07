@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from sampling_gate import FALSE_RED
 
-from dew.telemetry.benchmark import benchmark
+from dew.telemetry.benchmark import CuptiHeld, behind, benchmark, device_time, eviction
 
 
 class Slow:
@@ -157,7 +157,58 @@ def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_n
     result = compared(slow, fast, pairs=64, warmup=1, level=1 - FALSE_RED / 2)
     low, _ = result.interval
     alone_low, alone_high = result.alone
-    assert alone_low <= 1.0 <= alone_high < low <= 4.0
+    assert alone_low <= 1.0 <= alone_high < low <= 4.0 and result.differs
+
+
+@pytest.mark.parametrize(("ratios", "alone", "level", "ratio", "interval", "noise", "differs"), [
+    # Six pairs at 0.95 hold their median between their least and greatest (rank 1). Every value a binary
+    # float holds exactly, so medians and ends are their literals.
+    ((1.3125, 1.28125, 1.296875, 1.34375, 1.265625, 1.328125),
+     (0.984375, 1.015625, 1.0, 1.03125, 0.96875, 1.0), 0.95, 1.3046875, (1.265625, 1.34375),
+     (0.96875, 1.03125), True),
+    # Ten pairs at 0.95 between their second least and second greatest (rank 2): the outlier at 0.96875 leaves
+    # the interval apart from 1.
+    ((1.09375, 1.125, 1.109375, 1.140625, 0.96875, 1.078125, 1.125, 1.09375, 1.109375, 1.15625),
+     (1.0, 0.984375, 1.015625, 1.0, 1.03125, 0.96875, 1.0, 1.015625, 0.984375, 1.0), 0.95, 1.109375,
+     (1.078125, 1.140625), (0.984375, 1.015625), True),
+    # The same ten at 0.99 (rank 1): the outlier holds 1, so nothing differs.
+    ((1.09375, 1.125, 1.109375, 1.140625, 0.96875, 1.078125, 1.125, 1.09375, 1.109375, 1.15625),
+     (1.0, 0.984375, 1.015625, 1.0, 1.03125, 0.96875, 1.0, 1.015625, 0.984375, 1.0), 0.99, 1.109375,
+     (0.96875, 1.15625), (0.96875, 1.03125), False),
+    # Apart from 1 but within the A/A's noise: the placement's own, not a difference.
+    ((1.03125, 1.046875, 1.0625, 1.03125, 1.078125, 1.046875),
+     (0.9375, 1.078125, 1.0, 0.96875, 1.03125, 1.015625), 0.95, 1.046875, (1.03125, 1.078125),
+     (0.9375, 1.078125), False),
+    # Holding 1, though apart from the A/A's: chance accounts for it.
+    ((0.984375, 1.015625, 1.03125, 1.046875, 1.0625, 1.03125),
+     (0.96875, 0.984375, 0.984375, 0.96875, 0.984375, 0.984375), 0.95, 1.03125, (0.984375, 1.0625),
+     (0.96875, 0.984375), False),
+    # Ties at the ends.
+    ((1.25,) * 6, (1.0,) * 6, 0.95, 1.25, (1.25, 1.25), (1.0, 1.0), True),
+])
+def test_paired_ratios_are_judged_against_their_a_a_by_one_rule(ratios, alone, level, ratio, interval,
+                                                                  noise, differs):
+    """`judged`, the one judgment `compared` and a timing window (tools/timing.py) read a time by: the paired
+    ratios' median, the interval their order statistics hold it in at `level` (`_median_rank`), the A/A's
+    interval beside it, and a difference only where the interval lies apart from 1 and outside the A/A's."""
+    from dew.telemetry.benchmark import judged
+
+    judgment = judged(ratios, alone, level=level)
+    assert (judgment.ratio, judgment.interval, judgment.alone, judgment.differs) == (
+        ratio, interval, noise, differs)
+
+
+def test_ratios_too_few_for_an_interval_at_their_level_are_refused_and_six_are_not():
+    """Five pairs hold their median at 0.9375 at most, so `judged` refuses them at 0.95, either side short
+    (the call's or the A/A's), as `_median_rank` does; six it judges."""
+    from dew.telemetry.benchmark import judged
+
+    six = (1.0, 1.1, 1.2, 1.3, 1.4, 1.5)
+    with pytest.raises(ValueError):
+        judged(six[:5], six)
+    with pytest.raises(ValueError):
+        judged(six, six[:5])
+    assert judged(six, six).interval == (1.0, 1.5)
 
 
 def test_a_medians_rank_holds_it_at_its_level_and_no_higher_rank_does():
@@ -224,3 +275,41 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
     assert {"VmRSS", "RssAnon", "RssFile", "VmHWM"} <= set(before)
     assert after["RssAnon"] > before["RssAnon"] + measured["size"] // 2
     assert after["VmHWM"] >= after["VmRSS"] >= after["RssAnon"]
+
+
+@pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
+def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however_it_ends(tmp_path):
+    """A session reads each kernel a call launched with its device time and refuses a call that launched
+    none, whose time would read as zero; a call timed behind an eviction in its program reads its own
+    kernels, the eviction's left out; the session detaches CUPTI however it ends, after a read or only a
+    refused one, so a profile capture after it records the call's kernels, and a read inside that capture
+    is refused as held. Leaving a session runs none of its calls again: an input deleted inside it stays
+    deleted."""
+    from dew.telemetry.profile import Profiler, program_kernels
+
+    def squared(a):
+        return a @ a
+    x = jnp.ones((1024, 1024))
+    matmul = jax.jit(squared)
+    used = jnp.ones((1024, 1024))
+    with pytest.raises(ZeroDivisionError), device_time() as device:
+        kernels = device.kernels(matmul, used)
+        assert kernels and all(kernel.milliseconds > 0 for kernel in kernels)
+        assert device.seconds(matmul, used) > 0
+        used.delete()
+        raise ZeroDivisionError
+    with device_time() as device:
+        with pytest.raises(ValueError):
+            device.kernels(lambda: None)
+        buffer = eviction()
+        evicting = {kernel.name for kernel in device.kernels(jax.jit(jnp.sum), buffer)}
+        # The eviction runs in the program its call is timed in, which the compiler keeps.
+        assert evicting & {kernel.name for kernel in device.kernels(jax.jit(behind(matmul)), buffer, (x,))}
+        timed = device.kernels(matmul, x, evicted=True)
+        assert timed and not evicting & {kernel.name for kernel in timed}
+    profiler = Profiler(tmp_path)
+    with profiler, device_time() as device:
+        jax.block_until_ready(matmul(x))
+        with pytest.raises(CuptiHeld):
+            device.kernels(matmul, x)
+    assert program_kernels(profiler.captures[-1], ["squared"])["squared"]

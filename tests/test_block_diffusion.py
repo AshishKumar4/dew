@@ -4,6 +4,9 @@ The full checkpoint contains sliding/full attention, routed experts, shared
 encoder/decoder weights, self-conditioning, and a vision tower. The committed
 Transformers generate trajectory uses matched random inputs, not an assumed
 identity between Torch and JAX seeds (tools/diffusion_gemma_reference.py).
+The canvas logits are held to transformers' own DiffusionGemmaForBlockDiffusion,
+run here in float32 and float64 over drawn prompts, canvases, previous logits
+and pixels (check 1, `assert_canvas_logits`).
 """
 
 import json
@@ -14,8 +17,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given
+from interop_support import transformers_arms
+from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
 from dew.batch import coordinates
@@ -47,6 +50,103 @@ def prefill(model, variables, prompt):
                        mutable=["cache"])[1]["cache"]
 
 
+CANVAS_SEEDS = 16
+"""Each canvas site's declared seeds, sized by `seeds_for` paired (armada, 11-06): 8 to 16, but the sliding
+window's 32 (`WINDOW_SEEDS`)."""
+WINDOW_SEEDS = 32
+SPECIAL = 3
+"""The fixtures' pad, end and start ids sit below it, and their image ids at 60 and above: a draw keeps
+each where the fixture's prompt holds it and draws every other position (`canvas_draw`)."""
+
+
+def transformers_model(directory: Path, canvas_length: int | None = None):
+    """transformers' DiffusionGemmaForBlockDiffusion of `directory` in float32 with eager attention and
+    experts (the grouped matmul has no float64 kernel): a whole checkpoint read by `from_pretrained`, or with
+    `canvas_length` a released-layout fixture (its text config and text weights alone), built as its
+    generator builds it (tools/diffusion_gemma_reference.py's `diffusion_gemma_model`) with its weights, every
+    tensor but the vision tower's read."""
+    import torch
+    from safetensors.torch import load_file as torch_load
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
+
+    from tools.diffusion_gemma_reference import diffusion_gemma_model
+
+    if canvas_length is None:
+        model = DiffusionGemmaForBlockDiffusion.from_pretrained(str(directory), dtype=torch.float32,
+                                                                local_files_only=True,
+                                                                experts_implementation="eager")
+    else:
+        model = diffusion_gemma_model(json.loads((directory / "config.json").read_text()), canvas_length)
+        loaded = model.load_state_dict(torch_load(str(directory / "model.safetensors")), strict=False)
+        assert not loaded.unexpected_keys and all("vision" in name for name in loaded.missing_keys), loaded
+        for module in model.modules():
+            if hasattr(module, "experts") and hasattr(module.experts, "config"):
+                module.experts.config._experts_implementation = "eager"
+    model.set_attn_implementation("eager")
+    return model.float().eval()
+
+
+def canvas_draw(prompt: np.ndarray, canvas: np.ndarray, vocab: int, *, previous: bool = False,
+                pixels: np.ndarray | None = None):
+    """A seed's prompt and canvas of the fixture's, each ordinary id drawn and each structural one (the
+    start id, an image's markers: below SPECIAL or from 60) kept where the fixture holds it; the previous
+    logits normal where `previous`, and pixels uniform in [0, 1) of `pixels`' shape where given."""
+    def ordinary(rng, ids):
+        drawn = rng.integers(SPECIAL, 60, ids.shape)
+        return np.where((ids < SPECIAL) | (ids >= 60), ids, drawn).astype(np.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng([2219, prompt.size, canvas.size, seed])
+        drawn = [ordinary(rng, prompt), ordinary(rng, canvas)]
+        if previous:
+            drawn.append(rng.standard_normal((*canvas.shape, vocab)).astype(np.float32))
+        if pixels is not None:
+            drawn.append(rng.uniform(size=pixels.shape).astype(np.float32))
+        return tuple(drawn)
+    return draw
+
+
+def transformers_canvas(network, prompt, canvas, *rest):
+    """transformers' canvas logits after `prompt`, self-conditioned on the previous logits where given, or
+    with the prompt's images where pixels are (the reference's patches and their positions)."""
+    from tools.diffusion_gemma_reference import media_inputs
+
+    fields = {}
+    if rest and rest[0].ndim == 3:
+        fields["self_conditioning_logits"] = rest[0].to(next(network.parameters()).dtype)
+    elif rest:
+        fields = media_inputs(rest[0].to(next(network.parameters()).dtype))
+    return {"logits": network(input_ids=prompt, decoder_input_ids=canvas, **fields).logits}
+
+
+def dew_canvas(model, variables):
+    """Dew's canvas logits after a drawn prompt, as `transformers_canvas` takes them."""
+    def canvas_of(prompt, canvas, *rest):
+        if rest and rest[0].ndim == 3:
+            cache = prefill(model, variables, prompt)
+            return model.apply({**variables, "cache": cache}, canvas, self_conditioning_logits=rest[0])
+        if rest:
+            inputs = ModelInputs(prompt, {"image_indices": jnp.where(prompt == 60, 0, -1)},
+                                 {"pixel_values": rest[0]})
+            cache = model.apply(variables, prompt.shape[0], method=model.init_cache,
+                                mutable=["cache"])[1]["cache"]
+            cache = model.apply({**variables, "cache": cache}, inputs,
+                                method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
+                                mutable=["cache"])[1]["cache"]
+            return model.apply({**variables, "cache": cache}, canvas)
+        return model.apply({**variables, "cache": prefill(model, variables, prompt)}, canvas)
+
+    # Eager: the cache's prefill reads its prompt on the host (`TokenEmbedding`'s padding).
+    return as_given(lambda *inputs: {"logits": canvas_of(*map(jnp.asarray, inputs))})
+
+
+def assert_canvas_logits(model, variables, network, draw, label: str, seeds: int = CANVAS_SEEDS) -> None:
+    """Dew's canvas logits (`dew_canvas`) as exact as transformers' float32 run of `network` against its
+    float64 run over `seeds` draws (check 1)."""
+    reference, truth = transformers_arms(network, transformers_canvas)
+    assert_as_exact(dew_canvas(model, variables), reference, draw, label, seeds=seeds, truth_fn=truth)
+
+
 def test_diffusion_gemma_deferred_translation_materializes_the_same_model(system):
     """Text checkpoint leaves stay deferred until placement asks for their arrays, while their
     materialized tree retains the eager decoder's parameter values."""
@@ -76,25 +176,22 @@ def test_diffusion_gemma_export_reads_only_the_requested_decoder_tensor(system):
 
 
 def test_native_shared_model_forward_matches_reference(system):
-    """Bare and self-conditioned canvas logits, held to twice the fp32
-    reference's own distance from its float64 run (tests/reference_error.py).
-    Observed RMS: bare 3.5e-07 against the reference's 3.3e-07, conditioned
-    3.5e-07 against 3.7e-07.
-
-    Five prompt tokens exceed the four-token local window. Every canvas query
-    reads the same last three prefix keys and all four canvas keys; the old
-    query-relative mask changes these logits.
-    """
+    """Bare and self-conditioned canvas logits after drawn prompts of five
+    tokens, held to transformers' own (`assert_canvas_logits`). Five prompt
+    tokens exceed the four-token local window: every canvas query reads the
+    same last three prefix keys and all four canvas keys, where the old
+    query-relative mask changes these logits. A canvas step leaves the
+    prompt's cache as it was."""
     model, variables, _, reference, _ = system
+    network = transformers_model(WORKFLOW)
+    for previous in (False, True):
+        assert_canvas_logits(model, variables, network, canvas_draw(
+            reference["prompt"], reference["canvas"], 64, previous=previous),
+            "conditioned" if previous else "bare")
     cache = prefill(model, variables, reference["prompt"])
     before = jax.tree.map(np.asarray, cache)
-    bare = model.apply({**variables, "cache": cache}, reference["canvas"])
-    conditioned = model.apply({**variables, "cache": cache}, reference["canvas"],
-                              self_conditioning_logits=reference["previous"])
-    assert_as_exact_as_the_reference(bare, reference["bare"], reference["bare_f64"], "bare")
-    assert_as_exact_as_the_reference(conditioned, reference["conditioned"],
-                                     reference["conditioned_f64"], "conditioned")
-    np.testing.assert_array_equal(jnp.argmax(conditioned, -1), reference["conditioned"].argmax(-1))
+    model.apply({**variables, "cache": cache}, reference["canvas"],
+                self_conditioning_logits=reference["previous"])
     for expected, actual in zip(jax.tree.leaves(before), jax.tree.leaves(cache), strict=True):
         np.testing.assert_array_equal(actual, expected)
 
@@ -230,67 +327,55 @@ def test_zero_tokens_does_not_prefill_and_capacity_uses_whole_canvases(system):
         process.generate(small, variables, inputs, 6, key=jax.random.key(11))
 
 
+def released_fixture(name: str, canvas_length: int):
+    """A released-layout fixture of tools/hf_reference.py read by Dew's wrapper translation, and by
+    transformers (`transformers_model`)."""
+    directory = FIXTURES / name
+    config = {"model_type": "diffusion_gemma", "canvas_length": canvas_length,
+              "text_config": json.loads((directory / "config.json").read_text())}
+    model = adapter.build(config, dtype="float32", attention_impl="xla")
+    variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
+    return directory, model, variables, transformers_model(directory, canvas_length)
+
+
 def test_the_released_layout_denoiser_matches_the_reference():
     """tools/hf_reference.py's diffusion-gemma-denoise-tiny: the released
     checkpoint layout (text weights under both the encoder and the decoder
     prefix, a separate head, two full layers with routed experts), read
-    through the public wrapper translation. One prompt of four, one canvas of
-    four, bare and self-conditioned, each held to twice the fp32 reference's
-    distance from float64: observed RMS bare 4.4e-08 against 4.3e-08,
-    conditioned 5.2e-08 against 6.0e-08."""
-    directory = FIXTURES / "diffusion-gemma-denoise-tiny"
-    config = {"model_type": "diffusion_gemma", "canvas_length": 4,
-              "text_config": json.loads((directory / "config.json").read_text())}
-    model = adapter.build(config, dtype="float32", attention_impl="xla")
-    variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
-    cache = prefill(model, variables, np.load(directory / "prompt.npy"))
-    canvas = np.load(directory / "canvas.npy")
-    with np.load(directory / "numerics.npz") as exact:
-        for name, previous in (
-            ("ref_bare", None),
-            ("ref_conditioned", np.load(directory / "prev_logits.npy")),
-        ):
-            logits = model.apply({**variables, "cache": cache}, canvas, self_conditioning_logits=previous)
-            reference = np.load(directory / f"{name}.npy")
-            assert_as_exact_as_the_reference(logits, reference, exact[f"{name}_f64"], name)
-            np.testing.assert_array_equal(np.argmax(logits, -1), reference.argmax(-1))
+    through the public wrapper translation. Prompts of four and canvases of
+    four, bare and self-conditioned, held to transformers' own
+    (`assert_canvas_logits`)."""
+    directory, model, variables, network = released_fixture("diffusion-gemma-denoise-tiny", 4)
+    prompt, canvas = np.load(directory / "prompt.npy"), np.load(directory / "canvas.npy")
+    for previous in (False, True):
+        assert_canvas_logits(model, variables, network, canvas_draw(prompt, canvas, 64, previous=previous),
+                             "released conditioned" if previous else "released bare")
 
 
 def test_a_sliding_denoiser_reads_its_whole_canvas_past_its_window():
     """tools/hf_reference.py's diffusion-gemma-window-tiny: a sliding layer
-    of window 4 under a prompt of 6 and a canvas of 6. The decoder's sliding
+    of window 4 under prompts of 6 and canvases of 6. The decoder's sliding
     layer reads the last 3 cached prompt keys and every canvas key
-    (modeling_diffusion_gemma.py:1399-1401), held to twice the fp32
-    reference's distance from float64."""
-    directory = FIXTURES / "diffusion-gemma-window-tiny"
-    config = {"model_type": "diffusion_gemma", "canvas_length": 6,
-              "text_config": json.loads((directory / "config.json").read_text())}
-    model = adapter.build(config, dtype="float32", attention_impl="xla")
-    variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
-    cache = prefill(model, variables, np.load(directory / "prompt.npy"))
-    logits = model.apply({**variables, "cache": cache}, np.load(directory / "canvas.npy"))
-    reference = np.load(directory / "logits.npy")
-    assert_as_exact_as_the_reference(logits, reference, np.load(directory / "logits_f64.npy"),
-                                     "windowed canvas")
-    np.testing.assert_array_equal(np.argmax(logits, -1), reference.argmax(-1))
+    (modeling_diffusion_gemma.py:1399-1401), held to transformers' own
+    (`assert_canvas_logits`)."""
+    directory, model, variables, network = released_fixture("diffusion-gemma-window-tiny", 6)
+    assert_canvas_logits(model, variables, network, canvas_draw(
+        np.load(directory / "prompt.npy"), np.load(directory / "canvas.npy"), 64), "windowed canvas",
+        seeds=WINDOW_SEEDS)
 
 
 def test_media_prefill_and_canvas_generation_match_reference(system):
-    """Complete image-conditioned forward, held to twice the fp32 reference's
-    distance from float64: observed RMS 3.3e-07 against the reference's 2.9e-07."""
+    """The complete image-conditioned forward over drawn pixels and canvases,
+    the vision tower included, held to transformers' own
+    (`assert_canvas_logits`); and the image-conditioned generation, the
+    reference's tokens and steps."""
     model, variables, process, reference, _ = system
+    assert_canvas_logits(model, variables, transformers_model(WORKFLOW), canvas_draw(
+        reference["image_prompt"], reference["canvas"], 64, pixels=reference["pixels"]), "image")
     inputs = ModelInputs(
         jnp.asarray(reference["image_prompt"]),
         {"image_indices": jnp.where(reference["image_prompt"] == 60, 0, -1)},
         {"pixel_values": jnp.asarray(reference["pixels"])})
-    cache = model.apply(variables, 2, method=model.init_cache, mutable=["cache"])[1]["cache"]
-    cache = model.apply(
-        {**variables, "cache": cache}, inputs,
-        method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
-        mutable=["cache"])[1]["cache"]
-    logits = model.apply({**variables, "cache": cache}, reference["canvas"])
-    assert_as_exact_as_the_reference(logits, reference["image_logits"],
-                                     reference["image_logits_f64"], "image")
     generated = process.generate(model, variables, inputs, 7, key=jax.random.key(11))
     np.testing.assert_array_equal(generated.tokens, reference["image_tokens"][:, :12])
     np.testing.assert_array_equal(generated.decoder_steps, reference["image_steps"])

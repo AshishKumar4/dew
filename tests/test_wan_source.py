@@ -1,4 +1,4 @@
-"""Native Wan 2.1 against the actual Diffusers 0.34.0 objects it reconstructs.
+"""Native Wan 2.1 against the actual Diffusers objects it reconstructs, at the release the test extra pins.
 
 `tools/diffusers_wan_reference.py` builds tiny `WanTransformer3DModel`
 instances with every parameter moved off its initialization, saves each with
@@ -305,26 +305,28 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
 
     # Diffusers' own classes read the export: every component cleanly, the
     # pipeline whole, and its transformer recomputes the trained flow.
-    from one_draw import assert_as_exact_as_the_reference
+    from diffusion_support import assert_export_recomputes
 
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
     config = json.loads((export / "transformer" / "config.json").read_text())
-    rng = np.random.default_rng(7)
-    latents = rng.standard_normal((1, 2, 4, 6, config["in_channels"])).astype(np.float32)
-    context = rng.standard_normal((1, 5, config["text_dim"])).astype(np.float32)
     times = np.asarray([500.0], np.float32)
-    trained = pipeline.model.apply({"params": state.variables["params"]}, jnp.asarray(latents),
-                                   jnp.asarray(times), DenoisingCondition(jnp.asarray(context)))
+    forward = jax.jit(lambda latents, context: pipeline.model.apply(
+        {"params": state.variables["params"]}, latents, jnp.asarray(times), DenoisingCondition(context)))
 
-    def call(model, tensor):
+    def draw(seed):
+        """A latent video and a prompt's context of the transformer's widths, their values drawn."""
+        rng = np.random.default_rng([7, seed])
+        return (rng.standard_normal((1, 2, 4, 6, config["in_channels"])).astype(np.float32),
+                rng.standard_normal((1, 5, config["text_dim"])).astype(np.float32))
+
+    def call(model, tensor, latents, context):
         output = model(hidden_states=tensor(np.moveaxis(latents, -1, 1)), timestep=tensor(times),
                        encoder_hidden_states=tensor(context)).sample
         return channels_last(output.numpy())
 
-    assert_as_exact_as_the_reference(np.asarray(trained), consumer.denoiser_prediction(export, call),
-                                     consumer.denoiser_prediction(export, call, wide=True), "trained Wan")
+    assert_export_recomputes(export, forward, call, draw, "trained Wan")
 
 
 def test_an_unchanged_sample_cannot_exceed_its_sources_measured_float64_error():

@@ -41,8 +41,8 @@ thresh's annotations), each the input of the files that read it alone; any other
 environment, a cache) is none."""
 READS = {"open", "os.listdir", "os.scandir"}
 LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
-"""The cgroup files that set a process's execution limits, by the input a run that read one keys: host.py's
-`LIMITS`, which this module cannot import (it runs inside every test process, before the checkout's tools)."""
+"""The cgroup files that set a process's execution limits, by the input a run that read one keys, which host.py's
+`limit` reads the binding value of."""
 """Audit events of a read: a file opened, a directory listed."""
 IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
 """The import system's frozen modules, which list the directories it imports from and read the modules it
@@ -101,7 +101,7 @@ def code_unit(code: types.CodeType, root: str) -> str:
     whose text the module's top level holds."""
     name = code.co_filename[len(root):]
     if Path(name).name.startswith("test_") or Path(name).name == "conftest.py":
-        return name
+        return f"{name}{CODE}{WHOLE}"
     unit = code.co_qualname.split(".<locals>", 1)[0]
     body = not code.co_flags & OPTIMIZED
     return f"{name}{CODE}{TOP if body or unit.split('.')[-1].startswith('<') else unit}"
@@ -165,6 +165,8 @@ def read(event: str, args: tuple, root: str) -> str | None:
             isinstance(loader.f_back.f_locals.get("self"), importlib.machinery.SourceFileLoader)
         if compiling and loader.f_code.co_filename == "<frozen importlib._bootstrap_external>":
             return None
+        if rewriting():
+            return None
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
     name = os.path.abspath(os.fsdecode(path if path is not None else "."))
@@ -210,9 +212,21 @@ OPTIMIZED = 0x1
 body lacks: the child imports no more of the standard library than it must."""
 TOP = "<module>"
 """The unit of a module's top level: all its text but its functions' bodies (ci.py's `units`)."""
-IMPORTED = "import:"
-"""What a top-level module a run imported is recorded under (executed.py): a helper of that name under
-tests/, which leads sys.path, would shadow it, so ci.py's `contents` keys whether tests/ holds one."""
+WHOLE = "<file>"
+"""The unit of a test file or a conftest a run executed: its code whole, no comment, docstring or position
+of it (ci.py's `code_of`), as the run's tests are all of it; a read of its text, an `inspect` or a
+traceback's, is its bytes'."""
+LOOKUP = "lookup:"
+"""What an import's search of a checkout directory for a name is recorded under (`missed`), the directory
+and the name: ci.py's `contents` keys the entries there an import of the name finds (a module, a package, an
+extension), so the name's arrival reruns the run whose import of it failed, and no other name's does."""
+
+
+def shadowing(name: str) -> str:
+    """What module `name`, which a run imported, is recorded under: the lookup of its top-level name in
+    tests/ (`LOOKUP`), which leads sys.path, so a helper of that name arriving there, which would shadow it,
+    reruns the run (ci.py's `looked_up`), and one of another name does not."""
+    return f"{LOOKUP}tests/{name.partition('.')[0]}"
 
 
 def opening(recorded: Callable[[str], None], root: str) -> None:
@@ -240,6 +254,24 @@ def opening(recorded: Callable[[str], None], root: str) -> None:
         return descriptor
 
     os.open = opened
+
+
+REWRITER = f"{os.sep}_pytest{os.sep}assertion{os.sep}rewrite.py"
+"""pytest's assertion rewriter, which reads a test file's or a conftest's text to compile it: an import's
+read, whose record is the code it ran (`code_unit`)."""
+
+
+def rewriting() -> bool:
+    """Whether the open being audited is pytest's assertion rewriter's read of a module's text on its way to
+    compiling it (`REWRITER`), within the few frames between the audit hook and its `_rewrite_test`."""
+    frame = sys._getframe(2)
+    for _ in range(8):
+        if frame is None:
+            return False
+        if frame.f_code.co_filename.endswith(REWRITER) and frame.f_code.co_name == "_rewrite_test":
+            return True
+        frame = frame.f_back
+    return False
 
 
 def listing_tool(name: str) -> bool:
@@ -367,15 +399,34 @@ def closed_imports(seen: set[str], root: str):
 
 def imports(write: Callable[[str], None]):
     """The import system's first finder that passes each module imported by name, a statement's or
-    `importlib.import_module`'s, to `write` as the top-level name a helper under tests/ would shadow
-    (`IMPORTED`); it finds nothing itself."""
+    `importlib.import_module`'s, to `write` as the lookup a helper under tests/ would shadow it at
+    (`shadowing`); it finds nothing itself."""
 
     class Imports:
         @staticmethod
         def find_spec(name, path=None, target=None):
-            write(f"{IMPORTED}{name.partition('.')[0]}")
+            write(shadowing(name))
 
     return Imports
+
+
+def missed(write: Callable[[str], None], root: str):
+    """The import system's last finder, which an import reaches only where every other finder found nothing:
+    it passes each checkout directory the import searched for the name, with the name (`LOOKUP`), to `write`,
+    a package's path, or sys.path for a top-level name; it finds nothing itself. An import that fails, or that
+    a later finder answers, is then its run's input: a module of that name arriving there reruns it (an
+    optional import that now succeeds), and a module of another name does not."""
+
+    class Missed:
+        @staticmethod
+        def find_spec(name, path=None, target=None):
+            leaf = name.rpartition(".")[2]
+            for entry in path if path is not None else sys.path:
+                if isinstance(entry, str) and (looked := placed(
+                        os.path.abspath(os.path.join(entry or os.curdir, leaf)), root)) is not None:
+                    write(f"{LOOKUP}{looked}")
+
+    return Missed
 
 
 def follow() -> None:
@@ -409,7 +460,7 @@ def follow() -> None:
     write("inherited", int(os.environ.get(FRACTION, "") == os.environ.get("DEW_EXECUTED_SHARE", "")))
     write("began", time.time())
     for name in list(sys.modules):
-        write("file", f"{IMPORTED}{name.partition('.')[0]}")
+        write("file", shadowing(name))
 
     def started(code, offset):
         if code.co_name == OPENED[0] and code.co_filename.endswith(OPENED[1]):
@@ -457,6 +508,7 @@ def follow() -> None:
         write("unfollowed", 1)
         return
     sys.meta_path.insert(0, imports(lambda item: write("file", item)))
+    sys.meta_path.append(missed(lambda item: write("file", item), root))
     opening(lambda item: write("file", item), root)
     sys.monitoring.use_tool_id(FOLLOWER_TOOL, FOLLOWER)
     sys.monitoring.register_callback(FOLLOWER_TOOL, sys.monitoring.events.PY_START, started)

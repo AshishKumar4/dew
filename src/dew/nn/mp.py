@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
+from jax.typing import DTypeLike
 
 from dew.nn.activations import silu
 from dew.nn.conv import convolution
@@ -44,7 +45,10 @@ def normalize(x: jax.Array, axes: Sequence[int] | None = None, eps: float = 1e-4
 
     `axes` defaults to all but the last, which normalizes each output channel
     of a kernel, or each feature vector. `compensated` sums the squares with
-    `compensated_sum`, as a kernel's initialization does (`drawn_kernel`).
+    `compensated_sum`, as every kernel's normalization does (`drawn_kernel`,
+    `MPConv`, `forced_weight_normalization`): over a kernel's fan-in a plain
+    float32 sum left the kernels EDM2 trains 1.5 times as far from float64 as
+    EDM2's own (tests/test_edm2.py).
     """
     axes = tuple(range(x.ndim - 1)) if axes is None else tuple(axes)
     count = math.prod(x.shape[axis] for axis in axes)
@@ -145,15 +149,18 @@ class MPConv(nn.Module):
         return conv_flops(lengths, input_features, self.features, math.prod(self.kernel_size))
 
     @nn.compact
-    def __call__(self, x: jax.Array, gain: jax.Array | float = 1.0) -> jax.Array:
+    def __call__(self, x: jax.Array, gain: jax.Array | float = 1.0,
+                 out_dtype: DTypeLike | None = None) -> jax.Array:
+        """`x` through the normalized kernel, multiplied in `x`'s dtype and summed and returned in `out_dtype`
+        (a model's output head's `output_dtype`), `x`'s where None."""
         shape = (*self.kernel_size, x.shape[-1], self.features)
         weight = self.param(MP_KERNEL, lambda key: drawn_kernel(key, shape))
-        weight = normalize(weight.astype(at_least_fp32(x.dtype)))
+        weight = normalize(weight.astype(at_least_fp32(x.dtype)), compensated=True)
         weight = weight * (gain / math.sqrt(math.prod(shape[:-1])))
         weight = weight.astype(x.dtype)
         if not self.kernel_size:
-            return float32_matmul(x, weight)
-        return convolution(x, weight, [(size // 2, size // 2) for size in self.kernel_size])
+            return float32_matmul(x, weight, preferred_element_type=out_dtype)
+        return convolution(x, weight, [(size // 2, size // 2) for size in self.kernel_size], out_dtype)
 
 
 class Uncertainty(nn.Module):
@@ -188,7 +195,7 @@ def forced_weight_normalization() -> optax.GradientTransformation:
             last = path[-1]
             if not (isinstance(last, jax.tree_util.DictKey) and last.key == MP_KERNEL):
                 return change
-            return (normalize(value + change) - value).astype(change.dtype)
+            return (normalize(value + change, compensated=True) - value).astype(change.dtype)
 
         return jax.tree_util.tree_map_with_path(project, updates, params), state
 

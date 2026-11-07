@@ -28,7 +28,6 @@ import io
 import json
 import subprocess
 import sys
-import tarfile
 import tempfile
 from pathlib import Path
 
@@ -45,26 +44,18 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     of the writer's; a binary file, which a later main reads as it was written, is kept as it is."""
     import fixture_archive
 
+    def placed(member: str, data: bytes) -> bytes:
+        try:
+            text = data.decode()
+        except UnicodeDecodeError:
+            return data
+        # The longest place first, so a checkout within a scratch directory is read whole.
+        for place in sorted(places, key=len, reverse=True):
+            text = text.replace(place, places[place])
+        return text.encode()
+
     packed = io.BytesIO()
-    with tarfile.open(fileobj=packed, mode="w:xz", preset=fixture_archive.PRESET) as archive:
-        for path in sorted([run, *run.rglob("*")]):
-            info = fixture_archive.anonymous(tarfile.TarInfo((Path(name) / path.relative_to(run)).as_posix()))
-            if path.is_dir():
-                info.type, info.mode = tarfile.DIRTYPE, 0o755
-                archive.addfile(info)
-                continue
-            data = path.read_bytes()
-            try:
-                text = data.decode()
-            except UnicodeDecodeError:
-                text = None
-            if text is not None:
-                # The longest place first, so a checkout within a scratch directory is read whole.
-                for place in sorted(places, key=len, reverse=True):
-                    text = text.replace(place, places[place])
-                data = text.encode()
-            info.size, info.mode = len(data), 0o644
-            archive.addfile(info, io.BytesIO(data))
+    fixture_archive.write(packed, [(run, name)], cleaning=placed, modes=(0o755, 0o644))
     return packed.getvalue()
 
 
@@ -79,7 +70,8 @@ def evidence(run, state, directory: Path) -> dict:
     (tests/test_saved_runs.py): its parameters' dtypes, its compute's as its run states it, the dtypes
     one request of the task loaded from it multiplies in (`computed`), its dynamic loss scale and the
     finite steps it counted, the examples it consumed, its last step, and the rung its step compiled at,
-    the remat and the plan it was admitted under (`StepCompiled`) but the plan's probes and kernels."""
+    the remat and the plan it was admitted under (`StepCompiled`) but what the plan measured: its probes,
+    kernels and rewrites' reports, which time what they ran."""
     import jax
     from saved_run_kinds import computed
 
@@ -97,7 +89,7 @@ def evidence(run, state, directory: Path) -> dict:
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),
             "consumed": None if state.consumed is None else int(state.consumed), "remat": compiled["remat"],
             "plan": {name: value for name, value in plan.items()
-                     if name not in ("kernels", "probes", "derived")}}
+                     if name not in ("kernels", "probes", "derived", "rewrites")}}
 
 
 def main() -> None:
@@ -110,16 +102,24 @@ def main() -> None:
     configure_lane(os.environ)
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout the corpus is written into")
+    parser.add_argument("--kinds", nargs="+", help="the kinds to record (every kind the corpus saves by "
+                        "default): a kind new to the corpus recorded at the commit that adds it")
     args = parser.parse_args()
 
     import numpy as np
     from fetched_fixtures import save
     from saved_run_kinds import SAVED_KINDS
 
+    kinds = sorted(SAVED_KINDS) if args.kinds is None else args.kinds
+    unknown = sorted(set(kinds) - set(SAVED_KINDS))
+    if unknown:
+        parser.error(f"no saved kind named {', '.join(unknown)}; the corpus saves "
+                     f"{', '.join(sorted(SAVED_KINDS))}")
     commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], check=True, capture_output=True,
                             text=True).stdout.strip()
     written = Path(CORPUS) / commit[:12]
-    for kind, build in SAVED_KINDS.items():
+    for kind in kinds:
+        build = SAVED_KINDS[kind]
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             # The run keeps its last step alone: a later main pins and resumes from the latest. Its own
@@ -141,7 +141,7 @@ def main() -> None:
             save(written / f"{kind}.npz", {"run": np.frombuffer(packed, np.uint8)},
                  reference=f"Dew {commit[:12]}, tools/saved_runs_reference.py", license="MIT", root=args.root)
             (args.root / written / f"{kind}.evidence.json").write_text(json.dumps(seen, indent=1) + "\n")
-    source = {"commit": commit, "kinds": sorted(SAVED_KINDS), "evidence": EVIDENCE}
+    source = {"commit": commit, "kinds": sorted(kinds), "evidence": EVIDENCE}
     (args.root / written / "source.json").write_text(json.dumps(source, indent=1) + "\n")
 
 

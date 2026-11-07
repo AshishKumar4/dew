@@ -41,8 +41,16 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
-from dew.nn.derivatives import Protected, bound_span, surrogate
+from dew.nn.derivatives import (
+    Protected,
+    bound_span,
+    contracted,
+    declared_derivative,
+    declared_tangent,
+    surrogate,
+)
 from dew.nn.nested import nested
+from dew.nn.programs import equations
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -60,8 +68,8 @@ __all__ = [
     "activation_and_slope",
     "added_to",
     "asks_default_precision",
-    "at_default_precision",
     "at_least_fp32",
+    "at_precision",
     "bf16_dot_general",
     "bf16_einsum",
     "bf16_logits",
@@ -77,7 +85,9 @@ __all__ = [
     "configured_precision",
     "correctly_rounded_divide",
     "divided",
+    "effective_precision",
     "exact_float32",
+    "exact_products",
     "float32_dot_general",
     "float32_einsum",
     "float32_matmul",
@@ -85,6 +95,7 @@ __all__ = [
     "fp32_result_dot_general",
     "head_dot_general",
     "head_product",
+    "iteration_dtype",
     "l2norm",
     "numerics_of",
     "operand_precision",
@@ -95,6 +106,7 @@ __all__ = [
     "rms_weighted",
     "rounded_operand",
     "rounded_to",
+    "rounds_products",
     "rounds_to_bf16",
     "running_sum",
     "running_total",
@@ -234,47 +246,22 @@ def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple
     return spread_value.astype(value.dtype if dtype is None else dtype)
 
 
-def _doubled(value: jax.Array, shape: tuple[int, ...], axes: tuple[int, ...]) -> jax.Array:
-    """`value` broadcast to `shape` over its size-one `axes` by doubling: along each axis each entry is
-    paired with itself until the axis is covered, then cut to it, so JAX's transpose at any order sums a
-    cotangent over that axis pairwise, neighbours added level by level, and a cotangent split into
-    blocks over devices adds within each until a block is one entry. The broadcast's transpose is
-    XLA's reduction, which a CPU sums in an order up to twice torch's error at a few hundred rows of
-    16 channels (ledger 1698's Z-Image bias); the pairs' tree is under torch's at every size measured,
-    in the reduction's time."""
-    for axis in axes:
-        count = shape[axis]
-        while value.shape[axis] < count:
-            paired = jnp.stack([value, value], axis=axis + 1)
-            # The doubled axis keeps the value's placement, an Explicit axis's on a size-one one among it.
-            doubled = (*value.shape[:axis], 2 * value.shape[axis], *value.shape[axis + 1:])
-            value = jax.lax.reshape(paired, doubled, out_sharding=explicit_spec(value))
-        value = jax.lax.slice_in_dim(value, 0, count, axis=axis)
-    return value
-
-
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
     value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
     tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
-    broadcast is the outer product of ones and the value, whose transpose is a product. Elsewhere,
-    or where `accumulated` leaves a product its own sum, a CPU spreads a floating value by doubling
-    (`_doubled`), so its transpose sums pairwise in the value's dtype, and an accelerator broadcasts
-    it, whose transpose JAX sums in the value's dtype. A value an Explicit axis places along an axis it
-    spreads over (never a bias, whose leading axes `biased` adds) is broadcast: neither form keeps that
-    placement on a dropped or doubled size-one axis."""
+    broadcast is the outer product of ones and the value, whose transpose is a product. Everywhere
+    else, and where `accumulated` leaves a product its own sum (`FP32_SUMS`, a quantized model's
+    trace), it is the broadcast, whose transpose JAX sums in the value's dtype, as a user's process
+    sums it on every platform (ledger 3197). A value an Explicit axis places along an axis it spreads
+    over (never a bias, whose leading axes `biased` adds) is broadcast: the outer product does not keep
+    that placement on a dropped size-one axis."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
     placed = explicit_spec(value)
-    if not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes)):
+    if (not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes))
+            or not _sums_in_float64(value)):
         return jnp.broadcast_to(value, shape)
-    if not _sums_in_float64(value):
-        if not jnp.issubdtype(value.dtype, jnp.floating):
-            return jnp.broadcast_to(value, shape)
-        # A CPU sums the transpose pairwise (`_doubled`); an accelerator's reduction is a tree already.
-        return jax.lax.platform_dependent(
-            value, cpu=functools.partial(_doubled, shape=tuple(shape), axes=axes),
-            default=functools.partial(jnp.broadcast_to, shape=tuple(shape)))
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
@@ -320,10 +307,55 @@ def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool
     """Whether `precision` asks for no more than the default. With
     `configured`, an unset precision reads `jax_default_matmul_precision`,
     the default a product without one gets."""
-    names = precision_names(precision)
-    if not names and configured:
-        names = precision_names(jax.config.jax_default_matmul_precision)
-    return names <= {'DEFAULT'}
+    return precision_names(effective_precision(precision) if configured else precision) <= {'DEFAULT'}
+
+
+def effective_precision(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
+    """The precision a product multiplies at, resolved once: the one it states, else the run's configured
+    one (`jax_default_matmul_precision`, a run's `Numerics.matmul`, `generation.run_precision`), which a
+    route takes as the call's declaration, honouring it or handing the call to a route that does, never
+    replacing it with a backend's own arithmetic."""
+    return precision if precision_names(precision) else jax.config.jax_default_matmul_precision
+
+
+def rounds_products() -> bool:
+    """Whether the run's declaration lets a native route round an fp32 product's operands (TF32, or bf16
+    parts): its fast forms (`Numerics.forms`) at a configured precision of no more than the default
+    (`asks_default_precision`); a run at 'highest' or a dot algorithm keeps them whole whatever its forms."""
+    from dew.nn.kernels.generation import numerics
+
+    return numerics().forms == "fast" and asks_default_precision(None, configured=True)
+
+
+def iteration_dtype() -> jnp.dtype:
+    """The dtype an optimizer's matrix iteration (Muon's and M3's Newton-Schulz, `dew.newton_schulz`)
+    multiplies in under the run's numerics: in its fast forms, bfloat16 for any 16-bit compute dtype (the
+    measured default under bf16-mixed: a Qwen3.5-4B decision step 844 ms against 1287 at TF32 and 4641 at
+    IEEE float32 on an H100) and its compute dtype otherwise; at least float32 of it in its accurate ones;
+    a float64 run iterates in float64. Never float16, whose range holds neither the iteration's Frobenius
+    norm past 256 nor optax's 1e-8 under it, which rounds to zero there, so a zero update (a zero-initialized
+    output projection's upstream matrices at the first step) divides zero by zero."""
+    from dew.nn.kernels.generation import numerics
+
+    held = numerics()
+    compute = jnp.dtype(held.dtypes.compute)
+    if held.forms != "fast":
+        return jnp.promote_types(compute, jnp.float32)
+    return jnp.dtype(jnp.bfloat16) if compute.itemsize == 2 else compute
+
+
+def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
+    """Whether a route that multiplies `dtype` operands whole with float32 sums (an fp32 FMA, a 16-bit
+    operand's exact product, fp32 operands in bf16 parts that hold their 24 bits) computes the declaration
+    `effective_precision(precision)`: a precision level, each a floor (DEFAULT, HIGH, HIGHEST), or a dot
+    algorithm whose products are whole for these operands (F32_F32_F32, and a 16-bit operand's own
+    BF16_BF16_F32 or F16_F16_F32); not an algorithm that narrows them (TF32's, bf16 parts of an fp32
+    product) or widens them (F64), which a route hands to XLA, which computes it."""
+    dtype = jnp.dtype(dtype)
+    whole = {"DEFAULT", "HIGH", "HIGHEST", "F32_F32_F32"}
+    whole |= {jnp.dtype(jnp.bfloat16): {"BF16_BF16_F32"},
+              jnp.dtype(jnp.float16): {"F16_F16_F32"}}.get(dtype, set())
+    return precision_names(effective_precision(precision)) <= whole
 
 
 def products_dtype(*operands) -> jnp.dtype | None:
@@ -337,8 +369,8 @@ def products_dtype(*operands) -> jnp.dtype | None:
 
 def _intercepted() -> bool:
     """Whether this thread traces a quantized model's method, whose products Qwix owns
-    (`dew.cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
-    from dew.cache import QUANTIZED_TRACE
+    (`dew._cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
+    from dew._cache import QUANTIZED_TRACE
 
     return QUANTIZED_TRACE.value is not None
 
@@ -350,10 +382,9 @@ _OWN_DERIVATIVES = (core.primitives.custom_vjp_call_p, core.primitives.custom_jv
 def _own_backward(jaxpr) -> bool:
     """Whether a product's trace states a derivative of its own (a `jax.custom_vjp`, as Qwix's
     quantized products are when Qwix quantizes a model directly, or a `jax.custom_jvp`), in it or any
-    program inside it (`jax.extend.core.subjaxprs`): a product its library owns, which `accumulated`
+    program inside it (`dew.nn.programs.equations`): a product its library owns, which `accumulated`
     neither widens nor transposes, since a transpose would differentiate its primal instead."""
-    return (any(eqn.primitive in _OWN_DERIVATIVES for eqn in jaxpr.eqns)
-            or any(_own_backward(program) for program in core.subjaxprs(jaxpr)))
+    return any(eqn.primitive in _OWN_DERIVATIVES for eqn in equations(jaxpr))
 
 
 FP32_SUMS = "F32_F32_F32"
@@ -545,7 +576,8 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
             return tuple(transposed(index) for index in live)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
-    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
+    wide = contracted("test_a_wide_cpu_sum_of_products_holds_every_order")(
+        linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True))
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
@@ -621,10 +653,12 @@ def _held(product: jax.Array, preferred_element_type: DTypeLike | None, *operand
     return product.astype(held)
 
 
-def float32_matmul(lhs, rhs, precision: jax.lax.PrecisionLike = None) -> jax.Array:
+def float32_matmul(lhs, rhs, precision: jax.lax.PrecisionLike = None,
+                   preferred_element_type: DTypeLike | None = None) -> jax.Array:
     """`lhs @ rhs` at `precision`, JAX's configured one where unstated, accumulated as
-    `float32_dot_general` is."""
-    return accumulated(functools.partial(jnp.matmul, precision=precision), lhs, rhs)
+    `float32_dot_general` is, summed and returned in `preferred_element_type` where given."""
+    return accumulated(functools.partial(jnp.matmul, precision=precision), lhs, rhs,
+                       preferred_element_type=preferred_element_type)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -743,19 +777,26 @@ def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:
     return len(precision_names(precision)) <= 1 and not isinstance(precision, jax.lax.DotAlgorithm)
 
 
-def configured_precision(precision: jax.lax.PrecisionLike):
-    """A context in which a product that takes no precision of its own (jax.nn's xla attention)
-    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
-    precision changes nothing. A precision no config names (`configurable_precision`) is
-    refused."""
+def _configured_name(precision: jax.lax.PrecisionLike) -> str | None:
+    """The name `jax.default_matmul_precision` takes `precision` by, the default's 'default' among them;
+    None for an unset one. A precision no config names (`configurable_precision`) is refused."""
     if not configurable_precision(precision):
         raise ValueError(f"precision={precision} has no jax_default_matmul_precision name")
     names = precision_names(precision)
-    if names <= {'DEFAULT'}:
-        return contextlib.nullcontext()
+    if not names:
+        return None
     (name,) = names
-    preset = name in jax.lax.DotAlgorithmPreset.__members__
-    return jax.default_matmul_precision(name if preset else name.lower())
+    # A level's lower-case name (DotAlgorithmPreset has a DEFAULT of its own, which no config names).
+    return name.lower() if name in jax.lax.Precision.__members__ else name
+
+
+def configured_precision(precision: jax.lax.PrecisionLike):
+    """A context in which a product that takes no precision of its own (jax.nn's xla attention)
+    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
+    precision changes nothing, a floor the configured one meets. A precision no config names
+    (`configurable_precision`) is refused."""
+    name = _configured_name(precision)
+    return contextlib.nullcontext() if name in (None, 'default') else jax.default_matmul_precision(name)
 
 
 def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:
@@ -767,10 +808,10 @@ def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = No
     algorithm at run time (`dew.nn.kernels.generation.BF16_GPU`). A configured dot algorithm preset is
     no level a run picks but how dots that state none sum (check 1's arms state F32_F32_F32), which the
     algorithm's fp32 sums already are, so it keeps the algorithm."""
-    configured = jax.config.jax_default_matmul_precision
+    asked = effective_precision(precision)
     presets = set(jax.lax.DotAlgorithmPreset.__members__)
-    level = None if configured is None or precision_names(configured) & presets else configured
-    asked = precision if precision_names(precision) else level
+    if not precision_names(precision) and precision_names(asked) & presets:
+        asked = None
     if dtype is None or jnp.dtype(dtype) != jnp.bfloat16 or not asks_default_precision(asked):
         return precision
     # Imported here: dew.nn.kernels imports this module.
@@ -885,8 +926,8 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     return product, rounded(tail - lost if subtract else lost + tail)
 
 
-@jax.custom_jvp
-def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
+def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
+                              denominator: jax.typing.ArrayLike) -> jax.Array:
     """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
     dividers too: XLA:CPU rewrites a division by a broadcast into a multiplication
     by its reciprocal (openxla/xla#51148), and XLA:GPU's fp32 a / b is off IEEE on
@@ -905,7 +946,9 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     integer is the result's bits, which no flush to zero reaches. Past the
     largest float the quotient is infinite. A zero, infinite or NaN operand,
     or a subnormal one, which XLA:CPU reads as zero, is the division's. Its
-    derivative is the division's, as JAX differentiates `a / b`.
+    derivative is the division's, as JAX differentiates `a / b`: a protected
+    span (`correctly_rounded_divide`, `dew.nn.derivatives.declared_tangent`),
+    whose error-free steps the algebra pass must not reassociate.
     """
     numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
                                                   jnp.asarray(denominator, jnp.float32))
@@ -970,10 +1013,13 @@ def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[
     return rounded, jnp.sign((numerator - product) - error)
 
 
-@correctly_rounded_divide.defjvp
 def _divide_jvp(primals, tangents):
     """The rounding is a selection among neighbours, so the quotient's tangent is the division's."""
     return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
+
+
+correctly_rounded_divide = contracted("test_the_precision_seams_hold_every_order")(
+    declared_tangent(Protected(), _correctly_rounded_divide, _divide_jvp))
 
 
 def divided(numerator, rate):
@@ -1042,8 +1088,10 @@ def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     return _compensated_sum(values, tuple(axes))
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
-def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """The sum of `values` over `axes` its compensated pair rounds once, its tangent the plain sum's: a
+    protected span (`_compensated_sum`, `dew.nn.derivatives.declared_tangent`), whose compensation the
+    algebra pass must not cancel."""
     wide = values.astype(at_least_fp32(values.dtype))
     zero = jnp.zeros((), wide.dtype)
     hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
@@ -1123,10 +1171,13 @@ def compensated_total(pair: tuple[jax.Array, jax.Array], plain: jax.Array) -> ja
     return jnp.where(jnp.isfinite(plain), pair[0] + pair[1], plain)
 
 
-@_compensated_sum.defjvp
 def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
                          tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
     return _compensated_sum(primals[0], axes), jnp.sum(tangents[0], axes)
+
+
+_compensated_sum = contracted("test_the_precision_seams_hold_every_order")(
+    declared_tangent(Protected(), _compensated, _compensated_sum_jvp, nondiff_argnums=(1,)))
 
 def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).
@@ -1142,8 +1193,9 @@ def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
 
 
-rounded_operand = surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
-                            nondiff_argnums=(1,))
+rounded_operand = contracted("test_the_precision_seams_hold_every_order")(
+    surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
+              nondiff_argnums=(1,)))
 """The value `x` takes in `dtype`, held in `x`'s own dtype (`_rounded`), with a straight-through
 derivative (`dew.nn.derivatives.surrogate`): its tangent is `x`'s, never rounded a second time."""
 
@@ -1294,7 +1346,8 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
     def forward(lhs, rhs):
         return typed(lhs, rhs, numbers)
 
-    return linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward)(lhs, rhs)
+    return contracted("test_a_bf16_dot_holds_every_order")(
+        linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward))(lhs, rhs)
 
 
 def _transposed(cotangent, operands, numbers, side: int, product) -> jax.Array:
@@ -1337,31 +1390,42 @@ def _bf16_product(lhs: jax.Array, rhs: jax.Array, dimension_numbers, precision=N
     return product if out_sharding is None else jax.sharding.reshard(product, out_sharding)
 
 
-def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:
-    """`fn` traced, forward and backward, under the default matmul precision.
+def at_precision[Output](precision: jax.lax.PrecisionLike
+                         ) -> Callable[[Callable[..., Output]], Callable[..., Output]]:
+    """`fn` traced, forward and backward, at `precision`, the default included: a product that takes no
+    precision of its own (a Pallas dot, jax.nn's xla attention) reads it from the configuration at trace
+    time (`jax.default_matmul_precision`), and a custom derivative's backward is traced after the forward
+    returns, so it is held under the same setting by hand. An unset precision is the configured one, which
+    forward and backward read alike: `fn` itself. A precision no config names (`configurable_precision`)
+    is refused.
 
-    Mosaic's TPU kernels refuse a 16-bit matmul at HIGHEST ("Bad lhs type"),
-    and Pallas dots read the precision from the configuration at trace time.
-    16-bit dots are exact at any precision; an fp32 dot takes one bf16 pass on
-    a TPU, so splash's P·V rounds P to bf16 as every default-precision run
-    does. The kernels take no per-dot precision, so there is no other setting.
-    The backward is traced after the forward returns, so it is held under the
-    same setting by hand."""
-    @jax.custom_vjp
-    def run(*args):
-        with jax.default_matmul_precision('default'):
-            return fn(*args)
+    A fused attention route under a call's stated precision (`attention._attention_kernel`), and Mosaic's
+    TPU kernels at the default: they refuse a 16-bit matmul at HIGHEST ("Bad lhs type"); 16-bit dots are
+    exact at any precision, and an fp32 dot takes one bf16 pass on a TPU, so splash's P·V rounds P to
+    bf16 as every default-precision run does (`attention_tpu`)."""
+    name = _configured_name(precision)
 
-    def forward(*args):
-        with jax.default_matmul_precision('default'):
-            return jax.vjp(fn, *args)
+    def held(fn: Callable[..., Output]) -> Callable[..., Output]:
+        if name is None:
+            return fn
 
-    def backward(pullback, cotangent):
-        with jax.default_matmul_precision('default'):
-            return pullback(cotangent)
+        def forward(*args):
+            with jax.default_matmul_precision(name):
+                return jax.vjp(fn, *args)
 
-    run.defvjp(forward, backward)
-    return run
+        def backward(pullback, cotangent):
+            with jax.default_matmul_precision(name):
+                return pullback(cotangent)
+
+        # A protected span: the precision it holds is the kernels' own, which no rewrite may change.
+        @contracted("test_a_default_precision_call_holds_every_order_it_takes")
+        @functools.partial(declared_derivative, Protected(), forward=forward, backward=backward)
+        def run(*args):
+            with jax.default_matmul_precision(name):
+                return fn(*args)
+
+        return run
+    return held
 
 
 def sqrt_or_zero(square):

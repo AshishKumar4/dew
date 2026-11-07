@@ -62,7 +62,7 @@ from dew.nn.inputs import (
     unruled_fields,
 )
 from dew.nn.kernels.options import program
-from dew.nn.protocols import Logits, ShiftsLogits, TokenModel
+from dew.nn.protocols import ShiftsLogits, TokenModel, forward_method
 from dew.nn.sharding import explicit_spec
 
 MDLM_STEPS = 128
@@ -79,16 +79,20 @@ NOISE_REMOVAL_TIME = 1e-5
 class MaskingSchedule(ABC):
     """Sets how fast tokens are masked as t grows.
 
-    `alpha(t)` in (0, 1] is the fraction of tokens left unmasked at t, with
-    alpha(0) = 1.
+    `masked_fraction(t)` in [0, 1) is the fraction of tokens masked at t, zero at t = 0, which each schedule
+    states in a form exact near zero: the NELBO weight divides by it, and 1 - alpha(t) there keeps only the
+    last bits of alpha's rounding. `alpha(t)`, the fraction left unmasked, is its complement.
     """
 
     @abstractmethod
-    def alpha(self, t) -> jax.Array: ...
+    def masked_fraction(self, t) -> jax.Array: ...
 
     @abstractmethod
     def alpha_prime(self, t) -> jax.Array:
         """Return d alpha / dt, which is negative."""
+
+    def alpha(self, t) -> jax.Array:
+        return 1 - self.masked_fraction(t)
 
 
 @dataclass(frozen=True)
@@ -101,8 +105,8 @@ class LogLinear(MaskingSchedule):
 
     eps: float = 1e-3
 
-    def alpha(self, t):
-        return 1 - (1 - self.eps) * common.times(t)
+    def masked_fraction(self, t):
+        return (1 - self.eps) * common.times(t)
 
     def alpha_prime(self, t):
         return jnp.full_like(common.times(t), -(1 - self.eps))
@@ -145,7 +149,7 @@ class DiscreteProcess:
 
     def masked(self, draws, tokens, t) -> tuple[jax.Array, jax.Array]:
         """`corrupt` from a uniform draw for each of the tokens: those under `1 - alpha(t)` masked."""
-        is_masked = draws < (1 - self.schedule.alpha(t))[:, None]
+        is_masked = draws < self.schedule.masked_fraction(t)[:, None]
         return jnp.where(is_masked, self.mask_id, tokens), is_masked
 
     def weight(self, t) -> jax.Array:
@@ -155,7 +159,7 @@ class DiscreteProcess:
         token contributes, and the quotient itself is undefined.
         """
         t = common.times(t)
-        return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
+        return jnp.where(t > 0, -self.schedule.alpha_prime(t) / self.schedule.masked_fraction(t), 0.0)
 
     def times(self, steps: int) -> jax.Array:
         """MDLM's sampling grid for `steps` reveal steps: `steps + 1` times from
@@ -289,8 +293,8 @@ class DiscreteDenoiser:
     The denoiser ignores `t`, because the masked model is conditioned on the
     corruption it sees and not on the time. `Unmask.step` reads the time
     from the process. `t` stays in the signature because `sample` calls
-    every denoiser as `(x_t, t)`. A model with full-sequence logits
-    (`Logits`) is read through them, and any other through its call.
+    every denoiser as `(x_t, t)`. The model's full-sequence logits are read
+    through its `logits`, or a native module's own forward (`forward_method`).
 
     The model's own logits at an unmasked position do not matter, since the
     position keeps its token (MDLM's carry-over parameterization). The mask
@@ -333,7 +337,7 @@ class DiscreteDenoiser:
             fields = {**fields, "attention_pairwise_mask": self.visible}
         logits = self.model.apply(self.params, x_t, **fields, rngs=None, mutable=False,
                                   capture_intermediates=False,
-                                  method="logits" if isinstance(self.model, Logits) else None)
+                                  method=forward_method(self.model, "logits"))
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
         # Normalized in at least fp32 (`dew.nn.categorical`) over the logits each position reads
         # (`aligned`): the reveal draws its categorical from these, and a bf16 log partition would
@@ -402,8 +406,8 @@ class Unmask:
             raise ValueError(
                 f"Unmask reveals masked tokens, so it needs a DiscreteProcess and not "
                 f"{type(process).__name__}")
-        alpha_t = process.schedule.alpha(t)
-        return (process.schedule.alpha(t_next) - alpha_t) / (1 - alpha_t)
+        masked = process.schedule.masked_fraction(t)
+        return (masked - process.schedule.masked_fraction(t_next)) / masked
 
 
 @dataclass(frozen=True)
@@ -501,12 +505,13 @@ class MDLM:
 
 def refuse_causal(model: nn.Module) -> None:
     """Raise ValueError unless `model` can fill a masked row: MDLM draws each
-    masked slot from the row's full-sequence logits (`Logits`), so every
-    position must read the ones after it (`TokenModel` with `causal` False)."""
+    masked slot from the row's full-sequence logits (its `logits`, or a native
+    module's own forward: `forward_method`), so every position must read the
+    ones after it (`TokenModel` with `causal` False)."""
     name = type(model).__name__
-    if not isinstance(model, Logits):
+    if forward_method(model, "logits") is None:
         raise ValueError(f"masked generation requires a bidirectional model, and this {name} gives no "
-                         f"full-sequence logits (Logits)")
+                         f"full-sequence logits: no logits and no forward")
     if not isinstance(model, TokenModel):
         raise ValueError(f"masked generation requires a bidirectional model, and this {name} does not say "
                          f"whether a position reads the ones after it (TokenModel)")

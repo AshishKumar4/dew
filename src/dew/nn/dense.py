@@ -4,7 +4,7 @@
 shapes, initializers, promotion and product hooks alike, so checkpoints,
 LoRA and Qwix see the layers they did, but for a batched `DenseGeneral`'s
 kernel, which draws each batch member alone (`_members`). Their call is their own: the same
-product (the GEMM template's dense product where a launch takes it, `template.dot_general`, XLA's program
+product (the GEMM template's dense product where a launch takes it, `gemm.dot_general`, XLA's program
 otherwise), rounded to its dtype as flax's is, then the bias added by `biased`,
 which adds it in the dtype flax's addition gives them and broadcasts it at
 fp32, so its gradient sums at fp32 as torch's addmm sums it, and in float64 on a CPU under
@@ -29,9 +29,9 @@ from flax import linen as nn
 from flax.linen.module import InterceptorContext
 from flax.typing import Array
 
-from dew.cache import INTERCEPTED
+from dew._cache import INTERCEPTED
 
-from .kernels.templates.gemm import template
+from .kernels import gemm
 from .precision import accumulated, biased, float32_dot_general
 from .sharding import declared
 
@@ -41,7 +41,7 @@ QWIX = importlib.util.find_spec("qwix") is not None
 
 def intercepted() -> bool:
     """Whether a wrapper owns the layer's product, which reaches it as a `jax.lax.dot_general` call: a Dew
-    interception scope (`dew.quantization`, `dew.lora`: `dew.cache.INTERCEPTED`), or a Qwix rule matching
+    interception scope (`dew.quantization`, `dew.lora`: `dew._cache.INTERCEPTED`), or a Qwix rule matching
     the op at this module under a direct `qwix.quantize_model` call (`qwix.pallas.get_current_rule`, Qwix's
     public query for code that runs its own kernels, which every active provider answers)."""
     if INTERCEPTED.value:
@@ -58,7 +58,7 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
     it, else its `dot_general`, or lax's at its stated precision (`accumulated`: the plain product, its fp32
     sum taken in float64 on a CPU under Dew's tests). A plain product (lax's or `float32_dot_general`: its
     operands' dtype out, at the layer's precision) goes through the GEMM template's dense product where a
-    launch takes it (`template.dot_general`; XLA's program wherever the template declares XLA faster), but
+    launch takes it (`gemm.dot_general`; XLA's program wherever the template declares XLA faster), but
     where a wrapper owns the products (`intercepted`: Qwix quantizes them as it intercepts `dot_general`). A
     product with a policy of its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`)
     is the layer's own: the template reads no policy from a callable."""
@@ -66,7 +66,7 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
         return layer.dot_general_cls()
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     plain = layer.dot_general in (None, float32_dot_general)
-    return template.dot_general(product) if plain and not intercepted() else product
+    return gemm.dot_general(product) if plain and not intercepted() else product
 
 
 def plain_product():
@@ -74,7 +74,7 @@ def plain_product():
     the GEMM template's where a launch takes it, else lax's with its fp32 sum taken in float64 on a CPU
     under Dew's tests, and lax's alone where a wrapper owns the products (`intercepted`). A product read
     apart from its layer, as a vocabulary head's table reads `project_out` (`Projection`), takes it."""
-    return _accumulated_dot_general if intercepted() else template.dot_general(_accumulated_dot_general)
+    return _accumulated_dot_general if intercepted() else gemm.dot_general(_accumulated_dot_general)
 
 
 def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None,

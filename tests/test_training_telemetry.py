@@ -15,6 +15,7 @@ from reference_error import as_given, assert_as_exact
 import dew.config
 from dew.config import RunConfig, TrainerConfig
 from dew.data.dataset import Loader
+from dew.data.plan import PLAN_VERSIONS
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, OptimConfig
 from dew.training import Trainer, Wandb, WandbTracker
@@ -235,7 +236,9 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
 
     # The same four updates in Optax's own loop over the same batch, complex64 as the trainer's, and
     # the closed form in complex128, which both are held to over drawn targets (check 1), real and
-    # imaginary parts alike.
+    # imaginary parts alike. Optax descends a complex weight along its gradient's conjugate, JAX's
+    # gradient of a real loss being the conjugate of its steepest ascent (row 4496: unconjugated, the
+    # reference ascended).
     @jax.jit
     def optax_descent(target):
         batch = {'target': jnp.broadcast_to(target, (8, COMPLEX_WIDTH))}
@@ -243,7 +246,7 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
         def update(carry, _):
             weight, state = carry
             loss = ComplexSquared().loss
-            grads = jax.grad(lambda w: loss({'params': {'weight': w}}, batch, None)[0])(weight)
+            grads = jnp.conj(jax.grad(lambda w: loss({'params': {'weight': w}}, batch, None)[0])(weight))
             updates, state = optax.sgd(.1).update(grads, state, weight)
             return (optax.apply_updates(weight, updates), state), None
 
@@ -254,7 +257,8 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
     assert_as_exact(as_given(lambda target: parts(fit(4, target).variables['params']['weight'])),
                     as_given(lambda target: parts(optax_descent(target))), complex_target, "complex descent",
                     seeds=COMPLEX_SEEDS,
-                    truth_fn=lambda target: parts(np.asarray(target, np.complex128) * (1 - 0.8 ** 4)))
+                    truth_fn=as_given(
+                        lambda target: parts(np.asarray(target, np.complex128) * (1 - 0.8 ** 4))))
     norms = {step: scalars['train/grad_norm'] for step, scalars in sink.scalars
              if 'train/grad_norm' in scalars}
     assert norms[accumulation] == pytest.approx(np.sqrt(120.))
@@ -277,7 +281,9 @@ def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatc
     monkeypatch.chdir(tmp_path)
     config.train(Squared(), targets([1., 3.]), name='telemetry')
     record = run.configuration['run_record']
-    assert record['config'] == config.recorded(Squared()).to_dict()
+    # The run as it trained: by the data plan version it resolved and records (`RunConfig.resumed`).
+    assert record['config'] == config.resumed(('data_plan_version',)).recorded(Squared()).to_dict()
+    assert record['config']['data_plan_version'] == PLAN_VERSIONS[-1]
     assert record['dew_sha'] == expected_sha
     assert record['device_kind'] == jax.devices()[0].device_kind
     assert record['devices'] == jax.device_count()
@@ -306,6 +312,43 @@ def test_a_runs_wandb_name_is_its_own_and_its_checkpoints_keep_the_runs(tmp_path
     config.train(Squared(), targets([1., 3.]), name='kept')
     assert opened['name'] == ('kept' if shown is None else shown)
     assert (tmp_path / 'kept').is_dir()
+
+
+def test_a_shared_wandb_run_opens_as_its_primary_writer_and_another_attaches_on_its_own_axis(tmp_path,
+                                                                                          monkeypatch):
+    """A run whose W&B config is shared opens its run in W&B's shared mode as its primary writer, its rows on
+    `train/step`; a second writer attaches to the run's id with x_primary=False, logs its metrics on its own
+    step and leaves the run's state to the primary, the settings W&B keeps a second writer's rows under (two
+    processes on one run: 30 rows and 0 plainly, 30 and 3 shared, wandb 0.31.0). The installed wandb takes
+    each setting (`wandb.Settings`); W&B's server, which shared mode writes through, is recorded here."""
+    import wandb
+    from test_publish import TrackedRun
+
+    opened = []
+
+    def init(**given):
+        opened.append((given, TrackedRun()))
+        return opened[-1][1]
+
+    monkeypatch.setattr(wandb, 'init', init)
+    config = RunConfig(trainer=TrainerConfig(
+        name='shared', steps=2, checkpoint_dir=str(tmp_path), log_every=1, eval_every=None,
+        checkpoint_every=None, wandb=Wandb('dew', shared=True)))
+    monkeypatch.chdir(tmp_path)
+    config.train(Squared(), targets([1., 3.]), name='shared')
+    with WandbTracker('dew', id='run-0', shared=True, primary=False, label='forecast') as forecaster:
+        forecaster.log({'forecast/loss': 0.5}, step=3)
+    (primary, trained), (secondary, forecast) = opened
+    assert (primary['settings'].mode, primary['settings'].x_primary, primary['settings'].x_label) == (
+        'shared', True, 'train')
+    assert (secondary['id'], secondary['settings'].x_primary, secondary['settings'].x_label,
+            secondary['settings'].x_update_finish_state) == ('run-0', False, 'forecast', False)
+    assert any('train/loss' in row and 'train/step' in row for row in trained.history)
+    assert forecast.history == [{'forecast/loss': 0.5, 'forecast/step': 3}]
+    with pytest.raises(ValueError):
+        WandbTracker('dew', shared=True, offline=True)
+    with pytest.raises(ValueError):
+        WandbTracker('dew', shared=True, primary=False)
 
 
 def test_wandb_counts_each_new_step_shape_once(monkeypatch):

@@ -126,7 +126,7 @@ def test_a_rollout_advances_an_environment_whose_state_shares_an_array():
     """A Dreamer rollout donates its live state to the steps that advance it, each buffer once, so it runs
     over an environment whose state holds one array in two fields: three updates at a train ratio of 32 over
     windows of 16 in batches of 8 take the prefill and exactly the steps they owe."""
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.training import Trainer
 
     env = Batched(TimeLimit(SharedTarget(), episode_length=20), 8)
@@ -288,8 +288,8 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     dynamics or TransDreamer's, over the walk's position, the walks simulated on the host, or its
     pixels, the pixels' agent predicting the privileged position it never reads better too. Its policy's
     return is the acceptance run's to judge, on a task at the steps the paper reports."""
+    from dew.config.env import idle
     from dew.objectives.base import Step
-    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
     environments, model = AGENTS[agent]
@@ -323,7 +323,7 @@ def test_each_replayed_step_draws_its_posterior_from_its_own_key():
     observation = jnp.asarray(rng.normal(size=(3, 6, 1)), jnp.float32)
     previous = jnp.asarray(rng.uniform(-1, 1, (3, 6, 1)), jnp.float32)
     first = jnp.zeros((3, 6), bool).at[:, 0].set(True)
-    _, stoch, _ = jax.jit(objective.observed)(variables, observation, previous, first, jax.random.key(13))
+    _, stoch, _, _ = jax.jit(objective.observed)(variables, observation, previous, first, jax.random.key(13))
 
     @jax.jit
     def stepped(variables):
@@ -372,8 +372,8 @@ def test_the_worlds_kl_losses_are_the_codes_and_the_representation_one_spares_th
         # The loss draws its posterior from the first of its step key's two halves.
         world_key = jax.random.split(step.key)[0]
         previous = jnp.concatenate([jnp.zeros_like(windows["action"][:, :1]), windows["action"][:, :-1]], 1)
-        deter, _, posterior = objective.observed(variables, model.seen(windows["observation"]), previous,
-                                                 windows["first"], world_key)
+        deter, _, posterior, _ = objective.observed(variables, model.seen(windows["observation"]), previous,
+                                                    windows["first"], world_key)
         prior = model.bind(variables, rngs={"latent": world_key}).prior(deter)
     post, prior = np.asarray(posterior, np.float64), np.asarray(prior, np.float64)
     divergence = np.sum(np.exp(post) * (post - prior), axis=(-1, -2))
@@ -408,7 +408,7 @@ def test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them():
     """A Dreamer rollout started from a replay of recorded steps takes no random prefill: after 12 updates
     at a train ratio of 32 over windows of 16 in batches of 8, its environments have taken exactly the
     steps those updates owe, written after the recorded ones."""
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.rl.replay import ReplayBuffer
     from dew.training import Trainer
 
@@ -460,12 +460,13 @@ def pretrained_on(objective, replay):
     from dew.training import Trainer
 
     keys = iter(jax.random.split(jax.random.key(11), 1000))
-    data = Loader(train=lambda partition: (jax.device_get(replay.sample(next(keys), 8, 16))
+    sample = jax.jit(lambda replay, key: replay.sample(key, 8, 16))
+    data = Loader(train=lambda partition: (jax.device_get(sample(replay, next(keys)))
                                            for _ in itertools.count()), val=None, records=8, batch=8)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7))
     initial = jax.device_get(trainer.place()[0])
     final = trainer.fit(data, steps=150, log_every=150)
-    return initial, final, jax.device_get(replay.sample(jax.random.key(8), 8, 16))
+    return initial, final, jax.device_get(sample(replay, jax.random.key(8)))
 
 
 def test_pretraining_from_demonstrations_learns_the_world_and_clones_the_pilot():
@@ -513,7 +514,7 @@ def dreamer_targets(objective, *, checkpointed, replay=None):
 def dreamer_fit(directory, objective, rollout, steps, **options):
     """A Dreamer run of `steps` updates over `rollout`, checkpointed every update to `directory`."""
     from dew.checkpoints import Checkpoints, Keep
-    from dew.objectives.rl.config import idle
+    from dew.config.env import idle
     from dew.training import Trainer
 
     data = idle()

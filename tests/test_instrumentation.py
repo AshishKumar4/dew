@@ -4,7 +4,6 @@ None of the performance work is evaluable without these numbers, so they get
 the same treatment as the training maths.
 """
 
-import importlib.metadata
 import itertools
 import os
 import pathlib
@@ -21,7 +20,7 @@ from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
 
-from dew.cache import enable_compilation_cache
+from dew._cache import autotune_dir, enable_compilation_cache
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
 from dew.objectives.lm import LMObjective
@@ -406,7 +405,7 @@ def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tm
     try:
         monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=4")
         enable_compilation_cache(str(tmp_path / "cache"))
-        picks = tmp_path / "cache" / "autotune" / f"jaxlib-{importlib.metadata.version('jaxlib')}"
+        picks = pathlib.Path(autotune_dir(str(tmp_path / "cache")))
         assert os.environ["XLA_FLAGS"].split() == [
             "--xla_gpu_autotune_level=4", f"--xla_gpu_per_fusion_autotune_cache_dir={picks}"]
         assert picks.is_dir()
@@ -442,7 +441,7 @@ def a_run_prepared_on_a_gpu_keeps_its_picks_where_the_policy_puts_them(tmp_path)
     assert done.returncode == 0, done.stderr[-2000:]
     cache = pathlib.Path(done.stdout.strip().splitlines()[-1])
     assert cache.is_relative_to(tmp_path)
-    picks = cache / "autotune" / f"jaxlib-{importlib.metadata.version('jaxlib')}"
+    picks = pathlib.Path(autotune_dir(str(cache)))
     assert any(path.is_file() for path in picks.rglob("*"))
     assert not (cache / "xla_gpu_per_fusion_autotune_cache_dir").exists()
 

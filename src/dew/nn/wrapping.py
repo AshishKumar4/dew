@@ -18,10 +18,10 @@ from dew.batch import Variables, part, thaw
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
 from dew.nn.protocols import (
     CrossAttending,
-    HiddenStates,
     OutputTable,
     VocabularyRows,
     block_chunks_of,
+    forward_method,
     head_table,
     label_logits,
 )
@@ -32,6 +32,8 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
     from dew._records import JSON
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -69,6 +71,12 @@ class DecoderWrapper(nn.Module):
     @property
     def vocab_size(self) -> int:
         return self._decoder.vocab_size
+
+    @nn.nowrap
+    def fixed_routers(self) -> Mapping[str, Callable[[tuple[str, ...]], bool]]:
+        """Its decoder's (`ExpertRouted`), each over the paths under the field that holds it."""
+        return {name: (lambda path, owns=owns: path[:1] == (self.wraps,) and owns(path[1:]))
+                for name, owns in self._decoder.fixed_routers().items()}
 
     @property
     def max_seq_len(self) -> int:
@@ -162,9 +170,21 @@ class DecoderWrapper(nn.Module):
         return self._over(self._decoder.restore_recompute(record))
 
 
+def _states_method(backbone: nn.Module) -> str:
+    """The method a head reads `backbone`'s final states by (`forward_method`): its `hidden_states`
+    (`HiddenStates`), or a native module's own forward, which gives them; a backbone with neither is
+    refused (TypeError)."""
+    method = forward_method(backbone, "hidden_states")
+    if method is None:
+        raise TypeError(f"a head reads its backbone's final states, and a {type(backbone).__name__} "
+                        "declares no hidden_states and no forward")
+    return method
+
+
 @dataclass(frozen=True)
 class HeadedModel:
-    """Any backbone with final states (`HiddenStates`) and a head over them, applied as two modules
+    """Any backbone with final states (`HiddenStates`, or a native module's own forward that gives them:
+    `states_method`) and a head over them, applied as two modules
     over one variables tree: the two under `backbone` and `head` in every collection
     (`dew.objectives.base.joined`). Each is applied as its own module over its part, so a backbone
     that `Pretrained.adapt` gave LoRA factors runs with its own adapter, with its base weights under
@@ -176,9 +196,13 @@ class HeadedModel:
     head: nn.Module
 
     def __post_init__(self):
-        if not isinstance(self.backbone, HiddenStates):
-            raise TypeError(f"a head reads its backbone's final states (`HiddenStates`), which a "
-                            f"{type(self.backbone).__name__} does not give")
+        _states_method(self.backbone)
+
+    @property
+    def states_method(self) -> str:
+        """The backbone's method a head reads its final states by: its `hidden_states`, or a native
+        module's own forward (`dew.nn.protocols.forward_method`)."""
+        return _states_method(self.backbone)
 
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """The backbone's runs a pipeline over `stages` stacks, under `backbone` (`StagedStacks`); a head
@@ -224,7 +248,7 @@ class HeadedModel:
         tokens = jnp.zeros((1, 2), jnp.int32)
 
         def states(key: jax.Array) -> jax.Array:
-            return backbone.init_with_output(key, tokens, method="hidden_states")[0]
+            return backbone.init_with_output(key, tokens, method=_states_method(backbone))[0]
 
         shape = jax.eval_shape(states, jax.random.key(0))
         reduced = jnp.finfo(shape.dtype).bits < 32

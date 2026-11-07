@@ -44,7 +44,8 @@ from flax import linen as nn, struct
 from dew.batch import Variables
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
-from dew.nn.precision import compensated_add, two_product
+from dew.nn.derivatives import contracted
+from dew.nn.precision import at_least_fp32, compensated_add, two_product
 from dew.sampling.solvers.common import given
 
 Pair = tuple[jax.Array, jax.Array]
@@ -161,27 +162,43 @@ def guide(conditional: jax.Array, unconditional: jax.Array, scale) -> jax.Array:
     return _guided(conditional, unconditional, expand(jnp.asarray(scale, conditional.dtype), conditional))
 
 
+def _spread(conditional: jax.Array, unconditional: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The two predictions in float32 at least, and the factor they are formed at: one half where the
+    larger passes half the widened dtype's largest, else one. A half-precision pair then differs finitely
+    in float32 and a float32 pair finitely halved, so their difference and its multiples stay finite
+    wherever the combination is."""
+    wide = at_least_fp32(conditional.dtype)
+    held, unheld = conditional.astype(wide), unconditional.astype(wide)
+    large = jnp.maximum(jnp.abs(held), jnp.abs(unheld)) > jnp.finfo(wide).max / 2
+    return held, unheld, jnp.where(large, 0.5, 1.0).astype(wide)
+
+
+@contracted("test_a_guided_prediction_holds_every_order")
 @jax.custom_jvp
 def _guided(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
-    """`guide`'s value: the conditional prediction exactly at a unit scale, the affine combination
-    elsewhere."""
-    return jnp.where(scale == 1, conditional, unconditional + scale * (conditional - unconditional))
+    """`guide`'s value: the conditional prediction exactly at a unit scale and the unconditional at a zero
+    one, the affine combination elsewhere, formed `_spread` and rounded once, so finite predictions whose
+    combination is finite never overflow on the way (half precision's 40000 and -40000 at a scale of one
+    half give 0)."""
+    held, unheld, half = _spread(conditional, unconditional)
+    wide = scale.astype(held.dtype)
+    combined = ((half * unheld + wide * (half * held - half * unheld)) / half).astype(conditional.dtype)
+    return jnp.where(scale == 1, conditional, jnp.where(scale == 0, unconditional, combined))
 
 
 @_guided.defjvp
 def _guided_jvp(primals, tangents):
-    """The affine combination's derivative at every scale, a unit one's included, where the exact
-    conditional the value selects would leave the scale's out."""
+    """The affine combination's derivative at every scale, the endpoints' included, where the exact
+    prediction the value selects would leave the scale's out."""
     conditional, unconditional, scale = primals
     along_conditional, along_unconditional, along_scale = tangents
     # The predictions' direction in the affine order, the conditional's own at a unit scale.
     predicted = jnp.where(scale == 1, along_conditional,
                           along_unconditional + scale * (along_conditional - along_unconditional))
-    # The scale's: the predictions' difference, halved first only where it would pass float32's largest,
-    # so two finite predictions of opposite sign stay finite where the scale does not move.
-    wide = jnp.maximum(jnp.abs(conditional), jnp.abs(unconditional)) > jnp.finfo(conditional.dtype).max / 2
-    spread = jnp.where(wide, 0.5 * conditional - 0.5 * unconditional, conditional - unconditional)
-    return _guided(*primals), predicted + jnp.where(wide, 2, 1) * (spread * along_scale)
+    # The scale's: the predictions' difference, formed `_spread` as the value is.
+    held, unheld, half = _spread(conditional, unconditional)
+    along = ((half * held - half * unheld) * along_scale.astype(held.dtype) / half).astype(conditional.dtype)
+    return _guided(*primals), predicted + along
 
 
 @struct.dataclass
@@ -232,6 +249,9 @@ class CFG:
 
         return guided
 
+    def modules(self) -> tuple[nn.Module, ...]:
+        return ()
+
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
         scales = _scales(self.scale, self.interval, steps)
         return Walk.stateless(lambda index: self._guided(denoise, scales(index)))
@@ -272,6 +292,9 @@ class CFGPlusPlus:
 
         return guided
 
+    def modules(self) -> tuple[nn.Module, ...]:
+        return ()
+
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
         inside = _inside(self.interval, steps)
         return Walk.stateless(lambda index: self._guided(denoise, inside(index)))
@@ -289,12 +312,9 @@ def _projected_components(direction, output):
     axes = tuple(range(1, output.ndim))
     shape = (output.shape[0],) + (1,) * (output.ndim - 1)
     zero = jnp.asarray(0.0, dtype)
-    # Powers of two move the exponent exactly, so finite inputs cannot
-    # overflow either dot product before the quotient removes their scale.
-    _, vector_exponent = jnp.frexp(jnp.max(jnp.abs(vector), axis=axes, keepdims=True))
-    _, output_exponent = jnp.frexp(jnp.max(jnp.abs(conditioned), axis=axes, keepdims=True))
-    vector_exponent, output_exponent = jnp.maximum(vector_exponent, 0), jnp.maximum(output_exponent, 0)
-    vector, conditioned = jnp.ldexp(vector, -vector_exponent), jnp.ldexp(conditioned, -output_exponent)
+    # Finite inputs cannot overflow either dot product before the quotient removes their scale.
+    vector, vector_exponent = _row_scaled(vector)
+    conditioned, output_exponent = _row_scaled(conditioned)
     floor = jnp.ldexp(jnp.asarray(1e-24, dtype), -2 * output_exponent)
 
     def summed(left, right):
@@ -316,6 +336,25 @@ def _projected_components(direction, output):
     orthogonal = jnp.ldexp(orthogonal + orthogonal_lo, vector_exponent).astype(output.dtype)
     parallel = jnp.ldexp(parallel + parallel_lo, vector_exponent).astype(output.dtype)
     return orthogonal, parallel
+
+
+def _row_scaled(vector: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each row of `vector` over 2**exponent, its largest entry's power of two where that passes one, and
+    the exponent: powers of two move the exponent exactly, so a row's products and squares formed over
+    the scaled row cannot overflow where what they form is finite."""
+    axes = tuple(range(1, vector.ndim))
+    _, exponent = jnp.frexp(jnp.max(jnp.abs(vector), axis=axes, keepdims=True))
+    exponent = jnp.maximum(exponent, 0)
+    return jnp.ldexp(vector, -exponent), exponent
+
+
+def _clipped(vector: jax.Array, threshold: float) -> jax.Array:
+    """`vector` with each row's L2 norm over every axis but the first clipped at `threshold`. The norm is
+    formed over the row `_row_scaled` and the clip's factor against the threshold scaled alike, so a
+    finite row whose norm passes the dtype's largest is still clipped to its threshold."""
+    scaled, exponent = _row_scaled(vector)
+    norm = jnp.sqrt(jnp.sum(jnp.square(scaled), axis=tuple(range(1, vector.ndim)), keepdims=True))
+    return vector * jnp.minimum(1.0, jnp.ldexp(jnp.asarray(threshold, vector.dtype), -exponent) / norm)
 
 
 @struct.dataclass
@@ -351,17 +390,21 @@ class APG:
 
     def _guided(self, denoise: Denoiser, scale: jax.Array, x, t, average):
         (output, unconditional), sown = denoise.raw_both_observed(x, t)
-        direction = output - unconditional + self.momentum * average
-        axes = tuple(range(1, direction.ndim))
-        if self.norm_threshold > 0:
-            norm = jnp.sqrt(jnp.sum(jnp.square(direction), axis=axes, keepdims=True))
-            direction = direction * jnp.minimum(1.0, self.norm_threshold / norm)
+        # The direction, its running average (`walk`'s carry) and its clipping in float32 at least, as the
+        # reference's norm accumulates, so a half-precision direction overflows neither its difference,
+        # its average nor its norm.
+        wide = at_least_fp32(jnp.result_type(output, unconditional))
+        moved = output.astype(wide) - unconditional.astype(wide) + self.momentum * jnp.asarray(average, wide)
+        direction = _clipped(moved, self.norm_threshold) if self.norm_threshold > 0 else moved
         orthogonal, parallel = _projected_components(direction, output)
         update = orthogonal + self.eta * parallel
         off = scale == 1.0
         combined = jnp.where(off, output, unconditional + scale * update)
-        running = jnp.where(off, average, output - unconditional + self.momentum * average)
+        running = jnp.where(off, average, moved)
         return denoise.observed(denoise.convert(x, t, combined), sown), running
+
+    def modules(self) -> tuple[nn.Module, ...]:
+        return ()
 
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
         scales = _scales(self.scale, self.interval, steps)
@@ -370,11 +413,12 @@ class APG:
                 lambda index: lambda x, t: self._guided(denoise, scales(index), x, t, 0.0)[0])
 
         def step(x, t, index, average):
-            pair, running = self._guided(denoise, scales(index), x, t, average)
-            return pair, running.astype(average.dtype)
+            return self._guided(denoise, scales(index), x, t, average)
 
-        return Walk(jnp.zeros_like, step, lambda average, index: lambda x, t: self._guided(
-            denoise, scales(index), x, t, average)[0])
+        def predict(average, index):
+            return lambda x, t: self._guided(denoise, scales(index), x, t, average)[0]
+
+        return Walk(lambda x: jnp.zeros(x.shape, at_least_fp32(x.dtype)), step, predict)
 
 
 @struct.dataclass
@@ -402,6 +446,9 @@ class Autoguidance:
     def __post_init__(self):
         object.__setattr__(self, "interval", _interval(self.interval))
 
+    def modules(self) -> tuple[nn.Module, ...]:
+        return (self.model,)
+
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
         if "guide" not in denoise.params:
             raise ValueError("autoguidance reads its guide's variables under `guide` in the "
@@ -425,7 +472,8 @@ class Autoguidance:
 
 @runtime_checkable
 class Guidance(Protocol):
-    """What `sample` guides with: a walk over the steps for one denoiser.
+    """What `sample` guides with: a walk over the steps for one denoiser, and the modules that walk runs
+    besides the denoiser's model (`modules`, none for most). A guidance of one's own states both.
     CFG, CFG++, APG and autoguidance are four; a run records any by class.
 
     A walk's prediction over an opened denoiser (`Denoiser.opened`, a watched training step's) reads
@@ -436,11 +484,10 @@ class Guidance(Protocol):
 
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk: ...
 
-
-def guidance_modules(guidance: Guidance | None) -> tuple[nn.Module, ...]:
-    """The modules `guidance` runs besides its denoiser's model, autoguidance's guide, which a
-    program that walks it compiles for as it does for the denoiser (`compiler_options`)."""
-    return (guidance.model,) if isinstance(guidance, Autoguidance) else ()
+    def modules(self) -> tuple[nn.Module, ...]:
+        """The modules its walk runs besides its denoiser's model (autoguidance's guide), which a program
+        that walks it compiles for as it does for the denoiser (`compiler_options`)."""
+        ...
 
 
 __all__ = ["APG", "CFG", "Autoguidance", "CFGPlusPlus", "Guidance", "Walk"]

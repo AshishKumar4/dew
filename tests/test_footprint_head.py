@@ -133,9 +133,10 @@ def test_a_cotangent_sum_is_an_elementwise_value_like_any_other():
         return jnp.sum(jnp.exp(wide) + jnp.sin(wide)), ()
 
     peak = gradient_peak(twice, weights, (HIDDEN,), platform="gpu", workspace=Workspace(0, 0)).bytes
-    # The product the exponential and the sine read, the cotangent sum made for the product that reads it,
-    # and the weights' gradient that product makes.
-    assert peak == 2 * PRODUCT + WIDTH * VOCAB * 4
+    # The product the exponential and the sine read, and the cotangent sum made from it for the product that
+    # reads it, as that sum's fusion runs; the weights' gradient the product makes after it frees the first
+    # (`dying`) and holds less.
+    assert peak == 2 * PRODUCT
 
 
 def test_a_gradient_the_step_updates_where_it_is_made_is_held_while_it_is_made():
@@ -199,8 +200,7 @@ def test_a_step_consumes_a_gradient_where_it_is_made_only_into_device_resident_s
         trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
                           dynamic_scale=scaled)
         state, _, _ = trainer.place()
-        assert consumed_where_made(trainer.objective, trainer.optimizer, state, 1, shared=True,
-                                   progressed=False) is consumed
+        assert consumed_where_made(trainer.optimizer, state, 1, shared=True, progressed=False) is consumed
 
 
 def test_a_diloco_groups_step_is_planned_by_its_own_optimizer_state():
@@ -223,26 +223,56 @@ def test_a_diloco_groups_step_is_planned_by_its_own_optimizer_state():
             for probe in ahead.plan["probes"]] == [(True, True)]
 
 
-def test_a_step_whose_head_takes_its_gradient_in_the_backward_holds_every_gradient():
-    """A decoder's head that takes its gradient in the backward a tile at a time holds every gradient to the
-    step's end, as XLA schedules its weight gradients and updates after the whole backward (row 3653); its
-    whole logits, and its tile taking its gradient in the forward, consume each where it is made, as does
-    a head past a transform, which no matrix alone is and so keeps its whole logits whatever its tile
-    (`chunked.head_cross_entropy`), the step's loss traced as the derivation traces it (`traced_loss`)."""
+def test_a_head_that_takes_its_gradient_in_the_backward_has_its_weight_gradients_derived_last():
+    """A decoder's head that takes its gradient in the backward a tile at a time, unfused, has XLA run every
+    layer's weight gradient after the whole backward on an H100, holding the products' operands to then,
+    and on an A100 in each layer's backward (`GpuTarget.late_weight_gradients`, row 3341's calibration):
+    the derivation runs the gradient's own equations last there (`sunk`), each weight's product among them
+    and no cotangent the backward reads on, so four layers' weight gradients hold three activations and
+    three cotangents to the end, where run in the backward each frees its operands as it goes. Each
+    gradient is still read where it is made, whatever the head (`consumed_where_made`)."""
+    from dew.training.footprint import late_weight_gradients, sunk, traced_gradient
+
+    rows, square = jax.ShapeDtypeStruct((TOKENS * 16, WIDTH), jnp.float32), (WIDTH, WIDTH)
+    layers = [jax.ShapeDtypeStruct(square, jnp.float32) for _ in range(4)]
+
+    def chained(layers, rows):
+        for weights in layers:
+            rows = rows @ weights
+        return jnp.sum(rows), ()
+
+    def weights_last(program) -> bool:
+        """Whether every weight's product runs after every product another of the backward's reads."""
+        products = [equation for equation in program.eqns if equation.primitive.name == "dot_general"]
+        weights = [index for index, equation in enumerate(products)
+                   if equation.outvars[0].aval.shape == square]
+        read = {value for equation in products if equation.outvars[0].aval.shape != square
+                for value in equation.invars}
+        chained = [index for index, equation in enumerate(products) if equation.outvars[0] in read]
+        return len(weights) == 4 and max(chained) < min(weights)
+
+    program, count, _ = traced_gradient(chained, layers, (rows,))
+    program = compiled(program.replace(outvars=program.outvars[:count]), "cuda")
+    assert not weights_last(program) and weights_last(sunk(program))
+    early, late = (gradient_peak(chained, layers, (rows,), platform="gpu", workspace=Workspace(0, 0),
+                                 consumed=True, deferred=deferred).bytes for deferred in (False, True))
+    activation = TOKENS * 16 * WIDTH * 4
+    assert late >= early + 2 * activation
+    assert late_weight_gradients(compile_only_gpus("sm90", 1)[0])
+    assert not late_weight_gradients(compile_only_gpus("sm80", 1)[0])
     batch = {key: jnp.asarray(rows) for key, rows in token_rows(VOCAB, 2, 17).items()}
-    for transform, cases in ((None, (((16, 128), False, False), ((16, 128), True, True), (None, True, True))),
-                             ("gelu", (((16, 128), False, True),))):
+    for transform, cases in ((None, (((16, 128), False), ((16, 128), True), (None, True))),
+                             ("gelu", (((16, 128), False),))):
         model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, head_transform=transform)
         objective = LMObjective(model, 16, head_tile=(16, 128))
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                           layout=Layout(min_shard=1, tolerance=1.0))
         state, _, _ = trainer.place()
-        for tile, fused, consumed in cases:
+        for tile, fused in cases:
             objective.restore_head(tile, fused=fused)
             loss, arguments = traced_loss(objective, state, 1, 1)
             jax.eval_shape(loss, arguments[0], batch, *arguments[1:])
-            assert consumed_where_made(objective, trainer.optimizer, state, 1, shared=True,
-                                       progressed=False) is consumed
+            assert consumed_where_made(trainer.optimizer, state, 1, shared=True, progressed=False)
 
 
 class Layers(Features):

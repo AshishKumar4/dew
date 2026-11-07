@@ -5,6 +5,7 @@ import binascii
 import contextlib
 import functools
 import io
+import itertools
 import json
 import math
 import threading
@@ -21,6 +22,7 @@ from jax.typing import DTypeLike
 from PIL import Image
 
 from dew import _records
+from dew._files import write_atomically
 from dew._records import JSON, json_value, record
 from dew.batch import Variables
 from dew.checkpoints import Checkpoints
@@ -68,7 +70,6 @@ from dew.decision.questions import (
     Question,
     ScoreAnswer,
 )
-from dew.files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import (
     InItsForm,
@@ -117,6 +118,45 @@ class Budget:
     """The options every question of a pass pads to, the run's widest (training's own static width);
     None rounds each pass's widest up to a power of two, a program for each, compiled as it comes. A
     request of more widens its pass, compiling it."""
+
+
+@dataclass(frozen=True)
+class Knockout:
+    """Laya's tournament rule (`predict_tournament`): the options cut into near-equal groups of at most
+    `group`, each group's winner going on, round after round, until one group is left to answer the
+    question; the answer's probabilities cover that last round's options alone."""
+
+    group: int = 16
+
+    def __post_init__(self) -> None:
+        if self.group < 2:
+            raise ValueError("a tournament groups at least two options")
+
+
+@dataclass(frozen=True)
+class Finalists:
+    """A released engine's knock-out (StartLuxLabs/StartLux-Decision a99977d93, `startlux_decide`'s
+    pipeline and readout, its `wide_choice` defaults): a choice of more than `final` options is cut into
+    near-equal consecutive groups of at most `group`, the first ones one longer, each read once; the
+    `keep` best of each group, in group order, are its finalists, the `final` best of them by that round
+    where more qualify; the final round reads them, and the answer covers every option, the finalists
+    sharing 1 - `residual` as the final gave it them and the others `residual` in proportion to their
+    group round's probabilities."""
+
+    group: int = 25
+    keep: int = 3
+    final: int = 26
+    residual: float = 1e-3
+
+    def __post_init__(self) -> None:
+        if not (self.group >= 2 and 1 <= self.keep <= self.group and self.final >= 2
+                and 0 <= self.residual < 1):
+            raise ValueError("finalists need 2 <= group, 1 <= keep <= group, 2 <= final and "
+                             "0 <= residual < 1")
+
+
+LAYA_ROUNDS = Knockout()
+"""Laya's rounds, a tournament's by default."""
 
 
 @dataclass(frozen=True)
@@ -233,8 +273,18 @@ def _calibrated(directory: str, weights: Weights | None = None
     saved = kept if kept is not None and kept.exists() else epath.Path(directory) / TASK_FILE
     if not saved.exists():
         return None
-    settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
+    settings = _earlier_settings(_records.record(json.loads(saved.read_text()), TASK_FILE))
     return settings, from_record(Weights, _records.json_value(settings["weights"], "weights"))
+
+
+def _earlier_settings(settings: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved task's settings (`TASK_FILE`) in the shapes `Decide.save` writes now, read here and nowhere
+    else (`_calibrated`): a budget saved before a pass's question slots were its windows' (ledger 2385)
+    names the questions it padded to, which no pass reads now. Carried to 1.0 (ledger 1552)."""
+    budget = settings.get("budget")
+    if not isinstance(budget, Mapping) or "questions" not in budget:
+        return settings
+    return {**settings, "budget": {name: value for name, value in budget.items() if name != "questions"}}
 
 
 @dataclass(frozen=True)
@@ -393,11 +443,7 @@ class Decide(SavedRunTask, InItsForm):
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
                 f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
-        saved = dict(_records.record(settings["budget"], "budget"))
-        # A budget saved before a pass's question slots were its windows' (ledger 2385) names the questions
-        # it padded to, which no pass reads now.
-        saved.pop("questions", None)
-        budget = from_record(Budget, _records.json_value(saved, "budget"))
+        budget = from_record(Budget, _records.json_value(settings["budget"], "budget"))
         # An options width the saved budget leaves None is the run's recorded one (`DecideSettings.options`).
         if budget.options is None:
             budget = replace(budget, options=task.budget.options)
@@ -534,9 +580,10 @@ class Decide(SavedRunTask, InItsForm):
 
     def _persisted(self, directory: str) -> None:
         """The average's weights written to `directory`, its calibration file already there, as a run of
-        its own (`save`): its state at its weights' step, the optimizer's empty, under its record, where
-        the directory holds no checkpoint yet; one it holds is this average's (`_claimed`). Its counters
-        and key are placed over the task's mesh (`_mesh`), as a pool's save writes them."""
+        its own (`save`): its model alone at its weights' step (`Checkpoints.save`'s `weights_only`), which
+        resumes nothing, under its record, where the directory holds no checkpoint yet; one it holds is
+        this average's (`_claimed`). Its counters are placed over the task's mesh (`_mesh`), as a pool's
+        save writes them; the state's other fields, which the model's item leaves out, are scaffolding."""
         import optax
 
         from dew.decision.objective import DecisionObjective
@@ -555,19 +602,20 @@ class Decide(SavedRunTask, InItsForm):
             # The record names the numerics the average answers under (`traced`).
             with self.traced():
                 record = DecisionObjective(self).inference_record()
-            checkpoints.save(self.weights.step, state, artifact=record)
+            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True)
             checkpoints.wait()
 
     @overload
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
-                 images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]: ...
+                 images: Sequence[Image.Image] = (), context: JSON | None = None,
+                 request: Mapping[str, Question] | None = None) -> dict[str, Answer]: ...
 
     @overload
     def __call__(self, state: Sequence[tuple[JSON, Mapping[str, Question]]], questions: None = None, *,
                  contexts: Sequence[JSON | None] | None = None) -> list[dict[str, Answer]]: ...
 
     @traced_in_its_form
-    def __call__(self, state, questions=None, *, images=(), context=None, contexts=None):
+    def __call__(self, state, questions=None, *, images=(), context=None, contexts=None, request=None):
         """Return one answer per question in `questions`, about `state` and any `images`; or, given a
         sequence of `(state, questions)` requests and no `questions`, each request's answers in order.
 
@@ -576,13 +624,25 @@ class Decide(SavedRunTask, InItsForm):
         need a layout with a place for them (`Layout.images`) and the backbone's processor, as a
         joint-head release brings. `context` is a sequence the decision reads beside the state through
         the backbone's cross-attention (`Example.context`), and `contexts` each request's, in order.
+        `request` is the whole request `questions` are asked from, which a summary of it writes
+        (`RequestSummary`), where they are a part of it: a tournament's rounds (`tournament`).
         """
         if questions is None:
+            if request is not None:
+                raise ValueError("each of a batch's requests is its own whole request; ask a part of one "
+                                 "with questions= and request=")
+            if images or context is not None:
+                raise ValueError("a batch of requests reads no one request's images or context: give each "
+                                 "request's context in contexts=, and ask a request with images alone")
             return [answers for answers, _ in self._answered(self.rows(state, contexts=contexts),
                                                              [asked for _, asked in state])]
+        if contexts is not None:
+            raise ValueError("one request reads its context in context=; contexts= is a batch's, each "
+                             "request's own")
         if images:
-            return self._seen(state, questions, images, context)[0]
-        return self._answered(self.rows([(state, questions)], contexts=[context]), [questions])[0][0]
+            return self._seen(state, questions, images, context, request=request)[0]
+        return self._answered([self._encoded(state, questions, context=context, request=request)],
+                              [questions])[0][0]
 
     def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
              contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
@@ -719,17 +779,20 @@ class Decide(SavedRunTask, InItsForm):
         return self.layout.rows(self.tokenizer, self.specials, "", {"q": Choice("x", ["0"])})
 
     def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
-              context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:
-        """One request's answers and usage, its images laid out in its one row."""
-        return self._looked(questions, *self._shown(state, questions, images, context))
+              context: JSON | None = None, *, request: Mapping[str, Question] | None = None
+              ) -> tuple[dict[str, Answer], Usage]:
+        """One request's answers and usage, its images laid out in its one row, its questions asked from
+        `request` where they are a part of it."""
+        return self._looked(questions, *self._shown(state, questions, images, context, request=request))
 
     def _shown(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
-               context: JSON | None = None) -> tuple[Encoded, Images]:
+               context: JSON | None = None, *, request: Mapping[str, Question] | None = None
+               ) -> tuple[Encoded, Images]:
         """A request's one row with its images laid out before the state, and the images."""
         if self.processor is None or not self.layout.images:
             raise ValueError("images need a backbone with a vision encoder, which this task does not have")
         media = Images.of(self.processor, images, self.processor.image_text())
-        rows = self._encoded(state, questions, media.tokens, context=context)
+        rows = self._encoded(state, questions, media.tokens, context=context, request=request)
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")
         return rows[0], media
@@ -757,8 +820,11 @@ class Decide(SavedRunTask, InItsForm):
         return self.model.context_length
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
-                 media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
-        laid = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
+                 media: Sequence[int] = (), *, context: JSON | None = None,
+                 request: Mapping[str, Question] | None = None,
+                 tokens: Sequence[int] | None = None) -> list[Encoded]:
+        laid = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media, request=request,
+                                tokens=tokens)
         for row in laid:
             # A row whose declared budgets cut its options alike is answered as its release answers it,
             # the cut in its usage; training leaves such a row out (`Layout.refusal`).
@@ -857,33 +923,83 @@ class Decide(SavedRunTask, InItsForm):
         return logits(model, variables, inputs, media=media)
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,
-                   group: int = 16) -> dict[str, Answer]:
-        """Return answers in which every choice of more than `group` options is decided in rounds.
+                   rounds: Knockout | Finalists = LAYA_ROUNDS) -> dict[str, Answer]:
+        """Return answers in which every choice of more options than one pass reads is decided in rounds,
+        by `rounds`' rule: Laya's knock-out (`Knockout`) or a released engine's finalists (`Finalists`).
 
-        The options are cut into near-equal groups of at most `group`, and each
-        group's winner goes on, until one group is left to answer the question
-        (Laya's `predict_tournament`). A finalist's probabilities cover only the last
-        round's options. Each question plays its own rounds: one whose finalists fit a
-        group is not split again while the others play on, and waits for the final with
-        its finalists unchanged.
+        Each question plays its own rounds: one whose finalists fit a pass is not split again while the
+        others play on, and waits for the final with its finalists unchanged.
         """
-        if group < 2:
-            raise ValueError("a tournament groups at least two options")
+        if isinstance(rounds, Finalists):
+            return self._finalists(state, questions, rounds)
+        group = rounds.group
         remaining = {name: list(question.options) for name, question in questions.items()
                      if isinstance(question, Choice) and len(question.options) > group}
         while playing := {name: options for name, options in remaining.items() if len(options) > group}:
-            rounds = {}
+            played = {}
             for name, options in playing.items():
                 parts = -(-len(options) // group)
                 for part in range(parts):
                     chosen = options[part * len(options) // parts:(part + 1) * len(options) // parts]
-                    rounds[f"{name}/{part}"] = _restricted(questions[name], chosen)
-            answers = self(state, rounds)
-            remaining |= {name: [_choice(answers[key]) for key in rounds if key.rsplit("/", 1)[0] == name]
+                    played[f"{name}/{part}"] = _restricted(questions[name], chosen)
+            answers = self._played(state, played, questions)
+            remaining |= {name: [_choice(answers[key]) for key in played if key.rsplit("/", 1)[0] == name]
                           for name in playing}
         final = {name: _restricted(question, remaining[name]) if name in remaining else question
                  for name, question in questions.items()}
-        return self(state, final)
+        return self(state, final, request=questions)
+
+    def _played(self, state: JSON, played: Mapping[str, Question], request: Mapping[str, Question]
+                ) -> dict[str, Answer]:
+        """A round's answers, each group `played` under its key (`<name>/<group>`) asked as its question
+        `<name>` of the whole `request`, its row summarizing that request with it current
+        (`RequestSummary`), every group scored in one call."""
+        names = {key: key.rsplit("/", 1)[0] for key in played}
+        # The state's tokens encoded once for every group's row (`Layout.state`).
+        tokens = self.layout.state(self.tokenizer, self.specials, state)
+        encoded = [self._encoded(state, {names[key]: question}, request=request, tokens=tokens)
+                   for key, question in played.items()]
+        answered = self._answered(encoded, [{names[key]: question} for key, question in played.items()])
+        return {key: answers[names[key]] for key, (answers, _) in zip(played, answered, strict=True)}
+
+    def _finalists(self, state: JSON, questions: Mapping[str, Question], rounds: Finalists
+                   ) -> dict[str, Answer]:
+        """`tournament` by a released engine's rule (`Finalists`): one round of groups, each group's `keep`
+        best its finalists, the `final` best of them by that round where more qualify, then the final, and
+        every option's probability in the answer, the knocked-out ones sharing `residual`."""
+        wide = {name: _near_equal(list(question.options), rounds.group)
+                for name, question in questions.items()
+                if isinstance(question, Choice) and len(question.options) > rounds.final}
+        played = {f"{name}/{part}": _restricted(questions[name], chosen)
+                  for name, groups in wide.items() for part, chosen in enumerate(groups)}
+        answers = self._played(state, played, questions) if played else {}
+        first: dict[str, dict[str, float]] = {name: {} for name in wide}
+        finalists: dict[str, list[str]] = {}
+        for name, groups in wide.items():
+            kept = []
+            for part in range(len(groups)):
+                answer = answers[f"{name}/{part}"]
+                assert isinstance(answer, ChoiceAnswer)
+                seen = dict(zip(answer.options, map(float, answer.probabilities), strict=True))
+                first[name] |= seen
+                # The best of the group, a tie to the earlier option (a stable sort, as the engine's).
+                kept += sorted(answer.options, key=lambda option: -seen[option])[:rounds.keep]
+            if len(kept) > rounds.final:
+                kept = sorted(kept, key=lambda option: -first[name][option])[:rounds.final]
+            finalists[name] = kept
+        final = self(state, {name: _restricted(question, finalists[name]) if name in finalists else question
+                             for name, question in questions.items()}, request=questions)
+        for name in finalists:
+            question, answer = questions[name], final[name]
+            assert isinstance(answer, ChoiceAnswer)
+            combined = _knocked_out(dict(zip(answer.options, answer.probabilities, strict=True)),
+                                    first[name], rounds.residual)
+            # Every option in the engine's order, the finalists as the final round holds them first, so
+            # equal answers resolve as its `choice_answer` resolves them; abstaining as the whole question.
+            spread = np.asarray(list(combined.values()), np.float64)
+            final[name] = ChoiceAnswer(tuple(combined), spread, self.confidence(question, spread),
+                                       abstained=self.calibration.abstains(question, spread))
+        return final
 
     def calibrated(self, held_out: Iterable[Example | Mapping[str, object]] | Reader, *,
                    binning: bool = False, target_error: float | None = None,
@@ -1493,6 +1609,28 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
 def whole_blocks_of(layout: Layout) -> bool:
     """Whether `layout`'s rows are each one block of the whole row (`QuestionLayout.split` 'whole')."""
     return isinstance(layout, QuestionLayout) and layout.blocks and layout.split == "whole"
+
+
+def _near_equal(options: Sequence[str], group: int) -> list[list[str]]:
+    """`options` in near-equal consecutive groups of at most `group`, the first ones one longer
+    (`knockout_groups`, startlux_decide/readout.py, StartLuxLabs/StartLux-Decision a99977d93)."""
+    parts = -(-len(options) // group)
+    size, extra = divmod(len(options), parts)
+    bounds = np.cumsum([0] + [size + (part < extra) for part in range(parts)])
+    return [list(options[start:end]) for start, end in itertools.pairwise(bounds)]
+
+
+def _knocked_out(final: Mapping[str, float], first: Mapping[str, float], residual: float) -> dict[str, float]:
+    """Every option's probability after a knock-out (`knockout_combine`, startlux_decide/readout.py at
+    a99977d93): the finalists share 1 - `residual` as the final round gave it them, every other option
+    `residual` in proportion to its probability in its group's round (shared evenly where those are all
+    zero), all over their total."""
+    rest = [option for option in first if option not in final]
+    mass = sum(first[option] for option in rest)
+    spread = {option: float(value) * (1 - residual) for option, value in final.items()}
+    spread |= {option: residual * first[option] / mass if mass else residual / len(rest) for option in rest}
+    total = sum(spread.values())
+    return {option: value / total for option, value in spread.items()}
 
 
 def _restricted(question: Question, options: Sequence[str]) -> Choice:

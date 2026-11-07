@@ -1,39 +1,33 @@
 #!/usr/bin/env python3
-"""Write tests/fixtures/flow/loss.npz: Diffusers' flow-matching training
-loss and its gradient on the draws Dew's DiffusionObjective makes.
+"""Write tests/fixtures/flow/loss.npz: the inputs on which the flow-matching
+test runs Diffusers' training loss against Dew's DiffusionObjective, and
+`published_loss`, the loss it runs.
 
 The loss is the Flux DreamBooth script's (examples/dreambooth/
 train_dreambooth_flux.py at Diffusers v0.34.0): its statements from the
 noising to the reduction, `noisy_model_input = (1.0 - sigmas) * ...`,
 `weighting = compute_loss_weighting_for_sd3(...)`, `target = noise -
 model_input` and the two-line mean, read out of the published file's
-`main` and executed as written, with the installed Diffusers 0.34.0's
-`compute_loss_weighting_for_sd3` at its "logit_normal" scheme. Between the
-noising and the weighting a stand-in velocity network, the same function as
-the test's, takes the place of the transformer call, at the script's
-timestep (sigma times 1000); the script's latent packing and the model call
-itself are the transformer's and not the loss's.
+`main` and recorded here, executed as written with the installed Diffusers
+0.34.0's `compute_loss_weighting_for_sd3` at its "logit_normal" scheme.
+Between the noising and the weighting a stand-in velocity network, the
+same function as the test's, takes the place of the transformer call, at
+the script's timestep (sigma times 1000); the script's latent packing and
+the model call itself are the transformer's and not the loss's. The test
+draws the times and noise per seed and hands them to both sides.
 
-The draws come from `jax.random.key(KEY)`: its split's third key draws the
-training times, as `presets.Flow(shift=...)`'s schedule draws them, and the
-fourth the noise, which the test hands DiffusionObjective.loss by name
-(`Step.tape`); sigma is the schedule's
-noise rate at those times, so the script runs on Dew's own sigmas. The
-static shift that maps the drawn time to sigma is held on its own, against
-`FlowMatchEulerDiscreteScheduler(shift=3)`'s published grid, which lands
-here too. Each case runs in float32 and in float64, `.float()` reading the
-run's precision.
+The static shift that maps the drawn time to sigma is held on its own,
+against `FlowMatchEulerDiscreteScheduler(shift=3)`'s published grid, which
+lands here too.
 
     PYTHONPATH=src python tools/flow_loss_reference.py
 """
 
 from __future__ import annotations
 
-import json
 import types
 from pathlib import Path
 
-import jax
 import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
@@ -41,12 +35,10 @@ from diffusers.training_utils import compute_loss_weighting_for_sd3
 from reference_source import fetched, selected, simple_statements
 from torch_precision import float_as, replaced
 
-from dew.diffusion import presets
-
 SCRIPT = ("https://raw.githubusercontent.com/huggingface/diffusers/50dea89dc6036e71a00bc3d57ac062a80206d9eb/"
           "examples/dreambooth/train_dreambooth_flux.py")
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flow" / "loss.npz"
-SHAPE, KEY, SHIFTS = (6, 4, 4, 3), 9, (1.0, 3.0)
+SHAPE, SHIFTS = (6, 4, 4, 3), (1.0, 3.0)
 STATEMENTS = ("noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise",
               "weighting = compute_loss_weighting_for_sd3(", "target = noise - model_input",
               "loss = torch.mean(", "loss = loss.mean()")
@@ -68,44 +60,39 @@ def velocity(weights, x, timestep):
             + torch.cos(x) * time * weights[2] + time * weights[3])
 
 
+def published_loss(statements: tuple[str, str], weights, pixels, noise, sigmas, dtype) -> dict:
+    """The script's loss statements, as published, at `dtype` on the stand-in velocity network: the loss
+    and its gradient in the network's weights, from the pixels, noise and sigmas it is handed."""
+    noising, loss_lines = statements
+    x = (np.asarray(pixels).astype(np.float32) - np.float32(127.5)) / np.float32(127.5)
+    parameters = torch.tensor(np.asarray(weights), dtype=dtype, requires_grad=True)
+    scope = {"torch": torch, "compute_loss_weighting_for_sd3": compute_loss_weighting_for_sd3,
+             "args": types.SimpleNamespace(weighting_scheme="logit_normal"),
+             "model_input": torch.tensor(x, dtype=dtype),
+             "noise": torch.tensor(np.asarray(noise), dtype=dtype),
+             "sigmas": torch.tensor(np.asarray(sigmas), dtype=dtype).reshape(-1, 1, 1, 1)}
+    with replaced(float_as(dtype)):
+        exec(noising, scope)
+        scope["model_pred"] = velocity(parameters, scope["noisy_model_input"],
+                                       scope["sigmas"].flatten() * 1000)
+        exec(loss_lines, scope)
+        scope["loss"].backward()
+    return {"loss": scope["loss"].detach().numpy(), "gradient": parameters.grad.numpy()}
+
+
 def main() -> None:
     noising, loss_lines = published()
     generator = np.random.default_rng(13)
     pixels = generator.integers(0, 256, SHAPE, dtype=np.uint8)
-    x = (pixels.astype(np.float32) - np.float32(127.5)) / np.float32(127.5)
     weights = (generator.standard_normal((4, *SHAPE[1:])) * 0.4).astype(np.float32)
-    keys = jax.random.split(jax.random.key(KEY), 5)
-    noise = np.array(jax.random.normal(keys[3], SHAPE))
     scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=3.0)
-    arrays = {"pixels": pixels, "weights": weights, "key": np.asarray(KEY), "shifts": np.asarray(SHIFTS),
-              "noising": np.asarray(noising), "loss_lines": np.asarray(loss_lines),
-              # The scheduler's grid before its static shift, and after it.
-              "grid": np.linspace(1, 1000, 1000, dtype=np.float32)[::-1] / 1000,
-              "grid_shifted_3": scheduler.sigmas.numpy()}
-    for index, shift in enumerate(SHIFTS):
-        schedule = presets.Flow(shift=shift)().schedule
-        t = schedule.sample_t(keys[2], SHAPE[0])
-        sigmas = np.array(schedule.rates(t)[1])
-        arrays[f"sigmas_{index}"] = sigmas
-        for dtype, suffix in ((torch.float32, ""), (torch.float64, "_f64")):
-            parameters = torch.tensor(weights, dtype=dtype, requires_grad=True)
-            scope = {"torch": torch, "compute_loss_weighting_for_sd3": compute_loss_weighting_for_sd3,
-                     "args": types.SimpleNamespace(weighting_scheme="logit_normal"),
-                     "model_input": torch.tensor(x, dtype=dtype), "noise": torch.tensor(noise, dtype=dtype),
-                     "sigmas": torch.tensor(sigmas, dtype=dtype).reshape(-1, 1, 1, 1)}
-            with replaced(float_as(dtype)):
-                exec(noising, scope)
-                scope["model_pred"] = velocity(parameters, scope["noisy_model_input"],
-                                               scope["sigmas"].flatten() * 1000)
-                exec(loss_lines, scope)
-                scope["loss"].backward()
-            arrays[f"loss_{index}{suffix}"] = scope["loss"].detach().double().numpy()
-            arrays[f"grad_{index}{suffix}"] = parameters.grad.double().numpy()
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
-    losses = {f"shift {shift}": float(arrays[f"loss_{index}_f64"]) for index, shift in enumerate(SHIFTS)}
-    print(f"{FIXTURE}: {json.dumps(losses)}")
-
+    np.savez(FIXTURE, pixels=pixels, weights=weights, shifts=np.asarray(SHIFTS), noising=np.asarray(noising),
+             loss_lines=np.asarray(loss_lines),
+             # The scheduler's grid before its static shift, and after it.
+             grid=np.linspace(1, 1000, 1000, dtype=np.float32)[::-1] / 1000,
+             grid_shifted_3=scheduler.sigmas.numpy())
+    print(FIXTURE)
 
 if __name__ == "__main__":
     main()

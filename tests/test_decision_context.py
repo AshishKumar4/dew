@@ -18,7 +18,7 @@ from model_support import flat_tree
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 
-from dew.batch import FROZEN, thaw
+from dew.batch import FROZEN, thaw, unboxed
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
@@ -246,11 +246,15 @@ def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
     def arm(objective, batches):
         return as_given(lambda variables: scored(objective, batches, variables))
 
-    initialized = jax.jit(packed.init)
+    # A draw of every parameter, the backbone's too: `init` alone takes the objective's held checkpoint
+    # as its tree, the same at every seed (`Objective.init`), which leaves check 1 one rounding draw; a
+    # draw's leaves are its arrays, unboxed of their axes, as a loaded tree's are.
+    initialized = jax.jit(lambda key: unboxed(packed.init(key, variables={})))
     wide = copy.copy(alone)
     wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
                                alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
 
+    @as_given
     def truth(variables):
         with jax.enable_x64(new_val=True):
             return scored(wide, windows["alone"], widened(variables))
@@ -313,6 +317,7 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
     reading = Decide(crossed.model, variables, crossed.layout, crossed.tokenizer, crossed.specials)
     wide = {}
 
+    @as_given
     def truth(seed):
         with jax.enable_x64(new_val=True):
             if "task" not in wide:
@@ -422,6 +427,7 @@ def test_a_batch_answers_each_request_from_its_own_context():
             return scored(reading, asked)
         return np.concatenate([scored(reading, [one]) for one in asked])
 
+    @as_given
     def truth(seed):
         with jax.enable_x64(new_val=True):
             if "task" not in wide:
@@ -461,6 +467,7 @@ def test_a_request_with_images_reads_its_context_beside_them():
 
     shut, wide = task(variables), {}
 
+    @as_given
     def truth(seed):
         with jax.enable_x64(new_val=True):
             if "task" not in wide:

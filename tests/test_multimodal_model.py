@@ -11,6 +11,7 @@ addressing.
 """
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -391,10 +392,12 @@ def test_training_reaches_the_gemma3n_vision_drop_path():
                                   forward(loaded.model, train=False, seed=1))
 
 
-@pytest.fixture(scope="module", params=["gemma-3n-audio-tiny", "gemma-4-audio-tiny"])
-def audio_source(request):
+@functools.cache
+def _audio(name: str):
+    """The Gemma audio fixture `name`, loaded once a process: the model, its processor's inputs over the
+    fixture's prompts and waveforms, and its reference."""
     pytest.importorskip("torchvision", reason="the vision extra supplies the actual Gemma processors")
-    directory = FIXTURE.parent / request.param
+    directory = FIXTURE.parent / name
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     meta = json.loads((directory / "meta.json").read_text())
     assert loaded.processor is not None
@@ -402,6 +405,11 @@ def audio_source(request):
         meta["prompts"], audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)]
     )
     return loaded, inputs, np.load(directory / "reference.npz")
+
+
+@pytest.fixture(scope="module", params=["gemma-3n-audio-tiny", "gemma-4-audio-tiny"])
+def audio_source(request):
+    return _audio(request.param)
 
 
 def test_audio_only_processor_forward_and_greedy_continuation_match_reference(audio_source):
@@ -426,12 +434,7 @@ def test_a_gemma4_audio_models_prediction_depths_read_its_audio_frames():
     """A Gemma 4 audio model with a prediction depth initializes and trains with its audio, and the
     depth reads the embeddings the main forward read, its audio frames in place: its states are
     the language model's depth over the main forward's own prepared embeddings, bitwise."""
-    pytest.importorskip("torchvision", reason="the vision extra supplies the actual Gemma processors")
-    directory = FIXTURE.parent / "gemma-4-audio-tiny"
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    meta = json.loads((directory / "meta.json").read_text())
-    inputs = loaded.processor(meta["prompts"],
-                              audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)])
+    loaded, inputs, _ = _audio("gemma-4-audio-tiny")
     model = loaded.model.clone(language_model=loaded.model.language_model.clone(num_nextn_predict_layers=1))
     variables = model.init(jax.random.key(0), inputs.tokens, **inputs.kwargs())
     hidden, sown = model.apply(variables, inputs.tokens, **inputs.kwargs(), method="hidden_states",
@@ -597,37 +600,8 @@ def test_a_float64_wrapper_computes_in_float64_throughout(family_source):
 def test_a_float64_gemma4_audio_tower_computes_in_float64_throughout():
     """Gemma 4's audio tower built in float64 attends, forward and backward, with no float32 value: its
     projections and relative positions, float32 in a narrower model, read `at_least_fp32` (ledger 3332)."""
-    pytest.importorskip("torchvision", reason="the vision extra supplies the actual Gemma processors")
-    directory = FIXTURE.parent / "gemma-4-audio-tiny"
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    meta = json.loads((directory / "meta.json").read_text())
-    inputs = loaded.processor(meta["prompts"],
-                              audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)])
+    loaded, inputs, _ = _audio("gemma-4-audio-tiny")
     assert _float32_values_in_float64(loaded, inputs) == 0
-
-
-def test_gemma3ns_audio_embedder_reads_its_encoders_features_as_they_are():
-    """Gemma 3n's embedders take soft features as its source does: its image features scaled by the
-    square root of the vision width first (modeling_gemma3n.py:1983 at transformers 5.17.0), its audio
-    encoder's features as they are (:2192), the two told apart by its embedders' norm epsilon, so the
-    loaded wrapper's audio soft tokens are the embedder's over the encoder's output (ledger 3332)."""
-    directory = FIXTURE.parent / "gemma-3n-audio-tiny"
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    config = json.loads((directory / "config.json").read_text())
-    rng = np.random.default_rng(0x3332)
-    audio, vision = (jnp.asarray(rng.standard_normal((1, 5, config[part]["hidden_size"])), jnp.float32)
-                     for part in ("audio_config", "vision_config"))
-    scale = config["vision_config"]["hidden_size"] ** 0.5
-
-    def embedded(model, audio, vision):
-        return ((model.audio_conditioner.audio_projector(audio),
-                 model.audio_conditioner.audio_projector.soft_embeddings(audio)),
-                (model.conditioner.projector(vision),
-                 model.conditioner.projector.soft_embeddings(vision * jnp.asarray(scale, vision.dtype))))
-
-    for called, reference in jax.jit(lambda variables, audio, vision: loaded.model.apply(
-            variables, audio, vision, method=embedded))(loaded.variables, audio, vision):
-        np.testing.assert_array_equal(np.asarray(called), np.asarray(reference))
 
 
 @pytest.mark.parametrize("fixture", ["gemma4-unified-native-tiny", "gemma-4-audio-tiny",

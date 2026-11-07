@@ -10,7 +10,7 @@ permute's (id 1: collective-permute, send, recv; xla/backends/gpu/collectives/gp
 that holds both, or collectives over two groupings of its GPUs, makes several over the same GPUs.
 
 `import dew` has NCCL connect each communicator's rings, trees and NVLS peers as it creates it
-(NCCL_RUNTIME_CONNECT=0, `dew.devices.connect_at_creation`), where XLA returns a failure to every rank as an
+(NCCL_RUNTIME_CONNECT=0, `dew._devices.connect_at_creation`), where XLA returns a failure to every rank as an
 error. Connected lazily, as NCCL does by default since 2.22, a rank that fails to allocate at a collective's
 first launch leaves its peer waiting inside XLA's first-call rendezvous, which aborts the process after 40
 seconds (xla/service/rendezvous.cc, LOG(FATAL)): a 2xH100 LoRA run, whose first all-to-all one GPU entered
@@ -22,7 +22,7 @@ divides them, a collective's communicator, an all-to-all's connections to every 
 communicator connected along each directed pair in turn, as NCCL picks each peer's transport apart, and
 reports the bytes each GPU's driver saw go: NCCL's, and the runtime's own beside its pool. The answer is kept
 in Dew's cache per configuration (`configuration`), so a host pays for it once. The pool's share then leaves
-that room at NCCL's full speed, the run's share its upper bound (`dew.devices.pool_bound`, `pool_share`): the
+that room at NCCL's full speed, the run's share its upper bound (`dew._devices.pool_bound`, `pool_share`): the
 pool need hold only the compiled step, which the fit check holds to it, so no channel or buffer of NCCL's is
 cut to fit. Every program Dew compiles passes one point (`dew.nn.kernels.templates.report.compiled`), where
 its communicators, read from its HLO by the parser the FLOP count reads, are held with those of the programs
@@ -47,9 +47,9 @@ import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxlib.xla_client import LoadedExecutable
 
-from dew import pool
-from dew.cache import dew_cache_dir, package_digest
-from dew.devices import (
+from dew import _pool
+from dew._cache import dew_cache_dir, package_digest
+from dew._devices import (
     backend_open,
     cuda_driver_version,
     cuda_plugin,
@@ -61,8 +61,8 @@ from dew.devices import (
     nccl_version,
     pool_bound,
 )
-from dew.files import write_atomically
-from dew.telemetry.instrumentation import hlo_instructions
+from dew._files import write_atomically
+from dew.telemetry.instrumentation import compiled_memory, hlo_instructions
 from dew.telemetry.trace import collective
 
 _log = logging.getLogger(__name__)
@@ -202,9 +202,9 @@ class CommunicatorRoom(ValueError):
 
 
 def local_gpus() -> tuple[int, ...] | None:
-    """The GPUs this process's JAX opens, by the driver's ordinals (`dew.pool.local_gpus` under JAX's own
+    """The GPUs this process's JAX opens, by the driver's ordinals (`dew._pool.local_gpus` under JAX's own
     selection, `jax_cuda_visible_devices`); None where they could not be counted."""
-    return pool.local_gpus(jax.config.read("jax_cuda_visible_devices"))
+    return _pool.local_gpus(jax.config.read("jax_cuda_visible_devices"))
 
 
 def configuration() -> dict:
@@ -279,7 +279,7 @@ def everything(gpus: Iterable[int]) -> Collectives:
 
 
 def pool_share(needs: Needs, memory: Mapping[int, tuple[int, int]], bound: float, held: Collectives) -> float:
-    """The share of each GPU XLA's pool takes: the run's `bound` (`dew.devices.pool_bound`) at most, held to
+    """The share of each GPU XLA's pool takes: the run's `bound` (`dew._devices.pool_bound`) at most, held to
     leave each GPU the room `held`'s communicators and the runtime take outside it at NCCL's full speed, the
     tightest GPU deciding, to a thousandth below. The pool need hold only the compiled step, which the fit
     check holds to it after. `memory` is each GPU's free and total bytes before the backend opens, every
@@ -423,7 +423,7 @@ def sized_pool(*, measure: Callable[[], Needs | None] = needs_of,
     """Size XLA's pool on a host of several GPUs to leave room for its communicators (`pool_share`), before
     the backend opens, the run's share its upper bound, and return the sizing; the process holds it once
     `hold` is given it. None where nothing is sized: a process off CUDA (`cuda`, JAX's CUDA plugin by
-    default) or whose backend has opened (`opened`), a pool of no fixed share (`dew.devices.pool_bound`), or
+    default) or whose backend has opened (`opened`), a pool of no fixed share (`dew._devices.pool_bound`), or
     a host that makes no communicator (`needs_of`). A pool of processes is not measured: its communicators
     span hosts, whose network buffers one host's child does not make. Once the backend has opened, the pool
     keeps the share it took, so a process prepared again (a sweep's next run, a profile after a run) gets the
@@ -468,7 +468,7 @@ def held() -> Sizing | None:
 def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...], text: Callable[[], str]) -> Collectives:
     """The communicators an executable makes on `gpus` (`collectives_of`), read from its `text` once per
     executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, below
-    the digest of Dew's own code (`dew.cache.package_digest`), so a warm start that loads it from the
+    the digest of Dew's own code (`dew._cache.package_digest`), so a warm start that loads it from the
     compilation cache reads no text, and another Dew's are read again."""
     kept = Path(dew_cache_dir()) / "communicators" / "programs" / package_digest()
     path = kept / f"{fingerprint.hex()}.json"
@@ -502,9 +502,9 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
         loaded = None
     else:
         made = collectives_kept(fingerprint, gpus, lambda: executable.as_text() or "")
-        memory = executable.memory_analysis()
+        memory = compiled_memory(executable)
         # A backend that states no memory analysis states no code of the program's either.
-        loaded = None if memory is None else Loaded(fingerprint, gpus, memory.generated_code_size_in_bytes)
+        loaded = None if memory is None else Loaded(fingerprint, gpus, memory.generated_code)
     _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, loaded)
 
 
@@ -567,7 +567,7 @@ def main() -> None:
     import numpy as np
 
     # The GPUs its parent's JAX selects (`_child`), selected before the backend opens.
-    jax.config.update("jax_cuda_visible_devices", sys.argv[1] if len(sys.argv) > 1 else pool.ALL_GPUS)
+    jax.config.update("jax_cuda_visible_devices", sys.argv[1] if len(sys.argv) > 1 else _pool.ALL_GPUS)
     before = {index: gpu_free_bytes(index) or 0 for index in local_gpus() or ()}
     devices = jax.local_devices()
 

@@ -18,7 +18,7 @@ from dew.data import Loading, presets
 from dew.data.compile import compile, held, iterate
 from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset, Pipeline
-from dew.data.plan import earlier_plan
+from dew.data.plan import PLAN_VERSIONS, earlier_plan
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective
@@ -126,8 +126,9 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     # context included, so the front door rebuilds it without the recipe.
     recorded = LMRunConfig.load(str(run))
     assert recorded.model.fields["vocab_size"] == 256 and recorded.model.fields["max_seq_len"] == SEQ
-    # The record is the run as its build pinned it: its data plan version is this Dew's (`RunConfig.pinned`).
-    assert dataclasses.replace(recorded, model=config.model) == config.pinned()
+    # The record is the run as it trained: its data plan version this Dew's (`RunConfig.resumed`).
+    assert dataclasses.replace(recorded, model=config.model) == dataclasses.replace(
+        config, data_plan_version=PLAN_VERSIONS[-1])
     task = dew.pipeline(str(run))
     assert isinstance(task, TextGeneration) and task.max_new_tokens == 4
     drawn = task("the ", key=1, sampling=Sampling(temperature=0))
@@ -304,8 +305,8 @@ def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
     through the command's `--set trainer.steps=2`. The restored parameters
     move again, so the replay reaches training rather than only parsing.
     """
+    from dew._cli.main import main
     from dew.checkpoints import Checkpoints
-    from dew.cli.main import main
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
@@ -377,7 +378,7 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
     def dew(*arguments: str) -> None:
         """The command line on this checkout's source, as a fresh interpreter imports it."""
         environment = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
-        done = subprocess.run([sys.executable, "-m", "dew.cli.main", *arguments], capture_output=True,
+        done = subprocess.run([sys.executable, "-m", "dew._cli.main", *arguments], capture_output=True,
                               text=True, check=False, env=environment)
         assert done.returncode == 0, done.stdout + done.stderr
 

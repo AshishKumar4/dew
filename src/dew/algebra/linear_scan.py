@@ -629,7 +629,9 @@ CONSTRUCTORS = (Chunk.token, Chunk.entering, Chunk.decay, Chunk.loop, Chunk.plai
 def _work(node: Chunk, extents: Extents, shape_of) -> Work:
     """A node's own work and dependent steps at the chunk's extents: products as fp32 products at the default
     precision (`cost._mode`), elementwise work on the CUDA cores, exponentials on the special-function units,
-    a loop's and a substitution's rows a step each."""
+    a reduction's and a product's kernel (each a root of XLA's fusion, `cost.work`'s), and a loop's and a
+    substitution's rows a step each, whose launches the step's latency holds (`GpuTarget.step_seconds`, a
+    loop iteration's, measured with its kernels)."""
     c, k, v, d = extents.tokens, extents.keys, extents.values, extents.decay_keys
     product = cost.product_work
     if get_callable_args(node, Chunk.loop) is not None or get_callable_args(node, Chunk.plain) is not None:
@@ -643,11 +645,11 @@ def _work(node: Chunk, extents: Extents, shape_of) -> Work:
         # The compensated prefix (`scan._decays`), its pairs' exponentials.
         part = terms.text(args[0])
         elements = {"entering": c * d, "to_last": c * d, "whole": d, "between": c * c * d}[part]
-        return Work(operations=12.0 * c * d + elements, exponentials=elements)
+        return Work(operations=12.0 * c * d + elements, exponentials=elements, kernels=1.0)
     if (args := get_callable_args(node, Chunk.gram)) is not None:
         if d == 1:
             return product(c, k, c) + Work(operations=2.0 * c * c)
-        return Work(operations=3.0 * c * c * k)
+        return Work(operations=3.0 * c * c * k, kernels=1.0)
     if get_callable_args(node, Chunk.doubled) is not None:
         # log2(C) levels, each squaring the power and applying it: two products of C by C.
         levels = max(math.ceil(math.log2(max(c, 2))), 1)
