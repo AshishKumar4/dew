@@ -10,23 +10,65 @@ vocabulary, piece for piece and special id for special id; and Dew's
 logits hold tests/reference_error.py's rule against llama.cpp's.
 """
 
+import functools
 import json
+import tempfile
 from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
-from one_draw import assert_as_exact_as_the_reference
+from reference_runs import assert_arms_as_recorded
 
-FIXTURE = Path(__file__).resolve().parent / "fixtures" / "llama_cpp" / "reference.npz"
+EXPORTED = Path(__file__).resolve().parent / "fixtures" / "llama_cpp" / "reference.npz"
+"""tools/llama_cpp_reference.py's record of the export llama.cpp converted and the vocabulary its GGUF
+carries."""
 
 
-def test_llama_cpp_reads_the_decoder_dew_exports_at_dews_logits(tmp_path):
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "llama_cpp" / "recording.npz"
+"""tools/venv_reference.py's `llama-cpp` recording (tools/llama_cpp_worker.py), its outputs whole."""
+LLAMA_SEEDS = 8
+"""The site's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
+OUTPUTS = ("logits",)
+
+
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """One row of 24 ids over the decoder's vocabulary but its specials (`SPECIALS`), drawn for `seed`."""
+    from tools.llama_cpp_reference import FIELDS, SPECIALS
+
+    rng = np.random.default_rng([4735, seed])
+    return {"ids": rng.integers(len(SPECIALS), FIELDS["vocab_size"], (1, 24)).astype(np.int32)}
+
+
+@functools.cache
+def exported():
+    """The decoder llama.cpp reads, as Dew builds and exports it (`llama_cpp_reference.export`)."""
+    from tools.llama_cpp_reference import export
+
+    return export(Path(tempfile.mkdtemp(prefix="llama-cpp-export-")) / "export")
+
+
+def dew(_, inputs) -> dict:
+    """Dew's float32 logits over a draw's ids."""
+    model, variables = exported()
+    return {"logits": np.asarray(model.apply(variables, jnp.asarray(inputs["ids"])), np.float32)}
+
+
+def test_llama_cpp_reads_the_decoder_dew_exports_at_dews_logits():
+    """Dew's float32 logits on par with libllama's over drawn ids, both measured from transformers'
+    float64 run of the same export (check 1)."""
+    assert_arms_as_recorded((FIXTURE, draw, dew, OUTPUTS), "llama-cpp", LLAMA_SEEDS, "llama.cpp logits",
+                            host=True)
+
+
+def test_llama_cpp_reads_the_export_dew_writes(tmp_path):
+    """The export written again is the one llama.cpp read, config, generation config and weights; its
+    tokenizer is the GGUF's vocabulary, piece for piece and special id for special id."""
     from transformers import AutoTokenizer
 
     from tools.llama_cpp_reference import digests, export
 
-    model, variables = export(tmp_path / "export")
-    with np.load(FIXTURE) as stored:
+    export(tmp_path / "export")
+    with np.load(EXPORTED) as stored:
         recorded = {name: stored[name] for name in stored.files}
     meta = json.loads(recorded.pop("meta").tobytes())
     assert digests(tmp_path / "export") == meta["digests"], (
@@ -36,6 +78,3 @@ def test_llama_cpp_reads_the_decoder_dew_exports_at_dews_logits(tmp_path):
     assert tokenizer.convert_ids_to_tokens(list(range(len(tokenizer)))) == recorded["gguf.pieces"].tolist()
     special = [tokenizer.unk_token_id, tokenizer.bos_token_id, tokenizer.eos_token_id]
     assert special == recorded["gguf.special"].tolist()
-    logits = model.apply(variables, jnp.asarray(recorded["ids"]))
-    assert_as_exact_as_the_reference(np.asarray(logits), recorded["llama_cpp.fp32"],
-                                     recorded["transformers.fp64"], "llama.cpp")
