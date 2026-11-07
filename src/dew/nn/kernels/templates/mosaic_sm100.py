@@ -715,7 +715,7 @@ def _issuing(load: Callable[[], None], products: Callable[[], None]) -> None:
         pl.when(warp == MMA_WARP)(products)
 
 
-class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
+class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | jax.Array]):
     """tcgen05's issuer for 64-row tiles a consumer holds in registers (the recurrence's chunks, row 4747):
     each product into a scoped 64-row fp32 accumulator in tensor memory (one CTA's M=64 MMA, the half-lane
     layout `tcgen05.tmem_half_lane_layout`), its left operand from shared memory or, written there first,
