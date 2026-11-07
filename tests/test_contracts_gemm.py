@@ -86,6 +86,23 @@ def test_a_bf16_dot_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_a_cpu_pairwise_dense_product_holds_every_order(edge):
+    """`pairwise.pairwise_dot_general` (a CPU's float32 dense product summed blocked and pairwise, its
+    reverse pass blocked over each cotangent's own contraction, row 4863), 96 deep so it takes blocks and a
+    partial last one: every order runs, finite wherever float64 is a normal float32 and wherever XLA's plain
+    product is, at values whose products near float32's ends."""
+    from dew.nn import pairwise
+
+    primals = normal_draw(4863, (4, 96), (96, 5), scale=EDGES[edge])
+    direction = normal_draw(4864, (4, 96), (96, 5), scale=EDGES[edge])
+    (cotangent,) = normal_draw(4865, (4, 5))
+    assert pairwise.contraction_block(96) < 96
+    assert_contract(lambda lhs, rhs: pairwise.pairwise_dot_general(lhs, rhs, (((1,), (0,)), ((), ()))),
+                    primals, direction, cotangent, f"a CPU pairwise dense product {edge}",
+                    truth_fn=jnp.matmul, plain_fn=jnp.matmul)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch, edge):
     """`precision.accumulated` in a process running wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, its own
     custom derivative of the float64-summed product): every order runs, finite wherever float64 is a
