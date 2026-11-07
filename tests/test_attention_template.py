@@ -3,6 +3,8 @@ keeps the keys Dew's masks keep for every call form; its block map visits every 
 a tile whole only where every entry is visible; and its XLA arithmetic (`reference`), hooks and all, is
 on par with Dew's reference attention from float64 (check 1)."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -499,10 +501,12 @@ def test_every_parameter_layout_and_the_output_hook_are_on_par(case, dtype):
 def halves(spans: template.KeySpans, half: int) -> tuple[template.KeySpans, template.KeySpans]:
     """`spans` over the keys before `half` and over those from it, each in its own keys' indices."""
     ids = spans.key_ids
-    return (template.KeySpans(jnp.minimum(spans.start, half), jnp.minimum(spans.end, half), spans.query_ids,
-                              None if ids is None else ids[:, :half], half),
-            template.KeySpans(jnp.maximum(spans.start - half, 0), jnp.maximum(spans.end - half, 0),
-                              spans.query_ids, None if ids is None else ids[:, half:], spans.keys - half))
+    return (dataclasses.replace(spans, start=jnp.minimum(spans.start, half),
+                                end=jnp.minimum(spans.end, half),
+                                key_ids=None if ids is None else ids[:, :half], keys=half),
+            dataclasses.replace(spans, start=jnp.maximum(spans.start - half, 0),
+                                end=jnp.maximum(spans.end - half, 0),
+                                key_ids=None if ids is None else ids[:, half:], keys=spans.keys - half))
 
 
 @pytest.mark.parametrize("split", ["sliced-at-a-tile-edge", "spanned-at-the-half"])
@@ -531,10 +535,9 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dt
             return array[:, :edge], array[:, edge:]
     else:
         edge = keys // 2
-        first = template.KeySpans(jnp.minimum(spans.start, edge), jnp.minimum(spans.end, edge),
-                                  spans.query_ids, spans.key_ids, keys)
-        rest = template.KeySpans(jnp.maximum(spans.start, edge), spans.end, spans.query_ids, spans.key_ids,
-                                 keys)
+        first = dataclasses.replace(spans, start=jnp.minimum(spans.start, edge),
+                                    end=jnp.minimum(spans.end, edge))
+        rest = dataclasses.replace(spans, start=jnp.maximum(spans.start, edge))
 
         def parted(array):
             return array, array
