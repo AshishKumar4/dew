@@ -1316,11 +1316,11 @@ def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_
 
 def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci, tmp_path, monkeypatch,
                                                                              cache_worker):
-    """A run that reads a checkout file and writes it keeps no key, whoever writes it: Python's open (the
-    recorder's audit, `followed.WROTE`) or a native writer (sqlite's, which the task's watch sees change a
-    file it opened): its key would hash the bytes the run left, not those it read, so it is never reused and
-    runs again (row 2559). A file a run only writes, as each run here appends to `runs`, is no input and
-    leaves its key."""
+    """A run that reads a checkout file and writes it keeps no key, however it writes it: Python's write, one
+    handle that reads and writes, a truncation, a mapped page, a removal and a new file in its place, or a
+    native writer (sqlite's): its key would hash the bytes the run left, not those it read, so it is never
+    reused and runs again (row 2559). A file a run only writes, as each run here appends to `runs`, is no
+    input and leaves its key."""
     import sqlite3
 
     counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
@@ -1330,15 +1330,24 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     with sqlite3.connect(tmp_path / "tests/fixtures/rows.db") as database:
         database.execute("create table t (x)")
     database.close()
+    page = "    page = Path('docs/page.txt')\n"
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     for test, body in (
             ("plain", "    assert True\n"),
-            ("python", "    page = Path('docs/page.txt')\n    page.write_text(page.read_text())\n"),
+            ("python", page + "    page.write_text(page.read_text())\n"),
+            ("one handle", "    with open('docs/page.txt', 'r+') as held:\n"
+                           "        held.write(held.read())\n"),
+            ("truncated", page + "    assert page.read_text()\n    os.truncate(page, 5)\n"),
+            ("mapped", "    with open('docs/page.txt', 'r+b') as held, \\\n"
+                       "            mmap.mmap(held.fileno(), 0) as mapped:\n"
+                       "        mapped[0:1] = mapped[0:1].upper()\n"),
+            ("replaced", page + "    text = page.read_text()\n    page.unlink()\n"
+                                "    page.write_text(text)\n"),
             ("native", "    with sqlite3.connect('tests/fixtures/rows.db') as database:\n"
                        "        database.execute('insert into t values (1)')\n"
                        "    database.close()\n")):
-        written(tmp_path, {"test_a.py": "import sqlite3\nfrom pathlib import Path\n\n\ndef test_a():\n"
-                                        + counted + body})
+        written(tmp_path, {"test_a.py": "import mmap\nimport os\nimport sqlite3\nfrom pathlib import Path\n"
+                                        "\n\ndef test_a():\n" + counted + body})
         (tmp_path / "runs").unlink(missing_ok=True)
         commit(tmp_path, test)
         assert [run(), run()] == ([1, 1] if test == "plain" else [1, 2]), test
