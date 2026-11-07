@@ -223,9 +223,9 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
     `mainloop_backward.kept_backward`) at 128 tokens a chunk (`Tiles.chunk`), interpreted on wgmma's and
     mma.sync's bundles, on par from float64
     with the same launches at 64 (check 1, the truth the recurrence a token at a time in float64): the output,
-    final memory and every operand's gradient in bf16 (row 4770). Neither bundle's rule takes 128 itself
-    (`template.chunks`: their roles' rows are 64), and the backward's launches at 128 pass a GPU's shared
-    memory (`backward_holds`), so the launches are called as the rule calls them."""
+    final memory and every operand's gradient in bf16 (row 4770). No rule derives 128 at the scoreboard's
+    geometries, whose launches at 128 pass a GPU's resources (`template.chunks`' candidates, jsf-chunkchoice),
+    so the launches are called as the rule calls them."""
     hooks, dtype = case_hooks(case), jnp.bfloat16
     bundle = {'wgmma': bundles.INTERPRETED, 'mma.sync': bundles.of('sm80', jnp.bfloat16)}[family]
     (sample, _) = drawn(dtype, 0, **geometry(case))

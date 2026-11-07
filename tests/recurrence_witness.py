@@ -55,8 +55,6 @@ from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, template
 
-CHUNK = template.FLA_CHUNK
-"""The chunk the witnessed launches take (fla's, every bundle's narrowest, `template.chunks`)."""
 LOG2E = recurrence_algebra.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
 """How far a position's prefix `hi + lo` (`recurrence_algebra.prefix`) lies from its exact `log2(e)
@@ -338,8 +336,8 @@ def between(later, later_bound, earlier, earlier_bound, lane: Lane) -> Iv:
     return Iv(lo, np.where(difference + spread < PAIR_FLOOR - 2, 0.0, found.hi))
 
 
-def _lags() -> np.ndarray:
-    index = np.arange(CHUNK)
+def _lags(size: int) -> np.ndarray:
+    index = np.arange(size)
     return index[:, None] - index[None, :]
 
 
@@ -350,14 +348,16 @@ def inverse(k, beta, exponents: Exponents, lane: Lane) -> Iv:
     product = blocked(point(k), point(np.asarray(k).T), lane, parts=(lane.given, lane.given))
     decayed = fp32(mul(product, exponents.pairs(lane)), lane)
     system = fp32(mul(decayed, point(np.asarray(beta)[:, None])), lane)
-    return solved(where(_lags() > 0, system, point(np.zeros((CHUNK, CHUNK)))), lane)
+    size = np.shape(k)[0]
+    return solved(where(_lags(size) > 0, system, point(np.zeros((size, size)))), lane)
 
 
 def solved(system: Iv, lane: Lane) -> Iv:
     """`algebra.solved` of a chunk's strictly lower system `[C, C]`: `algebra.doubled` on `-system`, each
     level's two merges staged in fp16 (a 16-bit call's), less the unit diagonal."""
     lower_a = neg(system)
-    rows, cols = np.indices((CHUNK, CHUNK))
+    size = system.lo.shape[0]
+    rows, cols = np.indices((size, size))
     identity = (rows == cols).astype(np.float64)
     first = (rows % 2 == 1) & (cols == rows - 1)
     current = Iv(identity + np.where(first, lower_a.lo, 0.0), identity + np.where(first, lower_a.hi, 0.0))
@@ -372,10 +372,10 @@ def solved(system: Iv, lane: Lane) -> Iv:
         return dot(x, y, lane, FLOAT16)
 
     width = 2
-    while width < CHUNK:
+    while width < size:
         lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
         power = merged(merge(current), merge(lower_a))
-        masked = where(lower, power, point(np.zeros((CHUNK, CHUNK))))
+        masked = where(lower, power, point(np.zeros((size, size))))
         joined = merged(merge(masked), merge(current))
         current = fp32(add(current, joined), lane)
         width *= 2
@@ -423,7 +423,8 @@ def output(q, k, entering, values, exponents: Exponents, scale: float, lane: Lan
     given, held = lane.given, lane.held
     products = blocked(point(q), point(np.asarray(k).T), lane, parts=(given, given))
     scores = fp32(mul(products, exponents.pairs(lane)), lane)
-    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))), lane)
+    size = np.shape(q)[0]
+    scores = staged(where(_lags(size) >= 0, scores, point(np.zeros((size, size)))), lane)
     memory = blocked(point(q), held_iv(entering), lane, parts=(given, held))
     decay = exponents.raised(lane)
     memory = fp32(mul(memory, Iv(decay.lo[:, None], decay.hi[:, None])), lane)
@@ -454,7 +455,8 @@ def keys_gated_enclosures(step: "Step", scale: float, lane: Lane,
     columns = point(np.asarray(step.beta)[None, :])
     scores = hull(fp32(mul(fp32(mul(products, pairs), lane), columns), lane),
                   fp32(mul(products, fp32(mul(pairs, columns), lane)), lane))
-    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))), lane)
+    size = np.shape(step.q)[0]
+    scores = staged(where(_lags(size) >= 0, scores, point(np.zeros((size, size)))), lane)
     memory = fp32(mul(blocked(point(step.q), entering, lane, parts=(lane.given, lane.held)),
                       Iv(decay.lo[:, None], decay.hi[:, None])), lane)
     factor = point(np.float32(scale))
@@ -563,13 +565,14 @@ def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     its terms (a key block's sum and its adds into the total, at most as many roundings as the width's
     terms). The caller masks the lags."""
     exact, bound = exponents.exact, exponents.bound
-    sub_of = np.arange(CHUNK) // SUB
+    size = np.shape(k)[0]
+    sub_of = np.arange(size) // SUB
     firsts, lasts = sub_of * SUB, sub_of * SUB + SUB - 1
     down = between(exact, bound, exact[firsts], bound[firsts], lane)
     gated = fp32(mul(rows, down), lane)
     up = operand(fp32(mul(point(k), between(exact[lasts], bound[lasts], exact, bound, lane)), lane))
-    found = point(np.zeros((CHUNK, CHUNK)))
-    for t in range(CHUNK // SUB):
+    found = point(np.zeros((size, size)))
+    for t in range(size // SUB):
         reached = sub_of >= t
         middle = between(exact[firsts], bound[firsts], exact[t * SUB + SUB - 1][None, :],
                          bound[t * SUB + SUB - 1][None, :], lane)
@@ -591,9 +594,10 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     (`algebra.key_gated`, `key_decayed_output`)."""
     exponents = Exponents.of(step.g)
     raised = exponents.raised(lane)
-    zeros = point(np.zeros((CHUNK, CHUNK)))
+    size = np.shape(step.k)[0]
+    zeros = point(np.zeros((size, size)))
     writes = fp32(mul(point(step.k), point(np.asarray(step.beta)[:, None])), lane)
-    system = where(_lags() > 0, key_pairs(writes, step.k, exponents, lane), zeros)
+    system = where(_lags(size) > 0, key_pairs(writes, step.k, exponents, lane), zeros)
     w, c, values = solved_step(step, raised, lane)
     exact, bound = exponents.exact, exponents.bound
     # `range_decay`: the difference of the compensated prefixes, then `raised`'s fraction.
@@ -609,7 +613,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     # Each key block's scores scaled before their sum: one rounding a block more, at most the width's.
     width = np.asarray(step.k).shape[-1]
     slack = width * 2.0 ** -24 * np.maximum(np.abs(scores.lo), np.abs(scores.hi))
-    scores = staged(where(_lags() >= 0, _outward(scores.lo - slack, scores.hi + slack), zeros), lane)
+    scores = staged(where(_lags(size) >= 0, _outward(scores.lo - slack, scores.hi + slack), zeros), lane)
     queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane), lane)
     left = Iv(np.concatenate([queries.lo, scores.lo], 1), np.concatenate([queries.hi, scores.hi], 1))
     right = point(np.concatenate([step.h, step.c], 0))
@@ -721,6 +725,11 @@ class Run:
         return self.a.shape[0]
 
     @property
+    def chunk(self) -> int:
+        """The tokens a chunk its launches took (`mainloop.Tiles.chunk`)."""
+        return self.a.shape[-1]
+
+    @property
     def heads(self) -> int:
         return self.a.shape[1]
 
@@ -732,26 +741,26 @@ class Run:
     def step(self, n: int, head: int, *, carry: Iv | None = None) -> Step:
         """Chunk `n` and value head `head`'s step: its operands, its records and the fp32 memory it enters
         (`entered`), unless given."""
-        rows, key = slice(n * CHUNK, (n + 1) * CHUNK), head // (self.heads // self.k.shape[1])
+        rows, key = slice(n * self.chunk, (n + 1) * self.chunk), head // (self.heads // self.k.shape[1])
         return Step(self.q[rows, key], self.k[rows, key], self.v[rows, head], self.g[rows, head],
                     self.beta[rows, head], self.a[n, head], self.w[n, head], self.h[n, head], self.c[n, head],
                     point(self.entered(n, head)) if carry is None else carry)
 
 
-def laid_chunks(length: int, starts, max_segments: int | None) -> np.ndarray:
-    """The chunks a call of one row of `length` tokens lays its tokens in, `[N, 2]`: each chunk's first
-    token and its count, in the launches' order (`chunked_launch.sequences`, the mainloop's layout): a row's
-    own chunks, or each document's (its first token marked in `starts` `[1, T]`, up to `max_segments` a
-    row) its own, so a document beginning inside a chunk starts a chunk of its own."""
+def laid_chunks(length: int, starts, max_segments: int | None, chunk: int) -> np.ndarray:
+    """The chunks of `chunk` tokens a call of one row of `length` tokens lays its tokens in, `[N, 2]`: each
+    chunk's first token and its count, in the launches' order (`chunked_launch.sequences`, the mainloop's
+    layout): a row's own chunks, or each document's (its first token marked in `starts` `[1, T]`, up to
+    `max_segments` a row) its own, so a document beginning inside a chunk starts a chunk of its own."""
     from dew.nn.inputs import cu_seqlens
     from dew.nn.kernels import chunked_launch
 
     if starts is None:
-        table = chunked_launch.sequences(1, length, chunk=CHUNK).chunks
+        table = chunked_launch.sequences(1, length, chunk=chunk).chunks
     else:
         documents = length if max_segments is None else max_segments
         table = chunked_launch.sequences(1, length, np.asarray(cu_seqlens(starts, documents + 1)),
-                                         chunk=CHUNK).chunks
+                                         chunk=chunk).chunks
     table = np.asarray(table)[:, :2]
     return table[table[:, 1] > 0]
 
@@ -786,7 +795,6 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     # call without one takes each sub-chunk's own pairs (`algebra.key_diagonal_pairs`), which it does not.
     assert np.ndim(g) == 3 or (floor is not None and recurrence_algebra.factored_range(floor)), \
         "the witness holds a decay a key dimension's factored pairs alone"
-    from dew.nn.kernels.templates.recurrence import template
 
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
@@ -817,6 +825,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
             o, final = jax.jit(route if walked else lambda *x: jax.vjp(route, *x)[0])(*operands)
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
+        chunk = tiles.chunk
 
         def kept(*x, starts=starts):
             return jax.jit(lambda *x: chunk_forward.kept_forward(
@@ -830,7 +839,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                 "the certify build is the production program"
         _, length, heads, value_width = v.shape
         key_width = k.shape[-1]
-        table = laid_chunks(length, starts, max_segments)
+        table = laid_chunks(length, starts, max_segments, chunk)
         chunks = len(table)
         # Each chunk's leaving memory: the final memory of the call over the tokens up to its last, the
         # document it ends then the row's last.
@@ -843,55 +852,55 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         # The walk stores no memories, weighted keys or corrected values (`WALKED`), each chunk its own.
         assert starts is None and jnp.dtype(dtype).itemsize == 2, "the walk is a 16-bit call's, unpacked"
         laid = chunks
-        w = np.zeros((held * laid * CHUNK, heads * key_width))
+        w = np.zeros((held * laid * chunk, heads * key_width))
         h, c = (np.zeros((held * laid * heads * key_width, value_width)),
-                np.zeros((held * laid * CHUNK, heads * value_width)))
+                np.zeros((held * laid * chunk, heads * value_width)))
     laid = np.shape(h)[0] // (held * heads * key_width)
     if not delta:
         # No inverse or weighted keys of its own, nor corrected values where its keys take the gate.
-        a, w = (np.zeros((held * laid * CHUNK, heads * width)) for width in (CHUNK, key_width))
+        a, w = (np.zeros((held * laid * chunk, heads * width)) for width in (chunk, key_width))
         if write == "keys":
-            c = np.zeros((held * laid * CHUNK, heads * value_width))
+            c = np.zeros((held * laid * chunk, heads * value_width))
 
     def summed(x, rows):
         """A record's stacked parts (`mainloop.Operand`) summed, exactly, `[rows, ...]`."""
         return np.asarray(x, np.float64).reshape(held, rows, -1).sum(0)
 
     def chunked(x, width):
-        return summed(x, laid * CHUNK).reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
+        return summed(x, laid * chunk).reshape(laid, chunk, heads, width).transpose(0, 2, 1, 3)[:chunks]
 
     memories = summed(h, laid * heads * key_width).reshape(laid, heads, key_width, value_width)[:chunks]
     carries = [np.asarray(h0, np.float64)[0], *(np.asarray(end, np.float64)[0] for end in ends)]
     unknown = np.full(carries[0].shape, np.nan)
     carries += [unknown] * (chunks - len(carries)) + [np.asarray(kept_final, np.float64)[0]]
-    hosted_operands = {name: _laid(value, table)
+    hosted_operands = {name: _laid(value, table, chunk)
                        for name, value in hosted(operands, given=given, delta=delta).items()}
-    output = _laid(np.asarray(kept_o, np.float64)[0], table).reshape(chunks, CHUNK, heads, value_width)
+    output = _laid(np.asarray(kept_o, np.float64)[0], table, chunk).reshape(chunks, chunk, heads, value_width)
     # A document past the row's first begins on the zero memory (`chunked_launch.Sequences`).
     begins = np.asarray([first > 0 and (starts is not None and bool(np.asarray(starts)[0, first]))
                          for first, _ in table])
-    return Run(**hosted_operands, a=chunked(a, CHUNK), w=chunked(w, key_width), h=memories, scale=scale,
+    return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
 
-def _chunked(named, laid: int, heads: int, chunks: int) -> dict[str, np.ndarray]:
+def _chunked(named, laid: int, heads: int, chunks: int, chunk: int) -> dict[str, np.ndarray]:
     """Each named backward record `(x, width)`, its stacked parts summed exactly, laid `[N, H, C, width]`
-    over the `laid` chunks its launches lay, the first `chunks` of them."""
+    over the `laid` chunks of `chunk` tokens its launches lay, the first `chunks` of them."""
     def chunked(x, width):
-        rows = np.asarray(x, np.float64).reshape(-1, laid * CHUNK, heads * width).sum(0)
-        return rows.reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
+        rows = np.asarray(x, np.float64).reshape(-1, laid * chunk, heads * width).sum(0)
+        return rows.reshape(laid, chunk, heads, width).transpose(0, 2, 1, 3)[:chunks]
 
     return {name: chunked(x, width) for name, (x, width) in named.items()}
 
 
-def _laid(x: np.ndarray, table: np.ndarray) -> np.ndarray:
-    """A row's `[T, ...]` laid a chunk at a time by `table` (`laid_chunks`), `[N C, ...]`: each chunk's
+def _laid(x: np.ndarray, table: np.ndarray, chunk: int) -> np.ndarray:
+    """A row's `[T, ...]` laid `chunk` tokens at a time by `table` (`laid_chunks`), `[N C, ...]`: each chunk's
     tokens, its rows past them zero."""
-    found = np.zeros((len(table) * CHUNK, *x.shape[1:]), x.dtype)
+    found = np.zeros((len(table) * chunk, *x.shape[1:]), x.dtype)
     for n, (first, count) in enumerate(table):
-        found[n * CHUNK:n * CHUNK + count] = x[first:first + count]
+        found[n * chunk:n * chunk + count] = x[first:first + count]
     return found
 
 
@@ -958,13 +967,14 @@ def refusals(faulty: Run, claimed: Run, lane: Lane) -> dict[str, tuple[np.ndarra
     return {name: (within(found[name], truth[name]), separated(truth[name], fault[name])) for name in found}
 
 
-def rounded_cumsums(g) -> np.ndarray:
-    """Log decays `[1, T, H]` whose exact prefix within each chunk is `g`'s cumulative sum in fp32, token by
+def rounded_cumsums(g, chunk: int) -> np.ndarray:
+    """Log decays `[1, T, H]` whose exact prefix within each chunk of `chunk` tokens is `g`'s cumulative sum
+    in fp32, token by
     token (row 2066's defect, the decay from a difference of rounded cumulative sums): each token's the
     difference of two neighbouring rounded sums, rounded to fp32, so the kernel's compensated prefix carries
     their rounding."""
     shape = np.shape(g)
-    chunked = np.asarray(g, np.float32).reshape(shape[0], -1, CHUNK, shape[-1])
+    chunked = np.asarray(g, np.float32).reshape(shape[0], -1, chunk, shape[-1])
     sums = np.cumsum(chunked, axis=2, dtype=np.float32)
     before = np.concatenate([np.zeros_like(sums[:, :, :1]), sums[:, :, :-1]], axis=2)
     return (sums - before).astype(np.float32).reshape(shape)
@@ -995,16 +1005,15 @@ FLOOR = -5.0
 factor over sub-chunks (`algebra.factored_range`)."""
 
 
-def draw(seed: int, regime: str, *, chunks: int = 3, heads: int = 1, width: int = 64,
+def draw(seed: int, regime: str, *, length: int = 192, heads: int = 1, width: int = 64,
          per_key: bool = False, dtype=None):
-    """A call's operands `(q, k, v, g, beta, h0)` of one row of `chunks` chunks, in `dtype` (bf16 by default):
-    unit queries and keys,
+    """A call's operands `(q, k, v, g, beta, h0)` of one row of `length` tokens (chunks' boundaries among
+    them at every chunk the template derives), in `dtype` (bf16 by default): unit queries and keys,
     normal values, the regime's log decays (`REGIMES`), a write gate in (0, 1), an initial memory; `per_key`,
     a decay a key dimension in (`FLOOR`, 0) instead (Kimi delta attention's bounded gate)."""
     import jax.numpy as jnp
 
     rng = np.random.default_rng([2084, 3, seed, REGIMES.index(regime)])
-    length = chunks * CHUNK
 
     def unit(shape):
         x = rng.normal(size=shape)
@@ -1050,7 +1059,8 @@ def cumsum_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, 
     import jax.numpy as jnp
 
     q, k, v, g, beta, h0 = operands
-    faulty = recorded(q, k, v, jnp.asarray(rounded_cumsums(g)), beta, h0)
+    chunk = recorded(*operands, carried=False).chunk
+    faulty = recorded(q, k, v, jnp.asarray(rounded_cumsums(g, chunk)), beta, h0)
     return refusals(faulty, dataclasses.replace(faulty, g=hosted(operands)["g"]), lane)
 
 
@@ -1064,7 +1074,8 @@ def handed_refusals(operands: tuple, truth: Run, at: int, lane: Lane, *,
 
     carry = truth.carries[at]
     handed = np.asarray(np.asarray(carry, np.float32).astype(dtypes.bfloat16), np.float32)
-    tail = recorded(*(x[:, at * CHUNK:] for x in operands[:5]), jnp.asarray(handed)[None], walked=walked)
+    tail = recorded(*(x[:, at * truth.chunk:] for x in operands[:5]), jnp.asarray(handed)[None],
+                    walked=walked)
     claimed = dataclasses.replace(tail, carries=np.concatenate([carry[None], tail.carries[1:]]))
     return refusals(tail, claimed, lane)["leaving"]
 
@@ -1077,7 +1088,7 @@ def dropped_refusals(operands: tuple, truth: Run, at: int, lane: Lane) -> tuple[
     from native_certificates import separated
 
     length = operands[0].shape[1]
-    starts = jnp.zeros((1, length), bool).at[0, at * CHUNK].set(True)
+    starts = jnp.zeros((1, length), bool).at[0, at * truth.chunk].set(True)
     faulty = recorded(*operands, starts=starts, max_segments=2, carried=False)
     leaving = enclosed(truth, lane)["leaving"]
     stored = stored_memory(Iv(leaving.lo[at - 1], leaving.hi[at - 1]), lane)
@@ -1116,7 +1127,7 @@ def assert_carry_faults_refused(lane: Lane, heads: int | None = None) -> None:
     that memory rounded to bf16 where fp32 is held, at `HANDED_SHARE` of the fp32 memory it leaves."""
     from native_certificates import assert_refused
 
-    operands = draw(1, "slow", chunks=2, **({} if heads is None else {"heads": heads}))
+    operands = draw(1, "slow", length=128, **({} if heads is None else {"heads": heads}))
     truth = recorded(*operands)
     assert_refused(*dropped_refusals(operands, truth, 1, lane), DROPPED_SHARE)
     assert_refused(*handed_refusals(operands, truth, 1, lane), HANDED_SHARE)
@@ -1126,8 +1137,8 @@ def assert_step_faults_refused(lane: Lane, heads: int | None = None) -> None:
     """Decays from a difference of fp32 cumulative sums in a decay alone, refused at `CUMSUM_SHARES`; and each
     chunk's boundary a token early, at `SHIFTED_SHARES`; no record held where its intervals separate."""
     sized = {} if heads is None else {"heads": heads}
-    assert_refusals(cumsum_refusals(draw(1, "decay", chunks=2, **sized), lane), CUMSUM_SHARES)
-    assert_refusals(shifted_refusals(draw(1, "mild", chunks=2, **sized), lane), SHIFTED_SHARES)
+    assert_refusals(cumsum_refusals(draw(1, "decay", length=128, **sized), lane), CUMSUM_SHARES)
+    assert_refusals(shifted_refusals(draw(1, "mild", length=128, **sized), lane), SHIFTED_SHARES)
 
 
 KEY_DECAY_SHARES = {"leaving": 0.5}
@@ -1212,7 +1223,7 @@ def assert_walk_witnessed(lane: Lane, heads: int = 1) -> None:
             assert np.all(held[name]), (run.write, name, np.mean(held[name]))
     from native_certificates import assert_refused
 
-    slow = draw(1, "slow", chunks=2, heads=heads)
+    slow = draw(1, "slow", length=128, heads=heads)
     assert_refused(*handed_refusals(slow, recorded(*slow, walked=True), 1, lane, walked=True),
                    WALK_HANDED_SHARE)
 
@@ -1280,7 +1291,8 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
     raised, gated, pairs = exponents.raised(lane), exponents.gated(lane), exponents.pairs(lane)
     given, held = lane.given, lane.held
     factor = point(np.float32(scale))
-    zeros = point(np.zeros((CHUNK, CHUNK)))
+    size = np.shape(step.q)[0]
+    zeros = point(np.zeros((size, size)))
     rows = Iv(raised.lo[:, None], raised.hi[:, None])
     ranged = Iv(gated.lo[:, None], gated.hi[:, None])
     q, k, v, do = point(step.q), point(step.k), point(step.v), point(step.do)
@@ -1288,7 +1300,7 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
     keyed_gate = write == "keys"
     # The corrected values: as given where the keys take the gate, else a stored record.
     values_parts = given if keyed_gate else held
-    lag = _lags()
+    lag = _lags(size)
 
     transposed = fp32(mul(blocked(k, tr(q), lane, parts=(given, given)), tr(pairs)), lane)
     scores = staged(where(lag.T >= 0, fp32(mul(transposed, factor), lane), zeros), lane)
@@ -1387,7 +1399,7 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
 
     from dew.nn.kernels import generation, recurrence_chunk, tuning
     from dew.nn.kernels.templates import bundles
-    from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
+    from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
 
     q, k, v, _, _, h0 = operands
     dtype = jnp.result_type(q, k, v)
@@ -1431,17 +1443,18 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
     # The chunks the launches lay, of the memories' rows a part (`Run.held` of them stacked).
     laid = np.shape(saved.dh)[0] // (run.held * heads * key_width)
 
-    named = {"local": (saved.local, value_width), "dv": (saved.dv, value_width), "ds": (saved.ds, CHUNK),
+    chunk = run.chunk
+    named = {"local": (saved.local, value_width), "dv": (saved.dv, value_width), "ds": (saved.ds, chunk),
              "dq": (saved.dq, key_width), "dk": (saved.dk, key_width)}
     if delta:
-        named |= {"dw": (saved.dw, key_width), "d_l": (saved.d_l, CHUNK),
+        named |= {"dw": (saved.dw, key_width), "d_l": (saved.d_l, chunk),
                   "values": (saved.values, value_width), "keys": (saved.keys, key_width)}
-    records = _chunked(named, laid, heads, chunks)
+    records = _chunked(named, laid, heads, chunks, chunk)
     dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
     dh = np.asarray(saved.dh, np.float64).reshape(-1, laid, heads, key_width, value_width).sum(0)[:chunks]
     dtypes["entering"] = jnp.dtype(saved.dh.dtype)
-    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(length, None, None))
-    return BackRun(run, hosted_do.reshape(chunks, CHUNK, heads, value_width).transpose(0, 2, 1, 3),
+    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(length, None, None, chunk), chunk)
+    return BackRun(run, hosted_do.reshape(chunks, chunk, heads, value_width).transpose(0, 2, 1, 3),
                    np.asarray(dfinal, np.float64)[0], dh,
                    np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width), records, dtypes)
 
@@ -1545,7 +1558,7 @@ def key_pairs_back(d_pairs: Iv, rows, k: np.ndarray, exponents: Exponents, lane:
     exact sum within its terms' one native sum's bound (as `key_pairs`'), each term's decay `between`'s."""
     exact, bound = exponents.exact, exponents.bound
     decay = between(exact[:, None, :], bound[:, None, :], exact[None, :, :], bound[None, :, :], lane)
-    lag = _lags()[:, :, None] >= 0
+    lag = _lags(np.shape(k)[0])[:, :, None] >= 0
     decay = where(lag, decay, point(np.zeros(decay.lo.shape)))
     gradient = Iv(d_pairs.lo[:, :, None], d_pairs.hi[:, :, None])
     weighted = mul(gradient, decay)
@@ -1579,8 +1592,9 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
     exponents = Exponents.of(step.g)
     raised = exponents.raised(lane)
     factor = point(np.float32(scale))
-    zeros = point(np.zeros((CHUNK, CHUNK)))
-    lag = _lags()
+    size = np.shape(step.q)[0]
+    zeros = point(np.zeros((size, size)))
+    lag = _lags(size)
     q, do = point(step.q), point(step.do)
     beta = np.asarray(step.beta)[:, None]
     d_scores = where(lag >= 0, dot(do, tr(point(step.c)), lane), zeros)
@@ -1628,7 +1642,7 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
 
     from dew.nn.kernels import generation, recurrence_chunk, tuning
     from dew.nn.kernels.templates import bundles
-    from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
+    from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
 
     q, k, v, _, _, h0 = operands
     dtype = jnp.result_type(q, k, v)
@@ -1667,18 +1681,19 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
     key_width, chunks = k.shape[-1], run.chunks
     laid = np.shape(saved.dh)[0] // (heads * key_width)
 
-    named = {"d_scores": (saved.d_scores, CHUNK), "local": (saved.local, value_width),
+    chunk = run.chunk
+    named = {"d_scores": (saved.d_scores, chunk), "local": (saved.local, value_width),
              "dv": (saved.dv, value_width), "dq_memory": (saved.dq_memory, key_width),
              "dk_memory": (saved.dk_memory, key_width), "values": (saved.values, value_width),
-             "d_system": (saved.d_system, CHUNK), "dq_pairs": (saved.dq_pairs, key_width),
-             "dk_pairs": (saved.dk_pairs, key_width), "scores": (scores, CHUNK),
+             "d_system": (saved.d_system, chunk), "dq_pairs": (saved.dq_pairs, key_width),
+             "dk_pairs": (saved.dk_pairs, key_width), "scores": (scores, chunk),
              "kg": (gated_keys, key_width)}
-    records = _chunked(named, laid, heads, chunks)
+    records = _chunked(named, laid, heads, chunks, chunk)
     dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
     dh = np.asarray(saved.dh, np.float64).reshape(laid, heads, key_width, value_width)[:chunks]
     dtypes["entering"] = jnp.dtype(saved.dh.dtype)
-    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(v.shape[1], None, None))
-    back = BackRun(run, hosted_do.reshape(chunks, CHUNK, heads, value_width).transpose(0, 2, 1, 3),
+    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(v.shape[1], None, None, chunk), chunk)
+    back = BackRun(run, hosted_do.reshape(chunks, chunk, heads, value_width).transpose(0, 2, 1, 3),
                    np.asarray(dfinal, np.float64)[0], dh,
                    np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width), records, dtypes)
     return back, records
