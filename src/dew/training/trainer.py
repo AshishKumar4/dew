@@ -268,12 +268,15 @@ class Trainer(Generic[Loss, Effects]):
         lowers the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
         step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program.
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
-        config. `record` makes each step return in its metrics what each evaluation, replays too, sampled or
-        passed as a boundary (`taken_record`). `links` states an axis's `Link` by name in place of measuring
-        it (`_links`). `param_dtype`, a dtype's name, stores the parameters the run draws fresh, as Flax's
-        `param_dtype` (`dew.state.drawn_in`); None keeps each module's own.
-        `inspection` names what the run watches at its sampled steps (`dew.training.inspection`). `diloco`
-        trains the mesh's diloco groups apart, every few updates averaged (`dew.training.diloco`).
+        config. It measures Dew's own launches (`KernelOp`: the kernel templates,
+        `attention_impl="template"`); tokamax's flash kernel (`attention_impl="triton"`) runs at tokamax's
+        heuristic config, which it does not measure. `record` makes each step return in its metrics what each
+        evaluation, replays too, sampled or passed as a boundary (`taken_record`). `links` states an axis's
+        `Link` by name in place of measuring it (`_links`). `param_dtype`, a dtype's name, stores the
+        parameters the run draws fresh, as Flax's `param_dtype` (`dew.state.drawn_in`); None keeps each
+        module's own. `inspection` names what the run watches at its sampled steps
+        (`dew.training.inspection`). `diloco` trains the mesh's diloco groups apart, every few updates
+        averaged (`dew.training.diloco`).
         """
         layout = objective.placement(layout)  # as its models place their trees (a tier-3 plan, ledger 2777)
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
