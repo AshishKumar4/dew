@@ -63,6 +63,9 @@ try:
     if mode=='sizing':
         n=seeds_for(as_given(lambda x:r(x)),lambda seed:(t.drawing(case)(seed),),f'UNet3D {case}',dew_fn=candidate,truth_fn=lambda x:dew(jnp.float64,x),start=seeds)
         print('K sizing',case,n,flush=True)
+        if sys.argv[4:5]==['verdict']:
+            assert_as_exact(candidate,as_given(lambda x:r(x)),lambda seed:(t.drawing(case)(seed),),f'UNet3D {case} corrected truth',seeds=n,truth_fn=lambda x:truth(x))
+            print('K PASS',case,'corrected truth',n,flush=True)
     else:
         assert_as_exact(candidate,as_given(lambda x:r(x)),lambda seed:(t.drawing(case)(seed),),f'UNet3D {case} {mode}',seeds=seeds,truth_fn=lambda x:truth(x))
         print('K PASS',case,mode,seeds,flush=True)
