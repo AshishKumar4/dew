@@ -1372,31 +1372,34 @@ def test_phases_of_other_batches_each_read_their_own_steps_in_their_own_rows():
     assert [value for batch in read for value in batch] == alone[:36]
 
 
-def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own(tmp_path):
+def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own():
     """A fit accumulating updates of two steps over phases of 16, then 8, then 16 records a step, each phase's
-    end at an update's (`DataPartition.window`), steps each batch in a program of its own and trains as a
-    fit of one step an update over the same records, its phases batched by 32, 16 and 32: each update pools
-    one batch's microbatches. A phase of another batch that begins inside an update is refused, naming the
-    update."""
+    end at an update's (`DataPartition.window`), steps each batch in a program of its own and trains as the
+    three phases fitted one after another from the state the one before left, each from its corpus's first
+    record: each update pools one batch's microbatches, and no update spans two phases (SGD keeps no state
+    of its own, so the fits chain exactly). A phase of another batch that begins inside an update is
+    refused, naming the update."""
     from dew.telemetry.compiles import Compiles
 
-    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    corpora = [Pipeline(Memory(Indexed(tag, 64))).shuffle(tag).repeat() for tag in (1, 2, 3)]
+    batches, ends = (16, 8, 16), (2, 6, 8)
 
-    def fitted(directory: Path, rows: tuple[int, int, int], steps: int, accumulation: int):
-        trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0), accumulation=accumulation,
-                          checkpoints=Checkpoints(str(directory), keep=8))
-        early, middle, late = rows
-        chain = phases((first.batch(early), steps // 4), (first.batch(middle), 3 * steps // 4),
-                       (first.batch(late), None))
-        return trainer.fit(compile(chain, read="memory", loading=READ), steps=steps)
+    def accumulating() -> Trainer:
+        return Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
+                       layout=Layout(min_shard=1, tolerance=1.0), accumulation=2)
 
+    phased = phases(*((corpus.batch(batch), end) for corpus, batch, end in
+                      zip(corpora, batches, (*ends[:-1], None), strict=True)))
     with Compiles("step") as compiles:
-        accumulated = fitted(tmp_path / "accumulated", (16, 8, 16), 8, 2)
-    assert int(accumulated.step) == 8 and compiles.count == 2
-    whole = fitted(tmp_path / "whole", (32, 16, 32), 4, 1)
-    assert_same(parameters(accumulated), parameters(whole), "updates of two microbatches a phase")
-    misplaced = compile(phases((first.batch(16), 3), (first.batch(8), None)), read="memory", loading=READ)
+        state = accumulating().fit(compile(phased, read="memory", loading=READ), steps=ends[-1])
+    assert int(state.step) == ends[-1] and compiles.count == 2
+    chained = None
+    for corpus, batch, end in zip(corpora, batches, ends, strict=True):
+        chained = accumulating().fit(compile(corpus.batch(batch), read="memory", loading=READ), steps=end,
+                                     state=chained)
+    assert_same(parameters(state), parameters(chained), "phases fitted one after another")
+    misplaced = compile(phases((corpora[0].batch(16), 3), (corpora[0].batch(8), None)), read="memory",
+                        loading=READ)
     with pytest.raises(ValueError, match="inside an update of 2 steps"):
         misplaced.train(DataPartition(window=2))
 
