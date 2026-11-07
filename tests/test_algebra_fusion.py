@@ -201,13 +201,6 @@ def flax_attention(*, causal: bool):
     return attend
 
 
-def input_masked(q, k, v):
-    """jax.nn's attention under a mask drawn from the queries, which the compile point leaves as written."""
-    rows = (q[..., :1] > 0).transpose(0, 2, 1, 3)
-    mask = jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1]))
-    return jax.nn.dot_product_attention(q, k, v, mask=mask, implementation="xla")
-
-
 SPELLINGS = {"jax.nn causal, grouped": (jax_attention(causal=True), 2, True),
              "jax.nn, grouped": (jax_attention(causal=False), 2, False),
              "flax causal": (flax_attention(causal=True), 4, True),
@@ -248,15 +241,78 @@ def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
                          keep=kept(64, 64, causal=causal))
 
 
-def test_a_plain_programs_attention_under_a_mask_of_its_inputs_stays_as_written():
-    """Attention under a mask the program draws from its inputs is no region of Dew's (its mask read at no
-    compile): `dew.jit` runs it as written, its attention XLA's own on an H100."""
+def input_mask(q, k):
+    """A mask drawn from the queries, `[B, H, Q, K]`: each query row keeps every key where its first entry is
+    positive, none else."""
+    rows = (q[..., :1] > 0).transpose(0, 2, 1, 3)
+    return jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1]))
+
+
+def input_bias(q, k):
+    """A bias drawn from the queries, `[B, H, Q, K]`: a query row's first entry over every key."""
+    rows = (q[..., 0] * 0.25).transpose(0, 2, 1)[..., None]
+    return jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1])).astype(q.dtype)
+
+
+def capped(q, k, v):
+    """Gemma 2's attention as a plain program writes it: scaled logits softcapped at 50, causal."""
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+    logits = 50.0 * jnp.tanh(logits / 50.0)
+    causal = jnp.tril(jnp.ones((q.shape[1], k.shape[1]), bool))
+    weights = jax.nn.softmax(jnp.where(causal, logits, -jnp.inf), axis=-1).astype(v.dtype)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
+
+
+FORMS = {
+    "a mask of its inputs": (
+        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, mask=input_mask(q, k), implementation="xla"),
+        lambda q, k, v: {"mask": input_mask(q, k)}),
+    "a bias of its inputs": (
+        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, bias=input_bias(q, k), implementation="xla"),
+        lambda q, k, v: {"bias": input_bias(q, k)}),
+    "twice the default scale": (
+        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, scale=2 * q.shape[-1] ** -0.5,
+                                                     implementation="xla"),
+        lambda q, k, v: {}),
+    "a causal window": (
+        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True, local_window_size=(15, 0),
+                                                     implementation="xla"),
+        lambda q, k, v: {"causal": True, "sliding_window": 16}),
+    "a softcap": (capped, lambda q, k, v: {"causal": True, "softcap": 50.0}),
+}
+"""Each plain program's attention under a form beside the default scale and a causal mask, and the arguments
+Dew's own attention takes for it."""
+
+
+@pytest.mark.parametrize("form", list(FORMS))
+def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes(form):
+    """A plain program's attention under a mask or bias it draws from its inputs, a scale a power of two past
+    the default, a causal window or a softcap, compiled through `dew.jit` on an H100, runs the kernel Dew's
+    own attention call under those arguments routes to (none where that is XLA's), where the program as
+    written runs XLA's; on this host, under the template, its output and gradients on par with the program
+    as written (check 1)."""
+    from attention_oracle import attention_on_par
+    from contract_support import normal_drawn
+
     import dew
+    from dew.algebra.attention_regions import KEPT
+    from dew.nn.attention import scaled_dot_product_attention
 
+    attend, arguments = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
-    with generation.assumed("sm90"):
-        assert not _attention_routes(lambda: dew.jit(input_masked).trace(*shapes))
 
+    def own(q, k, v):
+        return scaled_dot_product_attention(q, k, v, **arguments(q, k, v))
+
+    with generation.assumed("sm90"):
+        assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
+        expected = [kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes))
+                    if kernel not in KEPT]
+        assert _attention_routes(lambda: dew.jit(attend).trace(*shapes)) == expected
+    draw = normal_drawn(41, *((2, 64, 4, 32),) * 4, dtype=jnp.bfloat16)
+    with generation.chosen(attention="template"):
+        attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}",
+                         truth=lambda *x: attend(*(a.astype(jnp.float64) for a in x)))
 
 def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None):
     """Causal softmax attention as a program writes it out (its products as einsums, a causal where, the
