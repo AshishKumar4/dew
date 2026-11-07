@@ -102,8 +102,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     each row's right option, with `label_smoothing` spread evenly over its
     options. `shuffle_options` and `none_of_the_above` augment the rows as
     `Encoding` describes, a choice of fewer than `none_of_the_above_options`
-    options drawing no "none of the above" (a yes or a no), and `data`
-    supplies their pipeline steps. The
+    options drawing no "none of the above" (by default three: a yes or a no draws none, where it would
+    change what the question asks; a run recorded before keeps its recorded floor,
+    `dew.registry.Registered.defaults`), and `data` supplies their pipeline steps. The
     training stream and the validation pass pack rows first-fit into windows
     of the layout's `max_len` tokens (`packing`), as many rows, questions and
     options as its `bounds` let a window hold, so a step pays for its tokens
@@ -249,7 +250,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
                  consistency: float = 0.0, context_window: int | None = None,
-                 none_of_the_above_options: int = 0):
+                 none_of_the_above_options: int = 3):
         held: Variables | None = None
         widths: tuple[int | None, int] | None = None
         self.image_processor = None

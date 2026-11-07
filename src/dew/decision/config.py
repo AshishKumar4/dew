@@ -427,7 +427,8 @@ class DecisionRunConfig(DecoderRunConfig):
         if any(value is None for value in stated):
             return None
         widest = {"options": max(integer(value, "slots.options") for value in stated)}
-        fields = self.objective.fields
+        # The objective's arguments as it builds them: those the run states over those it recorded defaulted.
+        fields = {**self.objective.defaults, **self.objective.fields}
         rate = number(fields.get("none_of_the_above") or 0.0, "none_of_the_above")
         fewest = integer(fields.get("none_of_the_above_options") or 0, "none_of_the_above_options")
         return option_width(widest, rate, fewest)
