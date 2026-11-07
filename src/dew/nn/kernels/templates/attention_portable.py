@@ -487,7 +487,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, *, score_mod,
                   scale: float, prescale: float, grad_scale: float, how: algebra.Recompute, block_q: int,
-                  block_k: int, drop=None):
+                  block_k: int):
     """The fast form's one launch (FlashAttention's, as Mosaic's fused launch computes it): a query head's
     key blocks in turn, each walking its query tiles once (`attention_program.fused_sums`), its dK and dV the
     walk's sums and each tile's dQ added into the head's, all at the first pass's D (`anchor`, `delta`, from
@@ -504,7 +504,6 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
     def program(index):
         row, head = index // heads, index % heads
-        draw = None if drop is None else drop.draw(row, head)
         kv_head = head // group
 
         def block(j, carry):
@@ -528,8 +527,6 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                          "at_anchor": columns[None, :] == key_index[row, head, rows][:, None]}
                 if slopes is not None:
                     tiles["slope"] = slopes[0]
-                if draw is not None:
-                    tiles["keep"] = draw(rows[:, None], columns[None, :])
                 return tiles, slopes, seen
 
             def add_dq(i, dq, tile):
@@ -538,8 +535,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
             dk, dv, dq = attention_program.fused_sums(
                 formed, k_tile, v_tile, ranges.q_lo[row, j], ranges.q_hi[row, j], dq, add_dq,
-                hooked=score_mod is not None, dropped=draw is not None, grad_scale=grad_scale, how=how,
-                dot=interpreted_dot)
+                hooked=score_mod is not None, grad_scale=grad_scale, how=how, dot=interpreted_dot)
             return (dq, jax.lax.dynamic_update_slice_in_dim(dk_all, dk, j * block_k, axis=0),
                     jax.lax.dynamic_update_slice_in_dim(dv_all, dv, j * block_k, axis=0))
 
@@ -588,21 +584,20 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
               "grad_scale": scale * prescale, "how": how,
               "block_q": block_q, "block_k": block_k, "accurate": accurate, "drop": drop}
     sums = others, own, others_total, forward_total
-    if not accurate and split and not score_kinds:
+    if not accurate and split and not score_kinds and drop is None:
         # The fast form's one pass, a call whose score hook, if any, takes no parameters: D from the
         # forward's split sums, dQ, dK and dV from one recomputation of each tile (`_fused_launch`), the
-        # initial state's keys' share of the weights from the split sums too (`gradient.split_mass`).
+        # initial state's keys' share of the weights from the split sums too (`gradient.split_mass`). A
+        # dropping call keeps the dQ launch, whose D is its own centred pass (`gradient.dropout_centre`:
+        # identical products cancel before any reduction, so identical keys give dQ exactly 0).
         _, state_total = gradient.off_anchor_start(peak, total, maximum, value.shape[-1], shift)
         values = jnp.swapaxes(anchor_value, 1, 2)
-        if drop is not None:
-            values = values * algebra.anchor_multipliers(drop, key_index)[..., None]
         anchor, delta, chosen = gradient.split_delta(others, own, others_total, forward_total, state_total,
                                                     values, jnp.swapaxes(dout, 1, 2).astype(jnp.float32),
                                                     key_index, shift)
         dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
                                    spans, score_mod=score_mod, scale=scale, prescale=prescale,
-                                   grad_scale=scale * prescale, how=how, block_q=block_q, block_k=block_k,
-                                   drop=drop)
+                                   grad_scale=scale * prescale, how=how, block_q=block_q, block_k=block_k)
         mass = gradient.split_mass(own, others_total, forward_total, shift)
         return (dq, delta, anchor, maximum, forward_total, mass, chosen, dk, dv)
     # The dQ launch reads its queries for their logits alone.

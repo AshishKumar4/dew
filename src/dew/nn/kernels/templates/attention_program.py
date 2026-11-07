@@ -141,14 +141,14 @@ def dq_sums(formed: Callable, q: jax.Array, do: jax.Array, m: jax.Array, anchor:
 
 
 def fused_sums(formed: Callable, k_tile: jax.Array, v_tile: jax.Array, lo, hi, dq: jax.Array,
-               add_dq: Callable, *, hooked: bool, dropped: bool, grad_scale: float, how: algebra.Recompute,
+               add_dq: Callable, *, hooked: bool, grad_scale: float, how: algebra.Recompute,
                dot: Callable[[jax.Array, jax.Array], jax.Array]):
     """A one-pass backward program's sums (the fast form's one launch, FlashAttention's): `dkv_sums`' walk of
     one key block over its query tiles `lo` to `hi`, each tile's own dQ (the derived forms' first output,
     walked keys first) added into the carried `dq` by `add_dq(index, dq, tile)` as it is formed, so dQ,
     dK and dV come from one recomputation of each tile's weights and cotangents. dK, dV `[bk, ...]` and
     `dq`."""
-    forms = derived_backward(grad_scale, "rows", hooked, dropped, how, accurate=False, anchored=True,
+    forms = derived_backward(grad_scale, "rows", hooked, False, how, accurate=False, anchored=True,
                              normalized_values=v_tile.dtype == jnp.bfloat16)
 
     def tiles_of(index):
