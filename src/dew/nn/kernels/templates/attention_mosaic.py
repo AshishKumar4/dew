@@ -1184,14 +1184,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         if config.fused and dropped and config.shared_keys:
             return False
-        if any(scopes_products(bundle_of(tiles, ba.arguments["query"].dtype))
-               for tiles in (config, config.dkv)):
-            # The backward's launches scope no issuer's product scratch (tcgen05's chunks'); row 4839's
-            # tensor-memory backward is their tcgen05 form.
-            return False
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         dkv_family = found.get(config.dkv.family)
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
+            return False
+        # The backward's launches scope no issuer's product scratch (tcgen05's chunks'); row 4839's
+        # tensor-memory backward is their tcgen05 form. A family the device has no bundle of (a pin of an
+        # H100's wgmma on an A100) is not read here: the mainloop's legality refuses it (`_Mainloop.legal`).
+        scoped = [found[tiles.family] for tiles in (config, config.dkv) if tiles.family in found]
+        if any(map(scopes_products, scoped)):
             return False
         keys_first = config.dkv_apart
         if config.fused and (ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1] or (
