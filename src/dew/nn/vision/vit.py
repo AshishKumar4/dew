@@ -11,8 +11,8 @@ register placement, learned-position arithmetic and which rows return after the 
 
 Each family's reference, transformers 5.16.1's `models/qwen3_5/modeling_qwen3_5.py` and
 `models/muse_glimmer/modeling_muse_glimmer.py`, MiMo-V2.6's `modeling_mimo_v2.py` and LFM3-VL's
-`modeling_lfm3_vl.py`, names its parts; `qwen35`, `mimo`, `muse_glimmer` and `lfm3` hold the configs and
-checkpoint maps.
+`modeling_lfm3_vl.py`, names its parts; `qwen35`, `mimo`, `muse_glimmer` and `lfm3` hold the models, and
+`dew.interop.towers`' modules of those names their configs and checkpoint maps.
 """
 
 from __future__ import annotations
