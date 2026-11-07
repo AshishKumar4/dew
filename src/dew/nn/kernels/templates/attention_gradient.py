@@ -1,10 +1,10 @@
 """The attention backward's tile algebra, what lies between its products (S = Q·Kᵀ, dP = dO·Vᵀ, then dV, dK
 and dQ) on natural logits: a tile's logits recomputed under the score hook and their derivatives
-(`tile_logits`, `scored`, `pulled`), its weights and score cotangents (`attention_backward_algebra.softmax_cotangents`), each query's dQ sums
-about its anchor key (`DqSums`, `dq_issued`, `dq_finish`), the anchors themselves (`off_anchor`, `centre_step`)
-and the dropout's (`dropped_products`). The forward's algebra and the products' operand parts every launch
-shares are `attention_algebra`'s; the declared backward and its derived forms
-`attention_backward_algebra`'s."""
+(`tile_logits`, `scored`, `pulled`), its weights and score cotangents
+(`attention_backward_algebra.softmax_cotangents`), each query's dQ sums about its anchor key (`DqSums`,
+`dq_issued`, `dq_finish`), the anchors themselves (`off_anchor`, `centre_step`) and the dropout's
+(`dropped_products`). The forward's algebra and the products' operand parts every launch shares are
+`attention_algebra`'s; the declared backward and its derived forms `attention_backward_algebra`'s."""
 
 import math
 from collections.abc import Callable, Mapping
@@ -244,15 +244,14 @@ def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift:
 
 
 class DqSums(NamedTuple):
-    """A dQ pass's sums over its keys: dQ `[bq, D]` and the score cotangents' row sums and the HEAD and
-    QUERY hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator
-    (the forward's, or the first pass's; `attention_backward_algebra.softmax_cotangents`); and the unnormalized weights' row sums, the hook
-    parameters' pullbacks of them (`weighed`) and their product with the keys as dQ's, scaled and pulled
-    through the hook over the prior denominator, held as its coefficients' magnitude
-    `keyed_mass · 2^keyed_shift` (`[bq]` each, the mantissa at most the keys' count, the exponent the
-    largest coefficient's) times a mean
-    of the keys under coefficients of magnitudes summing to at most one, `keyed` `[bq, D]`: each finite
-    wherever the keys are, whatever the scale and the hook's slopes, fp32."""
+    """A dQ pass's sums over its keys: dQ `[bq, D]` and the score cotangents' row sums and the HEAD and QUERY
+    hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator (the
+    forward's, or the first pass's; `attention_backward_algebra.softmax_cotangents`); and the unnormalized
+    weights' row sums, the hook parameters' pullbacks of them (`weighed`) and their product with the keys as
+    dQ's, scaled and pulled through the hook over the prior denominator, held as its coefficients' magnitude
+    `keyed_mass · 2^keyed_shift` (`[bq]` each, the mantissa at most the keys' count, the exponent the largest
+    coefficient's) times a mean of the keys under coefficients of magnitudes summing to at most one, `keyed`
+    `[bq, D]`: each finite wherever the keys are, whatever the scale and the hook's slopes, fp32."""
 
     dq: jax.Array
     residual: jax.Array

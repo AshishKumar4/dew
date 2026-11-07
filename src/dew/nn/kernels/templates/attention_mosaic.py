@@ -630,16 +630,16 @@ general registers (P2R) until the selects that read them (`_anchor_registers`)."
 
 
 def _anchor_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
-    """The registers a queries-first backward step's anchor select holds (`at_anchor`, `attention_backward_algebra.softmax_cotangents`)
-    across the step, from the compares that form it to the selects that read it: its predicates packed a
-    bit an entry; a row pass's of them, a role's rows, pending, all but those its predicate registers hold
-    (`PREDICATE_REGISTERS`); and the places it compares, the keys' column vector and the anchor keys' row
-    vector, int32. The SASS of dQ under ALiBi at 64 x 64, width 64, on an A100: 32 `key != anchor`
-    compares a thread packed into one word, 25 saved by P2R, restored by ISETP and FSEL, 43 words at its
-    need (200); the accurate form's at 64 x 64 and width 128 on an H100 1, 24 and 18, its need 255; dQ at
-    128 x 64, width 64, under sinks 2, 27 and 20. Priced beside every phase: beside its products alone, the
-    accurate form's dQ under a temperature took 64 x 64 at width 64, where it spills 232 bytes
-    (ET-PINBWD), its hook's slopes live across the select."""
+    """The registers a queries-first backward step's anchor select holds (`at_anchor`,
+    `attention_backward_algebra.softmax_cotangents`) across the step, from the compares that form it to the
+    selects that read it: its predicates packed a bit an entry; a row pass's of them, a role's rows, pending,
+    all but those its predicate registers hold (`PREDICATE_REGISTERS`); and the places it compares, the keys'
+    column vector and the anchor keys' row vector, int32. The SASS of dQ under ALiBi at 64 x 64, width 64, on
+    an A100: 32 `key != anchor` compares a thread packed into one word, 25 saved by P2R, restored by ISETP and
+    FSEL, 43 words at its need (200); the accurate form's at 64 x 64 and width 128 on an H100 1, 24 and 18,
+    its need 255; dQ at 128 x 64, width 64, under sinks 2, 27 and 20. Priced beside every phase: beside its
+    products alone, the accurate form's dQ under a temperature took 64 x 64 at width 64, where it spills 232
+    bytes (ET-PINBWD), its hook's slopes live across the select."""
     entries = block_q * block_k // resources.THREADS
     pending = max(0, family.role_rows * block_k // resources.THREADS - PREDICATE_REGISTERS)
     places = family.column_registers(block_k, jnp.int32) + family.row_registers(block_q, jnp.int32)
