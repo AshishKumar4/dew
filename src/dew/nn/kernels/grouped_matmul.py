@@ -1016,7 +1016,7 @@ class MosaicGmm(_Mosaic):
         # 4.7 us swapped, cuBLAS's time, row 1762). It is derived as the swapped call's own tile.
         swapped = self._swapped(ba, target)
         if swapped is None:
-            return super().derived(ba, target)
+            return self._decode_split(ba, super().derived(ba, target), target)
         tile = self._derived(swapped, target, admits=lambda tile: (self._left_fits(ba, tile)
                                                                     and tile.block_m <= SWAPPED_ROWS))
         if tile is None:
@@ -1033,6 +1033,32 @@ class MosaicGmm(_Mosaic):
         swapped_tile = dataclasses.replace(tile, swapped=True)
         split = dataclasses.replace(swapped_tile, splits=splits)
         return split if splits > 1 and self.legal(ba, split, target) else swapped_tile
+
+    def _decode_split(self, ba, tile: mosaic_gpu.Tiles | None, target) -> mosaic_gpu.Tiles | None:
+        """`tile`, a grouped call's of decode-sized groups (each group's rows within one row tile: a MoE
+        decode step's experts) its depth split where the busiest program then walks shorter
+        (`mosaic_gpu.split_count` over each active expert's one row tile, its matrix's stream the walk): its
+        one wave of tiles streamed each expert's matrix at a program's share of the memory rate, 1.28-1.46x
+        Triton's time at the same DRAM bytes, 48% of the peak rate against Triton's 80% (FS-3622-NCU1,
+        FS-3622-WAVES1, row 3622). None, a dense call, exact sums, hooks or a pair keep it unsplit."""
+        hooks = ba.arguments['hooks']
+        if (tile is None or ba.arguments['dense'] or ba.arguments['exact_sums']
+                or ba.arguments.get('paired') is not None or hooks.prologue is not None
+                or hooks.epilogue is not None):
+            return tile
+        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
+        groups = ba.arguments['sizes'].shape[0]
+        if tokens.shape[0] > groups * tile.block_m:
+            return tile
+        _, depth, width = self._generated_extents(ba)
+        assert depth is not None, "a product's steps run over its depth"
+        splits = mosaic_gpu.split_count(
+            tile, groups=groups, rows=depth, depth=tile.block_m, width=width,
+            itemsizes=(tokens.dtype.itemsize, kernel.dtype.itemsize),
+            multiprocessors=_multiprocessors(target), step_seconds=mosaic_gpu.step_seconds(tile, target),
+            bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
+        split = dataclasses.replace(tile, splits=splits)
+        return split if splits > 1 and self.legal(ba, split, target) else tile
 
     def _left_fits(self, ba, config: mosaic_gpu.Tiles) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
