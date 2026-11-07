@@ -71,45 +71,53 @@ def derived_cotangents(keys_first: bool, dropped: bool, masked: bool, how: algeb
 
 def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, slope=None, seen=None,
                       keep=None, at_anchor=None, *, scale: float, how: algebra.Recompute = algebra.PLAIN,
-                      accurate: bool = False):
+                      accurate: bool = False, normalized_values: bool = False):
     """Attention's gradients from its residuals, whole (theme A's backward declaration,
     `backward_declaration`): each tile's weights and score cotangents (`softmax_cotangents`) with
     `dP = dO Vᵀ`, the cotangents through the score hook by its `slope` (its derivative, `scored`) where a hook
     reads the logits, each masked where the tile's queries do not see its keys (`seen`: an empty query's
     product, or a padded query's hook derivative, need not be finite), and the queries', keys' and values'
     gradients their products at `scale` (dV from the dropped unnormalized weights against `dO / T`,
-    `value_operands`' order), each product Dew's (`float32_einsum`), the `accurate` form's cotangents where
-    it asks (`softmax_cotangents`). Returns dQ, dK, dV, and each tile's unnormalized weights and score
+    `value_operands`' order; with `normalized_values`, bf16's, the dropped normalized weights against `dO`
+    as it is, FlashAttention's order, which holds no `dO / T` tile beside the step's: a Pallas-Triton dK/dV
+    walk's shared memory 93,696 bytes against its hand form's 73,728 at width 64 on an sm86, dd-tsm), each
+    product Dew's (`float32_einsum`), the `accurate` form's cotangents where it asks
+    (`softmax_cotangents`). Returns dQ, dK, dV, and each tile's unnormalized weights and score
     cotangents, which the template's hook parameters and D's refinement read (`gradient.pulled`,
     `dq_rows`)."""
     products = float32_einsum("qd,kd->qk", dout, values, preferred_element_type=jnp.float32)
-    e, _, ds = softmax_cotangents(logits, products, peak, total, anchor, delta, keep, seen, at_anchor,
-                                  how=how, accurate=accurate)
+    e, weights, ds = softmax_cotangents(logits, products, peak, total, anchor, delta, keep, seen, at_anchor,
+                                        how=how, accurate=accurate)
     over = 1.0 / jnp.where(total == 0, 1.0, total)
     # The cotangents at the scale before their products, the reference's order: two keys of 2**127 whose
     # cotangents' quarter cancels in the product overflow it unscaled.
     scaled = (ds if slope is None else gradient.pulled(ds, (slope,), seen, ())[0]) * scale
-    dropped = e if keep is None else e * keep
+    if normalized_values:
+        values_operands = (weights if keep is None else weights * keep), dout
+    else:
+        values_operands = (e if keep is None else e * keep), dout * over[:, None]
     return (float32_einsum("qk,kd->qd", scaled, k), float32_einsum("qk,qd->kd", scaled, q),
-            float32_einsum("qk,qd->kd", dropped, dout * over[:, None]), e, ds)
+            float32_einsum("qk,qd->kd", *values_operands), e, ds)
 
 
 @functools.cache
 def derived_backward(scale: float, walked: str, hooked: bool = False, dropped: bool = False,
                      how: algebra.Recompute = algebra.PLAIN, accurate: bool = False,
-                     anchored: bool = False) -> derive.Derived:
+                     anchored: bool = False, normalized_values: bool = False) -> derive.Derived:
     """The backward's derived forms (`backward_declaration`'s, of the fast class or `accurate`'s), walked over
     the keys for dQ, over the queries
     for dK and dV, each walked sum's product the mainloop's to issue where it takes the step
-    (`Derived.step`'s `stepped`, `Accumulated`: the accurate form's keyed sums and split products)."""
+    (`Derived.step`'s `stepped`, `Accumulated`: the accurate form's keyed sums and split products); dV's
+    operands bf16's where `normalized_values` (`softmax_gradients`)."""
     return derive.derive(backward_declaration(scale=scale, walked=walked, hooked=hooked, dropped=dropped,
-                                              how=how, accurate=accurate, anchored=anchored),
+                                              how=how, accurate=accurate, anchored=anchored,
+                                              normalized_values=normalized_values),
                          accurate=accurate, saturation=SATURATION)
 
 
 def backward_declaration(*, scale: float, walked: str, hooked: bool = False, dropped: bool = False,
                          how: algebra.Recompute = algebra.PLAIN, accurate: bool = False,
-                         anchored: bool = False):
+                         anchored: bool = False, normalized_values: bool = False):
     """Attention's backward as theme A's declaration (`softmax_gradients`), walked over its key tiles
     (`walked="keys"`, queries first: dQ the walk's sum, dK and dV each tile's own) or its query tiles
     (`"rows"`, keys first: dK and dV the walk's sums, dQ each tile's own), from the forward's natural
@@ -123,5 +131,6 @@ def backward_declaration(*, scale: float, walked: str, hooked: bool = False, dro
             "dout": ("rows", "values"), "peak": ("rows",), "total": ("rows",), "anchor": ("rows",),
             "delta": ("rows",), "seen": tile, **({"slope": tile} if hooked else {}),
             **({"keep": tile} if dropped else {}), **({"at_anchor": tile} if accurate or anchored else {})}
-    return derive.Reduction(functools.partial(softmax_gradients, scale=scale, how=how, accurate=accurate),
+    return derive.Reduction(functools.partial(softmax_gradients, scale=scale, how=how, accurate=accurate,
+                                              normalized_values=normalized_values),
                             axes, walked=walked, exponent="e")
