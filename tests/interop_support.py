@@ -486,11 +486,12 @@ def nvfp4_qdq_case(kind: str) -> tuple[Path, dict[str, np.ndarray]]:
         return directory, dict(reference)
 
 
-def clearing_selections(loaded, draw, label: str, *, stable: bool = True, tries: int = 64):
+def clearing_selections(loaded, draw, label: str, *, stable: bool = True, tries: int = 64,
+                        margin: float | None = None):
     """`draw`, for a decoder that selects discontinuously (a mixture's routing, a lightning indexer's
-    top-k, Gemma 3n's gaussian top-k), redrawn until its selections clear `selection_margins.MARGIN`,
-    so the float32 runs and the float64 run select alike (`selection_margins.clearing`, at most `tries`
-    draws a seed); `draw` itself otherwise. A selection the compared runs could break a tie of
+    top-k, Gemma 3n's gaussian top-k), redrawn until its selections clear `margin` (float32 runs'
+    `selection_margins.MARGIN` where None), so the narrow runs and the float64 run select alike
+    (`selection_margins.clearing`, at most `tries` draws a seed); `draw` itself otherwise. A selection the compared runs could break a tie of
     differently clears none where one of them is not `stable` (torch's `topk`,
     `selection_margins.margin`)."""
     import jax.numpy as jnp
@@ -499,11 +500,11 @@ def clearing_selections(loaded, draw, label: str, *, stable: bool = True, tries:
     if not selection_margins.selects(loaded.model_config):
         return draw
     captured = selection_margins.capture(loaded.model)
+    least = selection_margins.MARGIN if margin is None else margin
 
     def clears(inputs):
         selections = captured(loaded.variables, jnp.asarray(inputs[0]))
-        return (selection_margins.margin(loaded.model_config, selections, label, stable=stable)
-                > selection_margins.MARGIN)
+        return selection_margins.margin(loaded.model_config, selections, label, stable=stable) > least
 
     return selection_margins.clearing(draw, clears, tries)
 
