@@ -295,12 +295,11 @@ def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
 _held: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
 
 
-def _decided[Decision](jaxpr: jcore.Jaxpr, places: Sequence[int], inputs: Sequence[jcore.Var],
-                       outputs: Sequence[jcore.Var], decide: Callable[[], Decision]) -> Decision:
-    """A region's decision (`decide`: whether it is fused, or which of its calls is written), weighed once for
-    its structure (`program.structure`'s, the algebra's windows' key) in the context it is weighed in
-    (`derive.context`: the mesh, the target, the numerics and precision; and the kernel choices a call
-    names), the latest `DECISIONS_HELD` held."""
+def _decided(jaxpr: jcore.Jaxpr, places: Sequence[int], inputs: Sequence[jcore.Var],
+             outputs: Sequence[jcore.Var], decide: Callable[[], bool]) -> bool:
+    """A region's decision (`decide`), weighed once for its structure (`program.structure`'s, the algebra's
+    windows' key) in the context it is weighed in (`derive.context`: the mesh, the target, the numerics and
+    precision; and the kernel choices a call names), the latest `DECISIONS_HELD` held."""
     from dew import _cache
     from dew.algebra import derive, program
 

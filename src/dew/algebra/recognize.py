@@ -76,8 +76,8 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int] = f
     a kernel of Dew's, written as that call (the module's account): the families in order, so a gated
     norm's activation is the norm's rather than a SwiGLU's, an anchor's candidates in the order its family
     names them, the first equal one taken, no two regions sharing an equation nor one `held` (a product's
-    epilogue's). Each candidate's decision is fusion's (`fusion._decided`), held by its region's structure
-    and context; the body's whole recognition held by its structure and constants (`_HELD_BODIES`)."""
+    epilogue's). Each region's choice is held by its structure and its constants' values (`_HELD_REGIONS`),
+    the body's whole recognition by its structure and constants (`_HELD_BODIES`)."""
     key = (_body_key(jaxpr, index), held, derive.context(), _cache.KERNEL_CHOICES.value)
     if key not in _HELD_BODIES:
         _HELD_BODIES[key] = [_positioned(jaxpr, written)
@@ -98,9 +98,7 @@ def _body_key(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
     """A body's structure (`program.structure`, its constants among its inputs) and its constants' values,
     which a call's static arguments read (an epsilon, a mask)."""
     window = jcore.Jaxpr([], [*jaxpr.constvars, *jaxpr.invars], list(jaxpr.outvars), jaxpr.eqns)
-    held = tuple((str(np.asarray(index.consts[var]).dtype), np.shape(index.consts[var]),
-                  hashlib.sha256(np.ascontiguousarray(index.consts[var]).tobytes()).hexdigest())
-                 if var in index.consts else None for var in jaxpr.constvars)
+    held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in jaxpr.constvars)
     return program.structure(window), held
 
 
@@ -148,21 +146,48 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
                  accurate: bool) -> fusion.Written | None:
     """The first of an anchor's candidates whose call takes a kernel of Dew's and whose region the e-graph
     proves computes it, written as its call; None where none is. Its regions are weighed in the order their
-    first candidates come, each once: which of its candidates is equal and taken (`_chosen`), decided by
-    fusion for its structure (`fusion._decided`), its candidates in one e-graph (`_equalities`) built only
-    where one of its calls takes a kernel."""
+    first candidates come, each once: which of its candidates is equal and taken (`_chosen`), held by the
+    region's structure and the values of the constants it reads (`_region_key`), its candidates in one
+    e-graph (`_equalities`) built only where one of its calls takes a kernel."""
     regions: dict[tuple[int, ...], list[Candidate]] = {}
     for candidate, places in spans:
         regions.setdefault(places, []).append(candidate)
     for places, members in regions.items():
-        def decide(places=places, members=members) -> int | None:
-            return _chosen(index, places, members, accurate)
-
-        chosen = fusion._decided(jaxpr, places, fusion._read(jaxpr, places), members[0].outputs, decide)
+        key = _region_key(jaxpr, index, places, members[0].outputs, accurate)
+        if key not in _HELD_REGIONS:
+            # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
+            with generation.routes(alone=True):
+                _HELD_REGIONS[key] = _chosen(index, places, members, accurate)
+            if len(_HELD_REGIONS) > fusion.DECISIONS_HELD:
+                _HELD_REGIONS.popitem(last=False)
+        _HELD_REGIONS.move_to_end(key)
+        chosen = _HELD_REGIONS[key]
         if chosen is not None:
             candidate = members[chosen]
             return fusion.Written(places, candidate.operands, candidate.outputs, places[-1], candidate.call)
     return None
+
+
+_HELD_REGIONS: collections.OrderedDict[Hashable, int | None] = collections.OrderedDict()
+"""Each region's chosen call (`_chosen`) by `_region_key`, the latest `fusion.DECISIONS_HELD` held: every
+layer of a stack weighs its norm once."""
+
+
+def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...],
+                outputs: Sequence[jcore.Var], accurate: bool) -> Hashable:
+    """What a region's choice reads: its structure (`program.structure`, every value it reads an input), the
+    values of the constants among them (`_digest`: a statistic's divisor, an epsilon held as an array), the
+    numerics' forms and the context its kernels are chosen in."""
+    inputs = fusion._read(jaxpr, places)
+    window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
+    held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in inputs)
+    return program.structure(window), held, accurate, derive.context(), _cache.KERNEL_CHOICES.value
+
+
+def _digest(value) -> Hashable:
+    """A constant by its type and bits."""
+    value = np.asarray(value)
+    return str(value.dtype), value.shape, hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
 
 
 def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Candidate],
@@ -197,7 +222,8 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
              outputs: Sequence[jcore.Var]) -> tuple[int, ...] | None:
     """The places of the equations computing `outputs` from `operands` and constants, in body order: None
     where they read another value of the body than the operands (an unbound input), hold more than `SPAN`
-    equations, or make a value the body reads outside them but the outputs."""
+    equations, hold an equation that changes a derivative (`BARRIERS`), make a value the body reads outside
+    them but the outputs, or make an output a reader outside reads before the region's last equation."""
     places: set[int] = set()
     frontier = [var for var in outputs if var not in operands]
     bound = set(operands)
@@ -215,12 +241,24 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
             return None
         frontier += [atom for atom in index.jaxpr.eqns[place].invars
                      if isinstance(atom, jcore.Var) and atom not in bound]
-    results = set(outputs)
+    results, last = set(outputs), max(places, default=-1)
     for place in places:
+        if jax_name(index.jaxpr.eqns[place].primitive) in BARRIERS:
+            return None
         for var in index.jaxpr.eqns[place].outvars:
-            if var not in results and (var in index.escaping or not index.readers[var] <= places):
+            outside = index.readers[var] - places
+            if var not in results and (var in index.escaping or outside):
+                return None
+            # A result is written where the region's last equation stood (`fusion._spliced`): a reader
+            # outside the region before it would read it before it is made.
+            if var in results and any(reader < last for reader in outside):
                 return None
     return tuple(sorted(places))
+
+
+BARRIERS = frozenset({"stop_gradient", "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
+"""The equations a region the compile point writes never holds: what they change is a derivative (a stop, a
+program's own derivative rule), which the call written in their place would not keep."""
 
 
 def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int, ...]]],
@@ -300,7 +338,8 @@ def _declaration(candidate: Candidate) -> Callable:
     declared = candidate.declared
     function = declared.func
     cells = tuple(cell.cell_contents for cell in function.__closure__ or ())
-    key = (function.__code__, _typed(function.__defaults__), _typed(cells),
+    keywords = tuple(sorted((function.__kwdefaults__ or {}).items()))
+    key = (function.__code__, _typed(function.__defaults__), _typed(keywords), _typed(cells),
            _typed(tuple(sorted(declared.keywords.items()))), _typed(tuple(candidate.operands)))
     if key not in _DECLARATIONS:
         traced = jax.make_jaxpr(lambda *values: jax.tree.leaves(declared(*values)))(
@@ -363,7 +402,8 @@ BODY_PARAMS = {"jit": "jaxpr", "pjit": "jaxpr", "closed_call": "call_jaxpr", "co
                "custom_jvp_call": "call_jaxpr", "custom_vjp_call": "call_jaxpr",
                "custom_vjp_call_jaxpr": "fun_jaxpr", "remat2": "jaxpr", "checkpoint": "jaxpr"}
 """The nested programs `_evaluated` runs in place, by the parameter holding each one's body: what its call
-computes, the primal of a custom derivative's (its derivative is the call's own once it is written)."""
+computes, the primal of a custom derivative's. A program's own derivative rule bars its region (`BARRIERS`);
+a declaration's is the call's, kept where the call is written."""
 
 
 def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
@@ -396,20 +436,22 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
     return [read(atom) for atom in jaxpr.outvars]
 
 
-VALUE_IDENTITIES = frozenset({"stop_gradient", "name"})
-"""The equations whose value is their operand's (a gradient's stop, a checkpoint's name), which `_normal`
-reads through: what they change is a derivative or a schedule, never the value compared."""
+VALUE_IDENTITIES = frozenset({"name"})
+"""The equations whose value is their operand's (a checkpoint's name), which `_normal` reads through: what
+they change is a schedule, never the value compared. A gradient's stop is no identity (`BARRIERS`)."""
 
 NARROW = {jnp.dtype(jnp.bfloat16): (8, 7), jnp.dtype(jnp.float16): (5, 10)}
 """The narrow floats, by the exponent and mantissa bits `reduce_precision` rounds a float32 to them by."""
 
-ROUNDED_ONCE = frozenset({"add", "sub", "mul", "div", "max", "min", "neg", "abs", "sqrt", "rsqrt", "exp",
-                          "exp2", "log", "log1p", "expm1", "logistic", "tanh", "erf", "sin", "cos"})
-"""The elementwise primitives whose narrow-float equation is its float32 one rounded once (`_normal`): the
-arithmetic exactly (float32 holds more than twice a bfloat16's or float16's digits and two more, so a
-float32 result rounded again rounds as the narrow operation does), the transcendentals as XLA computes a
-narrow float's, in float32 and rounded (its float normalization), on every backend the compile point
-writes a kernel for."""
+FULL_RANGE = frozenset({jnp.dtype(jnp.bfloat16)})
+"""The narrow floats holding float32's exponent range, whose `reduce_precision` is a round trip through them:
+a float16's underflows to zero where the cast keeps a subnormal (StableHLO's reduce_precision)."""
+
+ROUNDED_ONCE = frozenset({"add", "sub", "mul", "div", "max", "min", "neg", "abs", "sqrt"})
+"""The elementwise primitives whose narrow-float equation is its float32 one rounded once (`_normal`): IEEE's
+correctly rounded arithmetic, which float32 holds at least twice a bfloat16's or float16's digits and two
+more for, so a float32 result rounded again rounds as the narrow operation does. No transcendental: a
+backend computes a narrow one its own way (XLA:GPU's logistic in the operand's dtype)."""
 
 
 def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object],
@@ -440,7 +482,7 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]
         return [jax.lax.mul(operands[0], operands[0])]
     if name == "reduce_precision":
         bits = (equation.params["exponent_bits"], equation.params["mantissa_bits"])
-        narrow = next((dtype for dtype, held in NARROW.items() if held == bits), None)
+        narrow = next((dtype for dtype, held in NARROW.items() if held == bits and dtype in FULL_RANGE), None)
         if narrow is not None:
             return [_converted(_converted(operands[0], narrow, widened), operands[0].dtype, widened)]
     out = equation.outvars[0].aval.dtype if len(equation.outvars) == 1 else None
@@ -497,6 +539,8 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]
         params["shape"] = tuple(target)
         params["broadcast_dimensions"] = tuple(at[params["broadcast_dimensions"][axis]] for axis in kept[0])
     elif name == "reshape":
+        if params.get("dimensions") is not None:
+            return None
         target = tuple(size for size in out.shape if size != 1)
         core = inner[0] if jnp.shape(inner[0]) == target else jax.lax.reshape(inner[0], target)
         return [_unsqueezed(core, out.shape, squeezed)]
@@ -538,8 +582,12 @@ ELEMENTWISE = ROUNDED_ONCE | {"convert_element_type", "select_n", "integer_pow",
 
 
 def _zero(value) -> bool:
-    """Whether `value` is a constant (computed, `_evaluated`) of zeros alone."""
-    return not isinstance(value, jax.core.Tracer) and not np.any(np.asarray(value))
+    """Whether `value` is a constant (computed, `_evaluated`) of positive zeros alone: `x - 0` is `x` for
+    every `x`, where `x - (-0)` makes a negative zero positive."""
+    if isinstance(value, jax.core.Tracer):
+        return False
+    held = np.asarray(value)
+    return not np.any(held) and not np.any(np.signbit(held))
 
 
 def _laid(equation: jcore.JaxprEqn, value, laid: dict[int, tuple]):
@@ -547,7 +595,8 @@ def _laid(equation: jcore.JaxprEqn, value, laid: dict[int, tuple]):
     is, recorded in `laid` by its source and layout (`_lifted`)."""
     shape = equation.outvars[0].aval.shape
     if jax_name(equation.primitive) == "reshape":
-        dimensions = _unit_axes(jnp.shape(value), shape)
+        ordered = equation.params.get("dimensions") is None
+        dimensions = _unit_axes(jnp.shape(value), shape) if ordered else None
         if dimensions is None:
             return equation.primitive.bind(value, **equation.params)
     else:
