@@ -75,6 +75,7 @@ from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
+from dew.training.compiled_program import HOSTED, hosted
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
@@ -178,18 +179,8 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     if held != gpu_target(generation).generation:
         raise ValueError(f"the topology at {topology} holds {devices[0].device_kind} GPUs ({held}), not "
                          f"{generation}")
-    _HOSTED.update(devices[:count])
+    HOSTED.update(devices[:count])
     return tuple(devices[:count])
-
-
-_HOSTED: set = set()
-"""The devices `host_gpus` read off a host's serialized topology (`hosted`)."""
-
-
-def hosted(device) -> bool:
-    """Whether `device` is one of a host's own GPUs as it serialized them (`host_gpus`): XLA reads its memory
-    off the topology, so no compile restates it."""
-    return device in _HOSTED
 
 
 @dataclasses.dataclass(frozen=True)

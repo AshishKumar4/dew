@@ -144,6 +144,24 @@ def test_a_step_compiled_ahead_over_a_hosts_gpus_plans_within_the_memory_it_is_t
     assert ahead.capacity == 2**30 and ahead.plan is not None
 
 
+def test_the_planner_compiles_over_a_hosts_gpus_with_the_options_its_run_compiles_with(tmp_path):
+    """A host's own GPUs (`host_gpus`) compile with the options the host's run on attached GPUs does, its
+    autotuning kept, so the planner's programs key the cache entry that run reads; a canonical target's skip the
+    autotuning nothing can time there (`deviceless_options`)."""
+    from jax.experimental import topologies
+    from jax.sharding import Mesh
+
+    from dew.training.ahead import compile_only_gpus, host_gpus
+    from dew.training.memory import deviceless_options
+
+    canonical = compile_only_gpus("sm90", 1, 2**30)
+    serialized = tmp_path / "topology.bin"
+    serialized.write_bytes(topologies.TopologyDescription(list(canonical)).serialize())
+    over = lambda devices: deviceless_options(Mesh(np.asarray(devices), ("data",)), None)  # noqa: E731
+    assert over(host_gpus("sm90", serialized, 1)) is None
+    assert over(canonical) == {"xla_gpu_autotune_level": 0}
+
+
 @pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its

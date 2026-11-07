@@ -34,7 +34,7 @@ from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.telemetry.instrumentation import compiled_memory
-from dew.training.compiled_program import deviceless
+from dew.training.compiled_program import deviceless, hosted
 
 if TYPE_CHECKING:
     from dew.training.footprint import Footprint
@@ -193,9 +193,13 @@ def deviceless_options(mesh: Mesh,
     autotune on, and XLA's config assigner already gives each matmul its default config there
     (`dew.training.footprint.gemm_workspace`) while its autotuner still compiles the candidates it cannot
     time, so the program skips them (`xla_gpu_autotune_level` 0), its memory the same (a frontier
-    search's every probe and rung, 142 s to 99 s on armada, 11-02). Elsewhere `options` as given."""
+    search's every probe and rung, 142 s to 99 s on armada, 11-02). A host's own GPUs as it serialized them
+    (`dew.training.ahead.host_gpus`) compile as the host's run does, autotuning on, so the program keys the cache
+    entry that run reads (`jax.stages.CompilerOptions` are in the key), reading the picks the host measured where
+    its cache holds them. Elsewhere `options` as given."""
     device = mesh.devices.flat[0]
-    if device.platform != "gpu" or not deviceless(device) or xla_flag("xla_gpu_autotune_level") is not None:
+    if device.platform != "gpu" or not deviceless(device) or hosted(device) \
+            or xla_flag("xla_gpu_autotune_level") is not None:
         return options
     return {**(options or {}), "xla_gpu_autotune_level": 0}
 
