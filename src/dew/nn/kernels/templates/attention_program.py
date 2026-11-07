@@ -148,8 +148,8 @@ def fused_sums(formed: Callable, k_tile: jax.Array, v_tile: jax.Array, lo, hi, d
     walked keys first) added into the carried `dq` by `add_dq(index, dq, tile)` as it is formed, so dQ,
     dK and dV come from one recomputation of each tile's weights and cotangents. dK, dV `[bk, ...]` and
     `dq`."""
-    forms = derived_backward(grad_scale, "rows", hooked, False, how, accurate=False, anchored=True,
-                             normalized_values=v_tile.dtype == jnp.bfloat16)
+    forms = derived_backward(grad_scale, "rows", hooked, dropped=False, how=how, accurate=False,
+                             anchored=True, normalized_values=v_tile.dtype == jnp.bfloat16)
 
     def tiles_of(index):
         tiles, _, _ = formed(index)
