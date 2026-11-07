@@ -39,6 +39,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax._src import mesh as mesh_lib
+from jax._src.core import ShapedArray, Tracer
 from jax.extend import core as jcore
 
 from dew.nn.programs import jax_name
@@ -176,7 +177,7 @@ def written(region: Attention) -> Callable:
 def _q_free(region: Attention) -> list[int]:
     """q's free axes, in order: neither its width nor an axis it shares with k."""
     shared = [q for q, _, _ in region.shared]
-    return [a for a in range(region.query.aval.ndim) if a != region.query_width and a not in shared]
+    return [a for a in range(_shaped(region.query).ndim) if a != region.query_width and a not in shared]
 
 
 def _laid_mask(region: Attention, mask: jax.Array) -> jax.Array:
@@ -184,7 +185,7 @@ def _laid_mask(region: Attention, mask: jax.Array) -> jax.Array:
     to the logits' shape along its axes (`Attention.mask_axes`), then moved to the product's order
     (`Attention.perm`)."""
     mask = mask if mask.dtype == jnp.bool_ else mask != 0
-    query, key = region.query.aval.shape, region.key.aval.shape
+    query, key = _shaped(region.query).shape, _shaped(region.key).shape
     product = ([query[q] for q, _, _ in region.shared] + [query[a] for a in _q_free(region)]
                + [key[region.key_axis]])
     logits = tuple(product[region.perm[i]] for i in range(len(product)))
@@ -214,7 +215,7 @@ def taken(region: Attention) -> bool:
     from dew.nn.kernels import generation
     from dew.nn.kernels.selection import KernelRefused
 
-    shapes = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in region.operands]
+    shapes = [jax.ShapeDtypeStruct(_shaped(var).shape, _shaped(var).dtype) for var in region.operands]
     with generation.routes(alone=True) as found:
         try:
             jax.eval_shape(written(region), *shapes)
@@ -235,7 +236,7 @@ class Graph:
         # The body's constants (jax.nn's mask positions, an iota it closed over) by their values.
         self._constants: dict[jcore.Var, np.ndarray | None] = {
             var: np.asarray(value) for var, value in index.consts.items()
-            if not isinstance(value, jax.core.Tracer)
+            if not isinstance(value, Tracer)
             and math.prod(getattr(var.aval, "shape", ())) <= MASK_ENTRIES}
 
     def made(self, atom, *names: str):
@@ -295,6 +296,14 @@ class Graph:
 PLACEMENTS = frozenset({"sharding_constraint", "reshard", "mesh_cast", "device_put"})
 """The primitives that only place a value (on a mesh, on devices), which a host evaluation takes as the value
 itself (`_outputs`)."""
+
+
+def _shaped(atom) -> ShapedArray:
+    """`atom`'s abstract value, an array's: every value a region reads is one."""
+    aval = atom.aval
+    if not isinstance(aval, ShapedArray):
+        raise TypeError(f"an attention region reads arrays, not {aval}")
+    return aval
 
 
 def _evaluated(eqn: jcore.JaxprEqn, inputs: list, index: int) -> np.ndarray | None:
@@ -395,7 +404,7 @@ def _matched(graph: Graph, exp_place: int) -> Attention | None:
     places += logits_places
     first, query, key, query_width, key_width, layout, softcap, factor, bias, moved = _scaled_product(
         graph, scaled, places)
-    if first is None:
+    if first is None or query_width is None or key_width is None:
         return None
     # The logits' axes as the product lays them: through the layout before the bias (`moved`), then the
     # one before the softmax (`perm`).
@@ -466,19 +475,19 @@ def _back_to_rows(eqns, chain: list[int], labels: list[int], value, axis: int) -
     scalar), reaches `value` laid along the softmax's axes again: each of its axes but `axis` the same axis,
     `axis` a broadcast one. A sum or maximum broadcast to another row's place (`[None, :]` of a reduced
     vector) does not."""
-    labels = list(labels)
+    held: list[int | None] = list(labels)
     for place in chain:
         eqn = eqns[place]
         name = jax_name(eqn.primitive)
         if name == "transpose":
-            labels = [labels[d] for d in eqn.params["permutation"]]
+            held = [held[d] for d in eqn.params["permutation"]]
         elif name == "broadcast_in_dim":
             laid: list[int | None] = [None] * len(eqn.params["shape"])
             for source, target in enumerate(eqn.params["broadcast_dimensions"]):
-                laid[int(target)] = labels[source]
-            labels = laid
+                laid[int(target)] = held[source]
+            held = laid
     rank = value.aval.ndim
-    return len(labels) == rank and all(labels[a] == (None if a == axis else a) for a in range(rank))
+    return len(held) == rank and all(held[a] == (None if a == axis else a) for a in range(rank))
 
 
 def _normalized(graph: Graph, exponential, axis: int, places: list[int]) -> int | None:
@@ -564,7 +573,7 @@ def _laid(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
     the output axis it is laid along (`broadcast_in_dim`'s dimensions), and through a transpose, for each
     output axis the input axis it reads (an input of the output's rank: its permutation); None where it
     reaches the select otherwise."""
-    atom, axes = inner.invars[index], tuple(range(inner.invars[index].aval.ndim))
+    atom, axes = inner.invars[index], tuple(range(_shaped(inner.invars[index]).ndim))
     for eqn in inner.eqns:
         if atom not in eqn.invars:
             continue
@@ -576,7 +585,7 @@ def _laid(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
             permutation = tuple(int(d) for d in eqn.params["permutation"])
             axes = tuple(axes[d] for d in permutation)
         elif name == "select_n":
-            return axes if atom.aval.ndim == rank or index == 0 else None
+            return axes if _shaped(atom).ndim == rank or index == 0 else None
         elif (name == "ne" and index == 0
               and any(isinstance(v, jcore.Literal) and v.val == 0 for v in eqn.invars)):
             pass  # a float mask's predicate, x != 0: the mask's value read as booleans (`_unmasked`'s astype)
@@ -602,7 +611,7 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
             inner = graph.uncast(kept, [], widening)
             transposed = graph.made(inner, "transpose")
             inner = _capped(graph, inner if transposed is None else eqns[transposed].invars[0], [])[1]
-            if (isinstance(other, jcore.Var) and other.aval.shape == atom.aval.shape
+            if (isinstance(other, jcore.Var) and _shaped(other).shape == _shaped(atom).shape
                     and _product_of(graph, inner)):
                 # The bias as the program holds it, its widening for the add the region's (jax.nn's), and
                 # the logits laid out again before it, the transpose the region's.
@@ -651,7 +660,10 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
     else:
         # The default scale times a power of two, which the call's query takes exactly: the program's scale
         # that factor over sqrt(D) as its own constant holds it, not near it.
-        ratio = float(graph.constant(scale)) * math.sqrt(width)
+        stated = graph.constant(scale)
+        if stated is None:
+            return nothing
+        ratio = float(stated) * math.sqrt(width)
         factor = 2.0 ** round(math.log2(ratio)) if ratio > 0 else 0.0
         if factor == 0.0 or not graph.holds(scale, factor / math.sqrt(width)):
             return nothing
