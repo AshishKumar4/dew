@@ -251,7 +251,9 @@ def _on_host() -> Iterator[None]:
     abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
     concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
     try:
-        with jax.ensure_compile_time_eval(), jax.default_device(jax.devices("cpu")[0]):
+        # This process's own CPU: the pool's first device may be another process's, which this one
+        # cannot read back.
+        with jax.ensure_compile_time_eval(), jax.default_device(jax.local_devices(backend="cpu")[0]):
             yield
     finally:
         mesh_lib.device_context.set_local(concrete)
