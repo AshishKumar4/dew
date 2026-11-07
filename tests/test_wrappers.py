@@ -139,6 +139,27 @@ def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mat
     np.testing.assert_array_equal(first(restored, ids), first(loaded, ids))
 
 
+def test_a_wrapper_whose_parts_compute_in_a_dtype_of_their_own_exports_and_reloads_alike(tmp_path):
+    """A wrapper whose parts state a dtype of their own (a run's model, its projection in float32) is the
+    computation its family writes, as the wrapper computes its parts in its own numerics
+    (`dew.nn.multimodal._conditioner_modules`): it exports, its numerics read back as they were, and it
+    reloads computing its text as it did (row 4776's review: the projection's dtype was compared as
+    architecture and the export refused)."""
+    import dataclasses
+
+    from dew.interop import Pretrained, PretrainedDecoder
+
+    loaded = Pretrained.load(FIXTURES / "qwen38-dense-tiny", dtype="float32", attention_impl="xla")
+    model = loaded.model.clone(projection=dataclasses.replace(loaded.model.projection, dtype="float32"))
+    bundle = PretrainedDecoder.from_model(model, loaded.variables)
+    bundle.save(tmp_path / "export")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="xla")
+    assert (restored.model.dtype, restored.model.precision) == (model.dtype, model.precision)
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),
+                                  np.asarray(model.apply(loaded.variables, ids)))
+
+
 def load_wrapper(name):
     directory = FIXTURES / name
     record = translate_wrapper_config(

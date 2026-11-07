@@ -977,15 +977,31 @@ def host_rows(leaf: jax.typing.ArrayLike, rows: int | None) -> np.ndarray:
 
 
 def request_key(key: int | jax.Array | None) -> jax.Array:
-    """Normalize an integer seed or a single JAX key to one typed PRNG key."""
+    """Normalize an integer seed or a single JAX key to one typed PRNG key. A seed's key under JAX's
+    threefry implementation, the default, is its words as JAX derives them (`seeded_words`), wrapped
+    on the host, so making it compiles no program: a run compiled ahead compiles none of its start on its
+    devices (`dew.training.ahead`)."""
     if key is None or isinstance(key, bool):
         raise ValueError("key must be an integer seed or a single JAX PRNG key")
     if isinstance(key, (int, np.integer)):
+        if str(jax.config.jax_default_prng_impl) == "threefry2x32":
+            return jax.random.wrap_key_data(jax.device_put(seeded_words(int(key))), impl="threefry2x32")
         return jax.random.key(int(key))
     typed = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
     if typed.shape != ():
         raise ValueError("key must be a single JAX PRNG key")
     return typed
+
+
+def seeded_words(seed: int) -> np.ndarray:
+    """The two words JAX's threefry key of `seed` holds (`jax.random.key`: `random_seed` and
+    `threefry_seed` in jax/_src/prng.py): the seed read as a 64-bit integer (one past it refused, as JAX
+    refuses it), then as JAX's integer, 64 bits with x64 on and 32 without, the configured seed offset
+    added within it (`jax_random_seed_offset`), its high word shifted down logically (none of 32 bits)
+    and its low word, each as an unsigned 32-bit word."""
+    bits = 64 if jax.config.jax_enable_x64 else 32
+    held = (int(np.int64(seed)) + int(jax.config.jax_random_seed_offset)) % (1 << bits)
+    return np.asarray([(held >> 32) if bits == 64 else 0, held & 0xFFFFFFFF], np.uint32)
 
 
 def seed_of(key: int | jax.Array) -> int | None:

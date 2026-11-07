@@ -1,5 +1,6 @@
 """`DecisionObjective`: proper scoring rules, metrics, row encoding, and training through LoRA."""
 
+import itertools
 import json
 import shutil
 from dataclasses import replace
@@ -258,6 +259,22 @@ class AliasedEncoder(NativeEncoder):
 
     def hidden_states(self, tokens, **fields):
         return self(tokens, **fields)
+
+
+def test_a_decision_window_states_the_most_tokens_its_rows_score_from_its_shape():
+    """A decision batch states each window's tokens from its shape alone (`row_tokens`): the most its
+    packed rows score (`scored_tokens`), so a run with a token budget or cadence bounds its committed
+    tokens without reading them off the devices after every step (row 4740: the steps stopped running
+    ahead of the devices)."""
+    layout = replace(LAYOUT, max_len=192)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, shuffle_options=False)
+    data = decision_rows(HELD, 4, HELD, objective=objective.data())
+    for batch in itertools.islice(data.val(DataPartition()), 3):
+        batch = {name: np.asarray(value) for name, value in batch.items()}
+        width = objective.row_tokens(batch)
+        assert width == batch["tokens"].shape[-1]
+        assert 0 < objective.scored_tokens(batch).max() <= width
 
 
 def test_a_decision_reads_a_native_encoders_states_with_no_method_that_forwards_to_it():

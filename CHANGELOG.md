@@ -48,6 +48,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   (`--trainer.compile-ahead.topology PATH`, `dew.training.ahead.host_gpus`): its programs key the persistent
   compilation cache as the host's own compiles do, so the host's run reads them. Compiled for a generation alone,
   they key other entries (the generation's canonical SKU's memory: an A100's 80 GB, where a host's may hold 40 GB).
+- A decision objective's "none of the above" draws no longer touch a yes-or-no choice by default
+  (`none_of_the_above_options` defaults to 3); a run recorded before keeps its recorded floor.
 - A profile window may convert its reports as it stops, in the run's own process (`ProfileWindow(wait=True)`),
   as `Profiler.stop(wait=True)` does: a short interactive run's, or one whose sandbox forbids it to create a
   process. By default a window's reports still convert in a process of their own while the run trains on.
