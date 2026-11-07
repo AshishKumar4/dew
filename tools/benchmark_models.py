@@ -286,7 +286,7 @@ def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
     trainer = Trainer(
         build_objective(case, attention_impl),
         optimizer or OptimConfig(optimizer=case.optimizer, learning_rate=1e-4).build(None),
-        key=jax.random.key(0),
+        key=0,
         **trainer_mesh(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
         accumulation=case.accumulation, split=1, checkpoints=None, tracker=None, ahead=ahead)
     if case.device_order is not None:
