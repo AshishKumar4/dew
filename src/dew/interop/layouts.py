@@ -713,6 +713,11 @@ class SourceLayout:
             written.write_bytes(module.read_bytes())
 
 
+CROSSING_UNWRITTEN = ("the source's format holds no cross-attention layers; a run's checkpoint keeps this "
+                      "model")
+"""Why a decoder that reads a context through cross-attention is written in no family's layout."""
+
+
 def source_layout(model: nn.Module, *,
                   config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
     """The layout `model` is written in as its family's release, or what it cannot write (`Unwritable`):
@@ -738,7 +743,7 @@ def source_layout(model: nn.Module, *,
     except ValueError as error:
         return Unwritable(f"no family writes a {type(model).__name__}: {error}")
     if decoder.cross_attention is not None:
-        return Unwritable("cross-attention has no layout in any family")
+        return Unwritable(CROSSING_UNWRITTEN)
     # A differential extension is folded into each layer's output projection and an adapter's factors
     # merged into their kernels as it is written (`Pretrained.export`): the layout is the decoder's they
     # extend.
@@ -782,6 +787,7 @@ def _decoder_layout(decoder: CausalTransformer) -> Mapping[str, object] | Unwrit
 
 
 __all__ = [
+    "CROSSING_UNWRITTEN",
     "INDEX",
     "REQUIRED",
     "Choice",

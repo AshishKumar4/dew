@@ -23,6 +23,7 @@ import select
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -33,6 +34,7 @@ import pytest
 from lane_environment import MESH_DEVICES
 from interop_support import assert_same_stored_tensors, written_tensors
 from process_support import (
+    ProcessGroup,
     free_port,
     report_of,
     run_pool,
@@ -40,6 +42,7 @@ from process_support import (
     run_worker,
     serving,
     spawn,
+    start_process,
     stuck,
     terminate,
     worker_env as worker_env,
@@ -260,7 +263,8 @@ def test_a_pools_cooldown_across_its_uneven_tail_reads_its_shares_as_its_run_doe
     assert len(reports[0]["cooled"]) == 1 and np.isfinite(reports[0]["cooled"]).all()
     planned = clocked_pool(tmp_path / "planned", 2, deal="order", cooldown=True)
     alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal="order", cooldown=True)
-    # The same programs over the same rows, a sum of two devices' parts in either order.
+    # The same programs over the same rows, a sum of two devices' parts in either order: one SPMD program
+    # over one two-device mesh, whichever processes hold its devices (row 3177).
     assert len(planned[0]["cooled"]) == 1 and planned[0]["cooled"] == alone[0]["cooled"]
 
 
@@ -601,6 +605,38 @@ def test_the_layout_tools_step_reads_each_row_at_its_place_among_the_examples_on
     pool = run_pool("layout_rows", tmp_path / "pool", 2, script=script)
     for report in pool:
         assert report["rows"] == list(range(report["batch"])), report
+
+
+POOLED_LAYOUTS = ("data4", "fsdp4", "replicas4", "replicas2_fsdp2")
+"""The layouts whose sums cross hosts in the multi-host gang (tests/test_multihost.py), which runs each
+once."""
+POOLED_LAYOUT_SEEDS = 32
+"""Their declared check-1 draws: `seeds_for` paired sized data4 and fsdp4 at 32 on four devices of one
+host (armada, 11-06); a replica layout sums its rows across processes as data does."""
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("model", ["dense", "moe"])
+def test_the_layouts_a_gang_crosses_hosts_with_match_one_device_across_four_processes(model, tmp_path):
+    """The layout tool's dense decoder or mixture of experts over a pool of four processes of one device
+    each, as the multi-host gang runs it over four hosts: each of POOLED_LAYOUTS, whose sums cross the
+    processes, on par with one device over POOLED_LAYOUT_SEEDS draws (check 1). A replica layout forms only
+    across processes or slices, so its draws are judged here, where a draw takes a fraction of its time
+    across hosts (dense 91 s, the mixture 150 s for both replica layouts, armada 11-06)."""
+    rows = tmp_path / "rows.json"
+    command = [sys.executable, "tools/layout_parity.py", "--models", model,
+               "--seeds", str(POOLED_LAYOUT_SEEDS), "--out", str(rows), "--layouts", *POOLED_LAYOUTS]
+    pool = {"DEW_PROCESS_COUNT": "4", "JAX_COORDINATOR_ADDRESS": f"127.0.0.1:{free_port()}"}
+    with ProcessGroup() as group:
+        group.running.extend(start_process(command, 1, environment={**pool, "DEW_PROCESS_ID": str(rank)})
+                             for rank in range(4))
+        judged = report_of(group.running[0], rows, timeout=1200, pool=group.running)
+        # Every peer ends before the group's exit, which kills whatever still runs.
+        for process in group.running[1:]:
+            process.communicate(timeout=120)
+    assert [process.returncode for process in group.running] == [0] * 4
+    statuses = [(row["layout"], row["status"]) for row in judged]
+    assert statuses == [(layout, "works") for layout in POOLED_LAYOUTS], judged
 
 
 @pytest.mark.distributed
@@ -1484,7 +1520,8 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
                                    rtol=1e-5, atol=1e-6)
     assert any(value < 0 for row in single["drawn_behavior"] for value in row)
     # A task takes a resident global array without fetching it to the host;
-    # each rank generates from its own rows exactly as the direct call does.
+    # each rank generates from its own rows exactly as the direct call does:
+    # one generation program over the same rows, moved, not computed (row 3177).
     for report in reports:
         assert report["resident_addressable"] is False
         assert report["resident_tokens"] == report["direct_tokens"]

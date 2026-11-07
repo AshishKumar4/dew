@@ -44,7 +44,7 @@ from dew.artifacts import Artifacts
 from dew.batch import Batch, Variables, without
 from dew.nn import categorical
 from dew.nn.kernels.options import Held
-from dew.nn.precision import accumulated
+from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.protocols import Bounded
 from dew.objectives.base import (
     OMITTED,
@@ -318,21 +318,24 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         return statistics, aux, student, teacher
 
     def _distance(self, student: jax.Array, teacher: jax.Array) -> jax.Array:
-        """The pair's per-position feature distance, `[B, S]`, in fp32."""
+        """The pair's per-position feature distance, `[B, S]`, in the pair's common dtype, at least fp32."""
         # MaxText's distillation_utils.py:418-436.
-        student, teacher = student.astype(jnp.float32), teacher.astype(jnp.float32)
+        dtype = at_least_fp32(jnp.result_type(student, teacher))
+        student, teacher = student.astype(dtype), teacher.astype(dtype)
         if self.feature_loss == "cosine":
             return optax.cosine_distance(student, teacher, epsilon=1e-6)
         return jnp.mean(jnp.square(student - teacher), axis=-1)
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux[Effects]]:
         statistics, aux, student, teacher = self._predictions(variables, batch, step)
-        alpha, temperature, beta = (jnp.asarray(schedule(step.step), jnp.float32) for schedule in
+        # The terms' dtype: the losses', at least fp32, so a float64 run keeps float64 throughout.
+        dtype = at_least_fp32(jnp.result_type(student.losses, teacher.losses))
+        alpha, temperature, beta = (jnp.asarray(schedule(step.step), dtype) for schedule in
                                     (self.alpha, self.temperature, self.beta))
         # Every term is summed with the student's weights and divided by its
         # mass, the teacher's reported loss included (MaxText's
         # distillation_utils.py:492-547 and :562-566).
-        weights = student.weights.astype(jnp.float32)
+        weights = student.weights.astype(dtype)
         mass = statistics.mass
         counted = jnp.where(mass > 0, mass, 1)
         # A position where anything the teacher gives is non-finite, its scores or a paired layer's
@@ -352,8 +355,8 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         else:
             # log pi_s(y) - log pi_t(y) at the sampled y, the reward the student's log-likelihood is
             # weighted by (its score function); the estimate itself is reported.
-            ratio = teacher_losses - student.losses.astype(jnp.float32)
-            soft = self.row_mean(jax.lax.stop_gradient(ratio) * -student.losses.astype(jnp.float32), batch,
+            ratio = teacher_losses.astype(dtype) - student.losses.astype(dtype)
+            soft = self.row_mean(jax.lax.stop_gradient(ratio) * -student.losses.astype(dtype), batch,
                                  weights=scored).total
             estimate = self.row_mean(jax.lax.stop_gradient(ratio), batch, weights=scored).total
         total = (1 - alpha) * statistics.total + alpha * temperature ** 2 * soft
@@ -367,7 +370,9 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             distances = []
             for index, (own, other) in enumerate(zip(student.hidden, states, strict=True)):
                 if own.shape[-1] != other.shape[-1]:
-                    own = accumulated(jnp.matmul, own.astype(jnp.float32), projections[f"projection_{index}"])
+                    projection = projections[f"projection_{index}"]
+                    own = accumulated(jnp.matmul, own.astype(at_least_fp32(jnp.result_type(own, projection))),
+                                      projection)
                 distances.append(self._distance(own, jnp.where(finite[..., None], other, 0)))
             feature = (self.row_mean(jnp.stack(distances), batch, rows=1, weights=scored).total
                        / len(self.features))

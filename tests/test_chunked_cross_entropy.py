@@ -327,28 +327,45 @@ def test_the_scale_and_bias_gradients_match_full_logits_under_the_float64_rule(d
 def test_a_vocabulary_split_head_rounds_a_confident_targets_gradient_as_one_device_does(tile):
     """Under bf16 compute a split head's gradient rounds the target's whole cotangent, its softmax
     share and its one-hot together, once, as one device's head does: a target whose share rounds to
-    one in bf16 keeps a gradient, where rounding the share apart from the one-hot would cancel it."""
+    one in bf16 keeps a gradient, where rounding the share apart from the one-hot would cancel it. Over
+    drawn confident heads the split head's gradient is on par with one device's from float64 (check 1):
+    the two compile two programs."""
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.training import MeshSpec
 
-    states = jnp.ones((2, 1), jnp.float32)
-    matrix = jnp.asarray([[8.0, 0.0, 0.0, 0.0]], jnp.float32)
     targets = jnp.zeros((2,), jnp.int32)
-
-    def loss(states, matrix):
-        head = OutputTable(matrix, vocab_major=False, compute=jnp.bfloat16)
-        losses, _, _ = chunked_cross_entropy(states, head, targets, 1, tile=tile)
-        return jnp.sum(losses)
-
-    alone = jax.jit(jax.grad(loss, argnums=1))(states, matrix)
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
-    with jax.set_mesh(mesh):
-        placed = (jax.device_put(states, NamedSharding(mesh, P("fsdp"))),
-                  jax.device_put(matrix, NamedSharding(mesh, P(None, "fsdp"))))
-        split = jax.jit(jax.grad(loss, argnums=1))(*placed)
-    assert float(alone[0, 0]) != 0
-    np.testing.assert_array_equal(np.asarray(split), np.asarray(alone))
+
+    def gradient(states, matrix, compute=jnp.bfloat16):
+        def loss(states, matrix):
+            head = OutputTable(matrix, vocab_major=False, compute=compute)
+            losses, _, _ = chunked_cross_entropy(states, head, targets, 1, tile=tile)
+            return jnp.sum(losses)
+        return jax.jit(jax.grad(loss, argnums=1))(states, matrix)
+
+    def split(states, matrix):
+        with jax.set_mesh(mesh):
+            return gradient(jax.device_put(states, NamedSharding(mesh, P("fsdp"))),
+                            jax.device_put(matrix, NamedSharding(mesh, P(None, "fsdp"))))
+
+    def draw(seed):
+        """States near one and a head whose target column leads the others by about eight: the target's
+        softmax share rounds to one in bf16."""
+        rng = np.random.default_rng([351, seed])
+        states = np.full((2, 1), rng.uniform(.9, 1.1), np.float32)
+        matrix = np.concatenate([[rng.uniform(7.5, 8.5)], rng.uniform(-.5, .5, 3)]).astype(np.float32)[None]
+        return states, matrix
+
+    states, matrix = jnp.ones((2, 1), jnp.float32), jnp.asarray([[8.0, 0.0, 0.0, 0.0]], jnp.float32)
+    assert float(gradient(states, matrix)[0, 0]) != 0 and float(split(states, matrix)[0, 0]) != 0
+    assert_as_exact(as_given(split), as_given(gradient), draw, "a confident target's split gradient",
+                    seeds=SPLIT_CONFIDENT_SEEDS,
+                    truth_fn=as_given(lambda states, matrix: gradient(states, matrix, jnp.float64)))
+
+
+SPLIT_CONFIDENT_SEEDS = 8
+"""Check 1's declared seeds for a confident target's gradient under a split head."""
 
 
 @pytest.mark.mesh(devices=2)

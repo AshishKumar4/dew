@@ -11,9 +11,9 @@ an activation, a router's top-k, whether the head is the embedding's own paramet
 semantics are the source's own, never a guess from its names or shapes. A module no known part matches,
 or two parts that state one field differently, leave the decoder to tier 3 (`Unassembled`, naming it).
 
-The renamings map the source's module paths onto the canonical ones `decoder_parts.dew_path` reads
-(`Assembly.weight_path`), so a renamed checkpoint loads by its structure. `dew.interop.verify` confirms
-an assembly on its shrunken probe before any weight downloads.
+The renamings map the source's module paths onto the canonical ones the shared table reads
+(`DECODER_ROUTES`, `Assembly.weight_path`), so a renamed checkpoint loads by its structure.
+`dew.interop.verify` confirms an assembly on its shrunken probe before any weight downloads.
 """
 
 from __future__ import annotations

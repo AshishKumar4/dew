@@ -341,99 +341,16 @@ def parameter_loss(objective, variables, batch, step) -> Callable:
 
 
 def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict], dict[str, jax.Array]]:
-    """Dew's forward of `source` (a loaded remote-code release, `Pretrained`) at a recorded `site`
-    (tests/remote_code_draws.py), in float64 with `wide`, the truth its recording is held to: a seed's
-    inputs to its outputs by leaf. `logits` over plain rows; `packed` over a packed row, each document's
-    positions from 0; `decode` through the decode cache in `CHUNKS`; `gradients`, the parameters'
-    gradient of the logits' product with the cotangent, by each parameter's dotted path; `update`, the
-    logits after one SGD step at `RATE` on the rows' next-token cross-entropy; `biased` over left-padded
-    rows, each row's real slots alone (`row0`, `row1`); `image`, `video`, `frames` (a video's frames side
-    by side in one run) and `audio` over a row whose placeholders its drawn media fill, laid out as the
-    source's processor reads its own processor's fields (`Processor.from_hf`); `mtp`, its language model's
-    first prediction depth's logits over plain rows (`prediction_logits`)."""
-    import optax
+    """Dew's forward of `source` (a loaded remote-code release, `Pretrained`) at a recorded `site`, as the
+    site table declares it (tests/remote_code_draws.py's `SITE_FORMS`), in float64 with `wide`, the truth
+    its recording is held to: a seed's inputs to its outputs by leaf, every module it holds widened, a
+    wrapper's decoder beside its towers."""
     from reference_error import widened
-    from remote_code_draws import CHUNKS, DOCUMENTS, PADDED, RATE, positions
+    from remote_code_draws import SITE_FORMS
 
-    from dew.batch import coordinates
-
-    # Every module it holds widened, a wrapper's decoder beside its towers.
     model = float64_twin(source.model) if wide else source.model
     variables = widened(source.variables) if wide else source.variables
-    if site == "packed":
-        segments = np.concatenate([np.full(length, index + 1) for index, length in enumerate(DOCUMENTS)])
-        placed = coordinates(segments=segments[None].astype(np.int32), positions=positions(),
-                             max_segments=len(DOCUMENTS) + 1)
-        return jax.jit(lambda inputs: {"logits": model.apply(variables, inputs["ids"], coordinates=placed)})
-    if site == "decode":
-        made, step = decode_steps(model)
-
-        def decoded(inputs):
-            cache, steps, start = made(variables, inputs["ids"].shape[0]), [], 0
-            for chunk in CHUNKS:
-                logits, cache = step(variables, cache, inputs["ids"][:, start:start + chunk])
-                steps.append(logits)
-                start += chunk
-            return {"logits": jnp.concatenate(steps, axis=1)}
-        return decoded
-    if site == "gradients":
-        def gradients(inputs):
-            def loss(params):
-                logits = model.apply({**variables, "params": params}, inputs["ids"])
-                return jnp.sum(logits * inputs["cotangent"].astype(logits.dtype))
-            return dict(flat_tree(jax.grad(loss)(variables["params"])))
-        return jax.jit(gradients)
-    if site == "update":
-        def updated(inputs):
-            def loss(params):
-                logits = model.apply({**variables, "params": params}, inputs["ids"])
-                return optax.softmax_cross_entropy_with_integer_labels(
-                    logits[:, :-1], inputs["ids"][:, 1:]).mean()
-            params, optimizer = variables["params"], optax.sgd(RATE)
-            steps, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
-            return {"logits": model.apply({**variables, "params": optax.apply_updates(params, steps)},
-                                          inputs["ids"])}
-        return jax.jit(updated)
-    if site == "mtp":
-        # A wrapper's prediction depths are its language model's.
-        language = getattr(model, "language_model", model)
-        held = {collection: tree["language_model"] for collection, tree in variables.items()
-                if "language_model" in tree} if language is not model else variables
-        return jax.jit(lambda inputs: {"logits": prediction_logits(language, held, inputs["ids"])})
-    if site == "biased":
-        def biased(inputs):
-            mask = inputs["attention_mask"].astype(bool)
-            logits = model.apply(variables, inputs["ids"], attention_mask=mask)
-            return {"row0": logits[0], "row1": logits[1, PADDED:]}
-        return jax.jit(biased)
-    if site in ("image", "video", "frames", "audio"):
-        from remote_code_draws import draw
-
-        from dew.nn.inputs import ModelInputs
-
-        # The processor's reading of a draw, the same for every draw of the site, whose placeholders,
-        # grids and clips are fixed (`remote_code_draws.IMAGE_AT`, `IMAGE_GRID`, `AUDIO_FRAMES`): each
-        # patch vector, or each clip's frame, marked by its index, one past it, where `from_hf` places it,
-        # which a traced draw's vectors then fill.
-        template = draw(site, 0, dict(source.config))
-        drawn = {"image": "pixel_values", "video": "pixel_values_videos", "frames": "pixel_values_videos",
-                 "audio": "input_features"}[site]
-        held = "input_features" if site == "audio" else "pixel_values"
-        shape = template[drawn].shape
-        count = int(np.prod(shape[:-1]))
-        marked = np.broadcast_to(np.arange(1, count + 1, dtype=np.float32).reshape(*shape[:-1], 1), shape)
-        layout = source.processor.from_hf({"input_ids": template["ids"], **{
-            name: marked if name == drawn else value for name, value in template.items() if name != "ids"}})
-        places = np.asarray(layout.conditioning[held])[..., 0].astype(np.int64)
-
-        def media(inputs):
-            vectors = inputs[drawn].reshape(-1, shape[-1])
-            placed = jnp.where((places > 0)[..., None], vectors[np.maximum(places - 1, 0)], 0)
-            batch = ModelInputs(inputs["ids"], layout.token_fields,
-                                {**layout.conditioning, held: placed.astype(inputs[drawn].dtype)})
-            return {"logits": model.apply(variables, batch.tokens, **batch.kwargs())}
-        return jax.jit(media)
-    return jax.jit(lambda inputs: {"logits": model.apply(variables, inputs["ids"])})
+    return SITE_FORMS[site].dew(model, variables, source)
 
 
 def prediction_logits(model, variables, tokens):

@@ -12,7 +12,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.extend import core as jcore
 from reference_error import assert_as_exact
 
 from dew.algebra import SATURATION, cost, linear_scan, scan
@@ -347,33 +346,35 @@ def test_a_derived_scan_holds_its_latest_splits_alone():
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"),
                          [(gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)],
                          ids=["gated_delta", "kimi_delta"])
-def test_the_delta_rules_carry_reads_the_state_through_one_product_where_its_state_is_bounded(
-        update_fn, operands, draw_fn):
+def test_the_delta_rules_carry_from_a_ranged_state_computes_its_token_scan(update_fn, operands, draw_fn):
     """The delta rule's split (`carry.split`), its keys, write gates, log decays and values ranged (unit keys,
     so tokens' corrections overlap by at most their gates, under 1; decays at most 1; values under the draws'
-    8): where its entering state is ranged too
-    (`Scan.ranges`' "state"), its carry (`step` over a chunk's prepared values) reads the state through one
-    product, a matrix the chunk prepared times the state, the solve, the decays and every other product among
-    the prepared values. With no range on the state, the solve's distribution over `W h` makes an
-    intermediate of the state's magnitude no number bounds (§6.3), and the carry keeps it: more than one
-    product reads the state."""
+    8), its entering state ranged too (`Scan.ranges`' "state", where the solve need not distribute over
+    `W h`, §6.3) or not: a chunk's carry (`step` over its prepared values) from a drawn state within that
+    range on par with the token-by-token scan over the chunk, against the float64 truth (check 1)."""
     names = ("q", "k", "v", "g", "beta")
-    chunk = {name: value[:CHUNK] for name, value in zip(names, draw_fn(0), strict=True)}
     ranges = {"k": 1.0, "beta": 1.0, "overlap": 1.0, "g": (-np.inf, 0.0), "v": 8.0}
 
-    def carried_products(declared: dict) -> list[str]:
+    def draw(seed):
+        entering = np.random.default_rng([374, seed]).uniform(-64.0, 64.0, (KEY, VALUE)).astype(np.float32)
+        return (*(value[:CHUNK] for value in draw_fn(seed)), entering)
+
+    def tokens(q, k, v, g, beta, h):
+        for token in zip(q, k, v, g, beta, strict=True):
+            h = update_fn(h, *token)
+        return h
+
+    for declared in ({**ranges, "state": 64.0}, ranges):
         forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                            state=((KEY, VALUE), jnp.float32), ranges=declared),
                                  saturation=SATURATION)
-        prepared = forms.prepare(chunk)
-        carry = jax.make_jaxpr(lambda h: forms.step((jnp.zeros((KEY,), jnp.float32), h), prepared))(
-            jnp.zeros((KEY, VALUE)))
-        return list(_primitives(carry.jaxpr))
 
-    bounded = carried_products({**ranges, "state": 64.0})
-    assert bounded.count("dot_general") == 1, bounded
-    assert not any(name.startswith("custom_vjp") for name in bounded), bounded
-    assert carried_products(ranges).count("dot_general") > 1
+        def carried(*values, forms=forms):
+            prepared = forms.prepare(dict(zip(names, values[:-1], strict=True)))
+            return forms.step((jnp.zeros((KEY,), jnp.float32), values[-1]), prepared)[1]
+
+        label = f"{update_fn.__name__} carry, {'a ranged' if 'state' in declared else 'an unranged'} state"
+        assert_as_exact(jax.jit(carried), jax.jit(tokens), draw, label, seeds=16)
 
 
 def test_a_delta_rules_carry_stays_finite_wherever_the_token_scan_is():
@@ -548,17 +549,6 @@ def test_a_walk_carries_its_state_in_one_dtype(dtype):
         final = forms.finish(state, {})
         assert final.dtype == dtype and np.isfinite(np.asarray(final, np.float64)).all()
         assert state[0].dtype == jnp.dtype(jnp.float64 if dtype == jnp.float64 else jnp.float32)
-
-
-def _primitives(jaxpr):
-    """Each equation's primitive in `jaxpr` and in every jaxpr its equations hold (a jit's, a custom
-    derivative's), a cond's one branch (Dew's product a choice by platform, each branch one product)."""
-    for equation in jaxpr.eqns:
-        yield equation.primitive.name
-        inner = ([equation.params["branches"][-1].jaxpr] if equation.primitive.name == "cond"
-                 else jcore.jaxprs_in_params(equation.params))
-        for held in inner:
-            yield from _primitives(held)
 
 
 def adjoint(forms, chunk_of_values, count: int):

@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, unpacked
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop import Pretrained
@@ -56,21 +56,20 @@ def flux_inputs(bundle, seed: int = 0) -> dict[str, np.ndarray]:
             "times": np.asarray([700.0, 150.0], np.float32)}
 
 
-def dew_prediction(bundle, inputs) -> np.ndarray:
+def dew_prediction(bundle, inputs) -> jax.Array:
     grid = int(np.sqrt(inputs["packed"].shape[1]))
     guidance = None if inputs["guidance"] is None else jnp.asarray(inputs["guidance"])
     condition = DenoisingCondition(jnp.asarray(inputs["context"]), jnp.asarray(inputs["pooled"]),
                                    guidance=guidance)
     own = {"params": bundle.variables["params"]}
-    return np.asarray(bundle.model.apply(own, jnp.asarray(unpacked(inputs["packed"], grid, grid)),
-                                         jnp.asarray(inputs["times"]), condition))
+    return bundle.model.apply(own, jnp.asarray(unpacked(inputs["packed"], grid, grid)),
+                              jnp.asarray(inputs["times"]), condition)
 
 
-def diffusers_prediction(repo: str | Path, dduf_file: str, inputs, *, wide: bool,
-                         revision: str | None = None):
-    """Diffusers' own DDUF load of the pipeline, and its transformer's
-    prediction on `inputs` with FluxPipeline's own position ids, in float32
-    or in float64, read back into Dew's layout."""
+def diffusers_predictor(repo: str | Path, dduf_file: str, *, wide: bool, revision: str | None = None):
+    """Diffusers' own DDUF load of the pipeline, once, in float32 or in
+    float64, as its transformer's prediction on a draw's `inputs` with
+    FluxPipeline's own position ids, read back into Dew's layout."""
     import contextlib
 
     import torch
@@ -82,16 +81,16 @@ def diffusers_prediction(repo: str | Path, dduf_file: str, inputs, *, wide: bool
 
     dtype = torch.float64 if wide else torch.float32
     with float64() if wide else contextlib.nullcontext():
-        pipe = DiffusionPipeline.from_pretrained(str(repo), dduf_file=dduf_file, torch_dtype=dtype,
-                                                 revision=revision)
-        model = pipe.transformer.eval()
+        model = DiffusionPipeline.from_pretrained(str(repo), dduf_file=dduf_file, torch_dtype=dtype,
+                                                  revision=revision).transformer.eval()
+
+    def tensor(value):
+        return torch.from_numpy(np.asarray(value)).to(dtype)
+
+    def predict(inputs):
         grid = int(np.sqrt(inputs["packed"].shape[1]))
-
-        def tensor(value):
-            return torch.from_numpy(np.asarray(value)).to(dtype)
-
-        positions = FluxPipeline._prepare_latent_image_ids(1, grid, grid, "cpu", dtype)
-        with torch.no_grad():
+        with float64() if wide else contextlib.nullcontext(), torch.no_grad():
+            positions = FluxPipeline._prepare_latent_image_ids(1, grid, grid, "cpu", dtype)
             output = model(hidden_states=tensor(inputs["packed"]),
                            encoder_hidden_states=tensor(inputs["context"]),
                            pooled_projections=tensor(inputs["pooled"]),
@@ -99,7 +98,22 @@ def diffusers_prediction(repo: str | Path, dduf_file: str, inputs, *, wide: bool
                            guidance=None if inputs["guidance"] is None else tensor(inputs["guidance"]),
                            img_ids=positions,
                            txt_ids=tensor(np.zeros((inputs["context"].shape[1], 3)))).sample
-    return unpacked(output.numpy(), grid, grid)
+        return unpacked(output.numpy(), grid, grid)
+    return predict
+
+
+DDUF_SEEDS = 8
+"""Check 1's declared seeds for Dew's Flux prediction against Diffusers' own DDUF load."""
+
+
+def assert_reads_as_diffusers(loaded, repo, dduf_file: str, label: str, *, revision: str | None = None):
+    """Dew's Flux prediction from `loaded` on par with the transformer Diffusers' own DDUF load builds,
+    over the inputs each seed draws (`flux_inputs`), Diffusers' float64 run the truth (check 1)."""
+    narrow, wide = (diffusers_predictor(repo, dduf_file, wide=wide, revision=revision)
+                    for wide in (False, True))
+    assert_as_exact(lambda inputs: dew_prediction(loaded, inputs), as_given(narrow),
+                    lambda seed: (flux_inputs(loaded, seed),), label, seeds=DDUF_SEEDS,
+                    truth_fn=as_given(wide))
 
 
 def test_a_dduf_file_loads_what_diffusers_reads_from_it_and_unpacks_once(packed_pipeline, tmp_path,
@@ -132,9 +146,7 @@ def test_a_dduf_file_loads_what_diffusers_reads_from_it_and_unpacks_once(packed_
         with entry.as_mmap() as mapped:
             assert (written / name).read_bytes() == bytes(mapped), name
 
-    inputs = flux_inputs(loaded)
-    theirs, truth = (diffusers_prediction(repo, "pipeline.dduf", inputs, wide=wide) for wide in (False, True))
-    assert_as_exact_as_the_reference(dew_prediction(loaded, inputs), theirs, truth, "DDUF Flux")
+    assert_reads_as_diffusers(loaded, repo, "pipeline.dduf", "DDUF Flux")
 
     import huggingface_hub
 
@@ -181,8 +193,4 @@ def test_a_published_dduf_file_loads_what_diffusers_reads_from_it():
     commit: Dew's Flux prediction against Diffusers' own DDUF load."""
     repo, file, revision = PUBLISHED
     loaded = Pretrained.load(repo, dduf_file=file, revision=revision, dtype="float32", attention_impl="xla")
-    inputs = flux_inputs(loaded)
-    assert_as_exact_as_the_reference(dew_prediction(loaded, inputs),
-                                     diffusers_prediction(repo, file, inputs, wide=False, revision=revision),
-                                     diffusers_prediction(repo, file, inputs, wide=True, revision=revision),
-                                     "published DDUF Flux")
+    assert_reads_as_diffusers(loaded, repo, file, "published DDUF Flux", revision=revision)

@@ -804,14 +804,16 @@ def near_duplicates_removed(records: Callable[[], Iterator[Batch]],
 
 
 def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "text", eos: bool = True,
-                  rows_per_shard: int = 100_000, read: Read = "streamed", provision: bool = False
-                  ) -> Mapping[str, object]:
+                  rows_per_shard: int = 100_000, read: Read = "streamed", provision: bool = False,
+                  plan_version: int | None = None) -> Mapping[str, object]:
     """`dataset`'s documents in `field` tokenized by `tokenizer` and written to `url` as a committed
     token store (ArrayRecord shards, each record a document's ids under "text", its manifest naming
     the tokenizer, vocabulary and EOS), which `dew.data.sources.TokenFiles(url)` reads back and
-    `presets.lm(ds, None, ...)` packs. Each document is ended by the tokenizer's EOS with `eos`.
-    Returns the store's manifest."""
+    `presets.lm(ds, None, ...)` packs. Each document is ended by the tokenizer's EOS with `eos`, read by
+    data plan `plan_version` (`dew.data.plan.PLAN_VERSIONS`; this Dew's where None). Returns the
+    store's manifest."""
     from dew.data.compile import iterate
+    from dew.data.plan import PLAN_VERSIONS
     from dew.data.sinks import export
 
     # One step, so the manifest describes the resolution of the tokenizer that encoded the rows
@@ -821,8 +823,10 @@ def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "t
     vocabulary = step.vocabulary
     metadata = {"token_store": True, "tokenizer": tokenizer, "vocab_size": vocabulary.vocab_size,
                 "dtype": "int32", "eos_id": vocabulary.eos_id if eos else None}
-    return export(iterate(documents, read=read, provision=provision), url, format="array_record",
-                  rows_per_shard=rows_per_shard, metadata=metadata, length_field="text")
+    version = PLAN_VERSIONS[-1] if plan_version is None else plan_version
+    return export(iterate(documents, read=read, provision=provision, plan_version=version), url,
+                  format="array_record", rows_per_shard=rows_per_shard, metadata=metadata,
+                  length_field="text")
 
 
 def train_tokenizer(dataset: Dataset, base: str, path: str, *, vocab_size: int, field: str = "text",

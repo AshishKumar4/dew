@@ -1375,16 +1375,6 @@ a tensor that is present maps, whatever the family. The first name is the collec
 weight, `moe` for a router's balancing state, which a training step moves."""
 
 
-def dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The path of the HF tensor `hf_name` in a CausalTransformer's variables through the shared table
-    (`DECODER_ROUTES`), None for a tied head's copy; an unexplained name raises before any checkpoint is
-    accepted."""
-    found = DECODER_ROUTES.read(hf_name, config)
-    if found is None:
-        raise ValueError(f"unknown tensor name {hf_name!r}")
-    return found.path
-
-
 DEEPSEEK_ROUTES = layer_depth_routes(DECODER_ROUTES)
 """DeepSeek-V3's names (`layer_depth_routes` over the shared decoder's), which V2, V3.2 and GLM's MoE
 releases share."""

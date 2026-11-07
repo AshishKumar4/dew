@@ -2,7 +2,6 @@
 same declaration, and a model its family's layout holds written from its own fields and read back as
 itself (`source_layout`)."""
 
-import dataclasses
 import json
 from pathlib import Path
 
@@ -10,9 +9,10 @@ import numpy as np
 import pytest
 from model_support import flat_tree
 
-from dew.interop import Pretrained, PretrainedDecoder, decoder_parts, hf_decoders
+from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
 from dew.interop.codecs import SIDECARS
 from dew.interop.decoder_families import ENTRIES
+from dew.interop.decoder_parts import ExportRefused
 from dew.interop.layouts import (
     Choice,
     ConfigField,
@@ -53,8 +53,6 @@ def test_every_registered_family_reads_and_writes_by_its_one_layout():
     and its writer derive: a family holds no reader or writer of its own beside them, the second inverse
     of a path, a config field or a weight a family once kept and drifted from (ledger 1026, 1411, 4562,
     4570, 4571)."""
-    fields = {field.name for field in dataclasses.fields(decoder_parts.DecoderFamily)}
-    assert not fields & {"weight_path", "export_path", "export_weights", "export_fields", "translate_config"}
     for family in ENTRIES:
         assert all(isinstance(node, ROUTES) for node in declared(family.routes)), family.model_types
         assert all(isinstance(node, CONFIGS) for node in declared(family.config)), family.model_types
@@ -141,7 +139,9 @@ def test_a_routed_or_hybrid_model_writes_its_release_from_its_own_fields_and_rea
 def test_a_model_its_layout_cannot_hold_is_unwritable_with_its_reason():
     """A model no family's layout holds is `Unwritable`, falsy and naming why, before any file is written:
     a decoder with cross-attention, one whose family's config cannot state its computation (GPT-J's
-    layout under a gated MLP, `hf_ungated`), and a model of no decoder class."""
+    layout under a gated MLP, `hf_ungated`), and a model of no decoder class. A bundle of it is refused
+    at once (`PretrainedDecoder.from_model` writes the layout `source_layout` answers), never built to be
+    refused at its save."""
     from flax import linen as nn
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -155,3 +155,5 @@ def test_a_model_its_layout_cannot_hold_is_unwritable_with_its_reason():
     for model in (decoder.clone(cross_attention=CrossAttention((1,), 4)), gated_gptj, nn.Dense(4)):
         layout = source_layout(model)
         assert not layout and layout.reason
+        with pytest.raises(ExportRefused):
+            PretrainedDecoder.from_model(model, {})

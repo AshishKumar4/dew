@@ -159,8 +159,9 @@ class Row:
     """The tools/ file the row runs, or '' for a script of this file's."""
     gated: bool = True
     """Whether a regression of this row fails the gate, or is only shown."""
-    hardware: str | None = None
-    """Device-kind substring required to measure this row; an absent device is not a pass."""
+    hardware: tuple[str, ...] | None = None
+    """The device kinds that measure this row, each a substring of one (`hardware_status`); an absent
+    device is not a pass."""
     head_only: bool = False
     """Compare the head with an external reference, not with the base tree."""
     floor: float = FLOOR
@@ -241,9 +242,10 @@ def _qwen35_comparison(out: Path) -> tuple:
             if comparison is not None else {"error": record.get("error", "incomplete pair")},)
 
 
-STEP_HARDWARE = {"step finetune-4b 1x2048": "H100", "step finetune-1.7b 1x2048": "A100"}
-"""The device a step case is sized for (`Row.hardware`): a full fine-tune's, frozen once (batch, sequence,
-dtype, optimizer) and measured on its own kind alone."""
+STEP_HARDWARE = {"step finetune-4b 1x2048": ("H100", "GH200"), "step finetune-1.7b 1x2048": ("A100",)}
+"""The devices a step case is sized for (`Row.hardware`): a full fine-tune's, frozen once (batch, sequence,
+dtype, optimizer) and measured on each kind apart, the 4B one on Hopper's 80 GB or more (an H100, or the
+GH200 dew-ops' perf runs measure Hopper on: the owner, 2026-11-06)."""
 
 
 PROBES = [
@@ -306,7 +308,7 @@ PROBES = [
           lambda printed, _: (lambda record: (record["save_ms"], record["restore_ms"], peak(record)))(
               json.loads(printed.strip().splitlines()[-1]))),
     Probe((Row("reference qwen3.5-0.8b 8x3072 vs torch", "items/s", "reference_runs/qwen35_pair.py",
-               hardware="A100-SXM4-80GB", head_only=True),),
+               hardware=("A100-SXM4-80GB",), head_only=True),),
           lambda args, out: ["--torch-python", args.torch_python, "--out", str(out), "--claim"],
           lambda _, out: _qwen35_comparison(out)),
 ]
@@ -356,8 +358,8 @@ def claimed(row: Row) -> bool:
 
 def hardware_status(row: Row, device_kind: str) -> str | None:
     """A hardware-limited row is unmeasured off its named device, never silently passed."""
-    if row.hardware is not None and row.hardware not in device_kind:
-        return f"not measured on this hardware: requires {row.hardware}, found {device_kind}"
+    if row.hardware is not None and not any(name in device_kind for name in row.hardware):
+        return f"not measured on this hardware: requires {' or '.join(row.hardware)}, found {device_kind}"
     return None
 
 
@@ -500,7 +502,7 @@ def rounds(args: argparse.Namespace, results: dict, sample: Callable[[str, int],
         write_atomically(args.out, json.dumps(results, indent=2))
 
 
-COMPILE_TARGETS = {"a100": ("sm80", 40, "A100"), "h100": ("sm90", 80, "H100")}
+COMPILE_TARGETS = {"a100": ("sm80", 40, "A100"), "h100": ("sm90", 80, "H100"), "gh200": ("sm90", 96, "GH200")}
 """Each GPU kind dew-ops' perf runs measure, as `compile` plans its steps for it: its CUDA generation, whose
 multiprocessors `dew.training.ahead.built_target` states, its memory in GiB, the planner's capacity, and the
 device its sized steps run on (`STEP_HARDWARE`). A declared target, not the live run's program: a live run
@@ -555,7 +557,7 @@ def ahead_battery(args: argparse.Namespace) -> int:
                                     args.environments)
     cases = [case for name, case in STEP_CASES.items()
              if (not args.only or any(word in name for word in args.only))
-             and device in STEP_HARDWARE.get(name, device)]
+             and device in STEP_HARDWARE.get(name, (device,))]
     for name, path in trees.items():
         if name in unbuilt or not cases:
             continue
@@ -588,7 +590,7 @@ def compile_battery(args: argparse.Namespace) -> int:
     cases = {f"compile {name.removeprefix('step ')} ({AHEAD_ATTENTION} attention)": case
              for name, case in STEP_CASES.items()
              if (not args.only or any(word in name for word in args.only))
-             and device in STEP_HARDWARE.get(name, device)}
+             and device in STEP_HARDWARE.get(name, (device,))}
     rows = [Row(name, "s", "", floor=COMPILE_FLOOR) for name in cases]
     arms = arms_of(base, head, base_path, head_path)
     results = {"base": base, "head": head, "alone": f"{base}{ALONE}", "rounds": args.rounds,
