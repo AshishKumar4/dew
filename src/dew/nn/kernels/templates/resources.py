@@ -224,20 +224,38 @@ def raise_ceiling() -> int:
 
 
 def raised_registers(consumers: int, programs: int = 1, producer: int | None = None) -> int:
-    """The registers each of `consumers` consumer warpgroups raises a thread's to (`roles`' setmaxnreg),
-    `programs` programs held by a multiprocessor at once: the program's launch pool at that residency less
-    the producer's, shared among them in setmaxnreg's steps and at most `raise_ceiling` (one consumer's
-    248 at one program and 232 at two; two consumers' 240 at one). The pool is what the program launches with
-    (`entry_registers`), which setmaxnreg moves between a program's warps and never past ("The total number
-    of registers allocated to all warps in the CTA cannot exceed the initial CTA launch", NVIDIA forums
-    302068): four consumers' 640 threads launch at 96 a thread, so they hold 104, where the multiprocessor's
-    share would ask 112 and wait for registers no warp gives back. The producer lowers to `producer` a thread
-    (`producer_floor`, a model's own where it states another, `RegisterModel.cap`)."""
-    producer = producer_floor() if producer is None else producer
-    step = facts().raises().step
-    pool = entry_registers(consumers + 1, programs) * (consumers + 1) * THREADS
-    share = (pool - producer * THREADS) // (consumers * THREADS)
-    return min(raise_ceiling(), share // step * step)
+    """The registers each of `consumers` consumer warpgroups raises a thread's to beside a producer that
+    lowers to `producer` a thread (`producer_floor`, a model's own where it states another,
+    `RegisterModel.cap`): `role_registers` of equal weights (one consumer's 248 at one program and 232 at two;
+    two consumers' 240 at one)."""
+    return role_registers((1,) * consumers + (0,), programs, floor=producer)[0]
+
+
+def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | None = None) -> tuple[int, ...]:
+    """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg (`mosaic.Schedule`'s
+    roles), `programs` programs held by a multiprocessor at once: a warpgroup of weight 0 lowers to `floor`
+    (`producer_floor`), and the rest of the program's launch pool is shared among the others by weight, in
+    setmaxnreg's steps and at most `raise_ceiling`, a share past the ceiling given back to the rest. The pool
+    is what the program launches with (`entry_registers`), which setmaxnreg moves between a program's warps
+    and never past ("The total number of registers allocated to all warps in the CTA cannot exceed the
+    initial CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a thread, so they
+    hold 104, where the multiprocessor's share would ask 112 and wait for registers no warp gives back."""
+    floor = producer_floor() if floor is None else floor
+    step, ceiling = facts().raises().step, raise_ceiling()
+    pool = (entry_registers(len(weights), programs) * len(weights) - floor * weights.count(0)) * THREADS
+    raised = {index: weight for index, weight in enumerate(weights) if weight}
+    held = {}
+    while raised:
+        share = pool // (sum(raised.values()) * THREADS)
+        capped = [index for index, weight in raised.items() if share * weight >= ceiling]
+        if not capped:
+            held |= {index: share * weight // step * step for index, weight in raised.items()}
+            break
+        for index in capped:
+            held[index] = ceiling
+            pool -= ceiling * THREADS
+            del raised[index]
+    return tuple(held.get(index, floor) for index in range(len(weights)))
 
 
 def consumer_registers(consumers: int, programs: int = 1) -> int:

@@ -296,7 +296,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         def producer():
             family.stream(streams, views, *streamed)
 
-        family.roles(consumers, consumer, producer)
+        family.scheduled(consumers, consumer, producer)
 
     stages = min(program.tiles.stages, q_steps)
     # A score hook's warpgroups' scratch, or fp16's running scale's (`staged_parts`).

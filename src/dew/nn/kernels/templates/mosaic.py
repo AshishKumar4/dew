@@ -1016,38 +1016,139 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
     return plgpu.SMEM(shape, dtype, transforms=swizzle_transforms(dtype, swizzle))
 
 
-def roles(wg, consumers: int, consumer, producer) -> None:
-    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)`, the last
-    `producer()` (`tabled`'s one row)."""
-    tabled(wg, ((consumers, consumer),), producer)
+@dataclasses.dataclass(frozen=True)
+class Role:
+    """One of a program's roles (`Schedule`): `count` units, warpgroups or (`warp`) warps of the program's
+    last warpgroup, each running the body `Schedule.run` binds to `name`; `weight` its warpgroups' share of
+    the registers the program's raises divide (`resources.role_registers`), 0 lowering them to setmaxnreg's
+    least (the last warpgroup's). Warp roles share their warpgroup, so its least too."""
+    name: str
+    count: int = 1
+    warp: bool = False
+    weight: int = 1
+
+    @property
+    def arrivals(self) -> int:
+        """A barrier's arrivals this role makes at it in a turn: one a warpgroup, where a role's threads
+        arrive; one, where a warp's copy or a product's commit does."""
+        return 1 if self.warp else self.count
 
 
-def tabled(wg, table: tuple, producer) -> None:
-    """Each warpgroup's role in a cooperative block from a role table: each of `table`'s rows, `(count,
-    body)` in turn, its `count` warpgroups running `body(index)` (`index` the warpgroup's own among
-    them), every one with its register budget raised to its share at the launch's residency
-    (`resources.raised_registers`, `_RESIDENT`); the warpgroup after them runs `producer()` with its
-    lowered to `resources.producer_floor`, where the GPU's compile honors them
-    (`resources.RAISES_HONORED`)."""
-    total = sum(count for count, _ in table)
-    first = 0
-    for count, body in table:
-        # The first row's warpgroups are those below its count, each its own index: no bound and no shift
-        # is traced for it, so a one-row table builds the same kernel `roles` built (an attention
-        # forward's spill-free registers on an H100 turn on it, test_attention_mosaic's compile gate).
-        within = wg < first + count if first == 0 else (wg >= first) & (wg < first + count)
+@dataclasses.dataclass(frozen=True)
+class HandOff:
+    """A buffer between a program's roles (`Schedule`): `shape`, an allocation that states its barriers'
+    arrivals (`arrived(produced, released)`, then `scratch(target)` and `opened(*refs)`: tensor-core
+    signals, tensor-memory accumulators), filled by the role `producer` and given back by the roles
+    `released_by` (none for a signal, which is only filled)."""
+    name: str
+    shape: Any
+    producer: str
+    released_by: tuple[str, ...] = ()
 
-        @pl.when(within)
-        def _(body=body, first=first):
-            plgpu.set_max_registers(resources.raised_registers(total, _RESIDENT.get()), action="increase")
-            body(wg if first == 0 else wg - first)
 
-        first += count
+@dataclasses.dataclass(frozen=True)
+class Schedule:
+    """A program's roles and the buffers between them: its warpgroup roles in turn, each its `count`
+    warpgroups, its register budget raised to its weight's share (`registers`); then one warpgroup at
+    setmaxnreg's least, which holds either a role of weight 0 (a register family's producer) or the warp
+    roles (tcgen05's load and product warps, each a warp of it). A program of one role runs it on every
+    warpgroup and moves no registers. Its hand-offs' barriers count arrivals by the roles that fill and give
+    back each (`HandOff`), so no template states an arrival count."""
+    roles: tuple[Role, ...]
+    handoffs: tuple[HandOff, ...] = ()
 
-    @pl.when(wg == total)
-    def _():
-        plgpu.set_max_registers(resources.producer_floor(), action="decrease")
-        producer()
+    def __post_init__(self):
+        raised = [role for role in self.roles if role.weight]
+        lowered = [role for role in self.roles if not role.weight]
+        if raised and lowered and not (all(role.warp for role in lowered)
+                                        or (len(lowered) == 1 and lowered[0].count == 1)):
+            raise ValueError(f"a schedule's last warpgroup holds one role of weight 0 or its warp roles, not "
+                             f"{[role.name for role in lowered]}")
+        if any(role.warp and role.weight for role in self.roles):
+            raise ValueError("a warp role shares its warpgroup's least registers (weight 0)")
+        if self.roles[:len(raised)] != tuple(raised):
+            raise ValueError("a schedule's raised roles come before its last warpgroup's")
+
+    @property
+    def raised(self) -> tuple[Role, ...]:
+        return tuple(role for role in self.roles if role.weight)
+
+    def role(self, name: str) -> Role:
+        return next(role for role in self.roles if role.name == name)
+
+    def warpgroups(self) -> int:
+        """The warpgroups a program of this schedule runs (`kernel`'s `warpgroups`)."""
+        return sum(role.count for role in self.roles if not role.warp) + any(role.warp for role in self.roles)
+
+    def registers(self, programs: int = 1) -> dict[str, int]:
+        """Each role's registers a thread, `programs` programs held by a multiprocessor at once
+        (`resources.role_registers`); a warp role's its warpgroup's."""
+        weights = tuple(role.weight for role in self.raised for _ in range(role.count))
+        budgets = resources.role_registers(weights + (0,) * (len(self.raised) < len(self.roles)), programs)
+        held, first = {}, 0
+        for role in self.roles:
+            held[role.name] = budgets[first] if role.weight else budgets[-1]
+            first += role.count if role.weight else 0
+        return held
+
+    def scratch(self, target: generation.GpuTarget) -> tuple:
+        """Each hand-off's allocations, its barriers' arrivals its roles' (`HandOff`), in turn."""
+        return tuple(self._stated(handoff).scratch(target) for handoff in self.handoffs)
+
+    def opened(self, refs: Sequence) -> dict[str, Any]:
+        """Each hand-off opened by name over its scoped `refs` (`scratch`'s, in turn)."""
+        return {handoff.name: self._stated(handoff).opened(*(ref if isinstance(ref, tuple) else (ref,)))
+                for handoff, ref in zip(self.handoffs, refs, strict=True)}
+
+    def _stated(self, handoff: HandOff):
+        released = sum(self.role(name).arrivals for name in handoff.released_by)
+        return handoff.shape.arrived(self.role(handoff.producer).arrivals, released)
+
+    def run[R](self, **bodies: Callable[..., R]) -> R | None:
+        """Each role's body by its name: on a schedule of one role, `body(index)` on every warpgroup, its
+        index (the value it returns, a program's whose consumers keep theirs); otherwise each raised role's
+        `body(index)` on its warpgroups, its index among them, their registers raised to its share at the
+        launch's residency (`registers`, `_RESIDENT`), then the last warpgroup's, lowered to the least, its
+        role's `body()` or each warp role's on its warp, where the GPU's compile honors them
+        (`resources.RAISES_HONORED`)."""
+        if set(bodies) != {role.name for role in self.roles}:
+            raise ValueError(f"a schedule of {[role.name for role in self.roles]} given bodies for "
+                             f"{sorted(bodies)}")
+        wg = lax.axis_index("wg")
+        if len(self.roles) == 1:
+            role = self.roles[0]
+            return bodies[role.name](0 if role.count == 1 else wg)
+        budgets = self.registers(_RESIDENT.get())
+        first = 0
+        for role in self.raised:
+            # The first role's warpgroups are those below its count, each its own index: no bound and no
+            # shift is traced for it, so a one-role table builds the kernel a producer beside consumers
+            # always built (an attention forward's spill-free registers on an H100 turn on it,
+            # test_attention_mosaic's compile gate).
+            within = wg < first + role.count if first == 0 else (wg >= first) & (wg < first + role.count)
+
+            @pl.when(within)
+            def _(role=role, first=first):
+                plgpu.set_max_registers(budgets[role.name], action="increase")
+                bodies[role.name](wg if first == 0 else wg - first)
+
+            first += role.count
+        lowered = [role for role in self.roles if not role.weight]
+        if not lowered:
+            return None
+
+        @pl.when(wg == first)
+        def _():
+            plgpu.set_max_registers(budgets[lowered[0].name], action="decrease")
+            if not lowered[0].warp:
+                bodies[lowered[0].name]()
+                return
+
+            @plgpu.warp_map
+            def _(warp):
+                for index, role in enumerate(lowered):
+                    pl.when(warp == index)(bodies[role.name])
+        return None
 
 
 class Slots:
@@ -1747,7 +1848,7 @@ class Transport[Allocated, Opened](abc.ABC):
     def warpgroups(self, consumers: int) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
         family streams from a role of its own (`roles`)."""
-        return consumers
+        return self.roles(consumers).warpgroups()
 
     def program_index(self, name: str) -> jax.Array:
         """The program's coordinate on its launch grid's axis `name` (`kernel`'s `grid_names`): Mosaic GPU
@@ -1804,9 +1905,16 @@ class Transport[Allocated, Opened](abc.ABC):
         (`streams`), and what it returns: the program's one scope (`scoped`'s)."""
 
     @abc.abstractmethod
-    def roles(self, consumers: int, consumer, producer) -> None:
-        """Each role of a program: `consumer(index)` the compute roles', `producer()` the loads' where the
-        family streams from a role of its own."""
+    def roles(self, consumers: int) -> Schedule:
+        """A program's roles: its `consumers` compute warpgroups ('consumer') and the producer's ('producer')
+        where the family streams from a role of its own."""
+
+    def scheduled(self, consumers: int, consumer, producer):
+        """The family's roles run (`roles`): `consumer(index)` on its compute roles and `producer()` on
+        its producer's where it has one; the consumers' value where they are its every warpgroup."""
+        schedule = self.roles(consumers)
+        bodies = {"consumer": consumer, "producer": producer}
+        return schedule.run(**{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
         """A program's `streams` (`streams`') by lifetime (`resources.Scope`): those the program holds whole,
@@ -1864,7 +1972,7 @@ class Transport[Allocated, Opened](abc.ABC):
             self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(), walk.carry, (),
                       interpret)
 
-        self.roles(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
+        self.scheduled(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
 
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
@@ -2206,9 +2314,6 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def depths(self, dtype) -> tuple[int, ...]:
         return (swizzle_columns(dtype, SWIZZLE_BYTES),)
 
-    def warpgroups(self, consumers: int) -> int:
-        return consumers + 1
-
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
@@ -2233,8 +2338,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
                              collective_axes="wg")
 
-    def roles(self, consumers: int, consumer, producer) -> None:
-        roles(lax.axis_index("wg"), consumers, consumer, producer)
+    def roles(self, consumers: int) -> Schedule:
+        return Schedule((Role("consumer", consumers), Role("producer", weight=0)))
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
@@ -2291,7 +2396,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             return self._tiled(rings, tiles, schedule, issue, finish, smems, axis=axis, interpret=interpret,
                                in_flight=in_flight, unrolled=unrolled)
 
-        pl.run_scoped(lambda *smems: self.roles(consumers, consuming(smems), producer), *staging,
+        pl.run_scoped(lambda *smems: self.scheduled(consumers, consuming(smems), producer), *staging,
                       collective_axes="wg")
 
     def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, issue: Callable,

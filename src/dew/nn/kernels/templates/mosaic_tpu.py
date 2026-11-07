@@ -265,10 +265,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams)
 
-    def roles(self, consumers: int, consumer, producer) -> None:
+    def roles(self, consumers: int) -> mosaic.Schedule:
         _one(consumers)
-        del producer
-        consumer(0)
+        return mosaic.Schedule((mosaic.Role("consumer"),))
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,

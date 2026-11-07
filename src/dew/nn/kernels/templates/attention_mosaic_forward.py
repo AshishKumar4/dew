@@ -1892,9 +1892,9 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
 
         # A family that keeps its products' accumulators in the program's scratch, a role's own share
         # (`Issuer.product_scratch`: tcgen05's chunks'), takes each consumer built at its static role.
-        family.roles(consumers, (functools.partial(mosaic.per_role, roles=consumers,
-                                                    run=lambda role, index: consumer(index))
-                                 if scopes_products(family) else consumer), producer)
+        family.scheduled(consumers, (functools.partial(mosaic.per_role, roles=consumers,
+                                                       run=lambda role, index: consumer(index))
+                                     if scopes_products(family) else consumer), producer)
 
     products = forward_products(tiles, value_width, query.dtype, peaks=peaks, parts=parts)
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, products),
