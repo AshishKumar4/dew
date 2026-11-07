@@ -363,13 +363,8 @@ def taking_over[Held, Result](function: Callable[[Held, jax.Array], Result], tak
     output takes those and JAX only warns of a donation it cannot use. They are freed as the caller drops
     them."""
 
-    return functools.partial(start_program(function, shardings, _held_structure(taken)), _held_leaves(taken),
+    return functools.partial(start_program(function, shardings, taken), _held_leaves(taken),
                              _held_leaves(kept))
-
-
-def _held_structure(tree) -> jax.tree_util.PyTreeDef:
-    """The structure of one of the held tree's two trees (`_split`), a place for each leaf either holds."""
-    return jax.tree.structure(tree, is_leaf=lambda leaf: leaf is None)
 
 
 def _held_leaves(tree) -> list:
@@ -378,11 +373,14 @@ def _held_leaves(tree) -> list:
 
 
 def start_program[Held, Result](function: Callable[[Held, jax.Array], Result], shardings: Placements,
-                                structure: jax.tree_util.PyTreeDef) -> OuterProgram:
+                                like: Held) -> OuterProgram:
     """The program `taking_over` runs, over the held tree's two trees as their leaves (`_held_leaves`) and
-    the key, the tree rebuilt within it by its `structure`: one program whichever arrays or shapes it is
-    lowered over (`start_lowered`), whose arguments' structure holds none of the held tree's own, which an
-    initializer's functions may be part of, so a start compiled ahead saves whole (`AheadOfTime.starts`)."""
+    the key, the tree rebuilt within it in the structure of `like`, either of the two: one program
+    whichever arrays or shapes it is lowered over (`start_lowered`), whose arguments' structure holds none
+    of the held tree's own, which an initializer's functions may be part of, so a start compiled ahead
+    saves whole (`AheadOfTime.starts`)."""
+    structure = jax.tree.structure(like, is_leaf=lambda leaf: leaf is None)
+
     def joined(taken: list, kept: list, key: jax.Array) -> Result:
         return function(jax.tree.unflatten(structure, [other if one is None else one
                                                        for one, other in zip(taken, kept, strict=True)]), key)
@@ -412,15 +410,15 @@ def start_lowered(initial_state: Callable[[Initializer, jax.Array], TrainState],
     moving, frozen = apart(shardings)
     if frozen is None or not through:
         taken, kept = held_shapes(initializer, abstract.variables, shardings.variables, mesh)
-        return start_program(initial_state, shardings, _held_structure(taken)).lower(
-            _held_leaves(taken), _held_leaves(kept), key)
+        return start_program(initial_state, shardings, taken).lower(_held_leaves(taken), _held_leaves(kept),
+                                                                    key)
     inputs = jax.tree.leaves(initializer)
     where, _ = jax.tree.flatten(frozen)
     taken, kept = held_shapes(initializer, abstract.variables, shardings.variables, mesh,
                               shared={id(inputs[given]): where[index] for index, given in through.items()})
     built = [index for index in range(len(where)) if index not in through]
     return start_program(_rest(initial_state, built), (moving, tuple(where[index] for index in built)),
-                         _held_structure(taken)).lower(_held_leaves(taken), _held_leaves(kept), key)
+                         taken).lower(_held_leaves(taken), _held_leaves(kept), key)
 
 
 def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,

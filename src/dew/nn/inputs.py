@@ -979,7 +979,7 @@ def request_key(key: int | jax.Array | None) -> jax.Array:
         raise ValueError("key must be an integer seed or a single JAX PRNG key")
     if isinstance(key, (int, np.integer)):
         if str(jax.config.jax_default_prng_impl) == "threefry2x32":
-            return jax.random.wrap_key_data(jnp.asarray(seeded_words(int(key))), impl="threefry2x32")
+            return jax.random.wrap_key_data(jax.device_put(seeded_words(int(key))), impl="threefry2x32")
         return jax.random.key(int(key))
     typed = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
     if typed.shape != ():
