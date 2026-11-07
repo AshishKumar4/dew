@@ -225,8 +225,16 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
 def test_a_blackwells_gathered_product_lowers_for_cuda():
     """A gathered grouped product on a compile-only B200 lowers through Mosaic GPU on tcgen05's bundle: its
     load warp's TMA four-row gathers into the swizzled ring (`gathered.tma_rows`), each slot released by its
-    products' commit."""
+    products' commit. A gathered block-scaled product is refused: its loads read the rows' scales in the
+    rows' order, not gathered."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
     tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+    refused = functools.partial(mosaic_gpu._tables_refused, jnp.zeros((256,), jnp.int32), None, tiles,
+                                mosaic_sm100.RINGS, prologue=None, dense=False, transpose_lhs=False)
+    refused(block_scaled=False)
+    with pytest.raises(ValueError):
+        refused(block_scaled=True)
     sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
 
     def gathered(tokens, matrices, table):
