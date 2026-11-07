@@ -1357,14 +1357,48 @@ def test_a_fit_repeats_a_chain_only_where_its_read_can_end(tmp_path, name):
     assert_same(parameters(fitted), parameters(written), f"{name} as the fit reads it")
 
 
-def test_phases_of_another_batch_are_refused_before_their_step_ends_are_counted():
-    """Phases read until training steps, so each is of the run's one batch (`phases`): one batched by 4
-    between two batched by 8 is refused, where its end was counted at 4 records a step and the stream
-    moved on a step early under a loader declaring 8 (row 3940)."""
+def test_phases_of_other_batches_each_read_their_own_steps_in_their_own_rows():
+    """Phases read until training steps, each in batches of its own (`phases`): one batched by 4 between
+    two batched by 8 reads its three steps of 4 records, from step 1 to step 4, and the corpus it shares
+    with the others reads on where the phase before left it, each record once, in the corpus's own order
+    (rows 3940, 4812; it was refused, its end once counted at the first phase's 8 records a step)."""
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
-    with pytest.raises(ValueError):
-        compile(phases((first.batch(8), 1), (first.batch(4), 4), (first.batch(8), None)), read="memory",
-                loading=READ)
+    loader = compile(phases((first.batch(8), 1), (first.batch(4), 4), (first.batch(8), None)), read="memory",
+                     loading=READ)
+    read = ids(itertools.islice(loader.train(DataPartition()), 6))
+    alone = [value for batch in ids(itertools.islice(trained(first, batch=4).train(DataPartition()), 9))
+             for value in batch]
+    assert [len(batch) for batch in read] == [8, 4, 4, 4, 8, 8]
+    assert [value for batch in read for value in batch] == alone[:36]
+
+
+def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own(tmp_path):
+    """A fit accumulating updates of two steps over phases of 8, then 4, then 8 records a step, each phase's
+    end at an update's (`DataPartition.window`), steps each batch in a program of its own and trains as a
+    fit of one step an update over the same records, its phases batched by 16, 8 and 16: each update pools
+    one batch's microbatches. A phase of another batch that begins inside an update is refused, naming the
+    update."""
+    from dew.telemetry.compiles import Compiles
+
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+
+    def fitted(directory: Path, rows: tuple[int, int, int], steps: int, accumulation: int):
+        trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0), accumulation=accumulation,
+                          checkpoints=Checkpoints(str(directory), keep=8))
+        early, middle, late = rows
+        chain = phases((first.batch(early), steps // 4), (first.batch(middle), 3 * steps // 4),
+                       (first.batch(late), None))
+        return trainer.fit(compile(chain, read="memory", loading=READ), steps=steps)
+
+    with Compiles("step") as compiles:
+        accumulated = fitted(tmp_path / "accumulated", (8, 4, 8), 8, 2)
+    assert int(accumulated.step) == 8 and compiles.count == 2
+    whole = fitted(tmp_path / "whole", (16, 8, 16), 4, 1)
+    assert_same(parameters(accumulated), parameters(whole), "updates of two microbatches a phase")
+    misplaced = compile(phases((first.batch(8), 3), (first.batch(4), None)), read="memory", loading=READ)
+    with pytest.raises(ValueError, match="inside an update of 2 steps"):
+        misplaced.train(DataPartition(window=2))
 
 
 class TokenCounted(Regression):

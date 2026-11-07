@@ -1397,13 +1397,22 @@ class PhasedStream:
     in it from where they left it), so one after an end the run has yet to
     reach opens once the run reaches it. A phase the run's commits passed
     within one step ends where it starts, holding no record.
+
+    Each phase reads batches of its own rows (`batches`), so a run steps each
+    phase's batch in a program of its own (`Trainer._compiled_for`). An update
+    pools one batch's microbatches: on the step clock each phase whose batch
+    differs from the one before it begins a stage of the run's batches
+    (`stages`, as a ramp's do), where an update begins.
     """
 
     ends: Ends = "never"
 
     def __init__(self, phases: Sequence[tuple[Callable[[tuple[int, ...]], GlobalReader], int | None]],
-                 stop_seconds: float, *, tokens: Sequence[int | None] | None = None):
+                 stop_seconds: float, *, batches: Sequence[int], tokens: Sequence[int | None] | None = None):
         ends = [end for _, end in phases]
+        if len(batches) != len(phases):
+            raise ValueError(f"phases need one batch each: {len(phases)} phases and {len(batches)} batches")
+        self.batches = tuple(batches)
         if tokens is None:
             phase_ends(ends, "record")
         elif any(end is not None for end in ends) or len(tokens) != len(ends):
@@ -1422,6 +1431,18 @@ class PhasedStream:
 
     def __iter__(self) -> Iterator[Batch]:
         return self
+
+    @property
+    def stages(self) -> tuple[Stage, ...]:
+        """The stages of the run's batches on the step clock: the first phase's, and each phase whose batch
+        differs from the one before it, from the record it starts at; none on the token clock, whose phases
+        begin where the run's commits reach them (`dew.training._fit.stage_reached`)."""
+        if self._tokens is not None:
+            return ()
+        starts = (0, *(end for end in self._ends if end is not None))
+        return tuple(Stage(batch, start) for index, (batch, start) in enumerate(zip(self.batches, starts,
+                                                                                     strict=True))
+                     if not index or batch != self.batches[index - 1])
 
     def _stream(self, phase: int) -> GlobalReader:
         """Phase `phase`'s reader, opened with the ends of the phases before it."""

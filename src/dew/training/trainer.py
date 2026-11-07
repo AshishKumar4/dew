@@ -1587,15 +1587,19 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
-            self._ramp = run.source.stages if isinstance(run.source, RampedStream) else ()
+            stages = run.source.stages if isinstance(run.source, RampedStream | PhasedStream) else ()
+            self._ramp = stages if isinstance(run.source, RampedStream) else ()
             # The steps a stage after the first begins at, each where an update does (`Ramp.stages`): a
-            # ramp's here, a schedule's as each begins (`_scheduled`); the step lays its window out there.
+            # ramp's and phases' of other batches here (`PhasedStream.stages`), a schedule's as each begins
+            # (`_scheduled`); the step lays its window out there.
             self._stage_starts = frozenset(accumulate((after.records - stage.records) // stage.batch
-                                                      for stage, after in pairwise(self._ramp)))
+                                                      for stage, after in pairwise(stages)))
             if self._ramp:
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
-            self._rows = (plan.dataset.batch,)
+            # The batches the run reads, each phase's, which every split it plans cuts (`splits`).
+            self._rows = (run.source.batches if isinstance(run.source, PhasedStream)
+                          else (plan.dataset.batch,))
             run.partition = partition
             run.train = self._prefetched(plan, run, run.source, position)
             run.source = None  # Lifetime transferred to the prefetch worker.
