@@ -843,9 +843,20 @@ def policy(base: str) -> str:
             changed.remove(".armada.json")  # where and when tasks run, never what a test sees
     whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".armada.json",
              ".python-version"}
+    # A SHARED module whose code `base` holds as it is (a docstring's or a comment's edit) keys every row as
+    # it did (`code_of`, `shared`), so it leaves the cache on (Main, 2026-11-07: 12 of the queue's last 20
+    # train runs ran cold on harness edits).
+    changed = [name for name in changed
+               if not (name in SHARED and name.endswith(".py") and same_code(base, name))]
     if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
         return "off"
     return "on"
+
+
+def same_code(base: str, name: str) -> bool:
+    """Whether Python file `name` is the same code at commit `base` as in this checkout (`code_of`)."""
+    before = subprocess.run(["git", "show", f"{base}:{name}"], capture_output=True, check=False)
+    return before.returncode == 0 and Path(name).is_file() and code_of(name, before.stdout) == code_of(name)
 
 
 def borrowed(timings: dict, python: str) -> dict:

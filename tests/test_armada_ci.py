@@ -1111,11 +1111,14 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({".thresh/seams.toml": "[seam]\n"}, "on"), ({"MANIFEST.in": "include LICENSE\n"}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "off"),
+    ({"tools/armada/followed.py": '"""Followed, as each run reads."""\n\n\n# A note.\ndef read(path):\n'
+                                  '    return path\n'}, "on"),
+    ({"tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n    return [path]\n'}, "off"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
         "the test session", "the recorder", "a workflow", "a file no record places", "the changelog",
         "a native kernel package's wrapper", "a type stub", "a license", "thresh's annotations",
         "the manifest",
-        "the pool", "the environment's variables"])
+        "the pool", "the environment's variables", "the harness's wording", "the harness's code"])
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
@@ -1124,10 +1127,14 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file), and a workflow
     is an input of the files that read it alone (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache
     off, and 0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every
-    file's input: an old record may lack a dependency a new recorder finds."""
+    file's input: an old record may lack a dependency a new recorder finds, by its code alone, so an edit of
+    what it says of itself keeps the cache on (Main, 2026-11-07: 12 of 20 trains ran cold on harness
+    edits)."""
     armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
-                       "locks/cpu.txt": "jax==1\n", ".armada.json": armada}.items():
+                       "locks/cpu.txt": "jax==1\n", ".armada.json": armada,
+                       "tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n'
+                                                   '    return path\n'}.items():
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text(text)
     git(tmp_path, "init", "-q", "-b", "main")
