@@ -228,7 +228,7 @@ def test_a_recipe_projection_of_rows_an_explicit_axis_splits_is_each_devices_own
     `_recipe_general`) runs each device's rows apart (`gemm._projected_apart`, `jax.shard_map`), each laid
     in whole 128-row blocks of its own: its value and the rows' gradient bitwise each device's rows'
     projection alone, the matrix's gradient their gradients' sum. Integers, so every quantization and sum is
-    exact whatever adds them. A grouped projection of split rows is refused."""
+    exact whatever adds them."""
     from dew.distributed.placement import MeshSpec
     from dew.nn.precision import projection_role
 
@@ -251,14 +251,49 @@ def test_a_recipe_projection_of_rows_an_explicit_axis_splits_is_each_devices_own
         value, d_rows, d_matrix = jax.jit(pulled)(jax.device_put(rows, split), matrix,
                                                   jax.device_put(cotangent, split))
         assert jax.typeof(value).sharding.spec[0] == "data"
-        flat = jax.device_put(rows.reshape(1024, 256),
-                              jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None)))
-        with pytest.raises(ValueError), generation.run_precision(FP8), projection_role("experts"):
-            gemm.recipe_projection(flat, matrix[None], jnp.asarray([1024], jnp.int32), out_dtype=jnp.float32)
     each = [[np.asarray(leaf) for leaf in leaves] for leaves in alone]
     np.testing.assert_array_equal(np.asarray(value), np.concatenate([leaves[0] for leaves in each]))
     np.testing.assert_array_equal(np.asarray(d_rows), np.concatenate([leaves[1] for leaves in each]))
     np.testing.assert_array_equal(np.asarray(d_matrix), np.sum([leaves[2] for leaves in each], axis=0))
+
+
+def test_a_recipes_experts_of_rows_an_explicit_axis_splits_are_each_devices_share_of_each_group():
+    """Row 4859: under the 'fp8' numerics, experts' projection (`gemm.recipe_projection` with group sizes
+    counting every device's rows: ragged, one empty, rows past them) of rows an Explicit data axis splits
+    over eight devices runs each device's rows with its own share of each group (`gemm._local_sizes`): its
+    value and the rows' gradient bitwise each device's rows projected alone with those counts, the matrices'
+    gradient their gradients' sum. Integers, every quantization and sum exact."""
+    from dew.distributed.placement import MeshSpec
+    from dew.nn.precision import projection_role
+
+    rng = np.random.default_rng(31)
+    sizes = np.asarray([300, 0, 450, 150])
+    rows = jnp.asarray(rng.integers(-3, 4, size=(1024, 256)), jnp.float32)
+    matrices = jnp.asarray(rng.integers(-3, 4, size=(4, 256, 256)), jnp.float32)
+    cotangent = jnp.asarray(rng.integers(-3, 4, size=(1024, 256)), jnp.float32)
+
+    def pulled(rows, matrices, cotangent, sizes):
+        with generation.run_precision(FP8), projection_role("experts"):
+            value, pull = jax.vjp(lambda r, m: gemm.recipe_projection(r, m, sizes, out_dtype=jnp.float32),
+                                  rows, matrices)
+            return (value, *pull(cotangent))
+
+    ends, starts = np.cumsum(sizes), np.cumsum(sizes) - sizes
+    alone = []
+    for device in range(8):
+        lo, hi = device * 128, (device + 1) * 128
+        local = np.clip(ends, lo, hi) - np.clip(starts, lo, hi)
+        alone.append([np.asarray(leaf) for leaf in jax.jit(pulled)(
+            rows[lo:hi], matrices, cotangent[lo:hi], jnp.asarray(local, jnp.int32))])
+    mesh = MeshSpec(explicit=("data",)).build(jax.devices()[:8])
+    with jax.set_mesh(mesh):
+        split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+        value, d_rows, d_matrices = jax.jit(pulled)(jax.device_put(rows, split), matrices,
+                                                    jax.device_put(cotangent, split),
+                                                    jnp.asarray(sizes, jnp.int32))
+    np.testing.assert_array_equal(np.asarray(value), np.concatenate([leaves[0] for leaves in alone]))
+    np.testing.assert_array_equal(np.asarray(d_rows), np.concatenate([leaves[1] for leaves in alone]))
+    np.testing.assert_array_equal(np.asarray(d_matrices), np.sum([leaves[2] for leaves in alone], axis=0))
 
 
 @pytest.mark.parametrize("role", ["mlp", "experts"])
