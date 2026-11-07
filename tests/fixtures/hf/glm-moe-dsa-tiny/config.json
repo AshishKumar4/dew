@@ -13,7 +13,7 @@
   "hidden_act": "silu",
   "hidden_size": 32,
   "index_head_dim": 8,
-  "index_n_heads": 4,
+  "index_n_heads": 8,
   "index_share_for_mtp_iteration": true,
   "index_skip_topk_offset": 3,
   "index_topk": 4,
@@ -85,7 +85,7 @@
   "tie_word_embeddings": false,
   "topk_group": 1,
   "topk_method": "noaux_tc",
-  "transformers_version": "5.16.1",
+  "transformers_version": "5.17.0",
   "use_cache": true,
   "v_head_dim": 16,
   "vocab_size": 256
