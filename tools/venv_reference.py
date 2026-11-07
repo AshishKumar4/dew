@@ -87,6 +87,11 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                        "distribution": ("compressed-tensors", "0.17.1")}
             for family, kinds in (("storage", ("fp8", "nvfp4")), ("nvfp4_qdq", ("unrounded", "e4m3")))
             for kind in kinds},
+         **{f"beam-{name}": {"test": "test_beam_search", "arms": name, "worker": "beam_worker.py",
+                             "reference": "huggingface/transformers 5.16.1 with pytorch/pytorch 2.14.0",
+                             "license": "Apache-2.0", "distribution": ("transformers", "5.16.1"),
+                             "host": True, "outputs": True}
+            for name in ("llama-tiny", "qwen3-tiny")},
          "lm-steps": {"test": "test_reference_runs", "arms": "qwen3-tiny", "worker": "lm_steps_worker.py",
                       "reference": "huggingface/transformers 5.16.1 with pytorch/pytorch 2.14.0",
                       "license": "Apache-2.0", "distribution": ("transformers", "5.16.1"), "host": True,
