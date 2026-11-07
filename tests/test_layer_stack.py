@@ -571,11 +571,14 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
 
     draw = drawn_ids(0x1342, 8)
 
-    @as_given
+    # The plain loop's float64 twin over its variables widened once, which the gate compiles for every
+    # draw.
+    with jax.enable_x64(new_val=True):
+        wide, wide_variables = (tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64),
+                                float64_held(variables))
+
     def truth(ids):
-        with jax.enable_x64(new_val=True):
-            wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
-            return np.asarray(decoded(wide, widened(variables), ids)[0])
+        return decoded(wide, wide_variables, ids)[0]
 
     def steps(model, store):
         return lambda ids: decoded(model, store, ids)[0]
@@ -639,13 +642,12 @@ def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_
     for name, value in exact.items():
         np.testing.assert_array_equal(held[name], value, err_msg=name)
 
-    @as_given
-    def truth(ids):
-        with jax.enable_x64(new_val=True):
-            wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
-            cache = wide.init(jax.random.key(0), first, decode=True)["cache"]
-            return {name: np.asarray(value) for name, value in
-                    floating(decoded(wide, widened(variables), cache))(ids).items()}
+    # The plain loop's float64 twin, its variables and cache widened once, its decode one program the gate
+    # compiles for every draw.
+    with jax.enable_x64(new_val=True):
+        wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
+        truth = floating(decoded(wide, float64_held(variables),
+                                 float64_held(wide.init(jax.random.key(0), first, decode=True)["cache"])))
 
     assert_as_exact(floating(bank), floating(layers), drawn_ids(0x4550, 10), "banked decode",
                     seeds=BANKED_DECODE_SEEDS, truth_fn=truth)
