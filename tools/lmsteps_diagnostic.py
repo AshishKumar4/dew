@@ -2,6 +2,10 @@
 
 MODE is old or wide (sizing and a verdict on disjoint seeds); summary modes
 old-summary and wide-summary keep each step's tail measurements instead.
+wide-margin POOL THRESHOLD selects draws by the first loss's float64
+gradient: every parameter tensor's minimum magnitude over its maximum
+clears THRESHOLD. Each rejected draw takes selection_margins.clearing's
+independent key stream. The conditioning reads no float32 result.
 Run only through the armada probe runner, from the repository root.
 """
 import os, sys, json, time
