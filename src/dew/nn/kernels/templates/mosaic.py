@@ -1094,18 +1094,20 @@ class Schedule:
             first += role.count if role.weight else 0
         return held
 
+    def stated(self) -> tuple:
+        """Each hand-off's shape with its barriers' arrivals stated by its roles (`HandOff`), in turn."""
+        return tuple(handoff.shape.arrived(self.role(handoff.producer).arrivals,
+                                           sum(self.role(name).arrivals for name in handoff.released_by))
+                     for handoff in self.handoffs)
+
     def scratch(self, target: generation.GpuTarget) -> tuple:
-        """Each hand-off's allocations, its barriers' arrivals its roles' (`HandOff`), in turn."""
-        return tuple(self._stated(handoff).scratch(target) for handoff in self.handoffs)
+        """Each hand-off's allocations (`stated`), in turn."""
+        return tuple(shape.scratch(target) for shape in self.stated())
 
     def opened(self, refs: Sequence) -> dict[str, Any]:
         """Each hand-off opened by name over its scoped `refs` (`scratch`'s, in turn)."""
-        return {handoff.name: self._stated(handoff).opened(*(ref if isinstance(ref, tuple) else (ref,)))
-                for handoff, ref in zip(self.handoffs, refs, strict=True)}
-
-    def _stated(self, handoff: HandOff):
-        released = sum(self.role(name).arrivals for name in handoff.released_by)
-        return handoff.shape.arrived(self.role(handoff.producer).arrivals, released)
+        return {handoff.name: shape.opened(*(ref if isinstance(ref, tuple) else (ref,)))
+                for handoff, shape, ref in zip(self.handoffs, self.stated(), refs, strict=True)}
 
     def run[R](self, **bodies: Callable[..., R]) -> R | None:
         """Each role's body by its name: on a schedule of one role, `body(index)` on every warpgroup, its
