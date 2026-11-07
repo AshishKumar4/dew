@@ -330,11 +330,11 @@ class MultiHeadLatentAttention(LinearProducts):
     """
 
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
-                                                 "key_valid", "position_bias", "entered"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a dense layer's pairwise mask, key runs
-    or entered documents (`Entered.runs`), the key positions they are read at, its keys' validity and a
-    position bias, on an uncached call, as the standard attention reads them; an indexed layer narrows its
-    keys by the documents, the rows' validity and its own selection alone, and refuses them (`_check_call`)."""
+                                                 "key_valid", "position_bias"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a dense layer's pairwise mask or key
+    runs, the key positions they are read at, its keys' validity and a position bias, on an uncached call,
+    as the standard attention reads them; an indexed layer narrows its keys by the documents, the rows'
+    validity and its own selection alone, and refuses them (`_check_call`)."""
 
     emb_features: int
     num_heads: int
@@ -818,7 +818,6 @@ class MultiHeadLatentAttention(LinearProducts):
         own = None if metadata is None else [
             name for name, given in (("pairwise_mask", metadata.pairwise_mask),
                                      ("key_runs", metadata.key_runs),
-                                     ("entered", metadata.entered),
                                      ("key_valid", metadata.key_valid),
                                      ("key_positions", metadata.key_positions),
                                      ("position_bias", metadata.position_bias)) if given is not None]
