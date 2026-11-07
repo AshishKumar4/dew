@@ -1271,6 +1271,16 @@ class Transaction:
         refuse_fixed_routers(fixed)
         return realized
 
+    def _recorded_with(self, realized: Realization, state: TrainState, part, own, replays, fill, replayed
+                       ) -> Realization:
+        """`realized` with the window's records: this microbatch's (`own`, in its slot) and each other one's
+        the replay ran (`replays`, those of the `fill` slots the window holds where it `replayed`)."""
+        evaluations = [(own, self._places(state.microstep % self.size, own, part)), *replays]
+        held = jnp.arange(len(replays)) < fill
+        ran = jnp.concatenate([jnp.ones((1,), bool), jnp.logical_and(held, replayed)])
+        return dataclasses.replace(realized, aux=dataclasses.replace(realized.aux,
+                                                                    record=recorded(evaluations, ran)))
+
     def step(self, *, realize=None, host=False, frozen: Sequence[tuple[str, ...]] = ((FROZEN,),)):
         """Build the function that runs one attempt over the shared phases.
 
@@ -1372,12 +1382,8 @@ class Transaction:
             else:
                 gradient, replays = pending.gradient, []
             if own is not None:
-                replays = replays or []
-                evaluations = [(own, self._places(state.microstep % self.size, own, part)), *replays]
-                held = jnp.arange(len(replays)) < pending.fill
-                ran = jnp.concatenate([jnp.ones((1,), bool), jnp.logical_and(held, replayed)])
-                realized = dataclasses.replace(realized, aux=dataclasses.replace(
-                    realized.aux, record=recorded(evaluations, ran)))
+                realized = self._recorded_with(realized, state, part, own, replays or [], pending.fill,
+                                               replayed)
             if not host:
                 # The commit compiles as the host-master step's does, over values
                 # already computed: without the barrier XLA fuses the gradient's
