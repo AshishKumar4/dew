@@ -232,7 +232,8 @@ def test_a_weight_folded_into_the_inverse_associates_as_flax_and_takes_every_gra
                                            portable=portable, weight_first=True)[1]
 
     (x, scale), _ = norm_operands((3, 5, 64), dtype, scale_dtype)
-    weight = scale.astype(jnp.float32) + 1.0 if offset else scale
+    # The offset adds in the stored weight's dtype, as Dew's norm adds it.
+    weight = scale + 1.0 if offset else scale
     flax = nn.RMSNorm(epsilon=1e-5, dtype=jnp.float32, param_dtype=weight.dtype)
     expected = flax.apply({"params": {"scale": weight}}, x.astype(jnp.float32)).astype(dtype)
     np.testing.assert_array_equal(np.asarray(jax.jit(functools.partial(xla, dtype))(x, scale), np.float32),
