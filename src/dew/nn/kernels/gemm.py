@@ -519,13 +519,14 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         return out, ()
 
     def backward(saved, operands, cotangent, live):
-        # The cotangent times the decoded values' transpose, summed in fp32, rounded once to the rows', each
-        # gathered row's summed back into the row it read.
+        # The cotangent at its own precision times the decoded values' transpose (exact in fp32), summed in
+        # fp32 at IEEE products, rounded once to the rows', each gathered row's summed back into the row it
+        # read: narrowed to bfloat16 first, 1 - 511/512 summed to 0 (audit A2).
         del saved
         rows, words, scales, sizes, gather = operands
-        d_rows = gemm(cotangent.astype(jnp.bfloat16), decoded(words, scales), None if dense else sizes,
-                      transpose_rhs=True, out_dtype=rows.dtype, precision=jax.lax.Precision.DEFAULT,
-                      interpret_on_cpu=interpret)
+        d_rows = gemm(cotangent.astype(jnp.float32), decoded(words, scales).astype(jnp.float32),
+                      None if dense else sizes, transpose_rhs=True, out_dtype=rows.dtype,
+                      precision=jax.lax.Precision.HIGHEST, interpret_on_cpu=interpret)
         if gather is not None:
             d_rows = jnp.zeros(rows.shape, d_rows.dtype).at[gather].add(d_rows)
         leaves = (d_rows, zero_from_primal(words), zero_from_primal(scales), zero_from_primal(sizes),
@@ -659,9 +660,10 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     experts' (`[groups, in, out]`, `group_sizes` counting each group's leading rows, any past their sum
     outside every group), each group's rows padded with zero rows to whole 128-row blocks, multiplied by
     `blockwise_fp8_projection` and the padding dropped, a row outside every group zero; `bias`, each group's
-    `[groups, out]`, added to its rows after. None where the run trains in no recipe or the recipe does not
-    take the projection: its role keeps the run's dtypes (a router's, a head's) or its widths hold no whole
-    128-wide blocks, each such projection's route reported with the reason."""
+    `[groups, out]`, added to its rows' fp32 sums, the output rounded once after. None where the run trains
+    in no recipe or the recipe does not take the projection: its role keeps the run's dtypes (a router's, a
+    head's) or its widths hold no whole 128-wide blocks, each such projection's route reported with the
+    reason."""
     from dew.nn.precision import recipe_role
 
     held = recipe_role()
@@ -694,11 +696,14 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     laid = jnp.zeros((padded, depth), rows.dtype).at[place].set(rows, mode="drop")
     # The run's slack, zero rows, as the last group's further blocks: the recipe's rows are whole blocks.
     group_blocks = blocks.at[-1].add(padded // edge - blocks.sum())
-    product = blockwise_fp8_projection(laid, stacked, group_blocks, out_dtype=out_dtype)
+    # A biased product's sums stay fp32 through the bias, as the template's epilogue adds it (moe's
+    # `_biased`): one rounding of the whole.
+    summed_dtype = out_dtype if bias is None else jnp.float32
+    product = blockwise_fp8_projection(laid, stacked, group_blocks, out_dtype=summed_dtype)
     out = product.at[place].get(mode="fill", fill_value=0)
     if bias is not None:
-        out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(out.dtype), out)
-    return out
+        out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(jnp.float32), out)
+    return out.astype(out_dtype)
 
 
 def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
