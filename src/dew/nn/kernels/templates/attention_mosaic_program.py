@@ -379,14 +379,16 @@ def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups:
                  products: tuple | None = None) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
     walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), its issuer's product scratch
-    where its `products` take one (`Family.product_held`), with the algebra's reductions' scratch where it
-    `reduces` (a launch reducing its scores, weights or cotangents across warps) and its
-    `reducing_warpgroups`' scratch (`resources.Scope`)."""
+    where its `products` take one (`Family.product_held`, its tensor memory's addresses
+    `Issuer.product_addresses`), with the algebra's reductions' scratch where it `reduces` (a launch reducing
+    its scores, weights or cotangents across warps) and its `reducing_warpgroups`' scratch
+    (`resources.Scope`)."""
     scoped, streams, *after = allocations
     held, walks = family.lifetimes(streams)
     return resources.Scope(program=(scoped, *family.product_held(products), *held), walks=walks,
                            after=tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ())),
-                           reduces=reduces, reducing_warpgroups=reducing_warpgroups)
+                           reduces=reduces, reducing_warpgroups=reducing_warpgroups,
+                           addresses=family.product_addresses(products))
 
 
 def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
