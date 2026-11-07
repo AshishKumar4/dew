@@ -1479,24 +1479,23 @@ def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array]) -> Partial:
     return split._replace(acc=split_output(split.acc, anchored_own, rows(arg.key)))
 
 
-def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], Keys],
-                    rows: Callable[[jax.Array], jax.Array], bounds,
+def normalized_pass(spec: Forward, peak: jax.Array, maximum: jax.Array, total: jax.Array, anchors: jax.Array,
+                    keys_at: Callable[[jax.Array], Keys], bounds, width: int,
                     initial: tuple[jax.Array, jax.Array] | None) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """A guarded training walk's live rows' split sums, normalized (`split_residuals`): a pass over its key
-    tiles `bounds` (`keys_at`) at the walk's own maximum and natural denominator (`normalized_terms`), from
-    the `initial` state's share (`normalized_start`, `(m0, acc0)`): the other keys' weighted values, the
-    anchor's weight and the other keys' weights, over the denominator; a weight below its dtype's least
-    normal once normalized takes its product raised and in fp32, taken back after it (`SMALL_SHIFT`)."""
-    split, arg, _, _ = carry
-    state = joined(carry, rows)
-    _, maximum, total = finish(spec, state, initial=initial is not None)
+    """A guarded training walk's live rows' split sums, normalized (`split_residuals`): an instruction whose
+    operands are the walk's final statistics, its maximum in its own units `peak` and natural `maximum`, its
+    natural denominator `total` (`finish`'s) and its rows' anchor keys `anchors` `[bq]`, a pass over its key
+    tiles `bounds` (`keys_at`) at them (`normalized_terms`), from the `initial` state's share
+    (`normalized_start`, `(m0, acc0)`), `width` values wide: the other keys' weighted values, the anchor's
+    weight and the other keys' weights, over the denominator; a weight below its dtype's least normal once
+    normalized takes its product raised and in fp32, taken back after it (`SMALL_SHIFT`)."""
     share = None
     if initial is not None:
         # The initial state's factor to the walk's maximum, in the walk's own units, at most 1: folded, its
         # maximum taken to base 2 as the walk resumed from it (`resumed`), whose own may round back below it.
         m0 = initial[0].astype(jnp.float32)
         carried = jnp.where(m0 == -jnp.inf, 0.0,
-                            jnp.exp2(jnp.minimum(base2_maximum(m0) - state.m, 0.0)) if spec.base2
+                            jnp.exp2(jnp.minimum(base2_maximum(m0) - peak, 0.0)) if spec.base2
                             else jnp.exp(jnp.minimum(m0 - maximum, 0.0)))
         share = carried, initial[1]
 
@@ -1504,14 +1503,14 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
         # Each exponent in the walk's own units: folded logits against its base-2 maximum, natural ones
         # against the natural maximum as the backward recomputes them.
         if spec.base2:
-            return jnp.minimum(logits - expand(state.m, logits), 0.0)
+            return jnp.minimum(logits - expand(peak, logits), 0.0)
         return exponent(logits, maximum, recompute(spec))
 
     def walk(index, sums):
         keys = keys_at(index)
         value = keys.values.load()
         rest, own_tile, small = normalized_terms(difference(keys.logits), total,
-                                                 keys.coords.k_pos == arg.key[:, None], value.dtype,
+                                                 keys.coords.k_pos == anchors[:, None], value.dtype,
                                                  jnp.exp2 if spec.base2 else jnp.exp)
         multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
         if multiplier is None:
@@ -1519,7 +1518,7 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
         else:
             # The product takes the dropped weights and the others' sums the undropped ones.
             weighed, _, weighed_small = normalized_terms(
-                difference(keys.logits), total, keys.coords.k_pos == arg.key[:, None], value.dtype,
+                difference(keys.logits), total, keys.coords.k_pos == anchors[:, None], value.dtype,
                 jnp.exp2 if spec.base2 else jnp.exp, multiplier)
         lowered = jnp.float32(-SMALL_SHIFT)
         product = keys.dot(weighed, value) + power2(
@@ -1529,17 +1528,8 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
 
     nothing = jnp.zeros_like(total)
     lo, hi = bounds
-    start = normalized_start(share, total, split.acc.shape[-1])
+    start = normalized_start(share, total, width)
     return jax.lax.fori_loop(lo, hi, walk, (start, nothing, nothing))
-
-
-def split_written(carry: Carry, rows: Callable[[jax.Array], jax.Array],
-                  normalized: Callable[[], tuple[jax.Array, jax.Array, jax.Array]]
-                  ) -> tuple[Partial, jax.Array, tuple[jax.Array, ...]]:
-    """A training walk's state with its split sums joined (`joined`), its anchor keys, and its split sums
-    and their shift for the backward (`split_residuals`, a guarded walk's live rows' from `normalized()`)."""
-    split, arg, own, others_total = carry
-    return joined(carry, rows), arg.key, split_residuals(split, own, others_total, normalized)
 
 
 def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:

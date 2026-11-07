@@ -489,9 +489,11 @@ DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
                  "BWDSTAGES-h100); a training step's attention at Qwen3-8B's widths, 2 x 4096 bf16, 2.44 "
                  "against 11.38 ms causal and 4.26 against 15.61 full (CELLS-h100)"),
     ('wgmma', 'float32 attention'): (
-        'xla', "jax.nn's xla attention measured faster than the template's fp32 route on an H100: a training "
-               "step's attention at Qwen3-8B's widths, 1 x 1024 fp32, 2.08 against 26.36 ms causal and 2.19 "
-               "against 46.21 full (CELLS-h100)"),
+        'inference', "jax.nn's xla attention measured faster than the template's fp32 route on an H100 for a "
+                     "training step's attention at Qwen3-8B's widths, 1 x 1024 fp32, 2.08 against 26.36 ms "
+                     "causal and 2.19 against 46.21 full (CELLS-h100); the template's fp32 forward as bf16 "
+                     "parts faster than xla's for a call no derivative is taken of where `template_infers` "
+                     "(M-ET-16, W18-gh200-1)"),
     ('mma.sync', 'attention'): (
         'flash', "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
@@ -507,6 +509,16 @@ A call's kind is its dtype's, 16-bit or fp32: its kernel is chosen before the ca
 (`attention_route.attend`'s `custom_vjp`), so its forward and its training run one kernel, and the receipts
 cover both. Every other call takes the template (`_attention_preferred`). Nothing is ranked at runtime: the
 list shrinks as the template wins."""
+
+
+def template_infers(width: int, causal: bool) -> bool:
+    """Whether the template's fp32 forward (its operands as bf16 parts) measured faster than xla's fp32
+    attention for a call no derivative is taken of, `width` wide (the 'float32 attention' cell's
+    'inference'): at width 64 everywhere (0.22 to 0.55 of xla's time, 8192 causal 3.54 against 16.47 ms) and
+    causal at 128 (0.57 to 0.80), at an RMS error from float64 30 to 60 times xla's lower; not at 128 full
+    (1.19 to 1.37 of xla's, one consumer of 64 columns, its QK products' parts run twice), nor at widths
+    unmeasured (M-ET-16, W18-gh200-1, GH200, CUPTI median of 7, 2048 and 8192 tokens)."""
+    return width == 64 or (width == 128 and causal)
 
 
 def _attention_preferred(case: AttentionCase) -> str:
@@ -540,13 +552,16 @@ ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
+    Kernel[AttentionCase]('inference', TEMPLATE_SUPPORTS),
 ), _attention_preferred, _hosted, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
 splash, xla and the reference path, the first that takes the call. The old routes take only the fast
 form (`AttentionCase.form`): an accurate call runs the template, or the reference path on a CPU; a
 decode call keeps its own kernels whatever the form (`DECODE`). The template comes last, after the
-reference path, which takes every call, so it runs where the preference names it or a call names it."""
+reference path, which takes every call, so it runs where the preference names it or a call names it; and
+'inference' after it, the template for a call no derivative is taken of and xla's attention for one
+differentiated (`dew.nn.attention.forward_differentiable`'s `primal_alone`), where a cell declares it."""
 
 
 
