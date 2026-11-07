@@ -36,11 +36,13 @@ from common import (
     TracedWindow,
     WorkloadWork,
     attach_xplane_profile,
+    device_memory,
     documents,
     host,
     peak_flops,
     run_arguments,
     sha256,
+    stated_peak_gib,
     steps_for,
     throughput,
     window_rows,
@@ -303,9 +305,7 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
         "hlo_flops_per_step": (run.trainer.step_flops and run.trainer.step_flops.hardware),
         "mfu": None if peak_rate is None else run.work.training_flops_per_step * curves.timed_steps
             / curves.window_seconds / (peak_rate * devices),
-        # A device's figure it does not state is None, never a 0 it did not measure.
-        "memory": {"peak_allocated_bytes": [s.get("peak_bytes_in_use") for s in stats],
-                   "bytes_limit": [s.get("bytes_limit") for s in stats]},
+        "memory": device_memory(stats),
     }
     for name in (curves.extras[0] if curves.extras else {}):
         result[name] = np.asarray(jax.device_get([entry[name] for entry in curves.extras]),
@@ -331,7 +331,7 @@ def main() -> None:
     print(json.dumps({"first_loss": result["loss"][0], "last_loss": result["loss"][-1],
                       "tokens_per_s": result["throughput"]["tokens_per_s"], "mfu": result["mfu"],
                       "compile_s": run.compile_seconds,
-                      "peak_gib": max(result["memory"]["peak_allocated_bytes"]) / 2**30}, indent=1))
+                      "peak_gib": stated_peak_gib(result["memory"]["peak_allocated_bytes"])}, indent=1))
 
 
 if __name__ == "__main__":

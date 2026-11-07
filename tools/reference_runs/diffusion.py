@@ -46,10 +46,12 @@ from common import (
     TracedWindow,
     WorkloadWork,
     attach_xplane_profile,
+    device_memory,
     host,
     peak_flops,
     sha256,
     source_version,
+    stated_peak_gib,
     steps_for,
     throughput,
     window_rows,
@@ -371,8 +373,7 @@ def main() -> None:
                                else trainer.step_flops.hardware),
         "mfu": None if peak_rate is None else work.training_flops_per_step * window.timed_steps
             / window_seconds / (peak_rate * devices),
-        # A device's peak it does not state is None, never a 0 it did not measure.
-        "memory": {"peak_allocated_bytes": [s.get("peak_bytes_in_use") for s in stats]},
+        "memory": device_memory(stats),
     }
     if args.profile_steps:
         write_record(args.out, record)
@@ -380,7 +381,7 @@ def main() -> None:
     write_record(args.out, record)
     print(json.dumps({"first_loss": record["loss"][0], "last_loss": record["loss"][-1],
                       "images_per_s": timed["images_per_s"],
-                      "peak_gib": max(record["memory"]["peak_allocated_bytes"]) / 2**30}, indent=1))
+                      "peak_gib": stated_peak_gib(record["memory"]["peak_allocated_bytes"])}, indent=1))
 
 
 if __name__ == "__main__":

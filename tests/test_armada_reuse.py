@@ -335,31 +335,35 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 1]
 
 
-def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_runs_none_past_it(
+def test_a_kept_task_runs_a_stale_row_only_within_its_deadline_and_says_the_rest_stale_not_run(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A kept task that must run a kept group whose green run it cannot read, past its deadline, reads and
-    runs no group after it: each is a red row its task's deadline cut off, and the task writes every row
-    (review: each later group was still read and run, a fresh grace and settle each, past the deadline)."""
+    """A kept task whose kept groups' green runs it cannot read runs each only where its recorded seconds fit
+    what is left of its deadline: every other is said stale, not run (ci.py's `STALE`), its own outcome the
+    queue runs again, never a deadline red, and none runs past the deadline (row 4468: a kept task's 163 of
+    165 stale rows ran out its 1680 s one after another, each a deadline red); groups that fit run and
+    pass."""
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     _, _, seen = cache_worker
     names = "cde"
-    written(tmp_path, {"test_c.py": "import time\nfrom pathlib import Path\n" + "".join(
-        f"def test_{name}():\n    Path('runs-{name}').write_text('x')\n    time.sleep(3)\n"
-        for name in names)})
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {f"tests/test_c.py::test_{name}": 250.0 for name in names}))
+    written(tmp_path, {"test_c.py": "from pathlib import Path\n" + "".join(
+        f"def test_{name}():\n    Path('runs-{name}').write_text('x')\n" for name in names)})
     groups = " ".join(f"tests/test_c.py#{index}/3@GenuineIntel-6-143:0000" for index in (1, 2, 3))
-    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={groups}",
-                                      f"--out={verdict}", "--cache=on", "--deadline=1"])
-    seen.clear()
-    assert ci.main() == 0
-    rows = json.loads(verdict.read_text())["rows"]
-    assert [(row["name"], row["exitCode"], row["kind"]) for row in rows] == [
-        (f"3.12:tests/test_c.py#{index}/3", 1, "deadline") for index in (1, 2, 3)]
-    assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False]
-    # The groups past the deadline were never looked up.
-    assert [any(f"tests/test_c.py/{index}-of-3" in path for path in seen) for index in (1, 2, 3)] == [
-        True, False, False]
+
+    def kept_task(seconds: float, deadline: int) -> list[tuple[str, int, str | None]]:
+        (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+            {f"tests/test_c.py::test_{name}": seconds for name in names}))
+        monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={groups}",
+                                          f"--out={verdict}", "--cache=on", f"--deadline={deadline}"])
+        seen.clear()
+        assert ci.main() == 0
+        return [(row["name"], row["exitCode"], row.get("kind"))
+                for row in json.loads(verdict.read_text())["rows"]]
+
+    assert kept_task(250.0, 60) == [(f"3.12:tests/test_c.py#{index}/3", 1, ci.STALE) for index in (1, 2, 3)]
+    assert not any((tmp_path / f"runs-{name}").exists() for name in names)
+    assert any("tests/test_c.py/1-of-3" in path for path in seen)
+    assert kept_task(0.5, 600) == [(f"3.12:tests/test_c.py#{index}/3", 0, None) for index in (1, 2, 3)]
+    assert all((tmp_path / f"runs-{name}").exists() for name in names)
 
 
 def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_dependencies(

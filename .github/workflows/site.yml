@@ -34,7 +34,7 @@ permissions:
 
 concurrency:
   group: site-${{ github.ref }}${{ inputs.run_cells && '-cells' || '' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 jobs:
   build:
