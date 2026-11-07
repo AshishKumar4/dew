@@ -199,7 +199,9 @@ def _reads(index: fusion.Index, places: Sequence[int], var: jcore.Var) -> bool:
 
 def _canonical(closed: jcore.ClosedJaxpr) -> jcore.ClosedJaxpr:
     """`closed` as recognition compares it: its nested programs inlined (a jit, a closed call, a custom
-    derivative's primal), each value it makes from no input computed into a constant, every constant a
+    derivative's primal), each equation in its normal form (`_normal`: a square a product, a narrow float's
+    arithmetic its float32 arithmetic rounded once), each value it makes from no input computed into a
+    constant, every constant a
     literal of its value (so a mask the program builds and one a declaration builds are one where they are
     the same booleans), and each equation that repeats another's primitive, parameters and operands, and
     holds no effect, read as that one."""
@@ -236,10 +238,12 @@ computes, the primal of a custom derivative's (its derivative is the call's own 
 
 
 def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
-    """`jaxpr` run over `values` with every nested program (`BODY_PARAMS`) run in place: under a trace its
-    equations each bind once, a value of constants alone computed where it is made."""
+    """`jaxpr` run over `values` with every nested program (`BODY_PARAMS`) run in place, each equation in the
+    form recognition compares (`_normal`): under a trace its equations each bind once, a value of constants
+    alone computed where it is made."""
     env: dict[jcore.Var, object] = dict(zip(jaxpr.constvars, consts, strict=True))
     env.update(zip(jaxpr.invars, values, strict=True))
+    widened: dict[int, object] = {}
 
     def read(atom):
         return atom.val if isinstance(atom, jcore.Literal) else env[atom]
@@ -252,10 +256,63 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
             given = operands[len(operands) - len(closed.jaxpr.invars):]
             outputs = _evaluated(closed.jaxpr, closed.consts, *given)
         else:
-            bound = equation.primitive.bind(*operands, **equation.params)
-            outputs = bound if equation.primitive.multiple_results else [bound]
+            outputs = _normal(equation, operands, widened)
         env.update(zip(equation.outvars, outputs, strict=True))
     return [read(atom) for atom in jaxpr.outvars]
+
+
+NARROW = {jnp.dtype(jnp.bfloat16): (8, 7), jnp.dtype(jnp.float16): (5, 10)}
+"""The narrow floats, by the exponent and mantissa bits `reduce_precision` rounds a float32 to them by."""
+
+ROUNDED_ONCE = frozenset({"add", "sub", "mul", "div", "max", "min", "neg", "abs", "sqrt", "rsqrt", "exp",
+                          "exp2", "log", "log1p", "expm1", "logistic", "tanh", "erf", "sin", "cos"})
+"""The elementwise primitives whose narrow-float equation is its float32 one rounded once (`_normal`): the
+arithmetic exactly (float32 holds more than twice a bfloat16's or float16's digits and two more, so a
+float32 result rounded again rounds as the narrow operation does), the transcendentals as XLA computes a
+narrow float's, in float32 and rounded (its float normalization), on every backend the compile point
+writes a kernel for."""
+
+
+def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]) -> list:
+    """`equation` bound over `operands` in the form recognition compares (`_canonical`): a square a value
+    times itself, bit for bit; a narrow float's elementwise equation (`ROUNDED_ONCE`) its float32 one
+    rounded once to the narrow dtype; a float32 rounded to a narrow float's digits in place
+    (`reduce_precision`) a round trip through that dtype; a value widened exactly and rounded back to its
+    own dtype that value itself (`widened`, each exact widening's result by its source). Every other
+    equation as it is."""
+    name = jax_name(equation.primitive)
+    if name == "convert_element_type":
+        return [_converted(operands[0], equation.params["new_dtype"], widened)]
+    if name == "square" or (name == "integer_pow" and equation.params.get("y") == 2):
+        return [jax.lax.mul(operands[0], operands[0])]
+    if name == "reduce_precision":
+        bits = (equation.params["exponent_bits"], equation.params["mantissa_bits"])
+        narrow = next((dtype for dtype, held in NARROW.items() if held == bits), None)
+        if narrow is not None:
+            return [_converted(_converted(operands[0], narrow, widened), operands[0].dtype, widened)]
+    out = equation.outvars[0].aval.dtype if len(equation.outvars) == 1 else None
+    if name in ROUNDED_ONCE and out in NARROW and all(jnp.result_type(value) == out for value in operands):
+        wide = [_converted(value, jnp.float32, widened) for value in operands]
+        return [_converted(equation.primitive.bind(*wide, **equation.params), out, widened)]
+    bound = equation.primitive.bind(*operands, **equation.params)
+    return bound if equation.primitive.multiple_results else [bound]
+
+
+def _converted(value, dtype, widened: dict[int, object]):
+    """`value` cast to `dtype`: the value it was widened from where it is an exact widening of a value of
+    `dtype` (`widened`), else the cast, recorded in `widened` where it widens exactly (a narrow float to
+    float32, a float to float64)."""
+    dtype = jnp.dtype(dtype)
+    source = widened.get(id(value))
+    if source is not None and jnp.result_type(source) == dtype:
+        return source
+    cast = jax.lax.convert_element_type(value, dtype)
+    if cast is not value and jnp.issubdtype(dtype, jnp.floating) and jnp.issubdtype(jnp.result_type(value),
+                                                                                    jnp.floating) and (
+            jnp.finfo(dtype).nmant > jnp.finfo(jnp.result_type(value)).nmant
+            and jnp.finfo(dtype).maxexp >= jnp.finfo(jnp.result_type(value)).maxexp):
+        widened[id(cast)] = value
+    return cast
 
 
 def _equation_key(equation: jcore.JaxprEqn) -> Hashable | None:
@@ -369,17 +426,18 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
     for (_, row), (_, output) in itertools.product(rows, outputs):
         if row.aval.shape != output.aval.shape or not jnp.issubdtype(output.aval.dtype, jnp.floating):
             continue
-        extras = _extras(index, row, output)
-        if extras is None:
+        found = _extras(index, row, output)
+        if found is None or len(found) > 2:
             continue
         width = row.aval.shape[-1]
-        weights = [var for var in extras if var.aval.shape == (width,)]
-        gates = [var for var in extras if var.aval.shape == row.aval.shape]
-        if len(weights) > 1 or len(gates) > 1 or len(weights) + len(gates) != len(extras):
-            continue
-        weight = weights[0] if weights else None
-        epsilons = _scalars(index, _between(index, (row, *extras), (output,)) or ())
-        yield from _norm_candidates(index, row, output, weight, gates[0] if gates else None, epsilons)
+        for extras in itertools.product(*(_chain(index, var) for var in found)):
+            weights = [var for var in extras if var.aval.shape == (width,)]
+            gates = [var for var in extras if var.aval.shape == row.aval.shape]
+            if len(weights) > 1 or len(gates) > 1 or len(weights) + len(gates) != len(extras):
+                continue
+            epsilons = _scalars(index, _between(index, (row, *extras), (output,)) or ())
+            yield from _norm_candidates(index, row, output, weights[0] if weights else None,
+                                        gates[0] if gates else None, epsilons)
 
 
 def _norm_candidates(index: fusion.Index, row, output, weight, gate, epsilons) -> Iterator[Candidate]:
@@ -445,9 +503,12 @@ def _swiglus(index: fusion.Index, place: int) -> Iterator[Candidate]:
         if gate.aval.shape != output.aval.shape:
             continue
         extras = _extras(index, gate, output)
-        if extras is None or len(extras) != 1 or extras[0].aval.shape != gate.aval.shape:
+        if extras is None or len(extras) != 1:
             continue
-        up, dtype = extras[0], output.aval.dtype
+        ups = [var for var in _chain(index, extras[0]) if var.aval.shape == gate.aval.shape]
+        if not ups:
+            continue
+        up, dtype = ups[-1], output.aval.dtype
         packed = _packed(index, gate, up)
         if packed is not None:
             def halves(gate_up, implementation='auto', dtype=dtype):
@@ -524,6 +585,14 @@ def _nearest_product(index: fusion.Index, reached: dict[jcore.Var, int], *, upst
         places += [(distance, place) for place in near
                    if jax_name(index.jaxpr.eqns[place].primitive) == "dot_general"]
     return min(places)[1] if places else None
+
+
+def _chain(index: fusion.Index, var: jcore.Var, reach: int = 3) -> list[jcore.Var]:
+    """`var` and the values it is made from by up to `reach` equations of one non-constant operand each (a
+    cast, a layout, an activation), nearest first: the values an operand a region reads may be bound as,
+    the call's own casts and layouts of it the region's equations (a weight cast and broadcast along the
+    rows, a gate's activation)."""
+    return _sources(index, var, reach)[::-1]
 
 
 def _sources(index: fusion.Index, var: jcore.Var, reach: int) -> list[jcore.Var]:
