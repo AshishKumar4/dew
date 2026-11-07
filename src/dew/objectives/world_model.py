@@ -30,6 +30,7 @@ from dew.batch import Batch, Variables, unboxed
 from dew.inputs import unit_range
 from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.inputs import AttentionMetadata
+from dew.nn.norms import RMSNorm
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.text_encoders import clip_layer
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
@@ -141,6 +142,9 @@ class CausalTokenizer(nn.Module):
         self.encoder = [_block(self.width, self.heads, tokens, f"encoder_{index}", rotary_axes=axes)
                         for index in range(self.depth)]
         self.squeeze = nn.Dense(self.bottleneck)
+        # A rotary tokenizer's latents RMS-normalized before the squeeze: no parameter, so either `positions`
+        # keeps its checkpoints.
+        self.latent_norm = RMSNorm(epsilon=RMS_EPSILON, with_scale=False)
         self.unsqueeze = nn.Dense(self.width)
         self.readout_tokens = self.param("readout_tokens", nn.initializers.normal(0.02),
                                          (self.patches, self.width))
@@ -175,9 +179,7 @@ class CausalTokenizer(nn.Module):
         tokens = _attended(self.encoder, tokens, (index[:, None] >= count) | (index[None, :] < count),
                            positions=jnp.concatenate([patches, cells], 0) if rotary else None)
         encoded = tokens[..., count:, :]
-        if rotary:
-            encoded = encoded * jax.lax.rsqrt(jnp.mean(jnp.square(encoded), -1, keepdims=True) + RMS_EPSILON)
-        return jnp.tanh(self.squeeze(encoded))
+        return jnp.tanh(self.squeeze(self.latent_norm(encoded) if rotary else encoded))
 
     def decode(self, latents: jax.Array) -> jax.Array:
         lead = latents.shape[:-2]

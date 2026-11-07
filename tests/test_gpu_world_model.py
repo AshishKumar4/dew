@@ -10,7 +10,8 @@ import jax
 import numpy as np
 import optax
 import pytest
-from test_world_model import assert_lights_what_it_shows
+from learning_gate import assert_learns
+from test_world_model import reconstructed
 
 from dew.data.dataset import Loader
 from dew.objectives.world_model import CausalTokenizer, TokenizerObjective
@@ -19,6 +20,11 @@ from dew.training import Trainer
 pytestmark = pytest.mark.gpu(reason="tutorial 12's tokenizer at its own scale, 8,000 updates of 32 clips")
 
 TUTORIAL = Path(__file__).parent.parent / "tutorials" / "12-world-models.ipynb"
+BALL_UNITS = 32
+"""The held-out clips tutorial 12's reconstruction is judged over: four times `learning_gate.units_for`'s 8
+for the moving squares' pilot (`test_world_model.SQUARE_UNITS`), whose reconstruction lit 99% of its
+shapes, where the balls' at 8,000 updates correlate 0.976 with their frames, so a closer margin is still
+judged."""
 
 
 def tutorial_function(name: str):
@@ -38,19 +44,22 @@ def tutorial_function(name: str):
 
 
 def test_tutorial_12s_tokenizer_reconstructs_the_balls_it_was_trained_on():
-    """Tutorial 12's tokenizer, trained as the tutorial trains it on its own clips (2,048 clips of 12 frames
-    of two bouncing balls, 32 clips an update, Adam 3e-4) for 8,000 updates, reconstructs the balls of 8
-    held-out clips (`assert_lights_what_it_shows`). Its tokens know their places by Dreamer 4's rotary
-    positions (`positions`, row 4669): by learned vectors alone it reconstructed the mean frame (an H100 at
-    fdd1da52c9: squared error 0.1406 against the mean frame's 0.1417), where rotary positions reach 0.0067
-    and a correlation with the frames of 0.976."""
+    """Tutorial 12's tokenizer, trained on the tutorial's own clips (2,048 clips of 12 frames of two bouncing
+    balls, 32 clips an update, Adam 3e-4) for 8,000 updates, reconstructs the balls of held-out clips,
+    judged by the learning gate over them, a unit a clip (`reconstructed`). The tutorial as recorded
+    trains 2,000 updates, where rotary positions reach squared error 0.12; it takes 8,000 once recorded
+    again with them. Its tokens know their places by Dreamer 4's rotary positions (`positions`, row
+    4669): by learned vectors alone it reconstructed the mean frame (an H100 at fdd1da52c9: squared error
+    0.1406 against the mean frame's 0.1417), where rotary positions reach 0.0067 and a correlation with
+    the frames of 0.976."""
     bouncing = tutorial_function("bouncing")
-    videos, held = bouncing(2048, 12, 32, 0), bouncing(8, 12, 32, 1)
+    videos, held = bouncing(2048, 12, 32, 0), bouncing(BALL_UNITS, 12, 32, 1)
     clips = Loader(train=lambda partition: ({"video": videos[start:start + 32]}
                                             for start in itertools.cycle(range(0, 2048, 32))),
                    val=None, records=2048, batch=32)
     tokenizer = CausalTokenizer((32, 32, 1), width=128, depth=3, latents=16, bottleneck=8)
     state = Trainer(TokenizerObjective(tokenizer), optax.adam(3e-4), key=jax.random.key(9)).fit(
         clips, steps=8000, log_every=4000)
-    assert_lights_what_it_shows(tokenizer, state.variables, held.reshape(-1, 32, 32, 1),
-                                videos.reshape(-1, 32, 32, 1).mean(0))
+    contrasts = reconstructed(tokenizer, state.variables, held, videos.reshape(-1, 32, 32, 1).mean(0))
+    assert_learns(lambda clips: {claim: values[clips] for claim, values in contrasts.items()},
+                  "tutorial 12's tokenizer", units=BALL_UNITS)
