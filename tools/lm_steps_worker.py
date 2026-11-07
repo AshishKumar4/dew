@@ -16,6 +16,8 @@ IN holds each draw's `<draw>.tokens` `[STEPS, BATCH, SEQ + 1]`. OUT gets `<draw>
 leaf: a schedule is a runtime float32 operand by its contract (workaround audit group 44, ledger 1660).
 """
 
+import copy
+import functools
 import sys
 from pathlib import Path
 
@@ -47,8 +49,16 @@ def run(dtype: torch.dtype, tokens: np.ndarray) -> dict[str, list[float]]:
     return _steps(dtype, tokens)
 
 
-def _steps(dtype: torch.dtype, tokens: np.ndarray) -> dict[str, list[float]]:
+@functools.cache
+def _initial(dtype: torch.dtype) -> tuple:
+    """The checkpoint's model in `dtype` and its initial parameters, read once a process."""
     model = AutoModelForCausalLM.from_pretrained(CHECKPOINT, dtype=dtype, attn_implementation="eager")
+    return model, copy.deepcopy(model.state_dict())
+
+
+def _steps(dtype: torch.dtype, tokens: np.ndarray) -> dict[str, list[float]]:
+    model, initial = _initial(dtype)
+    model.load_state_dict(initial)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=OPTIMIZER["lr_peak"],
                                   betas=(OPTIMIZER["b1"], OPTIMIZER["b2"]), eps=OPTIMIZER["eps"],
