@@ -18,6 +18,14 @@ deviation over the 1,200 forwards of 320 draws, a light tail: each draw's larges
 median and 2.5e-6 at the 99th percentile."""
 
 
+NARROW_MARGIN = 8 * float(jnp.finfo(jnp.bfloat16).eps)
+"""The least selection margin a draw admits where the compared runs compute in bfloat16 (0.0625): above the
+distance bfloat16 rounding moves a selection's inputs. DeepSeek-V3-tiny's group scores (each the sum of its two
+best sigmoid-plus-bias expert scores), over 8,192 draws, moved by at most 0.033 relative between bfloat16 and
+float64, and the difference of two groups' by at most 0.060 (transformers') and 0.041 (Dew's); the 491 draws
+clearing 0.0625 flipped no group in either bfloat16 run (row 4734)."""
+
+
 def routes(config) -> bool:
     """Whether the model's mixture routes any of its layers by its router's scores: hash routing selects
     by the token alone, which no rounding moves, and DeepSeek V4 hashes only its first layers."""

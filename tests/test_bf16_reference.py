@@ -38,7 +38,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import fixture_ids, transformers_arms, transformers_model
+from interop_support import clearing_selections, fixture_ids, transformers_arms, transformers_model
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
@@ -56,32 +56,25 @@ DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek
 DECODER_SEEDS = {"float32": {"mixtral-tiny": 16}, "bfloat16": {"mixtral-tiny": 512}}
 """Each decoder's declared draws of ids against transformers' forward in the same precision (check 1),
 sized by `seeds_for` paired with Dew's logits on the CPU: 8 where a decoder is not named."""
-ONE_DRAW = {("deepseek-v3-tiny", "bfloat16")}
-"""The decoders whose check 1 does not resolve within the 512-seed cap, paired (G02's open row): held on
-their recorded draw by the one-draw rule, as before, until it does."""
-
-
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("name", DECODERS)
 def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     """Dew's logits in `dtype` (bfloat16 over float32 masters, as training runs) are on par with
     transformers' own forward in `dtype` (its weights cast to it, as `from_pretrained` casts them), both
-    from the float64 twin of the stored weights, over drawn ids (check 1)."""
+    from the float64 twin of the stored weights, over drawn ids (check 1). A decoder that routes draws ids
+    whose routes Dew's float64 run decides by the dtype's margin (`clearing_selections`: bfloat16's
+    `NARROW_MARGIN`), so neither narrow run routes otherwise than the truth (row 4734)."""
     directory = FIXTURES / name
     pretrained = Pretrained.load(str(directory), dtype=dtype, attention_impl="reference")
-    if (name, dtype) in ONE_DRAW:
-        ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
-        logits = np.asarray(pretrained.model.apply(pretrained.variables, ids), np.float32)
-        with np.load(directory / "numerics.npz") as exact:
-            assert_as_exact_as_the_reference(logits, exact["bf16"], exact["f64"], f"{name} {dtype}")
-        return
+    truth_model = Pretrained.load(str(directory), dtype="float64", attention_impl="reference")
+    draw = clearing_selections(truth_model, fixture_ids(directory), f"{name} {dtype}", tries=256,
+                               margin=NARROW_MARGIN if dtype == "bfloat16" else None)
     source = transformers_model(directory)
     narrow = source if dtype == "float32" else transformers_model(directory, dtype=dtype)
     reference, truth = transformers_arms(narrow, lambda model, ids: model(ids, use_cache=False).logits,
                                          source=source)
     assert_as_exact(lambda ids: pretrained.model.apply(pretrained.variables, ids).astype(jnp.float32),
-                    reference, fixture_ids(directory), f"{name} {dtype}",
-                    seeds=DECODER_SEEDS[dtype].get(name, 8), truth_fn=truth)
+                    reference, draw, f"{name} {dtype}", seeds=DECODER_SEEDS[dtype].get(name, 8), truth_fn=truth)
 
 
 BIAS_SEEDS = {"qwen2-tiny": 64, "llama-tiny": 32}
