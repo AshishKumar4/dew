@@ -92,9 +92,10 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
     gather. An NVFP4 `rhs` (`NvFp4`, row 4516) is `_nvfp4_gemm`'s, frozen."""
     if isinstance(rhs, NvFp4):
         return _nvfp4_gemm(lhs, rhs, group_sizes, epilogue=epilogue, epilogue_operands=epilogue_operands,
-                           out_dtype=out_dtype, out_dtypes=out_dtypes, gather=gather, scatter=scatter,
+                           out_dtype=out_dtype, gather=gather, scatter=scatter,
                            interpret_on_cpu=interpret_on_cpu,
-                           refused=(transpose_rhs, prologue, prologue_operands, layer, paired, prologue_jvp))
+                           refused=(transpose_rhs, prologue, prologue_operands, layer, paired, prologue_jvp,
+                                    out_dtypes))
     _gemm_refused(group_sizes, prologue=prologue, layer=layer, paired=paired, gather=gather, scatter=scatter,
                   compute=compute)
     straight = compute is not None
@@ -192,28 +193,22 @@ def _gemm_refused(group_sizes, *, prologue, layer, paired, gather, scatter, comp
         raise ValueError("a prologue's operand is multiplied in its own dtype, not a named `compute`")
 
 
-def _nvfp4_gemm(lhs, matrix: "NvFp4", group_sizes, *, epilogue, epilogue_operands: tuple, out_dtype,
-                out_dtypes, gather, scatter, interpret_on_cpu: bool, refused: tuple):
+def _nvfp4_gemm(lhs, matrix: "NvFp4", group_sizes, *, epilogue, epilogue_operands: tuple, out_dtype, gather,
+                scatter, interpret_on_cpu: bool, refused: tuple) -> jax.Array:
     """`gemm` of an NVFP4 `matrix` (a matrix, or a bank of experts' with `group_sizes`: `nvfp4_product`'s
     fp32 sums times the deferred factor, frozen), its epilogue on them in XLA before the one rounding, its
-    rows gathered and scattered as any; none of `refused` (a transposed matrix, a prologue, its side
-    operands, a stacked layer, a pair, a prologue's JVP) given."""
-    transpose_rhs, prologue, prologue_operands, layer, paired, prologue_jvp = refused
-    if transpose_rhs or prologue is not None or prologue_operands or layer is not None or paired is not None \
-            or prologue_jvp is not None:
-        raise ValueError("an NVFP4 matrix's product takes no prologue, pair, stacked layer or transposed "
-                         "matrix")
+    rows gathered and scattered as any, one output; none of `refused` (a transposed matrix, a prologue, its
+    side operands, a stacked layer, a pair, a prologue's JVP, several outputs) given."""
+    if any(given not in (None, False, ()) for given in refused):
+        raise ValueError("an NVFP4 matrix's product takes no prologue, pair, stacked layer, transposed "
+                         "matrix or several outputs")
     summed = nvfp4_product(lhs, matrix, group_sizes, gather=gather, out_dtype=jnp.float32,
                            interpret_on_cpu=interpret_on_cpu)
-    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
-    if epilogue is None:
-        outs = (summed,)
-    else:
+    if epilogue is not None:
         arrays, axes = _split(epilogue_operands, 'epilogue', group_sizes)
         sizes = jnp.asarray([summed.shape[0]], jnp.int32) if group_sizes is None else group_sizes
-        outs = _tupled(epilogue, summed, *_rows(arrays, axes, sizes, summed.shape[0]))
-    outs = scattered(tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True)), scatter)
-    return outs if out_dtypes else outs[0]
+        [summed] = _tupled(epilogue, summed, *_rows(arrays, axes, sizes, summed.shape[0]))
+    return scattered(summed.astype(out_dtype), scatter)
 
 
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,
@@ -292,11 +287,12 @@ class NvFp4:
     stages (`NVFP4_STAGE`): the mainloop's stage decode reads each column's words and scales as rows a TMA
     copy takes, at least 16 bytes. A bank of experts' matrices (`[groups, depth, width]`, row 4516) leads
     each field with its group axis: `words` `[groups, width, depth / 8]`, `scales` `[groups, width,
-    depth / 16]`, `scale` `[groups]`, each expert's matrix its own tensor scale."""
+    depth / 16]`, `scale` `[groups]`, each expert's matrix its own tensor scale. Its fields are NumPy
+    arrays where it was packed on the host (`of`)."""
 
-    words: jax.Array
-    scales: jax.Array
-    scale: jax.Array
+    words: jax.Array | np.ndarray
+    scales: jax.Array | np.ndarray
+    scale: jax.Array | np.ndarray
 
     @classmethod
     def quantized(cls, x: jax.Array) -> "NvFp4":
@@ -472,7 +468,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     `gemm`'s are (the packed kernel's producer gathering them where it does, the template's mainloop)."""
     rows = lhs.astype(jnp.bfloat16)
     launch = grouped_matmul.MosaicPackedGmm()
-    words = matrix.words if group_sizes is not None else matrix.words[None]
+    words = jnp.asarray(matrix.words if group_sizes is not None else matrix.words[None])
     groups, width, depth = words.shape[0], words.shape[1], 8 * words.shape[2]
     count = rows.shape[0] if gather is None else gather.shape[0]
     sizes = jnp.asarray([count], jnp.int32) if group_sizes is None else group_sizes.astype(jnp.int32)
@@ -484,7 +480,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
                         exact_sums=True)
     target = generation.gpu_target()
     tile = launch.derived(bound, target) if launch.eligible(bound, target) else None
-    scales = matrix.scales if group_sizes is not None else matrix.scales[None]
+    scales = jnp.asarray(matrix.scales if group_sizes is not None else matrix.scales[None])
     if selection.select(NVFP4, PackedCase(tile, math.prod(rows.shape[:-1]))).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
         summed = _packed(rows, words, scales, sizes, gather, tile, interpret_on_cpu,
@@ -494,6 +490,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
         # product's, whatever precision the program defaults to.
         summed = gemm(rows, matrix.decoded(), group_sizes, out_dtype=jnp.float32,
                       precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu, gather=gather)
+        assert isinstance(summed, jax.Array), "an unpaired product has one output"
     factor = matrix.factor if group_sizes is None else jnp.repeat(
         matrix.factor, sizes, total_repeat_length=count)[:, None]
     return (summed * factor).astype(out_dtype)
@@ -987,7 +984,8 @@ class NvFp4Block:
     def of(cls, matrix: NvFp4) -> "NvFp4Block":
         """A stored NVFP4 matrix (`NvFp4`, `[depth, width]`, its codes in the packed kernel's staged order)
         as the block-scaled products read it: `[1, width, depth]`, its depths in their own order."""
-        return cls(matrix.codes().T.astype(jnp.float4_e2m1fn)[None], matrix.scales[None], matrix.scale)
+        return cls(matrix.codes().T.astype(jnp.float4_e2m1fn)[None], jnp.asarray(matrix.scales)[None],
+                   jnp.asarray(matrix.scale))
 
     def decoded(self) -> jax.Array:
         """Its block-scaled values, exactly, in float32 (`[..., depth]`): each code times its block's scale,
