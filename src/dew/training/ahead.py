@@ -859,8 +859,10 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     with collecting() as collected:
         if window > 1 and trainer.step is None:
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
-        moving, *results = shapes_of(planned.executable.out_info)
-        loss, aux, finite, _, committed = results if split == 1 else whole_step([tuple(results)] * split)
+        moving, loss, aux, finite, accepted, committed = shapes_of(planned.executable.out_info)
+        if split > 1:
+            loss, aux, finite, accepted, committed = whole_step(
+                [(loss, aux, finite, accepted, committed)] * split)
         book = book_shapes(loss)
         counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))
         added_tokens(counted.tokens, counted.tokens)

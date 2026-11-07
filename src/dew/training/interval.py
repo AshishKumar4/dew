@@ -111,8 +111,8 @@ def fresh_book(loss: jax.Array) -> Book:
 def book_shapes(loss: jax.ShapeDtypeStruct) -> Book:
     """`fresh_book`'s counters as shapes, for a step whose loss is the shape `loss`: what a run compiled
     ahead compiles `bookkeep` over (`dew.training.ahead.started`)."""
-    return Book(*(jax.ShapeDtypeStruct(zero.shape, zero.dtype, sharding=loss.sharding)
-                  for zero in _zeros(loss)))
+    return Book(*jax.tree.map(
+        lambda zero: jax.ShapeDtypeStruct(zero.shape, zero.dtype, sharding=loss.sharding), _zeros(loss)))
 
 
 def booked(book: Book, fresh: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None,

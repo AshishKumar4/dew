@@ -197,7 +197,7 @@ def shapes_of(tree):
     """`tree`'s arrays or shapes as their shapes, dtypes, shardings and weak types, the layouts left the
     arrays' own, as a call over arrays of those shardings lowers (`collecting`)."""
     return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding,
-                                                          weak_type=getattr(leaf, "weak_type", False)), tree)
+                                                          weak_type=leaf.weak_type), tree)
 
 
 @contextlib.contextmanager
