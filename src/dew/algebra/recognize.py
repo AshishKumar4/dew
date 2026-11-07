@@ -95,28 +95,33 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int] = f
 def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int, ...]]],
                  accurate: bool) -> fusion.Written | None:
     """The first of an anchor's candidates whose call takes a kernel of Dew's and whose region the e-graph
-    proves computes it, written as its call; None where none is. Each region's candidates are weighed in one
-    e-graph (`_equalities`), built only once a candidate of it is weighed, so an anchor whose largest region
-    is its call's builds one; each decision fusion's (`fusion._decided`), held by its region's structure."""
-    regions: dict[tuple[int, ...], list[int]] = {}
-    for number, (_, places) in enumerate(spans):
-        regions.setdefault(places, []).append(number)
-    weighed: dict[tuple[int, ...], dict[int, bool]] = {}
+    proves computes it, written as its call; None where none is. Its regions are weighed in the order their
+    first candidates come, each once: which of its candidates is equal and taken (`_chosen`), decided by
+    fusion for its structure (`fusion._decided`), its candidates in one e-graph (`_equalities`) built only
+    where one of its calls takes a kernel."""
+    regions: dict[tuple[int, ...], list[Candidate]] = {}
+    for candidate, places in spans:
+        regions.setdefault(places, []).append(candidate)
+    for places, members in regions.items():
+        def decide(places=places, members=members) -> int | None:
+            return _chosen(index, places, members, accurate)
 
-    def equal(number: int) -> bool:
-        places = spans[number][1]
-        if places not in weighed:
-            members = [spans[member] for member in regions[places]]
-            weighed[places] = dict(zip(regions[places], _equalities(index, members, accurate), strict=True))
-        return weighed[places][number]
-
-    for number, (candidate, places) in enumerate(spans):
-        def decide(number=number, candidate=candidate) -> bool:
-            return candidate.taken() and equal(number)
-
-        if fusion._decided(jaxpr, places, candidate.operands, candidate.outputs, decide):
+        chosen = fusion._decided(jaxpr, places, fusion._read(jaxpr, places), members[0].outputs, decide)
+        if chosen is not None:
+            candidate = members[chosen]
             return fusion.Written(places, candidate.operands, candidate.outputs, places[-1], candidate.call)
     return None
+
+
+def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Candidate],
+            accurate: bool) -> int | None:
+    """The first of one region's candidates whose call takes a kernel and which the e-graph proves equal to
+    the region (`_equalities`, of the taken ones alone), its place among `members`; None where none is."""
+    taken = [number for number, candidate in enumerate(members) if candidate.taken()]
+    if not taken:
+        return None
+    equal = _equalities(index, [(members[number], places) for number in taken], accurate)
+    return next((number for number, same in zip(taken, equal, strict=True) if same), None)
 
 
 def _holds(equation: jcore.JaxprEqn, name: str) -> bool:
