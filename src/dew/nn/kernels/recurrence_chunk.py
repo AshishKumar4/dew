@@ -450,9 +450,11 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 row=INHERENT, kind='measured'),
     Requirement('backward', lambda case: case.product != 'training' or _trains(case.call),
                 "a gradient the template's fast backward does not take (`mainloop_backward."
-                "fast_backward_form`): fp32 operands under the accurate forms, an fp16 call without the "
-                "delta rule, a decay a key dimension without it; or launches past the device's registers or "
-                "shared memory at the call's tiles (`template.backward_holds`)", row='ledger 1294'),
+                "fast_backward_form`): fp32 operands in three bf16 parts (under the accurate forms, or "
+                "without the delta rule under either, `chunk_rounding`: their training the portable math's "
+                "until the template's fp32 backward, row 2076), an fp16 call without the delta rule, a decay "
+                "a key dimension without it; or launches past the device's registers or shared memory at the "
+                "call's tiles (`template.backward_holds`)", row='ledger 1294'),
     Requirement('precision', lambda case: exact_products(None, case.dtype),
                 "a dot algorithm the run declares that narrows the operands' products (TF32's, bf16 parts of "
                 "an fp32 product), which the template's whole products (its accurate parts, or a 16-bit "
