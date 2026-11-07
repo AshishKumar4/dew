@@ -1938,9 +1938,11 @@ class CausalTransformer(LinearProducts):
                 held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
             for name, run in tree.get('stages', {}).items():
                 layers = group_layers(name)
-                if layers is not None and layers.start == 0:
+                # A run that holds layer 0: a one-stage run its first group stacks, beside the leaves its
+                # stage-local state keeps on layer 0 itself (a frozen base joined in), or a pipeline's run
+                # where no layer 0 runs before it.
+                if layers is not None and layers.start == 0 and (stacked or 'layers_0' not in tree):
                     # The stage axis, a run's own layer axis; a periodic run's layer 0 at its first position.
-                    # Beside the leaves a stage-local state keeps on layer 0 itself (a frozen base joined in).
                     rows = 1 + (len(layers) > 1)
                     if run_period(self.scan_keys, 0, len(layers)) > 1:
                         run, rows = run['layers_0'], 2
