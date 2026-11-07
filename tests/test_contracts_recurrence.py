@@ -109,8 +109,8 @@ checkpoint`); a GPU's kernel carries none."""
 @pytest.mark.parametrize(("packed", "edge"), list(itertools.product((False, True), DELTA_RULE_EDGES)),
                          ids=lambda value: {False: "one sequence", True: "packed"}.get(value, value))
 def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
-    """`recurrence_chunk.chunk_delta_rule` (the portable rule's custom derivative through
-    `generation.linear_tangent`, rows 1861 and 1862): every order runs, its boolean document starts a
+    """`recurrence_chunk.xla_mainloop` (the recurrence template's plain-JAX mainloop, the portable route, its
+    derivatives the derived forms' rules, `dew.algebra.scan`): every order runs, its boolean document starts a
     residual with no tangent space, and each is finite wherever float64 is a normal float32 and JAX's own
     derivatives of the token recurrence are (`recurrent_delta_rule`, an independent formula of the same
     rule, in float64 the truth too: the chunk's own float64 run excused its float32 NaNs wherever it was NaN
@@ -133,7 +133,9 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
 
     def rule(query, key, value, g, beta):
-        return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=16, starts=starts)[0]
+        return recurrence_chunk.xla_mainloop(recurrence_chunk.Tiles(16), query, key, value, g[..., 0], beta,
+                                             None, starts, scale=width ** -0.5, delta=True,
+                                             dtype=jnp.float32)[0]
 
     def recurrence(query, key, value, g, beta):
         return recurrence_chunk.recurrent_delta_rule(query, key, value, g, beta, starts=starts)[0]

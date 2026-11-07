@@ -17,7 +17,7 @@ binomials; documents reset on chunks' first and last tokens; and saturated gates
 Mamba's step through softplus at 30), and pre-activations spread over [-20, 20], which keep gates near 0 and 1
 apart; a memory fading over a long sequence, whose output falls far below its scale; and a steep decay every
 eighth token between mild ones, whose pairs after it are differences of large, nearly equal prefixes. Each
-runs the portable math (`recurrence_chunk.chunk`'s `chunk_delta_rule`) forward and through its gradient
+runs the portable math (`recurrence_chunk.chunk`'s `xla_mainloop`) forward and through its gradient
 (`reference_error.with_gradients`, each seed's cotangents drawn with its operands), held to the recurrence's
 by check 1; a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. The
 template's Mosaic path, the default on a GPU, takes the same sites and regimes in

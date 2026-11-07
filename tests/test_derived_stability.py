@@ -9,10 +9,10 @@ suites' own families and the edges each pass found:
   hook empties beside a value product past fp32's largest, a query no span reaches beside one, keys past a
   whole tile, a hook infinite or NaN at the keys it masks, values at fp32's and fp16's largest and least, each
   in every dtype the derived forms walk, finite wherever the reference is;
-- the recurrence's: the template suite's every site and regime (`test_recurrence_stability`), its output and
-  final memory finite wherever float64's are and on par with the token-by-token recurrence's (check 1), and
-  the decays' edges both ways (none, every token vanishing, a live decay then a vanishing one, the reverse),
-  each through its value, its gradient and its gradient's tangent (every order the derived forms hold).
+- the recurrence's: the decays' edges both ways (none, every token vanishing, a live decay then a vanishing
+  one, the reverse), each through its value, its gradient and its gradient's tangent (every order the derived
+  forms hold); the template suite's every site and regime is the portable route's own suite's
+  (`test_recurrence_stability`, the plain-JAX mainloop's).
 
 A drawn input's check 1 is each derived form's own suite's (tests/test_attention_derived.py,
 tests/test_algebra_derive.py, tests/test_algebra_scan.py); the families here are adversarial, where the fast
@@ -149,25 +149,6 @@ def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(nam
         assert np.isfinite(np.asarray(ours, np.float32))[finite].all(), f"{name} {dtype} {leaf}"
 
 
-RECURRENCE_CASES = [pytest.param(name, regime, id=f"{name}-{regime}")
-                    for name in recurrence_suite.SITES for regime in recurrence_suite.REGIMES]
-
-
-@pytest.mark.parametrize(("name", "regime"), RECURRENCE_CASES)
-def test_the_derived_chunk_stays_finite_and_exact_on_every_regime(name, regime):
-    """The portable math's derived chunk forms (`recurrence_chunk.xla_mainloop`) under the template suite's
-    regime: output and final memory finite wherever float64's are, and on par with the token-by-token
-    recurrence's (check 1)."""
-    hooks = recurrence_suite.SITES[name]
-    seeds = recurrence_suite.SEEDS[name, regime]
-    with derived():
-        recurrence_suite.assert_finite_and_on_par(
-            functools.partial(chunk_on, "derived", hooks, chunk_size=recurrence_suite.CHUNK),
-            functools.partial(token_by_token, hooks),
-            functools.partial(recurrence_suite.stressed, hooks, regime),
-            f"the derived chunk, {name} under {regime}", seeds=seeds, finite_seeds=seeds)
-
-
 DECAY_EDGES = {"no decay": [0.0] * 4, "every token vanishing": [-(2.0 ** 127)] * 4,
                "live then vanishing": [-100.0, -(2.0 ** 127), -1.0, -(2.0 ** 127)],
                "vanishing then live": [-(2.0 ** 127), -(2.0 ** 70), -1.0, -0.5]}
@@ -206,7 +187,7 @@ def test_the_derived_chunk_holds_every_order_at_the_decays_edges(edge, name):
     with jax.enable_x64(new_val=True):
         exact = orders(functools.partial(token_by_token, hooks), *widened((operands, target)))
     with derived():
-        mine = orders(functools.partial(chunk_on, "derived", hooks, chunk_size=recurrence_suite.CHUNK),
+        mine = orders(functools.partial(chunk_on, "xla", hooks, chunk_size=recurrence_suite.CHUNK),
                       operands, target)
     for leaf, ours, theirs in zip(("value", "gradient", "tangent"), mine, exact, strict=True):
         # Finite where float64's is within the call's float32: a value past its range overflows as it must.

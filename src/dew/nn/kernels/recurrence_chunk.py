@@ -6,20 +6,19 @@ Per head, over a state `S` `[Dk, Dv]`, a token updates and reads
     S' = (I - delta beta k k^T) Gamma S + iota k v^T,    o = S'^T q (+ D v)
 
 as the decode step does (`recurrence.step`), its form the same `recurrence.Hooks`. Within a chunk of
-`C` tokens the dependencies resolve in matrix form: the decay between two positions is one
-exponential of their prefixes' difference (`recurrence_algebra.decays`), the delta rule's corrections
-one strictly lower inverse (`recurrence_algebra.factor`, fla's WY form), and only the memory crosses chunks
-(`xla_chunk_states`). Without the delta rule (`delta=False`, R = 0, Mamba2's SSD and the gated
-linear attentions) the inverse is the identity and nothing is corrected.
+`C` tokens the dependencies resolve in matrix form, the forms derived from the token update
+(`dew.algebra.scan`: the decays between positions, the delta rule's corrections one strictly lower inverse,
+fla's WY form), and only the memory crosses chunks. Without the delta rule (`delta=False`, R = 0, Mamba2's
+SSD and the gated linear attentions) the inverse is the identity and nothing is corrected.
 
-The portable math in XLA (`chunk_delta_rule`) computes every hook: Dew's float32 reference and the
-CPU path. Kernels take the rest, by what each takes and in order, no GPU named: the delta rule with one
-decay a head or one per key dimension runs on the recurrence template (`template.mosaic_rule`) where its
-launches take the call and the cell is not a declared port cell (`PORT_CELLS`), else on the port of fla
-0.5.2's kernels (`fla_rule`, `fla_gdn` and `fla_kda`) on any GPU Dew's Triton kernels run on
-(`GATED_DELTA`); without the delta rule, a rated decay (Mamba2's SSD) runs on the port of mamba_ssm's
-kernels (`dew.nn.kernels.mamba_ssd`) on such a GPU, or on a TPU's Pallas scan (`dew.nn.kernels.ssd`)
-(`SCAN`). `chunk` picks one per call and applies the hooks around it.
+The recurrence template's plain-JAX mainloop (`xla_mainloop`, those forms in XLA) computes every hook: Dew's
+float32 reference and the CPU path. Kernels take the rest, by what each takes and in order, no GPU named: the
+delta rule with one decay a head or one per key dimension runs on the recurrence template
+(`template.mosaic_rule`) where its launches take the call and the cell is not a declared port cell
+(`PORT_CELLS`), else on the port of fla 0.5.2's kernels (`fla_rule`, `fla_gdn` and `fla_kda`) on any GPU Dew's
+Triton kernels run on (`GATED_DELTA`); without the delta rule, a rated decay (Mamba2's SSD) runs on the port
+of mamba_ssm's kernels (`dew.nn.kernels.mamba_ssd`) on such a GPU, or on a TPU's Pallas scan
+(`dew.nn.kernels.ssd`) (`SCAN`). `chunk` picks one per call and applies the hooks around it.
 """
 
 import contextlib
@@ -28,7 +27,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import NamedTuple, Protocol
+from typing import Protocol
 
 import jax
 import jax.numpy as jnp
@@ -38,7 +37,7 @@ from jax.sharding import PartitionSpec as P
 from dew.algebra.scan import RESET_DECAY
 from dew.batch import document_firsts
 from dew.nn.attention_masks import repeat_kv_heads
-from dew.nn.derivatives import KernelGlue, Protected, contracted
+from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import at_least_fp32, l2norm
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
@@ -55,11 +54,6 @@ CHUNK_SIZE = 64
 recurrent form agree at any size; the size only trades memory for
 parallelism, and 64 is what the reference's kernels assume."""
 
-ADJOINT_CHUNKS = 16
-"""Chunks replayed at once in the portable backward: bounded groups keep a token span's memories
-from growing with the sequence, while every group's rows and heads run in parallel."""
-
-
 def held_chunk(chunk_size: int, key_width: int) -> int:
     """The delta rule's chunk at `key_width`: `chunk_size`, at most twice the keys' width. A measured
     sizing policy, not a conditioning bound: over a long sequence (1024 tokens, the decay near one),
@@ -69,398 +63,6 @@ def held_chunk(chunk_size: int, key_width: int) -> int:
     sequence)."""
     return min(chunk_size, 2 * key_width)
 
-
-def xla_chunk_states(key, k_cumdecay, out_vals, grown, last_decay, state, kept, *, last_token=None,
-                     delta: bool = True):
-    """The memory crossing chunks, the one sequential part of the chunked
-    rule, as a `lax.scan` over the algebra's `carry`: per chunk the reference's corrected values
-    `v_new = value - k_cumdecay @ S` and its write `S * exp(gc[-1]) +
-    (k * exp(gc[-1] - gc))^T @ v_new` (modeling_qwen3_next.py:439-446).
-
-    Operands are per chunk in the reference's layout, `[B, H, NC, C, ...]`,
-    `grown` `[B, H, NC, C, D]` being the decay from each chunk's start, `exp(gc)` of the log decay
-    cumulated within it (`recurrence_algebra.decays`),
-    D one for a decay per head or Dk for one per key dimension (KDA's, whose
-    rows of S decay apart, modeling_glm5_next.py:529-532), and `state`
-    `[B, H, Dk, Dv]` enters the first chunk. Returns the state each chunk
-    entered `[B, H, NC, Dk, Dv]`, each chunk's corrected values
-    `[B, H, NC, C, Dv]` and the state leaving the last chunk.
-
-    The write weighs each token by `last_decay` `[B, H, NC, C, D]`, the last
-    row of the chunk's pairwise decay (`recurrence_algebra.decays`' `exp(gc[-1] - gc)`):
-    its exponent compensated as every pair's is, where the prefix's rounded
-    half alone put a long chunk's write off by its whole sum's rounding, and
-    zero for every token of a packed chunk's earlier documents, which the
-    write does not keep. `kept` `[B, 1, NC, 1, 1]` marks the chunks no
-    document starts in, the only ones the memory they entered passes through
-    (`Chunked`).
-
-    With `last_token`, these operands describe the prefix through the penultimate real token
-    (`_peeled_chunk_inputs`); the last real token runs through `peeled_carry` afterwards. The
-    corrected values still cover every token, so the chunk's readout is unchanged.
-    """
-    carry = algebra.carry if last_token is None else functools.partial(algebra.peeled_carry, delta=delta)
-    operands = key, k_cumdecay, out_vals, grown, last_decay, kept, *(last_token or ())
-    final, (entered, corrected) = jax.lax.scan(
-        carry, state, tuple(jnp.moveaxis(x, 2, 0) for x in operands))
-    return jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2), final
-
-
-class Chunked(NamedTuple):
-    """A sequence's chunks as the algebra takes them, `[B, H, NC, C, ...]` in the working precision: the
-    scaled queries, the keys, the decay from each chunk's start `grown` (`recurrence_algebra.decays`), the
-    pairs' decay, the queries' and the write's decay from the memory entered `entering` (`grown`, zero
-    outside the entered document), the
-    write's products `W` and `U` (`recurrence_algebra.apply`), the decay's last row `last` (zero outside
-    the chunk's last document) and `kept` `[B, 1, NC, 1, 1]` (one where the memory entered passes
-    through), with `padding` the tokens the last chunk was padded with."""
-    query: jax.Array
-    key: jax.Array
-    grown: jax.Array
-    pairs: jax.Array
-    entering: jax.Array
-    w: jax.Array
-    u: jax.Array
-    last: jax.Array
-    kept: jax.Array
-    padding: int
-
-
-def chunked(query, key, value, g, beta, chunk_size: int = CHUNK_SIZE, *, starts=None, delta: bool = True,
-            scale: float | None = None) -> Chunked:
-    """`chunk_delta_rule`'s operands as each chunk's algebra (`Chunked`): what `carry` and `readout` read,
-    and what `transition` composes. Within a chunk each document's decays are its own, `entering` is zero
-    outside the document the memory entering belongs to and `last` outside the chunk's last document, so
-    a chunk's transition keeps the memory entering only where `kept`."""
-    work = at_least_fp32(jnp.result_type(query, key, value))
-    query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
-    B, S, H, Dk = key.shape
-    pad = (chunk_size - S % chunk_size) % chunk_size
-    query, key, value, g = (jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0))) for x in (query, key, value, g))
-    beta = jnp.pad(beta, ((0, 0), (0, pad), (0, 0)))
-    T = S + pad
-    query = query * (Dk ** -0.5 if scale is None else scale)
-
-    def chunks(x):  # [B, S, H, ...] -> [B, H, NC, C, ...], the reference's layout
-        moved = jnp.moveaxis(x, 2, 1)  # [B, H, S, ...]
-        return moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
-
-    q_c, k_c = chunks(query), chunks(key)
-    kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
-    document = first = None
-    kept = jnp.ones((1, 1, T // chunk_size, 1, 1), work)
-    if starts is not None:
-        # Each token's document within its row, per chunk, [B, 1, NC, C, 1], and the document the
-        # memory each chunk enters belongs to: its first token's, unless that token starts one.
-        begins = jnp.pad(jnp.asarray(starts, jnp.int32), ((0, 0), (0, pad)))
-        document = jnp.cumsum(begins, axis=1).reshape(B, 1, T // chunk_size, chunk_size, 1)
-        entered_document = document[..., :1, :] - begins.reshape(document.shape)[..., :1, :]
-        first = document == entered_document
-        kept = (document[..., -1:, :] == entered_document).astype(work)
-    # The decay from each chunk's start, exp of the reference's `g = g.cumsum(dim=-1)`
-    # (modeling_qwen3_next.py:417), and the decay `exp(gc[s] - gc[t])` between positions s >= t, zero
-    # above the diagonal: [B, H, NC, C, D], [B, H, NC, C, C, D].
-    grown, pairs = algebra.decays(chunks(g), document)
-    entering = grown if first is None else grown * first
-    # The reference's `attn + I` operator after its row correction loop; without the delta rule nothing
-    # is corrected, and each token writes its gated value.
-    inverse = algebra.factor(algebra.intra(k_c, kb_c, pairs)) if delta else None
-    w, u = algebra.apply(inverse, kb_c, vb_c, entering)
-    return Chunked(q_c, k_c, grown, pairs, entering, w, u, pairs[..., -1, :, :], kept, pad)
-
-
-def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *, starts=None,
-                     delta: bool = True, scale: float | None = None, dtype=None):
-    """The chunked delta rule over [B, S, H, D] operands with the log decay
-    `g` `[B, S, H, D]`, D one for a decay per head (the gated delta rule) or
-    Dk for one per key dimension (Kimi Delta Attention); returns
-    `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])`, the output in the
-    queries', keys' and values' common dtype and the memory in at least fp32,
-    as the port returns them (`fla_rule`), computed in at least fp32. The
-    references' sequential correction is the inverse `recurrence_algebra.factor`
-    builds from its diagonal blocks.
-
-    Only the memory crosses chunks, so only its recurrence runs chunk after
-    chunk (`xla_chunk_states`). Each chunk's output, the references'
-    `attn_inter + attn @ v_new`, reads the state that chunk entered and its
-    corrected values, so it is computed for every chunk at once after the
-    recurrence. The two decays differ only in how a pair of positions is
-    weighed (`recurrence_algebra.paired`). It is the portable math: a GPU runs the gated rule on
-    fla's kernels (`chunk_gated_delta_rule`), and this is their test oracle.
-
-    Without the `delta` rule (R = 0: Mamba2's SSD, the gated linear
-    attentions) nothing is corrected: the inverse is the identity and each
-    token writes `beta k v^T`, beta its write gate. The queries are scaled by
-    `scale` in the working precision, `Dk^-1/2` where None, and the output is
-    returned in `dtype` where one is given.
-
-    `starts` `[B, S]` marks packed documents' first tokens, each from a zero
-    memory: within a chunk each document's decays are its own (`recurrence_algebra.decays`),
-    a token reads the memory the chunk entered only in the document that
-    memory belongs to, and the chunk's write keeps only its last document's
-    tokens (the decay's last row is zero for the others), the memory it
-    entered passing through only where no document starts in it. A document
-    computes as it would alone.
-
-    The reverse rule erases before differentiating a token's decay, within independently replayed chunks
-    (`_chunk_delta_backward`). Differentiating the WY products instead cancelled independently
-    rounded paths through the inverse, pairwise decays and readout: under aligned keys their RMS
-    magnitudes summed to 16.2 times the resulting decay gradient on one draw. Over 40 draws its
-    fp32 error was 1.883 times the token recurrence's, and 2.941 at 128-wide keys with 64-token
-    chunks; regrouped it is 1.068 and 0.989. The vector decay's is 1.021, and the formed gates'
-    gate, log_a and bias 1.053, 1.038 and 1.023 over 320 draws. All arithmetic remains fp32.
-    Only the chunk boundaries couple across the sequence; bounded groups schedule each chunk's C-step
-    token scans, not one scan over the sequence's T. Forward mode takes the chunked math's own tangent
-    (`_portable_rule`), in any context.
-    """
-    dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
-    work = at_least_fp32(jnp.result_type(query, key, value))
-    B, _, H, Dk = key.shape
-    # A zero state like the values: inside a shard_map that checks varying axes the chunk loop's
-    # carry varies as the operands it takes in do, and under an Explicit axis its rows are placed as
-    # theirs are.
-    state = (rows_like(jnp.zeros_like(value, work, shape=(B, H, Dk, value.shape[-1])), value) if state is None
-             else state.astype(work))
-    query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
-    scale = Dk ** -0.5 if scale is None else scale
-    if query.shape[1] == 0:
-        return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
-    rule = _portable_rule(chunk_size, delta, scale, jnp.dtype(dtype))
-    return rule(query, key, value, g, beta, state, starts)
-
-
-def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
-    """The chunked readout and peeled memory write, and the operands their reverse rule keeps."""
-    B, S, H, _ = key.shape
-    Dv = value.shape[-1]
-    steps = chunked(query, key, value, g, beta, chunk_size, starts=starts, delta=delta, scale=scale)
-    T = S + steps.padding
-    # XLA:CPU workaround, on a CPU alone (row 1701), kept because a CPU user's
-    # results are wrong without it (bible §5): under a jitted scan over the
-    # layers the chunk loop's zero initial state came back with other values in
-    # most processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical
-    # modules). Without it a scanned GLM-5-Next's whole output is NaN at base
-    # 93ab9f5f3 (test_layer_stack, probe a079ff009). The barrier materializes
-    # the zero. Remove it when XLA:CPU no longer returns an uninitialized scan
-    # carry here.
-    if generation.placed_platform() == 'cpu':
-        state = jax.lax.optimization_barrier(state)
-    grown, last, kept, last_token = _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size)
-    entered, v_corrected, state = xla_chunk_states(
-        steps.key, steps.w, steps.u, grown, last, state, kept, last_token=last_token, delta=delta)
-    # The pairs are zero above the diagonal, so this is the reference's inclusive
-    # lower `masked_fill(triu(1), 0)`.
-    core = algebra.readout(steps.query, steps.entering, entered, steps.key, steps.pairs, v_corrected)
-    # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
-    core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
-    return (core.astype(dtype), state), (steps, entered)
-
-
-def _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
-    """The chunked primal with its ordinary tangent, used by forward-mode callers."""
-    return _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)[0]
-
-
-def _chunk_rows(x, chunk_size: int):
-    """`[B, S, H, ...]` as `[B, H, NC, C, ...]`, padded with exact zero tokens."""
-    B, S, H = x.shape[:3]
-    pad = (chunk_size - S % chunk_size) % chunk_size
-    x = jnp.pad(x, [(0, 0), (0, pad)] + [(0, 0)] * (x.ndim - 2))
-    return jnp.moveaxis(x, 2, 1).reshape(B, H, -1, chunk_size, *x.shape[3:])
-
-
-def _chunk_sequence(x, length: int):
-    """`[B, H, NC, C, ...]` back to `[B, S, H, ...]`, removing the padding."""
-    B, H, chunks, width = x.shape[:4]
-    return jnp.moveaxis(x.reshape(B, H, chunks * width, *x.shape[4:]), 1, 2)[:, :length]
-
-
-def _chunk_token(x, positions):
-    """One token per chunk of `[B, H, NC, C, ...]`, its local position `[NC]`, without its C axis."""
-    index = positions.reshape(1, 1, -1, 1, *((1,) * (x.ndim - 4)))
-    index = jnp.broadcast_to(index, (*x.shape[:3], 1, *x.shape[4:]))
-    return jnp.take_along_axis(x, index, axis=3)[:, :, :, 0]
-
-
-def _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size):
-    """The prefix's decay row and kept flag, and the last real token of every chunk.
-
-    The ragged last chunk peels its last unpadded token. An empty prefix has unit decay, no
-    writes and passes its entered memory on; a reset on the peeled token then drops it there.
-    Prefix `kept` sees only starts before the peeled token, while its pairwise decay row
-    already excludes previous documents. Thus a document starting on the boundary belongs to
-    the final token, not the WY prefix."""
-    count = steps.key.shape[2]
-    final = jnp.minimum(chunk_size, value.shape[1] - jnp.arange(count) * chunk_size) - 1
-    penultimate = jnp.maximum(final - 1, 0)
-    nonempty = final[None, None, :, None] > 0
-    grown = jnp.where(nonempty, _chunk_token(steps.grown, penultimate), 1.0)[..., None, :]
-    last = jnp.where(nonempty[..., None], _chunk_token(steps.pairs, penultimate), 0.0)
-    if starts is None:
-        kept = jnp.ones((1, 1, count, 1, 1), value.dtype)
-        reset = jnp.zeros(steps.key.shape[:3], bool)
-    else:
-        begins = jnp.broadcast_to(jnp.asarray(starts, bool)[..., None], value.shape[:3])
-        begins = _chunk_rows(begins, chunk_size)
-        prefix = jnp.arange(chunk_size)[None, None, None, :] < final[None, None, :, None]
-        kept = (~jnp.any(begins & prefix, axis=-1))[..., None, None].astype(value.dtype)
-        reset = _chunk_token(begins, final)
-    key = _chunk_token(steps.key, final)
-    value, g, beta = (_chunk_token(_chunk_rows(x, chunk_size), final) for x in (value, g, beta))
-    return grown, last, kept, (key, value, g, beta, reset)
-
-
-def _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
-    """`_kept_residual`'s, or where the block's remat rung recomputes the delta rule's memory (`RECOMPUTED`,
-    'delta_memory') the operands alone, the backward computing the memory and what it derives again, as the
-    port and the template drop theirs: `(out, (kept, operands))`, one of them None."""
-    if recomputed_memory():
-        out = _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
-        return out, (None, (query, key, value, g, beta, state, starts))
-    out, kept = _kept_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
-    return out, (kept, None)
-
-
-def _kept_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
-    """Keep chunk boundaries and the readout's memory-gradient operands, not per-token memories."""
-    out, (steps, entered) = _chunk_delta_forward(
-        query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
-    grown, last, kept, last_token = _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size)
-    transition, _ = algebra.peeled_transition(
-        steps.key, steps.w, steps.u, grown, last, kept, last_token, delta=delta)
-    scores = algebra.paired("scores", steps.query, steps.key, steps.pairs)
-    resets = (jnp.zeros(value.shape[:2], bool) if starts is None else jnp.asarray(starts, bool))
-    resets = _chunk_rows(jnp.broadcast_to(resets[..., None], value.shape[:3]), chunk_size)
-    residual = (steps.query, steps.key, *(_chunk_rows(x, chunk_size) for x in (value, g, beta)),
-                resets, entered, transition, steps.query * steps.entering, steps.w, scores)
-    return out, residual
-
-
-def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
-    """The token adjoint within independently replayed chunks; only their memory cotangents cross
-    boundaries. Replay C tokens from each entered memory, derive their terminal cotangents from
-    `readout_entered_gradient` and the transitions, then reverse C tokens. Replaying keeps a token's
-    erasure beside its decay, rather than cancelling separately rounded WY derivatives afterwards.
-    Checkpoint every SUB tokens, then replay one span at a time inside the reverse scan. Groups of
-    ADJOINT_CHUNKS bound the live span and checkpoints independently of the sequence's length.
-    Replays and adjoints preserve the token recurrence's arithmetic and order. Where the forward kept
-    its operands alone (`_chunk_delta_residual`), the rest is computed again first."""
-    kept, operands = residual
-    if kept is None:
-        query, key, value, g, beta, state, starts = operands
-        _, kept = _kept_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
-    del chunk_size, dtype
-    query, key, value, g, beta, resets, entered, transition, decayed_query, weights, scores = kept
-    cotangent, final_cotangent = cotangent
-    length = cotangent.shape[1]
-    cotangent = _chunk_rows(cotangent.astype(query.dtype), query.shape[3])
-    tokens = query, key, value, g, beta, resets
-
-    width = query.shape[3]
-    span_width = min(algebra.SUB, width)
-    spans = (width + span_width - 1) // span_width
-
-    def span_major(x):
-        x = jnp.moveaxis(x, 3, 0)
-        x = jnp.pad(x, [(0, spans * span_width - width)] + [(0, 0)] * (x.ndim - 1))
-        return x.reshape(spans, span_width, *x.shape[1:])
-
-    def token(state, query, key, value, g, beta, reset):
-        state = jnp.where(reset[..., None, None], 0.0, state)
-        # A decay a head broadcast over the keys before the update, as the token-by-token recurrence's
-        # (`recurrence._gates`): its gradient then sums each key's paths first, where a `[..., 1]` decay's
-        # took one reduction over every key and value, 3.3 times the recurrence's distance from float64
-        # (test_recurrence_mosaic_gradient's ragged fp32 case, after the gate compiled both arms without
-        # YNNPACK's fusions).
-        decay = jnp.broadcast_to(jnp.exp(g), key.shape)
-        return recurrence.update(state, query, key, value, decay, beta[..., None], delta=delta)
-
-    def replay(state, inputs):
-        _, final = token(state, *inputs)
-        return final, state
-
-    def checkpoint(state, inputs):
-        final, _ = jax.lax.scan(replay, state, inputs)
-        return final, state
-
-    source = algebra.readout_entered_gradient(decayed_query, weights, scores, cotangent)
-
-    def across(state_gradient, inputs):
-        transition, source = inputs
-        initial = algebra.portable("compose", jnp.swapaxes(transition, -1, -2), state_gradient) + source
-        return initial, state_gradient
-
-    _, terminal = jax.lax.scan(across, final_cotangent, (jnp.moveaxis(transition, 2, 0),
-                                                        jnp.moveaxis(source, 2, 0)), reverse=True)
-    terminal = jnp.moveaxis(terminal, 0, 2)
-
-    def adjoint(state_gradient, inputs):
-        state, out_gradient, query, key, value, g, beta, reset = inputs
-        _, pull = jax.vjp(lambda state, q, k, v, g, beta: token(state, q, k, v, g, beta, reset),
-                          state, query, key, value, g, beta)
-        state_gradient, *gradients = pull((out_gradient, state_gradient))
-        return state_gradient, tuple(gradients)
-
-    def reverse_span(state_gradient, inputs):
-        checkpoint, out_gradient, *tokens = inputs
-        _, before = jax.lax.scan(replay, checkpoint, tuple(tokens))
-        return jax.lax.scan(adjoint, state_gradient, (before, out_gradient, *tokens), reverse=True)
-
-    def within(inputs):
-        entered, terminal, cotangent, *tokens = inputs
-        span_tokens = tuple(map(span_major, tokens))
-        _, checkpoints = jax.lax.scan(checkpoint, entered, span_tokens)
-        initial, gradients = jax.lax.scan(
-            reverse_span, terminal, (checkpoints, span_major(cotangent), *span_tokens), reverse=True)
-
-        def rows(x):
-            return jnp.moveaxis(x.reshape(spans * span_width, *x.shape[2:])[:width], 0, 3)
-
-        return initial, tuple(map(rows, gradients))
-
-    count = entered.shape[2]
-    group_width = min(ADJOINT_CHUNKS, count)
-    groups = (count + group_width - 1) // group_width
-
-    def grouped(x):
-        padding = [(0, 0)] * x.ndim
-        padding[2] = (0, groups * group_width - count)
-        x = jnp.pad(x, padding)
-        return jnp.moveaxis(x.reshape(*x.shape[:2], groups, group_width, *x.shape[3:]), 2, 0)
-
-    def ungrouped(x):
-        x = jnp.moveaxis(x, 0, 2)
-        return x.reshape(*x.shape[:2], groups * group_width, *x.shape[4:])[:, :, :count]
-
-    initial, gradients = jax.lax.map(
-        within, tuple(map(grouped, (entered, terminal, cotangent, *tokens))))
-    dq, dk, dv, dg, dbeta = (_chunk_sequence(ungrouped(x), length) for x in gradients)
-    return dq * scale, dk, dv, dg, dbeta, ungrouped(initial)[:, :, 0], None
-
-
-@functools.cache
-def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype) -> Callable:
-    """The portable rule over `(query, key, value, g, beta, state, starts)` differentiated at every order
-    (`generation.linear_tangent`): reverse mode runs its reverse rule (`_chunk_delta_residual`,
-    `_chunk_delta_backward`), forward mode (`jax.jvp`, `jax.linearize`) the chunked math's own tangent,
-    in any context: a custom VJP alone refused a plain `jax.jvp` outside the attention's forward-mode
-    context (row 1834)."""
-    def forward(query, key, value, g, beta, state, starts):
-        return _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale,
-                                     dtype)
-
-    def backward(saved, operands, cotangent):
-        # Every operand's cotangent, as the portable rule's pullback gives them (`linear_tangent` checks the
-        # trees agree): `starts` has no tangent space, its cotangent float0's zero, or none without it.
-        starts = operands[6]
-        cotangents = _chunk_delta_backward(chunk_size, delta, scale, dtype, saved, cotangent)[:6]
-        return (*cotangents, None if starts is None else jax.custom_derivatives.zero_from_primal(starts))
-
-    def portable(query, key, value, g, beta, state, starts):
-        return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
-
-    return contracted("test_the_chunked_delta_rule_holds_every_order")(
-        generation.linear_tangent(forward, backward, portable, kind=Protected()))
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
@@ -475,8 +77,8 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
 
     Its kernels (`GATED_DELTA`: the recurrence template, or fla 0.5.2's
     chunked rule on Dew's port of its kernels, `fla_rule`, on fla's numbers)
-    take it where they take these operands; elsewhere the portable math
-    (`chunk_delta_rule`), in `chunk_size` chunks, which the kernels' 64 need
+    take it where they take these operands; elsewhere the plain-JAX mainloop
+    (`xla_mainloop`), in `chunk_size` chunks, which the kernels' 64 need
     not match: the rule's value does not depend on them. Each takes the
     operands as they come, which a layer rounds for the route it asks of
     them first (`kernel_routed`: the projections' dtype for a kernel, as
@@ -540,7 +142,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     template, or the port of fla's kernels, `fla_rule`); without the delta rule, a rated decay (Mamba2's
     SSD) runs on the kernel the scan's selector gives each product (`SCAN`: the recurrence template, the port
     of mamba_ssm's kernels, or a TPU's Pallas scan where its tiling covers the geometry); else on the
-    portable math (`chunk_delta_rule`, in `chunk_size` chunks, the delta rule's no longer than `held_chunk`,
+    portable math (`xla_mainloop`, in `chunk_size` chunks, the delta rule's no longer than `held_chunk`,
     which a kernel's need not match), which `generation.chosen` names for either selector ('xla').
     Packed documents (`starts`, at most `max_segments` a row) each compute as they would alone. A conv
     runs before the op: it takes the conv's output. The operands the hooks read are checked as the
@@ -603,16 +205,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
                                 scale=scale, wide=epilogue, firsts=firsts)
-            if kernel == 'derived':
-                # The portable math's forms derived from the token update, where a call names them.
-                return xla_mainloop(Tiles(chunk_size), query, key, value, g, beta, state, starts, scale=scale,
-                                    delta=hooks.delta, dtype=work, bound=hooks.inverse_bound)
-            group = value.shape[2] // key.shape[2]
-            if group > 1:
-                query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
             size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-            return chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state, size,
-                                    starts=starts, delta=hooks.delta, scale=scale, dtype=work)
+            return xla_mainloop(Tiles(size), query, key, value, g, beta, state, starts, scale=scale,
+                                delta=hooks.delta, dtype=work, bound=hooks.inverse_bound)
 
         out, final = _per_product(product_kernel, run, query, key, value, g, beta, state, starts, firsts)
         out = recurrence.skipped(hooks, out.astype(work), value, given, work)
@@ -848,15 +443,12 @@ MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
 GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
-                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True),
-                                Kernel('derived', (), generic=True)),
+                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
                                declared=PORT_CELLS)
 """The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
 recurrence template at its derived tiles, else the port on any GPU Dew's Triton kernels run on, else the
-portable math (`chunk_delta_rule`). The portable math's forms derived from the token update
-(`xla_mainloop`) run where a call names them (`generation.chosen(gated_delta_rule='derived')`), until they
-match the hand forms in check 1 at the edges, in every derivative order and in time."""
+template's plain-JAX mainloop (`xla_mainloop`), the forms derived from the token update."""
 
 
 RESET = "first"
@@ -997,7 +589,7 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     except KernelRefused as refusal:
         training = functools.partial(_refusing, refusal)
     else:
-        if forward == trained and forward in ('xla', 'derived'):
+        if forward == trained == 'xla':
             return run(forward, *operands)
         training = functools.partial(run, trained)
     primal = functools.partial(run, forward)
@@ -1233,7 +825,7 @@ def _padded(x, axis: int, size: int):
 def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None):
     """One token at a time, the decode path, in at least fp32 as a lax.scan over
     the time axis so the state rides the scan the way it rides the decode cache,
-    returned as the chunked rule returns them (`chunk_delta_rule`).
+    returned as the chunked rule returns them (`xla_mainloop`).
 
     `g` is the log decay per key dimension, `[B, S, H, Dk]`, which is
     `recurrent_kimi_delta_attention` (modeling_glm5_next.py:428-478). The
@@ -1324,11 +916,8 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
                 out, final = _ssd_tpu(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
                                       starts, scan_case(x, B, chunk_size, padded=True).tpu, work)
             return out[..., :head_dim], jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
-        group = heads // key.shape[2]
-        if group > 1:
-            query, key = (jnp.repeat(t, group, axis=2) for t in (query, key))
-        out, final = chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size, starts=starts,
-                                      delta=False, scale=1.0, dtype=work)
+        out, final = xla_mainloop(Tiles(chunk_size), query, key, value, g, beta, state, starts, scale=1.0,
+                                  delta=False, dtype=work)
         return recurrence.skipped(hooks, out, value, {'skip': skip}, work), final
 
     return _per_product(product_kernel, run, query, key, value, g, beta, rate, skip, state, starts, firsts)

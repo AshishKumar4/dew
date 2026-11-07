@@ -66,7 +66,7 @@ def test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference(source):
     `assert_as_exact_over_orders`. Dew's RMS over them is 0.95 of the
     reference's on CPU, 0.73 on an AVX-512 CPU (Intel SDE's Ice Lake server,
     the CI runners' ISA) and 0.56 on an RTX 4080. The gradient through the
-    KDA decays is where `recurrence_algebra.decays`' compensated sums matter."""
+    KDA decays is where the derived forms' compensated sums (`dew.algebra.scan`) matter."""
     assert_update_as_exact(source, TINY)
 
 
