@@ -206,3 +206,38 @@ def test_an_nvfp4_bank_packs_its_nibbles_on_the_host_as_its_values():
     values = np.where(nibbles >= 8, -1.0, 1.0) * np.asarray(E2M1)[nibbles & 7]
     device = gemm.NvFp4.of(jnp.asarray(values, jnp.float32), jnp.asarray(scales), jnp.asarray(scale))
     np.testing.assert_array_equal(host.words, np.asarray(device.words))
+
+
+@pytest.mark.parametrize("kernel", ["packed", "xla"])
+def test_gemm_takes_an_nvfp4_bank_as_its_matrix(kernel):
+    """`gemm.gemm` of a bank of NVFP4 experts (row 4516: moe's projection seam, no branch of its own), its
+    bias epilogue on the fp32 sums before the one rounding, its rows gathered from the tokens and scattered
+    back by a permutation: bitwise the decoded bank's grouped product of the gathered rows plus the bias,
+    the rows put back by the permutation (small integers, every sum exact), through `kernel`; and refused
+    with a prologue."""
+    bank, values = nvfp4_bank(14, 4, 512, 128)
+    rng = np.random.default_rng(15)
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(60, 512)), jnp.float32)
+    table = jnp.asarray(rng.integers(0, 60, 136), jnp.int32)
+    slots = jnp.asarray(rng.permutation(136), jnp.int32)
+    sizes = np.asarray([40, 0, 72, 24])
+    bias = jnp.asarray(rng.integers(-2, 3, size=(4, 128)), jnp.float32)
+
+    def plus(acc, b):
+        return acc + b
+
+    with generation.assumed("sm90"), generation.chosen(nvfp4=kernel):
+        got = gemm.gemm(tokens, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32, gather=table,
+                        scatter=slots, epilogue=plus, epilogue_operands=((bias, ("groups", "columns")),),
+                        interpret_on_cpu=True)
+        with pytest.raises(ValueError):
+            gemm.gemm(tokens, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32,
+                      prologue=lambda x: x)
+    rows = np.asarray(tokens, np.float64)[np.asarray(table)]
+    starts = np.cumsum([0, *sizes])
+    truth = np.zeros((136, 128))
+    for group, (first, last) in enumerate(itertools.pairwise(starts)):
+        truth[first:last] = rows[first:last] @ values[group] + np.asarray(bias[group], np.float64)
+    placed = np.zeros_like(truth)
+    placed[np.asarray(slots)] = truth
+    np.testing.assert_array_equal(np.asarray(got, np.float64), placed)
