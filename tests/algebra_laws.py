@@ -41,6 +41,7 @@ from egglog import declarations
 from jax.extend import core as jcore
 
 from dew.algebra import SATURATION, derive, forms
+from dew.nn import programs
 
 LAWS = ("identity", "associative", "consistent", "declared")
 """The laws a certificate proves, in the order it proves them."""
@@ -329,8 +330,9 @@ _SAME = frozenset({"convert_element_type", "copy", "copy_p", "optimization_barri
 
 def _equation(equation, values) -> list:
     name, params = equation.primitive.name, equation.params
-    if name in ("pjit", "jit", "closed_call", "custom_jvp_call", "custom_vjp_call", "remat", "checkpoint"):
-        inner = params.get("jaxpr") or params.get("call_jaxpr") or params.get("fun_jaxpr")
+    # A call's program, read where every reader reads it (`dew.nn.programs.called`).
+    inner = programs.called(equation)
+    if inner is not None:
         closed = inner if isinstance(inner, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(inner, ())
         return evaluate(closed.jaxpr, closed.consts, values)
     if name in _SAME:

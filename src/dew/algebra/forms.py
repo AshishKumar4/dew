@@ -18,6 +18,7 @@ from jax.extend import core as jcore
 
 from dew._cache import DERIVED
 from dew.algebra import program, terms
+from dew.nn import programs
 from dew.nn.precision import float32_dot_general
 
 
@@ -202,8 +203,8 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
             default = branches[-1]
             operands = [read(atom) for atom in equation.invars[1:]]
             outs = evaluated_inline(default.jaxpr, default.consts, operands)
-        elif equation.primitive.name in ("jit", "pjit", "closed_call"):
-            called = equation.params.get("jaxpr") or equation.params["call_jaxpr"]
+        elif (called := programs.called(equation)) is not None and isinstance(called, jcore.ClosedJaxpr):
+            # A call's program (`dew.nn.programs.called`), its constants with it.
             outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])
         else:
             outs = bound(equation, map(read, equation.invars))

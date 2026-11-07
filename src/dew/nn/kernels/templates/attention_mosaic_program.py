@@ -43,7 +43,7 @@ from dew.nn.kernels.templates.attention import (
     whole,
 )
 from dew.nn.kernels.templates.cost import estimate
-from dew.nn.programs import CALLS, equations
+from dew.nn.programs import CALLS, called, equations
 
 QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
@@ -449,10 +449,11 @@ def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
         if not any(used):
             continue
         nested = list(jax_core.jaxprs_in_params(eqn.params))
-        # A call (a jitted helper's `jaxpr`, a custom derivative's `call_jaxpr`): its jaxpr's inputs its own.
-        called = ("jaxpr" in eqn.params or "call_jaxpr" in eqn.params) and len(nested) == 1
-        if called and len(nested[0].invars) == len(eqn.invars):
-            reads = _live_inputs(nested[0], used)
+        # A call (a jitted helper's, a custom derivative's primal): its jaxpr's inputs its own, read where
+        # every reader reads a call's program (`dew.nn.programs.called`).
+        body = called(eqn)
+        if body is not None:
+            reads = _live_inputs(body.jaxpr if isinstance(body, jax_core.ClosedJaxpr) else body, used)
         else:
             reads = [not nested] * len(eqn.invars)
         live.update(var for var, read in zip(eqn.invars, reads, strict=True)
