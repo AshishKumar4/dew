@@ -844,12 +844,13 @@ class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()) -> dict:
-        # A 64-row product reads a transposed operand as two halves of 32 rows, each whole tiles of its
-        # swizzle: past 32 elements a tile, 128 bytes of bf16, the keys' (64, 8) transposed tiling divides no
-        # half (Mosaic GPU's layout inference refused a 27B gated delta net's fp32 forward on a B200; row
-        # 4747's debugging at 0e5d3aa9df8: at 64 bytes it lowers and compiles).
+        # A 64-row product reads a transposed operand as two halves of 32 rows and splits its columns
+        # between two lane groups, each whole tiles of its swizzle: at 128 bytes the keys' (64, 8) transposed
+        # tiling divides no half (Mosaic GPU's layout inference refused a 27B gated delta net's fp32 forward
+        # on a B200; row 4747's debugging at 0e5d3aa9df8: at 64 bytes it lowers and compiles), and a 96-column
+        # operand's halves of 48 no 32-column tile (`right_swizzle`).
         capped = {name: min((swizzles or {}).get(name, resources.widest_swizzle(dtype, shape[-1])),
-                            32 * jnp.dtype(dtype).itemsize)
+                            mosaic.SWIZZLE_BYTES // 2, self.right_swizzle(dtype, shape[-1]))
                   for name, (shape, dtype) in blocks.items() if len(shape) == 2}
         return super().streams(blocks, stages, consumers, multicast, {**(swizzles or {}), **capped}, copies,
                                gathered)
