@@ -1979,27 +1979,6 @@ class Transport[Allocated, Opened](abc.ABC):
         interpreted, where the programs' order stands in for them (`tail.ordered`)."""
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
 
-    def ticketed(self, ready, ticket, body: Callable[[], None]) -> None:
-        """`body`, an add into global memory (`added`), in its turn among the programs adding there: once
-        `ticket` of them have signalled `ready` (one of `partials_ready`'s, counting the adds done), then its
-        writes complete and `ready` signalled, so the adds land in a fixed order (a deterministic sum,
-        FlashAttention 3's dQ semaphore); `body` alone where `ready` is None (interpreted, the programs'
-        order standing in)."""
-        if ready is None:
-            body()
-            return
-        # Wait without taking: the semaphore counts the adds done, each program's turn the count before it.
-        plgpu.semaphore_wait(ready, ticket, decrement=False, memory_scope="gpu")
-        body()
-        # Its writes complete in global memory before the next turn (`added_settled`).
-        self.added_settled()
-        plgpu.semaphore_signal(ready, 1, memory_scope="gpu")
-
-    @abc.abstractmethod
-    def added_settled(self) -> None:
-        """A program's adds into global memory complete (`added`), past any copy of its still in flight (a
-        TMA reduction's); a family that adds from its registers has none in flight."""
-
     def fixed_up(self, summed, partials, ready, program, first, gathered, store,
                  combine=operator.add, firsts=None) -> None:
         """A consumer's share of a tile that programs `first` to `gathered` (exclusive) each walk a part of
@@ -2398,10 +2377,6 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             smem[...] = piece
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(smem, place, reduction_op="add")
-
-    def added_settled(self) -> None:
-        # Its adds are TMA reductions (`added`), each in flight past its issue until waited.
-        plgpu.wait_smem_to_gmem(0)
 
 
 def arrived(counter, contributors) -> jax.Array:
