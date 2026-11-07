@@ -143,6 +143,20 @@ def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_
     assert ahead.starts
 
 
+def test_a_bfloat16_decoders_step_compiles_ahead_for_an_a100():
+    """A bfloat16 decoder's training step compiles ahead for an A100 (`compile_only_gpus("sm80")`): its
+    compile point keys each body's recognition by its equations' parameters, a derivative rule's trees among
+    them, which JAX holds unhashable (row 4783's head: "unhashable type: 'Unhashable'")."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2,
+                         dtype="bfloat16")
+    trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+                      mesh=MeshSpec().build(compile_only_gpus("sm80", 1)),
+                      layout=Layout(min_shard=TINY_SHARD))
+    assert compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30).starts
+
+
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
     """A compile-only GPU with stated memory takes the run's own fit search, whose one fitting
     program is the saved executable, not another compile outside the report. The report records
