@@ -1,0 +1,18 @@
+diff --git a/tests/kernel_liveness.py b/tests/kernel_liveness.py
+--- a/tests/kernel_liveness.py
++++ b/tests/kernel_liveness.py
+@@ -633,6 +633,13 @@ class _Pass:
+     def _streamed(self, op, name: str) -> bool:
+         if not _elementwise(op, name):
+             return False
++        # Atom lists are physical register views: extracts, inserts and tied MMA
++        # operands index them by the result's type. A deferred expression whose
++        # distinct dependencies exceed its output's words must materialize here;
++        # retaining their union grows every subsequent sum's accumulator set.
++        dependencies = {a for operand in op.operands
++                        for a in self.atoms.of.get(operand, ()) if a is not None}
++        if len(dependencies) > len(self._lanes(op.results[0].type)):
++            return False
+         if self.compiler is not None and not self.compiler.streams_transcendentals:
+             assembly = (ir.StringAttr(op.attributes["asm_string"]).value
+                         if "asm_string" in op.attributes else "")
