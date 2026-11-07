@@ -207,7 +207,9 @@ def test_a_bias_gradient_is_as_exact_however_its_positions_are_split(site):
     """A bias's gradient sums its cotangents over every position, and is as exact with the batch
     split over eight devices as on one: check 1 over the site's seeds, truth the cotangents' float64
     sum. A CPU sums each shard's in float64 and their total before it rounds (`precision.spread`);
-    a plain sum of each device's shard was 5.7 times as far from float64 (ledger 833)."""
+    a plain sum of each device's shard was 5.7 times as far from float64 (ledger 833). Under check 1's
+    stated fp32 sums each arm's is a product's fp32 sum, whatever XLA's CPU fusions sum a reduction by
+    (row 4520)."""
     layer, shape, seeds = SPLIT[site]
     variables = layer.init(jax.random.key(0), jnp.zeros(shape, jnp.float32))
     out = jax.eval_shape(layer.apply, variables, jnp.zeros(shape, jnp.float32)).shape
@@ -232,6 +234,20 @@ def test_a_bias_gradient_is_as_exact_however_its_positions_are_split(site):
         return {"bias": np.asarray(cotangent, np.float64).reshape(-1, out[-1]).sum(0)}
 
     assert_as_exact(split, alone, draw, f"{site} bias gradient", seeds=seeds, truth_fn=truth)
+
+
+def test_a_bias_over_no_positions_has_a_zero_gradient_under_fp32_sums():
+    """A Dense over an empty batch adds its bias to no position, and its gradient, a sum over none, is zero
+    under check 1's stated fp32 sums (`FP32_SUMS`), whose spread sums its positions in blocks (row 4520)
+    as it is without them."""
+    layer = Dense(3)
+    variables = layer.init(jax.random.key(0), jnp.zeros((2, 4), jnp.float32))
+    x = jnp.zeros((0, 4), jnp.float32)
+    for stated in (False, True):
+        with jax.default_matmul_precision(FP32_SUMS if stated else None):
+            grads = jax.jit(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, x))))(
+                variables["params"])
+        np.testing.assert_array_equal(np.asarray(grads["bias"]), np.zeros(3, np.float32))
 
 
 @pytest.mark.parametrize("layer", [
