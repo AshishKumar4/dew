@@ -534,6 +534,65 @@ def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets
     assert ran.returncode == 0, ran.stderr[-3000:]
 
 
+EVERY_TEMPLATE_AHEAD = """
+import json, sys
+sys.path[:0] = [f"{sys.argv[1]}/src", f"{sys.argv[1]}/tests"]
+import jax
+import optax
+from token_support import token_rows
+
+from dew.nn.kernels.generation import routes
+from dew.objectives.lm import LMObjective
+from dew.registry import models
+from dew.training import Layout, MeshSpec, Trainer
+from dew.training.ahead import compile_ahead, compile_only_gpus
+
+model = models.build(
+    "causal_transformer", vocab_size=512, emb_features=256, num_layers=2, num_heads=4, num_kv_heads=2,
+    head_dim=64, mlp_features=512, max_seq_len=256, dtype="bfloat16", attention_impl="template",
+    layer_types=("linear_attention", "attention"),
+    kinds={"attention": {}, "linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
+        "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 64,
+        "linear_value_head_dim": 64, "linear_conv_kernel_dim": 4}}}},
+    mixture={"experts": 4, "top_k": 2, "layers": (1,)})
+mesh = MeshSpec(fsdp=2).build(compile_only_gpus(sys.argv[2], 2))
+trainer = Trainer(LMObjective(model, 256), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
+                  layout=Layout(min_shard=256))
+with routes() as taken:
+    ahead = compile_ahead(trainer, token_rows(512, 4, 257), capacity=2**34)
+print(json.dumps({"substituted": list(ahead.substituted),
+                  "kernels": sorted({(route.choice, route.kernel) for route in taken})}))
+"""
+"""A hybrid MoE decoder whose step runs every template, compiled ahead for two compile-only GPUs of a
+generation, in a process of its own: its checkout and the generation are its arguments; it prints what the
+step substituted and every kernel its routes took."""
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90", "sm100"])
+def test_a_step_running_every_template_compiles_ahead_over_two_compile_only_gpus(generation):
+    """A bf16 hybrid decoder's training step, a gated delta net's layer beside attention and a routed
+    experts' feed-forward under RMS norms and SwiGLU, compiled ahead for two compile-only GPUs of
+    `generation` over an FSDP mesh: every template it runs (the attention template's mainloop, the gated
+    delta rule's Mosaic GPU recurrence, the grouped matmul's Mosaic GPU mainloop) derives, lowers and
+    compiles there with no kernel lowered in another's place. A derivation, a selector or a rewrite that
+    computes a constant eagerly under the step's mesh places it on devices that run nothing here and fails
+    the compile ("'Executable' has no 'local_devices'": the balanced tail's walk, 6be12fce5b1; the
+    algebra's masks, b520fda9c59). Its own process, as Mosaic compiles for one capability a process."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = str(Path(__file__).resolve().parents[1])
+    ran = subprocess.run([sys.executable, "-c", EVERY_TEMPLATE_AHEAD, root, generation], capture_output=True,
+                         text=True, timeout=1500, check=False)
+    assert ran.returncode == 0, ran.stderr[-3000:]
+    found = json.loads(ran.stdout.strip().splitlines()[-1])
+    assert not found["substituted"], found["substituted"]
+    kernels = {tuple(kernel) for kernel in found["kernels"]}
+    assert {("attention", "template"), ("gated_delta_rule", "mosaic_gpu"),
+            ("grouped_matmul", "mosaic_gpu")} <= kernels, kernels
+
+
 @pytest.mark.parametrize("implementation", ["auto", "template"])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_runs(generation,
