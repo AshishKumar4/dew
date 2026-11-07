@@ -14,7 +14,8 @@ IN holds each draw's `<draw>.param.<path>` by its '/'-joined path in FlaxDiff's 
 order, concatenated (`answered`). The float64 walk runs a second copy of the same files with every
 `jnp.float32` and `np.float32` reading float64 (FlaxDiff pins its Fourier input, time input, RoPE and sincos
 tables, output heads and UNet attention to float32), under `jax.enable_x64`, but the Fourier frequencies,
-which FlaxDiff draws as a float32 normal and the float64 copy draws so too, widened: the model's constant.
+which FlaxDiff draws as a float32 normal: the float64 copy reads the float32 copy's, the model's constant
+(`fourier_table`).
 Every one of those is a dtype (a cast, a default, an initializer's dtype) but one comparison, common.py's
 weight-standardized convolution taking `eps = 1e-5 if self.dtype == jnp.float32 else 1e-3`: each walk
 compares against its own dtype, so the branch stays the same (and no case here builds that convolution).
@@ -35,6 +36,7 @@ from collections.abc import Iterator
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flaxdiff_family_cases import CASES
 from reference_source import github
@@ -56,8 +58,20 @@ FILES = {
     "video_dit": "cecd0c05fa53f2078cf5dc7fcc5e55232be3cc9bb722de43429997616d377bac",
     "unet_3d": "ec1323014ec4cedcccac84c7dfe6af46a1dbed9bb1fd8a5a9493a4063916ea6a",
 }
-FOURIER = "(self.features // 2, ), dtype=jnp.float64)"
-"""common.py's Fourier draw as the float64 copy reads it, which draws in float32 and widens instead."""
+FOURIER = ("jax.random.normal(jax.random.PRNGKey(42), (self.features // 2, ), dtype=jnp.float64) "
+           "* self.scale")
+"""common.py's Fourier frequencies as the float64 copy reads them, which take the float32 copy's instead
+(`fourier_table`)."""
+
+
+@functools.cache
+def fourier_table(features: int, scale: float) -> np.ndarray:
+    """The Fourier frequencies FlaxDiff's float32 model draws for `features` at `scale`, the model's constant:
+    drawn with JAX's float64 off, as the float32 run draws them (under float64 a float32 normal draw rounds
+    otherwise, a float32 ulp of its scale apart)."""
+    with jax.enable_x64(new_val=False):
+        embedding = flaxdiff(wide=False)["common"].FourierEmbedding(features=features, scale=scale)
+        return np.asarray(embedding.bind({}).freqs, np.float64)
 
 
 def flaxdiff(wide: bool) -> dict[str, types.ModuleType]:
@@ -75,11 +89,12 @@ def flaxdiff(wide: bool) -> dict[str, types.ModuleType]:
         source = local.read_text()
         if wide:
             source = source.replace("jnp.float32", "jnp.float64").replace("np.float32", "np.float64")
-            source = source.replace(FOURIER, "(self.features // 2, ), dtype=jnp.float32).astype(jnp.float64)")
+            source = source.replace(FOURIER, "FOURIER_TABLE(self.features, self.scale)")
         name = f"flaxdiff.models.{stem}"
         module = types.ModuleType(name)
         module.__package__, module.__file__ = "flaxdiff.models", str(local)
         sys.modules[name] = module
+        module.FOURIER_TABLE = fourier_table
         exec(compile(source, str(local), "exec"), module.__dict__)
         setattr(sys.modules["flaxdiff.models"], stem, module)
         modules[stem] = module

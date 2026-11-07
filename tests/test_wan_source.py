@@ -92,15 +92,20 @@ def transformer_draw(arrays, name):
 
 def source_model(source, name):
     """Diffusers' `WanTransformer3DModel` of case `name`, in float32 and its float64 twin."""
-    import torch
     from diffusers import WanTransformer3DModel
+    from safetensors.torch import load_file
 
     from tools.torch_precision import float64_twin
 
-    # The variant's checkpoint stores no affine weight for its query and key norms, which this Diffusers
-    # models as ones: built in full, they start at ones rather than unloaded.
-    narrow = WanTransformer3DModel.from_pretrained(source / name / "transformer", torch_dtype=torch.float32,
-                                                   local_files_only=True, low_cpu_mem_usage=False).eval()
+    # Built from its config, then its file loaded: the variant's checkpoint, saved by Diffusers 0.34, stores
+    # no affine weight for its query and key norms, which this Diffusers holds as weights at their init,
+    # ones, the same function; every other tensor loads.
+    directory = source / name / "transformer"
+    narrow = WanTransformer3DModel.from_config(WanTransformer3DModel.load_config(directory)).eval()
+    loaded = narrow.load_state_dict(load_file(directory / "diffusion_pytorch_model.safetensors"),
+                                    strict=False)
+    assert not loaded.unexpected_keys
+    assert all(key.endswith(("norm_q.weight", "norm_k.weight")) for key in loaded.missing_keys), loaded
     return narrow, float64_twin(narrow)
 
 
