@@ -563,42 +563,18 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         block_groups = image_groups = None
     if sliding_window is None:
         places = None
-    spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
-               "key_runs": key_runs,
-               "places": places}
-    if any(x is not None for x in spanned.values()) and shards > 1:
-        # Only a single device's template reads groups, key validity and places; across sequence shards the
-        # call's spans are the mask they mean, its causality, window, documents, key lengths and starts among
-        # them. On one device a route other than the template's takes them so (`_attention_kernel`).
-        mask = visibility_mask(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
-                               key_value_seq_lengths, key_value_seq_starts, **spanned)
-        causal, sliding_window, segment_ids, block_groups, image_groups = False, None, None, None, None
-        key_value_seq_lengths = key_value_seq_starts = key_valid = key_runs = places = None
-        implementation = kernel_for_materialized_mask(
-            implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
-    if (isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
-            and shards > 1):
-        # Only a single device's kernels read documents aligned to their last keys; elsewhere they
-        # are the mask they mean.
-        aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
-        mask = aligned if mask is None else jnp.logical_and(aligned, mask)
-        causal, sliding_window, segment_ids = False, None, None
-    if key_value_seq_starts is not None and shards > 1:
-        # Only a single device's decode kernel reads starts; elsewhere they are the mask they mean.
-        mask = with_key_starts(mask, key_value_seq_starts, key.shape[-3])
-        key_value_seq_starts = None
+    if shards > 1:
+        spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
+                   "key_runs": key_runs, "places": places}
+        causal, sliding_window, mask, key_value_seq_lengths, materialized = _sequence_sharded(
+            query.shape[-3], key.shape[-3], causal=causal, sliding_window=sliding_window, mask=mask,
+            segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts,
+            spanned=spanned)
+        if materialized:
+            implementation = kernel_for_materialized_mask(
+                implementation, query, key, dtype=dtype, precision=precision,
+                force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     words = template.dropout_seed(dropout_rng) if dropping else None
-    if shards > 1 and segment_ids is not None:
-        # The exchanges split an explicit mask along the sequence and have no
-        # split for the ids, so the documents travel as the mask they stand
-        # for, with causality and the window folded in beside them.
-        mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window,
-                                       with_documents(mask, segment_ids))
-        causal, sliding_window, segment_ids = False, None, None
-        implementation = kernel_for_materialized_mask(
-            implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
@@ -715,32 +691,40 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     elif implementation == 'flash':
         out = flash_attention(query, key, value, causal, sliding_window, sinks, segment_ids, max_segments)
     elif implementation == 'decode':
-        starts = key_value_seq_starts
+        # The keys' lengths and starts are the callbacks' operands, not their closure: a closed-over integer
+        # tracer stayed in a nested derivative's call as a constant no lowering takes (a paged decode's
+        # forward over reverse, M-DD-13b: "No constant handler for type DynamicJaxprTracer").
+        rest = {name: x for name, x in (("starts", key_value_seq_starts), ("sinks", sinks)) if x is not None}
 
-        def decoded(query, key, value, *sunk):
+        def decoded(query, key, value, lengths, *given):
+            held = dict(zip(rest, given, strict=True))
+
             # A Pallas call has no partitioning rule: each shard decodes its own rows and heads.
             def attend(query, key, value, lengths, starts=None, sinks=None):
                 return decode_attention.attend(query, key, value, lengths, starts, softcap=softcap,
                                                sinks=sinks)
 
             rows = ("activation_batch",)
-            return on_attention_shards(attend, query, key, value, lengths=(key_value_seq_lengths, rows),
-                              starts=(starts, rows), sinks=(sunk[0] if sunk else None, ("activation_heads",)))
+            return on_attention_shards(attend, query, key, value, lengths=(lengths, rows),
+                                       starts=(held.get("starts"), rows),
+                                       sinks=(held.get("sinks"), ("activation_heads",)))
 
-        def folded(query, key, value, *sunk):
-            visible = with_key_starts(with_key_lengths(None, key_value_seq_lengths, key.shape[-3]), starts,
+        def folded(query, key, value, lengths, *given):
+            held = dict(zip(rest, given, strict=True))
+            visible = with_key_starts(with_key_lengths(None, lengths, key.shape[-3]), held.get("starts"),
                                       key.shape[-3])
-            if not sunk and softcap is None:
+            if "sinks" not in held and softcap is None:
                 return folded_attention(query, key, value, visible)
             # The folded form has neither; the reference path computes both over the same keys.
-            return reference_attention(query, key, value, mask=visible, sinks=sunk[0] if sunk else None,
+            return reference_attention(query, key, value, mask=visible, sinks=held.get("sinks"),
                                        softcap=softcap)
 
         # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
         # sinks among its operands, at the kernel's arithmetic: IEEE products for fp32 operands
         # (`decode_attention`), its 16-bit products summed in fp32 otherwise.
-        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]),
-                                     precision="highest" if query.dtype == jnp.float32 else None)
+        kernel_precision = "highest" if query.dtype == jnp.float32 else None
+        out = forward_differentiable(decoded, folded, query, key, value, key_value_seq_lengths,
+                                     *rest.values(), precision=kernel_precision)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.
@@ -1127,6 +1111,33 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
         # it, a decode choice `chosen` names overriding both.
         return select(DECODE, case, preference=('decode', 'xla', 'reference'))
     return select(DECODE, case, {'auto': None, 'cudnn': 'cudnn'}[implementation])
+
+
+def _sequence_sharded(queries: int, keys: int, *, causal, sliding_window, mask, segment_ids, lengths, starts,
+                      spanned: dict):
+    """A call's visibility as the sequence exchange takes it (`sequence_parallel_attention`: its causality, a
+    window, a mask and key lengths alone): a single device's template reads block groups, key validity,
+    runs and places, and its kernels documents aligned to their last keys and the keys' starts; across
+    sequence shards each is the mask it means, its causality, window, documents, key lengths and starts
+    among them where `spanned` holds any (`visibility_mask`). The exchanges split an explicit mask along the
+    sequence and have no split for the ids, so the documents travel as the mask they stand for, causality
+    and the window folded in beside them. Returns the causality, window, mask and key lengths it takes, and
+    whether it materialized a mask its kernel must take (`kernel_for_materialized_mask`)."""
+    if any(x is not None for x in spanned.values()):
+        mask = visibility_mask(queries, keys, causal, sliding_window, mask, segment_ids, lengths, starts,
+                               **spanned)
+        return False, None, mask, None, True
+    if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None):
+        aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
+        mask = aligned if mask is None else jnp.logical_and(aligned, mask)
+        causal, sliding_window, segment_ids = False, None, None
+    if starts is not None:
+        mask = with_key_starts(mask, starts, keys)
+    if segment_ids is not None:
+        documents = with_documents(mask, segment_ids)
+        mask = combined_attention_mask(queries, keys, causal, sliding_window, documents)
+        return False, None, mask, lengths, True
+    return causal, sliding_window, mask, lengths, False
 
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,

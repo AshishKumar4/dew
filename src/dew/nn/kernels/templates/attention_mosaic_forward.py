@@ -78,6 +78,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     query_swizzle,
     reducing,
     refused,
+    scopes_products,
     score_places,
     stagings,
     stated,
@@ -128,6 +129,17 @@ def _stores_through_query(family: mosaic.Family, width: int, value_width: int, d
     family's 8-row tiles 32 bytes wide refuse the store ladder's rungs of fewer rows, FS-4324-DIAG1: "slice
     size (4) ... divisible by the tile size (8)" on an A100)."""
     return (value_width == width and out_dtype in (None, jnp.dtype(dtype)) and query_swizzle(family) is None)
+
+
+def forward_products(tiles: Tiles, value_width: int, dtype, *, peaks: bool = False, parts: int = 1) -> tuple:
+    """A forward program's products as its scope takes its issuer's scratch (`Family.scoped`'s `products`):
+    each consumer's logits, a key tile wide, and, but a peak walk's, its weighted values, the values' width,
+    whose left operand, the weights a key tile deep in the values' dtype (an fp32 call's bf16 parts), is a
+    register value (`Issuer.register_products`)."""
+    if peaks:
+        return (tiles.consumers, (tiles.block_k,), ())
+    return (tiles.consumers, (tiles.block_k, value_width),
+            ((tiles.block_k, jnp.bfloat16 if parts > 1 else dtype),))
 
 
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
@@ -1700,10 +1712,10 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
     """A forward launch's kernel entry (`_launched`'s): its `body` in its scoped allocations and rings, where
     a masked launch walks it alone (`_walked_program`: else its program loads and writes nothing; its
     `walk_rows` the walks' granule, which a masked launch states)."""
-    scoped, rings = allocations
+    scoped, rings, products = allocations
 
     def scoped_body():
-        program.family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
+        program.family.scoped(functools.partial(body, *refs), *scoped, streams=rings, products=products)
 
     walks = layout.read(refs).walks
     if walks is None:
@@ -1814,9 +1826,15 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         def producer():
             family.stream(streams, views, *streamed)
 
-        family.roles(consumers, consumer, producer)
+        # A family that keeps its products' accumulators in the program's scratch, a role's own share
+        # (`Issuer.product_scratch`: tcgen05's chunks'), takes each consumer built at its static role.
+        family.roles(consumers, (functools.partial(mosaic.per_role, roles=consumers,
+                                                    run=lambda role, index: consumer(index))
+                                 if scopes_products(family) else consumer), producer)
 
-    entry = functools.partial(_entry, program, layout, body, (scoped, rings), column_blocks=column_blocks,
+    products = forward_products(tiles, value_width, query.dtype, peaks=peaks, parts=parts)
+    entry = functools.partial(_entry, program, layout, body, (scoped, rings, products),
+                              column_blocks=column_blocks,
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by)

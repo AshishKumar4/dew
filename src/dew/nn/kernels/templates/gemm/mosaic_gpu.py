@@ -589,7 +589,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                       transpose_lhs=transpose_lhs, depth=k2, width=n)
     _gmm_refused(rhs, tiles, (rows, k, matrices, k2, n), dense=dense, first=first, paired=paired)
     _tables_refused(gather, scatter, tiles, family_of(tiles, lhs.dtype), prologue=prologue, dense=dense,
-                    transpose_lhs=transpose_lhs, block_scaled=mx_scales is not None)
+                    transpose_lhs=transpose_lhs)
     rows = rows if gather is None else gather.shape[0]
     accumulators = 1 if paired is None else 2
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
@@ -995,7 +995,9 @@ def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: 
 def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs: bool, plain: bool) -> None:
     """Dew: `gmm`'s refusal of a block-scaled product (`mx_scales`: the rows' and the matrices' scales, one
     every block of depths, `block_format`'s, tiled as `tcgen05.scales_layout` lays them out, `[rows / 128,
-    scale tiles, 32, 16]` and `[groups, width / 128, scale tiles, 32, 16]`; FP8 or E2M1 rows times a K-major
+    scale tiles, 32, 16]` and `[groups, width / 128, scale tiles, 32, 16]`, the rows' in the product's row
+    order, a gathered product's its tokens' at the table (the caller's gather, `gemm._block_scaled`, row
+    4851); FP8 or E2M1 rows times a K-major
     matrix of theirs, each block of each scaled in the products, `mosaic.Issuer.scaled_products`) it does
     not take: but on a family whose
     products take block scales, its matrix K-major, with no hook, pair, packed matrix, step scales,
@@ -1080,15 +1082,13 @@ def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, den
 
 
 def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
-                    transpose_lhs: bool, block_scaled: bool = False) -> None:
+                    transpose_lhs: bool) -> None:
     """Dew: `gmm`'s refusal of a gathered product (`gather`) but on a family that gathers rows
-    (`Family.gathers_rows`), of no prologue, transposed rows, dense call or block scales (`mx_scales`,
-    whose rows' scales its loads read in the rows' order, not gathered: tcgen05's bundle gathers), and of a
-    scattered one (`scatter`) but a grouped call's on such a family (its stores `mosaic.staged_rows`')."""
-    if gather is not None and (prologue is not None or dense or transpose_lhs or block_scaled
-                               or not family.gathers_rows):
+    (`Family.gathers_rows`), of no prologue, transposed rows or dense call, and of a scattered one
+    (`scatter`) but a grouped call's on such a family (its stores `mosaic.staged_rows`')."""
+    if gather is not None and (prologue is not None or dense or transpose_lhs or not family.gathers_rows):
         raise ValueError(f"a gathered product's rows are a ring family's gather, with no prologue, "
-                         f"transposed rows, dense call or block scales, not {tiles}'s")
+                         f"transposed rows or dense call, not {tiles}'s")
     if scatter is not None and (dense or not family.gathers_rows):
         raise ValueError(f"scattered rows are a grouped call's on a ring family, not {tiles}'s")
 

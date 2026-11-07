@@ -1290,6 +1290,21 @@ def test_the_forward_on_three_consumers_holds_check_1_interpreted(call, training
                    value_width=64, tiles=tiles, training=training)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training):
+    """The forward and the training forward on a B200's tcgen05 chunks (`mosaic_sm100.CHUNKS`: consumers of
+    64 rows, three a program for the forward and two for the training forward, whose registers three do
+    not hold, each product into its scoped tensor memory and read back into registers, the weights staged
+    into the issuer's tile for the values' product), under the interpreter, which models tensor memory: on
+    par with the reference (check 1)."""
+    consumers = 3 if training == template.Kept.NONE else 2
+    tiles = attention_mosaic.Tiles(64, 64, 2, consumers, family="tcgen05.chunks")
+    _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=64,
+                   value_width=64, tiles=tiles, training=training, target=generation.gpu_target("sm100"))
+
+
 @pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
 @pytest.mark.parametrize("consumers", [2, 3])
 def test_the_forwards_schedule_holds_every_property_in_every_interleaving(consumers, training):
@@ -1957,11 +1972,15 @@ FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for gener
 FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
 FORWARD_GATE += [(generation_name, width, training, "none", jnp.float16) for generation_name in GATED
                  for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)]
+FORWARD_GATE += [("sm100", width, training, "none", jnp.bfloat16) for width in (64, 128)
+                 for training in (template.Kept.NONE, template.Kept.SPLIT)]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
 split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set
 beside the walk's), a softcap's inference forward 256 wide (Gemma's), all in bf16, and fp16's inference and
-training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes)."""
+training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes); and a B200's
+bf16 forwards on tcgen05's chunks (products into scoped tensor memory, read back into registers, the
+weights staged for the values' product: the Blackwell fold's H1)."""
 
 
 @COMPILES_ON_CPU
