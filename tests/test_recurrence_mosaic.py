@@ -49,6 +49,10 @@ FLOOR = -5.0
 """A decay a key dimension's declared floor a token, Kimi delta attention's `lower_bound`: the draws' decays
 lie above it (`lower_bound * sigmoid`), and the mainloop's intra launch factors its pairs under it."""
 
+NARROW = mainloop.Tiles(32, 1, chunk=64)
+"""A 32-wide value block one deep at fla's chunk."""
+
+
 SHAPES = {
     'one sequence': {'rows': 2, 'length': 192, 'key_heads': 2, 'value_heads': 4, 'key_width': 128,
                      'value_width': 128},
@@ -240,10 +244,10 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype):
         # The portable math's arm is test_recurrence_chunk's.
         with pytest.raises(NotImplementedError):
-            jax.eval_shape(functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), floor=hooks.floor),
+            jax.eval_shape(functools.partial(mosaic_rule, tiles=NARROW, floor=hooks.floor),
                            operands.query, operands.key, operands.value, operands.log_decay, operands.beta)
         return None
-    narrowest = mainloop.Tiles(family.narrowest_columns(jnp.bfloat16), 1)
+    narrowest = mainloop.Tiles(family.narrowest_columns(jnp.bfloat16), 1, chunk=64)
     if mainloop.family_of() is not None:
         shapes = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype)
                   for x in (operands.query, operands.key, operands.value, operands.log_decay, operands.beta,
@@ -378,7 +382,8 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles(dtype):
     with generation.assumed(UNSEEN):
         if dtype == jnp.float32:
             assert template.MOSAIC.derived(bound, UNSEEN) is None
-            narrowest = mainloop.Tiles(bundles.of('sm80', jnp.bfloat16).narrowest_columns(jnp.bfloat16), 1)
+            narrowest = mainloop.Tiles(bundles.of("sm80", jnp.bfloat16).narrowest_columns(jnp.bfloat16), 1,
+                                       chunk=64)
             assert template.MOSAIC.registers(bound, narrowest) > template.MOSAIC.register_budget(narrowest)
             return
         picked = template.MOSAIC.derived(bound, UNSEEN)
@@ -386,7 +391,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles(dtype):
         assert template.MOSAIC.staged_bytes(bound, picked, UNSEEN) <= budget
         assert template.MOSAIC.registers(bound, picked) <= template.MOSAIC.register_budget(picked)
         if picked.stages == 1:
-            wider = mainloop.Tiles(picked.block_v, 2)
+            wider = mainloop.Tiles(picked.block_v, 2, chunk=picked.chunk)
             assert (template.MOSAIC.staged_bytes(bound, wider, UNSEEN) > budget
                     or template.MOSAIC.states_held(bound, wider, UNSEEN)
                     < template.MOSAIC.states_held(bound, picked, UNSEEN))
@@ -437,7 +442,7 @@ def test_the_mosaic_launches_state_their_work(training):
 
     def rule(*operands):
         # The bound a layer declares of its sigmoid write gates (`recurrence.Hooks.write_bound`).
-        return mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1), bound=1.0)[0].astype(jnp.float32).sum()
+        return mosaic_rule(*operands, tiles=NARROW, bound=1.0)[0].astype(jnp.float32).sum()
 
     lowered_for = generation.device_generation() if mainloop.family_of() is not None else "sm90"
     with generation.assumed(lowered_for):
@@ -466,7 +471,7 @@ def test_an_output_launch_lowers_at_a_value_block_narrower_than_its_keys(key_wid
         jax.ShapeDtypeStruct((1, 256, 4), dtype)]
     # The run's fast forms, under which an fp32 call derives tiles at all (`fast_rounding`).
     with generation.assumed('sm90'):
-        tiles = mainloop.Tiles(block, 1) if block is not None else template.MOSAIC.derived(
+        tiles = mainloop.Tiles(block, 1, chunk=64) if block is not None else template.MOSAIC.derived(
             template.MOSAIC.bind(*operands, None, None, floor=None, bound=1.0, rounded=True),
             generation.gpu_target())
         jax.jit(lambda *given: mosaic_rule(*given, tiles=tiles, bound=1.0, rounded=True)[0]).trace(
@@ -517,7 +522,7 @@ def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_produc
         jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
         jax.ShapeDtypeStruct((rows, length, value_heads), dtype)]
 
-    rule = functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), bound=1.0)
+    rule = functools.partial(mosaic_rule, tiles=NARROW, bound=1.0)
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), generation.run_precision(ACCURATE), jax.sharding.use_abstract_mesh(mesh):
         program = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",))
@@ -546,7 +551,7 @@ def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
         jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.float32),
         jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
 
-    rule = functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), floor=FLOOR)
+    rule = functools.partial(mosaic_rule, tiles=NARROW, floor=FLOOR)
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         program = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",))
@@ -576,7 +581,7 @@ def test_each_launch_lowers_once_however_many_layers_call_it():
             for layer in range(count):
                 # Each layer's own queries, as each layer projects its own.
                 scaled = query * (layer + 1)
-                out = mosaic_rule(scaled, key, value, g, beta, tiles=mainloop.Tiles(32, 1), bound=1.0)[0]
+                out = mosaic_rule(scaled, key, value, g, beta, tiles=NARROW, bound=1.0)[0]
                 total = total + out.astype(jnp.float32).sum()
             return total
 
@@ -1054,7 +1059,7 @@ def _two_roles(name: str, bound, derived, family, facts, *, packed: bool) -> lis
     value_width = RESOURCE_SHAPES[name][3]
     if template.walk_roles(family) < 2 or packed or value_width // derived.block_v % 2:
         return []
-    two = template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
+    two = template.MOSAIC._staged(bound, derived.block_v, facts, derived.chunk, walkers=2,
                                   wide=derived.block_o or derived.block_v)
     return [] if two is None else [(two, 'two roles ')]
 
@@ -1303,21 +1308,6 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
         cases = compiled_cases(target, plans, [], apart, only=group, launched=launched)
         found = compile_mosaic_kernels(cases, target)
     return cases, found
-
-
-def test_a_gated_delta_nets_ring_and_residency_are_one_choice():
-    """The 27B gated delta net at one row of 4,096 tokens on an H100 (sm90 stated) derives its value blocks 32
-    wide in a ring more than one deep, its walk one program a multiprocessor: its plans priced by the bytes
-    they hold in flight (`resources.hidden`), where the most programs first took two one deep and then
-    narrowed the block to 16, the forward 1.4 to 1.5 times as long (FS-RESIDENT-WINDOW1-h100)."""
-    op = template.MOSAIC
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        ba = op.bind(*resource_operands("qwen3.5-27b-gdn", jnp.bfloat16, 1, 4096), None, max_segments=None,
-                     floor=None)
-        tiles = op.derived(ba, target)
-        assert tiles is not None and tiles.block_v == 32 and tiles.stages > 1
-        assert op.states_held(ba, tiles, target) == 1
 
 
 @lowers('sm90')

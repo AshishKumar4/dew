@@ -20,7 +20,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import tuning
+from dew.nn.kernels import short_conv, tuning
 from dew.nn.kernels.templates import mosaic, scan
 
 TOKENS = 64
@@ -120,10 +120,7 @@ class _Piece:
         return [_kept(theirs == document, value) for value, theirs in read]
 
     def preactivation(self, window):
-        total = window[0] * self.taps[0]
-        for inputs, tap in zip(window[1:], self.taps[1:], strict=True):
-            total = total + inputs * tap
-        return total if self.bias is None else total + self.bias
+        return short_conv.preactivation(window, self.taps, self.bias)
 
 
 def _named(kernel: str, first: int, width: int) -> str:

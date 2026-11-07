@@ -233,9 +233,10 @@ def conv_pieces(convolved, parts, dtype):
 def _stream_order(valid):
     """Each slot's index among its row's real tokens (`cumsum(valid) - 1`)
     and, per compact column, the physical slot it holds. A column past the
-    row's real tokens holds `length`, the zero column `_masked_conv1d` appends,
-    so it gathers a zero and its cotangent lands there, never on a real slot;
-    every real token writes its own column, so no two writers meet."""
+    row's real tokens holds `length`, past the row, so it gathers a zero
+    (`_masked_conv1d`'s fill) and its cotangent's scatter drops, never landing
+    on a real slot; every real token writes its own column, so no two writers
+    meet."""
     length = valid.shape[1]
     order, counts = valid_order(valid)
     rank = prefix_sum(jnp.asarray(valid, bool), dtype=jnp.int32) - 1
@@ -633,11 +634,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
         state = rows_like(jnp.zeros((batch, width, channels), x.dtype), x)
     valid = jnp.asarray(valid, bool)
     rank, source = _stream_order(valid)
-    # Gathered in bounds from one appended zero row: an out-of-range 'fill'
-    # gather differentiates into a scatter-add whose dropped index XLA's
-    # deterministic GPU scatter writes onto the next channel (openxla/xla#49380).
-    padded = jnp.pad(x, ((0, 0), (0, 1), (0, 0)))
-    compact = jnp.take_along_axis(padded, source[:, :, None], axis=1, mode='promise_in_bounds')
+    compact = jnp.take_along_axis(x, source[:, :, None], axis=1, mode='fill', fill_value=0)
     stream = jnp.concatenate([state, compact], axis=1)
     # The K-1 stream rows from the row's token count on are the history it leaves.
     rows = (rank[:, -1] + 1)[:, None] + jnp.arange(width)[None, :]

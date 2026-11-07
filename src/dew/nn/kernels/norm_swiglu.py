@@ -512,7 +512,7 @@ def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: boo
 
 def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean_square_ref, *,
                  row_block: int, epsilon: float, offset: bool, stored, after_cast: bool,
-                 inverse_rounded: bool, activation: str, interpret: bool):
+                 inverse_rounded: bool, activation: str, weight_first: bool, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     row = pl.program_id(0) * row_block + jnp.arange(row_block)
@@ -534,7 +534,7 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean
                      weight=weight, gate=gate, activation=activation,
                      rounded=functools.partial(_round, dtype=y_ref.dtype, interpret=interpret)
                      if after_cast and weight is not None
-                     else None)
+                     else None, weight_first=weight_first)
     plgpu.store(y_ref.at[at], y.astype(y_ref.dtype), mask=mask)
     plgpu.store(mean_square_ref.at[row], mean_square, mask=row < rows)
 
@@ -705,6 +705,9 @@ class _Norm(NamedTuple):
     activation: str
     interpret: bool
     inverse_rounded: bool = False
+    weight_first: bool = False
+    """The weight folded into the inverse before the rows (`precision.rms_weighted`'s, Flax's association):
+    the forward's one multiply's order; the reverse's math is the same."""
 
 
 @tuning.lowered_once(('kernel', 'name', 'outputs', 'grid', 'warps', 'interpret', 'arithmetic'))
@@ -735,7 +738,8 @@ class RmsForward(tuning.KernelOp):
 
     def _fwd(self, x: jax.Array, branch: jax.Array | None, scale: jax.Array | None, gate: jax.Array | None, *,
              epsilon: float, dtype: str, offset: bool, stored: str, after_cast: bool, activation: str,
-             interpret: bool, inverse_rounded: bool, config: RowsConfig, return_residuals: bool = False):
+             interpret: bool, inverse_rounded: bool, weight_first: bool, config: RowsConfig,
+             return_residuals: bool = False):
         rows, width = x.shape
         return _launched(
             x, branch, scale, gate, kernel=_rms_forward, name="rms_norm_forward",
@@ -746,7 +750,8 @@ class RmsForward(tuning.KernelOp):
             warps=config.warps, interpret=interpret, arithmetic=(
                 ('row_block', config.rows), ('epsilon', epsilon), ('offset', offset),
                 ('stored', jnp.dtype(stored)), ('after_cast', after_cast),
-                ('inverse_rounded', inverse_rounded), ('activation', activation)),
+                ('inverse_rounded', inverse_rounded), ('activation', activation),
+                ('weight_first', weight_first)),
         ), None
 
     def _get_heuristics_config(self, ba) -> RowsConfig:
@@ -852,7 +857,7 @@ def _stored(portable, norm: _Norm, at: int):
 
 
 def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after_cast: bool, portable, *,
-                    axes=None):
+                    axes=None, weight_first: bool = False):
     """The pre-norm seam fused: `(stream, y)`, the stream `x + branch` and its RMSNorm, `portable(x, branch,
     scale)` its arithmetic in XLA. The forward reads both addends once and writes the sum beside the norm;
     the reverse takes the stream's own cotangent into the norm's pass, so the sum of the two gradients is
@@ -862,11 +867,12 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
     interprets where no Triton GPU runs it (`generation.triton_runs`), as the CPU suite calls it, and
     lowers for the assumed GPU within `generation.assumed`, as the GDN kernels decide. Every order of
     derivative goes through `portable` and each level's value through the kernels
-    (`generation.linear_tangent`)."""
+    (`generation.linear_tangent`). `weight_first` folds the weight into the inverse before the rows
+    (`_Norm.weight_first`)."""
     if branch is None:
         return x, rms_norm(x, scale, epsilon, dtype, offset, after_cast,
-                           lambda x, scale: portable(x, None, scale)[1], axes=axes)
-    norm = _norm(epsilon, dtype, offset, after_cast, scale)
+                           lambda x, scale: portable(x, None, scale)[1], axes=axes, weight_first=weight_first)
+    norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(weight_first=weight_first)
 
     def forward(x, branch, scale):
         outputs, mean_square = _rms_with_mean_square(x, branch, scale, None, norm)
@@ -885,11 +891,12 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
 
 
 def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, portable, *, axes=None,
-             inverse_rounded: bool = False):
+             inverse_rounded: bool = False, weight_first: bool = False):
     """The fused RMSNorm alone, `portable(x, scale)` its arithmetic in XLA, differentiated as
     `stream_rms_norm` is. With `inverse_rounded` the inverse RMS rounds to `dtype` before it
-    multiplies, as `unweighted_rmsnorm` rounds it."""
-    norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(inverse_rounded=inverse_rounded)
+    multiplies, as `unweighted_rmsnorm` rounds it; `weight_first` as `stream_rms_norm`'s."""
+    norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(inverse_rounded=inverse_rounded,
+                                                                     weight_first=weight_first)
 
     def forward(x, scale):
         (_, y), mean_square = _rms_with_mean_square(x, None, scale, None, norm)
