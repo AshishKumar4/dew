@@ -234,14 +234,16 @@ def _computed(record: JSON) -> JSON:
     built in a run's dtype is the computation its family writes (row 4776's review)."""
     from dew.interop.hf_decoders import NUMERICS_FIELDS
 
-    if isinstance(record, Mapping):
-        if isinstance(record.get("class"), str) and isinstance(record.get("fields"), Mapping):
-            return {**record, "fields": {name: _computed(value) for name, value in record["fields"].items()
+    match record:
+        case {"class": str(), "fields": dict() as fields}:
+            return {**record, "fields": {name: _computed(value) for name, value in fields.items()
                                          if name not in NUMERICS_FIELDS}}
-        return {key: _computed(value) for key, value in record.items()}
-    if isinstance(record, list | tuple):
-        return [_computed(value) for value in record]
-    return record
+        case dict():
+            return {key: _computed(value) for key, value in record.items()}
+        case list():
+            return [_computed(value) for value in record]
+        case _:
+            return record
 
 
 def _tree(tree: Mapping[str, object], name: str) -> Mapping[str, object]:
