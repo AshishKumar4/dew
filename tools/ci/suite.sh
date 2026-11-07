@@ -18,7 +18,7 @@
 #   PRIORITY         the jobs' armada priority (none: armada's default)
 #   DEW_TEST_CACHE   the test cache's policy (tools/armada/ci.py policy; `off` runs every file)
 #   DEW_WHOLE_SUITE  1 for the whole suite: the whole_suite cells, every file on the newest Python, and the release
-#                    checks after it (tools/armada/ci.py `selected`, `plan`, `release-plan`)
+#                    checks after it (tools/armada/session.py `selected`, ci.py `plan`, `release-plan`)
 #   GANGLESS         1 to run no gangs (a base/kernels push and a base/<producer> promote: main's trains run them)
 #   POOL             the suite's pool (none: .armada.json's), and BACKGROUND, 1 for a run that takes a bounded share
 #                    of the fleet with a longer deadline

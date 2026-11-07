@@ -244,7 +244,8 @@ def test_a_mark_the_plan_cannot_read_from_its_tests_decorator_is_refused(ci, tmp
     judges = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12" and "after" in entry]
     assert [(entry["split"], len(entry["after"])) for entry in judges] == [("TestSite.test_site", 3),
                                                                           ("TestSite.test_work", 4)]
-    assert ci.pytest_command(["pytest"], ["tests/test_site.py"], "TestSite.test_work.draws-24-30", "") == [
+    assert ci.session.pytest_command(["pytest"], ["tests/test_site.py"], "TestSite.test_work.draws-24-30",
+                                     "") == [
         "pytest", "-p", "executed", "tests/test_site.py::TestSite::test_work"]
 
 
@@ -524,7 +525,7 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
     ran = replanned_once_its_draws_change(ci, tmp_path)
     [again] = [entry for entry in ran if "after" in entry]
     maps = [entry for entry in ran if "after" not in entry]
-    assert {ci.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
+    assert {ci.session.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
     assert maps and set(again["after"]) == {entry["name"] for entry in maps}
 
 

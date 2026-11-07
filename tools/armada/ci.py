@@ -303,10 +303,6 @@ def shared(python: str) -> str:
                 digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
-    # This file's code that decides which tests a row's run holds and how pytest is called (`selected`,
-    # `pytest_command`): a change to either changes what a green row means (row 2558).
-    for selecting in ("selected", "pytest_command"):
-        digest.update(digests.unit(__file__, selecting))
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + (code_of(name) if name.endswith(".py") else digests.contents(name)))
     return digest.hexdigest()
@@ -379,7 +375,7 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
     reading = Reading() if reading is None else reading
     for path in inputs(name, depends):
         digest.update(path.encode() + reading.part(path))
-    if SITE.fullmatch(split):
+    if session.SITE.fullmatch(split):
         digest.update(split.encode())
     elif split and split != COLLECT:
         digest.update(split.encode() + json.dumps(members(name, split, reading)).encode())
@@ -783,7 +779,7 @@ def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | N
         if ":" not in row_name:
             continue
         python_, name_, split_ = parsed_row(row_name)
-        if (python_, name_) != (python, name) or split_ == COLLECT or SITE.fullmatch(split_):
+        if (python_, name_) != (python, name) or split_ == COLLECT or session.SITE.fullmatch(split_):
             continue
         if not split_:
             whole = seconds
@@ -875,14 +871,7 @@ COLD_SECONDS = 360.0
 the recorder changed): the compiles and imports no warm run paid. Train 254's cold suite ran about 470 s a
 task where its plan estimated about 120 (1,389 tasks in 2,700 s on 242 containers, 2026-10-28)."""
 
-SHARDS = {"check1_shards": "seeds", "shards": "units"}
-"""The marks of a site too long for one task (pyproject.toml's markers), each by the count it declares:
-`check1_shards(seeds=S, per_task=P)` on a test whose `assert_as_exact` sites (tests/reference_error.py)
-declare S seeds, which check 1's two stages draw (1 + REDRAW) times over; and `shards(units=N,
-per_task=P)` on a test whose work is N units of its own, split the same way (a witness's items). CI runs
-either as armada's map and judge (`site_entries`): map tasks of P units each over the units its stages or
-its work take, and one judge."""
-SITE_MARK = re.compile(r"\bmark\.(?:" + "|".join(SHARDS) + r")\b")
+SITE_MARK = re.compile(r"\bmark\.(?:" + "|".join(session.SHARDS) + r")\b")
 """A site's mark as a test file's source spells it (`sites`), which a file that holds none never parses."""
 LATER_JUDGED = "check1_later"
 """A check-1 site judge's row's word that its judgement needed its later map tasks (`later_judged`), which the
@@ -899,8 +888,8 @@ within it (`refused_sites`)."""
 
 @dataclasses.dataclass(frozen=True)
 class Mark:
-    """A site's mark (`SHARDS`): the units its map tasks together take, 0 to `units`, the most of them a map
-    task takes, the line of its test's source that holds the mark, and the units a whole run of its test
+    """A site's mark (`session.SHARDS`): the units its map tasks together take, 0 to `units`, the most of them
+    a map task takes, the line of its test's source that holds the mark, and the units a whole run of its test
     takes at least, over which its recorded seconds weigh one (`site_entries`): a check-1 site's declared
     seeds, of (1 + REDRAW) times as many its map tasks draw; a `shards` test's units, every one. A check-1
     site's weighed check (`conditioning`) draws `weighed` units more, `units` to `units + weighed`, at most
@@ -920,17 +909,11 @@ def armada_dir(variable: str, default: str) -> Path:
     return Path(os.environ.get(variable) or default)
 
 
-SITE = re.compile(r"(?P<test>(?:\w+\.)*test\w*)(?:\.draws-(?P<start>\d+)-(?P<stop>\d+))?")
-"""A check-1 site's group in its rows' names (`row`), which its tasks' split carries: its test's name in its
-file (`sites`), its judge's, whose row is the site's verdict; or that and the seeds one of its map tasks
-draws, `<test>.draws-<start>-<stop>`."""
-
-
 def sites(name: str) -> dict[str, Mark]:
-    """Test file `name`'s tests marked one of `SHARDS`, each by its name in the file (a class's method's
-    `Class.test_name`) with its mark (`Mark`). Read from the source, as `gangs` reads its models: the plan
-    runs under a Python with no pytest (`pinned`) and imports no test, so it reads the mark on the test's own
-    decorator, `@pytest.mark.check1_shards(seeds=S, per_task=P)` or `@pytest.mark.shards(units=N,
+    """Test file `name`'s tests marked one of `session.SHARDS`, each by its name in the file (a class's
+    method's `Class.test_name`) with its mark (`Mark`). Read from the source, as `gangs` reads its models: the
+    plan runs under a Python with no pytest (`pinned`) and imports no test, so it reads the mark on the test's
+    own decorator, `@pytest.mark.check1_shards(seeds=S, per_task=P)` or `@pytest.mark.shards(units=N,
     per_task=P)`, of literal counts above zero, one a test. A mark written otherwise (on a class or a module,
     in a parameter's marks, of counts computed, two on one test) would set its site aside from its file's
     tasks (`selected`) and plan none of its own, so nothing would run it: its file is refused, by the lines
@@ -952,23 +935,23 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
     read: set[int] = set()
     for test, mark in session.decorated_tests(tree.body):
         kind = ast.unparse(mark.func).removeprefix("pytest.mark.")
-        if kind not in SHARDS:
+        if kind not in session.SHARDS:
             continue
         counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
                   if isinstance(keyword.value, ast.Constant)}
-        allowed = [{SHARDS[kind], "per_task"}]
+        allowed = [{session.SHARDS[kind], "per_task"}]
         if kind == "check1_shards":
-            allowed.append({SHARDS[kind], "per_task", "conditioning", "conditioning_per_task"})
+            allowed.append({session.SHARDS[kind], "per_task", "conditioning", "conditioning_per_task"})
         if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
                 and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
-            declared = counts[SHARDS[kind]]
+            declared = counts[session.SHARDS[kind]]
             units = check1_wire().staged_units(declared) if kind == "check1_shards" else declared
             weighed = check1_wire().staged_units(counts.get("conditioning", 0))
             found[test] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
                                counts.get("conditioning_per_task", 0))
             read.add(id(mark.func))
     unread = sorted(node.lineno for node in ast.walk(tree)
-                    if isinstance(node, ast.Attribute) and node.attr in SHARDS
+                    if isinstance(node, ast.Attribute) and node.attr in session.SHARDS
                     and ast.unparse(node.value).rpartition(".")[2] == "mark" and id(node) not in read)
     if unread:
         raise SystemExit(f"{name}, line {', '.join(map(str, unread))}: check1_shards and shards mark a test "
@@ -1088,9 +1071,9 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     whose rows the cache holds for exactly these inputs (`reusable`) share tasks of the target's lookups each,
     which look each up again in their containers, so the verdict names every file and containers scale with
     the change. Under the policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by
-    the work, not the longest task, as warm estimates did. A site marked one of `SHARDS` runs as armada's
-    map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is the whole
-    suite with the cache off, whatever this environment says, each entry carrying it to its task."""
+    the work, not the longest task, as warm estimates did. A site marked one of `session.SHARDS` runs as
+    armada's map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is
+    the whole suite with the cache off, whatever this environment says, each entry carrying it to its task."""
     cache = "off" if census else os.environ.get("DEW_TEST_CACHE") or "on"
     # The whole suite's run alone (DEW_WHOLE_SUITE: the daily run's and the whole dispatch's, and the census)
     # runs whole_suite cells (`selected`) and every file on the newest Python.
@@ -1154,7 +1137,8 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(tokens),
                             "split": alone, "rows": [row(python, name, group) for name, group in held_rows],
                             "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), **stamped})
-        # The sites to run whose judge's last run needed its later map tasks draw them at once (`eager_sites`).
+        # The sites to run whose judge's last run needed its later map tasks draw them at once
+        # (`eager_sites`).
         eager = eager_sites(python, [(name, test) for name, held in marked.items() for test in held
                                      if (name, test) not in found])
         entries += [{**entry, "weight": entry["weight"] + (COLD_SECONDS if cache == "off" else 0.0),
@@ -1272,16 +1256,17 @@ def targeted(python: str, arguments: list[str], report: Path, tests: Sequence[st
     chooses instead; with `whole`, as main's whole run does, so a bisect of its red whole_suite cell runs it
     (row 4230). A file's group sets aside its sites as CI's does (`selected`), which run in their own
     tasks alone (2026-11-02: a targeted group ran a site's every seed itself, 2233 s against CI's 8)."""
-    site = SITE.fullmatch(split)
-    run = selected(session.pytest_run(python, report), network=False, whole=whole, site=site is not None)
-    return subprocess.run([*run, *arguments, *selection(list(tests), split)],
+    site = session.SITE.fullmatch(split)
+    run = session.selected(session.pytest_run(python, report), network=False, whole=whole,
+                           site=site is not None)
+    return subprocess.run([*run, *arguments, *session.selection(list(tests), split)],
                           env=session.pytest_environment(site_environment(site)), check=False).returncode
 
 
 def flow_cells(cases) -> dict[str, dict]:
     """A GPU flow's counts by its cases (each case's JUnit property `cells`, tests/conftest.py from
-    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an empty
-    object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
+    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an
+    empty object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
     unqualified, and a reused row keeps its counts (ledger 2643)."""
     return {node_of(case): json.loads(item.get("value") or "null") for case in cases
             for item in case.iter("property") if item.get("name") == "cells"}
@@ -1330,7 +1315,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                   release=release, kept=whole_files)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
-    site = SITE.fullmatch(split)
+    site = session.SITE.fullmatch(split)
     if site and site["start"] is not None and any(found["exitCode"]
                                                   for found in json.loads(out.read_text())["rows"]):
         return 1
@@ -1356,30 +1341,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     return code
 
 
-def selection(tests: list[str], split: str, release: str = "") -> list[str]:
-    """pytest's arguments that select `tests` as a CI task does: one group of a split file (`split`,
-    split.py), a release check's tests (`release`, release.py), or a check-1 site's test alone (`split` its
-    group, `SITE`)."""
-    site = SITE.fullmatch(split)
-    grouping = (["-p", "split", f"--ci-group={split}"] if split and not site else []) + (
-        ["-p", "release", f"--ci-release={release}"] if release else [])
-    named = [f"{name}::{site['test'].replace('.', '::')}" for name in tests] if site else tests
-    return [*named, *grouping]
-
-
-def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
-    """CI's pytest `run` over `tests`, with the plugin that records what ran (executed.py), as `selection`
-    selects them. A release check's pytest runs with its requirement over the suite's environment, whose
-    torch and jax it keeps: uv's overlay."""
-    command = [*run, "-p", "executed", *selection(tests, split, release)]
-    return ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
-            *command[1:]] if release else command
-
-
 def site_environment(site: re.Match | None) -> dict[str, str]:
-    """What a check-1 site's own task runs its test under (`site`, its group's match of `SITE`): a map task
-    draws its seeds into its artifacts, and its judge pools every map task's from its inputs, its ask for its
-    later map tasks (LATER) none before it runs; nothing for any other group."""
+    """What a check-1 site's own task runs its test under (`site`, its group's match of `session.SITE`): a map
+    task draws its seeds into its artifacts, and its judge pools every map task's from its inputs, its ask for
+    its later map tasks (LATER) none before it runs; nothing for any other group."""
     if site is None:
         return {}
     if site["start"] is None:
@@ -1539,10 +1504,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's. A check-1
-    site's map task (`SITE`) is never reused: its draws, among its artifacts, are what its judge reads."""
+    site's map task (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge
+    reads."""
     began = time.monotonic()
     group = split or (f"{RELEASE}{release}" if release else "")
-    site = SITE.fullmatch(group)
+    site = session.SITE.fullmatch(group)
     rows = ([] if cache == "off" or release or (site is not None and site["start"] is not None)
             else reused_rows(python, tests, group, common, network, kept))
     tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
@@ -1554,7 +1520,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
+    run = session.selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
     # A resuming task keeps its progress and sets aside the tests its recalled attempt passed (`resumed`,
     # SET_ASIDE); a site's map task (its artifacts its judge's draws), a release and a trace resume none.
@@ -1562,7 +1528,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     done_before = resumed(tests) if resumes else {}
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
-    command = [*pytest_command(run, tests, split, release), *(["-p", "progress"] if resumes else [])]
+    command = [*session.pytest_command(run, tests, split, release), *(["-p", "progress"] if resumes else [])]
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
                                               "DEW_UNRECORDED": str(unrecorded), "DEW_STACKS": str(stacks),
@@ -1669,14 +1635,14 @@ def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
 
 
 def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[str] | None:
-    """What row `row_name` of a check-1 site's task ran on (`SITE`), given what its own run executed and
-    read (`depends`, None where that is not known): a map task's own, kept among its artifacts for its judge,
-    which reads every one of its map tasks' among its inputs and keys on them with its own (`cache_key`), so
-    the site's key covers what its draws ran, which the judge runs none of (an arm run as given, a branch of a
-    later seed): its first stage's map tasks', and its later ones' where they ran; None where one of those is
-    not known or not found. Any other row's, as it is."""
+    """What row `row_name` of a check-1 site's task ran on (`session.SITE`), given what its own run executed
+    and read (`depends`, None where that is not known): a map task's own, kept among its artifacts for its
+    judge, which reads every one of its map tasks' among its inputs and keys on them with its own
+    (`cache_key`), so the site's key covers what its draws ran, which the judge runs none of (an arm run as
+    given, a branch of a later seed): its first stage's map tasks', and its later ones' where they ran; None
+    where one of those is not known or not found. Any other row's, as it is."""
     _, name, group = parsed_row(row_name)
-    site = SITE.fullmatch(group)
+    site = session.SITE.fullmatch(group)
     if site is None:
         return depends
     test = site["test"]
@@ -1836,28 +1802,6 @@ def collected(python: str, marks: str) -> dict[str, int]:
         if "::" in node:
             counts[node.split("::")[0]] = counts.get(node.split("::")[0], 0) + 1
     return counts
-
-
-def selected(command: list[str], network: bool, whole: bool = False, release: bool = False,
-             site: bool = False) -> list[str]:
-    """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
-    tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
-    the whole suite's run (`whole`: DEW_WHOLE_SUITE, CI's schedule and its whole dispatch), whatever
-    the cache's policy: a policy-off train runs every file, never a whole-suite cell (the maintainer,
-    2026-10-28: train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The
-    release checks run in their own tasks alone (`release`), every one whatever else marks it, under a
-    requirement the suite's environment lacks (`release_plan`), and on no other run, the network lane's among
-    them. A site marked one of `SHARDS` runs in its own tasks alone (`site`: its map tasks and its judge,
-    `site_entries`), and every other run sets it aside."""
-    at = command.index(session.SELECTION[1])
-    if release:
-        chosen = "release_env"
-    elif network:
-        chosen = "network and not release_env"
-    else:
-        chosen = (session.SELECTION[1] + " and not release_env" + ("" if whole else " and not whole_suite")
-                  + ("" if site else "".join(f" and not {kind}" for kind in SHARDS)))
-    return [*command[:at], chosen, *command[at + 1:]]
 
 
 GPU_HEADROOM = (1.25, 2 ** 30)
@@ -2060,8 +2004,8 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         if ":" not in row_["name"]:
             continue
         python, name, split_ = parsed_row(row_["name"])
-        if (python == PYTHONS[0] and split_ != COLLECT and not SITE.fullmatch(split_) and Path(name).is_file()
-                and name not in changed):
+        if (python == PYTHONS[0] and split_ != COLLECT and not session.SITE.fullmatch(split_)
+                and Path(name).is_file() and name not in changed):
             rows.setdefault(name, []).append(row_)
     kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
     for name, held in rows.items():
@@ -2183,7 +2127,7 @@ def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> 
     found = []
     for row_ in verdict["rows"]:
         cells = set(row_.get("whole_suite", []))
-        drawn = SITE.fullmatch(parsed_row(row_["name"])[2]) if "name" in row_ else None
+        drawn = session.SITE.fullmatch(parsed_row(row_["name"])[2]) if "name" in row_ else None
         mapped = drawn is not None and drawn["start"] is not None
         for test, seconds in (row_.get("tests") or {}).items():
             if seconds <= target or (base is not None and test in base and not mapped):

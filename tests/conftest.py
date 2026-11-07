@@ -184,9 +184,9 @@ class Unheld(NamedTuple):
 def release_unheld(requirement: str, test: str) -> Unheld | None:
     """Why this interpreter cannot run `test`, marked release_env(`requirement`): a release's own code under
     the package it pins apart from the suite's, a requirement or a wheel's path as CI's release task hands
-    it to its overlay (tools/armada/ci.py `pytest_command`); or None where it holds that package. The reason
-    names CI's own release operation, which runs the test's file under that overlay, where the release's
-    own loader would fail opaquely in its subprocess (row 3576)."""
+    it to its overlay (tools/armada/session.py's `pytest_command`); or None where it holds that package. The
+    reason names CI's own release operation, which runs the test's file under that overlay, where the
+    release's own loader would fail opaquely in its subprocess (row 3576)."""
     from importlib.metadata import PackageNotFoundError, version
 
     from packaging.requirements import Requirement

@@ -1,7 +1,6 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
 import functools
-import importlib.util
 import itertools
 import json
 import math
@@ -1344,33 +1343,25 @@ def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(c
         assert run() == runs, new
 
 
-def test_a_change_to_the_selection_every_task_runs_under_rekeys_every_row_and_its_wording_none(
-        tmp_path, monkeypatch):
-    """Every row's shared key holds the plan's code that decides which tests a row's run holds and how pytest
-    is called (`selected`, `pytest_command`), which a green row's meaning rests on, and nothing of its wording
-    (row 2558: a change to the selection reused rows its run would not give)."""
-    # The plan's own code from a copy of the harness beside the project file it reads as it loads, its
-    # checkout's inputs from this one, read only.
-    checkout = Path(__file__).resolve().parents[1]
-    harness = tmp_path / "tools" / "armada"
-    shutil.copytree(checkout / "tools" / "armada", harness, ignore=shutil.ignore_patterns("__pycache__"))
-    shutil.copy(checkout / "pyproject.toml", tmp_path)
-    monkeypatch.chdir(checkout)
-    source = (harness / "ci.py").read_text()
-
-    def shared_of(text: str) -> str:
-        (harness / "ci.py").write_text(text)
-        spec = importlib.util.spec_from_file_location("ci_copy", harness / "ci.py")
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module.shared("3.12")
-
-    head = source.index("def selected(")
-    body = source.index('"""', source.index('"""', head) + 3) + 3
-    worded = source[:head] + source[head:body].replace("CI's pytest", "CI's own pytest", 1) + source[body:]
-    changed = source[:body] + "\n    assert command" + source[body:]
-    assert shared_of(worded) == shared_of(source) != shared_of(changed)
+def test_a_pytest_option_the_supervisor_inherits_selects_nothing_a_row_is_kept_on(ci, tmp_path, monkeypatch,
+                                                                                  cache_worker):
+    """What a task's pytest selects and loads is its command's alone, which every row's key holds
+    (session.py's `selected` and `pytest_command`, among `SHARED`): an inherited PYTEST_ADDOPTS or
+    PYTEST_PLUGINS is no part of its run (session.py's `UNKEYED`), so a run under one that deselects a red
+    test is red, and no later run reuses a green row its tests would not give (row 2558)."""
+    written(tmp_path, {"test_a.py": "def test_passes():\n    assert True\n\n\n"
+                                    "def test_fails():\n    assert False\n"})
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    out = tmp_path / "verdict.json"
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-k 'not test_fails'")
+    ci.task("3.12", ["tests/test_a.py"], "", out, 600.0)
+    assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [1]
+    monkeypatch.delenv("PYTEST_ADDOPTS")
+    ci.task("3.12", ["tests/test_a.py"], "", out, 600.0)
+    assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [1]
 
 
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
