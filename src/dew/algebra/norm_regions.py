@@ -201,11 +201,12 @@ def _along_row(graph: Graph, reduced: int, inverse: int, row, places: list[int])
         eqn = eqns[reader]
         name = jax_name(eqn.primitive)
         other = next((var for var in eqn.invars if var is not atom), None)
-        # The row itself, or the same input widened again for the product (Flax's statistics and product
-        # each widen it).
+        # The row itself, or the same input widened again for the product less a mean of zero (Flax's
+        # statistics and product each widen it, its RMSNorm's `x - mean` at no mean).
         cast: list[int] = []
         if (after and name == "mul" and isinstance(other, jcore.Var) and other.aval.shape == row.aval.shape
-                and graph.uncast(other, cast, widening) is graph.uncast(row, [], widening)):
+                and graph.uncast(_unshifted(graph, other, cast), cast, widening)
+                is graph.uncast(row, [], widening)):
             rank = row.aval.ndim
             if len(labels) != rank or labels[-1] is not None or not all(
                     labels[a] in (a, None) and (labels[a] == a or row.aval.shape[a] == 1)
@@ -230,6 +231,20 @@ def _along_row(graph: Graph, reduced: int, inverse: int, row, places: list[int])
             places.append(reader)
         after = after or reader == inverse
         atom = eqn.outvars[0]
+
+
+def _unshifted(graph: Graph, atom, places: list[int]):
+    """`atom` past a subtraction of zeros (a constant every entry of which is 0), its place added to
+    `places`; `atom` itself where it is none."""
+    place = graph.made(atom, "sub")
+    if place is None:
+        return atom
+    minuend, subtrahend = graph.jaxpr.eqns[place].invars
+    zeros = graph.constant(subtrahend)
+    if zeros is None or np.any(zeros != 0):
+        return atom
+    places.append(place)
+    return minuend
 
 
 LAYOUTS = frozenset({"broadcast_in_dim", "reshape", "convert_element_type"})
