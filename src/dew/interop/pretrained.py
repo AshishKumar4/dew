@@ -582,7 +582,7 @@ class Pretrained:
 
 
     @classmethod
-    def _from_family(cls, name_or_dir: str | Path, trust_remote_code: bool | None, *,
+    def _from_family(cls, name_or_dir: str | Path, trust_remote_code: bool, *,
                      dtype: DTypeLike | None, param_dtype: DTypeLike | Literal["auto"] | None,
                      attention_impl: AttentionImpl, max_seq_len: int | None, revision: str | None,
                      subfolder: str | None, gguf_file: str | None, single_file: str | None,
