@@ -90,7 +90,8 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
     group = heads // kv_heads
     rows = grouped_rows(query, kv_heads)
     if spans.query_ids is None and spans.start.ndim == 2:
-        spans = KeySpans(spans.start, spans.end, None, spans.key_ids, spans.keys, "spans", group)
+        spans = KeySpans(spans.start, spans.end, None, spans.key_ids, spans.keys, "spans",
+                         spans.per_span * group)
     else:
         start, end = (jnp.repeat(x, group, axis=1) for x in (spans.start, spans.end))
         query_ids = None if spans.query_ids is None else jnp.repeat(spans.query_ids, group, axis=1)
@@ -128,9 +129,10 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     residency holds, `MosaicForward.resident`), but each slice at least twice its ring's stages of key tiles:
     a shorter slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to
     hide them (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where
-    cuDNN's whole step took 13). Where the family waits across programs (`Family.fixes_up`), the launch merges the
-    slices in the last one's program, the initial state with them (`MosaicForward.merges`); elsewhere each
-    slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config derived for them."""
+    cuDNN's whole step took 13). Where the family waits across programs (`Family.fixes_up`), the launch merges
+    the slices in the last one's program, the initial state with them (`MosaicForward.merges`); elsewhere
+    each slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config derived for
+    them."""
     found = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
                       sources=sources, out_dtype=None, scales=scales)
     if found is None:
