@@ -62,6 +62,82 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
         load_diffusion_source(str(source))
 
 
+def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_release(tmp_path, monkeypatch):
+    """A decision run whose head's format holds no backbone of its own family (Laya's fresh head, whose
+    format holds ModernBERT alone, over Qwen 3.5's MoE text decoder) exports as its native release, and a
+    second decision run naming it (`--pretrained <run>`) starts from that release as from the run's own
+    task: its head and backbone the first run's final ones, its record the run and step it read, and its
+    task answers (row 4776: the release's record states no dtypes a family's load reads, and the start
+    raised KeyError)."""
+    from dew.decision import Choice, Decide
+    from dew.decision.formats import format_unstated
+    from dew.inference.tasks import saved_model
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    decoder = Path(__file__).parent / "fixtures" / "hf" / "qwen38-moe-tiny"
+    first = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(decoder))
+    state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    assert format_unstated("laya", saved_model(SavedRun.pinned(str(source)).record, None).build()) is not None
+    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
+    started = run.prepare().objective.init(jax.random.key(0))
+    leaves_alike(started["params"], state.variables["params"])
+    second, _ = trained(run, tmp_path, "second", trainer={"checkpoint_final": True})
+    assert int(second.step) == 1
+    recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
+    assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
+    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
+
+
+def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, monkeypatch):
+    """A chat-format decision run, a joint head over Qwen 3.5's chat backbone, its rows framed as a
+    conversation by the backbone's chat template, saved, is a source a second decision run names
+    (`--pretrained <run>`): its release, written by `dew export` and by its task's `save_pretrained`,
+    reloads answering as the run's task serves its written weights, bit for bit; the second run trains
+    on from the first's final weights, head and backbone, its record names the run and step it read, and
+    its task loads and answers (a run from a finished chat-format run, which the export's Laya-only
+    layout refused: "Laya's layout is a MarkerLayout over a Hugging Face tokenizer", row 4310)."""
+    from run_kinds import QWEN_TINY
+
+    from dew.decision import Choice, Decide
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    joint = ["--pretrained", str(QWEN_TINY), "head:joint-shape", "--head.width", "16",
+             "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
+             "--head.feedforward", "32", "--max-len", "768"]
+    first = DecisionRunConfig.cli(joint, default=decision(tmp_path, drawn=False))
+    state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    # Its release, written by `dew export` and by its task's `save_pretrained`, reloads as the run's task
+    # serves its weights as written, on the host (the run's own task is placed on its training mesh).
+    from dew._cli.main import main
+    from dew.decision.sources import PretrainedDecision
+
+    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    task = Decide.from_run(str(source))
+    assert main(["export", str(source), str(tmp_path / "exported")]) == 0
+    task.save_pretrained(tmp_path / "saved")
+    served = Decide.of(PretrainedDecision.of(dataclasses.replace(task, variables=jax.tree.map(
+        np.asarray, task.variables))))
+    for written in ("exported", "saved"):
+        reloaded = Decide.from_pretrained(tmp_path / written, attention_impl="xla")
+        for state_text in ("charged twice", "is the site down?"):
+            np.testing.assert_array_equal(reloaded(state_text, {"team": team})["team"].probabilities,
+                                          served(state_text, {"team": team})["team"].probabilities)
+    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest", "--max-len", "768"],
+                                default=decision(tmp_path, drawn=False))
+    started = run.prepare().objective.init(jax.random.key(0))
+    leaves_alike(started["params"]["head"], state.variables["params"]["head"])
+    second, _ = trained(run, tmp_path, "second", trainer={"checkpoint_final": True})
+    assert int(second.step) == 1
+    recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
+    assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
+    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_run_whose_mixture_no_family_writes_exports_and_loads_back_answering_as_its_run(tmp_path):
     """A language model run whose decoder routes one layer of two through a mixture of experts exports

@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
     from dew.distributed.placement import Layout, MeshSpec
     from dew.interop.layouts import Unwritable
+    from dew.interop.pretrained import Pretrained
     from dew.interop.releases import ReleasePlan
     from dew.objectives.base import Objective, SavedTask
 
@@ -89,6 +90,15 @@ class SavedModel(SavedRunTask):
     def unstated(cls, run: SavedRun) -> Unwritable | None:
         """None: its own release states every model, its run's native release."""
         return None
+
+    @classmethod
+    def source_of(cls, run: SavedRun, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+                  dtype: DTypeLike | None, param_dtype: DTypeLike | None) -> Pretrained:
+        """Refused: a model's own release (a JEPA encoder's, a policy's) is its model alone, which
+        `dew.pipeline` loads (`from_pretrained`); no source bundle states it for another run to start from
+        (`ReleasedTask.source_of`)."""
+        raise ValueError(f"the native release of a {run.objective.__name__} run is its model, which "
+                         "dew.pipeline loads; a run starts from no such release")
 
     @classmethod
     def from_pretrained(cls, directory: str | Path, *, mesh: MeshSpec | Mesh | None = None,
