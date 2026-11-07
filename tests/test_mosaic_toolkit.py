@@ -1016,7 +1016,8 @@ def _negated(a, b, *, path: str, interpret: bool):
                         acc = family.added_into(acc, jnp.zeros(shape, jnp.float32), interpret)
                     return carry, (acc,)
 
-                _, (value,) = family.accumulated((mosaic.Loop(step, 0, 1),), jnp.int32(0), (shape,), interpret)
+                walk = (mosaic.Loop(step, 0, 1),)
+                _, (value,) = family.accumulated(walk, jnp.int32(0), (shape,), interpret)
             if path != "read":
                 plgpu.store(out_smem, -value, optimized=False)
             mosaic.synced(interpret)
