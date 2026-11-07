@@ -400,7 +400,8 @@ def test_a_streamed_window_shuffle_reads_each_window_as_the_one_before_is_given(
         assert next(ours) == next(theirs)
         reads.append(parent.reads - before)
     assert ours.get_state() == theirs.get_state()
-    assert reads[0] == window and max(reads[window:], default=0) <= 1, reads
+    # The first record reads the first window and the next's first record; each after it, one record.
+    assert reads[0] == window + 1 and max(reads[1:], default=0) <= 1, reads
     resumed = iter(WindowShuffle(Listed(1000), window=window, seed=3))
     resumed.set_state(ours.get_state())
     assert list(itertools.islice(resumed, 3 * window)) == list(itertools.islice(theirs, 3 * window))
