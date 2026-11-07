@@ -333,7 +333,8 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
         jnp.arange(1, SHAPE["max_seq_len"] + 1, dtype=jnp.int32)[None],
         (jax.device_count(), 1))}
     state = trainer.compile(state, batch)(state, batch)[0]
-    checkpoints.save(int(state.step), state, None, metrics={"loss": 1.0})
+    # Saved as a run saves it, each layer stored (`Trainer.stored`), as its step holds it stacked.
+    checkpoints.save(int(state.step), trainer.stored(state), None, metrics={"loss": 1.0})
     checkpoints.wait()
 
     resident = CheckpointBanks(directory).place(scanned, layout=DEVICE)

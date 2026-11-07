@@ -1091,7 +1091,8 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
 
 def pipeline_losses(trainer, rows, steps: int):
     """`steps` steps of the compiled step over this process's `rows` of the
-    token batch, with the losses and the final parameters."""
+    token batch, with the losses and the final state on its stored layers
+    (`Trainer.stored`), as a step holds its runs stacked."""
     from dew.distributed.batches import shard_batch
 
     state, _, _ = trainer.place()
@@ -1101,7 +1102,7 @@ def pipeline_losses(trainer, rows, steps: int):
     for _ in range(steps):
         state, loss, _, _, _, _ = compiled(state, batch)
         losses.append(float(loss))
-    return losses, state
+    return losses, trainer.stored(state)
 
 
 def mode_pipeline(args) -> dict:
@@ -1113,8 +1114,7 @@ def mode_pipeline(args) -> dict:
     mine = token_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     trainer = pipeline_trainer(args.stage_size, args.microbatches, args.fsdp_size)
     losses, state = pipeline_losses(trainer, mine, args.steps)
-    # A stage-local state holds each stage's layers stacked on its own devices; the dump reads every layer.
-    dump_params(args.out.with_suffix(".npz"), trainer.stored(state).variables)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
     return {
         "process_index": jax.process_index(),
         "losses": losses,

@@ -223,7 +223,8 @@ def main(config: Config) -> None:
     print(f"Mesh {dict(mesh.shape)} over {mesh.devices.size} {jax.devices()[0].device_kind} device(s)")
 
     state, _, _ = trainer.place()
-    kernel = state.variables["params"]["layers_0"]["mlp"]["experts"]["gate_proj"]["kernel"]
+    # The step holds the scan's run of layers stacked; its stored form reads layer 0's kernel by name.
+    kernel = trainer.stored(state).variables["params"]["layers_0"]["mlp"]["experts"]["gate_proj"]["kernel"]
     print(f"Expert kernel {kernel.shape} placed as {kernel.sharding.spec}")
     shards = mesh.shape["expert"]
     where = placement(mesh, kernel, (config.batch_size, config.sequence_length, 64), trainer.layout,
