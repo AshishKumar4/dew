@@ -265,6 +265,12 @@ class Graph:
         value = float(value)
         return value == -math.inf or value <= 0.5 * float(jnp.finfo(dtype).min)
 
+    def holds(self, atom, expected: float) -> bool:
+        """Whether `atom` is a constant scalar equal to `expected` rounded to its own dtype: the constant a
+        rule names exactly as the program can hold it, not a constant near it (row A4: a divisor of 8.004
+        taken for sqrt(64) changed the attention's scale)."""
+        return _equals(self.constant(atom), expected)
+
     def constant(self, atom) -> np.ndarray | None:
         """`atom`'s value where no input of the program makes it (literals, the body's constants, iotas,
         through any equation without effects), None else, nor where it holds more than MASK_ENTRIES
@@ -590,16 +596,16 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
         if divided is None or graph.readers[query] != {first}:
             return nothing
         numerator, denominator = eqns[divided].invars
-        root = graph.constant(denominator)
-        if (root is None or np.ndim(root) != 0
-                or not math.isclose(float(root), math.sqrt(width), rel_tol=1e-3)):
+        if not graph.holds(denominator, math.sqrt(width)):
             return nothing
         query = numerator
     else:
-        # The default scale times a power of two, which the call's query takes exactly.
+        # The default scale times a power of two, which the call's query takes exactly: the call's scale that
+        # factor over sqrt(D) at the logits' dtype, not near it.
         ratio = scale * math.sqrt(width)
         factor = 2.0 ** round(math.log2(ratio)) if ratio > 0 else 0.0
-        if factor == 0.0 or not math.isclose(ratio, factor, rel_tol=1e-6):
+        dtype = np.dtype(query.aval.dtype)
+        if factor == 0.0 or np.asarray(scale, dtype) != np.asarray(factor / math.sqrt(width), dtype):
             return nothing
     places.append(first)
     return (first, query, key, contracted_q[0], contracted_k[0], eqn.params["dimension_numbers"], softcap,
@@ -638,8 +644,8 @@ def _capped(graph: Graph, atom, places: list[int]) -> tuple[float | None, object
 
 
 def _equals(value, expected: float) -> bool:
-    """Whether `value` is a constant scalar within float32's rounding of `expected`."""
-    return value is not None and np.ndim(value) == 0 and math.isclose(float(value), expected, rel_tol=1e-6)
+    """Whether `value` is a constant scalar equal to `expected` rounded to its own dtype."""
+    return value is not None and np.ndim(value) == 0 and value == np.asarray(expected, value.dtype)
 
 
 def _product_of(graph: Graph, atom) -> bool:
