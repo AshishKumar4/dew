@@ -450,7 +450,7 @@ class CausalTransformer(LinearProducts):
     (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
-    scan_layers: bool = False
+    scan_layers: bool = True
     """Runs of like layers under flax's scan, and a step over resident weights, training's or a decode
     step's, a period's repeats as one body too (`scan_groups(periodic=True)`), so its program grows with
     the period, not the depth; a stage-local state on one stage holds each run as the scan reads it."""
@@ -1838,12 +1838,16 @@ class CausalTransformer(LinearProducts):
 
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """Where the run a pipeline over `stages` (or one stage's scan) stacks is stored in `store`, the
-        variables a stage-local state is made from (`stage_view`): none for a looped stack."""
+        variables a stage-local state is made from (`stage_view`): none for a looped stack, nor on one
+        stage where no scan stacks a run (a stack that does not scan, or whose runs are one layer each)."""
         if self.loop is not None:
             return ()
         bound = self if self.scope is not None else self.bind(jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
-        return (DecoderBank((), bound.stage_view(stages)),)
+        view = bound.stage_view(stages)
+        if stages == 1 and not (self.scan_layers and any(count > 1 for _, count in view.groups)):
+            return ()
+        return (DecoderBank((), view),)
 
     def banked_collections(self) -> tuple[str, ...]:
         """Return the collections whose layer subtrees the store holds as banks.
@@ -2197,9 +2201,10 @@ class CausalTransformer(LinearProducts):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def with_scanned_layers(self) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
-        return self.clone(scan_layers=True)
+    def with_scanned_layers(self, scanned: bool = True) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`), or a layer at a
+        time where not `scanned`."""
+        return self.clone(scan_layers=scanned)
 
     @nn.nowrap
     def reads_progress(self) -> bool:

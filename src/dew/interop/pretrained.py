@@ -457,7 +457,7 @@ class Pretrained:
              modeling_overrides: Mapping[str, object] | None = None,
              trust_remote_code: bool | None = None, text_only: bool = False,
              prediction_depths: int | None = None, dex: DifferentialExtension | None = None,
-             precision: Numerics | str | None = None, scan_layers: bool = False,
+             precision: Numerics | str | None = None, scan_layers: bool = True,
              step: int | str | None = None, ema: bool | None = None) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
@@ -2001,19 +2001,18 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
 
 
 def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | None,
-                                   placed: Callable[[Variables], Variables], scan: bool = False) -> Loaded:
+                                   placed: Callable[[Variables], Variables], scan: bool = True) -> Loaded:
     """`loaded` with DEX attached where a load names it (`Pretrained.with_dex`), drawn from key 0, its
     parameters placed as the load places the source's (`placed`), before the load's residency; and its
-    decoder, or a wrapper's language model, scanning its runs where `scan` says (`Scanning`), a field of
-    how the model runs, its stored tree unchanged, as its stack reads the layers through its view."""
+    decoder, or a wrapper's language model, scanning its runs or not as `scan` says (`Scanning`), a
+    field of how the model runs, its stored tree unchanged, as its stack reads the layers through its
+    view. A model with no layers to scan runs as it is."""
     from dew.nn.protocols import Scanning
 
     extended = loaded if dex is None else loaded.with_dex(dex, key=0).map_variables(placed)
-    if not scan:
-        return extended
     if not isinstance(extended.model, Scanning):
-        raise TypeError(f"scan_layers scans a decoder's layers; a {type(extended.model).__name__} has none")
-    return replace(extended, model=extended.model.with_scanned_layers())
+        return extended
+    return replace(extended, model=extended.model.with_scanned_layers(scan))
 
 
 def _within(name: str, layers: frozenset[int]) -> bool:

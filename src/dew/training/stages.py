@@ -103,7 +103,10 @@ def _key(where: jax.tree_util.KeyPath) -> str:
 
 def stage_mesh(mesh: Mesh, stage: int) -> Mesh:
     """Stage `stage`'s devices of `mesh`, as a mesh of the same axes with a stage axis of one: a row of
-    a stacked leaf sits there with the spec the layout gives its layer."""
+    a stacked leaf sits there with the spec the layout gives its layer; a mesh with no stage axis, its
+    one stage's, whole."""
+    if STAGE_AXIS not in mesh.axis_names:
+        return mesh
     return Mesh(np.take(mesh.devices, [stage], axis=mesh.axis_names.index(STAGE_AXIS)), mesh.axis_names,
                 axis_types=mesh.axis_types)
 
@@ -130,7 +133,8 @@ def _sharded(sharding: NamedSharding, mesh: Mesh, spec: Sequence) -> NamedShardi
 
 @dataclasses.dataclass(frozen=True)
 class StageLocal:
-    """How a trainer over `mesh` keeps the runs `sites` declare stacked by stage (module docstring);
+    """How a trainer over `mesh` keeps the runs `sites` declare stacked by stage (module docstring), on
+    one stage the runs its decoder's scan reads stacked (`StackView.stage_form` under one stage's index);
     with no site, every conversion leaves a tree as it is. `read_whole` names the transforms of an optimizer
     given built that kept every layer whole on every stage instead (`whole_reading`), which the run's plan
     reports (`Trainer.plan`); none otherwise."""
@@ -142,24 +146,28 @@ class StageLocal:
     @classmethod
     def of(cls, objective, mesh: Mesh, *, local: bool = True,
            optimizer: optax.GradientTransformation | None = None) -> StageLocal:
-        """How a trainer over `mesh` keeps `objective`'s pipelined runs, from its tree's shapes, traced only
-        where a run may keep them stage-local: no run where the mesh has no stage axis, the objective
-        declares none (`Objective.stage_sites`, which a log names), the run keeps every layer whole on
-        every stage (not `local`: `Layout.stage_local`, a CPU-owned state, a DiLoCo run), or `optimizer`,
+        """How a trainer over `mesh` keeps `objective`'s pipelined runs, or on one stage the runs its
+        decoder's scan reads (`Objective.stage_sites` at one stage), from its tree's shapes, traced only
+        where a run may keep them stage-local: no run where the objective declares none (which a log names
+        where the mesh has stages), the run keeps every layer whole on every stage (not `local`:
+        `Layout.stage_local`, a CPU-owned state, a DiLoCo run), or `optimizer`,
         a transformation Dew does not build, holds a transform that may read a parameter whole
         (`whole_reading`): no per-layer view of a transform whose reductions only its own code knows is
         exact short of each layer a leaf of its own, which one program holds on every stage alone, so the
         run keeps every layer whole on every stage, as `Layout(stage_local=False)` does, said once and
         named in its plan (`read_whole`). Dew's own optimizers read a stacked leaf as its layers."""
         stages = mesh.shape.get(STAGE_AXIS, 1)
-        if not local or stages == 1:
+        if not local:
             return cls((), mesh)
         # The draw's shapes, its tree plain as a run holds it (`dew.batch.unboxed`).
         shapes = unboxed(abstract(objective.initializer, jax.random.key(0)))
         declared = objective.stage_sites(shapes, stages)
         if not declared:
-            _log.info("%s declares no run a pipeline over %d stages stacks (Objective.stage_sites), so its "
-                      "state keeps every layer whole on every stage", type(objective).__name__, stages)
+            if stages > 1:
+                _log.info("%s declares no run a pipeline over %d stages stacks (Objective.stage_sites), so "
+                          "its state keeps every layer whole on every stage", type(objective).__name__,
+                          stages)
+            return cls((), mesh)
         # A run a collection holds in part (a stack frozen by layer index) stays on its stored layers in
         # every collection, which the pipeline restacks as it would any stored layers.
         from dew.inference.banks import in_namespace
@@ -178,7 +186,7 @@ class StageLocal:
 
     @property
     def stages(self) -> int:
-        return self.mesh.shape[STAGE_AXIS]
+        return self.mesh.shape.get(STAGE_AXIS, 1)
 
     def staged[Leaf](self, tree, stack: RowStack[Leaf] = _stacked_rows):
         """`tree`, any tree that holds or mirrors variables, with each run stacked by stage, its rows
@@ -194,12 +202,12 @@ class StageLocal:
     def received(self, objective, state: TrainState) -> TrainState:
         """`state`, one a run handed on (`fit`'s), read as this run's step starts from it: a run stacked
         by stage over another count, or by a run where this one keeps every layer whole, back on its
-        stored layers (`objective`'s stage sites at the count it holds), every mirror alike; a state on
-        its layers, or stacked as this run stacks, as it is."""
-        from dew.nn.backbones.layer_names import stage_count
+        stored layers (`objective`'s stage sites at the count it holds, one stage's included), every mirror
+        alike; a state on its layers, or stacked as this run stacks, as it is."""
+        from dew.nn.backbones.layer_names import stacked_by_stage, stage_count
 
         held = stage_count(state.variables)
-        if held == 1 or (self.sites and held == self.stages):
+        if not stacked_by_stage(state.variables) or (self.sites and held == self.stages):
             return state
         shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype), state.variables)
         sites = objective.stage_sites(shapes, held)
@@ -256,7 +264,8 @@ class StageLocal:
         return self.staged(rows, stacked)
 
     def _stacked_sharding(self, row: NamedSharding, stacked: int) -> NamedSharding:
-        return _sharded(row, self.mesh, (STAGE_AXIS, *[None] * (stacked - 1), *row.spec))
+        stage = STAGE_AXIS if STAGE_AXIS in self.mesh.axis_names else None
+        return _sharded(row, self.mesh, (stage, *[None] * (stacked - 1), *row.spec))
 
     def rows_placement(self, placement):
         """`placement`'s stored layers' own: each row the spec its stacked leaf gives it past the stack,

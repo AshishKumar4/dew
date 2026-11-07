@@ -759,7 +759,7 @@ class Scanning(Protocol):
     """A decoder whose like layers, and those repeating one period, can run under flax's scan
     (`CausalTransformer.scan_layers`): CausalTransformer, and a wrapper over one."""
 
-    def with_scanned_layers(self) -> Self: ...
+    def with_scanned_layers(self, scanned: bool = True) -> Self: ...
 
 
 @runtime_checkable
