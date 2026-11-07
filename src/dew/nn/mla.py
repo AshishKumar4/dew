@@ -330,12 +330,13 @@ class MultiHeadLatentAttention(LinearProducts):
     """
 
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
-                                                 "position_bias", "tree_parents"})
+                                                 "key_valid", "position_bias", "tree_parents"})
     """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a dense layer's pairwise mask or key
-    runs, the key positions they are read at and a position bias, on an uncached call, as the standard
-    attention reads them, and its pairwise mask or key runs over its cache on a cached one, a tree call's
-    among them (`AttentionMetadata.tree_parents`, `_cached_visibility`); an indexed layer narrows its keys
-    by the documents, the rows' validity and its own selection alone, and refuses them (`_check_call`)."""
+    runs, the key positions they are read at, its keys' validity and a position bias, on an uncached call,
+    as the standard attention reads them, and its pairwise mask or key runs over its cache on a cached one,
+    a tree call's among them (`AttentionMetadata.tree_parents`, `_cached_visibility`); an indexed layer
+    narrows its keys by the documents, the rows' validity and its own selection alone, and refuses them
+    (`_check_call`)."""
 
     emb_features: int
     num_heads: int
@@ -804,8 +805,9 @@ class MultiHeadLatentAttention(LinearProducts):
         if own is None and not (groups or window is not None or self.attention_chunk is not None):
             return None, False
         if own is not None:
+            # The call's own visibility replaces the layer's, its keys' validity with it (`CallVisibility`).
             mask, runs, window, key_places = own.mask, own.runs, own.window, own.key_places
-            causal, segment_ids, groups, valid, places = False, None, {}, None, key_places
+            causal, segment_ids, groups, valid, places = False, None, {}, own.valid, key_places
         else:
             mask = runs = None
             key_places = places
@@ -826,12 +828,14 @@ class MultiHeadLatentAttention(LinearProducts):
             name for name, given in (("pairwise_mask", metadata.pairwise_mask),
                                      ("key_runs", metadata.key_runs),
                                      ("tree_parents", metadata.tree_parents),
+                                     ("key_valid", metadata.key_valid),
                                      ("key_positions", metadata.key_positions),
                                      ("position_bias", metadata.position_bias)) if given is not None]
         if own and selecting:
             raise ValueError(f"an indexed mla layer selects among every key before each query, and reads "
                              f"none of {', '.join(own)}")
-        uncached = [name for name in own or () if name == "position_bias"]
+        # A cached call's keys are its cache's, whose validity it holds (`cached_validity`).
+        uncached = [name for name in own or () if name in ("position_bias", "key_valid")]
         if uncached and call.decode:
             raise ValueError(f"an mla layer reads {', '.join(uncached)} on a dense layer's uncached call, "
                              "its keys the call's own")
