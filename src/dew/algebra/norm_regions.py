@@ -231,11 +231,12 @@ def _row_weight(graph: Graph, atom, width: int, places: list[int]) -> tuple[jcor
     `offset`), casts between; None else."""
     eqns, found = graph.jaxpr.eqns, []
     atom = graph.uncast(atom, found, widening)
-    broadcast = graph.made(atom, "broadcast_in_dim")
-    if broadcast is None:
+    if graph.made(atom, "broadcast_in_dim") is None:
         return None
-    found.append(broadcast)
-    atom = graph.uncast(eqns[broadcast].invars[0], found, widening)
+    # Laid along the row: broadcast, reshaped to the row's rank first (Flax's `feature_shape`).
+    while (laid := graph.made(atom, "broadcast_in_dim", "reshape")) is not None:
+        found.append(laid)
+        atom = graph.uncast(eqns[laid].invars[0], found, widening)
     offset = False
     if (added := graph.made(atom, "add")) is not None:
         one, atom = _constant_beside(graph, eqns[added].invars)
