@@ -200,7 +200,7 @@ class Process(schedule: NoiseScheduler, prediction: PredictionTransform, weighti
   .times(self, steps: int) -> jax.Array
   .variances(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]
   .weight(self, t) -> jax.Array
-class ProfileWindow(directory: str, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>, reports: bool = True) -> None  [dew.training.profiling]
+class ProfileWindow(directory: str, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>, reports: bool = True, wait: bool = False) -> None  [dew.training.profiling]
 class Profiler(directory: str | os.PathLike[str] | None = None, *, options: jax.profiler.ProfileOptions | None = None, reports: bool = True) -> None  [dew.telemetry.profile]
   .captures: property -> tuple[Path, ...]
   .directory: property -> Path | None
@@ -994,6 +994,7 @@ dew.training.profiling.ProfileWindow
   warmup: int = 2
   capture: dew.telemetry.profile.CaptureOptions = dew.telemetry.profile.CaptureOptions()
   reports: bool = True
+  wait: bool = False
 dew.training.profiling.RunProfile
   steps: int = 2
   warmup: int = 10
