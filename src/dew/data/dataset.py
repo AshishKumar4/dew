@@ -1656,7 +1656,11 @@ class RampedStream(Forwarding):
     records left in the buffer are a suffix of that last read, as a step reads one
     whole batch only where the buffer holds less than its own. Every reader of an
     elastic read keeps every count-th record of each batch, so the records skipped
-    are each reader's first ones and any process count resumes it (row 1913).
+    are each reader's first ones and any process count resumes it (row 1913). A read's
+    short last batch comes to every reader filled to its share's rows, its repeats
+    marked (`FilledBatch`), so the ramp cuts every reader's rows alike and its steps
+    carry the marks, a step past the read's last record all repeats; the records
+    the position counts there include the repeats, on every reader alike (row 4811).
     """
 
     # MaxText reference: common/data_loader.py:122-176.
@@ -1713,13 +1717,6 @@ class RampedStream(Forwarding):
             read = next(self._source, None)
             if read is None:
                 break
-            if self._elastic and VALID_ROWS in read and not np.all(read[VALID_ROWS]):
-                # Each reader marks its own share of a short last batch real, none the order's count of them
-                # (row 4811).
-                raise ValueError("a batch ramp over an elastic read reached the read's last batch, kept "
-                                 "short and filled, whose real records no reader counts for every reader, "
-                                 "so no ramp step can end where they end on every reader alike; drop the "
-                                 "read's short last batch (`batch(..., drop_remainder=True)`) or repeat it")
             if self._skip:
                 read = take_batch(read, slice(self._skip // self._partition.count, None))
                 self._skip = 0

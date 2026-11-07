@@ -732,20 +732,30 @@ def test_a_ramped_elastic_read_reads_one_readers_steps_and_resumes_on_another_co
             whole[step][at] for index in range(resumed) for at in range(index, len(whole[step]), resumed)]
 
 
-def test_a_ramped_elastic_read_that_keeps_its_short_last_batch_is_refused_where_it_reaches_it():
-    """A ramp over an elastic read that ends keeping its short last batch, filled, is refused where it
-    reaches that batch, each reader marking its own share of the batch's real records and none their
-    count, which a ramp step's end on every reader needs; one that drops it ramps to its end."""
+@pytest.mark.parametrize("count", [2, 4])
+def test_a_ramped_elastic_read_that_keeps_its_short_last_batch_cuts_it_alike_on_every_reader(count):
+    """A ramp over an elastic read that ends keeping its short last batch cuts it alike on every reader: each
+    step's shares, interleaved, are one reader's step, its real records and the marks of its repeats
+    (`VALID_ROWS`) place by place, to the last step, so every reader ends at the same step (row 4811: such a
+    ramp was refused, each reader holding its own share of the batch's real records)."""
     ramp = Ramp(start=4, increment=4, samples=16)
 
-    def read(drop: bool):
+    def steps(index, readers):
         chain = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(30)))).batch(
-            BATCH, drop_remainder=drop).elastic()
-        return ramped(compile(chain, loading=READ, seed=3), ramp).train(DataPartition(0, 2))
+            BATCH, drop_remainder=False).elastic()
+        return list(ramped(compile(chain, loading=READ, seed=3), ramp).train(DataPartition(index, readers)))
 
-    assert sum(len(batch["id"]) for batch in read(drop=True)) == 24 // 2
-    with pytest.raises(ValueError):
-        list(read(drop=False))
+    def places(batch):
+        valid = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+        return [int(row) if real else None for row, real in zip(batch["id"], valid, strict=True)]
+
+    whole = [places(batch) for batch in steps(0, 1)]
+    shares = [[places(batch) for batch in steps(index, count)] for index in range(count)]
+    assert {len(share) for share in shares} == {len(whole)}
+    assert sum(row is not None for step in whole for row in step) == 30
+    for at, step in enumerate(whole):
+        assert [step[place] for place in range(len(step))] == [
+            shares[place % count][at][place // count] for place in range(len(step))]
 
 
 @dataclasses.dataclass(frozen=True)
