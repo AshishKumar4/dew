@@ -1,11 +1,13 @@
 """Beam search against transformers' own and against searches written apart
 from the device loop.
 
-transformers' `_beam_search` (tools/beam_reference.py, 5.16.1) on the
-llama-tiny and qwen3-tiny checkpoints: three prompts, width three, three
-returned beams, six new tokens, an EOS that ends some beams inside the
-budget, under four settings of the length penalty and early stopping. Its
-beams are the float64 search's too, so a rounding cannot choose them.
+transformers' `_beam_search` (tools/beam_worker.py, 5.16.1) on the
+llama-tiny and qwen3-tiny checkpoints over drawn prompts: three prompts,
+width three, three returned beams, six new tokens, an EOS that ends some
+beams inside the budget, under four settings of the length penalty and
+early stopping. Each draw's every ranking is decided by the selection margin
+in Dew's float64 search (`Beam.margins`), so a rounding cannot choose its
+beams.
 
 One more oracle: over a two-token budget with the width set to the vocabulary the
 search is exhaustive, so the returned hypothesis has to be the best-scoring
@@ -21,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import initialized_decoder
-from one_draw import assert_as_exact_as_the_reference
+from reference_runs import assert_arms_as_recorded
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
@@ -68,36 +70,92 @@ PROMPT = [1, 2, 3]
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 
+BEAM_SEEDS = {"llama-tiny": 32, "qwen3-tiny": 32}
+"""Each checkpoint's declared seeds, sized by `seeds_for` paired over margin-cleared draws (`beam_draw`)."""
+PROMPTS, LENGTH, NEW_TOKENS, WIDTH = 3, 6, 6, 3
+SETTINGS = ((1.0, False), (0.0, True), (2.0, "never"), (-1.0, False))
+"""(length_penalty, early_stopping) pairs, tools/beam_reference.py's: the three early-stopping rules, and a
+penalty that rewards, ignores and punishes length."""
+
+
+def _searched(pretrained, ids, eos: int, pad: int, penalty, early, *, margins: bool = False):
+    return generate(pretrained.model, pretrained.variables, jnp.asarray(ids, jnp.int32), NEW_TOKENS,
+                    key=jax.random.key(0), sampling=Sampling(eos_token_ids=eos, pad_token_id=pad), n=WIDTH,
+                    strategy=Beam(width=WIDTH, length_penalty=penalty, early_stopping=early, stop_ids=1,
+                                  margins=margins))
+
+
+def _scored(found, penalty) -> np.ndarray:
+    """Each returned beam's score: its summed log probability over its generated length raised to the
+    penalty, as transformers' `sequences_scores`."""
+    lengths = np.asarray(found.lengths)
+    valid = np.arange(NEW_TOKENS)[None] < lengths[:, None]
+    summed = np.sum(np.where(valid, np.asarray(found.raw_log_probs, np.float64), 0.0), -1)
+    return (summed / lengths ** penalty).astype(np.float32)
+
+
+def _special(name: str) -> tuple[int, int]:
+    with np.load(FIXTURES / name / "beam.npz") as stored:
+        return int(stored["eos"]), int(stored["pad"])
+
+
+def beam_draw(name: str):
+    """`draw(seed)` of checkpoint `name`: PROMPTS unpadded prompts of LENGTH tokens over its vocabulary but
+    its EOS and pad, redrawn until Dew's float64 search decides every ranking of every setting by the
+    selection margin (`Beam.margins`, `selection_margins.MARGIN`), so float32 searches return its beams."""
+    from selection_margins import MARGIN, clearing
+
+    vocabulary = json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"]
+    eos, pad = _special(name)
+    tokens = np.asarray([token for token in range(vocabulary) if token not in (eos, pad)])
+    with jax.enable_x64(new_val=True):
+        truth = Pretrained.load(str(FIXTURES / name), dtype="float64", attention_impl="reference")
+
+    def clears(drawn: dict) -> bool:
+        # In float64 in any process: a recorder's draws run where JAX's float64 is off.
+        with jax.enable_x64(new_val=True):
+            for penalty, early in SETTINGS:
+                found = _searched(truth, drawn["ids"], eos, pad, penalty, early, margins=True)
+                margins = np.asarray(found.margins)
+                if np.any(margins[np.isfinite(margins)] <= MARGIN):
+                    return False
+        return True
+
+    def draw(seed: int) -> dict:
+        rows = np.random.default_rng([53, seed]).choice(tokens, (PROMPTS, LENGTH))
+        return {"ids": rows.astype(np.int32)}
+
+    return lambda seed: clearing(draw, clears)(seed)
+
+
+def beam_scores(name: str):
+    """`dew(dtype, inputs)` of checkpoint `name`: its float32 search's returned beams' scores under each
+    setting (`case_<i>`)."""
+    pretrained = Pretrained.load(str(FIXTURES / name), dtype="float32", attention_impl="reference")
+    eos, pad = _special(name)
+
+    def dew(_, inputs) -> dict:
+        return {f"case_{index}": _scored(_searched(pretrained, inputs["ids"], eos, pad, penalty, early),
+                                        penalty) for index, (penalty, early) in enumerate(SETTINGS)}
+
+    return dew
+
+
+def pipeline_arms(name: str):
+    """tools/venv_reference.py's `beam-<name>` site: its recording, draw, Dew run and leaves."""
+    return (FIXTURES / name / "beam_recording.npz", beam_draw(name), beam_scores(name),
+            tuple(f"case_{index}" for index in range(len(SETTINGS))))
+
+
 @pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])
 def test_beams_are_transformers_beam_search(name):
-    """Every returned beam, its length and its EOS flag as transformers
-    returns them for each prompt, from Dew's batch of the three prompts left
-    padded together, and each beam's score (its summed log probability over
-    its generated length raised to the penalty) held to transformers'
-    float64 search by the float64 rule."""
-    directory = FIXTURES / name
-    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
-    with np.load(directory / "generate.npz") as stored:
-        inputs = ModelInputs(jnp.asarray(stored["prompt"], jnp.int32),
-                             {"attention_mask": jnp.asarray(stored["mask"], bool)})
-        width = stored["prompt"].shape[1]
-    with np.load(directory / "beam.npz") as stored:
-        reference = {key: stored[key] for key in stored.files}
-    eos, pad = int(reference["eos"]), int(reference["pad"])
-    for case, (penalty, early) in enumerate(json.loads(str(reference["settings"]))):
-        found = generate(pretrained.model, pretrained.variables, inputs, 6, key=jax.random.key(0),
-                         sampling=Sampling(eos_token_ids=eos, pad_token_id=pad), n=3,
-                         strategy=Beam(width=3, length_penalty=penalty, early_stopping=early, stop_ids=1))
-        want = reference[f"case_{case}_tokens"]
-        np.testing.assert_array_equal(np.asarray(found.tokens)[:, width:], want, err_msg=f"case {case}")
-        ended = want == eos
-        lengths = np.where(ended.any(-1), ended.argmax(-1) + 1, 6)
-        np.testing.assert_array_equal(np.asarray(found.lengths), lengths, err_msg=f"case {case}")
-        np.testing.assert_array_equal(np.asarray(found.terminated), ended.any(-1), err_msg=f"case {case}")
-        valid = np.arange(6)[None] < lengths[:, None]
-        summed = np.sum(np.where(valid, np.asarray(found.raw_log_probs, np.float64), 0.0), -1)
-        assert_as_exact_as_the_reference(summed / lengths ** penalty, reference[f"case_{case}_scores"],
-                                         reference[f"case_{case}_scores_f64"], f"case {case} scores")
+    """Each returned beam's score (its summed log probability over its generated length raised to the
+    penalty), Dew's float32 search on par with transformers' over drawn prompts whose every ranking the
+    float64 search decides by the selection margin (check 1, the truth transformers' float64 search):
+    under each of four settings of the penalty and early stopping, beams ending on EOS and beams running
+    to the budget alike."""
+    assert_arms_as_recorded(pipeline_arms(name), f"beam-{name}", BEAM_SEEDS[name], f"{name} beam scores",
+                            host=True)
 
 
 @pytest.mark.parametrize("penalty", [0.0])
@@ -157,6 +215,29 @@ def test_asking_for_more_hypotheses_than_the_width_is_refused(model):
     with pytest.raises(ValueError):
         generate(module, params, jnp.asarray([[1, 2, 3]], jnp.int32), 2, key=jax.random.key(0),
                  strategy=Beam(width=2), n=3)
+
+
+@pytest.mark.parametrize(("penalty", "early", "width", "stop_ids"),
+                         [(1.0, False, 2, 1), (0.5, True, 2, 1), (2.0, "never", 2, 1), (1.0, False, 1, 12)])
+def test_a_search_reports_its_margins_without_changing_its_beams(model, penalty, early, width, stop_ids):
+    """A search asked for its margins (`Beam.margins`) returns the beams, lengths, flags and likelihoods it
+    returns unasked, which reports none, a search keeping every candidate of its 13-token vocabulary among
+    them (one beam, twelve stop ids); under a model that scores every token alike each ranking it makes
+    ties, a margin of zero at every step it searches."""
+    module, params = model
+
+    def search(variables, *, margins):
+        return generate(module, variables, jnp.asarray([PROMPT], jnp.int32), 3, key=jax.random.key(0),
+                        sampling=Sampling(eos_token_ids=4, pad_token_id=0), n=width,
+                        strategy=Beam(width=width, length_penalty=penalty, early_stopping=early,
+                                      stop_ids=stop_ids, margins=margins))
+
+    asked, unasked = search(params, margins=True), search(params, margins=False)
+    assert unasked.margins is None
+    for field in ("tokens", "lengths", "terminated", "raw_log_probs"):
+        np.testing.assert_array_equal(np.asarray(getattr(asked, field)), np.asarray(getattr(unasked, field)))
+    alike = np.asarray(search(jax.tree.map(jnp.zeros_like, params), margins=True).margins)
+    assert np.all(alike[:, 0] == 0) and np.all((alike == 0) | np.isposinf(alike))
 
 
 @pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])
