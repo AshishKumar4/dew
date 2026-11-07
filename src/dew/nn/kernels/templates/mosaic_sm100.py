@@ -817,8 +817,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
                  ) -> Accumulator | jax.Array:
         if not isinstance(acc, Accumulator):
             # A sum the walk carries in registers: the product in a fresh accumulator, added to it.
-            return acc + self.summed(acc.shape, lambda fresh: self.products(fresh, lhs, rhs, interpret),
-                                     interpret)
+            return acc + self.summed((acc.shape[0], acc.shape[1]),
+                                     lambda fresh: self.products(fresh, lhs, rhs, interpret), interpret)
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
         if rhs.shape[1] < PADDED:
             rhs = self._padded(rhs)
@@ -850,7 +850,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # tensor core reads it as it runs). A sum the walk carries in registers takes the parts' products
         # in a fresh accumulator, added to it (`summed`).
         if not isinstance(acc, Accumulator):
-            return acc + self.summed(acc.shape, lambda fresh: self.register_products(
+            return acc + self.summed((acc.shape[0], acc.shape[1]), lambda fresh: self.register_products(
                 fresh, parts, rhs, interpret), interpret)
         _, done = self._scratch(acc.shape[1])
         for part in parts:
