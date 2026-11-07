@@ -390,7 +390,9 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     (modeling_gemma2.py:192-208), and `sinks` `[H]` put one value-free logit
     per head in the softmax's denominator (`sink_softmax`). Keys and values
     may carry fewer heads. Without sinks they repeat to the query's, as flax
-    repeats them, which keeps flax's rounding; with sinks the query heads
+    repeats them, which keeps flax's rounding, but in jax.nn's form
+    (`scale_logits`), whose query heads group over their key head as jax.nn's
+    do (`_grouped_as_jax_nn`); with sinks the query heads
     group over their key head and no key or value repeats, as the decode
     selector (`attention_kernels.decodes`) needs where it routes a sink
     layer here rather than to the fused decode kernel, which takes sinks on a
@@ -413,6 +415,11 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     dtype = query.dtype
     *rows, length, heads, width = query.shape
     kv_heads, keys = key.shape[-2], key.shape[-3]
+    if scale_logits and sinks is None and not dropout_rate and kv_heads != heads:
+        attend = functools.partial(reference_attention, softcap=softcap, precision=precision,
+                                   force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
+                                   scale_logits=True, mask_fill=mask_fill)
+        return _grouped_as_jax_nn(attend, query, key, value, mask, bias)
     if wide_logits:
         scaled_query, scoring = query.astype(at_least_fp32(dtype)), key.astype(at_least_fp32(dtype))
     elif scale_logits:
@@ -481,6 +488,31 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
     return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
         *rows, length, heads, value.shape[-1])
+
+
+def _grouped_as_jax_nn(attend: Callable, query, key, value, mask, bias) -> jax.Array:
+    """`attend` (the reference's jax.nn form, `scale_logits`) over query heads grouped as jax.nn groups them
+    (`_dot_product_attention_xla`): the query `[..., T, K, G, D]`, a mask or bias of every head
+    `[..., K, G, T, S]` (one shared by the heads read whole), the call mapped over the group with the keys
+    and values whole, so each product is one dot over the grouped batch and no key or value repeats; out
+    `[..., T, H, Dv]`."""
+    *rows, length, heads, width = query.shape
+    kv_heads = key.shape[-2]
+    groups = heads // kv_heads
+
+    def grouped(operand):
+        # A mask's or bias's axis of the group, its heads split as the query's; None where the heads share it.
+        if operand is None or jnp.ndim(operand) < 3 or jnp.shape(operand)[-3] == 1:
+            return operand, None
+        *leading, _, queries, keys = jnp.shape(operand)
+        return jnp.reshape(operand, (*leading, kv_heads, groups, queries, keys)), len(leading) + 1
+
+    (mask, mask_axis), (bias, bias_axis) = grouped(mask), grouped(bias)
+    axis = len(rows) + 2
+    each = jax.vmap(lambda query, mask, bias: attend(query, key, value, mask=mask, bias=bias),
+                    in_axes=(axis, mask_axis, bias_axis), out_axes=axis)
+    out = each(query.reshape(*rows, length, kv_heads, groups, width), mask, bias)
+    return out.reshape(*rows, length, heads, value.shape[-1])
 
 
 def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
