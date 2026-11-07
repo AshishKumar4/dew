@@ -80,6 +80,10 @@ VISIT = "visit"
 """A switch of the owner of what runs (`switch`): a file's tests begin, or the session's end does."""
 UNOPENED = "unopened:"
 """What a process whose GPU backend never opened logs instead of its peak: why, as jax said."""
+BOTH = "readwrite:"
+"""What an open of a checkout file to read and write ('r+', O_RDWR) is logged as: the file is its run's input,
+which the run may have changed in place where no stamp of it shows (a mapped page on a filesystem that stamps
+none), so its record keeps no key (`recorded`, row 2559)."""
 EVIDENCE = (READ, STARTED, PEAK, CLOSED, VISIT, UNOPENED)
 """What a log holds beside the record's inputs."""
 decided: dict[types.CodeType, bool] = {}
@@ -94,13 +98,14 @@ def checkout(name: str, root: str) -> bool:
 
 
 def code_unit(code: types.CodeType, root: str) -> str:
-    """How a record names code object `code` of a checkout file run under `root`: a test file or conftest
-    whole, as its text is the run's; else the file, CODE, and the unit holding the code (ci.py's `units`): the
-    outermost function it lies in, by its qualified name, whose text holds every function and class nested in
-    it, or `TOP`, a module's or a class's body, or a lambda or a generator expression outside any function,
-    whose text the module's top level holds."""
+    """How a record names code object `code` of a checkout file run under `root`: a test file whole, as its
+    text is the run's; else, a conftest among them, the file, CODE, and the unit holding the code (ci.py's
+    `units`): the outermost function it lies in, by its qualified name, whose text holds every function and
+    class nested in it, or `TOP`, a module's or a class's body, or a lambda or a generator expression outside
+    any function, whose text the module's top level holds. A conftest's fixture or hook is so the input of the
+    files whose runs ran it alone (row 4385: every file's key held the whole of tests/conftest.py)."""
     name = code.co_filename[len(root):]
-    if Path(name).name.startswith("test_") or Path(name).name == "conftest.py":
+    if Path(name).name.startswith("test_"):
         return f"{name}{CODE}{WHOLE}"
     unit = code.co_qualname.split(".<locals>", 1)[0]
     body = not code.co_flags & OPTIMIZED
@@ -109,7 +114,10 @@ def code_unit(code: types.CodeType, root: str) -> str:
 
 def coded(event: str, args: tuple, root: str) -> str | None:
     """The unit (`code_unit`) of the checkout function whose code a run took (`object.__getattr__`'s audit of
-    `__code__`): its body is then the run's input though it never ran (its constants, its bytecode)."""
+    `__code__`): its body is then the run's input though it never ran (its constants, its bytecode). A take of
+    `inspect`'s for a signature, a code flag or a file (`SIGNED`), which pytest's collection makes of every
+    fixture a conftest defines, taken or not, reads what the module's top level holds alone: the function's
+    `def` line, its generator's or coroutine's mark (digests.py's `digested`) and its file (row 4385)."""
     if event != "object.__getattr__" or args[1] != "__code__" or getattr(taking, "code", False):
         return None
     taking.code = True
@@ -117,9 +125,24 @@ def coded(event: str, args: tuple, root: str) -> str | None:
         code = getattr(args[0], "__code__", None)
     finally:
         taking.code = False
-    if isinstance(code, types.CodeType) and checkout(code.co_filename, root):
-        return code_unit(code, root)
-    return None
+    if not isinstance(code, types.CodeType) or not checkout(code.co_filename, root):
+        return None
+    unit = code_unit(code, root)
+    # The frame that took it, beneath this and the audit hook that called it.
+    taker = sys._getframe(2).f_code
+    if taker.co_filename == INSPECT and taker.co_name in SIGNED and not unit.endswith(WHOLE):
+        return f"{code.co_filename[len(root):]}{CODE}{TOP}"
+    return unit
+
+
+INSPECT = os.path.join(os.path.dirname(os.__file__), "inspect.py")
+"""The standard library's `inspect`, by its file, which this module does not import: it imports what it
+must."""
+SIGNED = frozenset({"_signature_from_function", "_signature_is_functionlike", "_has_code_flag", "getfile"})
+"""`inspect`'s functions that take a function's code for what its `def` line and file decide alone, the same
+in Python 3.10 to 3.14: a signature (`signature`'s), a code flag (`isgeneratorfunction`'s,
+`iscoroutinefunction`'s) and the file (`getfile`'s). Its `findsource` and `getclosurevars` read the body, and
+so key it."""
 
 
 taking = threading.local()
@@ -150,11 +173,13 @@ def read(event: str, args: tuple, root: str) -> str | None:
     path = args[0]
     if isinstance(path, int):
         return None
+    both = False
     if event == "open":
+        # An open that reads, whether or not it writes too ('r+', O_RDWR): one only to write is no read.
         mode, flags = args[1], args[2]
-        written = any(letter in mode for letter in "wax+") if mode is not None else (
-            flags & os.O_ACCMODE != os.O_RDONLY)
-        if written or (mode is None and getattr(placing, "relative", False)):
+        reads = ("r" in mode or "+" in mode) if mode is not None else flags & os.O_ACCMODE != os.O_WRONLY
+        both = ("+" in mode) if mode is not None else flags & os.O_ACCMODE == os.O_RDWR
+        if not reads or (mode is None and getattr(placing, "relative", False)):
             return None
         # The source loader's read of the module's text on its way to compiling it (its get_code beneath
         # get_data), not a caller's get_source or get_data, nor a sourceless loader's bytecode, nor
@@ -174,7 +199,8 @@ def read(event: str, args: tuple, root: str) -> str | None:
     cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
     if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
         return LIMITS[os.path.basename(name)]
-    return placed(name, root)
+    place = placed(name, root)
+    return f"{BOTH}{place}" if both and place is not None else place
 
 
 def placed(name: str, root: str) -> str | None:
@@ -213,9 +239,9 @@ body lacks: the child imports no more of the standard library than it must."""
 TOP = "<module>"
 """The unit of a module's top level: all its text but its functions' bodies (ci.py's `units`)."""
 WHOLE = "<file>"
-"""The unit of a test file or a conftest a run executed: its code whole, no comment, docstring or position
-of it (ci.py's `code_of`), as the run's tests are all of it; a read of its text, an `inspect` or a
-traceback's, is its bytes'."""
+"""The unit of a test file a run executed: its code whole, no comment, docstring or position of it (ci.py's
+`code_of`), as the run's tests are all of it; a read of its text, an `inspect` or a traceback's, is its
+bytes'."""
 LOOKUP = "lookup:"
 """What an import's search of a checkout directory for a name is recorded under (`missed`), the directory
 and the name: ci.py's `contents` keys the entries there an import of the name finds (a module, a package, an
@@ -248,9 +274,9 @@ def opening(recorded: Callable[[str], None], root: str) -> None:
             descriptor = plain(path, flags, mode, dir_fd=dir_fd)
         finally:
             placing.relative = False
-        if flags & os.O_ACCMODE == os.O_RDONLY and (name := placed(
+        if flags & os.O_ACCMODE != os.O_WRONLY and (name := placed(
                 os.readlink(f"/proc/self/fd/{descriptor}"), root)) is not None:
-            recorded(name)
+            recorded(f"{BOTH}{name}" if flags & os.O_ACCMODE == os.O_RDWR else name)
         return descriptor
 
     os.open = opened
@@ -516,18 +542,21 @@ def follow() -> None:
     sys.addaudithook(audited)
 
 
-def gpu_memory() -> tuple[int, int] | str:
-    """The GPU pool this process held and the most memory it used, read as its last atexit before jax's
-    backend closes; or why the backend never opened, as jax said, where it holds none."""
+def gpu_memory(backend: str = "gpu") -> tuple[int, int] | str:
+    """The pool this process held on `backend`'s devices and the most memory it used, read as its last atexit
+    before jax's backend closes; or why it cannot say: the backend never opened, as jax said, or no device
+    states the most it used (a backend whose allocator keeps no peak), never a peak of 0 it did not read."""
     import jax
 
     try:
-        devices = jax.local_devices(backend="gpu")
+        devices = jax.local_devices(backend=backend)
     except RuntimeError as error:  # the backend failed to open, and holds no pool
         return " ".join(str(error).split())
     stats = [device.memory_stats() or {} for device in devices]
-    return (sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats),
-            max(stat.get("peak_bytes_in_use", 0) for stat in stats))
+    peaks = [stat["peak_bytes_in_use"] for stat in stats if "peak_bytes_in_use" in stat]
+    if not peaks:
+        return f"no {backend} device states the most memory it used (peak_bytes_in_use)"
+    return sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats), max(peaks)
 
 
 def logged(path: Path) -> dict:
@@ -627,7 +656,10 @@ def recorded(path: Path) -> dict[str, dict]:
             item for item in shared if not item.startswith(EVIDENCE)}
         held = [each for each in (*peaks, child["peak"], shared_child["peak"]) if each is not None]
         out[file] = {
-            "depends": sorted(inputs | child["files"] | shared_child["files"]) if whole else None,
+            "depends": (sorted(inputs | child["files"] | shared_child["files"])
+                        if whole and not any(item.startswith(BOTH)
+                                             for item in inputs | child["files"] | shared_child["files"])
+                        else None),
             "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
             "peak": max(held) if len(files) == 1 and whole and held else None,

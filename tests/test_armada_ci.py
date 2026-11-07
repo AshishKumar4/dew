@@ -202,18 +202,21 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
 
 def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_override(ci, tmp_path):
     """`ci.py pytest`, which a lane's targeted run uses (tmp/run_tests.py), runs the tests a CI task would,
-    with the task's own marker selection: a network test is deselected; a `-m` of the caller's own, after
-    the selection, chooses instead. Its exit status is pytest's."""
+    with the task's own marker selection: a network test and a whole_suite cell are deselected; a `-m` of the
+    caller's own, after the selection, chooses instead; with `whole`, as main's whole run selects, its
+    whole_suite cells run, as a bisect of its red runs them (row 4230). Its exit status is pytest's."""
     written(tmp_path, {"test_marked.py": "import pytest\n\ndef test_offline():\n    pass\n\n\n"
-                                         "@pytest.mark.network\ndef test_online():\n    pass\n"})
+                                         "@pytest.mark.network\ndef test_online():\n    pass\n\n\n"
+                                         "@pytest.mark.whole_suite\ndef test_cell():\n    pass\n"})
     interpreter(tmp_path, "3.12")
 
-    def ran(*arguments: str) -> tuple[int, list[str]]:
+    def ran(*arguments: str, whole: bool = False) -> tuple[int, list[str]]:
         report = tmp_path / "report.xml"
-        status = ci.targeted("3.12", ["tests/test_marked.py", *arguments], report)
+        status = ci.targeted("3.12", ["tests/test_marked.py", *arguments], report, whole=whole)
         return status, [case.get("name") for case in ET.parse(report).iter("testcase")]
 
     assert ran() == (0, ["test_offline"])
+    assert ran(whole=True) == (0, ["test_offline", "test_cell"])
     assert ran("-m", "network") == (0, ["test_online"])
     assert ran("-k", "nothing_matches")[0] == 5
 
@@ -893,7 +896,9 @@ def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tm
     """A census task, run as armada starts it from `plan --census`'s entry, runs its tests with CENSUS set,
     where the accuracy gate compiles check 1's arms with YNNPACK's fusions on (tests/reference_error.py), and
     writes nothing to the test cache: its green row, run in another numerical mode than its inputs say, is
-    reused by no later run, and a red one replaces no green. An ordinary task sees no CENSUS."""
+    reused by no later run, and a red one replaces no green. An ordinary task sees no CENSUS, whatever this
+    test's own process runs under (the census's whole suite sets it here too: row 4660)."""
+    monkeypatch.delenv(ci.check1_wire().CENSUS, raising=False)
     (tmp_path / "tests/test_seen.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
@@ -1106,11 +1111,14 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({".thresh/seams.toml": "[seam]\n"}, "on"), ({"MANIFEST.in": "include LICENSE\n"}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "off"),
+    ({"tools/armada/followed.py": '"""Followed, as each run reads."""\n\n\n# A note.\ndef read(path):\n'
+                                  '    return path\n'}, "on"),
+    ({"tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n    return [path]\n'}, "off"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
         "the test session", "the recorder", "a workflow", "a file no record places", "the changelog",
         "a native kernel package's wrapper", "a type stub", "a license", "thresh's annotations",
         "the manifest",
-        "the pool", "the environment's variables"])
+        "the pool", "the environment's variables", "the harness's wording", "the harness's code"])
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
@@ -1119,10 +1127,14 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file), and a workflow
     is an input of the files that read it alone (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache
     off, and 0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every
-    file's input: an old record may lack a dependency a new recorder finds."""
+    file's input: an old record may lack a dependency a new recorder finds, by its code alone, so an edit of
+    what it says of itself keeps the cache on (Main, 2026-11-07: 12 of 20 trains ran cold on harness
+    edits)."""
     armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
-                       "locks/cpu.txt": "jax==1\n", ".armada.json": armada}.items():
+                       "locks/cpu.txt": "jax==1\n", ".armada.json": armada,
+                       "tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n'
+                                                   '    return path\n'}.items():
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text(text)
     git(tmp_path, "init", "-q", "-b", "main")
@@ -1270,11 +1282,12 @@ def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does
 
 def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_code_does(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A test file and a conftest a run executes are its input by their code (followed.py's `WHOLE`): an edit
-    to a comment or a docstring of either, which pytest's assertion rewriter reads to compile and no test
-    reads, reruns nothing, as the owner asks of a comment-only edit (row 4385: one conftest edit re-keyed
-    every file); an edit to what either does reruns the file. A test that reads its own text is that text's
-    reader, keyed by its bytes."""
+    """A test file a run executes is its input by its code (followed.py's `WHOLE`), and a conftest by the
+    units the run executed, as any module (`code_unit`): an edit to a comment of either, or to the test
+    file's docstrings, which pytest's assertion rewriter reads to compile and no test reads, reruns nothing,
+    as the owner asks of a comment-only edit (row 4385: one conftest edit re-keyed every file); an edit to
+    what either does reruns the file. A test that reads its own text is that text's reader, keyed by its
+    bytes."""
     counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
     fixture = "import pytest\n\n\n@pytest.fixture\ndef base():\n"
     written(tmp_path, {"conftest.py": fixture + "    return 1\n",
@@ -1286,7 +1299,7 @@ def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_
     for path, text, runs in (
             ("tests/test_a.py", noted + "    assert base == 1\n", 1),
             ("tests/conftest.py", "import pytest\n\n\n# The base.\n@pytest.fixture\ndef base():\n"
-                                  '    """One."""\n    return 1\n', 1),
+                                  "    # One.\n    return 1\n", 1),
             ("tests/conftest.py", fixture + "    return 2 - 1\n", 2),
             ("tests/test_a.py", "def test_a(base):\n" + counted + "    assert base == len(['one'])\n", 3)):
         (tmp_path / path).write_text(text)
@@ -1299,6 +1312,111 @@ def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_
         (tmp_path / "tests/test_a.py").write_text(text)
         commit(tmp_path, "the test reads itself")
         assert run() == runs
+
+
+def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci, tmp_path, monkeypatch,
+                                                                             cache_worker):
+    """A run that reads a checkout file and writes it keeps no key, however it writes it: Python's write, one
+    handle that reads and writes, a truncation, a mapped page, a removal and a new file in its place, through
+    an alias of what it read, under a nested hidden directory, a copy that puts the file's time back, or a
+    native writer (sqlite's); nor does one that found a file absent and made it: its key would hash the
+    checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its review).
+    A file a run only writes, as each run here appends to `runs`, is no input and leaves its key."""
+    import sqlite3
+
+    counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/page.txt").write_text("page\n")
+    (tmp_path / "tests/fixtures").mkdir(parents=True)
+    with sqlite3.connect(tmp_path / "tests/fixtures/rows.db") as database:
+        database.execute("create table t (x)")
+    database.close()
+    page = "    page = Path('docs/page.txt')\n"
+    # An alias of the page, a file under a nested hidden directory, and a file of the page's size whose copy
+    # over it puts its time back.
+    (tmp_path / "docs/link.txt").symlink_to("page.txt")
+    (tmp_path / "docs/.data").mkdir()
+    (tmp_path / "docs/.data/input.txt").write_text("input\n")
+    (tmp_path / "docs/same.txt").write_text("PAGE\n")
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    for test, body in (
+            ("plain", "    assert True\n"),
+            ("python", page + "    page.write_text(page.read_text())\n"),
+            ("one handle", "    with open('docs/page.txt', 'r+') as held:\n"
+                           "        held.write(held.read())\n"),
+            ("truncated", page + "    assert page.read_text()\n    os.truncate(page, 5)\n"),
+            ("mapped", "    with open('docs/page.txt', 'r+b') as held, \\\n"
+                       "            mmap.mmap(held.fileno(), 0) as mapped:\n"
+                       "        mapped[0:1] = mapped[0:1].upper()\n"),
+            ("replaced", page + "    text = page.read_text()\n    page.unlink()\n"
+                                "    page.write_text(text)\n"),
+            ("aliased", "    assert Path('docs/link.txt').read_text()\n"
+                        "    Path('docs/page.txt').write_text('page\\n')\n"),
+            ("hidden", "    held = Path('docs/.data/input.txt')\n    held.write_text(held.read_text())\n"),
+            ("restored", page + "    assert page.read_text()\n    stamp = page.stat()\n"
+                                "    os.utime('docs/same.txt', ns=(stamp.st_atime_ns, stamp.st_mtime_ns))\n"
+                                "    shutil.copy2('docs/same.txt', page)\n"),
+            ("made", "    made = Path('docs/made.txt')\n    if not made.exists():\n"
+                     "        made.write_text('made\\n')\n"),
+            ("native", "    with sqlite3.connect('tests/fixtures/rows.db') as database:\n"
+                       "        database.execute('insert into t values (1)')\n"
+                       "    database.close()\n")):
+        written(tmp_path, {"test_a.py": "import mmap\nimport os\nimport shutil\nimport sqlite3\n"
+                                        "from pathlib import Path\n\n\ndef test_a():\n" + counted + body})
+        (tmp_path / "runs").unlink(missing_ok=True)
+        commit(tmp_path, test)
+        assert [run(), run()] == ([1, 1] if test == "plain" else [1, 2]), test
+
+
+def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(ci, tmp_path, monkeypatch,
+                                                                              cache_worker):
+    """A conftest is keyed by the units each run executed, as any module is (followed.py's `code_unit`): an
+    edit to a fixture no run took reruns nothing, one to the fixture a file's tests took reruns that file
+    alone, and one to a hook every run runs reruns every file (row 4385: every file's key held the whole of
+    tests/conftest.py, so one conftest edit reran the suite)."""
+    counted = "    with open('runs-{0}', 'a') as runs: runs.write('x')\n"
+    written(tmp_path, {
+        "conftest.py": "import pytest\n\n\ndef pytest_configure(config):\n"
+                       "    config.addinivalue_line('markers', 'mine: a mark')\n\n\n"
+                       "@pytest.fixture\ndef base():\n    return 1\n\n\n"
+                       "@pytest.fixture\ndef other():\n    return 2\n",
+        "test_user.py": "def test_user(base):\n" + counted.format("user") + "    assert base\n",
+        "test_none.py": "def test_none():\n" + counted.format("none") + "    assert True\n"})
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    out, names = tmp_path / "verdict.json", ("user", "none")
+
+    def run() -> list[int]:
+        # Each file a task of its own: a task's later files share what its earlier ones ran.
+        for name in names:
+            ci.task("3.12", [f"tests/test_{name}.py"], "", out, 600.0)
+            assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0], name
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in names]
+
+    assert run() == [1, 1]
+    assert run() == [1, 1]
+    conftest = tmp_path / "tests/conftest.py"
+    for old, new, runs in (("return 2", "return 3", [1, 1]), ("return 1", "return 4 - 3", [2, 1]),
+                           ("a mark", "the mark", [3, 2])):
+        conftest.write_text(conftest.read_text().replace(old, new))
+        assert run() == runs, new
+
+
+def test_a_pytest_option_the_supervisor_inherits_selects_nothing_a_row_is_kept_on(ci, tmp_path, monkeypatch,
+                                                                                  cache_worker):
+    """What a task's pytest selects and loads is its command's alone, which every row's key holds
+    (session.py's `selected` and `pytest_command`, among `SHARED`): an inherited PYTEST_ADDOPTS or
+    PYTEST_PLUGINS is no part of its run (session.py's `UNKEYED`), so a run under one that deselects a red
+    test is red, and no later run reuses a green row its tests would not give (row 2558)."""
+    written(tmp_path, {"test_a.py": "def test_passes():\n    assert True\n\n\n"
+                                    "def test_fails():\n    assert False\n"})
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-k 'not test_fails'")
+    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict)] == [1]
+    monkeypatch.delenv("PYTEST_ADDOPTS")
+    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict)] == [1]
 
 
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
@@ -2058,8 +2176,7 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
     # Main's whole run's gates start after every lane's run at a head, as its suite does.
-    for ref, whole, priority in (("fix/lane", "", []), ("ci/batch-abc-1", "", ["--priority=10"]),
-                                 ("ci/stage-abc-1", "", ["--priority=5"]), ("main", "", ["--priority=5"]),
+    for ref, whole, priority in (("fix/lane", "", []), ("main", "", ["--priority=5"]),
                                  ("main", "1", ["--priority=-15"])):
         script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
         environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref,
@@ -2092,7 +2209,7 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
     assert cold == {tests: weight + ci.COLD_SECONDS for tests, weight in warm.items()}
 
     def deadline(policy: str) -> list[str]:
-        calls = suite_step(tmp_path / f"cold-{policy}", "ci/batch-abc-1", "", policy, 2)
+        calls = suite_step(tmp_path / f"cold-{policy}", "fix/lane", "", policy, 2)
         [run] = [call for call in calls if call[0] == "run"]
         return [word for word in run if word.startswith("--deadline")]
 
@@ -2108,29 +2225,15 @@ def run_options(tmp_path: Path, ref: str, policy: str, option: str, whole: bool 
     return [word for word in run if word.startswith(option)]
 
 
-def test_a_staged_trains_suite_asks_no_more_than_its_lease(tmp_path):
-    """A train staged on the testing train's tip runs its suite on the pool its branch names
-    (ci/stage-...-p<N>, the share of its lease the queue's promote.sh leaves the suite), never the whole
-    pool, so it asks armada no more than it leased (the maintainer, 2026-10-28); a train on main asks the
-    whole pool."""
-    assert run_options(tmp_path, "ci/stage-abc-1-p120", "on", "--pool") == ["--pool=120"]
-    assert run_options(tmp_path, "ci/batch-abc-1", "on", "--pool") == []
-
-
 def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
-    """A push to base/kernels and a base/<producer> promote run their suite
-    at a lane's whole-suite priority, -10 as verdict.sh's, so they never take containers from a train (10)
-    or a lane's precheck or targeted run (0); a train's runs at 10, and a lane's branch at the default
-    (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger)."""
+    """A push to base/kernels runs its suite at a lane's whole-suite priority, -10 as verdict.sh's, so it
+    never takes containers from a lane's precheck or targeted run (0), and a lane's branch at the default
+    (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger); a train's CI is the
+    queue's gates on the hub, which set its own (runbooks/hub.md)."""
     def priority(ref: str) -> list[str]:
         return run_options(tmp_path, ref, "off", "--priority")
 
-    for ref in ("base/kernels", "ci/base-abc-1"):
-        assert priority(ref) == ["--priority=-10"], ref
-    assert priority("ci/batch-abc-1") == ["--priority=10"]
-    # A train staged on the testing train's tip runs beside it, below it (owner and the maintainer,
-    # 2026-10-28).
-    assert priority("ci/stage-abc-1") == ["--priority=5"]
+    assert priority("base/kernels") == ["--priority=-10"]
     assert priority("fix/lane") == []
     # Main's whole run (the schedule's, the queue's whole dispatch) is background work, below every lane's run
     # at a head (verdict.sh's -10), so no head waits behind it (Main, 2026-11-06); a push to main stays its

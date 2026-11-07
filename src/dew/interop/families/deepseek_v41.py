@@ -10,21 +10,21 @@ pins.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from types import MappingProxyType
 
 import numpy as np
 
 from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.decoder_config import read_only
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     NO_AUDIO,
     DecoderFamily,
     DecoderFields,
     KindFields,
-    Ropes,
     WrapperFields,
-    base_config,
-    dew_path,
+    in_trunk,
     kind_mixers,
     record_float,
     record_int,
@@ -33,15 +33,17 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.families.deepseek import (
     DSPARK_LEAVES,
-    V4_LAYER_NAMES,
+    V4_DECODER,
     V4_SCORES,
-    V4_TRUNK,
-    deepseek_v4_prepare,
     dspark_fields,
     dspark_kept,
-    dspark_path,
     v4_depth,
+    v4_layer_routes,
+    v4_prepare,
+    v4_routes,
 )
+from dew.interop.layouts import Route, mapped, one_of
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
@@ -193,11 +195,8 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
     kinds, layer_types, shared = _v41_kinds(text, layers, ratios[:layers], modes, fields,
                                           compressed, index, seen)
     moe = record_int(text, 'moe_intermediate_size')
-    base_used: set[str] = set()
-    config = base_config({**text, 'intermediate_size': moe, 'num_key_value_heads': 1,
-                           'tie_word_embeddings': text.get('tie_word_embeddings', False)},
-                          base_used, layer_types=tuple(layer_types), rope=Ropes(main_theta))
-    seen.update(base_used - {'intermediate_size'})
+    config = V4_DECODER.read(text, seen, NativeFields(CausalTransformer, {'layer_types': tuple(layer_types)}))
+    config['rope_theta'] = main_theta
     scoring = text.get('scoring_func', 'sqrtsoftplus')
     if scoring not in V4_SCORES:
         refuse(f"scoring_func {scoring!r}", f"the router scores with one of {sorted(V4_SCORES)}")
@@ -302,17 +301,6 @@ def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | No
             pad_token_id=record_int(text, 'engram_pad_token_id', 2))
 
 
-# The release's own names inside a layer, before those V4 shares
-# (`V4_LAYER_NAMES`). The indexer keeps V3.2's leaf names (wq_b, wk,
-# k_norm, weights_proj), which the shared reader already places under
-# self_attn/indexer.
-_DEEPSEEK_V41_NAMES = (
-    ('.compressor.norm.', '.compressor.kv_norm.'),
-    ('.attn.wq_a.', '.attn.q_a_proj.'), ('.attn.wq_b.', '.attn.q_b_proj.'), ('.attn.wkv.', '.attn.kv_proj.'),
-    ('.compressor.wkv.', '.compressor.kv_proj.'), ('.compressor.wgate.', '.compressor.gate_proj.'),
-    ('.gate.bias_vl', '.gate.media_bias'),
-    *V4_LAYER_NAMES,
-)
 # V4.1's Markov tables (v41:1077-1081), beside the leaves both releases name.
 _V41_DSPARK_LEAVES: dict[str, tuple[str, ...]] = {
     **DSPARK_LEAVES,
@@ -322,24 +310,22 @@ _ENGRAM_LEAVES: dict[str, tuple[str, ...]] = {
     'q_weight': ('q_weight',), 'k_weight': ('k_weight',)}
 
 
-def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the decoder's path for one DeepSeek-V4.1 tensor name, the
-    DSpark drafter's `mtp.*` included; the tied head's copy is None."""
-    if name.startswith('mtp.'):
-        return dspark_path(name, config, _V41_DSPARK_LEAVES, _deepseek_v41_path)
-    name = V4_TRUNK.get(name, name)
-    parts = name.split('.')
-    if len(parts) >= 4 and parts[0] == 'layers' and parts[1].isdigit() and parts[2] == 'engram':
-        leaf = '.'.join(parts[3:])
-        if leaf not in _ENGRAM_LEAVES:
-            raise ValueError(f"unknown tensor name {name!r}")
-        return ('params', f'layers_{parts[1]}', 'engram', *_ENGRAM_LEAVES[leaf])
-    if not (len(parts) >= 3 and parts[0] == 'layers' and parts[1].isdigit()):
-        return dew_path(name, config)
-    tail = '.' + '.'.join(parts[2:])
-    for theirs, ours in _DEEPSEEK_V41_NAMES:
-        tail = tail.replace(theirs, ours)
-    return dew_path(f"model.layers.{parts[1]}{tail}", config)
+DEEPSEEK_V41_ROUTES = v4_routes(
+    v4_layer_routes(
+        # V4.1's compressor sits under the layer and under its indexer, which keeps V3.2's leaf names.
+        mapped({'compressor': 'compressor', 'indexer.compressor': 'indexer/compressor'}),
+        mapped({'bias': 'e_score_correction_bias', 'tid2eid': 'tid2eid', 'bias_vl': 'media_bias'}),
+        *(Route('layers.{layer}.attn.indexer.{projection}.weight',
+                'params/layers_{layer}/self_attn/indexer/{projection}/kernel',
+                MappingProxyType({'projection': one_of('wq_b', 'wk', 'weights_proj')}), in_trunk),
+          Route('layers.{layer}.attn.indexer.k_norm.weight',
+                'params/layers_{layer}/self_attn/indexer/k_norm/scale', when=in_trunk),
+          *(Route(f'layers.{{layer}}.engram.{name}', 'params/layers_{layer}/engram/' + '/'.join(path),
+                  when=in_trunk) for name, path in _ENGRAM_LEAVES.items()))),
+    _V41_DSPARK_LEAVES)
+"""DeepSeek-V4.1's names: V4's layer, its compressor under the indexer and the image span's router bias
+`bias_vl` beside the balancing one, each layer's engram, and the DSpark drafter's `mtp.*`; the tied
+head's copy fills no leaf."""
 
 
 def _deepseek_v41_constants(directory, record: Mapping[str, object]) -> Mapping[str, object]:
@@ -380,11 +366,14 @@ def _deepseek_v41_constants(directory, record: Mapping[str, object]) -> Mapping[
 # V4.1 is V4's block under CSA2's compressor, which names the family; the
 # hub's table registers it.
 DEEPSEEK_V41 = DecoderFamily(
-    ('deepseek_v41',), _deepseek_v41_config,
+    ('deepseek_v41',),
+    read_only(_deepseek_v41_config, "a V4.1 model is written as its release, whose text_config no exporter "
+              "of Dew's states"),
     lambda fields: any(isinstance(mixer, DeepseekV4Mixer) and mixer.compressor == 'csa2'
                        for mixer in kind_mixers(fields)),
-    'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
-    weight_path=_deepseek_v41_path, prediction_depth=v4_depth, prepare=deepseek_v4_prepare,
+    'deepseek_v41', 'DeepseekV41ForCausalLM',
+    routes=DEEPSEEK_V41_ROUTES, prediction_depth=v4_depth, prepare=v4_prepare(DEEPSEEK_V41_ROUTES),
+    folded=('o_a_proj/kernel',),
     preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight'),
     prediction_counts=('num_nextn_predict_layers', 'n_mtp_layers'), whole_drafter=dspark_kept,
     constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,

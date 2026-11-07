@@ -108,28 +108,19 @@ def write_legacy() -> None:
               + (f" = {float(value):.6f}" if value.ndim == 0 else ""))
 
 
-class Numpy(types.ModuleType):
-    """jax.numpy with `float32`, which the loss casts its softmaxes to, as
-    the run's precision: the float64 run is the same code in float64."""
-
-    def __init__(self, dtype):
-        super().__init__("jax.numpy")
-        self.float32 = dtype
-
-    def __getattr__(self, name):
-        import jax.numpy as jnp
-
-        return getattr(jnp, name)
-
-
 def published_methods(dtype) -> tuple[dict, float]:
     """`Indexer.generate_mask` and `MLA.calculate_indexer_loss` from
     attention_mla.py, with the module scope they read, at `dtype`."""
     import jax
+    import jax.numpy as jnp
+    from flax_precision import Widened
     from jax.ad_checkpoint import checkpoint_name
     from reference_source import defined_in, definitions, fetched
 
-    scope = {"jax": jax, "jnp": Numpy(dtype), "checkpoint_name": checkpoint_name, "np": np,
+    # The float32 the loss casts its softmaxes to read as the run's precision: the float64 run is the same
+    # code in float64 (tools/flax_precision.py's one widening).
+    scope = {"jax": jax, "jnp": Widened(("float32",)) if dtype == jnp.float64 else jnp,
+             "checkpoint_name": checkpoint_name, "np": np,
              "Array": jax.Array, "Optional": __import__("typing").Optional}
     definitions(MAXTEXT + "utils/globals.py", {"EPS"}, scope)
     definitions(MAXTEXT + "common/common_types.py", {"DEFAULT_MASK_VALUE"}, scope)

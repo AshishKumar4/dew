@@ -296,14 +296,8 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     def draw(seed):
         return scan_operands(*SHARDED, documents=True, seed=seed)[0]
 
-    # One float64 program for every seed's truth: the scan's reference math, which the port chosen below
-    # refuses for float64 operands.
-    wide = through(32, starts, *widened((dy, dfinal)))
-
-    @jax.jit
-    def exact(*operands):
-        with row_names_port("ssd", "pallas", port=False):
-            return wide(*operands)
+    # One float64 program for every seed's truth: the scan's reference math, the one float64 operands take.
+    exact = jax.jit(through(32, starts, *widened((dy, dfinal))))
 
     def spec(rank: int, axes: tuple[int, ...]):
         return PartitionSpec(*(axis if dim in axes else None for dim in range(rank)))
@@ -314,6 +308,12 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
              spec(4, rows + heads), spec(4, rows + heads), spec(1, (0,) if heads else ()),
              spec(4, rows + ((1,) if heads else ()))]
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    with row_names_port("ssd", "pallas"):
-        assert_runs_per_shard(run, draw, specs, mesh, f"ssd split over {axis}", seeds=SHARDED_SEEDS,
-                              truth_fn=exact)
+
+    def ported(*operands):
+        # The port entered inside the arm, under check 1's own scope (`summed_as_run`), which would hand
+        # an fp32 call on to XLA (`row_names_port`).
+        with row_names_port("ssd", "pallas"):
+            return run(*operands)
+
+    assert_runs_per_shard(ported, draw, specs, mesh, f"ssd split over {axis}", seeds=SHARDED_SEEDS,
+                          truth_fn=exact)

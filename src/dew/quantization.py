@@ -75,7 +75,7 @@ from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.kernels.generation import backend, linear_map
+from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide
 from dew.nn.sharding import abstract
@@ -1128,23 +1128,6 @@ def _real(*dtypes: jax.typing.DTypeLike) -> bool:
     return not any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes)
 
 
-def _refuse_grouped_on_gpu() -> None:
-    """Refuse a grouped convolution with quantized activations on a GPU,
-    where jax 0.11.2 computed it wrong or failed to compile it (the error
-    says where; in int8 on the A100 the 176M text-to-image model's CLIP score
-    fell from 0.247 to 0.137). The refusal covers every GPU, dtype and group
-    width until an H100 is measured."""
-    if backend() == "gpu":
-        raise ValueError(
-            "Dew refuses to quantize a grouped convolution's activations on a GPU. Measured with jax "
-            "0.11.2: in int8, one input channel per group gives wrong values without an error on the "
-            "RTX 4080 and the A100, and two per group on the RTX 4080; in fp8, one or two per group "
-            "fail to compile on sm_89 (the RTX 4080), the A100 computes it emulated, with no fp8 "
-            "units to gain from, and sm_90 is untested. Leave the convolution out of "
-            "Quantization.patterns, as patterns=('^(?!.*spatial_fusion).*',) does for the hybrid "
-            "DiT's depthwise convolutions, or quantize weights only (weight_only=True)")
-
-
 def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array]:
     """Qwix's quantized `op` with the product of two quantized operands
     scaled in float32, then rounded once to the dtype Qwix returns it in.
@@ -1159,6 +1142,8 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     int8 and from an attention block in fp8, and scaled in float32 it samples
     as well as unquantized (docs/performance.md). A weight-only product, one
     quantized operand, dequantizes before a float matmul and passes through.
+    Qwix 0.1.8.post4 scales a convolution's integer product in at least
+    float32 itself, so a served convolution passes through Qwix's own.
 
     Quantized training runs Qwix's own operations, with no hook for this.
     Its grouped convolutions quantize from float32 instead
@@ -1364,8 +1349,9 @@ def _group_scaled_convolution() -> type:
         group then peaks at 1, so Qwix's single scale is each group's own.
 
         The divided input is float32, so Qwix scales the convolution's 8-bit
-        product in float32 in training as well as in serving
-        (`_scaled_in_float32`), and the output returns to the input's dtype.
+        product in float32 in training as well as in serving (Qwix
+        0.1.8.post4 scales it so whatever its input), and the output returns
+        to the input's dtype.
         From a bf16 input Qwix scaled it in bf16, a form XLA:TPU computes as
         NaN for an int8 depthwise convolution.
         """
@@ -1379,8 +1365,8 @@ def _group_scaled_convolution() -> type:
 
         def dew_conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, *args, **kwargs) -> jax.Array:
             """Dew's convolution, through this provider when a rule
-            quantizes it, so that it keeps the per-group scales and the GPU
-            refusal, and otherwise Dew's own, as the unwrapped model computes
+            quantizes it, so that it keeps the per-group scales, and
+            otherwise Dew's own, as the unwrapped model computes
             it (inside this handler Qwix calls the original). Sent through
             the provider unquantized, an excluded or weight-only dilated
             depthwise convolution took lax's path on CUDA, and quantized
@@ -1418,7 +1404,6 @@ def _group_scaled_convolution() -> type:
             if feature_group_count == 1 or rule is None or rule.act_qtype is None:
                 out = convolve(lhs=lhs)
                 return _honoured(out, preferred_element_type, None) if quantized else out
-            _refuse_grouped_on_gpu()
             numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
             scales = _group_scales(lhs, numbers, feature_group_count).astype(jnp.float32)
             batch, feature = numbers.lhs_spec[:2]
@@ -1493,7 +1478,8 @@ def _complex_in_float() -> type:
 @functools.cache
 def _serving_provider() -> type:
     """The serving provider (`_providers`): Qwix's post-training quantization with Dew's grouped
-    convolution, its products scaled in float32 (`_scaled_in_float32`), a quantized kernel no rule matches
+    convolution, its matmuls' products scaled in float32 (`_scaled_in_float32`) and its convolutions' by
+    Qwix's own (in at least float32 from 0.1.8.post4), a quantized kernel no rule matches
     multiplied by its own recorded recipe, and a quantized kernel's scales promoted with the module's."""
     qwix = _qwix()
 
@@ -1504,7 +1490,7 @@ def _serving_provider() -> type:
             super().__init__(
                 rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
                 _einsum_fn=_scaled_in_float32(qwix.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
+                _conv_general_dilated_fn=qwix.conv_general_dilated)
             # The training provider over the spec's training rules, which forms a moving weight's
             # products (`moving_weights`).
             self._moving = _providers()[0](moving)
