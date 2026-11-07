@@ -12,6 +12,8 @@ update (`scan`), each shared piece in `forms`."""
 
 import functools
 
+# First, before anything of the pass imports egglog.
+from dew.algebra import _egglog  # noqa: F401  (isort: skip)
 from dew.algebra import cost, derive, error, forms, program, rules, scan, terms
 from dew.algebra.derive import Reduction
 from dew.algebra.forms import Derived, Refused
