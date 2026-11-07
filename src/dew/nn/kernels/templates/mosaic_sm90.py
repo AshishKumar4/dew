@@ -88,7 +88,7 @@ class WgmmaIssuer(mosaic.Issuer):
             mosaic.committed()
             if then is not None:
                 then()
-            return acc_ref[...]
+            return _landed(acc_ref[...])
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
@@ -111,8 +111,9 @@ class WgmmaIssuer(mosaic.Issuer):
     def read(self, acc, *, first: int = 0, columns: int | None = None, pending: int = 0) -> jax.Array:
         # A scoped warpgroup accumulator read once at most `pending` of the warpgroup's product groups are in
         # flight (`wgmma_accumulator_load`'s wait), the later ones running on; interpreted, its value.
-        value = acc if isinstance(acc, jax.Array) else plgpu.wgmma_accumulator_load(acc, wait_n=pending)
-        return super().read(value, first=first, columns=columns)
+        if not isinstance(acc, jax.Array):
+            acc = _landed(plgpu.wgmma_accumulator_load(acc, wait_n=pending))
+        return super().read(acc, first=first, columns=columns)
 
     def register_products(self, acc, parts, rhs, interpret: bool):
         for formed in parts:
@@ -132,7 +133,7 @@ class WgmmaIssuer(mosaic.Issuer):
 
         def run(acc_ref):
             issue(acc_ref)
-            return acc_ref[...]
+            return _landed(acc_ref[...])
 
         return pl.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
@@ -142,7 +143,7 @@ class WgmmaIssuer(mosaic.Issuer):
         if interpret:
             return acc + self.as_tile(value)
         plgpu.wgmma_wait(0)
-        acc[...] = acc[...] + value
+        acc[...] = _landed(acc[...]) + value
         return acc
 
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
@@ -150,7 +151,7 @@ class WgmmaIssuer(mosaic.Issuer):
             return self.register_products(scale(acc), parts, rhs, interpret)
         # The accumulator's value read once its products are done, scaled, stored back.
         plgpu.wgmma_wait(0)
-        acc[...] = scale(acc[...])
+        acc[...] = scale(_landed(acc[...]))
         return self.register_products(acc, parts, rhs, interpret)
 
     def settled(self, pending: int = 0) -> None:
@@ -179,9 +180,19 @@ class WgmmaIssuer(mosaic.Issuer):
             if finish is not None:
                 carry = finish(carry, accumulators)[0]
             plgpu.wgmma_wait(0)
-            return carry, tuple(acc[...] for acc in accumulators)
+            return carry, tuple(_landed(acc[...]) for acc in accumulators)
 
         return pl.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
+
+
+def _landed(value: jax.Array) -> jax.Array:
+    """A warpgroup accumulator's registers read past their products' wait, held there: an optimization
+    barrier on them, which Mosaic GPU lowers to a side-effecting asm that redefines them, so no use is
+    scheduled above the wait. Pallas's read waits by an asm of no register operands, and the registers are
+    the products' outputs from their issue on, so a use could run before the products landed: an H100's
+    fast backward stored the weights' gradient `-dv S^T` as zeros while a mark added to it, or another
+    accumulator's value, stored through the same path landed (row 4346, M-JS-13, M-JS-15, M-JS-16)."""
+    return lax.optimization_barrier(value)
 
 
 class Wgmma(WgmmaIssuer, mosaic.RingFamily):
