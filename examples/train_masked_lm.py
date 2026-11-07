@@ -29,18 +29,19 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import tyro
 
 import dew
-from dew.config import ObjectiveConfig, TrainerConfig
-from dew.config.lm import LMRunConfig
 from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading, presets, text
 from dew.data.compile import iterate
+from dew.diffusion.discrete import MDLM
+from dew.inference import RunProcessor
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import Perplexity
 from dew.optim import Cosine, OptimConfig
-from dew.registry import ModelConfig
-from dew.training import Evaluation, MeshSpec
+from dew.training import Checkpoints, Evaluation, MeshSpec, Trainer
 
 SMOKE_TEXT = (
     "The cat sat on the warm mat and watched the rain.\n",
@@ -114,30 +115,31 @@ def main(config: Config) -> Path:
     # The final score reads every held-out window.
     whole = held.pipe(presets.lm, None, seq_len=window, batch=config.batch_size, pack=None).read("memory")
     name = f"mdlm-{config.dataset.rsplit('/', 1)[-1].lower()}"
-    trainer = TrainerConfig(name=name, checkpoint_dir=str(config.out / "checkpoints"), keep=1,
-                            steps=config.steps,
-                            log_every=1 if config.smoke else 100, eval_every=config.eval_every,
-                            checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1), multi_host=False)
-    # The mask is the id past the tokenizer's, so no text can contain it.
-    run = LMRunConfig(
-        model=ModelConfig("causal_transformer", {
-            **config.model, "causal": False, "mask_token_id": tokenizer.vocab_size,
-            "dtype": "float32" if config.smoke else "bfloat16"}),
-        data=data, validation=validation, tokenizer=config.tokenizer,
-        objective=ObjectiveConfig("masked_diffusion", {
-            "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999,
-            "eos_token_ids": () if tokenizer.eos_id is None else (tokenizer.eos_id,)}),
-        optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, learning_rate=Cosine(
-            peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
-            end_value=config.learning_rate / 10)),
-        trainer=replace(trainer, compilation_cache_dir=None) if config.smoke else trainer)
+    run_dir = config.out / "checkpoints" / name
+    # A bidirectional transformer whose table holds one id past the tokenizer's: the mask, which no text can
+    # contain. MDLM denoises the whole row, a window and the id the preset adds.
+    mask = tokenizer.vocab_size
+    model = CausalTransformer(**config.model, vocab_size=mask + 1, max_seq_len=config.sequence_length,
+                              causal=False, mask_token_id=mask,
+                              dtype=jnp.float32 if config.smoke else jnp.bfloat16)
+    objective = MaskedDiffusionObjective(
+        model, MDLM(mask_id=mask)(), config.sequence_length, steps=config.sample_steps,
+        ema_decay=0.9 if config.smoke else 0.999,
+        eos_token_ids=() if tokenizer.eos_id is None else (tokenizer.eos_id,), decode=tokenizer.decode,
+        # Recorded with the run, so what loads it (`dew.pipeline` below) reads text.
+        processor=RunProcessor(tokenizer))
+    optimizer = OptimConfig(weight_decay=0.03, clip_grads=1.0, learning_rate=Cosine(
+        peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
+        end_value=config.learning_rate / 10)).build(config.steps)
+    trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
+                      checkpoints=Checkpoints(str(run_dir), keep=1))
     started = time.perf_counter()
-    run.run()
+    trainer.fit(data, steps=config.steps, log_every=1 if config.smoke else 100, eval_every=config.eval_every,
+                checkpoint_every=config.eval_every, validation=validation)
     trained = time.perf_counter()
 
     # The other half, from the files alone: the run directory loads as the
     # task its objective saved, and both the score and the samples read it.
-    run_dir = config.out / "checkpoints" / name
     task = dew.pipeline(str(run_dir))
     scored = Evaluation.run(MaskedDiffusionObjective(task.model, task.process, config.sequence_length),
                             task.variables, whole, key=jax.random.key(0), metrics=[Perplexity()],

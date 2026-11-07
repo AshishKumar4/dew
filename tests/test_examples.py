@@ -245,6 +245,18 @@ def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_n
     assert losses(tmp_path / "again") == losses(tmp_path / "first")
 
 
+def test_train_masked_lm_smoke_trains_in_python_and_reads_its_run_back_as_a_task(tmp_path):
+    """MDLM built and trained in Python, the run read back from its directory alone by `dew.pipeline`: the
+    held-out split scored with the loaded weights, a finite perplexity bound, and a continuation unmasked for
+    each prompt, each beginning with its prompt."""
+    smoke("train_masked_lm", tmp_path)
+
+    report = json.loads((tmp_path / "result.json").read_text())
+    assert np.isfinite(report["held_out"]["val/perplexity"]) and report["held_out"]["val/perplexity"] > 1
+    assert [sample[:len(prompt)] for sample, prompt in zip(report["samples"], ("The cat", "A small boat"),
+                                                           strict=True)] == ["The cat", "A small boat"]
+
+
 def test_train_flowers_tpu_smoke_samples_a_grid_and_scores_it(tmp_path):
     """The diffusion run's whole arc: synthetic ArrayRecords in, a run
     directory with its record and checkpoint, a samples grid out of
