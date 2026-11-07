@@ -37,13 +37,13 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import compiler_options, program
+from dew.nn.kernels.options import compiler_options, program, program_digest
 from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.instrumentation import compiled_memory
 from dew.telemetry.profile import Profiler, active_profile
-from dew.training.ahead import handed, program_of
+from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
 from dew.training.memory import (
@@ -74,6 +74,10 @@ if TYPE_CHECKING:
     from dew.training.trainer import StepFn
 
 _log = logging.getLogger(__name__)
+
+MODEL_MISS = "dew_model_miss"
+"""The attribute a model miss's warning carries, the probe the derivation judged otherwise than its compile
+(`Probe.named`): what a reader selects a miss by, whatever its wording."""
 
 
 def read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
@@ -173,7 +177,7 @@ class Relowered:
 
 class SampledStep(NamedTuple):
     """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
-    from (`dew.training.ahead.program_of`) and its executable."""
+    from (`dew.nn.kernels.options.program_digest`) and its executable."""
 
     program: str
     executable: jax.stages.Compiled
@@ -620,7 +624,7 @@ class FitSearch[LossT, EffectsT]:
     that keeps its residuals in pinned host memory ('minimal_offloaded') keeps as many on the device as
     'full' does (`tests/test_remat_rungs.py`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
     132,296), so it fits nowhere 'full' does not, and a run takes it by its own remat."""
-    lower: Callable[[int, bool, Footprint | None], Candidate]
+    lower: Callable[[int, bool, Footprint | None, bool], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
     objective: Objective[LossT, EffectsT]
     mesh: Mesh
@@ -823,14 +827,16 @@ class FitSearch[LossT, EffectsT]:
 
     def lowering(self, split: int) -> Candidate:
         """The step at `split` at the objective's rung and the search's `narrow`, lowered, with the
-        footprint the derivation traced of it where it read it (`footprints`)."""
-        return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)))
+        footprint the derivation traced of it where it read it (`footprints`); one the step compiled ahead
+        serves (`ahead`) derives none, its compile having judged the derivation where it was compiled."""
+        return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)),
+                          self.ahead is None)
 
     def relowering(self, split: int) -> Candidate:
         """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), its footprint traced
         again: the kernel's next config can change the buffers the derivation traced at its first (a
         Triton attention backward's partial gradients, a block of queries each)."""
-        return self.lower(split, self.narrow, None)
+        return self.lower(split, self.narrow, None, self.ahead is None)
 
     def candidate_key(self, split: int, narrow: bool) -> tuple[str, int]:
         """The step at `split` and `narrow` at the objective's rung, as the derivation's judgments keep it."""
@@ -1021,7 +1027,7 @@ class FitSearch[LossT, EffectsT]:
                                            first=None if beside is None else firsts[1])
             if len(lowered) > 1:
                 self.footprints.clear()
-            self.sampled = None if compiled is None else SampledStep(program_of(lowered[-1]), compiled)
+            self.sampled = None if compiled is None else SampledStep(program_digest(lowered[-1]), compiled)
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
@@ -1046,7 +1052,8 @@ class FitSearch[LossT, EffectsT]:
                          None if footprint is None else footprint.temporaries,
                          None if footprint is None else footprint.peak,
                          None if footprint is None else footprint.staged,
-                         None if probe.derived is None else probe.derived.record())
+                         None if probe.derived is None else probe.derived.record(),
+                         extra={MODEL_MISS: probe.named()})
         return options, candidate, executable, probe
 
     def fits_here(self, split: int, pruned: bool = False) -> bool:

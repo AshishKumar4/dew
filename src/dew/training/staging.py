@@ -24,7 +24,7 @@ import jax.extend.core as jcore
 from jax.core import ShapedArray
 
 from dew.distributed.placement import placed_bytes
-from dew.nn.programs import CALLS, called, computed, inlined
+from dew.nn.programs import CALLS, called, computed, inlined, named
 
 PURE_CALLS = CALLS - {"remat2", "checkpoint", "custom_jvp_call", "custom_vjp_call", "marked_call"}
 """The calls (`dew.nn.programs.CALLS`) that run a program on their operands and do nothing else, which
@@ -55,7 +55,7 @@ def flattened(program: jcore.Jaxpr, operands: Sequence, consts: Sequence = ()) -
         placing = [sharding for key in ("in_shardings", "out_shardings")
                    for sharding in equation.params.get(key, ())
                    if isinstance(sharding, jax.sharding.Sharding)]
-        if body is not None and equation.primitive.name in PURE_CALLS and not placing:
+        if body is not None and named(equation.primitive) in PURE_CALLS and not placing:
             inner, outputs = flattened(body, reading, tuple(body.consts))
             expanded.extend(inner)
             renamed.update(zip(equation.outvars, outputs, strict=True))
