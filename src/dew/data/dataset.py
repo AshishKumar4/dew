@@ -1714,7 +1714,8 @@ class RampedStream(Forwarding):
             if read is None:
                 break
             if self._elastic and VALID_ROWS in read and not np.all(read[VALID_ROWS]):
-                # Each reader marks its own share of a short last batch real, none the order's count (row 4811).
+                # Each reader marks its own share of a short last batch real, none the order's count of them
+                # (row 4811).
                 raise ValueError("a batch ramp over an elastic read reached the read's last batch, kept "
                                  "short and filled, whose real records no reader counts for every reader, "
                                  "so no ramp step can end where they end on every reader alike; drop the "
