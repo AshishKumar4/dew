@@ -346,13 +346,22 @@ class Lent:
         return self.held.__dlpack_device__()
 
 
+def aligned(shape: tuple[int, ...]) -> np.ndarray:
+    """A float32 buffer of `shape` on a 64-byte boundary, which XLA:CPU reads in place through DLPack
+    (an unaligned one it copies)."""
+    size = int(np.prod(shape))
+    held = np.zeros(size + 16, np.float32)
+    start = (-held.ctypes.data % 64) // held.itemsize
+    return held[start:start + size].reshape(shape)
+
+
 class ReusingWalks(HostWalks):
     """`HostWalks` answering every observation and reward from one buffer each, lent through DLPack and
     written again in place every step, as a GPU simulator's fixed output buffers are."""
 
     def __init__(self, count: int, length: int):
         super().__init__(count, length)
-        self.observed, self.rewarded = np.zeros((count, 1), np.float32), np.zeros(count, np.float32)
+        self.observed, self.rewarded = aligned((count, 1)), aligned((count,))
 
     def _lent(self, observation) -> Lent:
         self.observed[...] = observation
