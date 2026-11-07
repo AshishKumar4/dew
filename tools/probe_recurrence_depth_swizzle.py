@@ -6,13 +6,15 @@ import test_recurrence_mosaic as t
 import kernel_compile as kc
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.recurrence import key_backward as kb
+from dew.nn.kernels import recurrence_algebra as algebra
 original=kb._key_pairs_staged
 def staged(call,keys):
  tiles,landing=original(call,keys)
  def narrow(tile):
-  return pg.SMEM(tile.shape,tile.dtype,transforms=mosaic.swizzle_transforms(tile.dtype,32)) if len(tile.shape)==2 else tile
- operands,other=tiles[:3],tiles[3:]
- return (*jax.tree.map(narrow,operands),*other),landing
+  swizzle=mosaic.swizzle_for(tile.dtype,algebra.SUB)
+  return pg.SMEM(tile.shape,tile.dtype,transforms=mosaic.swizzle_transforms(tile.dtype,swizzle))
+ pairs,squares,gated,*other=tiles
+ return (pairs,jax.tree.map(narrow,squares),gated,*other),landing
 kb._key_pairs_staged=staged
 target,index=sys.argv[1],int(sys.argv[2])
 for case in t.compiled_cases(target,{},[],{},only=t.GATE_GROUPS[index]):
