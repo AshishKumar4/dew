@@ -50,7 +50,7 @@ from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
 from dew.nn.kernels.templates.product import declared
 from dew.nn.precision import at_least_fp32, refuse_recipe
-from dew.nn.sharding import seen_whole
+from dew.nn.sharding import explicit_spec, seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 """The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
@@ -709,6 +709,8 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     if refusal is not None:
         generation.route("blockwise_fp8", kernel="unquantized", preferred=recipe.recipe, refusal=refusal)
         return None
+    if (placed := explicit_spec(rows)) is not None and placed.spec[0] is not None:
+        return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias, placed=placed)
     stacked = matrix if matrix.ndim == 3 else matrix[None]
     groups, count = stacked.shape[0], rows.shape[0]
     sizes = (jnp.full((1,), count, jnp.int32) if group_sizes is None
@@ -732,6 +734,31 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     if bias is not None:
         out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(jnp.float32), out)
     return out.astype(out_dtype)
+
+
+def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, placed) -> jax.Array:
+    """`recipe_projection` of rows an Explicit mesh axis splits (row 4854): each device's rows its own
+    projection (`jax.shard_map` over the axes splitting the rows), laid in whole 128-row blocks of its own
+    as a data-parallel recipe quantizes them, the matrix and bias whole on every device and their
+    gradients summed over the devices (shard_map's transpose). A grouped projection's sizes count the
+    rows of all devices together, so no device's rows are whole groups: refused."""
+    if group_sizes is not None:
+        raise ValueError("a recipe's experts take their rows whole: an Explicit mesh axis splits these, "
+                         "and their groups' sizes count every device's rows")
+    from dew.mesh import mesh_axes
+
+    split = jax.sharding.PartitionSpec(placed.spec[0], None)
+    whole = jax.sharding.PartitionSpec()
+
+    def projected(rows, matrix, *bias):
+        return recipe_projection(rows, matrix, out_dtype=out_dtype, bias=bias[0] if bias else None)
+
+    # The recipe's own loops start their sums typed for no device (`grouped_matmul.step_scaled`'s carry), so
+    # the program is not checked for the devices' varying values (`check_vma`); each device's rows are its
+    # own by the specs, and the whole operands' gradients sum over the devices as shard_map transposes them.
+    return jax.shard_map(projected, mesh=placed.mesh, in_specs=(split, whole, *(whole,) * (bias is not None)),
+                         out_specs=split, axis_names=frozenset(mesh_axes(placed.spec[0])), check_vma=False)(
+        rows, matrix, *(() if bias is None else (bias,)))
 
 
 def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
