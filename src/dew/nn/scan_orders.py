@@ -14,6 +14,7 @@ import einops
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import DTypeLike
 
 from dew.nn.rope import sincos_grid, sinusoid_frequencies
 
@@ -24,19 +25,20 @@ ScanOrder = Literal['raster', 'hilbert', 'zigzag']
 curve, or in a zigzag."""
 
 
-def build_2d_sincos_pos_embed(emb_dim: int, H_P: int, W_P: int) -> np.ndarray:
-    """Fixed MAE-style 2D sin-cos positional embedding, row-major [H_P * W_P, emb_dim], in float32.
+def build_2d_sincos_pos_embed(emb_dim: int, H_P: int, W_P: int,
+                              dtype: DTypeLike = np.float32) -> np.ndarray:
+    """Fixed MAE-style 2D sin-cos positional embedding, row-major [H_P * W_P, emb_dim], in `dtype`.
     The first half of the channels encodes the row and the second the column (MAE's own 2D table puts
     the column first). For another scan order, index the result by that order's permutation.
 
     Each axis is MAE's `get_1d_sincos_pos_embed_from_grid`, which computes in float64: so is it here,
-    rounded once to float32 (`sincos_grid`).
+    rounded once to `dtype` (`sincos_grid`): float32 for a model computing in float32 or narrower, float64
+    for one computing in float64.
     """
     assert emb_dim % 4 == 0, f"emb_dim must be divisible by 4 for 2D sincos, got {emb_dim}"
     quarter = emb_dim // 4
     rows, columns = np.meshgrid(np.arange(H_P), np.arange(W_P), indexing="ij")
-    return sincos_grid(sinusoid_frequencies(quarter, quarter, dtype=np.float64), rows, columns,
-                       dtype=np.float32)
+    return sincos_grid(sinusoid_frequencies(quarter, quarter, dtype=np.float64), rows, columns, dtype=dtype)
 
 
 def _d2xy(n: int, d: int) -> tuple[int, int]:
