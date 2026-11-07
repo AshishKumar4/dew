@@ -954,8 +954,8 @@ row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU inde
 
 def swizzle_columns(dtype, swizzle: int) -> int:
     """The elements of `dtype` a row of a `swizzle`-byte swizzle spans: a swizzled tile's width, so the least
-    slice a load of a block swizzled along that axis takes."""
-    return swizzle // jnp.dtype(dtype).itemsize
+    slice a load of a block swizzled along that axis takes (a packed dtype's two a byte)."""
+    return swizzle * 8 // resources.element_bits(dtype)
 
 
 def swizzle_for(dtype, *contractions: int) -> int:
