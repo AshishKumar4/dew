@@ -899,7 +899,9 @@ class Anchor:
         from reference_error import widened
 
         self.case, self.label = case, label
-        state, _, _ = _trainer(case, {}, one_device=True).place()
+        # The truth reads the model's stored layers, as the gradient compared is read (`_gradient`).
+        trainer = _trainer(case, {}, one_device=True)
+        state = trainer.stored(trainer.place()[0])
         native, objective = bench.build_objective(case), bench.build_objective(case, widened=True)
         for mine, twin in zip(native.program_key(), objective.program_key(), strict=True):
             if _model_record(mine.module) != _model_record(twin.module):

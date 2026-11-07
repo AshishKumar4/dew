@@ -1081,7 +1081,10 @@ def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
     adapter's targets are named per layer, so the branch resolves the run to
     its layers and every layer's factors carry gradient. Before this, a
     stack cloned to `scan_layers=True` after adapting silently trained only
-    the layers that ran alone."""
+    the layers that ran alone. Layers whose targets differ (another alpha at
+    one rank, the factors' shapes alike) run as runs of their own
+    (`CausalTransformer.scanned_like`), computing what the plain loop does,
+    where the scan refused them."""
     adapter = LoRA(rank=2, modules=("q_proj",), alpha=4.0).apply(decoder.model, decoder.variables, key=1,
                                                                  layouts=decoder.layouts)
     variables = adapter.variables
@@ -1099,11 +1102,11 @@ def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
     for layer in ("layers_0", "layers_1"):
         factors = grads[layer]["self_attn"]["q_proj"]
         assert float(jnp.abs(factors["lora_B"]).max()) > 0, layer
-    # One scanned module runs both layers, so their targets must agree.
     uneven = {**adapter.targets, ("params", "layers_1", "self_attn", "q_proj"): Target(2, 8.0)}
-    with pytest.raises(ValueError):
-        _rebound(adapter, decoder.model.clone(scan_layers=True), targets=uneven).model.apply(
-            variables, tokens)
+    looped = _rebound(adapter, decoder.model.clone(scan_layers=False), targets=uneven).model
+    rerun = _rebound(adapter, decoder.model.clone(scan_layers=True), targets=uneven).model
+    np.testing.assert_array_equal(np.asarray(rerun.apply(variables, tokens)),
+                                  np.asarray(looped.apply(variables, tokens)))
 
 
 # --------------------------------------------------------------------------

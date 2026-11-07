@@ -63,37 +63,6 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_run_whose_mixture_no_family_writes_exports_and_loads_back_answering_as_its_run(tmp_path):
-    """A language model run whose decoder routes one layer of two through a mixture of experts exports
-    through `dew export`, in its family's source layout where one states the model and as its native
-    release, stating why, where none does (export review #1), and `dew.pipeline` loads the release back
-    answering as the run's own task, where the export was refused."""
-    from option_witness import answered_alike, answers
-
-    from dew._cli.main import main
-    from dew.inference.loading import pipeline
-    from dew.inference.models import ReleasedRun
-    from dew.inference.tasks import SavedRun, TextGeneration, saved_model
-    from dew.interop.layouts import source_layout
-
-    routed = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 2, "num_heads": 2,
-                                                "mlp_features": 32, "dtype": "float32",
-                                                "mixture": {"experts": 4, "top_k": 2, "layers": [1]}})
-    trained(dataclasses.replace(lm(tmp_path, drawn=False), model=routed), tmp_path, "routed",
-            trainer={"checkpoint_final": True})
-    run, release = tmp_path / "runs" / "routed", tmp_path / "release"
-    assert main(["export", str(run), str(release)]) == 0
-    # The release is the one the family's layout answers for the model: its source layout, or the native
-    # release stating the layout's reason.
-    layout = source_layout(saved_model(SavedRun.pinned(str(run)).record, None).build())
-    if layout:
-        assert (release / "config.json").is_file()
-    else:
-        assert ReleasedRun.of(release).unstated == layout.reason
-    assert answered_alike(answers(pipeline(str(release))), answers(TextGeneration.from_run(str(run))))
-
-
-@pytest.mark.mesh(devices=8)
 def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_on(tmp_path):
     """A named run started from a saved Dew run (`--pretrained <run>`) at the step its selection names by
     default (a diffusion run's, its latest) records that step; when the saved run has trained on, so that
@@ -126,6 +95,23 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
         dataclasses.replace(recorded, source=SourceOptions(step=later)).check_resume(saved)
     trained(command, tmp_path, "after", trainer={"name": "after", "steps": 2, "checkpoint_final": True})
     assert "2" in {path.name for path in (tmp_path / "runs" / "after").iterdir()}
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_run_resumes_whether_its_decoder_scans_its_layers_or_not(tmp_path):
+    """How a decoder executes its layers (`scan_layers`, `RunConfig.EXECUTED`) is no part of what a run
+    computes or stores, its checkpoint holding every layer `layers_N` either way: a run saved running a
+    layer at a time resumes scanning them, and back, where its resume refused it as another model (row
+    4104)."""
+    first = lm(tmp_path, drawn=False)
+    deeper = dataclasses.replace(first, model=ModelConfig("causal_transformer",
+                                                          {**first.model.fields, "num_layers": 2}))
+    trained(deeper, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
+    for scanned, steps in ((True, 2), (False, 3)):
+        run = dataclasses.replace(deeper, model=ModelConfig("causal_transformer", {
+            **deeper.model.fields, "scan_layers": scanned}))
+        trained(run, tmp_path, "run", trainer={"name": "run", "steps": steps, "checkpoint_final": True})
+        assert str(steps) in {path.name for path in (tmp_path / "runs" / "run").iterdir()}
 
 
 @pytest.mark.mesh(devices=8)

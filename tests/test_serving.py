@@ -1398,8 +1398,9 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
     """An adapter set of two adapters over different layers of one decoder, one over layer 0's q and one
     over layer 1's: each layer's update is its own adapter's or none, and each row's logits are those of
     its adapter alone, on par with that adapter against its float64 twin (check 1). A scanned stack, which
-    runs its like layers under one factor pair, refuses layers whose adapters differ, as it refuses one
-    adapter's uneven targets (test_lora's test_the_branch_reaches_every_layer_of_a_scanned_run)."""
+    runs its like layers under one factor pair, runs layers whose adapters differ as runs of their own,
+    as it runs one adapter's uneven targets (test_lora's
+    test_the_branch_reaches_every_layer_of_a_scanned_run)."""
     from pathlib import Path
 
     from arm_arithmetic import widened

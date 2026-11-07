@@ -1220,14 +1220,21 @@ def cfg_sweep_figure():
 
 
 Part = tuple[str, Sequence[str], str, tuple[float, float, float, float], int]
-"""A part of an architecture figure: its title, its lines, its kind ("dew", Dew's own engine, teal; or
-"plain"), where it sits in the wide layout (x, y, width, height), and its row: parts of one row are
-alternatives, drawn side by side wide and boxed together on a phone, never with an arrow between them."""
+"""A part of an architecture figure: its title, its lines, its kind ("dew", Dew's own engine, teal; "plain";
+"elsewhere", built on another branch, amber), where it sits in the wide layout (x, y, width, height), and its
+row: parts of one row are alternatives, drawn side by side wide and boxed together on a phone, never with an
+arrow between them."""
 
 
 def part(svg: Figure, x, y, w, h, title, lines, kind: str):
     """One part, drawn as its kind is (`Part`)."""
-    box(svg, x, y, w, h, title, lines, accent=kind == "dew")
+    if kind == "elsewhere":
+        svg.rect(x, y, w, h, fill="warm_fill", stroke="warm")
+        svg.text(x + 12, y + 23, title, size=14, mono=True, weight=600)
+        for i, line in enumerate(lines):
+            svg.text(x + 12, y + 45 + 19 * i, line, size=13, color="muted")
+    else:
+        box(svg, x, y, w, h, title, lines, accent=kind == "dew")
 
 
 def drawn(name: str, label: str, size: tuple[int, int], parts: Sequence[Part],
@@ -1400,7 +1407,7 @@ def architecture_derived_figure():
         ("saturate", ["step, merge, finish;", "decoupled rules"], "dew", (384, 16, 172, 81), 2),
         ("extract", ["priced by the tile", "walk, or refused"], "dew", (568, 16, 176, 81), 3),
         ("Derived", ["init, step, merge,", "finish"], "dew", (568, 143, 176, 81), 4),
-        ("dew._cache.DERIVED", ["one switch,", "off by default"], "dew", (272, 143, 240, 81), 5),
+        ("dew._cache.DERIVED", ["one switch,", "off by default"], "elsewhere", (272, 143, 240, 81), 5),
         ("hand-written forms", ["attention_algebra,", "recurrence_algebra"], "plain", (16, 143, 220, 81), 4),
         ("plain_step, merge, finish", [], "plain", (196, 252, 392, 40), 6),
     ]

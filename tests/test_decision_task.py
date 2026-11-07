@@ -30,7 +30,6 @@ from dew.decision import (
     Temperatures,
 )
 from dew.decision.calibration import softmax
-from dew.decision.laya import LAYA_OPTION_LAYOUTS, LAYA_REQUIRED
 from dew.decision.metrics import Answered
 from dew.decision.task import Finalists, Knockout, decoded_images, trained_tree
 
@@ -646,50 +645,12 @@ def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     # eleven options and more is written as the 0.5 both answer with.
     agent = json.loads((tmp_path / "rl_agent_config.json").read_text())
     published = json.loads((TINY / "rl_agent_config.json").read_text())
-    # What Laya's agent reads it by: every key it requires, an option layout of its own (row 4599).
-    assert set(LAYA_REQUIRED) <= set(agent) and agent["option_layout"] == "sequential"
     assert agent["temperature"] == published["temperature"]
     assert agent["head_layers"] == published["head_layers"]
     assert agent["temperature_by_options"] == {**published["temperature_by_options"], "choice:11+": 0.5}
     again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
     for request in CASES.values():
         assert again.systemone(request) == decide.systemone(request)
-
-
-def test_a_laya_tasks_release_bundle_saves_and_exports_the_tasks_release(decide, tmp_path):
-    """Each decision format has one writer (export review #5): a Laya task's release bundle
-    (`PretrainedDecision.of`), as a joint or slot task's, saves the files the task saves, byte for byte,
-    and exports every tensor they hold, where the bundle of a Laya task was refused."""
-    from interop_support import written_tensors
-
-    from dew.decision.sources import PretrainedDecision
-
-    def files(root: Path) -> dict[Path, bytes]:
-        return {path.relative_to(root): path.read_bytes() for path in sorted(root.rglob("*"))
-                if path.is_file()}
-
-    decide.save_pretrained(tmp_path / "task")
-    bundle = PretrainedDecision.of(decide)
-    bundle.save(tmp_path / "bundle")
-    assert files(tmp_path / "bundle") == files(tmp_path / "task")
-    written, exported = written_tensors(tmp_path / "task"), bundle.export()
-    assert exported.keys() == written.keys()
-    for name, tensor in written.items():
-        np.testing.assert_array_equal(np.asarray(exported[name]), tensor, err_msg=name, strict=True)
-
-
-def test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in(decide, tmp_path):
-    """A Laya task's release states the dtype the task computes in; loaded and saved again, its bundle
-    restates it, so the second release loads computing as the task did, where its record dropped it and a
-    load took BF16 (EX02's review)."""
-    from dew.config.release import Release
-    from dew.interop.pretrained import Pretrained
-
-    decide.save_pretrained(tmp_path / "task")
-    Pretrained.load(tmp_path / "task").save(tmp_path / "again")
-    first, again = Release.load(tmp_path / "task"), Release.load(tmp_path / "again")
-    assert first is not None and again is not None and first.task is not None
-    assert again.task == first.task
 
 
 def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(decide, tmp_path):
@@ -769,50 +730,18 @@ def test_a_released_checkpoint_keeps_its_option_budget(decide, tmp_path):
     assert not np.array_equal(decide(state, question)["q"].probabilities, expected)
 
 
-def test_a_released_checkpoint_states_the_layout_its_task_was_trained_with(decide, tmp_path):
-    """A task whose layout Laya's config cannot state (a row order, blocks, a framing of the rows as a
-    chat) exports and reads back with the layout it was trained with, which the release states beside
-    Laya's own files (`dew.config.Release`): Laya's config keeps the window and budgets it states, and a
-    release with no such record reads as Laya's file alone does (row 4310)."""
-    from dew.decision.layout import Framing, MarkerLayout
-
-    framed = Framing(system="Answer from the state.", prefill="", thinking=False)
-    for number, chosen in enumerate(({"order": "state_first"}, {"order": "re_read"}, {"blocks": True},
-                                     {"framing": framed, "order": "question_first"})):
-        layout = replace(decide.layout, **chosen)
-        replace(decide, layout=layout).save_pretrained(tmp_path / str(number))
-        again = Decide.from_pretrained(tmp_path / str(number), attention_impl="xla")
-        assert again.layout == layout, chosen
-        stated = json.loads((tmp_path / str(number) / "rl_agent_config.json").read_text())
-        assert stated["max_len"] == layout.max_len and stated["option_tokens"] == layout.option_tokens
-        # Laya's readers refuse a layout they would lay out otherwise (row 4599).
-        assert stated["option_layout"] not in LAYA_OPTION_LAYOUTS
-    (tmp_path / "0" / "dew_release.json").unlink()
-    assert Decide.from_pretrained(tmp_path / "0", attention_impl="xla").layout == MarkerLayout(
-        max_len=decide.layout.max_len, head_max_len=decide.layout.head_max_len,
-        option_tokens=decide.layout.option_tokens, parallel=decide.layout.parallel)
-
-
-def test_a_released_checkpoint_states_the_calibration_laya_cannot(decide, tmp_path):
-    """A task that abstains below a confidence, or maps its probabilities through a binning, exports with
-    that calibration beside Laya's temperatures and answers as it did once read back, where the
-    checkpoint refused both (row 4310)."""
-    from dew.decision.calibration import Binning
-
-    gated = decide.gated(0.99)
-    gated = replace(gated, calibration=replace(gated.calibration, binning=Binning(
-        {"choice:3-5": (0.1, 0.5, 0.9), "choice:2": (0.2, 0.8)})))
-    gated.save_pretrained(tmp_path)
-    # Laya's readers refuse a calibration they would answer otherwise by (row 4599).
-    stated = json.loads((tmp_path / "rl_agent_config.json").read_text())
-    assert stated["option_layout"] not in LAYA_OPTION_LAYOUTS
-    again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=gated.name)
-    assert again.calibration.abstention == gated.calibration.abstention
-    assert again.calibration.binning == gated.calibration.binning
-    # With details, which report whether each answer abstained.
-    answers = [again.systemone(request, details=True) for request in CASES.values()]
-    assert answers == [gated.systemone(request, details=True) for request in CASES.values()]
-    assert answers != [decide.systemone(request, details=True) for request in CASES.values()]
+def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_path):
+    """A gated task, and a task whose row order or blocks Laya's config cannot state, are refused before
+    anything is written; Laya's own order, named, saves as the release's."""
+    gated = decide.gated(0.5)
+    with pytest.raises(ValueError):
+        gated.save_pretrained(tmp_path)
+    for chosen in ({"order": "state_first"}, {"order": "re_read"}, {"blocks": True}):
+        with pytest.raises(ValueError):
+            replace(decide, layout=replace(decide.layout, **chosen)).save_pretrained(tmp_path / "chosen")
+        assert not (tmp_path / "chosen").exists()
+    replace(decide, layout=replace(decide.layout, order="question_first")).save_pretrained(tmp_path / "own")
+    assert Decide.from_pretrained(tmp_path / "own", attention_impl="xla").layout == decide.layout
 
 
 MESH_SEEDS = 8

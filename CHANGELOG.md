@@ -7,34 +7,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
-- Every release Dew writes is planned once and written once (`dew.interop.releases.ReleasePlan`): `dew
-  export`, `Pretrained.save`, `Decide.save_pretrained` and `SavedModel.save_pretrained` each write a plan of
-  a model part, a decision head's files, the task's assets and one release record, and `export` returns the
-  plan's tensors. A run whose model no family's layout writes (a Qwen3-MoE or Qwen2-MoE config, a decoder
-  with cross-attention, a decision head with no release format) exports as its native release, stating why,
-  where `dew export` refused some of them. Each decision release format is declared once, beside its reader
-  (`dew.decision.formats`). `dew.decision.LayaCheckpoint` is removed: `Decide.save_pretrained` writes
-  Laya's format.
-- A decision release may state one temperature over every question type (`Temperatures.default`): Laya's
-  `rl_agent_config.json` takes a number for `temperature` beside its per-type list, and a release record's
-  calibration states it for formats whose files hold none.
-- A decision run's question rows can ask a request's questions over one copy of its state (`--shared-state n`,
-  `QuestionLayout.shared_state`): a row holds the state once and up to `n` questions after it, each read as
-  its own row reads it, at its own row's positions, so a request of `q` questions reads its state once a row
-  rather than `q` times. `--siblings` lets each question also read the questions before it in its row. A
-  request that outgrows a row takes several, each repeating the state.
-- A trained model whose objective declares no inference task (a JEPA encoder, a control policy, a DreamerV3
-  agent) exports as a native release: `dew export` writes its weights as safetensors and its model, settings
-  and numerics in the release record, and `dew.pipeline` loads it back from a directory or the Hub as the
-  model and weights its run trained (`dew.inference.models.SavedModel`), its parameters stored in the
-  `param_dtype` asked and its other state as written. Such a run saved before this release records no
-  declaration and is refused.
-- Every export states what its format's files cannot in one release record (`dew.config.Release`,
-  `dew_release.json`): a decision task's layout, its calibration beyond temperatures, a slot readout's window
-  and the numerics its task traces under, which the one decision loader reads back over the format's own files.
-  `Decide.save_pretrained` writes the format its head is released in (`Head.release_format`: Laya's, the joint
-  head's or the slot readout's), where only Laya's was written, so a task of any layout it trained with
-  exports and loads as the task it is.
 - A profile window may convert its reports as it stops, in the run's own process (`ProfileWindow(wait=True)`),
   as `Profiler.stop(wait=True)` does: a short interactive run's, or one whose sandbox forbids it to create a
   process. By default a window's reports still convert in a process of their own while the run trains on.

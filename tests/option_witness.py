@@ -20,7 +20,6 @@ from run_kinds import (
     decision,
     diffusion,
     dreamed,
-    jepa,
     lettered,
     lm,
     masked,
@@ -340,14 +339,12 @@ TASK_RUNS = {"TextSettings": ((prefixed, "lm"),),
              "MaskedSettings": ((masked, "masked_diffusion"), (dreamed, "masked_diffusion")),
              "ImageSettings": ((diffusion, "diffusion"),), "BlockSettings": ((blockwise, "block_diffusion"),),
              "DecideSettings": ((decision, "decision"), (blocked, "decision"), (lettered, "decision"),
-                                (merged, "decision"), (shared, "decision")),
-             "ModelSettings": ((jepa, "jepa"),)}
+                                (merged, "decision"), (shared, "decision"))}
 """The runs here of an objective that records each saved task's settings, and the objective's name: a
 decision release's, which exports, a fresh head's over a backbone that reads blocks, a fresh letter
 readout's, whose labels its layout takes, a fresh head's over a tokenizer that merges, whose unit a row
 shows, and a letter readout's whose rows ask a request's questions over one state, whose siblings it reads;
-a masked run over a release, whose walk it takes; a JEPA encoder's, whose native release records no settings
-of its own (`dew.inference.models.ModelSettings`)."""
+a masked run over a release, whose walk it takes."""
 
 
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:

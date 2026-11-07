@@ -12,25 +12,21 @@ onto `DecisionHead`.
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from pathlib import Path
 
+import jax
 import numpy as np
 
-from dew import _records
-from dew._files import write_atomically
-from dew.config.release import RELEASE_FILE
-from dew.decision.calibration import Calibration, Temperatures
-from dew.decision.formats import beyond_temperatures
+from dew.batch import Variables, part, thaw
+from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead
-from dew.decision.layout import Layout, MarkerLayout, QuestionLayout
+from dew.decision.layout import MarkerLayout, Specials
+from dew.decision.model import DecisionModel
 from dew.interop.decoder_parts import Packed, layout_tensors, packed_layouts
-from dew.interop.releases import HeadFiles
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, save_sharded, tensor_specs
+from dew.lora import FACTORS
 from dew.registry import from_record
-
-if TYPE_CHECKING:
-    from dew.decision.sources import PretrainedDecision
 
 # Laya's head, as nn.TransformerEncoderLayer and its nn.Sequential scorer name it.
 _HEAD = re.compile(r"head\.layers\.(\d+)\.(.+)")
@@ -77,143 +73,86 @@ LAYA = "convaiinnovations/laya"
 """The released Laya checkpoint the decision task, its runs and the checkpoint loader start from."""
 
 
-LAYA_OPTION_LAYOUTS = ("sequential", "parallel")
-"""The option layouts Laya's readers lay rows out by (`laya.common.OPTION_LAYOUTS` at LAYA_COMMIT), each
-refusing any other value of `option_layout` (`uses_parallel_layout`)."""
-
-LAYA_REQUIRED = ("encoder", "head_layers")
-"""The keys Laya's agent refuses a config without (`_verify_compatibility`'s `required_cfg`)."""
-
-LAYA_BUDGETS = {"head_max_len": 192, "option_tokens": 48}
-"""The question budgets Laya's release declares where its config states none: the tokens its question
-and options share, and the most one option keeps (`QuestionLayout.head_max_len`, `option_tokens`)."""
-
-
-TEMPERATURE_TYPES = ("choice", "score", "noul")
-"""The question types Laya's `temperature` list holds a temperature of, in its order."""
-
-
-def _temperature(value: object, key: str) -> tuple[float, ...] | float:
-    """Laya's `temperature`: a list of `TEMPERATURE_TYPES`' temperatures, or one number over every type (a
-    release's global temperature)."""
-    if not isinstance(value, list):
-        return _records.number(value, key)
-    if len(value) != len(TEMPERATURE_TYPES):
-        raise ValueError(f"{key} lists {', '.join(TEMPERATURE_TYPES)}, or is one number over every type")
-    return tuple(_records.number(each, key) for each in value)
-
-
-def _budget(value: _records.JSON, key: str) -> int | None:
-    """A question budget Laya's file states: a count of tokens, or null to keep that part whole."""
-    return None if value is None else _records.integer(value, key)
-
-
 @dataclass(frozen=True)
-class LayaConfig:
-    """Laya's `rl_agent_config.json`, each key declared once, a field of its name (its reader in its metadata,
-    its default where the file states none), which `read` reads and `record` writes: the encoder Laya's
-    agent names (`LAYA_REQUIRED`), the head's depth, the layout's window, question budgets (Laya's own,
-    `LAYA_BUDGETS`, where it states none) and option layout, and the temperatures by type and by type and
-    option count (`temperatures`). A key a layout states names its layout's field (`laid`), and the
-    spellings of that field's values where Laya spells them (`spelled`, the option layout's by
-    `LAYA_OPTION_LAYOUTS`, sequential for a row whose options are not parallel), which `of` writes and
-    `layout` reads."""
+class LayaCheckpoint:
+    """One released Laya checkpoint: its model, variables, layout and tokenizer, and its agent's temperatures.
 
-    encoder: str | None = field(default=None, metadata={"read": _records.text})
-    head_layers: int = field(default=2, metadata={"read": _records.integer})
-    max_len: int = field(default=512, metadata={"read": _records.integer, "laid": "max_len"})
-    head_max_len: int | None = field(default=LAYA_BUDGETS["head_max_len"],
-                                     metadata={"read": _budget, "laid": "head_max_len"})
-    option_tokens: int | None = field(default=LAYA_BUDGETS["option_tokens"],
-                                      metadata={"read": _budget, "laid": "option_tokens"})
-    option_layout: str = field(default=LAYA_OPTION_LAYOUTS[False], metadata={
-        "read": _records.text, "laid": "parallel", "spelled": LAYA_OPTION_LAYOUTS})
-    temperature: tuple[float, ...] | float = field(default=1.0, metadata={"read": _temperature})
-    temperature_by_options: Mapping[str, float] = field(default_factory=dict, metadata={
-        "read": lambda value, key: {name: _records.number(each, name)
-                                    for name, each in _records.record(value, key).items()}})
+    `temperatures` is `rl_agent_config.json`'s per-type list (choice, score,
+    noul), and `bucket_temperatures` its per-(type, option count) map, as the file
+    states them.
+    """
 
-    @classmethod
-    def read(cls, record: Mapping[str, object]) -> "tuple[LayaConfig, frozenset[str]]":
-        """The config `record` states, each key it leaves out its field's default, and the keys it states."""
-        names = {held.name: held for held in fields(cls)}
-        stated = frozenset(record) & set(names)
-        return cls(**{name: names[name].metadata["read"](record[name], name) for name in stated}), stated
-
-    def record(self) -> Mapping[str, object]:
-        """The file this config writes: each key, the encoder where it names one."""
-        values = {held.name: getattr(self, held.name) for held in fields(self)}
-        if self.encoder is None:
-            values.pop("encoder")
-        temperature = self.temperature
-        values["temperature"] = list(temperature) if isinstance(temperature, tuple) else temperature
-        values["temperature_by_options"] = dict(self.temperature_by_options)
-        return values
-
-    @classmethod
-    def of(cls, layers: int, layout: QuestionLayout, calibration: Calibration,
-           encoder: str | None) -> "LayaConfig":
-        """The config of a head of `layers` over `layout`, its `calibration`'s temperatures held within their
-        bounds as the task applies them, so that a reader which does not hold them answers as it does."""
-        applied = calibration.temperatures.applied()
-        laid = {}
-        for held in fields(cls):
-            if "laid" in held.metadata:
-                value, spelled = getattr(layout, held.metadata["laid"]), held.metadata.get("spelled")
-                laid[held.name] = value if spelled is None else spelled[value]
-        return cls(encoder=encoder, head_layers=layers, **laid,
-                   temperature=tuple(applied.types.get(kind, applied.default) for kind in TEMPERATURE_TYPES),
-                   temperature_by_options=dict(applied.buckets))
-
-    def layout(self) -> MarkerLayout:
-        """The layout this config states, which Laya's readers lay rows out by: a spelled value Laya spells
-        none of (the release's file named in its place) reads as its first spelling's."""
-        laid = {}
-        for held in fields(self):
-            if "laid" in held.metadata:
-                value, spelled = getattr(self, held.name), held.metadata.get("spelled")
-                laid[held.metadata["laid"]] = value if spelled is None else value == spelled[True]
-        return MarkerLayout(**laid)
-
-    def temperatures(self) -> Temperatures:
-        """The temperatures this config states, by type (`TEMPERATURE_TYPES`) or one over every type, and
-        by type and option count."""
-        if isinstance(self.temperature, tuple):
-            return Temperatures(dict(zip(TEMPERATURE_TYPES, self.temperature, strict=True)),
-                                dict(self.temperature_by_options))
-        return Temperatures({}, dict(self.temperature_by_options), default=self.temperature)
+    model: DecisionModel
+    variables: Variables
+    layout: MarkerLayout
+    tokenizer: HFTokenizer
+    specials: Specials
+    temperatures: tuple[float, float, float]
+    bucket_temperatures: dict[str, float]
 
 
-def head_files(bundle: "PretrainedDecision") -> HeadFiles:
-    """Laya's head in its release (`dew.decision.formats`): its tensors under Laya's names beside the
-    encoder's in `model.safetensors`, and `rl_agent_config.json` with the head's depth, the layout's window,
-    question budgets and option layout, and the calibration's temperatures held within their bounds as the
-    task applies them, so that a reader which does not hold them answers as it does, and the encoder its
-    agent requires (`LAYA_REQUIRED`). Laya's config states no more of a layout than that, nor of a
-    calibration than its temperatures: the rest is the release's record's (`dew_release.json`), which
-    `DecisionSource.describe` reads back over Laya's file; where the task holds any of it, the option layout
-    names that file, which Laya's readers refuse (`LAYA_OPTION_LAYOUTS`), so none of them lays rows out or
-    answers unlike the task with nothing saying so."""
-    head = from_record(DecisionHead, bundle.head)
-    layout = bundle.layout
-    if not isinstance(layout, QuestionLayout):
-        raise ValueError(f"Laya's head reads rows a QuestionLayout lays out, not a {type(layout).__name__}")
-    # The encoder Laya's agent names: its tokenizer's, which the release holds under tokenizer/.
-    config = LayaConfig.of(head.layers, layout, bundle.calibration, bundle.decision_tokenizer.name)
-    # What Laya's file states of a layout, read as its readers read it; a layout that names Laya's own
-    # order, question first, lays rows out as one that names none.
-    held = replace(layout, order=None) if layout.order == "question_first" else layout
-    if held != config.layout() or beyond_temperatures(bundle.calibration) is not None:
-        config = replace(config, option_layout=RELEASE_FILE)
-    written = json.dumps(config.record(), indent=2) + "\n"
-    return HeadFiles(_head_tensors(bundle.head_variables["params"]), merged=True,
-                     files={CONFIG_FILE: lambda path: write_atomically(str(path), written)})
+
+    def save(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        """Write this checkpoint in Laya's layout, which `Pretrained.load` and llama.cpp's converter read.
+
+        That is `model.safetensors` (the encoder's ModernBertModel tensors under
+        `encoder.` and the head's under Laya's names), `encoder/config.json`, the
+        tokenizer under `tokenizer/`, and `rl_agent_config.json` with the head's
+        depth, the layout's budgets and the temperatures. The backbone must be a
+        ModernBERT encoder and the head Laya's. A backbone under LoRA is written
+        with its factors merged into their kernels (`Pretrained.bound`). Laya's config states a layout's
+        window, question budgets and option layout alone, so a layout that chooses more (an order, labels,
+        segments, blocks) is refused before anything is written; a run saved by `Decide.save` keeps it.
+        """
+        layout = self.layout
+        # Laya's own order is the question first, however the layout names it.
+        stated = MarkerLayout(max_len=layout.max_len, head_max_len=layout.head_max_len,
+                              option_tokens=layout.option_tokens, parallel=layout.parallel,
+                              order="question_first" if layout.order == "question_first" else None)
+        if layout != stated:
+            raise ValueError(f"Laya's config states a layout's window, budgets and option layout alone, not "
+                             f"this one's other choices ({layout}); save the task into a run with `save`")
+        head = from_record(DecisionHead, self.model.head)
+        tensors, config = laya_tensors(self.model, self.variables)
+        root = Path(directory)
+        (root / "encoder").mkdir(parents=True, exist_ok=True)
+        save_sharded(tensors, root, max_shard_size)
+        config = {**config, "architectures": ["ModernBertModel"]}
+        (root / "encoder" / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        self.tokenizer.save_pretrained(root / "tokenizer")
+        (root / CONFIG_FILE).write_text(json.dumps({
+            "head_layers": head.layers, "max_len": self.layout.max_len,
+            "head_max_len": self.layout.head_max_len, "option_tokens": self.layout.option_tokens,
+            "option_layout": "parallel" if self.layout.parallel else "sequential",
+            "temperature": list(self.temperatures), "temperature_by_options": self.bucket_temperatures,
+        }, indent=2) + "\n")
 
 
-def stated(bundle: "PretrainedDecision") -> tuple[Layout, None, Calibration | None]:
-    """What Laya's release states beside Laya's files: its layout whole, and a calibration beyond its
-    temperatures."""
-    return bundle.layout, None, beyond_temperatures(bundle.calibration)
+def laya_tensors(model: DecisionModel, variables: Variables
+                 ) -> tuple[LazyTensors[np.ndarray], Mapping[str, object]]:
+    """Every tensor of a Laya release of `model` over `variables`, by its name in `model.safetensors`
+    (the encoder's ModernBertModel tensors under `encoder.`, the head's under Laya's names), and the
+    encoder's config, which `LayaCheckpoint.save` writes and a release's `export` returns. A backbone
+    under LoRA has its factors merged into their kernels (`Pretrained.bound`). Each tensor is built as
+    it is read, so a sharded writer holds one shard of the release (ledger 2874)."""
+    from dew.interop.pretrained import PretrainedDecoder
+
+    backbone = thaw(part(variables, "backbone"))
+    encoder = model.backbone
+    bundle = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
+    if bundle.adapter is None and any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
+                                      for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
+                                      for key in path):
+        raise ValueError("the backbone carries LoRA factors its model binds to no adapter")
+    if bundle.config.get("model_type") != "modernbert":
+        raise ValueError(f"Laya's layout holds a ModernBERT encoder, not a {bundle.config.get('model_type')}")
+    encoder_tensors = bundle.export()
+    names = {f"encoder.{name.removeprefix('model.')}": name for name in encoder_tensors}
+    head = _head_tensors(thaw(part(variables, "head"))["params"])
+    specs = {**{name: tensor_specs(encoder_tensors)[source] for name, source in names.items()},
+             **tensor_specs(head)}
+    return LazyTensors(specs, lambda name: (np.asarray(encoder_tensors[names[name]]) if name in names
+                                            else head[name])), bundle.config
 
 
 def _head_tensors(params: Mapping[str, object]) -> LazyTensors[np.ndarray]:

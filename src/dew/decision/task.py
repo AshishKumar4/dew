@@ -29,7 +29,7 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import Pack, Refused, Rejected, cut_counts, cut_unit
-from dew.data.text import Tokenizer
+from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import (
     BUCKET_MINIMUM,
     TYPE_MINIMUM,
@@ -42,7 +42,7 @@ from dew.decision.calibration import (
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
-from dew.decision.laya import LAYA
+from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
     OPTION_TILE,
     QUESTION_FIELDS,
@@ -51,6 +51,7 @@ from dew.decision.layout import (
     Encoded,
     Laid,
     Layout,
+    MarkerLayout,
     QuestionLayout,
     Specials,
     render,
@@ -95,8 +96,6 @@ if TYPE_CHECKING:
     from dew.decision.objective import DecisionObjective
     from dew.decision.sources import PretrainedDecision
     from dew.distributed.placement import Layout as Placement, MeshSpec
-    from dew.interop.layouts import Unwritable
-    from dew.interop.releases import ReleasePlan
 
 TASK_FILE = "decide.json"
 """The file `Decide.save` writes into a run: its calibration, budget and name."""
@@ -409,21 +408,6 @@ class Decide(SavedRunTask, InItsForm):
         return step_calibrations(directory, step)
 
     @classmethod
-    def unstated(cls, run: SavedRun) -> "Unwritable | None":
-        """Why the format its head is released in does not state `run`'s backbone
-        (`dew.decision.formats.format_unstated`: a backbone no family's layout writes, one with
-        cross-attention layers a decision context's encoder is read through among them), so its export is
-        its run's native release; None where it does."""
-        from dew.decision.formats import format_unstated
-        from dew.inference.tasks import saved_model, saved_settings
-
-        # The record's model is the backbone the head reads (`from_saved`).
-        backbone = saved_model(run.record, None).build()
-        head = Head.from_record(saved_settings(run.record, DecideSettings).head,
-                                DecisionModel.head_size(backbone)[0])
-        return format_unstated(head.release_format, backbone)
-
-    @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
                    layout: "Placement | None" = None, dtype: DTypeLike | None = None,
                    param_dtype: DTypeLike | None = None) -> Self:
@@ -441,7 +425,11 @@ class Decide(SavedRunTask, InItsForm):
 
         directory, record, step = run.directory, run.record, run.step
         variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        averaged = run.averaged(ema)
+        if ema is None:
+            with Checkpoints(directory) as checkpoints:
+                averaged = checkpoints.stored(step).get("ema") is not None
+        else:
+            averaged = ema
         backbone = saved_model(record, dtype).build()
         task = cls._recorded(directory, record, backbone, variables, Weights(step, averaged), dtype)
         task = replace(task, variables=_served(task.model, task.variables))
@@ -510,28 +498,27 @@ class Decide(SavedRunTask, InItsForm):
         task = replace(task, budget=replace(task.budget, options=widest))
         return task if calibrate_on is None else task.calibrated(calibrate_on)
 
-    def release_plan(self) -> "ReleasePlan | Unwritable":
-        """This task's release (`dew.decision.formats.decision_plan`), or why none states it.
-
-        The files are those of the format its head is released in (`Head.release_format`): Laya's layout
-        for a `DecisionHead` (the files llama.cpp's converter and `/v1/systemone` server read too), the
-        joint head's for a `JointSchemaHead`, the slot readout's for a `LabelReadout` or a `SlotReadout`.
-        What a format's files cannot state, the task's own layout and a calibration beyond temperatures,
-        goes beside them in the release (`dew.config.Release`), which the one decision loader reads back
-        over them (`dew.decision.release`), so a task of any layout it was trained with exports and loads
-        as the task it is. The calibration's temperatures go into Laya's file held within their bounds as
-        this task applies them, so that a reader which does not hold them answers as this task does."""
-        from dew.decision.formats import decision_plan, format_unstated
-        from dew.decision.sources import PretrainedDecision
-
-        why = format_unstated(self.model.head.release_format, self.model.backbone)
-        return why if why is not None else decision_plan(PretrainedDecision.of(self))
-
     def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write this task as a released checkpoint (`release_plan`), which `from_pretrained` reads back."""
-        from dew.interop.releases import writable
+        """Write this task as a released checkpoint, which `from_pretrained` reads back.
 
-        writable(self.release_plan(), "decision task").write(directory, max_shard_size=max_shard_size)
+        A ModernBERT backbone under Laya's head and layout is written in Laya's
+        layout (`LayaCheckpoint.save`), the files llama.cpp's converter and
+        `/v1/systemone` server read too. The calibration's temperatures go with
+        it, held within their bounds as this task applies them, so that a reader
+        which does not hold them answers as this task does. A binning map or
+        abstention thresholds, which that layout has no place for, are refused
+        rather than dropped.
+        """
+        if self.calibration.binning is not None or self.calibration.abstention is not None:
+            raise ValueError("a released checkpoint keeps temperatures alone; save the binning and "
+                             "abstention into a run with `save` instead")
+        if not isinstance(self.layout, MarkerLayout) or not isinstance(self.tokenizer, HFTokenizer):
+            raise ValueError("Laya's layout is a MarkerLayout over a Hugging Face tokenizer")
+        applied = self.calibration.temperatures.applied()
+        types = applied.types
+        LayaCheckpoint(self.model, self.variables, self.layout, self.tokenizer, self.specials,
+                       (types.get("choice", 1.0), types.get("score", 1.0), types.get("noul", 1.0)),
+                       dict(applied.buckets)).save(directory, max_shard_size=max_shard_size)
 
     def save(self, directory: str) -> None:
         """Write this task's calibration, budget and name into the run `directory`.
