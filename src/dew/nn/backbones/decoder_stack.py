@@ -38,7 +38,7 @@ from ..kv_cache import cache_at_layer, cache_from_layer
 from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
-from .decoder_block import DecoderBlock
+from .decoder_block import DecoderBlock, RematPolicy
 from .layer_names import array_rows, group_layers, group_name, stage_count
 from .layer_plan import LayerSpec, run_period
 
@@ -164,7 +164,7 @@ def _rows_read(tree, index: jax.Array):
     found = _row_containers(tree)
     branches = [functools.partial(lambda held, offset: [rows[offset] for rows in held], offset=offset)
                 for offset in range(len(found[0][1]))]
-    # Named so the scan's body recomputes them in the backward from the index (`_ROWS_RECOMPUTED`): kept,
+    # Named so the scan's body recomputes them in the backward from the index (`_rows_recomputed`): kept,
     # each iteration's rows would stack the run a second time among the scan's residuals.
     read = jax.tree.map(lambda leaf: checkpoint_name(leaf, LAYER_ROWS),
                         jax.lax.switch(index, branches, [rows for _, rows in found]))
@@ -175,12 +175,19 @@ def _rows_read(tree, index: jax.Array):
     return unflatten_dict(flat)
 
 
-def _ROWS_RECOMPUTED(primitive: jax.extend.core.Primitive, *_, **params) -> bool:
-    """What a scanned run's body that reads rows keeps for the backward: all its layer keeps, but the rows it
-    read (`_rows_read`, named `LAYER_ROWS`), which the backward reads again from the iteration's index. JAX
-    0.12's `save_anything_except_these_names` saves every value, the names it is given among them, which kept
-    each iteration's rows among the scan's residuals (row 4751)."""
-    return not (primitive.name == 'name' and params.get('name') == LAYER_ROWS)
+def _rows_recomputed(remat: RematPolicy | None) -> Callable[..., bool]:
+    """What a scanned run's body that reads rows keeps for the backward: what its layer's own remat keeps
+    (`remat`: everything where it has none, `RematPolicy.checkpoint_policy` otherwise, nothing where that is
+    None), but never the rows it read (`_rows_read`, named `LAYER_ROWS`), which the backward reads again from
+    the iteration's index. JAX 0.12's `save_anything_except_these_names` saves every value, the names it is
+    given among them, which kept each iteration's rows among the scan's residuals (row 4751)."""
+    layer = ((lambda *_, **__: True) if remat is None
+             else remat.checkpoint_policy() or jax.checkpoint_policies.nothing_saveable)
+
+    def policy(primitive: jax.extend.core.Primitive, *avals, **params) -> bool:
+        return not (primitive.name == 'name' and params.get('name') == LAYER_ROWS) and layer(
+            primitive, *avals, **params)
+    return policy
 
 
 def _rows_joined(variables: Mapping[str, Mapping], index: jax.Array) -> dict:
@@ -355,13 +362,14 @@ def _run_module(block: Block, specs: Sequence[LayerSpec], first: int, count: int
 
 
 def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[LayerSpec], x, *, fetching: bool,
-                  train: bool, decode: bool, kv_store, per_layer_input, attention_metadata):
+                  train: bool, decode: bool, kv_store, per_layer_input, attention_metadata,
+                  remats: Sequence[RematPolicy | None]):
     """`run_stack` without the inference prefetch: each run of one layer
     called as the plain loop calls it, and each longer run under flax's
     scan, a periodic run's (a `PipelineStage` of its period) over its repeats. Training, or a
     forward that keeps intermediates, through host-resident banks scans with
     the fetch mapped onto each row under remat (`run_stack`)."""
-    for run, (first, count) in zip(runs, groups, strict=True):
+    for run, (first, count), remat in zip(runs, groups, remats, strict=True):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         periodic = isinstance(run, PipelineStage)
         store = kv_store if count == 1 or specs[first].kv_shared else None
@@ -399,11 +407,13 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # is always a run of one (`run_stack`).
             # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
             # reading its row in place, by the iteration's index the carry counts, into the collections they
-            # join (`_rows_joined`), recomputed in the backward (`_ROWS_RECOMPUTED`); every other collection
+            # join (`_rows_joined`), recomputed in the backward (`_rows_recomputed`); every other collection
             # scans its stacked layers.
             rows = tuple(run.variables.get(LAYER_ROWS, {}))
 
-            def scanned(layer, carry, per_layer_input, *, store=store, step=step, rows=rows):
+            policy = _rows_recomputed(remat)
+
+            def scanned(layer, carry, per_layer_input, *, store=store, step=step, rows=rows, policy=policy):
                 x, index = carry
                 if not rows:
                     return (step(layer, x, per_layer_input, store)[0], index + 1), None
@@ -413,7 +423,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                         lambda layer, x, per_layer_input: step(layer, x, per_layer_input, store)[0],
                         (LAYER_ROWS, *rows), trans_in_fn=functools.partial(_rows_joined, index=index),
                         init=False, mutable=False)(layer, x, per_layer_input)
-                return (nn.remat(read, policy=_ROWS_RECOMPUTED, prevent_cse=False)(
+                return (nn.remat(read, policy=policy, prevent_cse=False)(
                     layer, x, per_layer_input, index), index + 1), None
 
             repeats = count // len(run.specs) if periodic else count
@@ -461,7 +471,8 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
                     for (first, count), period in zip(groups, periods, strict=True)]
         return _scanned_runs(periodic, groups, specs, x, fetching=False, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
-                             attention_metadata=attention_metadata)
+                             attention_metadata=attention_metadata,
+                             remats=[layers[first].remat for first, _ in groups])
     runs = [layers[first] if count == 1 else block(first, group_name(first, count))
             for first, count in groups]
     streaming = any('streaming' in run.variables for run in runs)
@@ -471,7 +482,8 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     if not fetching or train:
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
-                             attention_metadata=attention_metadata)
+                             attention_metadata=attention_metadata,
+                             remats=[layers[first].remat for first, _ in groups])
 
 
     def read_only(run: DecoderBlock) -> list[str]:
