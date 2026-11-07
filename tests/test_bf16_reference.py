@@ -57,19 +57,27 @@ DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek
 DECODER_SEEDS = {"float32": {"mixtral-tiny": 16}, "bfloat16": {"mixtral-tiny": 512}}
 """Each decoder's declared draws of ids against transformers' forward in the same precision (check 1),
 sized by `seeds_for` paired with Dew's logits on the CPU: 8 where a decoder is not named."""
+NARROW_ROUTED = ("deepseek-v3-tiny",)
+"""The decoders whose bfloat16 routing flips move both arms' errors past check 1's resolution (DeepSeek-V3's
+group selection: each draw's flip a heavy tail, its paired ratio 0.96 over cleared draws, row 4734); the
+others' check 1 resolves over every draw."""
+
+
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("name", DECODERS)
 def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     """Dew's logits in `dtype` (bfloat16 over float32 masters, as training runs) are on par with
     transformers' own forward in `dtype` (its weights cast to it, as `from_pretrained` casts them), both
-    from the float64 twin of the stored weights, over drawn ids (check 1). A decoder that routes draws ids
-    whose routes Dew's float64 run decides by the dtype's margin (`clearing_selections`: bfloat16's
-    `NARROW_MARGIN`), so neither narrow run routes otherwise than the truth (row 4734)."""
+    from the float64 twin of the stored weights, over drawn ids (check 1). A decoder whose bfloat16 routing
+    moves both arms past check 1 (`NARROW_ROUTED`) draws ids whose routes Dew's float64 run decides by
+    bfloat16's margin (`clearing_selections`, `NARROW_MARGIN`), so neither narrow run routes otherwise than
+    the truth (row 4734)."""
     directory = FIXTURES / name
     pretrained = Pretrained.load(str(directory), dtype=dtype, attention_impl="reference")
-    truth_model = Pretrained.load(str(directory), dtype="float64", attention_impl="reference")
-    draw = clearing_selections(truth_model, fixture_ids(directory), f"{name} {dtype}", tries=256,
-                               margin=NARROW_MARGIN if dtype == "bfloat16" else None)
+    draw = fixture_ids(directory)
+    if dtype == "bfloat16" and name in NARROW_ROUTED:
+        truth_model = Pretrained.load(str(directory), dtype="float64", attention_impl="reference")
+        draw = clearing_selections(truth_model, draw, f"{name} {dtype}", tries=256, margin=NARROW_MARGIN)
     source = transformers_model(directory)
     narrow = source if dtype == "float32" else transformers_model(directory, dtype=dtype)
     reference, truth = transformers_arms(narrow, lambda model, ids: model(ids, use_cache=False).logits,
