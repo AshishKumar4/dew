@@ -230,59 +230,53 @@ class Accumulators:
     """A ring of `count` fp32 accumulators of `rows` x `columns` in tensor memory side by side: a done barrier
     each, which the producing role arrives at (the product warp's commit once a turn's products are issued),
     and a read barrier each, which the roles that give the turn back arrive at (`released`: the reading
-    warpgroups once they have read it out, or a product's commit where a product is its last reader); both
-    tensor-core ordered (`mosaic.HandOff` states both counts from its roles). A turn is a counter round the
-    ring; its accumulator is the turn's remainder. With `narrowed` (a 16-bit dtype) each accumulator's
-    columns are also a tile of that dtype, two to a column, over the accumulator's own first half: a
-    product's left operand a role writes over the accumulator it reads (FlashAttention 4's P over S,
-    `Tensor.narrowed`). Over a pair of CTAs (`topology`) each holds its rows' accumulators, allocated
-    together, and an accumulator is free once both CTAs have read theirs out (its read barrier the
-    cluster's)."""
+    warpgroups once they have read it out); both tensor-core ordered, their counts stated by the roles that
+    fill and give back the ring (`mosaic.HandOff`, `arrived`). A turn is a counter round the ring; its
+    accumulator is the turn's remainder. Over a pair of CTAs (`topology`) each holds its rows' accumulators,
+    allocated together, and an accumulator is free once both CTAs have read theirs out (its read barrier
+    the cluster's)."""
     count: int
     rows: int
     columns: int
     topology: Topology = SINGLE
-    narrowed: Any = None
     produced: int = 1
     released: int = 1
+    running: bool = False
+    """Whether a tile's running sums lie past the turns, as many columns again (an exactly summed walk's,
+    each window's turn promoted into them: `Tcgen05Rings.persist`'s `summed`)."""
 
     def arrived(self, produced: int, released: int) -> "Accumulators":
         return dataclasses.replace(self, produced=produced, released=released)
 
-    def scratch(self, target: generation.GpuTarget) -> tuple:
-        if self.count * self.columns > TCGEN05.columns(target):
-            raise ValueError(f"{self.count} accumulators of {self.columns} columns exceed tensor memory")
-        if self.narrowed is not None and jnp.dtype(self.narrowed).itemsize != 2:
-            raise ValueError(f"an accumulator narrows to a 16-bit tile, two to a column, not {self.narrowed}")
-        paired = self.topology.paired
+    def barriers(self) -> tuple:
+        """The ring's done and read barriers (`scratch`'s, which a launch's shared memory counts)."""
         done = plgpu.Barrier(num_arrivals=self.produced, num_barriers=self.count, orders_tensor_core=True)
-        read = (plgpu.ClusterBarrier(collective_axes=(mosaic.CLUSTER,), num_arrivals=self.released,
-                                     num_barriers=self.count, orders_tensor_core=True)
-                if paired else plgpu.Barrier(num_arrivals=self.released, num_barriers=self.count,
-                                             orders_tensor_core=True))
-        wide = plgpu.TMEM((self.rows, self.count * self.columns), jnp.float32, collective=paired)
-        if self.narrowed is None:
-            return wide, done, read
-        # The narrowed tiles' columns: twice the accumulators' elements packed two to a column, so a turn's
-        # tile starts at its accumulator's first column (`Tensor.narrowed`).
-        narrow = plgpu.TMEM((self.rows, 2 * self.count * self.columns), self.narrowed, packed=True,
-                            collective=paired)
-        return plgpu.RefUnion(wide, narrow), done, read
+        if self.topology.paired:
+            return done, plgpu.ClusterBarrier(collective_axes=(mosaic.CLUSTER,), num_arrivals=self.released,
+                                              num_barriers=self.count, orders_tensor_core=True)
+        read = plgpu.Barrier(num_arrivals=self.released, num_barriers=self.count, orders_tensor_core=True)
+        return done, read
+
+    def scratch(self, target: generation.GpuTarget) -> tuple:
+        columns = (self.count + self.running) * self.columns
+        if columns > TCGEN05.columns(target):
+            raise ValueError(f"{self.count + self.running} accumulators of {self.columns} columns exceed "
+                             "tensor memory")
+        tmem = plgpu.TMEM((self.rows, columns), jnp.float32, collective=self.topology.paired)
+        return tmem, *self.barriers()
 
     def opened(self, tmem, done, read) -> "Tensor":
-        wide, narrow = tmem if self.narrowed is not None else (tmem, None)
-        return Tensor(self, wide, narrow, done, read)
+        return Tensor(self, tmem, done, read)
 
 
 @dataclasses.dataclass(frozen=True)
 class Tensor:
-    """Opened accumulators (`Accumulators.opened`): the product warp acquires a turn's accumulator, issues
-    into it and commits (`acquire`, `issued`); a reading role waits for it once (`ready`), reads its columns
-    in parts (`slot` through the issuer's `read`) and gives it back (`release`), or leaves that to the
-    product that reads it last (`release_by`)."""
+    """Opened accumulators (`Accumulators.opened`): the product warp waits for a turn's accumulator to be
+    free (`freed`, `acquire`), issues into it and commits (`issued`); a reading role waits for it once
+    (`ready`), reads its columns in parts (`slot`, `columns`, through the issuer's `read`) and gives it back
+    (`release`)."""
     shape: Accumulators
     tmem: Ref
-    narrow: Ref | None
     done: state_types.AbstractRef
     read_done: state_types.AbstractRef
 
@@ -290,11 +284,20 @@ class Tensor:
         """Turn `counter` round the accumulators (`mosaic.Turn`, its slot the accumulator's index)."""
         return mosaic.Turn.of(counter, self.shape.count)
 
-    def acquire(self, turn: mosaic.Turn):
-        """The product warp's turn: the turn's accumulator once the turn `count` before is given back."""
+    def freed(self, turn: mosaic.Turn) -> None:
+        """The product warp waits for the turn's accumulator: given back by the turn `count` before."""
         pl.when(turn.counter >= self.shape.count)(lambda: plgpu.barrier_wait(
             self.read_done.at[turn.slot], parity=turn.freed))
+
+    def acquire(self, turn: mosaic.Turn):
+        """The product warp's turn: the turn's accumulator, once `freed`."""
+        self.freed(turn)
         return column_span(self.tmem, turn.slot * self.shape.columns, self.shape.columns)
+
+    def columns(self, turn: mosaic.Turn, first, count: int):
+        """Columns `first` to `first + count` of the turn's accumulator (several products' accumulators side
+        by side in one turn's columns: a launch's paired outputs)."""
+        return column_span(self.tmem, turn.slot * self.shape.columns + first, count)
 
     def issued(self, turn: mosaic.Turn) -> None:
         """The product warp's turn's products all issued: the reader may wait on them."""
@@ -304,32 +307,20 @@ class Tensor:
         """A reading role's turn: its products done, once, however many parts it reads (`slot`)."""
         plgpu.barrier_wait(self.done.at[turn.slot], parity=turn.parity)
 
+    def running_columns(self, first, count: int):
+        """Columns `first` to `first + count` of the tile's running sums (`Accumulators.running`)."""
+        return column_span(self.tmem, self.shape.count * self.shape.columns + first, count)
+
     def slot(self, turn: mosaic.Turn) -> "Accumulator":
         """The turn's accumulator, which the issuer reads, writes and updates in column parts
         (`Tcgen05Issuer.read`, `write`, `update`) once it is `ready`."""
         shape = (self.shape.rows, self.shape.columns)
         return Accumulator(column_span(self.tmem, turn.slot * self.shape.columns, self.shape.columns), shape)
 
-    def narrowed(self, turn: mosaic.Turn) -> "Accumulator":
-        """The turn's narrowed tile (`Accumulators.narrowed`): a product's left operand over the turn's own
-        accumulator, its 16-bit elements two to a column, so its part of `p` columns from column `i p` lies
-        on the accumulator's columns `i p / 2` to `(i + 1) p / 2`: a role that reads the accumulator in parts
-        of `p` columns and writes each part's narrowed tile after reading it overwrites only columns it has
-        read. The product reading it gives the turn back (`release_by`)."""
-        if self.narrow is None:
-            raise ValueError("these accumulators hold no narrowed tiles (`Accumulators.narrowed`)")
-        tile = column_span(self.narrow, 2 * turn.slot * self.shape.columns, self.shape.columns)
-        return Accumulator(tile, (self.shape.rows, self.shape.columns), dtype=self.shape.narrowed)
-
     def release(self, turn: mosaic.Turn) -> None:
         """A reading role's turn read out: its accumulator free for the turn `count` after."""
         plgpu.wait_load_tmem()
         plgpu.barrier_arrive(self.read_done.at[turn.slot])
-
-    def release_by(self, turn: mosaic.Turn):
-        """The barrier a product's commit gives the turn back at, the product being its last reader (a
-        narrowed tile's, `TCGEN05.product`'s `released`)."""
-        return self.read_done.at[turn.slot]
 
     def drain(self, turns) -> None:
         """The product warp's last turns' give-backs, which no later product waited for (`mosaic.drained`)."""
@@ -638,12 +629,22 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 else CommittedRing(**scoped) if isinstance(scoped['full'].dtype, plgpu_core.BarrierType)
                 else gathered.Committed(**scoped) for name, scoped in allocated.items()}
 
+    def persist_schedule(self, consumers: int, width: int, *, summed: bool = False,
+                         rewrites: bool = False) -> mosaic.Schedule:
+        """A persistent walk's roles: its `consumers` epilogue warpgroups, a rewriting warpgroup where its
+        steps' slots are rewritten (`persist`'s `prepared`), and the issuing warpgroup's warps; and its
+        accumulator turns (`turns` of `width` columns, `Accumulators`, their running sums past them where
+        exactly `summed`), which the product warp fills and the epilogue gives back."""
+        rewriting = (mosaic.Role("rewrite", 1),) if rewrites else ()
+        return mosaic.Schedule((mosaic.Role("epilogue", consumers), *rewriting, *ISSUING), (mosaic.HandOff(
+            "accumulators", Accumulators(self.turns, self.rows, width, running=summed), "mma",
+            ("epilogue",)),))
+
     def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
         # Its accumulator turns' barriers, filled and drained (`persist`), each rewritten ring's slots'
         # publish barriers (`prepared`), and its tensor memory's address.
-        return ((plgpu.Barrier(num_barriers=self.turns, orders_tensor_core=True),
-                 plgpu.Barrier(num_barriers=self.turns, num_arrivals=consumers, orders_tensor_core=True),
-                 *(plgpu.Barrier(num_barriers=stages) for stages in rewrites)),
+        (accumulators,) = self.persist_schedule(consumers, 0).stated()
+        return ((*accumulators.barriers(), *(plgpu.Barrier(num_barriers=stages) for stages in rewrites)),
                 resources.TMEM_ADDRESS_BYTES)
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
@@ -676,34 +677,31 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         rewrites = () if prepared is None else tuple(ring.stages for ring in rings.values())
         width = sum(shape[1] for shape in accumulators)
         offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]
-
         def windows(steps):
             return 1 if not summed else (steps + summed - 1) // summed
 
-        def scoped(tmem, done, read, *rest):
+        roles = self.persist_schedule(consumers, width, summed=bool(summed), rewrites=prepared is not None)
+
+        def scoped(*allocated):
+            (tensor,) = roles.opened(allocated[:1]).values()
             # The product warp reads each step's slots once the rewrite publishes them (`prepared`): each
             # slot's `masked` barrier in its loads' place.
-            masked = dict(zip(rings, rest[:len(rewrites)], strict=True)) if rewrites else {}
-            smems = rest[len(rewrites):]
+            masked = dict(zip(rings, allocated[1:1 + len(rewrites)], strict=True)) if rewrites else {}
+            smems = allocated[1 + len(rewrites):]
             issued = ({name: _published(ring, masked[name]) for name, ring in rings.items()} if masked
                       else rings)
-            def turn_of(done_turns) -> mosaic.Turn:
-                return mosaic.Turn.of(done_turns, self.turns)
-
-            def at_columns(first: int | jax.Array) -> tuple:
-                # Every accumulator of a tile, each its columns of tensor memory from `first`.
-                return tuple(Accumulator(column_span(tmem, first + offset, shape[1]), shape)
-                             for offset, shape in zip(offsets, accumulators, strict=True))
 
             def held(turn: mosaic.Turn) -> tuple:
                 # The turn's accumulators: each its columns of the turn's share of tensor memory.
-                return at_columns(turn.slot * width)
+                return tuple(Accumulator(tensor.columns(turn, offset, shape[1]), shape)
+                             for offset, shape in zip(offsets, accumulators, strict=True))
 
             # An exactly summed tile's running sums: the columns past the turns'.
-            running = at_columns(self.turns * width) if summed else ()
+            running = tuple(Accumulator(tensor.running_columns(offset, shape[1]), shape)
+                            for offset, shape in zip(offsets, accumulators, strict=True)) if summed else ()
 
-            products = self._issued(issued, issue, turn_of, held, running, read, done, summed=summed,
-                                    interpret=interpret, unrolled=unrolled)
+            products = self._issued(issued, issue, tensor, held, running, summed=summed, interpret=interpret,
+                                    unrolled=unrolled)
 
             def epilogue(index):
                 store = self._stores(smems, index)
@@ -713,8 +711,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
                     @pl.when(active)
                     def _():
-                        into, turn = self._awaited(turn_of, held, running, done, read, done_turns, steps,
-                                                   summed)
+                        into, turn = self._awaited(tensor, held, running, done_turns, steps, summed)
 
                         def walk(step, start, shapes, *, initial=None):
                             # The products issued it: the tile's accumulators (its running sums), done.
@@ -724,9 +721,10 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                             return start, into
 
                         finish(index, tile, issue(index, tile, walk, active=True), store, active=True)
-                        plgpu.wait_load_tmem()
                         if turn is not None:
-                            plgpu.barrier_arrive(read.at[turn.slot])
+                            tensor.release(turn)
+                        else:
+                            plgpu.wait_load_tmem()
 
                     pl.when(~active)(lambda: finish(index, tile, issue(index, tile, persistent.unwalked(self),
                                                                        active=False), store, active=False))
@@ -742,43 +740,35 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
             def issue_all():
                 _, computed = persistent.tiled(tiles, schedule, products, axis=axis, turns=windows)
-                mosaic.drained(read, computed, self.turns)
+                tensor.drain(computed)
 
             def rewrite(index):
                 del index
                 persistent.tiled(tiles, schedule, functools.partial(_rewritten, rings, masked, prepared),
                                  axis=axis)
 
-            # The rewrite a role beside the epilogue's, before the issuing warpgroup (`prepared`).
             rewriting = {"rewrite": rewrite} if prepared is not None else {}
-            roles = (mosaic.Role("epilogue", consumers), *(mosaic.Role(name, 1) for name in rewriting),
-                     *ISSUING)
-            mosaic.Schedule(roles).run(epilogue=epilogue, load=load, mma=issue_all, **rewriting)
+            roles.run(epilogue=epilogue, load=load, mma=issue_all, **rewriting)
 
-        # Each ring's slots' rewrites published, a barrier of the ring's own (a wait of the product warp's
-        # one turn each).
-        pl.run_scoped(scoped, plgpu.TMEM((self.rows, (self.turns + bool(summed)) * width), jnp.float32),
-                      *self.persist_scratch(consumers, rewrites)[0], *staging, collective_axes="wg")
+        (accumulated,) = roles.scratch(generation.gpu_target())
+        # Each ring's slots' rewrites published, a barrier of the ring's own (`prepared`).
+        published = tuple(plgpu.Barrier(num_barriers=stages) for stages in rewrites)
+        pl.run_scoped(scoped, accumulated, *published, *staging, collective_axes="wg")
 
-
-    def _issued(self, rings, issue: Callable, turn_of: Callable, held: Callable, running: tuple, read,
-                done, *, summed: int, interpret: bool, unrolled: bool) -> Callable:
+    def _issued(self, rings, issue: Callable, tensor: "Tensor", held: Callable, running: tuple, *,
+                summed: int, interpret: bool, unrolled: bool) -> Callable:
         """`persist`'s product warp's visit of a tile (`persistent.tiled`'s): each active tile's windows (its
         steps, where not `summed`) into a turn's accumulators once the window `turns` back has been read out
         of them, each window then a commit the epilogue waits on."""
         def products(counter, active, steps, views, tile, done_turns):
             del views
 
-            def freed(turn: mosaic.Turn) -> None:
-                pl.when(turn.counter >= self.turns)(lambda: plgpu.barrier_wait(read.at[turn.slot],
-                                                                               parity=turn.freed))
-
             @pl.when(active)
             def _():
                 # A tile not summed takes one turn, freed and held before its walk is issued.
-                turn = None if summed else turn_of(done_turns)
+                turn = None if summed else tensor.turn(done_turns)
                 if turn is not None:
-                    freed(turn)
+                    tensor.freed(turn)
                 into = None if turn is None else held(turn)
 
                 def walked(lo, hi, start, shapes, accumulators: tuple, step):
@@ -795,38 +785,38 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                         return walked(counter, counter + steps, start, shapes, into, step)
 
                     def window(index, carry):
-                        each = turn_of(done_turns + index)
-                        freed(each)
+                        each = tensor.turn(done_turns + index)
+                        tensor.freed(each)
                         lo = counter + index * summed
                         carry, _ = walked(lo, jnp.minimum(lo + summed, counter + steps), carry, shapes,
                                           held(each), step)
-                        plgpu.tcgen05_commit_arrive(done.at[each.slot])
+                        tensor.issued(each)
                         return carry
 
                     return lax.fori_loop(0, (steps + summed - 1) // summed, window, start), running
 
                 issue(0, tile, walk, active=True)
                 if turn is not None:
-                    plgpu.tcgen05_commit_arrive(done.at[turn.slot])
+                    tensor.issued(turn)
 
         return products
 
-    def _awaited(self, turn_of: Callable, held: Callable, running: tuple, done, read, done_turns, steps,
+    def _awaited(self, tensor: "Tensor", held: Callable, running: tuple, done_turns, steps,
                  summed: int) -> tuple:
         """`persist`'s epilogue's wait for a tile's products: its turn's accumulators once their commit
-        arrives, and the turn the epilogue frees once it has read them; exactly summed (`summed`), each
-        window's partials promoted into the running sums as its commit arrives, each window's turn freed
-        then, the running sums the tile's accumulators and no turn left to free."""
+        arrives, and the turn the epilogue gives back once it has read them; exactly summed (`summed`), each
+        window's partials promoted into the running sums as its commit arrives, each window's turn given
+        back then, the running sums the tile's accumulators and no turn left to give back."""
         if not summed:
-            turn = turn_of(done_turns)
-            plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
+            turn = tensor.turn(done_turns)
+            tensor.ready(turn)
             return held(turn), turn
 
         def window(at, carry):
-            turn = turn_of(done_turns + at)
-            plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
+            turn = tensor.turn(done_turns + at)
+            tensor.ready(turn)
             self._promoted(held(turn), running, at == 0)
-            plgpu.barrier_arrive(read.at[turn.slot])
+            tensor.release(turn)
             return carry
 
         lax.fori_loop(0, (steps + summed - 1) // summed, window, None)

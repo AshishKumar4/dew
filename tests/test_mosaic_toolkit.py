@@ -298,23 +298,20 @@ def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
 
 
 def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
-    """A hand-off's barriers (`Schedule.scratch`): a signal two softmax warpgroups fill counts two arrivals,
-    an accumulator ring the product warp fills and the correction gives back counts one each, and one a
-    product's commit gives back (`release_by`) counts that commit alone."""
+    """A hand-off's barriers (`Schedule.scratch`) count the arrivals of the roles that fill and give it
+    back: a signal two softmax warpgroups fill counts two, and an accumulator ring the product warp fills
+    and two epilogue warpgroups give back counts one done arrival and two read ones. A role of weight 0
+    beside a warp role is refused, the last warpgroup holding one or the other."""
     from dew.nn.kernels.templates import mosaic_sm100
 
     schedule = mosaic.Schedule(
-        (mosaic.Role("softmax", count=2), mosaic.Role("correction"), *mosaic_sm100.ISSUING),
+        (mosaic.Role("softmax", count=2), mosaic.Role("epilogue", count=2), *mosaic_sm100.ISSUING),
         (mosaic.HandOff("scales", mosaic_sm100.Signals(count=2, tensor_core=False), "softmax"),
-         mosaic.HandOff("output", mosaic_sm100.Accumulators(1, 128, 64), "mma", ("correction",)),
-         mosaic.HandOff("scores", mosaic_sm100.Accumulators(2, 128, 64, narrowed=jnp.bfloat16), "mma",
-                        ("mma",))))
-    scales, (_, output_done, output_read), (_, scores_done, scores_read) = schedule.scratch(
-        generation.gpu_target("sm100"))
+         mosaic.HandOff("output", mosaic_sm100.Accumulators(2, 128, 64), "mma", ("epilogue",))))
+    scales, (_, done, read) = schedule.scratch(generation.gpu_target("sm100"))
     assert scales.num_arrivals == 2
-    assert (output_done.num_arrivals, output_read.num_arrivals) == (1, 1)
-    assert (scores_done.num_arrivals, scores_read.num_arrivals) == (1, 1)
-    assert schedule.warpgroups() == 4
+    assert (done.num_arrivals, read.num_arrivals) == (1, 2)
+    assert schedule.warpgroups() == 5
     with pytest.raises(ValueError, match="last warpgroup"):
         mosaic.Schedule((mosaic.Role("consumer"), mosaic.Role("producer", weight=0), *mosaic_sm100.ISSUING))
 
