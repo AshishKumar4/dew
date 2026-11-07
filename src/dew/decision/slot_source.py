@@ -42,7 +42,7 @@ from .layout import (
 )
 from .model import DecisionModel
 from .release import released_decision, released_length
-from .sources import PretrainedDecision
+from .sources import PretrainedDecision, head_axes
 
 SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the listed options. Respond with only "
                "its uppercase letter, with no explanation or reasoning.")
@@ -131,6 +131,9 @@ def _one_variant(mode: str, labels: Labels) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class SlotHeadSource(HeadComponent):
+    def axes(self, head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+        return head_axes(head, backbone)
+
     def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         if backbone is None:
