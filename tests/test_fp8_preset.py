@@ -274,7 +274,7 @@ def fake_quantized(dtype):
     from dew.nn.moe import ExpertMLP
 
     project = laid_projection(dtype)
-    taken = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+    taken = {"q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"}
 
     def dense(module, x):
         kernel = nn.unbox(module.variables["params"]["kernel"])
