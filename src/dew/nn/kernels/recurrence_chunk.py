@@ -1640,17 +1640,13 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('forms', lambda case: case.fast,
                 "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
                 "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
-    Requirement('qualified', lambda case: case.family == 'wgmma',
-                "the template's selective scan held to recorded mamba_ssm's distance from float64 on an H100 "
-                "alone (selective-recorded2-h100-497ea24e7), not on this GPU", row='ledger 2968',
-                kind='measured'),
 )
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
 blocks of channels, at most `SELECTIVE_STATES` states, a chunk's tokens at least (a decode step hands off
-to the portable math), the run's fast forms, and its
-qualification against recorded mamba_ssm on the GPU's family: on an H100 the template is as exact as
-mamba_ssm in every recorded case (tests/test_gpu_recurrence.py)."""
+to the portable math), and the run's fast forms. Off Hopper too: on an A100 it beat the portable scan in
+every cell, forward 4.0 to 9.1 times, training 11.2 to 13.8 (Mamba 130M and 2.8B at 2k and 8k tokens,
+W84-a100, M-JS-23)."""
 
 SELECTIVE: Op[SelectiveCase] = Op('selective_scan', (Kernel('mosaic_gpu', SELECTIVE_SUPPORTS),
                                                      Kernel('xla', (), generic=True)))
