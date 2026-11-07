@@ -535,10 +535,13 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     Packed documents (`starts`, at most `max_segments` a row) each compute as they would alone. A conv
     runs before the op: it takes the conv's output. The operands the hooks read are checked as the
     decode step's (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction.
-    A memory entering is read through its chunk's decays at their size while it lies within 2^96 of the
-    values: past it, a decay that leaves fp32's normals (a chunk's prefix under 2^-126) reads it as zero, as
-    fla's chunked form does (row 2344: on par at 2^96 through a token's decay of exp2(-124.8), a write gate's
-    output 150 times the recurrence's distance at 2^110). A call names a kernel through `generation.chosen`
+    A memory entering is read through its chunk's decays at their size while it lies within 2^100 of the
+    values, every form on par with the recurrence a token at a time there; past it fp32 holds no such read,
+    its own token recurrence 4e-6 from float64 at 2^110 and 6e-2 at 2^124 through a token's decay of
+    exp2(-124.8), and under a decay a head an out-of-range memory's read overflows to inf where the template
+    scales its read output-side (`recurrence_algebra.chunk_output`), never a silent value (row 2344, group 7;
+    jsf-range at base/kernels 3bc9e1b09e: the template inf at 2^126, the portable forms 0.77 from float64
+    until they scale so too). A call names a kernel through `generation.chosen`
     alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
