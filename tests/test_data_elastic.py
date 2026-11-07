@@ -751,6 +751,8 @@ def test_a_ramped_elastic_read_that_keeps_its_short_last_batch_cuts_it_alike_on_
         return [int(row) if real else None for row, real in zip(batch["id"], valid, strict=True)]
 
     whole = [places(batch) for batch in steps(0, 1)]
+    # The ramp's steps: 4 records at first, its stages growing to the read's batch.
+    assert [len(step) for step in whole[:3]] == [4, 4, 4] and len(whole[-1]) == BATCH
     shares = [[places(batch) for batch in steps(index, count)] for index in range(count)]
     assert {len(share) for share in shares} == {len(whole)}
     assert sum(row is not None for step in whole for row in step) == 30
