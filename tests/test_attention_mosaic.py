@@ -100,7 +100,7 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     64 of a slot's 128 queries, or queries first over keys its two consumers share on `FED`'s layout
     (`fused-shared-keys`), or keys first on the dQ launch's layout, each of its two consumers its own keys,
     their score cotangents exchanged for a shared dQ (`fused-shared-dq`, FlashAttention 3's width 128), its
-    producer adding it (`fused-producer-dq`)."""
+    producer adding it (`fused-producer-dq`); or the fast form at its derivation's tiles (`derived`)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family=WGMMA)
     if form == "fused-shared-keys":
@@ -115,6 +115,8 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     if form == "accurate":
         # Its derivation's: two launches, its dK/dV programs' column shares its dQ's two sums' choice.
         return True, None
+    if form == "derived":
+        return False, None
     columns = 2 if form == "accurate-halves" else 1
     return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, family=WGMMA,
                                                              **FED)
@@ -1653,6 +1655,14 @@ def _counted(fn, *arrays) -> tuple[float, float]:
     (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (its cost estimate), as the lowered
     program's structured reader reads them (`lowered.kernel_launches`, each launch times the calls a call
     of the program makes)."""
+@ON_HOPPER
+def the_backward_256_wide_under_a_softcap_is_on_par_on_an_h100():
+    """Gemma 2's backward, a softcap 256 wide, at its derivation's tiles (row 3704: one launch whose
+    consumers share a key block, `BackwardTiles.shared_keys`) compiled on an H100: on par with the reference
+    (check 1)."""
+    _check_hooked_backward("softcap", form="derived", interpret=False, width=256)
+
+
     from dew.nn.kernels.lowered import kernel_launches
 
     # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
@@ -1814,8 +1824,11 @@ BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name 
 """The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
 call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
 whole, in each form (row 2281: its live set beside the step's; FS-A100CHECK1d: the accurate form under a
-row-indexed hook failed an A100's layout inference, a case no fast-form gate lowered)."""
+row-indexed hook failed an A100's layout inference, a case no fast-form gate lowered); and Gemma 2's, a
+softcap 256 wide on an H100, whose one launch's consumers share a key block within its block where its hook
+reserves no reduction scratch (row 3704, `hook_reduces`)."""
 
+BACKWARD_GATE += [("sm90", 256, False, "softcap")]
 
 def _gated_hooks(hooks: str, queries: int, width: int):
     """The gate's score hook `SCORE_HOOKS[hooks]` over `queries` queries and keys, four query heads, its
