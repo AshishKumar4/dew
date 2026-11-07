@@ -88,7 +88,8 @@ PRODUCTS = {
     "inverse_t": "the inverse's transpose against a gradient, `L^T dX` (`system_gradient`)",
     "inverse_dx": "a gradient against a weighted operand's transpose, `dw (k b exp(gc))^T`",
     "inverse_l": "the inverse's gradient through the inverse, `L^T dX L^T`",
-    "keys_dl": "the system's gradient against the keys, `dL k`, and the keys against themselves, `k k^T`",
+    "keys_dl": "the system's gradient against the keys, `dL k` (`keys_gradient`)",
+    "keys_pairs": "the keys against themselves, `k k^T` (`keys_gradient`)",
     "keys_dlt": "the system's gradient, its rows scaled by the write gates, transposed against the keys",
     "summed": "a decay's range terms against a triangle or the identity, each token's sum (`summed_pairs`)",
 }
@@ -1544,7 +1545,7 @@ def keys_gradient(lower, keys: TileLoad, columns: int, w_grads: TileLoad, d_l, b
     products = None
     for c in range(columns):
         key = keys(c)
-        products = _added(products, issue("keys_dl", key, key.T))
+        products = _added(products, issue("keys_pairs", key, key.T))
     assert products is not None and d_gate is not None, "a chunk's keys take at least a block"
     pairs = narrow.astype(jnp.float32) * (products * beta[:, None])
     return _summed(d_betas), d_gate, pairs
