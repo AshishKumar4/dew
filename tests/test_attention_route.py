@@ -154,15 +154,18 @@ SINK_HEADS = (32, 8)
 @pytest.mark.parametrize("name", CASES)
 def test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward(name, dtype):
     """The route's output and its gradients of the query, key, value and sinks, on par with the reference
-    path (`implementation='reference'`) measured from float64 over the site's draws (check 1); a case with
-    sinks at `SINK_HEADS` over its own seeds (`SINK_SITES`)."""
+    path (`implementation='reference'`) measured from float64 over the site's draws (check 1), each entry
+    sized by its float64 terms over the keys the case keeps (`_terms`): a query that keeps one key has a dQ
+    of zero in float64, which the fast form's D, formed from the rounded output, leaves a rounding off (the
+    default form claims exact zeros only of a row of no keys, docs/design/testing.md); a case with sinks at
+    `SINK_HEADS` over its own seeds (`SINK_SITES`)."""
     case = CASES[name]
     queries, keys = geometry(case)
     heads, kv_heads = SINK_HEADS if name in SINK_SITES else (HEADS, KV_HEADS)
     seeds = SINK_SITES[name][jnp.dtype(dtype).name] if name in SINK_SITES else SEEDS
     draw = drawing(queries, keys, dtype, sinks=bool(case.get("sinks")), heads=heads, kv_heads=kv_heads)
     assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
-                    f"template route {case} {jnp.dtype(dtype).name}", seeds=seeds)
+                    f"template route {case} {jnp.dtype(dtype).name}", seeds=seeds, terms=_terms(case))
 
 
 MESH_CASES = {
@@ -497,20 +500,18 @@ def an_fp16_call_on_an_h100_is_on_par(case):
     template_pass = jax.jit(pulled("template", CASES[case]))
     assert_as_exact(template_pass, jax.jit(pulled("reference", CASES[case])), draw,
                     f"fp16 Mosaic forward and backward, {case}", seeds=SEEDS,
-                    terms=False if CASES[case].get("sinks") else _terms(CASES[case], queries, keys))
+                    terms=False if CASES[case].get("sinks") else _terms(CASES[case]))
 
 
-def _terms(case: dict, queries: int, keys: int):
-    """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps, a
-    function of a draw `(query, key, value, sinks, dout)`."""
-    names = keywords(case)
-    keep = kept(queries, keys, causal=case.get("causal", False), sliding_window=case.get("sliding_window"),
-                segment_ids=names.get("segment_ids"))
+def _terms(case: dict):
+    """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps (its
+    spans as a mask, `case_keep`), under its sinks and softcap, a function of a draw `(query, key, value,
+    sinks, dout)`; the sinks' gradient its own size."""
+    keep = case_keep(case)[:, None]
 
     def terms(query, key, value, sinks, dout):
-        del sinks
-        # The sinks' gradient, which a call without sinks holds as None.
-        return (*attention_terms(query, key, value, dout, keep), None)
+        return (*attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap")),
+                None)
 
     return terms
 
