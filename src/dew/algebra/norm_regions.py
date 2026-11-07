@@ -423,7 +423,8 @@ def _activated(graph: Graph, atom, shape, places: list[int]) -> tuple[jcore.Var,
 
 def _row_weight(graph: Graph, atom, width: int, places: list[int]) -> tuple[jcore.Var, bool] | None:
     """`(w, offset)` where `atom` is a weight `w` of the row's `width` laid along its feature axis alone (`1 +
-    w` where `offset`), through casts, reshapes and broadcasts (Flax's `feature_shape`); None else."""
+    w` where `offset`), through value-preserving casts, reshapes and broadcasts (Flax's `feature_shape`):
+    at a cast that rounds it, its rounded vector the weight; None else."""
     eqns, chain = graph.jaxpr.eqns, []
     offset = False
     while True:
@@ -432,9 +433,9 @@ def _row_weight(graph: Graph, atom, width: int, places: list[int]) -> tuple[jcor
             break
         if (jax_name(eqns[place].primitive) == "convert_element_type"
                 and not widening(eqns[place].invars[0].aval.dtype, atom.aval.dtype)):
-            # A cast that rounds the weight is part of the program's math, which the written norm would drop
-            # (row A4: a weight of 1.001 cast to bf16 is 1 there, 1.001 written).
-            return None
+            # A cast that rounds the weight stays the program's, outside the region: the weight its rounded
+            # vector (audit A4: a weight of 1.001 cast to bf16 is 1 there, which the written norm then reads).
+            break
         if jax_name(eqns[place].primitive) == "add":
             one, inner = _constant_beside(graph, eqns[place].invars)
             if one != 1.0 or offset:

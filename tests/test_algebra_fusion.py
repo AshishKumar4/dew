@@ -324,9 +324,11 @@ def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows
     `root` near sqrt(D) but not it (Flax's division, its divisor another scale)."""
     def attend(q, k, v):
         if root is not None:
-            q = q / jnp.float32(root)
-        scale = 1.0 if root is not None else q.shape[-1] ** -0.5
-        s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * scale
+            # Flax's: the queries divided before the product, no scale after it.
+            s = jnp.einsum("bthd,bshd->bhts", q / jnp.float32(root).astype(q.dtype), k,
+                           preferred_element_type=jnp.float32)
+        else:
+            s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
         if logits_cast is not None:
             s = s.astype(logits_cast).astype(jnp.float32)
         s = jnp.where(jnp.tril(jnp.ones(s.shape[-2:], bool)), s, fill)
@@ -348,9 +350,11 @@ def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows
                                                   ("another row's sum", {"other_rows": True}),
                                                   ("logits narrowed", {"logits_cast": jnp.float16}),
                                                   ("sum narrowed", {"sum_cast": jnp.float16}),
+                                                  ("attention by a root", {"root": 32 ** 0.5}),
                                                   ("a root near sqrt(D)", {"root": 32 ** 0.5 * 1.0005})])
 def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
-    """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100; written out with
+    """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100, scaled after its
+    product or its queries divided by sqrt(D) before it (Flax's); written out with
     any step computing otherwise (a finite fill, truncated or narrowed logits, an initial maximum above the
     logits, a row normalized by another's sum, a sum narrowed past its range, a scale near the default one
     but not it), it stays as written, XLA's."""
@@ -359,7 +363,7 @@ def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
     shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), jnp.bfloat16),) * 3
     with generation.assumed("sm90"):
         routes = _attention_routes(lambda: dew.jit(written_out(**options)).trace(*shapes))
-    assert bool(routes) == (variant == "attention"), routes
+    assert bool(routes) == (variant in ("attention", "attention by a root")), routes
 
 
 @pytest.mark.parametrize("order", [("xla", "template"), ("template", "xla")],
@@ -555,7 +559,7 @@ NEAR_NORMS = {
         x.astype(jnp.float32) * _rows_inverse(x)[:, None]
         * jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1)[None, :]).astype(x.dtype),
     "a mean near the width": lambda x, w: (x.astype(jnp.float32) * jax.lax.rsqrt(
-        jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) / 256.03 + 1e-6)
+        jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) / 256.001 + 1e-6)
         * w.astype(jnp.float32)).astype(x.dtype),
     "a weight rounded to bf16 before it weighs": lambda x, w: (
         x.astype(jnp.float32) * _rows_inverse(x)[:, None]

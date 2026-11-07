@@ -574,7 +574,7 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
         for factor, other in ((b, a), (a, b)):
             value = graph.constant(factor)
             if value is not None and np.ndim(value) == 0:
-                scale, atom = float(value), other
+                scale, atom = factor, other
                 break
         else:
             return nothing
@@ -600,12 +600,11 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
             return nothing
         query = numerator
     else:
-        # The default scale times a power of two, which the call's query takes exactly: the call's scale that
-        # factor over sqrt(D) at the logits' dtype, not near it.
-        ratio = scale * math.sqrt(width)
+        # The default scale times a power of two, which the call's query takes exactly: the program's scale
+        # that factor over sqrt(D) as its own constant holds it, not near it.
+        ratio = float(graph.constant(scale)) * math.sqrt(width)
         factor = 2.0 ** round(math.log2(ratio)) if ratio > 0 else 0.0
-        dtype = np.dtype(query.aval.dtype)
-        if factor == 0.0 or np.asarray(scale, dtype) != np.asarray(factor / math.sqrt(width), dtype):
+        if factor == 0.0 or not graph.holds(scale, factor / math.sqrt(width)):
             return nothing
     places.append(first)
     return (first, query, key, contracted_q[0], contracted_k[0], eqn.params["dimension_numbers"], softcap,

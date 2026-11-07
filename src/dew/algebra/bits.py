@@ -826,20 +826,19 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """An fp32 tile `x` `[depth, columns]` as NVFP4: its packed codes (`[depth / 8, columns]` uint32, the
     stored order `nvfp4_decoded` reads), its block scales (`[depth / 16, columns]` float8_e4m3fn, one for
     each sixteen along the depth) and its tensor scale (fp32): the tensor scale its largest magnitude over
-    6 * 448 (1 where it is zero), so every block's scale fits e4m3; a block's scale the least e4m3 at or
-    above its largest magnitude over 6 times the tensor scale, so no code saturates; each value over its
-    block's scale and the tensor scale rounded to e2m1 (`encoded`), a block of zeros codes of zero. Its
-    decode (`nvfp4_decoded`) times `NVFP4_OWED` times the tensor scale is each value's rounding, as the GEMM
-    epilogue's NVFP4 output stores it (row 4050). A tile whose largest over 6 * 448 is no normal fp32 (a
-    flushing device's zero) takes its largest over 6 instead, every block's scale then at most 1, so a
-    nonzero tile keeps its codes (row A24)."""
+    6 * 448, at least fp32's least normal (1 where the tile is zero), so every block's scale fits e4m3 and
+    no tensor scale flushes to zero; a block's scale the least e4m3 at or above its largest magnitude over
+    the tensor scale over 6, so no code saturates; each value over the tensor scale, then over its block's
+    scale, rounded to e2m1 (`encoded`), a block of zeros codes of zero. Each quotient is formed from the
+    tile's values divided down, never by a product of the scales, which could fall below fp32's normals and
+    flush a small tile's codes to zero (audit A24). Its decode (`nvfp4_decoded`) times `NVFP4_OWED` times the
+    tensor scale is each value's rounding, as the GEMM epilogue's NVFP4 output stores it (row 4050)."""
     magnitude = jnp.abs(x)
     largest = jnp.max(magnitude)
-    spread = largest / np.float32(6 * 448)
-    tensor = jnp.where(largest > 0, jnp.where(spread >= np.finfo(np.float32).tiny, spread, largest / 6),
-                       np.float32(1))
+    least_normal = np.float32(np.finfo(np.float32).tiny)
+    tensor = jnp.where(largest > 0, jnp.maximum(largest / np.float32(6 * 448), least_normal), np.float32(1))
     blocks = jnp.max(magnitude.reshape(-1, 16, x.shape[-1]), axis=1)
-    ratio = blocks / (np.float32(6) * tensor)
+    ratio = blocks / tensor / np.float32(6)
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
 
     def value(codes: jax.Array) -> jax.Array:
@@ -849,7 +848,7 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     codes = jnp.where(value(nearest) < ratio, jnp.minimum(nearest + jnp.uint32(1), jnp.uint32(E4M3.largest)),
                       nearest)
     scales = jax.lax.bitcast_convert_type(codes.astype(jnp.uint8), jnp.float8_e4m3fn)
-    each = jnp.repeat(value(codes), 16, axis=0) * tensor
-    quotient = jnp.where(each > 0, x / jnp.where(each > 0, each, 1), 0)
+    each = jnp.repeat(value(codes), 16, axis=0)
+    quotient = jnp.where(each > 0, x / tensor / jnp.where(each > 0, each, 1), 0)
     words = packed(encoded(jax.lax.bitcast_convert_type(quotient, jnp.uint32), E2M1).T, E2M1).T
     return words, scales, tensor
