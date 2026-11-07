@@ -4,6 +4,7 @@ import os
 import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -181,3 +182,22 @@ def test_groups_started_and_stopped_from_many_threads_at_once_each_end_as_their_
 
     with ThreadPoolExecutor(16) as pool:
         assert list(pool.map(ran, range(400))) == [0] * 400
+
+
+def test_a_relayed_child_says_its_output_as_it_comes_and_its_stacks_when_it_runs_past_its_time(capfd):
+    """`relayed` runs a child as its own group, every line it writes passed to this process's stdout as it
+    comes, so a rank's log holds how far a gang's child got even when the gang's deadline kills the rank
+    (row 4686: trains 670 and 671's lost gangs logged nothing of their children); one past its time is
+    aborted for its faulthandler stacks, which its failure carries, and its group ended."""
+    from process_support import relayed, worker_env
+
+    program = "import time\nprint('first step done', flush=True)\ntime.sleep(600)\n"
+    started = time.monotonic()
+    with pytest.raises(pytest.fail.Exception) as failed:
+        relayed([sys.executable, "-c", program], worker_env(1), timeout=5)
+    assert time.monotonic() - started < 120
+    assert "first step done" in capfd.readouterr().out
+    assert "did not end within 5 s" in str(failed.value) and "time.sleep" in str(failed.value)
+    done = relayed([sys.executable, "-c", "print('ok')"], worker_env(1), timeout=60)
+    assert (done.returncode, done.output) == (0, "ok\n")
+
