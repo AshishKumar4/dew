@@ -771,9 +771,10 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
 
 
 def _held(kernel):
-    """What an expert matrix's compute dtype reads of `kernel`: a packed bank's dtype, the one its decode
-    yields (`gemm.NvFp4.dtype`), else the array."""
-    return kernel.dtype if isinstance(kernel, gemm.NvFp4) else kernel
+    """What an expert matrix's compute dtype reads of `kernel` (`canonicalize_dtype`, which takes arrays): a
+    packed bank's dtype, the one its decode yields (`gemm.NvFp4.dtype`), as a scalar of it, else the
+    array."""
+    return jnp.zeros((), kernel.dtype) if isinstance(kernel, gemm.NvFp4) else kernel
 
 
 def _named(implementation: str) -> contextlib.AbstractContextManager:
