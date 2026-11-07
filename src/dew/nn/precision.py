@@ -284,8 +284,8 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
 def _spread_block(count: int) -> int:
     """The positions a blocked spread sums together first (`_blocked_spread`): the power of two nearest the
     square root of `count`, a function of the count alone, so every program and every site sums one count of
-    positions in one order."""
-    return 2 ** max(0, round(math.log2(math.sqrt(count))))
+    positions in one order; one where there are none."""
+    return 2 ** max(0, round(math.log2(math.sqrt(max(count, 1)))))
 
 
 def _blocked_spread(value: jax.Array, sizes: tuple[int, ...], outer_product) -> jax.Array:
