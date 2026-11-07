@@ -1828,10 +1828,10 @@ def running_parts(x: jax.Array, exponent: jax.Array, dtype=jnp.float16
 
 def running_restored(value: jax.Array, exponent: jax.Array) -> jax.Array:
     """A product of `running_parts`' parts, or an accumulator of them, at the walk's scale taken back:
-    `value` times `2^(exponent - 14)`, nothing where no tile moved the exponent."""
-    restored_value = power2(value, jnp.broadcast_to(jnp.where(exponent == -jnp.inf, 0.0, exponent - 14.0),
-                                                    value.shape), reach=2 * 127)
-    return jnp.where(exponent == -jnp.inf, 0.0, restored_value)
+    `value` times `2^(exponent - 14)`; itself where no tile moved the exponent, every part then zero. No
+    select of a scalar's condition over the tile: Mosaic GPU broadcasts none implicitly (et-fp16lower)."""
+    return power2(value, jnp.broadcast_to(jnp.where(exponent == -jnp.inf, 0.0, exponent - 14.0), value.shape),
+                  reach=2 * 127)
 
 
 def restored(value: jax.Array, exponent: jax.Array) -> jax.Array:
