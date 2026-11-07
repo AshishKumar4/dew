@@ -276,7 +276,9 @@ def parameter_key(value) -> Hashable:
     its mesh, partitions, memory and logical device order; an array by its dtype, shape and bytes' digest; a
     function by its module and name, a partial one with its bound arguments. Any other object is its type's
     name and the object itself, compared by its own equality, never by its printed form, which a key kept in
-    another process cannot read (`opaque`). `value` is any parameter JAX's primitives take, which share no
+    another process cannot read (`opaque`); an object that cannot be hashed (JAX's `WrappedFun` of a
+    derivative rule, hashing an `Unhashable` tree) by its identity, held alive by the key (`_Identity`), so
+    it is equal to itself alone. `value` is any parameter JAX's primitives take, which share no
     type."""
     if value is None or isinstance(value, (bool, str)):
         return type(value).__name__, value
@@ -326,7 +328,28 @@ def parameter_key(value) -> Hashable:
                                         for name, part in value.items()), key=repr))
     if isinstance(value, types.FunctionType):
         return "function", value.__module__, value.__qualname__
+    try:
+        hash(value)
+    except TypeError:
+        # A function JAX wraps (a derivative rule's `WrappedFun`) hashes its parts, an `Unhashable` tree among
+        # them: keyed by its identity.
+        return "object", _named(type(value)), _Identity(value)
     return "object", _named(type(value)), value
+
+
+class _Identity:
+    """An unhashable parameter as a key: equal to a key of the same object alone, the object held."""
+
+    __slots__ = ("held",)
+
+    def __init__(self, held):
+        self.held = held
+
+    def __hash__(self) -> int:
+        return id(self.held)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _Identity) and other.held is self.held
 
 
 def opaque(key) -> Hashable:
