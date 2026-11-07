@@ -1058,16 +1058,17 @@ class _Program[T: (Tiles, BackwardTiles)]:
             # Read by position (`_spans_of`): no block map.
             return self._positions_reach(first, spans, row)
         block = lax.div(first, self.tiles.block_q)
-        full_lo, full_hi = spans.full_lo[row, block], spans.full_hi[row, block]
+        at = functools.partial(self._entry, row=row)
+        full_lo, full_hi = at(spans.full_lo, block), at(spans.full_hi, block)
 
         def whole(index):
             inside = (index >= full_lo) & (index < full_hi)
             if spans.query_doc is None or spans.key_doc is None:
                 return inside
-            doc = spans.query_doc[row, block]
-            return inside & (doc != 0) & (doc == spans.key_doc[row, index])
+            doc = at(spans.query_doc, block)
+            return inside & (doc != 0) & (doc == at(spans.key_doc, index))
 
-        return *self._sliced(spans.lo[row, block], spans.hi[row, block]), whole
+        return *self._sliced(at(spans.lo, block), at(spans.hi, block)), whole
 
     def _positions(self, first, spans: _Spans, row) -> list[tuple[jax.Array, ...]]:
         """The positions a query block from `first` holds rows of, in a call whose intervals each hold
@@ -1083,7 +1084,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
             # A position past the call's holds no row: read its last one's, unused.
             index = jnp.minimum(position, positions - 1)
             holds = (position < positions) & (position * self.per_span < first + self.tiles.block_q)
-            found.append((position, spans.start[row, index], spans.end[row, index], holds))
+            found.append((position, self._entry(spans.start, index, row=row),
+                          self._entry(spans.end, index, row=row), holds))
         return found
 
     def _positions_reach(self, first, spans: _Spans, row):
@@ -1121,6 +1123,13 @@ class _Program[T: (Tiles, BackwardTiles)]:
             start, end = jnp.where(mine, low, start), jnp.where(mine, high, end)
         return ((family.as_row(start), family.as_row(end)),), None
 
+    def _entry(self, ref, index, *, row):
+        """A block map's entry `ref[row, index]` as the family reads a launch's scalar (`Family.scalar_of`: a
+        GPU thread's load, a TPU core's copy into its scalar memory, whose operands stay in HBM, where a load
+        lowers on no core: a v5e's documents call refused to lower, "ANY memory space can only be accessed
+        using async_copy")."""
+        return self.family.scalar_of(ref.at[row, pl.ds(index, 1)])
+
     def _sliced(self, lo, hi) -> tuple[jax.Array, jax.Array]:
         """`[lo, hi)` key tiles, this program's slice of them (`split`): the `splits` contiguous slices of a
         query tile's tiles, as long as the others but for rounding, partition them; its whole range of one."""
@@ -1141,16 +1150,17 @@ class _Program[T: (Tiles, BackwardTiles)]:
         block = lax.div(k_first, self.tiles.block_k)
         full_lo, full_hi = spans.full_lo, spans.full_hi
         assert full_lo is not None and full_hi is not None, "a key block's walk reads its block map"
+        at = functools.partial(self._entry, row=row)
 
         def seen_whole(index):
-            inside = (block >= full_lo[row, index]) & (block < full_hi[row, index])
+            inside = (block >= at(full_lo, index)) & (block < at(full_hi, index))
             if spans.query_doc is None or spans.key_doc is None:
                 return inside
-            doc = spans.key_doc[row, block]
-            return inside & (doc != 0) & (doc == spans.query_doc[row, index])
+            doc = at(spans.key_doc, block)
+            return inside & (doc != 0) & (doc == at(spans.query_doc, index))
 
         assert spans.q_lo is not None and spans.q_hi is not None, "a key block's walk reads its readers"
-        return spans.q_lo[row, block], spans.q_hi[row, block], seen_whole
+        return at(spans.q_lo, block), at(spans.q_hi, block), seen_whole
 
     def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:
         """A key block's walk of query tiles `[lo, hi)` as `Family.walk`'s segments, `step` each: where its
