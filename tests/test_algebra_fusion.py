@@ -254,7 +254,7 @@ def input_bias(q, k):
     return jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1])).astype(q.dtype)
 
 
-def capped(q, k, v):
+def softcapped_attention(q, k, v):
     """Gemma 2's attention as a plain program writes it: scaled logits softcapped at 50, causal."""
     logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
     logits = 50.0 * jnp.tanh(logits / 50.0)
@@ -278,7 +278,7 @@ FORMS = {
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True, local_window_size=(15, 0),
                                                      implementation="xla"),
         lambda q, k, v: {"causal": True, "sliding_window": 16}),
-    "a softcap": (capped, lambda q, k, v: {"causal": True, "softcap": 50.0}),
+    "a softcap": (softcapped_attention, lambda q, k, v: {"causal": True, "softcap": 50.0}),
 }
 """Each plain program's attention under a form beside the default scale and a causal mask, and the arguments
 Dew's own attention takes for it."""
@@ -362,7 +362,7 @@ def flax_rms(x, w):
     return nn.RMSNorm(epsilon=1e-6, dtype=x.dtype).apply({"params": {"scale": w}}, x)
 
 
-def plain_rms(x, w):
+def widened_rms(x, w):
     """An RMSNorm as a plain program writes it: float32 statistics, the weight before the cast."""
     widened = x.astype(jnp.float32)
     inverse = jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + 1e-6)
@@ -376,7 +376,7 @@ def offset_rms(x, w):
     return normed.astype(x.dtype) * (1 + w.astype(x.dtype))
 
 
-def swiglu(a, b):
+def gated_product_of(a, b):
     """A gated MLP's product as a plain program writes it."""
     return jax.nn.silu(a) * b
 
@@ -400,9 +400,9 @@ def _norms_written(fn, *shapes):
 
 NORM_FORMS = {
     "flax RMSNorm": (flax_rms, {"scale_offset": False, "scale_after_cast": False}),
-    "plain RMSNorm": (plain_rms, {"scale_offset": False, "scale_after_cast": False}),
+    "plain RMSNorm": (widened_rms, {"scale_offset": False, "scale_after_cast": False}),
     "Gemma RMSNorm": (offset_rms, {"scale_offset": True, "scale_after_cast": True}),
-    "SwiGLU": (swiglu, None),
+    "SwiGLU": (gated_product_of, None),
 }
 """Each plain program's fused norm, and how Dew's own RMSNorm weighs it (None: Dew's SwiGLU)."""
 
