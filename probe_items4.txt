@@ -1,0 +1,5 @@
+barrier|0
+barriereach|0
+barrierbetween|0
+leftonly|0
+spanonly|0

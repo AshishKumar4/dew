@@ -1,0 +1,3 @@
+base|0|profile
+barrierbetween|0|profile
+barrierbetween|1|profile

@@ -1,0 +1,8 @@
+base|0
+base|1
+ftz|0
+ftz|1
+mild|0
+strong|0
+ordinary|0
+stopbetween|0

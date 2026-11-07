@@ -1,0 +1,4 @@
+zerodecay|0
+simpledecay|0
+nog|0
+onlyg|0
