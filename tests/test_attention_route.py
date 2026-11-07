@@ -401,6 +401,30 @@ def test_a_call_named_onto_the_template_lowers_for_a_gpu(name, differentiated, f
     assert len([route for route in found if route.choice == "attention_mainloop"]) == 1 + differentiated
 
 
+@pytest.mark.parametrize("implementation", ["reference", "template"])
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
+def test_a_call_scaling_its_logits_after_the_product_is_on_par_with_flaxs_form(dtype, implementation):
+    """A causal call whose scale takes the fp32 logits after the product (`scale_logits`, jax.nn's form,
+    the reference path's `float32_einsum(query, key) * D ** -0.5`), on the reference path and on the
+    template, which scales its fp32 products so natively: its output and its gradients on par with the
+    reference path in flax's form, the query scaled before the product (check 1)."""
+    def call(implementation: str, *, scale_logits: bool):
+        def run(query, key, value, _sinks, dout):
+            def attend(query, key, value):
+                return scaled_dot_product_attention(query, key, value, causal=True, scale_logits=scale_logits,
+                                                    implementation=implementation)
+
+            out, pull = jax.vjp(attend, query, key, value)
+            return (out, *pull(dout))
+
+        return run
+
+    assert_as_exact(jax.jit(call(implementation, scale_logits=True)),
+                    jax.jit(call("reference", scale_logits=False)),
+                    drawing(QUERIES, KEYS, dtype, sinks=False), f"logits scaled after {implementation}",
+                    seeds=SEEDS)
+
+
 @pytest.mark.parametrize("name", ["block-causal-documents-window", "valid-documents-window-places"])
 def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
