@@ -619,14 +619,17 @@ def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column
     made visible to TMA, and its rows `first` to `first + stored` stored to `o_gmem` at row
     `row_start + first` and `column` (`store_rows`); the copies stay in flight (the caller waits before
     `smem` is written again). A `Scattered` output's rows each land where its table says, copied by the
-    warpgroup's threads (`gathered.scattered_rows`), done when it returns."""
-    write(smem, value)
-    plgpu.commit_smem()
+    warpgroup's threads (`gathered.scattered_rows`), done when it returns, its value written unoptimized
+    (no TMA copy reads the buffer, whose plain layout has no optimized transfer from a warpgroup MMA's)."""
     if isinstance(o_gmem, Scattered):
+        plgpu.store(smem, value.astype(smem.dtype), optimized=False)
+        plgpu.commit_smem()
         from dew.nn.kernels.templates import gathered  # it builds on `Ring`
 
         gathered.scattered_rows(smem, o_gmem, row_start, first, stored, column)
         return
+    write(smem, value)
+    plgpu.commit_smem()
     store_rows(smem, o_gmem, row_start, first, stored, column, most, least)
 
 

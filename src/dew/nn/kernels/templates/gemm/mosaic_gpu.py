@@ -1052,12 +1052,12 @@ def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, pro
                     transpose_lhs: bool) -> None:
     """Dew: `gmm`'s refusal of a gathered product (`gather`) but on a family that gathers rows
     (`Family.gathers_rows`), of no prologue, transposed rows or dense call, and of a scattered one
-    (`scatter`) but a grouped call's."""
+    (`scatter`) but a grouped call's on such a family (its stores `mosaic.staged_rows`')."""
     if gather is not None and (prologue is not None or dense or transpose_lhs or not family.gathers_rows):
         raise ValueError(f"a gathered product's rows are a ring family's gather, with no prologue, "
                          f"transposed rows or dense call, not {tiles}'s")
-    if scatter is not None and dense:
-        raise ValueError("scattered rows are a grouped call's")
+    if scatter is not None and (dense or not family.gathers_rows):
+        raise ValueError(f"scattered rows are a grouped call's on a ring family, not {tiles}'s")
 
 
 def _gmm_refused(rhs, tiles: Tiles, extents: tuple, *, dense: bool, first, paired) -> None:
