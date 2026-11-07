@@ -740,7 +740,7 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
     """Build the published CLIP text towers, their tokenizers, their parameters, the layouts those
     parameters came from and the tokenizers' files, each pinned as it is loaded."""
     from dew.data.text import pin_tokenizer
-    from dew.nn.text_encoders import translate_config
+    from dew.interop.text_encoders import translate_config
 
     towers, tokenizers, pins, layouts = [], [], [], ()
     bound = {} if params is None else params
@@ -771,7 +771,7 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     the pipeline pads to.
     """
     from dew.data.text import pin_tokenizer
-    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
+    from dew.interop.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, component)
     tower = translate_t5_config(config).value.clone(dtype=compute)
@@ -789,7 +789,7 @@ def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str
     """Build Wan's conditioner: the UMT5 encoder, its tokenizer, the
     parameters and their layouts."""
     from dew.data.text import pin_tokenizer
-    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
+    from dew.interop.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, "text_encoder")
     if config.get("model_type") != "umt5":
@@ -1013,7 +1013,7 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
     layouts and the two configs it ships; supplied `params` are bound without
     a weight read."""
     from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
-    from dew.nn.text_encoders import translate_vision_config
+    from dew.interop.text_encoders import translate_vision_config
 
     config = _component_config(directory, "safety_checker")
     with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
@@ -1031,7 +1031,7 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
 
 
 def _text_head_path(name: str):
-    from dew.nn.text_encoders import _text_path
+    from dew.interop.text_encoders import _text_path
     if name == "text_projection.weight":
         return ("text_projection", "kernel")
     path = _text_path(name)
@@ -1039,7 +1039,7 @@ def _text_head_path(name: str):
 
 
 def _safety_path(name: str):
-    from dew.nn.text_encoders import _clip_path
+    from dew.interop.text_encoders import _clip_path
     if name.startswith(("concept_embeds", "special_care_embeds")):
         return (name,)
     return _clip_path(name.removeprefix("vision_model."))
