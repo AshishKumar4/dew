@@ -23,7 +23,8 @@
 #   POOL             the suite's pool (none: .armada.json's), and BACKGROUND, 1 for a run that takes a bounded share
 #                    of the fleet with a longer deadline
 #   PROVEN           non-empty where the commit was proven green already: nothing runs
-#   OUT              where the clients' logs and the jobs' ids (jobs.txt) are kept (default: a new directory)
+#   OUT              where the clients' logs, the jobs' ids (jobs.txt) and the gangs' outcome (gangs.outcome) are
+#                    kept (default: a new directory)
 set -u
 sha=$1
 armada=${ARMADA:-armada}
@@ -91,7 +92,9 @@ if [ -n "${DEW_WHOLE_SUITE:-}" ]; then
   fi
 fi
 if [ -n "${gangs:-}" ]; then
-  wait "$gangs" || failed=1
+  # The gangs' own outcome beside the logs (gangs.outcome), apart from the suite's: the land queue's CI reads it
+  # as a job of its own, so a round whose suite rows prove flaky publishes only with the gangs green (row 4034).
+  if wait "$gangs"; then echo success > "$out/gangs.outcome"; else echo failure > "$out/gangs.outcome"; failed=1; fi
   echo "--- the multi-host gangs"
   cat "$out/gangs.log"
   # A red gang's logs, every rank's and attempt's with each one's relay (armada's GET /jobs/<id>/tasks/<i>/runs, and
