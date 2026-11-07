@@ -956,15 +956,16 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
 
 def _gmm_split_refused(tiles: Tiles, k: int, n: int, step_scales, *, dense: bool, exact_sums: bool,
                        hooked: bool, plain: bool) -> None:
-    """Dew: `gmm`'s refusal of a depth split but a dense product's of no hooks, pair or exact sums, each run
-    some steps, of step scales but on an exactly summed product of no hook, pair, packed matrix or split
-    (`_step_scaled_takes`), and of a met walk (`Tiles.raster`) but a dense product's of no exact sums,
-    split or cluster, whose steps are its own (`_met`)."""
+    """Dew: `gmm`'s refusal of a depth split but a product's of no hooks, pair or exact sums, each run some
+    steps (a grouped one's runs over each tile its group's rows, the rows past every group's zeros in every
+    run, so their partials sum to the product: a decode step's experts, row 3622), of step scales but on an
+    exactly summed product of no hook, pair, packed matrix or split (`_step_scaled_takes`), and of a met walk
+    (`Tiles.raster`) but a dense product's of no exact sums, split or cluster, whose steps are its own
+    (`_met`)."""
     if tiles.raster and (not dense or exact_sums or tiles.splits > 1 or tiles.cluster > 1):
         raise ValueError(f"a met walk is a dense product's of no exact sums, split or cluster, not {tiles}")
-    if tiles.splits > 1 and (not dense or hooked or exact_sums or not split_runs(k // tiles.block_k,
-                                                                                  tiles.splits)):
-        raise ValueError(f"a depth split is a dense product's of no hooks, pair or exact sums, each run some "
+    if tiles.splits > 1 and (hooked or exact_sums or not split_runs(k // tiles.block_k, tiles.splits)):
+        raise ValueError(f"a depth split is a product's of no hooks, pair or exact sums, each run some "
                          f"steps, not {tiles} of a {k}-deep one")
     if step_scales is not None and not _step_scaled_takes(step_scales, tiles, k, n, exact_sums=exact_sums,
                                                           plain=plain):
