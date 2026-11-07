@@ -351,14 +351,15 @@ def test_companion_pool_uses_one_global_optimizer_reduction(tmp_path):
 # bound below qualifies these cases numerically and settles nothing about that
 # failure. Leaves nothing moves are compared exactly.
 def updated(objective, batch, layout, *, optimizer=None, checkpoints=None, steps=1):
-    """`steps` compiled updates of one objective under one placement."""
+    """`steps` compiled updates of one objective under one placement, the state on its stored layers
+    (`Trainer.stored`: a device layout's one-stage scan holds its runs stacked)."""
     trainer = Trainer(objective, optax.adam(.01) if optimizer is None else optimizer,
                       key=jax.random.key(5), layout=layout, checkpoints=checkpoints)
     state, _, _ = trainer.place()
     step = trainer.compile(state, batch)
     for _ in range(steps):
         state, *_ = step(state, batch)
-    return state
+    return trainer.stored(state)
 
 
 def tokens(width=9):
