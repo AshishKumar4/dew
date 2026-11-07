@@ -1174,14 +1174,19 @@ class Transaction:
                 return jax.tree.map(lambda leaf: leaf[0, 0], _at(tree, where))
 
             held = layer(weights)
-            before = _placeholders_at(
-                _with_copies(state.opt_state, params, lambda index, _: layer(moments[names[index]])), params,
-                where)
+            copies = [layer(moments[name]) for name in names]
+            before = _with_copies(_placeholders_at(state.opt_state, params, where), params,
+                                  lambda index, _: copies[index])
             descent = layer(jax.tree.map(_descending, gradient, weights))
             moved, after = optimizer_update(self.optimizer, descent, before, held, progress=progress)
-            copied = zip(names, _param_copies(after, held), strict=True)
+            # Each copy's new value where the update leaves it in the state it read, which the update keeps
+            # laid out as it was: a group with no parameter in this run holds placeholders alone there.
+            laid = _laid_as(held)
+            slots = [slot for copy in copies
+                     for slot, node in enumerate(jax.tree.leaves(before, is_leaf=laid)) if node is copy]
+            stepped_copies = [jax.tree.leaves(after, is_leaf=laid)[slot] for slot in slots]
             return (unlayer(stepped(held, moved, before, after)),
-                    {name: unlayer(copy) for name, copy in copied})
+                    {name: unlayer(copy) for name, copy in zip(names, stepped_copies, strict=True)})
 
         norms = {}
         for path in runs:

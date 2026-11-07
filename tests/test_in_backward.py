@@ -40,10 +40,11 @@ def trainer(model, optimizer: OptimConfig, *, key: int = 0) -> Trainer:
 ADAMW = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1)
 
 GROUPED = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1,
-                      param_groups=(ParamGroup("attention", ("*self_attn*",), learning_rate_multiplier=2.0),
+                      param_groups=(ParamGroup("embedding", ("*embed_tokens*",), learning_rate_multiplier=.5),
+                                    ParamGroup("attention", ("*self_attn*",), learning_rate_multiplier=2.0),
                                     ParamGroup("rest", ("*",))))
-"""Adamw over two groups (`optax.multi_transform`), whose moments each group holds masked where the other
-steps."""
+"""Adamw over three groups (`optax.multi_transform`), whose moments each group holds masked where another
+steps: the embedding's holds none in the scanned run, the attention's some of it."""
 
 
 RUN_SEEDS = 64
