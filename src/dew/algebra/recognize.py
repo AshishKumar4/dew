@@ -543,7 +543,11 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]
         target = [size for size in out.shape if size != 1]
         at = {axis: place for place, axis in enumerate(a for a, size in enumerate(out.shape) if size != 1)}
         params["shape"] = tuple(target)
-        params["broadcast_dimensions"] = tuple(at[params["broadcast_dimensions"][axis]] for axis in kept[0])
+        dimensions = tuple(at[params["broadcast_dimensions"][axis]] for axis in kept[0])
+        if list(dimensions) != sorted(dimensions):
+            # A broadcast that also reorders its operand's axes is another layout: computed as it is.
+            return None
+        params["broadcast_dimensions"] = dimensions
     elif name == "reshape":
         if params.get("dimensions") is not None:
             return None

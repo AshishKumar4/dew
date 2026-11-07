@@ -769,11 +769,11 @@ def _literals[Node: (Term, Skeleton)](forms: type[Node], literals: list, shapes:
 
 
 def literal_key(atom: jcore.Literal) -> Hashable:
-    """A literal's identity in a region: its type as the program holds it (dtype, weak type, shape) and its
-    bits, so two literals are one term where they are the same constant, and never where they round apart."""
+    """A literal's identity in a region: its dtype, shape and bits, so two literals are one term where they
+    are the same constant, and never where they round apart. Its weak type is no part of it: an equation's
+    types are settled where it is traced, so a weak and a strong literal of one dtype compute alike."""
     value = np.asarray(atom.val)
-    aval = atom.aval
-    return (str(value.dtype), getattr(aval, "weak_type", False), value.shape, value.tobytes())
+    return str(value.dtype), value.shape, value.tobytes()
 
 
 def _shape(atom) -> tuple[int, ...]:

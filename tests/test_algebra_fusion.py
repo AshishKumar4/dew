@@ -466,7 +466,7 @@ def _norms_written(fn, *shapes):
 
     closed = jax.make_jaxpr(fn)(*shapes)
     with generation.assumed("sm90"):
-        written = recognize.recognized(closed.jaxpr, fusion.Index(closed.jaxpr), recognize.NORMS)
+        written = recognize.recognized(closed, fusion.Index(closed), recognize.NORMS)
     return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(written)
 
 
@@ -697,7 +697,7 @@ def test_the_compile_point_writes_a_program_by_its_own_values(name):
     written, found = _norms_written(program, *shapes)
     assert found == norms
     x, w = normal_draw(4783, (256, 256), (256,), dtype=jnp.bfloat16)
-    for ours, theirs in zip(jax.tree.leaves(written(x, w)), jax.tree.leaves(program(x, w)), strict=True):
+    for ours, theirs in zip(written(x, w), jax.tree.leaves(program(x, w)), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
@@ -724,7 +724,7 @@ def test_a_norm_of_a_stopped_row_passes_no_gradient_to_it():
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.float32), jax.ShapeDtypeStruct((256,), jnp.float32))
     written, _ = _norms_written(program, *shapes)
     x, w = normal_draw(4785, (256, 256), (256,))
-    assert not np.any(np.asarray(jax.grad(written)(x, w)))
+    assert not np.any(np.asarray(jax.grad(lambda x, w: written(x, w)[0])(x, w)))
 
 
 def test_a_gate_less_a_negative_zero_keeps_its_sign_as_written():
@@ -738,7 +738,7 @@ def test_a_gate_less_a_negative_zero_keeps_its_sign_as_written():
     written, _ = _norms_written(program, *shapes)
     g = jnp.full((256, 256), -0.0, jnp.bfloat16)
     u = jnp.ones((256, 256), jnp.bfloat16)
-    np.testing.assert_array_equal(np.signbit(np.asarray(written(g, u))),
+    np.testing.assert_array_equal(np.signbit(np.asarray(written(g, u)[0])),
                                   np.signbit(np.asarray(program(g, u))))
 
 
