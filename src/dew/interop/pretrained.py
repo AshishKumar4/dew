@@ -2306,6 +2306,9 @@ def _translated(config: Mapping[str, object],
     banks: dict[str, object] = {}
     if packed_experts:
         tensors, banks = _packed_banks(tensors, config)
+        # Its leaves translated as views read when placed, as a streaming load's: the banks' unread leaves
+        # are replaced before any is read (`_with_banks`).
+        streaming = True
     tensors, quantized_tensors, scale_dtype, grid, checked, stored = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
