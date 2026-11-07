@@ -510,10 +510,13 @@ def slice_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Ar
 
 def initial_state(spec: Forward, initial: Partial) -> Partial:
     """A call's initial state (its sums unnormalized, its maximum natural) as a finished slice's
-    (`slice_state`): normalized where it holds mass, its maximum in `spec`'s units."""
+    (`slice_state`): normalized where it holds mass, its maximum in `spec`'s units, saturated where a raw
+    fold's passes fp32's largest (`raw_maximum`, as `resumed` takes it: a finite maximum of 1e38 at a scale
+    of 1/8 was infinite, and its merge's mass NaN)."""
     held = initial.total > 0
     out = jnp.where(held[..., None], initial.acc / jnp.where(held, initial.total, 1.0)[..., None], 0.0)
-    return slice_state(spec, out, initial.m / spec.scale if spec.raw else initial.m, initial.total)
+    maximum = raw_maximum(initial.m, spec.scale) if spec.raw else initial.m
+    return slice_state(spec, out, maximum, initial.total)
 
 
 def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
