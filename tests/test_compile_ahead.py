@@ -121,7 +121,7 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
                                                backend=backend)
         return cache_key.get(lowered.compiler_ir("stablehlo"), np.array(devices[:1]), options, backend)
 
-    read = host_gpus(serialized, 2)
+    read = host_gpus("sm90", serialized, 2)
     assert [device.device_kind for device in read] == [device.device_kind for device in host]
     assert key(read) == key(host)
     assert key(read) != key(compile_only_gpus("sm90", 2))
