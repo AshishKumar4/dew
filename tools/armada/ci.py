@@ -1811,8 +1811,8 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
         if ran["depends"] is not None:
-            ran = {**ran, "depends": None if opened is None or wrote_inputs(ran["depends"], changed) else
-                   sorted({*ran["depends"], *opened})}
+            inputs = None if opened is None else sorted({*ran["depends"], *opened})
+            ran = {**ran, "depends": None if inputs is None or wrote_inputs(inputs, changed) else inputs}
         ran = {**ran, "depends": site_inputs(python, row_["name"], ran["depends"])}
         if row_["exitCode"] == 0 and name not in executed:
             continue
