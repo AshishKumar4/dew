@@ -507,6 +507,24 @@ def test_a_joint_release_fine_tunes_and_reloads_from_its_run(joint_runs):
 
 
 @pytest.mark.shared_setup("joint_runs")
+def test_a_trained_joint_task_on_a_multimodal_backbone_exports_and_reloads_as_itself(joint_runs, tmp_path):
+    """A task trained from a joint-head release over Qwen 3.5's multimodal backbone (`joint_runs`), its
+    model a run's, not the release's source, exports as a release (`save_pretrained`): its backbone
+    planned from the model it trained (`PretrainedDecoder.from_model` of its `MultimodalTransformer`),
+    its head and layout beside it, and the release loads back as a task answering every question as the
+    trained task does (row 4525)."""
+    objective, state, asked = joint_runs["objective"], joint_runs["state"], joint_runs["asked"]
+    trained = objective.pipeline(state)
+    trained.save_pretrained(tmp_path / "exported")
+    assert json.loads((tmp_path / "exported" / "config.json").read_text())["model_type"] == "qwen3_5"
+    reloaded = Decide.from_pretrained(tmp_path / "exported", attention_impl="xla")
+    for state_text in ("charged twice!", "is the site down?"):
+        for answer, again in zip(trained(state_text, asked).values(), reloaded(state_text, asked).values(),
+                                 strict=True):
+            np.testing.assert_array_equal(answer.probabilities, again.probabilities)
+
+
+@pytest.mark.shared_setup("joint_runs")
 def test_two_joint_release_runs_average_into_a_task_that_reloads(joint_runs):
     """Two runs of a joint-head release (`joint_runs`) average into one task, its temperatures refit on
     held-out answers (`Decide.averaged`), which saves to a directory of its own and reloads through
