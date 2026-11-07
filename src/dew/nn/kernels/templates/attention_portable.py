@@ -485,6 +485,71 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                          batch=batch, heads=heads, queries=queries, keys=keys, block_k=block_k)
 
 
+def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, *, score_mod,
+                  scale: float, prescale: float, grad_scale: float, how: algebra.Recompute, block_q: int,
+                  block_k: int):
+    """The fast form's one launch (FlashAttention's, as Mosaic's fused launch computes it): a query head's
+    key blocks in turn, each walking its query tiles once (`attention_program.fused_sums`), its dK and dV the
+    walk's sums and each tile's dQ added into the head's, all at the first pass's D (`anchor`, `delta`, from
+    the forward's split sums) and the forward's maximum `peak` and denominator `total`: each tile's weights
+    and cotangents recomputed once where the two launches recompute them twice. dQ `[B, Qp, H, D]` fp32, dK
+    and dV a query head's `[B, Kp, H, ...]`."""
+    batch, queries, heads, width = query.shape
+    factor = scale if how.factor is None else 1.0
+    keys, kv_heads = key.shape[1], key.shape[2]
+    group = heads // kv_heads
+    blocks = keys // block_k
+    start, end, query_ids, key_ids = spans
+    ranges = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
+
+    def program(index):
+        row, head = index // heads, index % heads
+        kv_head = head // group
+
+        def block(j, carry):
+            dq, dk_all, dv_all = carry
+            columns = j * block_k + jnp.arange(block_k)
+            k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
+            v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
+
+            def formed(i):
+                # A query tile's operands as the derived walk reads them (`_dkv_launch`'s `formed`).
+                rows = i * block_q + jnp.arange(block_q)
+                q = jax.lax.dynamic_slice_in_dim(query[row, :, head], i * block_q, block_q)
+                do = jax.lax.dynamic_slice_in_dim(dout[row, :, head], i * block_q, block_q)
+                seen = _seen(spans, row, rows, columns)
+                logits, slopes = gradient.tile_logits(
+                    score_mod, interpreted_dot(by_power(q, prescale), k_tile.T), seen, rows[:, None],
+                    columns[None, :], (), scale=factor, slopes=True)
+                tiles = {"logits": logits, "q": q, "dout": do, "peak": peak[row, head, rows],
+                         "total": total[row, head, rows], "anchor": anchor[row, head, rows],
+                         "delta": delta[row, head, rows], "seen": seen,
+                         "at_anchor": columns[None, :] == key_index[row, head, rows][:, None]}
+                if slopes is not None:
+                    tiles["slope"] = slopes[0]
+                return tiles, slopes, seen
+
+            def add_dq(i, dq, tile):
+                held = jax.lax.dynamic_slice_in_dim(dq, i * block_q, block_q)
+                return jax.lax.dynamic_update_slice_in_dim(dq, held + tile, i * block_q, axis=0)
+
+            dk, dv, dq = attention_program.fused_sums(
+                formed, k_tile, v_tile, ranges.q_lo[row, j], ranges.q_hi[row, j], dq, add_dq,
+                hooked=score_mod is not None, grad_scale=grad_scale, how=how, dot=interpreted_dot)
+            return (dq, jax.lax.dynamic_update_slice_in_dim(dk_all, dk, j * block_k, axis=0),
+                    jax.lax.dynamic_update_slice_in_dim(dv_all, dv, j * block_k, axis=0))
+
+        start = (jnp.zeros((queries, width), jnp.float32), jnp.zeros((keys, width), jnp.float32),
+                 jnp.zeros((keys, value.shape[-1]), jnp.float32))
+        return jax.lax.fori_loop(0, blocks, block, start)
+
+    dq, dk, dv = jax.lax.map(program, jnp.arange(batch * heads))
+    def laid_out(x):
+        return jnp.swapaxes(x.reshape(batch, heads, *x.shape[1:]), 1, 2)
+
+    return laid_out(dq), laid_out(dk), laid_out(dv)
+
+
 def _dkv_laid_out(dk, dv, written, kinds, *, batch: int, heads: int, queries: int, keys: int, block_k: int):
     """`_dkv_launch`'s programs' results laid out: dK, dV and the key parameters' gradients (`kinds`, each of
     `written`'s) from `[blocks * batch * heads, bk, ...]` to `[B, Kp, H, ...]`, the tile parameters' from
@@ -519,6 +584,22 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
               "grad_scale": scale * prescale, "how": how,
               "block_q": block_q, "block_k": block_k, "accurate": accurate, "drop": drop}
     sums = others, own, others_total, forward_total
+    if not accurate and split and not score_kinds and drop is None:
+        # The fast form's one pass, a call whose score hook, if any, takes no parameters: D from the
+        # forward's split sums, dQ, dK and dV from one recomputation of each tile (`_fused_launch`), the
+        # initial state's keys' share of the weights from the split sums too (`gradient.split_mass`). A
+        # dropping call keeps the dQ launch, whose D is its own centred pass (`gradient.dropout_centre`:
+        # identical products cancel before any reduction, so identical keys give dQ exactly 0).
+        _, state_total = gradient.off_anchor_start(peak, total, maximum, value.shape[-1], shift)
+        values = jnp.swapaxes(anchor_value, 1, 2)
+        anchor, delta, chosen = gradient.split_delta(others, own, others_total, forward_total, state_total,
+                                                    values, jnp.swapaxes(dout, 1, 2).astype(jnp.float32),
+                                                    key_index, shift)
+        dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
+                                   spans, score_mod=score_mod, scale=scale, prescale=prescale,
+                                   grad_scale=scale * prescale, how=how, block_q=block_q, block_k=block_k)
+        mass = gradient.split_mass(own, others_total, forward_total, shift)
+        return (dq, delta, anchor, maximum, forward_total, mass, chosen, dk, dv)
     # The dQ launch reads its queries for their logits alone.
     dq, softmax, chosen, dq_grads = _dq_launch(by_power(query, prescale), key, value, dout, peak, total,
                                                initial_term, maximum, key_index, anchor_value, shift, sums,

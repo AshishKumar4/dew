@@ -573,7 +573,7 @@ def refused_alone(lowered: jax.stages.Lowered) -> dict[str, int]:
                     for index, argument in enumerate(block.arguments):
                         clone.operands[index] = argument
                     # A sharding names the program's mesh, which the module alone holds none of.
-                    held = [getattr(attribute, "name", attribute) for attribute in clone.attributes]
+                    held = [clone.attributes[index].name for index in range(len(clone.attributes))]
                     for attribute in [name for name in held if name.startswith("sdy.")]:
                         del clone.attributes[attribute]
                     func.ReturnOp(clone.results)

@@ -416,6 +416,21 @@ def _arithmetic(build):
     return levels
 
 
+def _truncated(result, dividend, divisor):
+    """An integer division's quotient as `lax.div` gives it, truncated toward zero, wrapped to the result's
+    width."""
+    dtype = np.asarray(result).dtype
+    dividends, divisors = (np.asarray(value).ravel().tolist()
+                           for value in np.broadcast_arrays(dividend, divisor))
+    # Python's integers hold every magnitude (int64's -2**63, uint64's past 2**63) exactly; the quotient wraps
+    # to the result's width once.
+    bits = 8 * dtype.itemsize
+    quotients = [((abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)) % (1 << bits) if b else 0
+                 for a, b in zip(dividends, divisors, strict=True)]
+    return np.asarray(quotients, np.uint64 if bits == 64 else np.int64).astype(dtype).reshape(
+        np.shape(result))
+
+
 def _rounding(name: str, integral):
     """A rounding primitive's contract: each float result's level (`LEVELS[name]`) within the lane's
     reach for it (`lane`); an integer result bit for bit (`integral`), where the primitive has one."""
@@ -942,7 +957,11 @@ CONTRACTS = {
     "sub": _rounding("sub", _wrapping(np.subtract)),
     "mul": _rounding("mul", _wrapping(np.multiply)),
     "square": _rounding("square", _wrapping(lambda a: a * a)),
-    "div": _rounding("div", None),
+    "div": _rounding("div", _truncated),
+    # A remainder (C's, the dividend's sign) is exact in IEEE arithmetic and in integers, and a sign is a
+    # sign operation, each kept zero's sign: bit for bit.
+    "rem": _moved(lambda params, a, b: np.fmod(a, b)),
+    "sign": _moved(lambda params, a: np.where(a == 0, a, np.sign(a))),
     "sqrt": _rounding("sqrt", None),
     "neg": _moved(lambda params, a: -a),
     "abs": _moved(lambda params, a: np.abs(a)),
