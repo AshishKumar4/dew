@@ -16,7 +16,6 @@ import lane_environment
 
 # The lane's environment, before JAX reads it.
 os.environ.update(lane_environment.configured(os.environ))
-import float64_terms
 import hypothesis
 import jax
 import pytest
@@ -65,13 +64,6 @@ else:
         # On armada, where each task's container starts cold, a cache the tasks share.
         _remote = remote_cache.install_from_environment()
 
-# XLA parses XLA_FLAGS once, at the first compile, not when the backend
-# opens. A test that edits the variable, such as `without_deterministic_ops`
-# or the apply_xla_flags tests, would otherwise hand its flags to the whole
-# run whenever it happens to run first: the cuda lane then loses
-# --xla_gpu_deterministic_ops and its bitwise checks see two compilations of
-# one forward disagree. Compiling here fixes the flags set above.
-jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 
 def bundle(node) -> str:
@@ -98,6 +90,18 @@ def pytest_configure(config):
     filled one, 2026-10-31). A run that names its marks, an empty expression included, chooses."""
     if not _marks_named(config):
         config.option.markexpr = load("session", "tools/armada").SELECTION[1]
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtestloop(session):
+    """Compile once before the first test, which fixes the flags set above: XLA parses XLA_FLAGS once, at
+    the first compile, not when the backend opens, and a test that edits the variable, such as
+    `without_deterministic_ops` or the apply_xla_flags tests, would otherwise hand its flags to the whole
+    run whenever it happens to run first: the cuda lane then loses --xla_gpu_deterministic_ops and its
+    bitwise checks see two compilations of one forward disagree. Here, not at import, so a process that only
+    collects (CI's planner, a job's prepare) opens no backend and starts none of its threads."""
+    if not session.config.option.collectonly:
+        jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 
 def pytest_collectstart(collector):
@@ -255,11 +259,12 @@ the kernel's limit, leaving the next test the other half to compile in; None whe
 
 def release() -> None:
     """Release every compiled executable JAX holds, and the code XLA mapped for it, the float64 terms
-    walk's traces and compiled runs among them (`float64_terms.released`), and those Dew's own programs
-    keep past jit's caches (`dew.nn.kernels.options.release`)."""
+    walk's traces and compiled runs among them (`float64_terms.released`, where a test loaded the walk),
+    and those Dew's own programs keep past jit's caches (`dew.nn.kernels.options.release`)."""
     from dew.nn.kernels import options
 
-    float64_terms.released()
+    if (terms := sys.modules.get("float64_terms")) is not None:
+        terms.released()
     options.release()
     jax.clear_caches()
     gc.collect()
