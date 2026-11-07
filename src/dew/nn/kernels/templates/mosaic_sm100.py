@@ -733,9 +733,14 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
     def product_scratch(self, consumers: int, widths: tuple[int, ...]) -> dict:
         # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
         # groups, so a narrower product's is no column slice of a wider one's (Mosaic GPU's layout inference
-        # refused one, jsf-tmem4).
+        # refused one, jsf-tmem4). A 16-column product is issued 32 wide, its right operand padded
+        # (`_padded`), its sum's first columns read (`summed`).
+        widths = tuple(sorted({max(width, PADDED) for width in widths}))
         return {"tmem": {width: tuple(accumulator_columns(self.rows, width) for _ in range(consumers))
                          for width in widths},
+                "padded": tuple(plgpu.SMEM((self.rows, PADDED), jnp.bfloat16,
+                                           transforms=mosaic.swizzle_transforms(jnp.bfloat16, PADDED))
+                                for _ in range(consumers)),
                 "done": plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True)}
 
     @contextlib.contextmanager
@@ -747,7 +752,9 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
             _PRODUCTS.reset(token)
 
     def _scratch(self, width: int):
-        """The building role's accumulator `width` columns wide and its barrier (`product_scratch`'s)."""
+        """The building role's accumulator `width` columns wide (`PADDED` at least) and its barrier
+        (`product_scratch`'s)."""
+        width = max(width, PADDED)
         found = _PRODUCTS.get()
         if found is None or width not in found["tmem"]:
             raise ValueError(f"{self.name} has no {width}-column accumulator in its program's product "
@@ -758,15 +765,34 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
     def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
         del interpret
         tmem, done = self._scratch(shape[1])
-        issue(Accumulator(tmem, shape))
-        return _awaited(tmem, done)
+        issue(Accumulator(tmem, (shape[0], max(shape[1], PADDED))))
+        found = _awaited(tmem, done)
+        return found if shape[1] >= PADDED else found[:, :shape[1]]
 
     def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
                  ) -> Accumulator:
         del interpret
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
+        if rhs.shape[1] < PADDED:
+            rhs = self._padded(rhs)
         plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
         return dataclasses.replace(acc, accumulate=True)
+
+    def _padded(self, rhs):
+        """A right operand of fewer than `PADDED` columns in the building role's padded tile, zeros past
+        its columns: a 64-row product splits its columns between two lane groups, and 16's halves of 8 are
+        whole tiles of no shared-memory tiling a transposed operand takes (Mosaic GPU's layout inference
+        refused Kimi delta attention's 16-wide sub-chunk pairs on a B200; row 4747's debugging at
+        0e5d3aa9df8: padded, they lower)."""
+        padded = _PRODUCTS.get()["padded"][mosaic.ROLE.get()]
+        rows, columns = rhs.shape
+        if rows != self.rows:
+            raise ValueError(f"{self.name} pads a {self.rows}-row right operand, not {rows} rows")
+        padded[...] = jnp.zeros((rows, PADDED), padded.dtype)
+        plgpu.store(padded.at[:, :columns], plgpu.load(rhs, layout=plgpu.Layout.WGMMA, optimized=False),
+                    optimized=False)
+        plgpu.commit_smem()
+        return padded
 
     def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
         # A 64-row product takes no left operand from tensor memory (tcgen05.py: M=128 alone) nor registers:
@@ -815,6 +841,22 @@ class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
 
     consumers = 3
 
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
+                gathered: tuple[str, ...] = ()) -> dict:
+        # A 64-row product reads a transposed operand as two halves of 32 rows, each whole tiles of its
+        # swizzle: past 32 elements a tile, 128 bytes of bf16, the keys' (64, 8) transposed tiling divides no
+        # half (Mosaic GPU's layout inference refused a 27B gated delta net's fp32 forward on a B200; row
+        # 4747's debugging at 0e5d3aa9df8: at 64 bytes it lowers and compiles).
+        capped = {name: min((swizzles or {}).get(name, resources.widest_swizzle(dtype, shape[-1])),
+                            32 * jnp.dtype(dtype).itemsize)
+                  for name, (shape, dtype) in blocks.items() if len(shape) == 2}
+        return super().streams(blocks, stages, consumers, multicast, {**(swizzles or {}), **capped}, copies,
+                               gathered)
+
+
+PADDED = 32
+"""The fewest columns a 64-row tcgen05 product takes (`Tcgen05ChunksIssuer._padded`)."""
 
 CHUNKS = Tcgen05Chunks()
 """tcgen05's bundle for the recurrence's 64-row chunks."""
