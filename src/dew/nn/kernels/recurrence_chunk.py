@@ -235,16 +235,6 @@ def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, 
     Dv = value.shape[-1]
     steps = chunked(query, key, value, g, beta, chunk_size, starts=starts, delta=delta, scale=scale)
     T = S + steps.padding
-    # XLA:CPU workaround, on a CPU alone (row 1701), kept because a CPU user's
-    # results are wrong without it (bible §5): under a jitted scan over the
-    # layers the chunk loop's zero initial state came back with other values in
-    # most processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical
-    # modules). Without it a scanned GLM-5-Next's whole output is NaN at base
-    # 93ab9f5f3 (test_layer_stack, probe a079ff009). The barrier materializes
-    # the zero. Remove it when XLA:CPU no longer returns an uninitialized scan
-    # carry here.
-    if generation.placed_platform() == 'cpu':
-        state = jax.lax.optimization_barrier(state)
     grown, last, kept, last_token = _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size)
     entered, v_corrected, state = xla_chunk_states(
         steps.key, steps.w, steps.u, grown, last, state, kept, last_token=last_token, delta=delta)
@@ -545,11 +535,14 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     Packed documents (`starts`, at most `max_segments` a row) each compute as they would alone. A conv
     runs before the op: it takes the conv's output. The operands the hooks read are checked as the
     decode step's (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction.
-    A memory entering is read through its chunk's decays at their size while it lies within 2^96 of the
-    values: past it, a decay that leaves fp32's normals (a chunk's prefix under 2^-126) reads it as zero, as
-    fla's chunked form does (row 2344: on par at 2^96 through a token's decay of exp2(-124.8), a write gate's
-    output 150 times the recurrence's distance at 2^110). A call names a kernel through `generation.chosen`
-    alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
+    A memory entering is read through its chunk's decays at their size while it lies within 2^100 of the
+    values, every form on par with the recurrence a token at a time there; past it fp32 holds no such read,
+    its own token recurrence 4e-6 from float64 at 2^110 and 6e-2 at 2^124 through a token's decay of
+    exp2(-124.8), and no form loses it to zero: under a decay a head each reads it output-side
+    (`recurrence_algebra.chunk_output`, the derived forms' alike), within 2.5 times the fp32 recurrence's
+    distance (row 2344, workaround audit group 7; jsf-range at base/kernels 3bc9e1b09e). A call names a kernel
+    through `generation.chosen` alone, the recurrence template's 'mosaic_gpu' among them (row 959: the
+    selectors decide every call)."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
     given = recurrence.read(hooks, operands, optional=('state',))

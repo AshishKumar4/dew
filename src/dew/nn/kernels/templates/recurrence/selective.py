@@ -13,6 +13,7 @@ backward does."""
 
 import dataclasses
 import functools
+import math
 from typing import ClassVar
 
 import jax
@@ -22,6 +23,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew._devices import deterministic_ops_requested
 from dew.nn import derivatives
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan
@@ -55,6 +57,9 @@ class Scan:
     packed: bool = False
     entered: bool = False
     launch: str | None = None
+    owned: bool = False
+    """Whether the backward's programs own their partial sums, the run asking its reductions ordered
+    (`backward`)."""
 
     @property
     def chunks(self) -> int:
@@ -308,17 +313,22 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     sum over the channels in global memory, each program's added atomically (mamba_ssm's atomicAdd), a
     block's tokens across the threads so a warp's adds are adjacent (cub's BlockedToStriped), into one of
     `PARTIALS` buffers, which XLA sums. The adds land in whatever order the programs run, so a step repeated
-    on the same schedule differs in B's and C's gradients' last bits (row 4392): speed over determinism
-    (bible §1), as mamba_ssm's. A deterministic order costs the step 2.0 to 2.7 times on an A100, a program
-    owning a buffer and walking its channels in turn (rows x channels 1x5120: 2.31 ms atomic, 4.70 owned, 6.17
-    summed in shared memory; 4x8192: 9.22, 21.1, 25.1; selective-ab-a100 at 8ca2795113), and a buffer a
-    program at the atomic adds' parallelism needs gigabytes."""
+    on the same schedule differs in B's and C's gradients' last bits (row 4392), each run within check 1 of
+    float64: speed over determinism (bible §1), as mamba_ssm's, the default and a declared contract (row
+    4448). A run asking its reductions ordered (`--xla_gpu_deterministic_ops`, `deterministic_ops_requested`)
+    takes the fixed order instead: a program owns a buffer and walks the channels it holds in their order,
+    adding plainly, every run's bits the same, at 2.0 to 2.2 times the step on an A100 (rows x channels
+    1x5120: 2.31 ms atomic, 4.70 owned, 6.17 summed in shared memory; 4x8192: 9.22, 21.1, 25.1;
+    selective-ab-a100 at 8ca2795113)."""
     _, channels, length = x.shape
     states, positions = b.shape[1], block_positions(length, scan.positions)
     blocks = length // positions
     interpret = scan.interpret
     layout = block_scan.blocked(positions)
-    partials = min(PARTIALS, channels)
+    owned = scan.owned
+    partials = math.gcd(PARTIALS, channels) if owned else min(PARTIALS, channels)
+    # A program's channels: its own where the adds are atomic, else every `partials`-th from its buffer's.
+    turns = channels // partials if owned else 1
 
     def entry(x_ref, dt_ref, b_ref, c_ref, parameters_ref, entered_ref, resets_ref, dy_ref, dfinal_ref,
               dbc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged, carried):
@@ -328,9 +338,10 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
             return plgpu.load(ref, layout=layout, optimized=False).astype(jnp.float32)
 
         def added(ref, value):
-            """`value` added to `ref` atomically across the threads (`block_scan.to_striped`), a warp's adds
-            adjacent; plainly interpreted, whose programs run one at a time."""
-            if interpret:
+            """`value` added to `ref`: plainly where the program owns it or interpreted (whose programs run
+            one at a time), else atomically across the threads (`block_scan.to_striped`), a warp's adds
+            adjacent."""
+            if interpret or owned:
                 plgpu.store(ref, load(ref) + value, optimized=False)
                 return
             plgpu.atomic_add(ref, block_scan.to_striped(value, staged), optimized=False)
@@ -374,20 +385,24 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
             plgpu.store(ddt_ref.at[row, channel, span], ddt, optimized=False)
             return d_skip + block_scan.summed(dys * xs, exchanged, interpret=interpret)
 
-        channel = lax.axis_index("channels")
-        # Each state's cotangent carried from block to block and its rate's gradient summed, in shared
-        # memory, a state's a turn of the rolled loop.
-        for n in range(states):
-            carried[0, n] = dfinal_ref[row, n, channel]
-            carried[1, n] = jnp.zeros((), jnp.float32)
-        dd_ref[row, channel] = lax.fori_loop(0, blocks, functools.partial(block, channel=channel),
-                                             jnp.zeros((), jnp.float32))
-        for n in range(states):
-            dstate_ref[row, n, channel] = carried[0, n]
-            da_ref[row, n, channel] = carried[1, n]
+        def walked(turn, carry):
+            channel = lax.axis_index("channels") + turn * partials
+            # Each state's cotangent carried from block to block and its rate's gradient summed, in shared
+            # memory, a state's a turn of the rolled loop.
+            for n in range(states):
+                carried[0, n] = dfinal_ref[row, n, channel]
+                carried[1, n] = jnp.zeros((), jnp.float32)
+            dd_ref[row, channel] = lax.fori_loop(0, blocks, functools.partial(block, channel=channel),
+                                                 jnp.zeros((), jnp.float32))
+            for n in range(states):
+                dstate_ref[row, n, channel] = carried[0, n]
+                da_ref[row, n, channel] = carried[1, n]
+            return carry
+
+        lax.fori_loop(0, turns, walked, None)
 
     return _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfinal, scan,
-                              programs=channels, partials=partials)
+                              programs=channels // turns, partials=partials)
 
 
 
@@ -455,7 +470,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     entering = (jnp.zeros((rows, states, channels), jnp.float32) if state is None
                 else jnp.swapaxes(jnp.asarray(state, jnp.float32), 1, 2))
     scan = Scan(rows, padded, channels, states, chunk, block, family, positions, resident, interpret,
-                packed=starts is not None, launch=report.launch_digest())
+                packed=starts is not None, launch=report.launch_digest(), owned=deterministic_ops_requested())
     y, final = _scan(pad(x), pad(dt), jnp.asarray(A, jnp.float32), pad(B), pad(C),
                      jnp.asarray(D, jnp.float32), entering, resets, scan)
     return y[:, :length], jnp.swapaxes(final, 1, 2).astype(x.dtype)
