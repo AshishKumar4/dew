@@ -1147,3 +1147,60 @@ def test_a_cp_async_walk_joins_its_pages_into_the_tile_its_products_read(on_gpu)
     with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(functools.partial(_paged_products, interpret=False)).trace(*shapes).lower(
             lowering_platforms=("cuda",))
+
+
+CHUNK_DEPTH = 64
+
+
+def _chunks_products(x, w, *, interpret):
+    """`x @ w` on tcgen05's chunks (`mosaic_sm100.CHUNKS`) three ways, each from one walk step's slots: both
+    operands from shared memory (`product`); `x` from registers (`registers_product`: staged into the
+    issuer's tile, `product_scratch`'s lefts); and `x` from registers into a sum of ones the walk carries
+    in registers (`register_products`)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.CHUNKS
+    rows, columns = family.rows, w.shape[1]
+
+    def body(x_gmem, w_gmem, ss_gmem, staged_gmem, carried_gmem):
+        allocated = family.streams({'x': ((rows, CHUNK_DEPTH), jnp.bfloat16),
+                                    'w': ((CHUNK_DEPTH, columns), jnp.bfloat16)}, 2, 1)
+        scratch = family.product_scratch(1, (columns,), lefts=((CHUNK_DEPTH, jnp.bfloat16),))
+
+        def scope(products, *, streams):
+            with family.products_in(products):
+                rings = family.opened(streams)
+                views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
+
+                def step(index, slots, carry, accumulators):
+                    del index
+                    held, ones = family.tile_of(slots['x']), jnp.ones((rows, columns), jnp.float32)
+                    ss_gmem[...] = family.product(slots['x'], slots['w'], (rows, columns),
+                                                  interpret=interpret)
+                    staged_gmem[...] = family.registers_product(held, slots['w'], interpret)
+                    carried_gmem[...] = family.register_products(ones, (held,), slots['w'], interpret)
+                    return carry, accumulators
+
+                family.roles(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
+                             lambda: family.stream(rings, views, 0, 1))
+
+        family.scoped(scope, scratch, streams=allocated)
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=(out, out, out), grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="chunks_left")(x, w)
+
+
+@INTERPRETS
+def test_a_register_left_product_on_tcgen05s_chunks_is_its_shared_memory_product():
+    """Interpreted: on tcgen05's chunks, whose product takes no register left operand
+    (`takes_register_left`), a register value staged into the issuer's tile and multiplied from there
+    (`register_products`), alone and into a sum the walk carries in registers, gives exactly the product of
+    the same operands from shared memory, and the carried sum plus it."""
+    keys = jax.random.split(jax.random.key(3))
+    x = jax.random.randint(keys[0], (64, CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    ss, staged, carried = (np.asarray(out) for out in _chunks_products(x, w, interpret=INTERPRETED))
+    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    np.testing.assert_array_equal(ss, expected)
+    np.testing.assert_array_equal(staged, expected)
+    np.testing.assert_array_equal(carried, expected + 1)

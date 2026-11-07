@@ -1344,6 +1344,11 @@ class Issuer[Accumulator](abc.ABC):
     product. Where not (tcgen05's: one warp issues them, the tensor core reading each stage as loaded), a
     call needing that is not a template's launch's there."""
 
+    takes_register_left: bool = True
+    """Whether its product takes its left operand from a consumer's registers (`register_products`: wgmma's
+    RS form, mma.sync's fragments); a family without it takes a register value staged into a shared tile
+    first (`staged`, tcgen05's issuers)."""
+
     takes_pairs: bool = True
     """Whether a launch on it takes a paired product whole, its model pricing the second accumulator beside
     the first in a consumer's registers (`column_registers`); where not (tcgen05's, whose accumulators stay
@@ -1398,12 +1403,14 @@ class Issuer[Accumulator](abc.ABC):
 
         return resources.widest_swizzle(dtype, columns)
 
-    def product_scratch(self, consumers: int, widths: tuple[int, ...]) -> tuple | dict:
+    def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = ()) -> tuple | dict:
         """The memory a program's products take where the issuer keeps each product's accumulator itself
         (tcgen05's chunks: tensor memory of each product width in `widths` and a tensor-core barrier, a
-        consumer role each), allocated at the program's scope: a role's own scope may not allocate (Mosaic
-        GPU's thread-collective allocations wait for every warpgroup); none where its products need none."""
-        del consumers, widths
+        consumer role each), and stages a register left operand of each `(depth, dtype)` in `lefts` where
+        it takes none in registers (`takes_register_left`: a shared tile a role), allocated at the program's
+        scope: a role's own scope may not allocate (Mosaic GPU's thread-collective allocations wait for
+        every warpgroup); none where its products need none."""
+        del consumers, widths, lefts
         return ()
 
     def product_shared(self, scratch) -> tuple:
