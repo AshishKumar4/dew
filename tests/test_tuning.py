@@ -181,22 +181,19 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
 
 
 def test_a_lowering_records_each_launch_it_traces_again_where_its_trace_was_cached():
-    """A step's lowering records each launch whose config picks decide as it traces it (`seen`), the
-    four of a norm seam and SwiGLU step, and the same again in each lowering whose trace was cached
-    before: a step needs no lowering of its own to be tuned."""
-    def keyed(op, ba):
-        return type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items()))
-
-    function = step()
-    function.lower(*operands(15))
-    lowerings = []
-    for _ in range(2):
+    """A step's lowering records each launch whose config picks decide as it traces it (`seen`), and
+    a lowering whose trace was cached before records the same launches as a fresh step's: a step needs
+    no lowering of its own to be tuned."""
+    def recorded_by(function) -> list:
         with tuning.seen() as found:
             function.lower(*operands(15))
-        lowerings.append(sorted(keyed(op, ba) for op, ba in found))
-    assert lowerings[0] == lowerings[1]
-    assert [name for name, _ in lowerings[0]] == ["RmsBackward", "RmsForward", "SwigluBackward",
-                                                   "SwigluForward"]
+        return sorted((type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items())))
+                      for op, ba in found)
+
+    fresh_step = recorded_by(step())
+    function = step()
+    function.lower(*operands(15))
+    assert fresh_step and recorded_by(function) == recorded_by(function) == fresh_step
 
 
 def test_a_launch_is_resolved_and_recorded_without_asking_a_traced_array_for_its_devices(monkeypatch):

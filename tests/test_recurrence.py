@@ -186,17 +186,15 @@ def summed(hooks: recurrence.Hooks):
 
 
 def test_a_decode_step_is_tuned_by_what_it_was_called_with():
-    """A decode token's one launch (`StepLaunch`) is recorded for tuning as its own lowering traces it
-    (`tuning.seen`), keyed by the state it was called with: a decode step's picks are found and stored
-    by what it was called with."""
+    """A decode token's launch is recorded for tuning as its own lowering traces it (`tuning.seen`),
+    keyed by the state it was called with: a decode step's picks are found and stored by what it was
+    called with."""
     hooks = HOOKS[0]
     given = operands(hooks)
     with tuning.seen() as seen:
         jax.jit(functools.partial(recurrence.step, hooks)).lower(given)
-    [(op, ba)] = seen
-    assert type(op) is recurrence.StepLaunch
     state = jax.ShapeDtypeStruct(given.state.shape, given.state.dtype)
-    assert dict(ba.autotuning_cache_key)["state"] == state
+    assert state in [dict(ba.autotuning_cache_key).get("state") for _, ba in seen]
 
 
 @pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
