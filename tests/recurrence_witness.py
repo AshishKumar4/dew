@@ -53,9 +53,10 @@ from op_certificates import (
 
 from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.templates import bundles
-from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop
+from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, template
 
-CHUNK = mainloop.CHUNK
+(CHUNK,) = template.CHUNKS
+"""The chunk every call's tiles take (`template.CHUNKS`' one), the witnessed launches'."""
 LOG2E = recurrence_algebra.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
 """How far a position's prefix `hi + lo` (`recurrence_algebra.prefix`) lies from its exact `log2(e)

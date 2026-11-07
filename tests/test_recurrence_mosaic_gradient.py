@@ -256,7 +256,7 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     skips it. Its interpreted forward's 256 recorded draws took 108 s whole with the shared cache warm
     (jsf-slow-37e5) and 135 to 148 s in main's CI (ea1d57903, 614382ac3): a site, two map tasks."""
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
-    tiles = mainloop.Tiles(32, 1, walkers=2)
+    tiles = mainloop.Tiles(32, 1, walkers=2, chunk=64)
 
     def walked(given: Chunk):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,

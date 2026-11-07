@@ -20,7 +20,6 @@ from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.chunk_forward import prepared, zero_padded
 from dew.nn.kernels.templates.recurrence.mainloop import (
-    CHUNK,
     Call,
     Held,
     Operand,
@@ -179,7 +178,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
         # The keys launch's terms a key block's, summed (each linear in them).
         dbeta_k, after_w, decay_w = (x.sum(0) for x in (dbeta_k, after_w, decay_w))
         dbeta = dbeta_u + dbeta_k
-        after_w = after_w.reshape(heads, chunks, CHUNK)
+        after_w = after_w.reshape(heads, chunks, call.chunk)
     else:
         dv, dbeta, dskip = _gate_back(run, call, dv2, gated, laid_do, skip)
         dk_w, after_w, decay_w = None, 0.0, 0.0
@@ -187,9 +186,9 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     # query/key launch's ranges, `after` from each token to the chunk's end and `leaving` from its start to
     # before it, the keys launch's beside them, and the memory's decay across each chunk.
     memory = memory.reshape(-1, heads, chunks, call.block).sum((0, 3))
-    ending = (run.hi + run.lo).reshape(heads, chunks, CHUNK)[..., -1]
-    after, leaving = (x.sum(0).reshape(heads, chunks, CHUNK) for x in (after, leaving))
-    dg = algebra.decay_gradient((decay_pairs + decay_w).reshape(heads, chunks, CHUNK), after + after_w,
+    ending = (run.hi + run.lo).reshape(heads, chunks, call.chunk)[..., -1]
+    after, leaving = (x.sum(0).reshape(heads, chunks, call.chunk) for x in (after, leaving))
+    dg = algebra.decay_gradient((decay_pairs + decay_w).reshape(heads, chunks, call.chunk), after + after_w,
                                 leaving, memory, ending)
     dg, dbeta = dg.reshape(heads, rows).T, dbeta.T if delta else dbeta
 
@@ -247,19 +246,21 @@ def _local_back_held(call: Call, vb: int) -> Held:
     their narrow form's product with a block of the output's gradient and its cast (`algebra.local_gradient`:
     the scores are narrowed before the products): as one phase, an H100's model stated 248 registers where
     ptxas needed 136, an A100's 280 against 160."""
+    chunk = call.chunk
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
     return Held(phases=(
-        [f32(CHUNK, CHUNK)] * 2 + masks(CHUNK, CHUNK)
-        + fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),
-        [*held_tile(held, CHUNK, CHUNK), f32(CHUNK, vb), *held_tile(_value_grads(call), CHUNK, vb),
-         *fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, vb))]))
+        [f32(chunk, chunk)] * 2 + masks(chunk, chunk)
+        + fragments(call, (given, chunk, call.block), (given, chunk, call.block)),
+        [*held_tile(held, chunk, chunk), f32(chunk, vb), *held_tile(_value_grads(call), chunk, vb),
+         *fragments(call, (held, chunk, chunk), (given, chunk, vb))]))
 
 
 def _local_back_staged(call: Call, vb: int) -> tuple:
     """`_local_back`'s staging tiles and landings at value block `vb`: the scores' narrow form and a value
     block's gradient's landing."""
+    chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
-    return staging_tiles(held, (CHUNK, CHUNK)), {"row": _value_grads(call).landing(CHUNK, vb)}
+    return staging_tiles(held, (chunk, chunk)), {"row": _value_grads(call).landing(chunk, vb)}
 
 
 @lowered_once
@@ -268,6 +269,7 @@ def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
     (`algebra.local_gradient`, fla's chunk_bwd_dv_local), rounded as fla's, a program a chunk and value head
     (persistent): apart from the memory's reverse walk (`_reverse`), whose tiles beside these spilled 80
     bytes a thread on an H100's."""
+    chunk = call.chunk
     width, value_width, family = call.width, call.value_width, call.family
     given, grads = call.given, _value_grads(call)
     # A value row a block at a time, from the whole width down to whole value tiles (`Call.value_block`).
@@ -277,11 +279,11 @@ def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
     def program(at, q_ref, k_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, dv_ref, *,
                 streams, staging, landing):
         n, h = at["chunks"], at["heads"]
-        row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
+        row, span = n * chunk, pl.ds(n * chunk, chunk)
         keyed = h // call.group * width
-        views = stream_views(queries=given.views(q_ref, row, CHUNK, keyed, width),
-                             keys=given.views(k_ref, row, CHUNK, keyed, width),
-                             out=given.views(do_ref, row, CHUNK, h * value_width, value_width))
+        views = stream_views(queries=given.views(q_ref, row, chunk, keyed, width),
+                             keys=given.views(k_ref, row, chunk, keyed, width),
+                             out=given.views(do_ref, row, chunk, h * value_width, value_width))
         vectors = {"gate": hi_ref, "low": lo_ref, "column_gate": column_hi_ref, "column_low": column_lo_ref}
         streamed = family.copies_vectors
         if streamed:
@@ -300,7 +302,7 @@ def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
                 return stream_tile(slots, name, given, columns=pl.ds(c * call.block, call.block))
 
             def stored(j, dv):
-                grads.store(dv_ref, dv, row, CHUNK, h * value_width + j * vb, vb, family=family,
+                grads.store(dv_ref, dv, row, chunk, h * value_width + j * vb, vb, family=family,
                             smem=landing["row"])
 
             # The local scores once, staged for every value block's product with the output's gradient.
@@ -314,11 +316,11 @@ def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
 
         return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
 
-    tiles = stream_blocks(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
-                          out=((CHUNK, value_width), given))
+    tiles = stream_blocks(queries=((chunk, width), given), keys=((chunk, width), given),
+                          out=((chunk, value_width), given))
     tiles |= vector_blocks(call, "gate", "low", "column_gate", "column_low")
     # The local scores, then their product with the output's gradient.
-    work = Work(flops=2 * CHUNK * CHUNK * (width + value_width), span=1, exponentials=CHUNK * CHUNK)
+    work = Work(flops=2 * chunk * chunk * (width + value_width), span=1, exponentials=chunk * chunk)
     staging, landing = _local_back_staged(call, vb)
     return launch_kernel(program, call, out_type=grads.shape(call.heads * value_width),
                          grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles,
@@ -357,13 +359,14 @@ def _reverse_held(call: Call, bv: int, *, gates: bool, skips: bool = False) -> H
     the values beside the gradient for beta's sum, and where it `skips`, the output's gradient widened for
     the skip's; under a decay a key dimension a key slice of the memory entered, widened for the memory
     decay's sum."""
+    chunk = call.chunk
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
     return Held(carried=[f32(call.width, bv)] * 2, phases=(
-        [f32(CHUNK, bv)] * (2 + gates + skips) + [f32(call.block, bv)] * call.per_key
-        + held_tile(given, CHUNK, bv) * (1 + gates)
+        [f32(chunk, bv)] * (2 + gates + skips) + [f32(call.block, bv)] * call.per_key
+        + held_tile(given, chunk, bv) * (1 + gates)
         + held_tile(held, call.block, bv) + held_tile(call.memories, call.block, bv)
-        + held_tile(_reverse_values(call, gates=gates), CHUNK, bv)
-        + fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
+        + held_tile(_reverse_values(call, gates=gates), chunk, bv)
+        + fragments(call, (given, chunk, call.block), (held, chunk, call.block)),))
 
 
 def _reverse_views(call: Call, q_ref, k_ref, w_ref, do_ref, local_ref, v_ref, h, walked, walked_width: int
@@ -399,6 +402,7 @@ def _reverse_launched(call: Call, batch: int, bv: int, walked_width: int, *, gat
     """`_reverse`'s outputs' types, its walked streams and its final memories' streams, a program walking
     `walked_width` value columns; where the walk `gates` the values, their stream and beta's sums, where it
     `skips`, the skip's sums, and under a decay a key dimension the memory decay's."""
+    chunk = call.chunk
     width, value_width, given = call.width, call.value_width, call.given
     final = Operand(batch * call.heads * width, 1, jnp.dtype(jnp.float32))
     values = _reverse_values(call, gates=gates)
@@ -409,12 +413,12 @@ def _reverse_launched(call: Call, batch: int, bv: int, walked_width: int, *, gat
                 *((jax.ShapeDtypeStruct((value_width // bv, call.chunks * call.heads * width), jnp.float32),)
                   * call.per_key))
     keyed = _reverse_keyed(call, 0)[0]
-    blocks = stream_blocks(queries=((CHUNK, width), keyed), keys=((CHUNK, width), keyed),
-                           **({"w": ((CHUNK, width), dataclasses.replace(call.held, rows=call.rows))}
+    blocks = stream_blocks(queries=((chunk, width), keyed), keys=((chunk, width), keyed),
+                           **({"w": ((chunk, width), dataclasses.replace(call.held, rows=call.rows))}
                               if call.delta else {}),
-                           out=((CHUNK, walked_width), given),
-                           local=((CHUNK, walked_width), _value_grads(call)),
-                           **({"values": ((CHUNK, walked_width), given)} if gates else {}))
+                           out=((chunk, walked_width), given),
+                           local=((chunk, walked_width), _value_grads(call)),
+                           **({"values": ((chunk, walked_width), given)} if gates else {}))
     finals = stream_blocks(**{f"final{i}": ((call.block, walked_width), final)
                               for i in range(width // call.block)})
     return out_type, blocks, finals
@@ -440,6 +444,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     fourth output `[Dv / BV, chunks * HV * Dk]` fp32 each value block's part of the memory decay's gradient
     `sum(h dh)` (`algebra.key_memory_decay`) from the memory's gradient the walk holds, its key rows a
     tile's (kda-lower5-sm90 at 6e03eb57e: where the keys' columns met them, no layout held)."""
+    chunk = call.chunk
     gates, skips = v is not None, skip is not None
     width, value_width, family = call.width, call.value_width, call.family
     grads = _reverse_values(call, gates=gates)
@@ -489,7 +494,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
 
         def _reverse_step(lands, issue, column, columns, f, slots, grad, accumulators):
             n = chunks - 1 - f
-            span = pl.ds(n * CHUNK, CHUNK)
+            span = pl.ds(n * chunk, chunk)
             for i, part in enumerate(grad):
                 before_store()
                 memories.store(dh_ref, part, memory(n, i), call.block, column, bv, family=family,
@@ -506,7 +511,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                 dv = _gated_values_stored(call, slots, columns, out, dv, (beta_ref, skip_ref, gated_ref), h,
                                           span, column // bv)
             before_store()
-            grads.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + column, bv, family=family,
+            grads.store(dv_ref, dv, n * chunk, chunk, h * value_width + column, bv, family=family,
                         smem=lands["corrected"], wait=False)
             return grad, accumulators
 
@@ -519,7 +524,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     out_type, blocks, finals = _reverse_launched(call, batch, bv, walked_width, gates=gates, skips=skips)
     # The memory's carried gradient: three memory products a chunk, two without the delta rule's weights.
     steps = chunks / sequences.shape[0]
-    work = Work(flops=2 * (2 + call.delta) * CHUNK * width * walked_width * steps, span=steps)
+    work = Work(flops=2 * (2 + call.delta) * chunk * width * walked_width * steps, span=steps)
     final_landing, after = final_memory_landing(call, bv)
     return launch_kernel(program, call, out_type=out_type,
                          grid=(value_width // walked_width, sequences.shape[0], call.heads),
@@ -530,9 +535,9 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                          held=_reverse_held(call, bv, gates=gates, skips=skips), consumers=walkers,
                          live=lambda at, refs: refs[8][at["sequences"], 1] > 0,
                          staging=(*staging_tiles(held, (call.block, bv)),
-                                  (plgpu.SMEM((CHUNK, bv), held.stored),)),
+                                  (plgpu.SMEM((chunk, bv), held.stored),)),
                          once=finals,
-                         landing={**memory_landing(call, bv), "corrected": grads.landing(CHUNK, bv),
+                         landing={**memory_landing(call, bv), "corrected": grads.landing(chunk, bv),
                                   **final_landing},
                          # The keys take the place of weights without the delta rule, and the keys and the
                          # prefix that of values a walk gates none of: operands no step reads.
@@ -549,8 +554,9 @@ def _reverse_carried(call: Call, slots, grad: list, out: Parts, columns, issue: 
     `algebra.key_reverse_carried`, each key slice's rows decayed across the chunk by `exp2(g_last)` a
     column's), from the walk's tiles (`slots`, the value block's `columns`) and the prefix's halves'
     refs."""
+    chunk = call.chunk
     family, held, width = call.family, dataclasses.replace(call.held, rows=call.rows), call.width
-    span, last = pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
+    span, last = pl.ds(n * chunk, chunk), n * chunk + chunk - 1
 
     def block(name, operand, i):
         return stream_tile(slots, name, operand, columns=pl.ds(i * call.block, call.block))
@@ -564,7 +570,7 @@ def _reverse_carried(call: Call, slots, grad: list, out: Parts, columns, issue: 
                                  for ref in prefix))[:, None] for i in range(width // call.block)]
         return algebra.key_reverse_carried(grad, keys, weights, queries, out, local, kept, held.dtype, issue)
     gate, low = (family.rows_of(ref.at[h, span]) for ref in prefix)
-    ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in prefix)
+    ending, ending_low = (jnp.full((chunk,), ref[h, last]) for ref in prefix)
     return algebra.reverse_carried(grad, keys, weights, queries, out.value(), local, gate, low, ending,
                                    ending_low, scale, held.dtype, issue)
 
@@ -597,10 +603,11 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
     memory_row = (chunk * call.heads + first) * width + block * call.block
     # Step `i` the `i`-th value head's columns: the view the group's value heads' rows.
     columns = first * value_width
-    return {**stream_views(lambda i: (0, 0), queries=given.views(q_ref, row, CHUNK, key_columns, call.block),
-                           keys=given.views(k_ref, row, CHUNK, key_columns, call.block)),
+    return {**stream_views(lambda i: (0, 0),
+                           queries=given.views(q_ref, row, call.chunk, key_columns, call.block),
+                           keys=given.views(k_ref, row, call.chunk, key_columns, call.block)),
             **stream_views(lambda i: (0, i),
-                           **{name: operand.views(ref, row, CHUNK, columns, group * value_width)
+                           **{name: operand.views(ref, row, call.chunk, columns, group * value_width)
                               for name, (operand, ref) in operands.items()}),
             **stream_views(lambda i: (i * (width // call.block), 0),
                            **{name: memories.views(ref, memory_row, group * width, 0, value_width)
@@ -647,13 +654,14 @@ def _query_key_held(call: Call) -> Held:
     diagonal's mask where products read registers, with a block of each operand, else the memories in fp32.
     An accumulator a value block, the SSD's spilled 168 bytes a thread on an A100, where one needed 249
     registers (gateqk at c2808ebbe)."""
+    chunk = call.chunk
     held, memories, given = call.held, call.memories, call.given
     block = (memories, call.block, call.block)
     summed = ([f32(call.block, call.block), *masks(call.block, call.block), *fragments(call, block, block)]
               if call.family.operands_in_registers else [f32(call.block, call.block)] * 2)
     return Held(phases=(
-        [f32(CHUNK, call.block)] * 4
-        + fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block), (memories, call.block,
+        [f32(chunk, call.block)] * 4
+        + fragments(call, (given, chunk, call.block), (held, chunk, call.block), (memories, call.block,
                                                                                       call.block)),
         summed))
 
@@ -661,21 +669,23 @@ def _query_key_held(call: Call) -> Held:
 def _query_key_landing(call: Call) -> dict:
     """`_query_key`'s stores' tiles: the weights' gradient with the delta rule, in the held operand's form,
     and the queries' and keys' sums."""
+    chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
-    return {**({"weights": held.landing(CHUNK, call.block)} if call.delta else {}),
-            "sums": ((CHUNK, call.block), jnp.float32)}
+    return {**({"weights": held.landing(chunk, call.block)} if call.delta else {}),
+            "sums": ((chunk, call.block), jnp.float32)}
 
 
 def _query_key_launched(call: Call) -> tuple[dict, tuple]:
     """`_query_key`'s streams, a value head's columns whole, and its outputs' types (the weights' gradient
     the delta rule's alone)."""
+    chunk = call.chunk
     width, columns, held, memories, given = (call.width, call.value_width, call.held, call.memories,
                                              call.given)
-    tiles = stream_blocks(queries=((CHUNK, call.block), given), keys=((CHUNK, call.block), given),
-                          values=((CHUNK, columns), held), out=((CHUNK, columns), given),
-                          **({"value_grads": ((CHUNK, columns), held)} if call.delta else {}),
+    tiles = stream_blocks(queries=((chunk, call.block), given), keys=((chunk, call.block), given),
+                          values=((chunk, columns), held), out=((chunk, columns), given),
+                          **({"value_grads": ((chunk, columns), held)} if call.delta else {}),
                           entered=((call.block, columns), memories),
-                          leaving=((call.block, columns), memories), ds=((CHUNK, CHUNK), _score_grads(call)))
+                          leaving=((call.block, columns), memories), ds=((chunk, chunk), _score_grads(call)))
     keyed_out = jax.ShapeDtypeStruct((call.rows, call.heads // call.group * width), jnp.float32)
     terms = jax.ShapeDtypeStruct((width // call.block, call.heads, call.rows), jnp.float32)
     weights = dataclasses.replace(held, rows=call.rows).shape(call.heads * width)
@@ -703,6 +713,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     and the call trains on the port. Split across programs, each split's own sums, an H100 landed none of the
     weights' gradient (M-JS-1, M-JS-8, M-JS-10: zeros, or other programs' tiles, through either landing tile;
     interpreted exact), row 4346."""
+    chunk = call.chunk
     width, value_width, family = call.width, call.value_width, call.family
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     grads = _score_grads(call)
@@ -713,7 +724,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         del staging
         dq_ref, dk_ref, *weights_ref, after_ref, leaving_ref, memory_ref = outs
         c, n, keyed = at["blocks"], at["chunks"], at["heads"]
-        row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
+        row, span, last = n * chunk, pl.ds(n * chunk, chunk), n * chunk + chunk - 1
         key_columns = keyed * width + c * call.block
         first = keyed * group
         views = _query_key_views(call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row,
@@ -722,7 +733,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         # head's, summed over its value heads (`_scores_back`).
         scored = (first, group) if call.delta else (keyed, 1)
         views |= stream_views(lambda i: (0, i if call.delta else 0),
-                              ds=grads.views(ds_ref, row, CHUNK, scored[0] * CHUNK, scored[1] * CHUNK))
+                              ds=grads.views(ds_ref, row, chunk, scored[0] * chunk, scored[1] * chunk))
 
         def step(index, slots, carry, accumulators, *, scores: bool = True):
             h = first + index
@@ -734,13 +745,13 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                 return stream_tile(slots, name, operand)
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
-            ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
+            ending, ending_low = (jnp.full((chunk,), ref[h, last]) for ref in (hi_ref, lo_ref))
             first_head = index == 0
 
             columns = pl.ds(key_columns, call.block)
             sums = {"dq": dq_ref.at[span, columns], "dk": dk_ref.at[span, columns]}
             weights = (() if not weights_ref else
-                       held.views(weights_ref[0], row, CHUNK, h * width + c * call.block, call.block))
+                       held.views(weights_ref[0], row, chunk, h * width + c * call.block, call.block))
             stored = functools.partial(_gradient_stored, call, weights=weights, sums=sums, first=first_head,
                                        landing=landing)
 
@@ -777,8 +788,8 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     tiles, out_type = _query_key_launched(call)
     # Each value head of the group: three memory products (two without the delta rule's weights) and the
     # scores' gradient's two, a key head's two without the delta rule.
-    scores = 2 * CHUNK * CHUNK * call.block
-    each = (2 + call.delta) * CHUNK * value_width * call.block + scores * call.delta
+    scores = 2 * chunk * chunk * call.block
+    each = (2 + call.delta) * chunk * value_width * call.block + scores * call.delta
     work = Work(flops=2 * (each * group + scores * (not call.delta)), span=group)
     dq, dk, *weights, after, leaving, memory = launch_kernel(
         program, call, out_type=out_type,
@@ -842,6 +853,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
     in fp32 in shared memory and the key head's stored at the last (`_score_grads`). Persistent: apart from
     `_query_key`, each launch's tiles a thread's registers hold (one launch spilled 1.5 KB a thread on an
     H100's, SE bwd-probe at a49c8da50)."""
+    chunk = call.chunk
     width, value_width, family = call.width, call.value_width, call.family
     grads = _score_grads(call)
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
@@ -852,14 +864,14 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
                 beta_ref, ds_ref, decay_ref, *, streams, staging, landing):
         n, head = at["chunks"], at["heads"]
         first = head * group
-        row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
+        row, span = n * chunk, pl.ds(n * chunk, chunk)
         keyed = first // call.group * width
-        views = stream_views(lambda i: (0, 0), queries=given.views(q_ref, row, CHUNK, keyed, width),
-                             keys=given.views(k_ref, row, CHUNK, keyed, width))
+        views = stream_views(lambda i: (0, 0), queries=given.views(q_ref, row, chunk, keyed, width),
+                             keys=given.views(k_ref, row, chunk, keyed, width))
         # Step `i` the `i`-th value head's.
         columns = first * value_width, group * value_width
-        views |= stream_views(lambda i: (0, i), values=held.views(v_ref, row, CHUNK, *columns),
-                              out=given.views(do_ref, row, CHUNK, *columns))
+        views |= stream_views(lambda i: (0, i), values=held.views(v_ref, row, chunk, *columns),
+                              out=given.views(do_ref, row, chunk, *columns))
         vectors = {"gate": hi_ref, "low": lo_ref, "column_gate": column_hi_ref, "column_low": column_lo_ref}
         # A program a value head streams its vectors where the family copies them; a key head's steps read
         # theirs.
@@ -886,7 +898,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
             # pairs are gone.
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)
             if accumulated is None:
-                grads.store(ds_ref, ds, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
+                grads.store(ds_ref, ds, row, chunk, h * chunk, chunk, family=family, smem=landing["square"])
             else:
                 # The key head's sum so far, in shared memory from step to step, zero at its first.
                 total = accumulated
@@ -900,7 +912,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
 
                 @pl.when(index == group - 1)
                 def _():
-                    grads.store(ds_ref, ds.astype(grads.dtype), row, CHUNK, head * CHUNK, CHUNK,
+                    grads.store(ds_ref, ds.astype(grads.dtype), row, chunk, head * chunk, chunk,
                                 family=family, smem=landing["square"])
 
             return carry, accumulators
@@ -909,15 +921,15 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
         prologue = None if streamed or group > 1 else lambda: read(None)
         return mosaic.Walk(views, step, steps=group, prologue=prologue)
 
-    tiles = stream_blocks(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
-                          values=((CHUNK, value_width), held), out=((CHUNK, value_width), given))
+    tiles = stream_blocks(queries=((chunk, width), given), keys=((chunk, width), given),
+                          values=((chunk, value_width), held), out=((chunk, value_width), given))
     if group == 1:
         tiles |= vector_blocks(call, "gate", "low", "column_gate", "column_low")
-    out_type = (grads.shape((call.heads // group) * CHUNK),
+    out_type = (grads.shape((call.heads // group) * chunk),
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     # The scores' gradient, the scores and the pairs' sums, each value head's.
-    work = Work(flops=2 * CHUNK * CHUNK * (value_width + width + CHUNK) * group, span=group,
-                exponentials=CHUNK * CHUNK * group)
+    work = Work(flops=2 * chunk * chunk * (value_width + width + chunk) * group, span=group,
+                exponentials=chunk * chunk * group)
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
     # the pairs' sum's product: three fp32 tiles at once, the decays taken before the scores' product and
     # each block sum into one accumulator (`algebra.scores_gradient`; an accumulator a block, four, and an
@@ -925,15 +937,15 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
     # back beside them; and where the scores' gradient leaves in parts (an fp32 call's), the remainder each
     # part after the first is formed from (`product.formed`): without it the model stated 232 registers
     # where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22).
-    held_tiles = Held(phases=([f32(CHUNK, CHUNK)] * (3 + (group > 1) + (grads.parts > 1))
-                              + held_tile(grads, CHUNK, CHUNK)
-                              + masks(CHUNK, CHUNK)
-                              + fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
-    summing = summing_staging(call) + ((plgpu.SMEM((CHUNK, CHUNK), jnp.float32),) if group > 1 else ())
+    held_tiles = Held(phases=([f32(chunk, chunk)] * (3 + (group > 1) + (grads.parts > 1))
+                              + held_tile(grads, chunk, chunk)
+                              + masks(chunk, chunk)
+                              + fragments(call, (given, chunk, call.block), (given, chunk, call.block)),))
+    summing = summing_staging(call) + ((plgpu.SMEM((chunk, chunk), jnp.float32),) if group > 1 else ())
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads // group),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(8),
                          work=work,
-                         held=held_tiles, staging=summing, landing={"square": grads.landing(CHUNK, CHUNK)},
+                         held=held_tiles, staging=summing, landing={"square": grads.landing(chunk, chunk)},
                          persistent=True)(q, k, corrected, do, hi, lo, hi, lo, taken, beta)
 
 
@@ -944,19 +956,20 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: Call):
     `du` (`call.held`) and the inverse `a` less its unit diagonal (`_solved`'s), which `_keys_back` takes.
     Apart from `_keys_back` and `_values_back`, each launch's tiles a thread's registers hold (in one they
     spilled 360 bytes a thread on an H100's)."""
+    chunk = call.chunk
     width, value_width, family = call.width, call.value_width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
 
     def program(at, a_ref, k_ref, v_ref, dw_ref, du_ref, hi_ref, lo_ref, beta_ref, column_hi_ref,
                 column_lo_ref, taken_ref, dl_ref, *, streams, staging, landing):
         n, h = at["chunks"], at["heads"]
-        row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
+        row, span = n * chunk, pl.ds(n * chunk, chunk)
         (staged,) = staging
-        views = stream_views(lower=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
-                             keys=given.views(k_ref, row, CHUNK, h // call.group * width, width),
-                             values=given.views(v_ref, row, CHUNK, h * value_width, value_width),
-                             w_grads=held.views(dw_ref, row, CHUNK, h * width, width),
-                             u_grads=held.views(du_ref, row, CHUNK, h * value_width, value_width))
+        views = stream_views(lower=held.views(a_ref, row, chunk, h * chunk, chunk),
+                             keys=given.views(k_ref, row, chunk, h // call.group * width, width),
+                             values=given.views(v_ref, row, chunk, h * value_width, value_width),
+                             w_grads=held.views(dw_ref, row, chunk, h * width, width),
+                             u_grads=held.views(du_ref, row, chunk, h * value_width, value_width))
 
         def step(index, slots, carry, accumulators):
             del index
@@ -974,29 +987,29 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: Call):
                 gate, low, held.dtype, issue, issue.summed,
                 laid=(family.columns_of(column_hi_ref.at[h, span]),
                       family.columns_of(column_lo_ref.at[h, span])))
-            held.store(dl_ref, d_l, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
+            held.store(dl_ref, d_l, row, chunk, h * chunk, chunk, family=family, smem=landing["square"])
             return carry, accumulators
 
         return mosaic.Walk(views, step)
 
-    tiles = stream_blocks(lower=((CHUNK, CHUNK), held), keys=((CHUNK, width), given),
-                          values=((CHUNK, value_width), given), w_grads=((CHUNK, width), held),
-                          u_grads=((CHUNK, value_width), held))
+    tiles = stream_blocks(lower=((chunk, chunk), held), keys=((chunk, width), given),
+                          values=((chunk, value_width), given), w_grads=((chunk, width), held),
+                          u_grads=((chunk, value_width), held))
     # The weighted keys' and values' products into the inverse's gradient, and its products through it.
-    work = Work(flops=2 * CHUNK * CHUNK * (width + value_width + 2 * CHUNK), span=1)
+    work = Work(flops=2 * chunk * chunk * (width + value_width + 2 * chunk), span=1)
     # A block's keys or values scaled, narrow, beside the inverse's gradient; then it masked, its products
     # through the inverse and the pairs' decays with their masks (`algebra.system_gradient`).
     held_tiles = Held(phases=(
-        [f32(CHUNK, CHUNK), f32(CHUNK, call.block), *held_tile(held, CHUNK, call.block),
-         *fragments(call, (held, CHUNK, call.block), (held, CHUNK, call.block))],
-        [f32(CHUNK, CHUNK)] * 4 + held_tile(held, CHUNK, CHUNK) + masks(CHUNK, CHUNK)
-        + fragments(call, (held, CHUNK, CHUNK), (held, CHUNK, CHUNK))))
-    return launch_kernel(program, call, out_type=held.shape(call.heads * CHUNK),
+        [f32(chunk, chunk), f32(chunk, call.block), *held_tile(held, chunk, call.block),
+         *fragments(call, (held, chunk, call.block), (held, chunk, call.block))],
+        [f32(chunk, chunk)] * 4 + held_tile(held, chunk, chunk) + masks(chunk, chunk)
+        + fragments(call, (held, chunk, chunk), (held, chunk, chunk))))
+    return launch_kernel(program, call, out_type=held.shape(call.heads * chunk),
                          grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
                          work=work,
-                         held=held_tiles, staging=staging_tiles(held, (CHUNK, CHUNK)),
-                         landing={"square": held.landing(CHUNK, CHUNK)})(a, k, v, dw, du, hi, lo, beta, hi,
+                         held=held_tiles, staging=staging_tiles(held, (chunk, chunk)),
+                         landing={"square": held.landing(chunk, chunk)})(a, k, v, dw, du, hi, lo, beta, hi,
                                                                          lo,
                                                                          taken)
 
@@ -1006,17 +1019,18 @@ def _values_back(a, v, du, beta, taken, call: Call):
     """`dv [R, HV * Dv]` as `call.held` and `dbeta [HV, R]` fp32: the WY representation's backward's values'
     part a chunk and value head at a time (`algebra.values_gradient`): the values' gradient and beta's
     through `u`."""
+    chunk = call.chunk
     value_width, family = call.value_width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
 
     def program(at, a_ref, v_ref, du_ref, beta_ref, taken_ref, dv_ref, dbeta_ref, *, streams, staging,
                 landing):
         n, h = at["chunks"], at["heads"]
-        row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
+        row, span = n * chunk, pl.ds(n * chunk, chunk)
         (staged,) = staging
-        views = stream_views(lower=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
-                             values=given.views(v_ref, row, CHUNK, h * value_width, value_width),
-                             u_grads=held.views(du_ref, row, CHUNK, h * value_width, value_width))
+        views = stream_views(lower=held.views(a_ref, row, chunk, h * chunk, chunk),
+                             values=given.views(v_ref, row, chunk, h * value_width, value_width),
+                             u_grads=held.views(du_ref, row, chunk, h * value_width, value_width))
 
         def step(index, slots, carry, accumulators):
             del index
@@ -1033,20 +1047,20 @@ def _values_back(a, v, du, beta, taken, call: Call):
 
         return mosaic.Walk(views, step)
 
-    tiles = stream_blocks(lower=((CHUNK, CHUNK), held), values=((CHUNK, value_width), given),
-                          u_grads=((CHUNK, value_width), held))
+    tiles = stream_blocks(lower=((chunk, chunk), held), values=((chunk, value_width), given),
+                          u_grads=((chunk, value_width), held))
     out_type = (held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
-    work = Work(flops=2 * CHUNK * CHUNK * value_width, span=1)
+    work = Work(flops=2 * chunk * chunk * value_width, span=1)
     # A value block's gradient in fp32 and narrow, its product through the inverse, and the values in fp32.
     held_tiles = Held(phases=(
-        [f32(CHUNK, call.block)] * 3 + held_tile(held, CHUNK, call.block)
-        + fragments(call, (held, CHUNK, CHUNK), (held, CHUNK, call.block)),))
+        [f32(chunk, call.block)] * 3 + held_tile(held, chunk, call.block)
+        + fragments(call, (held, chunk, chunk), (held, chunk, call.block)),))
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(4),
                          work=work,
-                         held=held_tiles, staging=staging_tiles(held, (CHUNK, call.block)),
-                         landing={"block": held.landing(CHUNK, call.block)})(a, v, du, beta, taken)
+                         held=held_tiles, staging=staging_tiles(held, (chunk, call.block)),
+                         landing={"block": held.landing(chunk, call.block)})(a, v, du, beta, taken)
 
 
 @lowered_once
@@ -1059,20 +1073,21 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
     (each linear in its block's terms). A program takes one key block: a program walking a chunk's key blocks
     held each block's operand fragments across the walk, 64 to 200 bytes a thread past an A100's 255
     registers."""
+    chunk = call.chunk
     width, family = call.width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
 
     def program(at, a_ref, k_ref, dw_ref, dl_ref, hi_ref, lo_ref, beta_ref, taken_ref, dk_ref, dbeta_ref,
                 after_ref, decay_ref, *, streams, staging, landing):
         c, n, h = at["blocks"], at["chunks"], at["heads"]
-        row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
+        row, span = n * chunk, pl.ds(n * chunk, chunk)
         staged, *summing = staging
         column = c * call.block
-        views = stream_views(lower=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
-                             keys=given.views(k_ref, row, CHUNK, h // call.group * width + column,
+        views = stream_views(lower=held.views(a_ref, row, chunk, h * chunk, chunk),
+                             keys=given.views(k_ref, row, chunk, h // call.group * width + column,
                                               call.block),
-                             w_grads=held.views(dw_ref, row, CHUNK, h * width + column, call.block),
-                             system=held.views(dl_ref, row, CHUNK, h * CHUNK, CHUNK))
+                             w_grads=held.views(dw_ref, row, chunk, h * width + column, call.block),
+                             system=held.views(dl_ref, row, chunk, h * chunk, chunk))
 
         def step(index, slots, carry, accumulators):
             del index
@@ -1099,24 +1114,24 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
 
         return mosaic.Walk(views, step)
 
-    tiles = stream_blocks(lower=((CHUNK, CHUNK), held), keys=((CHUNK, call.block), given),
-                          w_grads=((CHUNK, call.block), held), system=((CHUNK, CHUNK), held))
+    tiles = stream_blocks(lower=((chunk, chunk), held), keys=((chunk, call.block), given),
+                          w_grads=((chunk, call.block), held), system=((chunk, chunk), held))
     blocks = width // call.block
     terms = jax.ShapeDtypeStruct((blocks, call.heads, call.rows), jnp.float32)
     out_type = (held.shape(call.heads * width), terms, terms, terms)
     # The key block's products through `w` and the system, and its keys' own pairs.
-    work = Work(flops=2 * CHUNK * CHUNK * (4 * call.block), span=1)
+    work = Work(flops=2 * chunk * chunk * (4 * call.block), span=1)
     # The system's gradient narrow and scaled by beta beside the key block's terms: through `w`, the keys in
     # fp32, the product being issued and the sum it joins (`algebra.keys_gradient`: each term dies as the next
     # forms); then its keys' own pairs, the pair terms, and the pairs' sums' masks and product.
     held_tiles = Held(phases=(
-        held_tile(held, CHUNK, CHUNK) * 2 + [f32(CHUNK, call.block)] * 4
-        + fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, call.block), (held, CHUNK, call.block)),
-        held_tile(held, CHUNK, CHUNK) + [f32(CHUNK, CHUNK)] * 4 + masks(CHUNK, CHUNK)))
+        held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4
+        + fragments(call, (held, chunk, chunk), (given, chunk, call.block), (held, chunk, call.block)),
+        held_tile(held, chunk, chunk) + [f32(chunk, chunk)] * 4 + masks(chunk, chunk)))
     return launch_kernel(program, call, out_type=out_type, grid=(blocks, call.chunks, call.heads),
                          grid_names=("blocks", "chunks", "heads"), blocks=tiles, stages=1,
                          live=chunk_liveness(7),
                          work=work, held=held_tiles,
-                         staging=staging_tiles(held, (CHUNK, CHUNK)) + summing_staging(call),
-                         landing={"block": held.landing(CHUNK, call.block)})(a, k, dw, dl, hi, lo, beta,
+                         staging=staging_tiles(held, (chunk, chunk)) + summing_staging(call),
+                         landing={"block": held.landing(chunk, call.block)})(a, k, dw, dl, hi, lo, beta,
                                                                              taken)
