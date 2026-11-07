@@ -110,8 +110,10 @@ def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: floa
     """Each piece's output, a launch each (`templates.recurrence.conv.forward`)."""
     from .templates.recurrence import conv
 
+    lanes = conv.lanes(parts)
     return tuple(conv.forward(x, taps, bias, valid, documents, first=first, width=width, head=head,
-                              activation=activation, eps=eps, dtype=dtype, **_launched(interpret))
+                              lanes_=lanes, activation=activation, eps=eps, dtype=dtype,
+                              **_launched(interpret))
                  for first, width, head in conv.pieces(parts))
 
 
