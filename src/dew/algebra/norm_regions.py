@@ -68,7 +68,7 @@ def regions(index) -> list[Norm | Gated]:
     found, claimed = [], set()
     for place, equation in enumerate(index.jaxpr.eqns):
         name = jax_name(equation.primitive)
-        gated = name == "logistic" or (name in ("jit", "pjit") and equation.params.get("name") == "silu")
+        gated = name == "logistic" or _silu(equation)
         region = _rms(graph, place) if name == "rsqrt" else _gated(graph, place) if gated else None
         if region is not None and not claimed & set(region.places):
             found.append(region)
@@ -121,7 +121,7 @@ def _rms(graph: Graph, place: int) -> Norm | None:
         if scaled is None:
             return None
         inverse_width, summed = _constant_beside(graph, eqns[scaled].invars)
-        width = None if inverse_width is None else 1 / inverse_width
+        width = None if inverse_width is None or inverse_width <= 0 else 1 / inverse_width
     if summed is None:
         return None
     reduced = graph.made(_unkept(graph, graph.uncast(summed, places, widening), places), "reduce_sum")
@@ -133,14 +133,15 @@ def _rms(graph: Graph, place: int) -> Norm | None:
     if (row is None or tuple(eqns[reduced].params["axes"]) != (row.aval.ndim - 1,)
             or not np.isclose(float(width), row.aval.shape[-1]) or np.dtype(row.aval.dtype).itemsize < 4):
         return None
-    # The inverse broadcast along the row and multiplied into it.
-    normed = _times_row(graph, eqns[place].outvars[0], row, places)
+    # The statistics laid back along the row and multiplied into it.
+    normed = _along_row(graph, reduced, place, row, places)
     if normed is None:
         return None
     weight, offset, after_cast, output = _weighted(graph, normed, places)
     source = graph.uncast(row, places, widening)
     places = sorted(set(places))
-    if not _closed(graph, places, output):
+    operands = (source,) if weight is None else (source, weight)
+    if not _closed(graph, places, output, operands):
         return None
     return Norm(tuple(places), source, weight, output, float(epsilon), offset, after_cast)
 
@@ -179,23 +180,70 @@ def _squared(graph: Graph, atom, places: list[int]):
     return eqn.invars[0]
 
 
-def _times_row(graph: Graph, inverse, row, places: list[int]):
-    """The product of `row` and `inverse` laid along it (a broadcast, casts between), its value; None where
-    the inverse's one reader chain reaches none."""
-    eqns, atom = graph.jaxpr.eqns, inverse
+def _along_row(graph: Graph, reduced: int, inverse: int, row, places: list[int]):
+    """The product of `row` and its statistics laid back along it, its value: the row reduction at `reduced`
+    followed forward through the statistics' equations (`places`, the inverse square root at `inverse`
+    among them) and then layouts and casts alone (added to `places`), each value read once, its axes tracked
+    (`_relabeled`) so each of the row's leading axes lies where it did and its feature axis is broadcast;
+    None where they do not (another row's statistics, or the statistics laid along the features)."""
+    eqns, known = graph.jaxpr.eqns, set(places)
+    atom, labels, after = eqns[reduced].outvars[0], list(range(row.aval.ndim - 1)), False
     while True:
         readers = graph.readers[atom]
         if len(readers) != 1 or atom in graph.escaping:
             return None
         (reader,) = readers
-        name = jax_name(eqns[reader].primitive)
-        if name == "mul" and row in eqns[reader].invars:
+        eqn = eqns[reader]
+        name = jax_name(eqn.primitive)
+        if after and name == "mul" and row in eqn.invars:
+            rank = row.aval.ndim
+            if len(labels) != rank or labels[-1] is not None or not all(
+                    labels[a] in (a, None) and (labels[a] == a or row.aval.shape[a] == 1)
+                    for a in range(rank - 1)):
+                return None
             places.append(reader)
-            return eqns[reader].outvars[0]
-        if name not in ("broadcast_in_dim", "reshape", "convert_element_type"):
+            return eqn.outvars[0]
+        if (reader not in known if not after else name not in LAYOUTS):
             return None
-        places.append(reader)
-        atom = eqns[reader].outvars[0]
+        labels = _relabeled(graph, eqn, atom, labels)
+        if labels is None:
+            return None
+        if after:
+            places.append(reader)
+        after = after or reader == inverse
+        atom = eqn.outvars[0]
+
+
+LAYOUTS = frozenset({"broadcast_in_dim", "reshape", "convert_element_type"})
+"""The equations that lay a value out again or cast it, each entry the same number."""
+
+
+def _relabeled(graph: Graph, eqn: jcore.JaxprEqn, atom, labels: list) -> list | None:
+    """`labels` (for each of `atom`'s axes, the axis of the row or weight it is, None for a broadcast or unit
+    axis) for `eqn`'s output: through a broadcast or a reshape that adds or drops unit axes, as laid; through
+    a cast, or an entrywise equation whose other operands are constant scalars, as they are; None through
+    any other."""
+    name = jax_name(eqn.primitive)
+    shape, out = atom.aval.shape, eqn.outvars[0].aval.shape
+    if name == "broadcast_in_dim":
+        laid: list = [None] * len(out)
+        for source, target in enumerate(eqn.params["broadcast_dimensions"]):
+            laid[int(target)] = labels[source] if shape[source] == out[int(target)] else None
+        return laid
+    if name == "reshape":
+        kept = [a for a in range(len(shape)) if shape[a] != 1]
+        made = [a for a in range(len(out)) if out[a] != 1]
+        if [shape[a] for a in kept] != [out[a] for a in made]:
+            return None
+        laid = [None] * len(out)
+        for source, target in zip(kept, made, strict=True):
+            laid[target] = labels[source]
+        return laid
+    others = [var for var in eqn.invars if var is not atom]
+    if name == "convert_element_type" or all(
+            graph.constant(var) is not None and np.ndim(graph.constant(var)) == 0 for var in others):
+        return labels
+    return None
 
 
 def _weighted(graph: Graph, normed, places: list[int]) -> tuple[jcore.Var | None, bool, bool, jcore.Var]:
@@ -227,27 +275,35 @@ def _weighted(graph: Graph, normed, places: list[int]) -> tuple[jcore.Var | None
 
 
 def _row_weight(graph: Graph, atom, width: int, places: list[int]) -> tuple[jcore.Var, bool] | None:
-    """`(w, offset)` where `atom` is a weight `w` of the row's `width` broadcast along it (`1 + w` where
-    `offset`), casts between; None else."""
-    eqns, found = graph.jaxpr.eqns, []
-    atom = graph.uncast(atom, found, widening)
-    if graph.made(atom, "broadcast_in_dim") is None:
-        return None
-    # Laid along the row: broadcast, reshaped to the row's rank first (Flax's `feature_shape`).
-    while (laid := graph.made(atom, "broadcast_in_dim", "reshape")) is not None:
-        found.append(laid)
-        atom = graph.uncast(eqns[laid].invars[0], found, widening)
+    """`(w, offset)` where `atom` is a weight `w` of the row's `width` laid along its feature axis alone (`1 +
+    w` where `offset`), through casts, reshapes and broadcasts (Flax's `feature_shape`); None else."""
+    eqns, chain = graph.jaxpr.eqns, []
     offset = False
-    if (added := graph.made(atom, "add")) is not None:
-        one, atom = _constant_beside(graph, eqns[added].invars)
-        if one != 1.0:
-            return None
-        found.append(added)
-        offset = True
-        atom = graph.uncast(atom, found, widening)
-    if not isinstance(atom, jcore.Var) or atom.aval.shape != (width,):
+    while True:
+        place = graph.made(atom, *LAYOUTS, "add")
+        if place is None:
+            break
+        if jax_name(eqns[place].primitive) == "add":
+            one, inner = _constant_beside(graph, eqns[place].invars)
+            if one != 1.0 or offset:
+                return None
+            offset = True
+        else:
+            inner = eqns[place].invars[0]
+        chain.append(place)
+        atom = inner
+    if not isinstance(atom, jcore.Var) or atom.aval.shape != (width,) or graph.constant(atom) is not None:
         return None
-    places += found
+    # Its one axis followed forward to where the product reads it: the row's feature axis alone.
+    labels, value = [0], atom
+    for place in reversed(chain):
+        labels = _relabeled(graph, eqns[place], value, labels)
+        if labels is None:
+            return None
+        value = eqns[place].outvars[0]
+    if labels[-1] != 0 or any(label is not None for label in labels[:-1]):
+        return None
+    places += chain
     return atom, offset
 
 
@@ -276,13 +332,42 @@ def _gated(graph: Graph, place: int) -> Gated | None:
     places.append(product)
     output = eqns[product].outvars[0]
     places = sorted(places)
-    if not _closed(graph, places, output):
+    if not _closed(graph, places, output, (gate, up)):
         return None
     return Gated(tuple(places), gate, up, output)
 
 
-def _closed(graph: Graph, places: list[int], output) -> bool:
-    """Whether every value the region's equations make but its `output` is read inside it alone."""
+def _closed(graph: Graph, places: list[int], output, operands) -> bool:
+    """Whether the region's `operands` are made outside it and every value its equations make but its
+    `output` is read inside it alone, so the splice removes no value another equation reads."""
     inside = set(places)
-    return all(var is output or (var not in graph.escaping and graph.readers[var] <= inside)
-               for place in places for var in graph.jaxpr.eqns[place].outvars)
+    return (all(graph.producer.get(var) not in inside for var in operands)
+            and all(var is output or (var not in graph.escaping and graph.readers[var] <= inside)
+                    for place in places for var in graph.jaxpr.eqns[place].outvars))
+
+
+def _silu(eqn: jcore.JaxprEqn) -> bool:
+    """Whether `eqn` is a nested program computing `x * logistic(x)` of its one input (`jax.nn.silu`'s), the
+    logistic itself or a nested program of it alone: its body read, not its name."""
+    body = _body(eqn)
+    if body is None or len(body.invars) != 1 or len(body.eqns) != 2 or len(body.outvars) != 1:
+        return False
+    (x,), (first, second) = body.invars, body.eqns
+    return (_logistic(first) and first.invars == [x] and jax_name(second.primitive) == "mul"
+            and set(second.invars) == {x, first.outvars[0]} and second.outvars == body.outvars)
+
+
+def _logistic(eqn: jcore.JaxprEqn) -> bool:
+    """Whether `eqn` is a logistic, or a nested program of one of its input alone (`jax.nn.sigmoid`'s)."""
+    if jax_name(eqn.primitive) == "logistic":
+        return True
+    body = _body(eqn)
+    return (body is not None and len(body.eqns) == 1 and jax_name(body.eqns[0].primitive) == "logistic"
+            and body.eqns[0].invars == body.invars and body.eqns[0].outvars == body.outvars)
+
+
+def _body(eqn: jcore.JaxprEqn) -> jcore.Jaxpr | None:
+    """A nested program's body with no constants (a `jit`'s), None for any other equation."""
+    if jax_name(eqn.primitive) not in ("jit", "pjit") or eqn.params["jaxpr"].consts:
+        return None
+    return eqn.params["jaxpr"].jaxpr

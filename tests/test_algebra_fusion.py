@@ -426,3 +426,51 @@ def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
     assert_as_exact(jax.jit(with_gradients(dew.jit(program))), jax.jit(with_gradients(program)), draw,
                     f"dew.jit {form}", seeds=8, truth_fn=with_gradients(
                         lambda *x: program(*(a.astype(jnp.float64) for a in x))))
+
+
+def _rows_inverse(x):
+    """Each row's inverse root mean square, fp32 `[rows]`, the feature axis reduced."""
+    widened = x.astype(jnp.float32)
+    return jax.lax.rsqrt(jnp.sum(widened * widened, axis=-1) / x.shape[-1] + 1e-6)
+
+
+def _named_silu(x):
+    return jnp.tanh(x)
+
+
+_named_silu.__name__ = "silu"
+
+
+NEAR_NORMS = {
+    "columns scaled by the rows' statistics":
+        lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[None, :]).astype(x.dtype),
+    "a weight along the rows":
+        lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[:, None] * w[:, None]).astype(x.dtype),
+    "a jit named silu that is tanh": lambda x, w: jax.jit(_named_silu)(x) * w.astype(x.dtype),
+    "a zero mean multiplier": lambda x, w: (x.astype(jnp.float32) * jax.lax.rsqrt(
+        jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) * 0.0 + 1e-6)).astype(x.dtype),
+    "its own sum as the weight": lambda x, w: (
+        x.astype(jnp.float32) * _rows_inverse(x)[:, None]
+        * jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1)[None, :]).astype(x.dtype),
+}
+"""Programs a norm's recogniser reads almost as an RMSNorm or SwiGLU and computes otherwise (a square row,
+so every axis has the feature axis's extent)."""
+
+
+@pytest.mark.parametrize("program", list(NEAR_NORMS))
+def test_a_plain_program_near_a_norm_stays_as_written(program):
+    """A program whose arithmetic is no RMSNorm or SwiGLU though its equations resemble one (the statistics
+    or the weight laid along another axis, a nested program only named silu, a mean scaled by zero, the
+    region's own sum read as its weight) runs as written through `dew.jit` on an H100: no fused norm, and
+    its value the program's own, bitwise."""
+    import dew
+
+    fn = NEAR_NORMS[program]
+    x = jax.random.normal(jax.random.key(3), (256, 256), jnp.float32).astype(jnp.bfloat16)
+    w = jax.random.normal(jax.random.key(4), (256,), jnp.float32)
+    shapes = (jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct(w.shape, w.dtype))
+    with generation.assumed("sm90"), generation.routes() as found:
+        dew.jit(fn).trace(*shapes)
+    assert not [route for route in found if route.choice in ("rms_norm", "swiglu") and route.kernel != "xla"]
+    np.testing.assert_array_equal(np.asarray(dew.jit(fn)(x, w), np.float32),
+                                  np.asarray(jax.jit(fn)(x, w), np.float32))
