@@ -987,8 +987,9 @@ one's, a walk's accumulator read in it, the walk's results, and a value added in
 
 def _negated(a, b, *, path: str, interpret: bool):
     """`-(a @ b)` by warpgroup MMA (`mosaic_sm90.FED`, one warpgroup), the accumulator read along `path`
-    (`READS`) and negated before it is stored: a pure op on the accumulator's registers, which a read that
-    did not order its uses after the products' wait would form before the products land (row 4346)."""
+    (`READS`) and negated before it is stored: a sign op on the accumulator's registers, which ptxas 12.9
+    folded through their value before the MMA where it was an integer op, storing -0.0 (row 4346; the fork's
+    float-sign-ops emits it as a float instruction)."""
     from dew.nn.kernels.templates import mosaic_sm90, resources
 
     family = mosaic_sm90.FED
@@ -998,6 +999,9 @@ def _negated(a, b, *, path: str, interpret: bool):
         def scoped(a_smem, b_smem, out_smem):
             mosaic.copied(a_gmem, a_smem)
             mosaic.copied(b_gmem, b_smem)
+            if not interpret:
+                # Written through registers (the generic proxy), read by warpgroup MMA (the async one).
+                plgpu.commit_smem()
             mosaic.synced(interpret)
             if path == "product":
                 value = family.product(a_smem, b_smem, shape, interpret=interpret)
@@ -1017,9 +1021,12 @@ def _negated(a, b, *, path: str, interpret: bool):
                     return carry, (acc,)
 
                 walk = (mosaic.Loop(step, 0, 1),)
-                _, (value,) = family.accumulated(walk, jnp.int32(0), (shape,), interpret)
+                _, (value,) = family.accumulated(walk, (), (shape,), interpret)
             if path != "read":
                 plgpu.store(out_smem, -value, optimized=False)
+            if not interpret:
+                # Written through registers, read by the store's copy.
+                plgpu.commit_smem()
             mosaic.synced(interpret)
             mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED, copy=mosaic.coalesced,
                               widest=resources.copied_rows(LANDED, jnp.float32))
@@ -1034,9 +1041,9 @@ def _negated(a, b, *, path: str, interpret: bool):
 
 
 def every_warpgroup_read_lands_its_products_on_an_h100(path: str):
-    """On an H100: each read path of a warpgroup accumulator (`READS`) gives the products' value to a pure op
-    on its registers, `-(a @ b)` exactly over small integers, where an op ordered above the products' wait
-    stored zeros (row 4346)."""
+    """On an H100: each read path of a warpgroup accumulator (`READS`) gives the products' value to a sign op
+    on its registers, `-(a @ b)` exactly over small integers, where ptxas dropped the MMA and stored -0.0
+    (row 4346)."""
     keys = jax.random.split(jax.random.key(7))
     a, b = (jax.random.randint(key, (LANDED, LANDED), -2, 3).astype(jnp.bfloat16) for key in keys)
     expected = -(np.asarray(a, np.float32) @ np.asarray(b, np.float32))

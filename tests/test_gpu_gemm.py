@@ -9,7 +9,7 @@ one process (`gpu_flow`), each cell its own file's property:
 - The template takes gpt-oss's 2880-wide projection, its ragged stores' one-row rungs, as exactly as XLA's
   (test_grouped_gemm; row 4474).
 - A ring streams tiles of their own trip counts, consumers feeding their own ring split a step, and every
-  read path of a warpgroup accumulator lands its products before a pure op on them (row 4346), on an H100
+  read path of a warpgroup accumulator lands its products under a sign op on them (row 4346), on an H100
   (test_mosaic_toolkit).
 - The shared GEMM mainloop runs on Blackwell's tcgen05, exactly, on a B200 or a B300, sm100 and sm103 alike
   (test_gemm_tcgen05).
