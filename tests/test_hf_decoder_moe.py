@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from flax.traverse_util import flatten_dict
 from interop_support import (
     clearing_selections,
     fixture_ids,
@@ -286,7 +287,8 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
     packed, decoded = (Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto",
                                        attention_impl="xla", packed_experts=served)
                        for served in (True, False))
-    banks = flat_tree(packed.variables[QUANTIZATION])
+    banks = {".".join(path): bank for path, bank in flatten_dict(
+        dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()}
     assert sorted(banks) == sorted(path for path in flat_tree(decoded.variables["params"])
                                    if path.endswith(("gate_up_proj", "down_proj")))
     params = flat_tree(packed.variables["params"])
