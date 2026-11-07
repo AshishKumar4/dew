@@ -231,13 +231,14 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
 
 
 def _scaled_term_value(value: jax.Array, mean: jax.Array, variance: jax.Array, extra: jax.Array) -> jax.Array:
-    """`|value - mean|**2 / (2 variance) * 2**extra` per row (`extra` `[B]` int32), the density's quadratic
+    """`|value - mean|**2 / (2 variance) * 2**extra` per row (`extra` `[B]`, integral, held as float32 so its
+    tangent is a float's zero, which every rule takes, not an integer's float0), the density's quadratic
     term as the KL forms it (`_divergence`), its power restored once: the plain float32 formula bit for bit
     wherever it stays in range at `extra` 0, and finite wherever the term is (a residual of 2**64 under a
     variance of 2**126; a value of 2**127 beside a mean of -2**127). Its derivatives are the plain formula's
     at every order (`_scaled_term_jvp`)."""
     *_, (quotient, power) = _divergence_parts(value, mean, variance)
-    return _scaled(quotient, power + extra)
+    return _scaled(quotient, power + extra.astype(jnp.int32))
 
 
 def _scaled_term_jvp(primals, tangents):
@@ -252,6 +253,7 @@ def _scaled_term_jvp(primals, tangents):
     variance of 2**100 along 2**100), the plain formula's in range, bit for bit, the powers of two exact."""
     value, mean, variance, extra = primals
     along_value, along_mean, along_variance, _ = tangents
+    extra = extra.astype(jnp.int32)
     difference, shift, (_, power) = _divergence_parts(value, mean, variance)
     level, spread = _split(variance)
     axes = tuple(range(1, value.ndim))
@@ -265,8 +267,9 @@ def _scaled_term_jvp(primals, tangents):
     # The term's coefficient, a quotient in (1/2, 2) times its power, restored as far as that keeps it.
     stretch_power = power - spread + extra
     stretch_before = _restored(stretch_power, jnp.ones_like(stretch_power))
-    stretched = -_scaled_term(value, mean, variance, stretch_before - power) * along_variance / level
-    return (_scaled_term(value, mean, variance, extra),
+    stretched = -_scaled_term(value, mean, variance, (stretch_before - power).astype(jnp.float32))
+    stretched = stretched * along_variance / level
+    return (_scaled_term(*primals),
             moved + _scaled(stretched, stretch_power - stretch_before))
 
 
@@ -279,7 +282,7 @@ rule (`_scaled_term_jvp`): numerics the algebra pass keeps as written."""
 def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
     """`|value - mean|**2 / (2 variance)` per row, the density's quadratic term (`_scaled_term` at no
     power), differentiated at every order as the plain formula is."""
-    return _scaled_term(value, mean, variance, jnp.zeros(value.shape[:1], jnp.int32))
+    return _scaled_term(value, mean, variance, jnp.zeros(value.shape[:1], jnp.float32))
 
 
 def _restored(power: jax.Array, exponent: jax.Array) -> jax.Array:
