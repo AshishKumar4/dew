@@ -438,10 +438,12 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if hooks.drop is not None and (hooks.drop.queries is not None or hooks.drop.keys is not None):
         return DROPPING
-    if hooks.drop is not None and jnp.dtype(dtype) == jnp.dtype(jnp.float16):
-        # fp16's dropped weights take scaled parts (`algebra.weights_parts`), which the mainloop's register
-        # products do not take back (`mosaic.unscaled_part`).
-        return Refusal('dropout_dtype', "the Mosaic dropping walk takes bf16 operands, not float16")
+    if hooks.drop is not None and not algebra.drops_in_place(dtype, hooks.drop.bound):
+        # Dropped weights past the dtype's largest take scaled parts (`algebra.dropped_parts`), which the
+        # mainloop's sums in place do not take back (`mosaic.unscaled_part`).
+        return Refusal('dropout_rate', f"the Mosaic dropping walk takes {jnp.dtype(dtype).name} weights "
+                       f"within its range, not a multiplier of {hooks.drop.bound:g} (a rate of "
+                       f"{hooks.drop.rate:g})")
     if jnp.dtype(dtype) not in sixteen:
         return Refusal('dtype', f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}")
     if backward and not transposable(hooks):

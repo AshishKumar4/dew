@@ -623,22 +623,27 @@ def test_the_backward_is_on_par_at_head_widths_interpreted(width, value_width):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_forward_is_on_par_dropping_interpreted(call, training):
+def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
     """The forward and the training forward under probability dropout, its draw the reference's bit for bit
-    (`template.Draw`), under the interpreter."""
-    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True,
-                   training=training, drop=True)
+    (`template.Draw`), over bf16 or fp16 operands, fp16's dropped weights narrowed as they are and summed in
+    place (`algebra.dropped_parts`), under the interpreter."""
+    _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True, training=training,
+                   drop=True)
 
 
 @INTERPRETS
-@pytest.mark.parametrize("form", [*HOOKED_FORMS, "fused"])
-def test_the_backward_is_on_par_dropping_interpreted(form):
+@pytest.mark.parametrize(("form", "dtype"), [*((form, jnp.bfloat16) for form in (*HOOKED_FORMS, "fused")),
+                                             ("default", jnp.float16), ("derived", jnp.float16)],
+                         ids=lambda value: value if isinstance(value, str) else jnp.dtype(value).name)
+def test_the_backward_is_on_par_dropping_interpreted(form, dtype):
     """The backward in each form under probability dropout over a causal call, the fast form's one launch
     too (each consumer's tile its own draw), its D the forward's dropped split sums' about the anchor's
-    value as its draw keeps it (`algebra.anchor_multipliers`), under the interpreter."""
-    _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True)
+    value as its draw keeps it (`algebra.anchor_multipliers`), under the interpreter; over fp16 operands in
+    two launches and at its derivation's tiles."""
+    _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True, dtype=dtype)
 
 
 @INTERPRETS
@@ -1650,11 +1655,6 @@ def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     _check_hooked_backward(hooks, form=form, interpret=False)
 
 
-def _counted(fn, *arrays) -> tuple[float, float]:
-    """The model's share of the Mosaic launches' work `fn` lowers for an H100 each declares
-    (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (its cost estimate), as the lowered
-    program's structured reader reads them (`lowered.kernel_launches`, each launch times the calls a call
-    of the program makes)."""
 @ON_HOPPER
 def the_backward_256_wide_under_a_softcap_is_on_par_on_an_h100():
     """Gemma 2's backward, a softcap 256 wide, at its derivation's tiles (row 3704: one launch whose
@@ -1663,6 +1663,11 @@ def the_backward_256_wide_under_a_softcap_is_on_par_on_an_h100():
     _check_hooked_backward("softcap", form="derived", interpret=False, width=256)
 
 
+def _counted(fn, *arrays) -> tuple[float, float]:
+    """The model's share of the Mosaic launches' work `fn` lowers for an H100 each declares
+    (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (its cost estimate), as the lowered
+    program's structured reader reads them (`lowered.kernel_launches`, each launch times the calls a call
+    of the program makes)."""
     from dew.nn.kernels.lowered import kernel_launches
 
     # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
@@ -1821,14 +1826,14 @@ BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name 
 BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name in GATED
                   for width in (64, 128) for accurate in (False, True)
                   for hooks in BACKWARD_HOOKS if hooks != "none"]
+BACKWARD_GATE += [("sm90", 256, False, "softcap")]
 """The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
-call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
+call's head widths, each form, hookless; each score hook at the widths a hooked call's derivation takes
 whole, in each form (row 2281: its live set beside the step's; FS-A100CHECK1d: the accurate form under a
 row-indexed hook failed an A100's layout inference, a case no fast-form gate lowered); and Gemma 2's, a
 softcap 256 wide on an H100, whose one launch's consumers share a key block within its block where its hook
 reserves no reduction scratch (row 3704, `hook_reduces`)."""
 
-BACKWARD_GATE += [("sm90", 256, False, "softcap")]
 
 def _gated_hooks(hooks: str, queries: int, width: int):
     """The gate's score hook `SCORE_HOOKS[hooks]` over `queries` queries and keys, four query heads, its
