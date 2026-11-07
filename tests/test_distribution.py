@@ -866,6 +866,8 @@ def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_
     alone, single = scheduled(tmp_path, {"fsdp": 2}, 1)
     assert pool["partition"] == {"count": 2, "readers": 1} and pool["step"] == 1
     together, reference = every_row(pool), every_row(alone)
+    # The behavior log-probabilities are one sampling program's over one two-device mesh, whichever
+    # processes hold its devices (row 3177).
     for name in ("input_ids", "response_mask", "behavior_log_probs"):
         np.testing.assert_array_equal(together[name], reference[name])
     np.testing.assert_allclose(together["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
@@ -879,10 +881,21 @@ def test_the_global_estimator_whitens_every_share_by_the_whole_batch(tmp_path):
     (`--estimator global`): each process packs its own rows, whitened by the moments of every share
     pooled, so together they hold the advantages one process gives the whole batch, not each share's
     own whitening."""
+    from scheduler_worker import TASKS, reward
+
+    # The bitwise claim below rests on this: every group's rewards are integers, so they centre to
+    # multiples of a half and each share's centred values sum to exactly zero.
+    for task in range(1, TASKS + 1):
+        rewards = [reward(task, sample, "global") for sample in range(2)]
+        assert all(value == int(value) for value in rewards)
     pool, _ = scheduled(tmp_path, {"fsdp": 2}, 2, "--estimator", "global")
     alone, _ = scheduled(tmp_path, {"fsdp": 2}, 1, "--estimator", "global")
     together, reference = every_row(pool), every_row(alone)
     assert np.unique(np.abs(reference["advantages"])).size > 2
+    # Bit for bit by exact arithmetic (row 3177): the worker's rewards, a sample's index times its task's
+    # id, centre to multiples of a half, so each share's mean is 0 and its m2 a multiple of a quarter,
+    # exact, and the shares' merge (`pooled`) and one process's direct moments are the one exact 102/16;
+    # both then round the same square root, epsilon and division of the same values.
     for name in ("input_ids", "response_mask", "advantages"):
         np.testing.assert_array_equal(together[name], reference[name])
 

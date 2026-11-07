@@ -153,13 +153,15 @@ WITNESSED_ON = {"DecideSettings": {
                  "questions"),
     "blocked": ("layout.blocks", "layout.segments", "layout.split", "specials"),
     "lettered": ("layout.labels",),
-    "merged": ("layout.unit",)}}
+    "merged": ("layout.unit",),
+    "shared": ("layout.shared_state", "layout.siblings")}}
 """The settings whose options are witnessed one an armada map task (`shards`), each on the run of `TASK_RUNS`
 that witnesses it, by its builder's name: a run's unset save and one option's alternatives a task, where the
 four DecideSettings runs witnessing in turn took 700 s on one core (row 2788). A decision run's head over a
 backbone that reads no blocks witnesses its layout's reads, order and framing; one over a backbone that reads
 blocks its segments, splits and the blocks it reads; a letter readout its labels; a tokenizer that merges its
-unit (the runs' turns: each option on the first run that witnessed it)."""
+unit; rows over one state their sharing and siblings, which only such a row takes (the runs' turns: each
+option on the first run that witnessed it)."""
 
 ALTERNATIVE_UNITS = {"layout.split": 3}
 """The options whose alternatives are witnessed apart, by how many units: each its own unit's but the last's,
@@ -201,7 +203,7 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.shards(units=19, per_task=1)
+@pytest.mark.shards(units=21, per_task=1)
 def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_line(tmp_path):
     """`test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line`'s witness of
     DecideSettings, each option on the run that witnesses it (`WITNESSED_ON`), one option a unit of armada's
@@ -219,7 +221,7 @@ def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_l
 
     units = [(name, option, part) for name, options in WITNESSED_ON["DecideSettings"].items()
              for option in options for part in parts(option)]
-    assert len(units) == 19, "the shards mark counts each option's units"
+    assert len(units) == 21, "the shards mark counts each option's units"
     label = "the options DecideSettings' runs witness"
 
     def witness(start: int, stop: int) -> list[tuple[list[str], dict[str, str], bool, list[str], str]]:

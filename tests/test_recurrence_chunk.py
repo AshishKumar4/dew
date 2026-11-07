@@ -3,6 +3,7 @@ every hook combination it takes, a sequence over several chunks and a ragged las
 too, held to the same recurrence run a token at a time (the decode step's reference,
 `recurrence.step_reference`) under the accuracy gate (tests/reference_error.py), both from float64."""
 
+import contextlib
 import dataclasses
 import functools
 import itertools
@@ -13,6 +14,7 @@ import numpy as np
 import pytest
 from certified import assert_certified
 from jax.sharding import Mesh, PartitionSpec as P
+from port_support import row_names_port
 from reference_error import (
     FEWEST_SEEDS,
     assert_as_exact,
@@ -73,10 +75,12 @@ PACKED = (False, True)
 def formed(forms: str, fn):
     """`fn` under the run's `forms` (`generation.numerics`): an fp32 call on the template in three parts
     under the accurate forms, as the portable math holds it, whose bar is the fp32 recurrence's own distance;
-    in two under the fast forms (`mainloop.FAST_PARTS`), held to recorded upstream's instead."""
+    in two under the fast forms (`mainloop.FAST_PARTS`), held to recorded upstream's instead, at the default
+    product precision they round at (`rounds_products`; the suite's lanes configure 'highest')."""
     @functools.wraps(fn)
     def run(*args, **kwargs):
-        with generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)):
+        with (generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)),
+              jax.default_matmul_precision('default') if forms == 'fast' else contextlib.nullcontext()):
             return fn(*args, **kwargs)
 
     return run
@@ -465,7 +469,8 @@ def test_a_kernel_named_for_the_rule_takes_forward_mode_however_a_caller_stages_
 
     def tangent(kernel):
         def tangents(*given):
-            with generation.chosen(gated_delta_rule=kernel):
+            # The port at the default product precision its fp32 products are declared at (`port_support`).
+            with row_names_port('gated_delta_rule', 'fla', port=kernel == 'fla'):
                 found = jax.jvp(stage(recurrence_chunk.chunk_gated_delta_rule), given[:6], given[6:])[1]
             return dict(zip(('output', 'memory'), jax.tree.leaves(found), strict=True))
         return tangents

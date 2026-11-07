@@ -1,7 +1,7 @@
 """What the data suites share: Grain's flags parsed for its worker processes, a caption reader that
 hands the words back, the caption templates and host augmentation the image suites draw from, a
 random step that draws a wide integer, objectives' expansions of a record into rows of it, a step that
-refuses every n-th record and a draw configured for the run."""
+refuses every n-th record and a draw configured for the run, and the data plan version a new run reads by."""
 
 import dataclasses
 import itertools
@@ -11,6 +11,10 @@ import numpy as np
 from absl import flags
 
 from dew.data import Memory, images
+from dew.data.plan import PLAN_VERSIONS
+
+LATEST = PLAN_VERSIONS[-1]
+"""The data plan version a new run reads by, whose shards a manifest names."""
 
 
 @dataclasses.dataclass(frozen=True)

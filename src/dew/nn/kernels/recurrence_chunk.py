@@ -40,7 +40,7 @@ from dew.algebra.scan import RESET_DECAY
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import contracted
 from dew.nn.inputs import cu_seqlens
-from dew.nn.precision import at_least_fp32, l2norm
+from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
@@ -640,6 +640,22 @@ class PortCase:
 _VARYING = ("a shard_map that checks varying axes holds the operands, and a Pallas call states no varying "
             "type for its results")
 
+
+def _port_precision(case) -> bool:
+    """Whether the run's declaration (`dew.nn.precision.effective_precision`) admits a port's products for a
+    call of `case.dtype`: a 16-bit call's, exact with fp32 sums, where the declaration takes those
+    (`exact_products`); an fp32 call's, TF32 (fla's and mamba_ssm's Triton dots), at no more than the
+    default."""
+    if case.dtype.itemsize == 2:
+        return exact_products(None, case.dtype)
+    return asks_default_precision(None, configured=True)
+
+
+_PORT_PRECISION = ("a product precision the run declares that the port's products do not compute: above "
+                   "the default for fp32 operands, whose products it takes in TF32, or a dot algorithm that "
+                   "narrows 16-bit ones")
+
+
 PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     Requirement('gated', lambda case: case.delta and case.decayed,
                 "a recurrence other than the gated delta rule, which the rule's kernels run (fla's "
@@ -655,6 +671,7 @@ PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     Requirement('triton', lambda case: triton_runs(),
                 "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
                 "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
+    Requirement('precision', _port_precision, _PORT_PRECISION, row=INHERENT, kind='handoff'),
 )
 """What the port (`fla_rule`) needs of a rule's call: the gated delta rule, a decay with the delta rule (the
 other forms hand over to the portable math, the call's route reporting it); a GPU Dew's Triton kernels run on,
@@ -711,7 +728,7 @@ def _trains(call: base.Call | None) -> bool:
 class Templated(Protocol):
     """A case the recurrence template's requirements read (`TEMPLATE_SUPPORTS`): the template's
     implementations bound to the call (`call`), the instruction family of the device it runs on (`family`,
-    None off a GPU) and the product it is selected for (`product`)."""
+    None off a GPU), the product it is selected for (`product`) and the operands' `dtype`."""
 
     @property
     def call(self) -> base.Call | None: ...
@@ -721,6 +738,9 @@ class Templated(Protocol):
 
     @property
     def product(self) -> str: ...
+
+    @property
+    def dtype(self) -> np.dtype: ...
 
 
 TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
@@ -735,6 +755,11 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "fast_backward_form`): fp32 operands under the accurate forms, an fp16 call without the "
                 "delta rule, a decay a key dimension without it; or launches past the device's registers or "
                 "shared memory at the call's tiles (`template.backward_holds`)", row='ledger 1294'),
+    Requirement('precision', lambda case: exact_products(None, case.dtype),
+                "a dot algorithm the run declares that narrows the operands' products (TF32's, bf16 parts of "
+                "an fp32 product), which the template's whole products (its accurate parts, or a 16-bit "
+                "operand's own) do not compute; it rounds an fp32 product at the default alone, under the "
+                "run's fast forms (`fast_rounding`)", row=INHERENT, kind='handoff'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,
@@ -1183,8 +1208,8 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     # (`mainloop.Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast forms),
     # the skip is added after. Decided once: the selector judges the call the run makes (its skip's reverse
     # tile).
-    fast = fast_rounding()
     operand = jnp.dtype(jnp.result_type(query, key, value))
+    fast = fast_rounding(operand)
     fused = fast and hooks.skip and operand.itemsize == 2
     narrow = fused and hooks.output is None and jnp.dtype(dtype) == operand
 
@@ -1305,6 +1330,7 @@ SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
     Requirement('triton', lambda case: triton_runs(),
                 "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
                 "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
+    Requirement('precision', _port_precision, _PORT_PRECISION, row=INHERENT, kind='handoff'),
 )
 """What mamba_ssm's kernels (`mamba_ssd.ssd_scan`) need of a scan: no caller's `shard_map` that checks
 varying axes over operands that vary,
@@ -1318,9 +1344,13 @@ TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
                 lambda case: "the TPU's Pallas scan takes a float32 scan on a TPU over power-of-two widths "
                              "and a chunk its program holds, not head width {}, state {} and chunk {}"
                              .format(*case.widths), row=INHERENT),
+    # The scan widens its operands first (`_ssd_tpu`'s `work`): its products are fp32's.
+    Requirement('precision', lambda case: exact_products(None, at_least_fp32(case.dtype)),
+                "a dot algorithm the run declares that narrows the scan's fp32 products, which the TPU's "
+                "scan takes whole (`ssd._mm`, HIGHEST)", row=INHERENT, kind='handoff'),
 )
 """What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: its tiling over the geometry
-(`ssd_kernel_runs`)."""
+(`ssd_kernel_runs`), and a declaration its whole fp32 products compute (`exact_products`)."""
 
 
 def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | None = None,
@@ -1340,12 +1370,17 @@ def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | 
                     call=call, family=family, product=product)
 
 
-def fast_rounding() -> bool:
-    """Whether a call on the template takes the run's fast forms' numbers (`rounded`): the SSD's mamba_ssm's
-    16-bit ones, an fp32 call's products TF32 (JAX's default precision for an fp32 product, and fla's), under
-    the run's fast forms (`generation.numerics`), resolved at its route, so its launches and their caches key
-    on it, never on the run's numerics read inside them."""
-    return generation.numerics().forms == 'fast'
+def fast_rounding(dtype) -> bool:
+    """Whether a call of `dtype` on the template takes the run's fast forms' numbers (`rounded`), resolved at
+    its route, so its launches and their caches key on it, never on the run's numerics read inside them: a
+    16-bit call's under the run's fast forms (`generation.numerics`), the 16-bit roundings of its
+    intermediates mamba_ssm's and fla's, its products whole at any precision; an fp32 call's products TF32
+    (JAX's default precision for an fp32 product, and fla's) where the run's declaration lets a route round
+    them (`dew.nn.precision.rounds_products`: its fast forms at no more than the default precision; a run at
+    'highest' keeps an fp32 product whole, the template's accurate parts)."""
+    if jnp.dtype(dtype).itemsize == 2:
+        return generation.numerics().forms == 'fast'
+    return rounds_products()
 
 
 def chunk_rounding(delta: bool, dtype) -> bool:
@@ -1355,7 +1390,7 @@ def chunk_rounding(delta: bool, dtype) -> bool:
     (`_rated_scan`). Rounded there, a write gate without the delta rule passed its values between launches
     in bf16, its final memory 2.1e4 times the portable math's distance from float64 under aligned keys
     (interpreted at 2b595ff93, 9593 to 46978 times on an H100, gpuflow-a-abfff38d9)."""
-    return fast_rounding() and (delta or jnp.dtype(dtype) == jnp.float32)
+    return fast_rounding(dtype) and (delta or jnp.dtype(dtype) == jnp.float32)
 
 
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,
@@ -1369,7 +1404,8 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=1.0, delta=False, wide=wide, rounded=fast_rounding(),
+                     max_segments=max_segments, scale=1.0, delta=False, wide=wide,
+                     rounded=fast_rounding(jnp.result_type(query, key, value)),
                      skip=skip, recomputed=recomputed_memory())
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
     return select(SCAN, case).kernel
@@ -1431,7 +1467,8 @@ class SelectiveCase:
     """A selective scan (Mamba's, `dew.nn.mixers.mamba.selective_scan`) as its selector reads it
     (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype and
     its states' rows' narrower one (B's or C's, which stream each in its own: the narrower's rows are the
-    shorter), its tokens, channels and states, whether the run's forms are the fast ones (`fast_rounding`)
+    shorter), its tokens, channels and states, whether the run's forms are the fast ones (its template forms
+    its products whole in fp32 whatever the run's precision)
     and its device's instruction family (None off a GPU); the forward and the training step route alike."""
 
     varying: bool
@@ -1480,6 +1517,10 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('tokens', lambda case: case.length >= _selective().CHUNK,
                 lambda case: f"{case.length} tokens, fewer than a chunk of {_selective().CHUNK}: a decode "
                              "step's scan, the portable math's own steps", row=INHERENT, kind='handoff'),
+    # The template forms its state and products in fp32 whatever its operands' storage.
+    Requirement('precision', lambda case: exact_products(None, at_least_fp32(case.dtype)),
+                "a dot algorithm the run declares that narrows the scan's products, which the template takes "
+                "whole in fp32", row=INHERENT, kind='handoff'),
     Requirement('forms', lambda case: case.fast,
                 "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
                 "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
@@ -1515,7 +1556,8 @@ def selective_kernel(x, A, B, C) -> str:
     case = SelectiveCase(varying=bool(jax.typeof(x).mat.varying), dtype=jnp.dtype(x.dtype),
                          state_dtype=min(jnp.dtype(jnp.result_type(B)), jnp.dtype(jnp.result_type(C)),
                                          key=lambda dtype: dtype.itemsize),
-                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], fast=fast_rounding(),
+                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1],
+                         fast=generation.numerics().forms == 'fast',
                          family=family)
     return select(SELECTIVE, case).kernel
 

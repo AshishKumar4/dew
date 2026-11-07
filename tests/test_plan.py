@@ -601,6 +601,48 @@ def test_a_run_that_stops_inside_its_profile_window_stops_its_capture_and_report
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
 
 
+def test_a_profile_window_spanning_a_checkpoints_evaluation_holds_the_training_steps_alone(tmp_path):
+    """A window that spans the evaluation a checkpoint's ranking runs (its cadence's, every second step) and
+    the save holds the training steps alone: the work between them runs outside its capture, which
+    starts again at the next step's read, so the window's captures hold its four steps between them, each
+    once, and no evaluation, which a capture marks wherever one runs inside it (`region`); and the run
+    finishes, every checkpoint written. Inside the window an evaluation filled a step profile's capture."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import gzip
+
+    from affine_run import Replaying
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+    from dew.training import ProfileWindow
+    from dew.training.profiling import traced_steps
+
+    def regions(capture):
+        named = set()
+        for trace in capture.glob("plugins/profile/*/*.trace.json.gz"):
+            with gzip.open(trace, "rt") as stream:
+                named.update(event.get("name") for event in json.load(stream)["traceEvents"])
+        return named
+
+    tracker = RecordingTracker()
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+    checkpoints = Checkpoints(str(tmp_path / "run"), keep=3)
+    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                                 tracker=tracker, checkpoints=checkpoints,
+                                 profile=ProfileWindow(str(tmp_path / "trace"), steps=4, warmup=0)))
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    held = {"held": lambda partition: iter([{"text": np.asarray(BATCH["text"])}])}
+    trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1, checkpoint_every=2,
+                validation=held)
+    assert checkpoints.committed() == [2, 4, 6]
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
+    captures = sorted((tmp_path / "trace").glob("capture-*"))
+    assert window.steps == 4 and len(captures) > 1
+    assert sorted(step for capture in captures for step in traced_steps(capture)) == [1, 2, 3, 4]
+    assert all(traced_steps(capture) and "evaluate" not in regions(capture) for capture in captures)
+
+
 def test_a_borrowed_compile_under_autopgle_profiles_beside_the_state_only_where_the_devices_hold_both(
         monkeypatch):
     """Under AutoPGLE a compile given no trials profiles its step on a copy of the state beside the
@@ -904,10 +946,12 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
     at a rung where the half rung fits it, and the search asks each split there after it misses. The
-    delta rule runs its port (`chosen`), whatever the generation's row names: the half rung recomputes
-    the memory the port names (`checkpoint_name`), and the portable route, an A10's, names none."""
+    delta rule runs its port (`chosen`), whatever the generation's row names, at the default product
+    precision its fp32 products are declared at (`recurrence_chunk._port_precision`; the suite's lanes
+    configure 'highest'): the half rung recomputes the memory the port names (`checkpoint_name`), and the
+    portable route, an A10's, names none."""
     half = "all_but_delta_memory"
-    with chosen(gated_delta_rule="fla"):
+    with chosen(gated_delta_rule="fla"), jax.default_matmul_precision("default"):
         free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
         trainer = lm(**DELTA)
         state, _, _ = trainer.place()

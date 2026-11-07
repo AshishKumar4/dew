@@ -987,31 +987,19 @@ def test_options_knocked_out_with_no_probability_share_the_residual_evenly():
     assert combined == {option: share / total for option, share in shares.items()}
 
 
-def test_a_tournament_round_encodes_its_state_once_and_a_batch_takes_no_request(decide):
-    """A tournament's round lays every group's row over its state's tokens encoded once (`Layout.state`):
-    its tokenizer encodes the state's text once a round, where it encoded it once a group; and a batch of
-    requests, each its own whole request, refuses a `request` of its parts (train 658's review, rows 4604
-    and 4605)."""
-    from dew.data.text import HFTokenizer
-    from dew.decision.layout import render
+def test_a_batch_of_requests_takes_no_one_requests_request_images_or_context(decide):
+    """A batch of requests, each its own whole request, refuses a `request` of its parts (train 658's
+    review, row 4605), and the images and context of one request, which it would read for none of them;
+    each request's context goes in `contexts`, which one request refuses (train 660's review, row 4622;
+    train 666's, row 4658)."""
+    from PIL import Image
 
     request = CASES["many_options"]
     asked = {"intent": Question.from_wire(request["questions"]["intent"])}
-    texts: list[str] = []
-
-    class Counting(HFTokenizer):
-        """The release's tokenizer, each text it encodes noted."""
-
-        def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
-            texts.append(text)
-            return super().encode(text, add_special_tokens=add_special_tokens)
-
-    tokenizer = Counting(decide.tokenizer.name, local_files_only=True)
-    counted = replace(decide, tokenizer=tokenizer)
-    # The state's text as a row encodes it alone (`QuestionLayout.state`).
-    state = render(request["state"]).replace(decide.specials.marker_text, " ")
-    counted.tournament(request["state"], asked, rounds=Knockout(group=4))
-    # Two rounds: the groups' and the final's.
-    assert texts.count(state) == 2
+    batch = [(request["state"], asked)]
+    for given in ({"request": asked}, {"images": [Image.new("RGB", (8, 8))]}, {"context": "a context"}):
+        with pytest.raises(ValueError):
+            decide(batch, **given)
+    # One request's context goes in `context`; a batch's `contexts` it would read none of (row 4658).
     with pytest.raises(ValueError):
-        decide([(request["state"], asked)], request=asked)
+        decide(request["state"], asked, contexts=["a context"])

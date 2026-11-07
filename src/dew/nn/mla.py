@@ -330,11 +330,11 @@ class MultiHeadLatentAttention(LinearProducts):
     """
 
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
-                                                 "position_bias"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a dense layer's pairwise mask or key
-    runs, the key positions they are read at and a position bias, on an uncached call, as the standard
-    attention reads them; an indexed layer narrows its keys by the documents, the rows' validity and
-    its own selection alone, and refuses them (`_check_call`)."""
+                                                 "position_bias", "entered"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a dense layer's pairwise mask, key runs
+    or entered documents (`Entered.runs`), the key positions they are read at and a position bias, on an
+    uncached call, as the standard attention reads them; an indexed layer narrows its keys by the
+    documents, the rows' validity and its own selection alone, and refuses them (`_check_call`)."""
 
     emb_features: int
     num_heads: int
@@ -798,8 +798,8 @@ class MultiHeadLatentAttention(LinearProducts):
         if own is None and not (groups or window is not None or self.attention_chunk is not None):
             return None, False
         if own is not None:
-            mask, runs, window, key_places = own
-            causal, segment_ids, groups, valid = False, None, {}, None
+            mask, runs, window, key_places = own.mask, own.runs, own.window, own.key_places
+            causal, segment_ids, groups, valid, places = False, None, {}, None, key_places
         else:
             mask = runs = None
             key_places = places
@@ -817,6 +817,7 @@ class MultiHeadLatentAttention(LinearProducts):
         own = None if metadata is None else [
             name for name, given in (("pairwise_mask", metadata.pairwise_mask),
                                      ("key_runs", metadata.key_runs),
+                                     ("entered", metadata.entered),
                                      ("key_positions", metadata.key_positions),
                                      ("position_bias", metadata.position_bias)) if given is not None]
         if own and (selecting or call.decode):
