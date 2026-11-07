@@ -189,7 +189,7 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-@pytest.mark.parametrize('case', ['one sequence', 'a decay a key dimension'])
+@pytest.mark.parametrize('case', ['one sequence', 'packed documents'])
 def test_tcgen05s_chunks_train_as_wgmma_does_interpreted(case):
     """The template's training step at a B200's derived tiles on its bundle (tcgen05's 64-row products into
     tensor memory read back in the WGMMA layout, `mosaic_sm100.CHUNKS`, interpreted: Mosaic GPU's interpreter
