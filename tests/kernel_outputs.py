@@ -62,8 +62,7 @@ def _evaluated(jaxpr: core.Jaxpr, consts, args, found: list) -> list:
             # A custom rule's body takes its operands past the rule's own (`num_consts` leading ones too).
             outs = _evaluated(inner, inner_consts, values[len(values) - len(inner.invars):], found)
         else:
-            subfuns, bind_params = equation.primitive.get_bind_params(equation.params)
-            outs = equation.primitive.bind(*subfuns, *values, **bind_params)
+            outs = equation.primitive.bind(*values, **equation.primitive.get_bind_params(equation.params))
             outs = list(outs) if equation.primitive.multiple_results else [outs]
         env.update(zip(equation.outvars, outs, strict=True))
     return [read(variable) for variable in jaxpr.outvars]
