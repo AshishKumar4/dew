@@ -693,6 +693,7 @@ def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
     for stage_local in (True, False):
         run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables,
                       stage_local=stage_local)
+        run.validate(steps=1)
         state, _, _ = run.place()
         step = run.compile(state, batch)
         stepped.append((run, state, run.executable.memory_analysis().temp_size_in_bytes, step(state, batch)))
