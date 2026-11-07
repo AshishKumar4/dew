@@ -995,6 +995,33 @@ def test_a_hoppers_gathered_projection_runs_the_template_producers_gather():
     _assert_launches("sm90", "gathered projection", _gathered_projection, 4, "dew_gmm")
 
 
+def _fp8_exact_product():
+    """Row 3620's FP8 product: 8192 x 4096 E4M3 rows times a 14336 x 4096 K-major E4M3 matrix, its sums
+    promoted every step (`product.promoted`: an FP8 product's law)."""
+    from dew.nn.kernels import gemm
+
+    def product(x, w):
+        return gemm.gemm(x, w, transpose_rhs=True, out_dtype=jnp.bfloat16)
+
+    e4m3 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float8_e4m3fn)
+    return product, (e4m3((8192, 4096)), e4m3((14336, 4096)))
+
+
+def test_a_hoppers_exact_fp8_product_takes_a_spill_free_256_column_tile():
+    """Row 3620's FP8 product on a compile-only H100 derives a 256-column tile (each step's product summed
+    apart 128 columns at a time, `WgmmaIssuer.summed_columns`) and compiles it within its registers, ptxas
+    spilling nothing (`kernel_compile`'s gate): the persistent walk's one induction variable (`mosaic.tiled`)
+    left none of the two loop-control integers nd_loop kept live, which spilled 16 bytes (NSDBG3620-F5)."""
+    launch = grouped_matmul.MosaicGmm()
+    e4m3 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float8_e4m3fn)
+    bound = launch.bind(e4m3((8192, 4096)), e4m3((1, 14336, 4096)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                        out_dtype="bfloat16", trans_rhs=True, interpret=False, dense=True, exact_sums=True)
+    with generation.assumed("sm90"):
+        tile = launch.derived(bound, generation.gpu_target())
+    assert tile is not None and tile.block_n == 256, tile
+    _assert_launches("sm90", "fp8 exact product", _fp8_exact_product, 2, "dew_gmm")
+
+
 def _blockwise_gradient():
     """A blockwise-scaled FP8 MoE projection's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`: 2048
     deep, 768 wide, eight experts of 4 to 12 whole 128-row blocks) through the template named."""
