@@ -513,6 +513,8 @@ class Mamba2Mixer(MixerBase):
     """
 
     residuals = ('context', 'scan', 'conv')
+    # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
+    packed_cache = True
     draws_init_std = True
 
     @property

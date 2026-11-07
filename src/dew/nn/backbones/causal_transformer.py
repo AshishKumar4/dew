@@ -1704,10 +1704,10 @@ class CausalTransformer(LinearProducts):
                              "visibility; pass one")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
-        if decode and coordinates is not None and coordinates.max_segments > 1:
-            raise ValueError(
-                "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
-                "call would attend across documents; prefill each document into a row of its own")
+        if decode and coordinates is not None and coordinates.max_segments > 1 and (
+                refusal := self.packed_cache_refusal()) is not None:
+            raise ValueError(f"packed rows cannot append to this decoder's cache, which would read their "
+                             f"documents together ({refusal}); prefill each document into a row of its own")
         engram_ids = (None if self.engram is None else self.engram_hashes(tokens, coordinates, decode,
                                                                           media_mask))
         if context is not None and context.segments is not None:
@@ -2436,6 +2436,20 @@ class CausalTransformer(LinearProducts):
             refusal = (spec.kind.mixer or default).mixed_refusal(
                 self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex,
                                    self._dex_start(index), spec.routed))
+            if refusal is not None:
+                return f"layer {index}: {refusal}"
+        return None
+
+    @nn.nowrap
+    def packed_cache_refusal(self) -> str | None:
+        """Why a cached call of several documents a row would read them together in some layer, or None:
+        every layer's mixer reads its documents apart over its cache (`MixerBase.packed_cache_refusal`;
+        a cache keeps each key's document, `dew.nn.kv_cache.DOCUMENTS`). A row's later steps continue its
+        last document, naming it (`Coordinates.segments`) where the row holds several."""
+        types = self.per_layer_types
+        default = self.layer_mixer
+        for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
+            refusal = (spec.kind.mixer or default).packed_cache_refusal()
             if refusal is not None:
                 return f"layer {index}: {refusal}"
         return None
