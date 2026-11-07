@@ -750,11 +750,9 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
         return _modelopt_input_qdq(x, spec, qwix)
     largest = jnp.max(jnp.abs(groups), -1)
     divisor = jnp.full(largest.shape, 6, jnp.float32)
-    # CT's local division must round before global scaling, including its bf16 cast. A float64 input is
-    # quantized as its float32 cast: the quantizer's discrete function is CT's float32 one.
-    rounded_to = jnp.float32 if x.dtype == jnp.float64 else x.dtype
+    # CT's local division must round before global scaling, including its bf16 cast.
     scale = jnp.asarray(
-        rounded_operand(correctly_rounded_divide(largest.astype(jnp.float32), divisor), rounded_to), jnp.float32)
+        rounded_operand(correctly_rounded_divide(largest.astype(jnp.float32), divisor), x.dtype), jnp.float32)
     overall = jnp.full(scale.shape, spec.scale, jnp.float32)
     scale = scale * overall
     if spec.e4m3_scale:

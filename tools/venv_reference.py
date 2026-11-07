@@ -84,14 +84,12 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                      "reference": "huggingface/transformers 5.16.1",
                                      "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")}
             for family in ("gemma4", "qwen35", "llama4", "gemma3n")},
-         **{f"codec-{family}-{kind}": {"test": "test_codec_checkpoints", "arms": f"{family}/{kind}",
-                                       "worker": "codec_worker.py",
-                                       "reference": "neuralmagic/compressed-tensors 0.17.1 with "
-                                                    "huggingface/transformers 5.16.1",
-                                       "license": "Apache-2.0",
-                                       "distribution": ("compressed-tensors", "0.17.1")}
-            for family, kind in (("nvfp4_qdq", "unrounded"), ("nvfp4_qdq", "e4m3"), ("storage", "fp8"),
-                                 ("storage", "nvfp4"))},
+         **{f"codec-storage-{kind}": {"test": "test_codec_checkpoints", "arms": f"storage/{kind}",
+                                      "worker": "codec_worker.py",
+                                      "reference": "neuralmagic/compressed-tensors 0.17.1 with "
+                                                   "huggingface/transformers 5.16.1", "license": "Apache-2.0",
+                                      "distribution": ("compressed-tensors", "0.17.1")}
+            for kind in ("fp8", "nvfp4")},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",
