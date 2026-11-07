@@ -333,7 +333,8 @@ def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     spans = _spans(3)
     rows, row_spans, _ = attention_decode.packed(query, spans, 2)
     np.testing.assert_array_equal(template.ungrouped_rows(rows, 8), query)
-    np.testing.assert_array_equal(row_spans.per_query().start, np.repeat(np.asarray(spans.start), 4, axis=1))
+    np.testing.assert_array_equal(row_spans.per_query().start,
+                                  np.repeat(np.asarray(spans.per_query().start), 4, axis=1))
 
 
 

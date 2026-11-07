@@ -269,7 +269,7 @@ def triton_evidence(calls: dict[str, int], thunks: list[str]) -> dict:
     largest shared bytes a call launches with, or why they say nothing. Each Triton call states its shared
     bytes in a launch line of its own, named as the call is, XLA numbering a name's later calls
     (recurrence_cumulated__1): XLA's own fusions launch as custom kernels too, and one kernel's name can
-    begin another's. A call with no launch line of its
+    begin another's (attention_forward, attention_forward_headroom). A call with no launch line of its
     own, or a program that calls no Triton kernel, is no evidence its kernel compiled within its block
     (row 1381)."""
     launches: dict[str, list[int]] = {}
