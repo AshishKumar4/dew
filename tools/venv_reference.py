@@ -85,6 +85,10 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                                    "huggingface/transformers 5.16.1", "license": "Apache-2.0",
                                       "distribution": ("compressed-tensors", "0.17.1")}
             for kind in ("fp8", "nvfp4")},
+         "qwen-image-export": {"test": "test_qwen_image_source", "arms": "export",
+                               "worker": "qwen_image_export_reference.py",
+                               "reference": "huggingface/diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c",
+                               "license": "Apache-2.0", "distribution": ("transformers", "5.17.0")},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",
