@@ -260,9 +260,11 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
     return tuple(sorted(places))
 
 
-BARRIERS = frozenset({"stop_gradient", "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
-"""The equations a region the compile point writes never holds: what they change is a derivative (a stop, a
-program's own derivative rule), which the call written in their place would not keep."""
+BARRIERS = frozenset({"custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
+"""The equations a region the compile point writes never holds: a program's own derivative rule, which the
+call written in its place would not keep. A gradient's stop is no barrier but no identity either
+(`VALUE_IDENTITIES`): it stays its own equation, so a region matches a declaration only where the declaration
+stops the same value (a softmax's maximum), and a stop on a call's operand stays outside the call."""
 
 
 def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int, ...]]],
@@ -1001,7 +1003,7 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
             region = _between(index, (q, k, v, *extras), (output,)) or ()
             yield from _attention_candidates(q, k, v, output, extras[0] if extras else None,
                                              [None, *_scalars(index, region, frozenset({"div", "mul"}))],
-                                             [None, *_fills(index, region)])
+                                             [None, *_fills(index, (q, k, v, *extras), region, output)])
 
 
 def _nearest_product(index: fusion.Index, reached: dict[jcore.Var, int], *, upstream: bool) -> int | None:
@@ -1037,37 +1039,32 @@ def _attention_candidates(q, k, v, output, extra, softcaps, fills) -> Iterator[C
                         functools.partial(_attention_taken, attend, operands))
 
 
-def _fills(index: fusion.Index, places: Sequence[int]) -> list[float]:
-    """The constants the equations at `places` select in place of masked values, each once: a select's
-    operand of constants alone holding one value throughout (a mask's fill: -inf, a finite large negative)."""
+def _fills(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequence[int],
+           output: jcore.Var) -> list[float]:
+    """The constants the region at `places` selects in place of masked values, each once: in its normal form
+    (`_canonical`: nested programs inlined, constants computed), a select's operand of one value throughout (a
+    mask's fill: -inf, a finite large negative)."""
+    if not places:
+        return []
+    read = (atom for place in places for atom in index.jaxpr.eqns[place].invars
+            if isinstance(atom, jcore.Var) and atom not in index.consts
+            and index.producer.get(atom) not in places)
+    inputs = list(dict.fromkeys([*operands, *read]))
+    window = jcore.Jaxpr([var for var in index.consts if _reads(index, places, var)], inputs, [output],
+                         [index.jaxpr.eqns[place] for place in places])
+    closed = _canonical(jax.make_jaxpr(jcore.jaxpr_as_fun(jcore.ClosedJaxpr(
+        window, [index.consts[var] for var in window.constvars])))(*(_shape(var) for var in inputs)))
     found: dict[float, None] = {}
-    for place in places:
-        equation = index.jaxpr.eqns[place]
+    for equation in closed.jaxpr.eqns:
         if jax_name(equation.primitive) != "select_n":
             continue
         for atom in equation.invars[1:]:
-            value = atom.val if isinstance(atom, jcore.Literal) else _constant_value(index, atom)
-            if value is None:
+            if not isinstance(atom, jcore.Literal):
                 continue
-            held = np.asarray(value)
+            held = np.asarray(atom.val)
             if held.size and jnp.issubdtype(held.dtype, jnp.floating) and np.all(held == held.flat[0]):
                 found[float(held.flat[0])] = None
     return list(found)
-
-
-def _constant_value(index: fusion.Index, var: jcore.Var):
-    """The value of a body's value made from its constants alone (`_constant`), computed; None for another."""
-    if not _constant(index, var):
-        return None
-    if var in index.consts:
-        return index.consts[var]
-    place = index.producer[var]
-    equation = index.jaxpr.eqns[place]
-    operands = [atom.val if isinstance(atom, jcore.Literal) else _constant_value(index, atom)
-                for atom in equation.invars]
-    with jax.ensure_compile_time_eval():
-        made = equation.primitive.bind(*operands, **equation.params)
-    return made[equation.outvars.index(var)] if equation.primitive.multiple_results else made
 
 
 KEPT = frozenset({"xla", "reference"})
