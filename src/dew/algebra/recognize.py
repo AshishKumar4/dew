@@ -225,7 +225,10 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
 def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int, ...]]],
                 accurate: bool) -> list[bool]:
     """Whether each candidate's results are its declaration's, in one e-graph of every span's equations and
-    every declaration, saturated under the rule sets the numerics admit (the module's account)."""
+    every declaration, saturated under the rule sets the numerics admit (the module's account). Where a
+    candidate's results are already its declaration's own values in the normal form (`_canonical`: one
+    term, which every rule set admits), that candidate is equal and the rest are not weighed: no e-graph
+    is built."""
     if not spans:
         return []
     places = sorted(set().union(*(set(span) for _, span in spans)))
@@ -251,6 +254,17 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
 
     closed = _canonical(jax.make_jaxpr(joint)(*(jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype)
                                                  for var in inputs)))
+    written = [_atom_key(atom) for atom in closed.jaxpr.outvars]
+    shared, program_at = [], 0
+    declared_at = sum(len(candidate.outputs) for candidate, _ in spans)
+    for candidate, _ in spans:
+        width = len(candidate.outputs)
+        shared.append(written[program_at:program_at + width] == written[declared_at:declared_at + width])
+        program_at += width
+        declared_at += width
+    if any(shared):
+        first = shared.index(True)
+        return [number == first for number in range(len(spans))]
     region = terms.region(closed)
     graph, _, _ = program.graphed(region)
     program.saturate(graph, region, rules.admitted(accurate), SATURATION)
@@ -265,6 +279,11 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
         program_at += len(candidate.outputs)
         declared_at += len(candidate.outputs)
     return equal
+
+
+def _atom_key(atom) -> Hashable:
+    """An output of a canonical program as its value: the variable itself, or a literal's value."""
+    return terms.literal_key(atom) if isinstance(atom, jcore.Literal) else atom
 
 
 def _reads(index: fusion.Index, places: Sequence[int], var: jcore.Var) -> bool:
