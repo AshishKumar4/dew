@@ -279,7 +279,7 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
     each expert matrix an NVFP4 bank in the `QUANTIZATION` collection, no parameter beside it, holding
     exactly the values the dequantizing load decodes; its logits on par with that load's, both bf16 with
     the stored weights' own dtype (check 1, truth the decoded load in fp32); and its export the source's
-    MXFP4 tensors bit for bit."""
+    MXFP4 values."""
     from dew.nn.kernels.gemm import NvFp4
     from dew.quantization import QUANTIZATION
 
@@ -312,9 +312,12 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
 
     stored = load_file(str(source / "model.safetensors"))
     exported = packed.export()
-    for name in stored:
-        if name.endswith(("_blocks", "_scales")):
-            np.testing.assert_array_equal(np.asarray(exported[name]), stored[name])
+    # The released encoder takes a group's scale from its largest value, which a group whose codes reach
+    # half the format's largest alone states at half the stored scale: its values, not its bytes.
+    for stem in {name.removesuffix("_blocks") for name in stored if name.endswith("_blocks")}:
+        np.testing.assert_array_equal(
+            np.asarray(dequantize_mxfp4(exported[stem + "_blocks"], exported[stem + "_scales"])),
+            np.asarray(dequantize_mxfp4(stored[stem + "_blocks"], stored[stem + "_scales"])))
 
 
 def _packed_run(source: Path, directory: Path, steps: int):
