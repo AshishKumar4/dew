@@ -46,6 +46,26 @@ def build(dtype):
         return AutoModelForCausalLM.from_pretrained(root,dtype=dtype,attn_implementation="eager").train()
 models={dtype:build(dtype) for dtype in (torch.float32,torch.float64)}
 weights={dtype:{k:v.clone() for k,v in model.state_dict().items()} for dtype,model in models.items()}
+margin_threshold=float(sys.argv[8]) if len(sys.argv)>8 else 1e-6
+attempts=[]
+def tokens_of(seed):
+    for attempt in range(128):
+        key=seed if attempt==0 else 1_000_003*(attempt+1)+seed
+        tokens=np.random.default_rng([45,key]).integers(0,256,(steps,batch,width)).astype(np.int32)
+        if "margin" not in mode:return tokens
+        with float64():
+            model=models[torch.float64]
+            model.load_state_dict(weights[torch.float64]);model.zero_grad(set_to_none=True)
+            rows=torch.from_numpy(tokens[0].astype(np.int64))
+            logits=model(input_ids=rows[:,:-1]).logits
+            loss=F.cross_entropy(logits.reshape(-1,logits.shape[-1]),rows[:,1:].reshape(-1))
+            loss.backward()
+            margin=min(float(p.grad.detach().abs().min()/p.grad.detach().abs().max())
+                       for p in model.parameters() if p.grad is not None and p.grad.detach().abs().max()>0)
+        if margin>margin_threshold:
+            attempts.append(attempt+1)
+            return tokens
+    raise AssertionError(f"seed {seed} did not clear first-gradient margin {margin_threshold}")
 
 def reference_inside(tokens,dtype):
     model=models[dtype]; model.load_state_dict(weights[dtype]); model.zero_grad(set_to_none=True)
@@ -81,7 +101,7 @@ if not mode.endswith("summary"):
     def get(seed):
         seed=int(seed)
         if seed not in cache:
-            tokens=np.random.default_rng([45,seed]).integers(0,256,(steps,batch,width)).astype(np.int32)
+            tokens=tokens_of(seed)
             cache[seed]=(dew(tokens),reference(tokens,torch.float32),reference(tokens,torch.float64))
             if len(cache)%128==0:print("K EVALUATED",len(cache),flush=True)
         return cache[seed]
@@ -101,10 +121,12 @@ if not mode.endswith("summary"):
     except Exception as error:
         print("K FAIL",type(error).__name__,str(error).replace("\n"," ")[:550],flush=True)
         raise
+    finally:
+        if attempts:print("K MARGIN",margin_threshold,"draws",len(attempts),"attempts",sum(attempts),"max",max(attempts),flush=True)
     raise SystemExit
 start=time.time(); ours=[]; theirs=[]
 for seed in range(first,first+count):
-    tokens=np.random.default_rng([45,seed]).integers(0,256,(steps,batch,width)).astype(np.int32)
+    tokens=tokens_of(seed)
     truth=reference(tokens,torch.float64); ref=reference(tokens,torch.float32); candidate=dew(tokens)
     ours.append((candidate-truth)**2);theirs.append((ref-truth)**2)
     if seed%128==0: print('K PROGRESS '+str(seed),flush=True)
