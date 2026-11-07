@@ -87,7 +87,7 @@ def as_written(layer, *operands):
 
 
 def rewritten(layer, *operands):
-    return jax.jit(algebra.rewritten(layer))(*operands)
+    return jax.jit(algebra.rewritten(layer, kernels=True))(*operands)
 
 
 def assert_equal(got, expected):
@@ -144,7 +144,7 @@ def test_a_plain_programs_product_runs_the_template_its_call_names(layer, forms)
         with generation.routes() as written:
             jax.jit(layer).trace(*operands)
         with generation.routes() as passed:
-            jax.jit(algebra.rewritten(layer)).trace(*operands)
+            jax.jit(algebra.rewritten(layer, kernels=True)).trace(*operands)
     assert not any(route.choice == "grouped_matmul" for route in written)
     assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic_gpu" for route in passed)
 
