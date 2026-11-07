@@ -560,10 +560,6 @@ class KVStore:
             # axes first, as NumPy places indices a slice parts: the values as they come.
             return pool.at[layer, :, page, offset].set(incoming, mode="drop")
 
-        # Mapped over the groups even for one: unmapped, under --xla_gpu_deterministic_ops (jax
-        # 0.11.2) a dropped token's keys landed at another head's kept slot, the implicit-dimension
-        # case openxla/xla#49498 fixes (issue #49380), after the jax pin. A jax bump past that fix
-        # can write a group of one unmapped.
         pages = 1 if layer is None else 2
         return jax.vmap(stored, in_axes=(pages, 0, 0, 0), out_axes=pages)(
             grouped(pool, pages, groups), grouped(page, 0, groups), grouped(safe % size, 0, groups),
