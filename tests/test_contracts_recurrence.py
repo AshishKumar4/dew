@@ -526,12 +526,10 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orders(edge):
-    """`dew.algebra.scan`'s chunk adjoint (`backward`) walked back over three chunks of the gated delta rule,
-    each chunk's solve its forward's kept inverse (`_kept`) and each product a mainloop's issuer's, its
-    adjoint's products the issuer's too (`_adjoined`): the queries' gradient, and its reverse derivative (a
-    reverse-only custom derivative's other orders do not run), finite wherever float64 is a normal float32
-    and the token-by-token scan's gradient is."""
+def test_the_derived_delta_rules_chunk_adjoint_holds_its_orders(edge):
+    """`dew.algebra.scan`'s chunk adjoint (`backward`, its token update replayed per chunk) walked back over
+    three chunks of the gated delta rule: the queries' gradient, and every order of it, forward mode among
+    them, finite wherever float64 is a normal float32 and the token-by-token scan's gradient is."""
     tokens, chunk, keys_, values = 24, 8, 4, 6
     draws = jax.random.split(jax.random.key(3312), 6)
     scale = EDGES[edge]
@@ -545,24 +543,17 @@ def test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orde
     forms = scan.derive_scan(scan.Scan(_gated, _read, axes, walked="time",
                                        state=((keys_, values), jnp.float32)), saturation=SATURATION)
 
-    def issue(role, left, right):
-        del role
-        return left @ right
-
     def gradient(q, k, v, g, beta):
         values_ = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
         parts = [{name: value[index * chunk:(index + 1) * chunk] for name, value in values_.items()}
                  for index in range(tokens // chunk)]
-        states, inverses = [forms.init({})], []
+        states = [forms.init({})]
         for part in parts:
-            prepared = forms.prepare(part)
-            inverses.append(prepared.inverse)
-            states.append(forms.step(states[-1], prepared))
+            states.append(forms.step(states[-1], forms.prepare(part)))
         d_state, d_queries = jnp.zeros((keys_, values)), []
         for index in reversed(range(len(parts))):
             d_state, d_chunk = forms.backward(parts[index], states[index], d_state,
-                                              d_out[index * chunk:(index + 1) * chunk], issue,
-                                              inverse=inverses[index])
+                                              d_out[index * chunk:(index + 1) * chunk])
             d_queries.append(d_chunk["q"])
         return jnp.concatenate(d_queries[::-1])
 
@@ -579,5 +570,5 @@ def test_the_derived_delta_rules_kept_and_issued_adjoint_hold_their_reverse_orde
     primals = (q, k, v, g, beta)
     direction = tuple(jax.random.normal(draws[5], x.shape) for x in primals)
     cotangent = jax.random.normal(draws[0], (tokens, keys_))
-    assert_contract(gradient, primals, direction, cotangent, f"the kept and issued delta-rule adjoint {edge}",
-                    truth_fn=tokenwise, plain_fn=tokenwise, without=REVERSE_ONLY)
+    assert_contract(gradient, primals, direction, cotangent, f"the derived delta-rule adjoint {edge}",
+                    truth_fn=tokenwise, plain_fn=tokenwise)
