@@ -84,3 +84,15 @@ def test_a_gathered_product_lowers_for_cuda(paired):
         jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
                                 jax.ShapeDtypeStruct((2, 4, 512, 256), jnp.bfloat16),
                                 jax.ShapeDtypeStruct((2048,), jnp.int32)).lower(lowering_platforms=("cuda",))
+
+
+def test_a_gathered_products_table_covers_every_tile_its_schedule_walks():
+    """A gathered product's table, on a family whose loads past the rows are bounded (wgmma's TMA, compiled),
+    still extends to every row its schedule's tiles walk (`mosaic_gpu.row_extent`): the producer's threads
+    read a tile's entries by plain loads, which no TMA bounds; read past it, a GH200 faulted
+    (CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+    table = jnp.zeros((256,), jnp.int32)
+    _, gathered, m, extent = mosaic_gpu._walked_rows(jnp.zeros((200, 128), jnp.bfloat16), table, tiles,
+                                                     transpose_lhs=False, dense=False, bounded=True)
+    assert gathered.shape[0] == extent == mosaic_gpu.row_extent(m, tiles.block_m) > m

@@ -92,12 +92,15 @@ def passes(on: bool = True, target: str | None = None) -> Iterator[None]:
 
 
 def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tuple[int, ...] = (),
-              static_argnames: str | tuple[str, ...] = ()) -> Callable:
+              static_argnames: str | tuple[str, ...] = (), kernels: bool = False) -> Callable:
     """`fn` with its program rewritten where the switch is on (`passes`): its static arguments bound as the
     jit around it binds them (`static_argnums`, `static_argnames`), traced over the others, its terms
     saturated under the rule sets the run's numerics admit (`rules.admitted`: the `exact` sets alone under
     the accurate forms, `generation.numerics`, which the trace context keys) and its values evaluated in
-    their cheapest forms. Its arguments, outputs and their structure are `fn`'s."""
+    their cheapest forms; with `kernels` (the compile point's, `options.program`), its regions written as
+    Dew's kernels where they take them (`fusion.fused_program`), which a program a kernel itself traces (a
+    fused prologue's producer, a score mod) never is. Its arguments, outputs and their structure are
+    `fn`'s."""
     # The static positions and names as jit resolves them: each given, and its other spelling read from the
     # signature's positional parameters, so a static argument passed either way is bound.
     numbers = {static_argnums} if isinstance(static_argnums, int) else set(static_argnums)
@@ -128,21 +131,23 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tup
             return fn(*whole, **fixed, **dynamic_kwargs)
 
         closed, shaped = jax.make_jaxpr(bound, return_shape=True)(dynamic, named)
-        done = rewrite(closed, jax.tree.leaves((dynamic, named)), accurate=accurate, saturation=saturation)
+        done = rewrite(closed, jax.tree.leaves((dynamic, named)), accurate=accurate, saturation=saturation,
+                       kernels=kernels)
         return jax.tree.unflatten(jax.tree.structure(shaped), done)
     return run
 
 
 def rewritten_program(closed: jcore.Jaxpr, *, saturation: Saturation) -> jcore.Jaxpr:
-    """`closed`, a jit's own trace of a program, its bodies and its own math rewritten where the switch is on
-    (`passes`, `rewrite`'s walks): `closed` itself where no rule changes it, so the trace jit made lowers as
-    it is, never staged again (a Dory-4B training step's replay of its unchanged program, 1.8 seconds of
-    its compile). The pass's whole seconds, its walks among them, recorded (`report.record_pass`)."""
+    """`closed`, a jit's own trace of a program at the compile point, its bodies and its own math rewritten
+    and its regions written as Dew's kernels where the switch is on (`passes`, `rewrite`'s walks,
+    `kernels`): `closed` itself where no rule changes it, so the trace jit made lowers as it is, never
+    staged again (a Dory-4B training step's replay of its unchanged program, 1.8 seconds of its
+    compile). The pass's whole seconds, its walks among them, recorded (`report.record_pass`)."""
     if not ALGEBRA.value.on:
         return closed
     accurate = generation.numerics().forms == "accurate"
     began = time.perf_counter()
-    made = _rewritten(closed, accurate, saturation)
+    made = _rewritten(closed, accurate, saturation, kernels=True)
     kernel_report.record_pass(time.perf_counter() - began)
     return made
 
@@ -182,10 +187,12 @@ def _dynamic(args: tuple, kwargs: Mapping, numbers: Iterable[int],
             {name: value for name, value in kwargs.items() if name not in names})
 
 
-def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation) -> list:
+def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation,
+            kernels: bool = False) -> list:
     """The outputs of `closed` (a jaxpr and its constants) over `arguments` (flattened), its bodies rewritten
-    in place first (`_within`), then its own math (`_windowed`)."""
-    rewritten = _rewritten(closed, accurate, saturation)
+    in place first (`_within`), then its own math (`_windowed`), then, with `kernels`, its regions written as
+    Dew's kernels (`fusion.fused_program`)."""
+    rewritten = _rewritten(closed, accurate, saturation, kernels)
     return eval_jaxpr(rewritten, rewritten.consts, *arguments)
 
 
@@ -594,7 +601,7 @@ BODIES = frozenset({"jit", "pjit", "closed_call", "scan", "while", "cond", "rema
 a scan, a loop, a conditional, a checkpoint, and a custom derivative's primal call, its rules kept."""
 
 
-def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
+def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
     """`jaxpr`, its constants kept, with each body (`BODIES`) of its equations rewritten, the equation itself
     kept: `jaxpr` itself, and each equation itself, where no body changes. A program's identity is what
     JAX shares its lowering by: every call site of one jitted function holds one body, lowered once (one
@@ -606,11 +613,12 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore
     for equation in jaxpr.eqns:
         if equation.primitive.name in BODIES or _marked(equation, WITHIN) or (
                 _marked(equation, (Algebra,)) and not _opens(equation)):
-            params = {name: _body(value, accurate, saturation) for name, value in equation.params.items()}
+            params = {name: _body(value, accurate, saturation, kernels)
+                      for name, value in equation.params.items()}
         elif _opens(equation):
             # Its body's own bodies rewritten, its math left to the region it opens into (`_opened`).
             params = {**equation.params, "call_jaxpr": _within(equation.params["call_jaxpr"], accurate,
-                                                               saturation)}
+                                                               saturation, kernels)}
         else:
             params = equation.params
         if any(params[name] is not value for name, value in equation.params.items()):
@@ -640,20 +648,20 @@ def _opens(equation: jcore.JaxprEqn) -> bool:
             and all(isinstance(var.aval, ShapedArray) for var in (*equation.invars, *equation.outvars)))
 
 
-def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
+def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
     """`closed`'s bodies rewritten in place (`_within`), then its own math (`_windowed`) with each Algebra
     span's body opened into it (`_opened`), so a window reaches across the span's boundary, where the run's
-    numerics admit a rewrite of it (`_saturating`), then its products fused with their consumers where the
-    GEMM template takes them and its attention written as Dew's where a kernel of Dew's takes it
-    (`fusion.fused_program`), whatever the numerics admit: accurate forms limit reassociation alone (row
-    4730). The program with its spans kept as traced where no window's form lands (`closed` itself where
-    nothing changed)."""
-    made = _within(closed, accurate, saturation)
+    numerics admit a rewrite of it (`_saturating`), then, with `kernels`, its products fused with their
+    consumers where the GEMM template takes them and its attention and norms written as Dew's where a kernel
+    of Dew's takes them (`fusion.fused_program`), whatever the numerics admit: accurate forms limit
+    reassociation alone (row 4730). The program with its spans kept as traced where no window's form lands
+    (`closed` itself where nothing changed)."""
+    made = _within(closed, accurate, saturation, kernels)
     if _saturating(accurate):
         opened = _opened(made)
         windowed = _windowed(opened, accurate, saturation)
         made = made if windowed is opened else windowed
-    return fusion.fused_program(made)
+    return fusion.fused_program(made) if kernels else made
 
 
 def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -686,13 +694,13 @@ def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
                          outvars=[outer(atom) for atom in jaxpr.outvars])
 
 
-def _body(value, accurate: bool, saturation: Saturation):
+def _body(value, accurate: bool, saturation: Saturation, kernels: bool):
     """A body parameter rewritten: a jaxpr's program, each of a conditional's branches (the tuple itself
     where none changes); any other parameter, and a body whose constants it does not hold, as it is."""
     if isinstance(value, jcore.Jaxpr):
-        return _closed(value, accurate, saturation)
+        return _closed(value, accurate, saturation, kernels)
     if isinstance(value, tuple) and value and all(isinstance(branch, jcore.Jaxpr) for branch in value):
-        branches = tuple(_closed(branch, accurate, saturation) for branch in value)
+        branches = tuple(_closed(branch, accurate, saturation, kernels) for branch in value)
         return value if all(new is old for new, old in zip(branches, value, strict=True)) else branches
     return value
 
@@ -705,7 +713,7 @@ switch's target), held while the body lives: every call site of one body, and ev
 nothing changes holds None, not itself, which would keep it alive."""
 
 
-def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
+def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
     """A body's program rewritten, over the same inputs, weak types included, and the same outputs, the same
     object for every call site and retrace of one body (`_REWRITTEN`), the body itself where nothing
     changes; a body whose constants another holds (an open jaxpr), or that reads a value of no shape, as it
@@ -715,9 +723,9 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcor
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
     rewrites = _REWRITTEN.setdefault(closed, {})
-    key = _deriving(accurate, saturation)
+    key = (_deriving(accurate, saturation), kernels)
     if key not in rewrites:
-        made = _rewritten(closed, accurate, saturation)
+        made = _rewritten(closed, accurate, saturation, kernels)
         rewrites[key] = None if made is closed else made
     made = rewrites[key]
     return closed if made is None else made

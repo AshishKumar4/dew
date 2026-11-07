@@ -18,8 +18,9 @@ def _on_tcgen05(*, interpret: bool) -> None:
     of 16-bit products is exactly summed, `templates.product.promoted`, whose step tcgen05's launch does not
     take, its products issued by one warp): a grouped forward, a grouped
     input gradient (its matrix read transposed) and a dense forward, each exactly numpy's, routed to the
-    template on a 128-row tile of tcgen05's; a kernel gradient, whose step prepares its operands, takes
-    another route. Interpreted as an sm100 on a CPU, or run on the Blackwell GPU itself."""
+    template on a 128-row tile of tcgen05's; a kernel gradient, whose step prepares its operands, which
+    tcgen05's bundle refuses, on the template's next issuer, mma.sync on TMA rings (`bundles.groups`, row
+    4727), exactly numpy's too. Interpreted as an sm100 on a CPU, or run on the Blackwell GPU itself."""
     sizes = jnp.asarray([128, 200, 56], jnp.int32)
     starts = np.cumsum([0, *np.asarray(sizes)])
 
@@ -59,9 +60,12 @@ def _on_tcgen05(*, interpret: bool) -> None:
         assert {(tile.family, tile.block_m // tile.warpgroups) for tile in derived} == {("tcgen05", 128)}
         np.testing.assert_array_equal(got, expected, err_msg=name)
     with generation.routes() as routes:
-        jax.jit(lambda: gemm.gemm_t(x, dy, sizes, out_dtype=jnp.float32, precision="default",
-                                    interpret_on_cpu=interpret))()
-    assert "mosaic_gpu" not in {route.kernel for route in routes}
+        got = np.asarray(jax.jit(lambda: gemm.gemm_t(x, dy, sizes, out_dtype=jnp.float32, precision="default",
+                                                     interpret_on_cpu=interpret))())
+    assert {route.kernel for route in routes} == {"mosaic_gpu"}
+    expected = np.stack([np.asarray(x[starts[g]:starts[g + 1]], np.float32).T
+                         @ np.asarray(dy[starts[g]:starts[g + 1]], np.float32) for g in range(3)])
+    np.testing.assert_array_equal(got, expected, err_msg="kernel gradient")
 
 
 @INTERPRETS

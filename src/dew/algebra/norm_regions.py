@@ -14,8 +14,13 @@ An RMSNorm is a row's root mean square, its inverse times the row and an optiona
                                  (`scale_after_cast`), or none
     y = cast(y)
 
-A SwiGLU is `silu(a) * b`, silu `a * sigmoid(a)`. Each value between the region's inputs and its output is
-read by the region alone. The call computes as Dew's norms do, on par with the program's own (check 1), not
+Its row may be a residual stream's sum `x + branch`, which the program reads on (a pre-norm block's seam,
+`dew.nn.norms.stream_rms_normalized`, its sum one of the region's outputs), and its weighted row may be
+gated, `y * act(g)` before the cast with `act` silu or sigmoid (Qwen3-Next's,
+`dew.nn.norms.gated_rms_normalized`). A SwiGLU is `silu(a) * b`, silu `a * sigmoid(a)`, its two halves read
+from one packed projection's `[..., 2, H]` where they are its two slices along that axis
+(`dew.nn.activations.packed_gated_product`). Each value between the region's inputs and its outputs is read
+by the region alone. The call computes as Dew's norms do, on par with the program's own (check 1), not
 bitwise.
 """
 
@@ -34,7 +39,8 @@ from dew.nn.programs import jax_name
 
 class Norm(NamedTuple):
     """An RMSNorm region (the module's account): its equations' places, its row and weight as the program
-    holds them (the weight None where there is none), its output, and Dew's norm's arguments."""
+    holds them (the weight None where there is none), its output, and Dew's norm's arguments; a stream's
+    branch and the sum the program reads on (`stream`), and a gate and its activation, where it has them."""
 
     places: tuple[int, ...]
     row: jcore.Var
@@ -43,62 +49,102 @@ class Norm(NamedTuple):
     epsilon: float
     offset: bool
     after_cast: bool
+    branch: jcore.Var | None = None
+    stream: jcore.Var | None = None
+    gate: jcore.Var | None = None
+    activation: str | None = None
 
     @property
     def operands(self) -> tuple[jcore.Var, ...]:
-        return (self.row,) if self.weight is None else (self.row, self.weight)
+        """The row, then the branch, weight and gate it has, in that order (`written`'s)."""
+        return tuple(var for var in (self.row, self.branch, self.weight, self.gate) if var is not None)
+
+    @property
+    def outputs(self) -> tuple[jcore.Var, ...]:
+        """The stream's sum the program reads on, where it does, then the normalized row."""
+        return (self.output,) if self.stream is None else (self.stream, self.output)
 
 
 class Gated(NamedTuple):
-    """A SwiGLU region: its equations' places, its gate and up projections, its output."""
+    """A SwiGLU region: its equations' places, its gate and up projections (or the one packed projection
+    `[..., 2, H]` both are slices of, `packed`), its output."""
 
     places: tuple[int, ...]
     gate: jcore.Var
     up: jcore.Var
     output: jcore.Var
+    packed: jcore.Var | None = None
 
     @property
     def operands(self) -> tuple[jcore.Var, ...]:
-        return self.gate, self.up
+        return (self.packed,) if self.packed is not None else (self.gate, self.up)
+
+    @property
+    def outputs(self) -> tuple[jcore.Var, ...]:
+        return (self.output,)
 
 
 def regions(index) -> list[Norm | Gated]:
-    """Every RMSNorm and SwiGLU region of the body `index` reads (`fusion.Index`), the first found where two
-    would share an equation."""
+    """Every RMSNorm and SwiGLU region of the body `index` reads (`fusion.Index`): the norms first, so a gated
+    norm's activation is its own rather than a SwiGLU's, the first found where two would share an equation."""
     graph = Graph(index)
     found, claimed = [], set()
-    for place, equation in enumerate(index.jaxpr.eqns):
-        name = jax_name(equation.primitive)
-        gated = name == "logistic" or _silu(equation)
-        region = _rms(graph, place) if name == "rsqrt" else _gated(graph, place) if gated else None
-        if region is not None and not claimed & set(region.places):
-            found.append(region)
-            claimed.update(region.places)
+    for norms in (True, False):
+        for place, equation in enumerate(index.jaxpr.eqns):
+            name = jax_name(equation.primitive)
+            if norms:
+                region = _rms(graph, place) if name == "rsqrt" else None
+            else:
+                region = _gated(graph, place) if name == "logistic" or _silu(equation) else None
+            if region is not None and not claimed & set(region.places):
+                found.append(region)
+                claimed.update(region.places)
     return found
 
 
 def written(region: Norm | Gated) -> Callable:
-    """The region's call: Dew's RMSNorm or SwiGLU over its operands, at implementation 'auto'."""
-    from dew.nn.activations import gated_product
-    from dew.nn.norms import rms_normalized
+    """The region's call over its operands (`operands`), its outputs (`outputs`) its results: Dew's RMSNorm,
+    stream norm, gated norm, SwiGLU or packed SwiGLU, at implementation 'auto'."""
+    from dew.nn.activations import gated_product, packed_gated_product
+    from dew.nn.norms import gated_rms_normalized, stream_rms_normalized
 
     dtype = region.output.aval.dtype
     if isinstance(region, Gated):
+        if region.packed is not None:
+            return lambda packed: packed_gated_product("swiglu")(packed).astype(dtype)
         return lambda gate, up: gated_product("swiglu")(gate, up).astype(dtype)
-    return lambda row, weight=None: rms_normalized(row, weight, region.epsilon, dtype, region.offset,
-                                                   region.after_cast, fp32_statistics=True)
+
+    def call(*operands):
+        given = iter(operands)
+        row = next(given)
+        branch = next(given) if region.branch is not None else None
+        weight = next(given) if region.weight is not None else None
+        if region.gate is not None:
+            return gated_rms_normalized(row, next(given), weight, region.epsilon, dtype, region.activation)
+        stream, normed = stream_rms_normalized(row, branch, weight, region.epsilon, dtype, region.offset,
+                                               region.after_cast, fp32_statistics=True)
+        return normed if region.stream is None else (stream, normed)
+
+    return call
 
 
 def taken(region: Norm | Gated) -> bool:
     """Whether the norms' selector gives the region's call Dew's fused kernel rather than XLA's arithmetic."""
     from dew.nn.kernels import norm_swiglu
 
-    shapes = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in region.operands]
+    def shape(var):
+        return None if var is None else jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype)
+
+    dtype = region.output.aval.dtype
     if isinstance(region, Gated):
-        return norm_swiglu.swiglu_kernel("auto", *shapes) == "pallas"
-    weight = shapes[1] if len(shapes) > 1 else None
-    return norm_swiglu.rms_kernel("auto", shapes[0], weight, region.output.aval.dtype,
-                                  fp32_statistics=True) == "pallas"
+        if region.packed is not None:
+            return norm_swiglu.packed_swiglu_kernel("auto", shape(region.packed)) == "pallas"
+        return norm_swiglu.swiglu_kernel("auto", shape(region.gate), shape(region.up)) == "pallas"
+    if region.gate is not None:
+        return norm_swiglu.gated_rms_kernel("auto", shape(region.row), shape(region.gate),
+                                            shape(region.weight), dtype, region.activation) == "pallas"
+    return norm_swiglu.rms_kernel("auto", shape(region.row), shape(region.weight), dtype,
+                                  fp32_statistics=True, branch=shape(region.branch)) == "pallas"
 
 
 def _rms(graph: Graph, place: int) -> Norm | None:
@@ -139,13 +185,28 @@ def _rms(graph: Graph, place: int) -> Norm | None:
     if along is None:
         return None
     normed, first = along
-    weight, offset, after_cast, output = _weighted(graph, normed, places, first)
+    weight, offset, after_cast, gate, activation, output = _weighted(graph, normed, places, first)
+    if gate is not None and (offset or after_cast):
+        return None  # Qwen3-Next's gated norm weighs before its one cast, by the weight itself
     source = graph.uncast(row, places, widening)
+    # A residual stream's sum: its addends the call's, the sum one of its outputs where the program reads it
+    # on, after the call's place.
+    branch = stream = None
+    summed = graph.made(source, "add")
+    if summed is not None and gate is None:
+        addends = graph.jaxpr.eqns[summed].invars
+        others = graph.readers[source] - set(places)
+        if (all(isinstance(var, jcore.Var) and var.aval.shape == source.aval.shape
+                and var.aval.dtype == source.aval.dtype for var in addends)
+                and all(reader > max(places) for reader in others)):
+            places.append(summed)
+            (source, branch), stream = addends, (source if others or source in graph.escaping else None)
     places = sorted(set(places))
-    operands = (source,) if weight is None else (source, weight)
-    if not _closed(graph, places, output, operands):
+    region = Norm(tuple(places), source, weight, output, float(epsilon), offset, after_cast, branch, stream,
+                  gate, activation)
+    if not _closed(graph, places, region.outputs, region.operands):
         return None
-    return Norm(tuple(places), source, weight, output, float(epsilon), offset, after_cast)
+    return region
 
 
 def _constant_beside(graph: Graph, operands) -> tuple[float | None, object]:
@@ -279,35 +340,76 @@ def _relabeled(graph: Graph, eqn: jcore.JaxprEqn, atom, labels: list) -> list | 
     return None
 
 
-def _weighted(graph: Graph, normed, places: list[int], first=None
-              ) -> tuple[jcore.Var | None, bool, bool, jcore.Var]:
-    """The weight the normalized row takes and how (`(weight, offset, after_cast, output)`): a product with a
-    weight broadcast along the row (one more than it where `offset`), before the row's last cast or after it,
-    or none, or `first`, the one the statistics took before the row (`_along_row`); the region's output its
-    last value."""
+def _weighted(graph: Graph, normed, places: list[int], first=None):
+    """The weight and gate the normalized row takes and how (`(weight, offset, after_cast, gate, activation,
+    output)`): a product with a weight broadcast along the row (one more than it where `offset`), before the
+    row's last cast or after it, or none, or `first`, the one the statistics took before the row
+    (`_along_row`); a product with an activation of a gate of the row's shape before the cast (`_activated`),
+    or none; the region's output its last value."""
     eqns, atom, cast = graph.jaxpr.eqns, normed, False
     weight, offset = first if first is not None else (None, None)
     weight_after_cast = False
+    gate = activation = None
     while len(graph.readers[atom]) == 1 and atom not in graph.escaping:
         (reader,) = graph.readers[atom]
         eqn = eqns[reader]
         name = jax_name(eqn.primitive)
         if name == "convert_element_type" and not cast:
             cast = True
-        elif name == "mul" and weight is None:
+        elif name == "mul":
             other = next((var for var in eqn.invars if var is not atom), None)
-            found = None if other is None else _row_weight(graph, other, atom.aval.shape[-1], places)
-            if found is None:
+            weighed = (None if other is None or weight is not None
+                       else _row_weight(graph, other, atom.aval.shape[-1], places))
+            activated = (None if other is None or gate is not None or cast
+                         else _activated(graph, other, atom.aval.shape, places))
+            if weighed is not None:
+                weight, offset = weighed
+                weight_after_cast = cast
+            elif activated is not None:
+                gate, activation = activated
+            else:
                 break
-            weight, offset = found
-            weight_after_cast = cast
         else:
             break
         places.append(reader)
         atom = eqn.outvars[0]
-    if weight is None:
-        return None, False, False, atom
-    return weight, bool(offset), weight_after_cast, atom
+    return weight, bool(offset), weight is not None and weight_after_cast, gate, activation, atom
+
+
+def _activated(graph: Graph, atom, shape, places: list[int]) -> tuple[jcore.Var, str] | None:
+    """`(g, activation)` where `atom` is silu or sigmoid of a gate `g` of the row's `shape` (a logistic, its
+    product with its input, or `jax.nn`'s nested programs of either), casts between, its places added to
+    `places`; None else."""
+    eqns, found = graph.jaxpr.eqns, []
+    atom = graph.uncast(atom, found, widening)
+    place = graph.made(atom, "mul", "logistic", "jit", "pjit")
+    if place is None:
+        return None
+    eqn = eqns[place]
+    name = jax_name(eqn.primitive)
+    if name == "mul":
+        logistic = next((graph.made(var, "logistic", "jit", "pjit") for var in eqn.invars
+                         if graph.made(var, "logistic", "jit", "pjit") is not None), None)
+        if logistic is None or not _logistic(eqns[logistic]):
+            return None
+        argument = eqns[logistic].invars[0]
+        if argument not in eqn.invars or len(graph.readers[eqns[logistic].outvars[0]]) != 1:
+            return None
+        found += [logistic, place]
+        activation = "silu"
+    elif _silu(eqn):
+        argument, activation = eqn.invars[0], "silu"
+        found.append(place)
+    elif _logistic(eqn):
+        argument, activation = eqn.invars[0], "sigmoid"
+        found.append(place)
+    else:
+        return None
+    gate = graph.uncast(argument, found, widening)
+    if not isinstance(gate, jcore.Var) or gate.aval.shape != tuple(shape):
+        return None
+    places += found
+    return gate, activation
 
 
 def _row_weight(graph: Graph, atom, width: int, places: list[int]) -> tuple[jcore.Var, bool] | None:
@@ -367,18 +469,52 @@ def _gated(graph: Graph, place: int) -> Gated | None:
         return None
     places.append(product)
     output = eqns[product].outvars[0]
+    packed = _halves(graph, gate, up, places)
     places = sorted(places)
-    if not _closed(graph, places, output, (gate, up)):
+    region = Gated(tuple(places), gate, up, output, packed)
+    if not _closed(graph, places, region.outputs, region.operands):
         return None
-    return Gated(tuple(places), gate, up, output)
+    return region
 
 
-def _closed(graph: Graph, places: list[int], output, operands) -> bool:
+def _halves(graph: Graph, gate, up, places: list[int]) -> jcore.Var | None:
+    """The packed projection `[..., 2, H]` whose two slices along its pair axis (the second last) are `gate`
+    and `up`, first and second, each read by the region alone (a static slice, or `jnp.split`'s, its unit
+    axis squeezed or reshaped away); its slicing's places added to `places`. None where they are none."""
+    eqns, found, sources = graph.jaxpr.eqns, [], []
+    for half, index in ((gate, 0), (up, 1)):
+        dropped = graph.made(half, "squeeze", "reshape")
+        if dropped is None or len(graph.readers[half]) != 1:
+            return None
+        sliced = eqns[dropped].invars[0]
+        place = graph.made(sliced, "slice", "split")
+        if place is None or len(graph.readers[sliced]) != 1:
+            return None
+        eqn = eqns[place]
+        source = eqn.invars[0]
+        shape = source.aval.shape
+        if len(shape) < 2 or shape[-2] != 2 or sliced.aval.shape != (*shape[:-2], 1, shape[-1]):
+            return None
+        if jax_name(eqn.primitive) == "slice":
+            start = eqn.params["start_indices"]
+            if start[-2] != index or any(start[a] for a in range(len(shape)) if a != len(shape) - 2):
+                return None
+        elif eqn.params["axis"] % len(shape) != len(shape) - 2 or eqn.outvars.index(sliced) != index:
+            return None
+        found += [dropped, place]
+        sources.append(source)
+    if sources[0] is not sources[1] or not isinstance(sources[0], jcore.Var):
+        return None
+    places += sorted(set(found))
+    return sources[0]
+
+
+def _closed(graph: Graph, places: list[int], outputs, operands) -> bool:
     """Whether the region's `operands` are made outside it and every value its equations make but its
-    `output` is read inside it alone, so the splice removes no value another equation reads."""
+    `outputs` is read inside it alone, so the splice removes no value another equation reads."""
     inside = set(places)
     return (all(graph.producer.get(var) not in inside for var in operands)
-            and all(var is output or (var not in graph.escaping and graph.readers[var] <= inside)
+            and all(var in outputs or (var not in graph.escaping and graph.readers[var] <= inside)
                     for place in places for var in graph.jaxpr.eqns[place].outvars))
 
 
