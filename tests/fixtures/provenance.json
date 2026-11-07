@@ -3352,7 +3352,7 @@
    "note": "ImaginaireTrainer_Distill.training_step over T2VDistillModel_rCM's closures, its two torch Adam optimizers and FastEmaModelUpdater, ten iterations from a teacher stand-in network with per-entry weights; the float64 run replays the float32 run's draws, and each run takes its own precision where the source names one. A second run (dcm/*) takes rCM's discrete-time consistency (_student_dcm_step)."
   },
   "reference_runs": {
-   "tool": "tools/reference_runs/lm_steps_fixture.py",
+   "tool": "tools/lm_steps_worker.py",
    "sources": [
     {
      "repo": "huggingface/transformers",
@@ -3360,7 +3360,7 @@
      "runs": "transformers"
     }
    ],
-   "note": "Stored meta also records torch 2.14.0+cpu; uses torch AdamW and a locally implemented warmup-cosine schedule."
+   "note": "Recorded over margin-cleared drawn rows by tools/venv_reference.py's lm-steps site under torch 2.14.0+cpu; torch AdamW and reference_runs/common.py's warmup-cosine schedule, the float64 run inside torch_precision.float64."
   },
   "repa": {
    "tool": "tools/repa_reference.py",
