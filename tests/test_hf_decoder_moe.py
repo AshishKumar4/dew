@@ -320,28 +320,32 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
             np.asarray(dequantize_mxfp4(stored[stem + "_blocks"], stored[stem + "_scales"])))
 
 
+@pytest.mark.mesh(devices=2)
 def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(tmp_path):
-    """An MXFP4 GPT-OSS loaded packed onto a mesh of this process's devices (`packed_experts` with
-    `mesh`): each bank's three leaves placed by its dense matrix's axes as the bank lays them out
-    (`quantization.expert_leaf_axes`), its words and block scales sharded as the dense matrix's experts are,
-    and its logits on par with the unplaced packed load's (check 1)."""
+    """An MXFP4 GPT-OSS loaded packed onto a mesh whose expert axis takes two devices (`packed_experts`
+    with `mesh`): each bank's three leaves placed by its dense matrix's axes as the bank lays them out
+    (`quantization.expert_leaf_axes`), its words, block scales and tensor scales sharded on the expert
+    axis as the dense matrix's experts are, and its logits on par with the unplaced packed load's
+    (check 1)."""
     from dew.distributed.placement import MeshSpec
     from dew.nn.kernels.gemm import NvFp4
     from dew.quantization import QUANTIZATION
 
     source = _mxfp4_gpt_oss(tmp_path)
+    mesh = MeshSpec(expert=2)
     placed = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
-                             packed_experts=True, mesh=MeshSpec())
+                             packed_experts=True, mesh=mesh)
     held = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
                            packed_experts=True)
     dense = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
-                            mesh=MeshSpec())
+                            mesh=mesh)
     params = dict(flatten_dict(dict(dense.variables["params"])))
     banks = flatten_dict(dict(placed.variables[QUANTIZATION]),
                          is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
     for path, bank in banks.items():
         experts = params[path].sharding.spec[0]
-        assert bank.words.sharding.spec[0] == experts and bank.scales.sharding.spec[0] == experts
+        assert experts is not None
+        assert all(leaf.sharding.spec[0] == experts for leaf in (bank.words, bank.scales, bank.scale))
 
     def draw(seed: int):
         return (jax.random.randint(jax.random.key(seed), (2, 8), 0, PACKED_CONFIG["vocab_size"]),)
