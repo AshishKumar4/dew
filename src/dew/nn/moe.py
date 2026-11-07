@@ -655,8 +655,9 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
                 expert_projection(x, second, group_sizes, compute, implementation, precision))
     with _named(implementation):
-        return gemm.gemm(tokens, first, group_sizes, compute=compute, out_dtype=compute,
-                         out_dtypes=(compute, compute), precision=precision, paired=second, gather=rows)
+        gate, up = gemm.gemm(tokens, first, group_sizes, compute=compute, out_dtype=compute,
+                             out_dtypes=(compute, compute), precision=precision, paired=second, gather=rows)
+    return gate, up
 
 
 def _named(implementation: str) -> contextlib.AbstractContextManager:

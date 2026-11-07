@@ -1097,9 +1097,13 @@ class MosaicGmm(_Mosaic):
 
     def _ran(self, ba, config: mosaic_gpu.Tiles) -> tuple:
         """`_Mosaic._ran`: a swapped tile runs the call swapped (`_swapped`), the tile unswapped, on the
-        target being selected for (`generation.gpu_target`)."""
+        target being selected for (`generation.gpu_target`); a grouped split's runs write fp32 partials, each
+        at the tile unsplit (`_decode_split`)."""
         if not config.swapped:
-            return ba, config
+            if config.splits == 1:
+                return ba, config
+            return (self.bind(*ba.args, **{**ba.kwargs, 'out_dtype': 'float32'}),
+                    dataclasses.replace(config, splits=1))
         swapped = self._swapped(ba, generation.gpu_target())
         assert swapped is not None, "a swapped tile is a swappable call's (`legal`)"
         if config.splits > 1:
@@ -1110,9 +1114,10 @@ class MosaicGmm(_Mosaic):
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         if config.swapped and (self._swapped(ba, target) is None or not self._left_fits(ba, config)):
             return False
-        # A split is a swapped call's (a decode step's), of no exact sums, each run some steps.
+        # A split is a swapped dense call's or a grouped call's (a decode step's), of no exact sums, each run
+        # some steps.
         depth = ba.arguments['tokens'].shape[1]
-        if config.splits > 1 and (not config.swapped or ba.arguments['exact_sums']
+        if config.splits > 1 and ((ba.arguments['dense'] and not config.swapped) or ba.arguments['exact_sums']
                                   or not mosaic_gpu.split_runs(depth // config.block_k, config.splits)):
             return False
         return super().legal(ba, config, target)
