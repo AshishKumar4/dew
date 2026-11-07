@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.batch import CLOSES_WINDOW, EXAMPLES_CONSUMED, VALID_ROWS, Batch
-from dew.data.dataset import rows_of
+from dew.data.dataset import rows_of, take_batch
 from dew.objectives.base import Objective
 
 TRAINING_FLOPS = "__dew_training_flops"
@@ -56,17 +56,19 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
         raise ValueError("the input batch contains reserved model-work telemetry columns")
     rows = rows_of(batch)
     counted = dict(batch)
+    # A repeat that fills the batch (`VALID_ROWS`, `dew.data.dataset.FilledBatch`) is no work the run does
+    # for its signal: it scores no target and counts no model work, a batch of repeats alone none.
+    valid = batch.get(VALID_ROWS)
+    real = np.ones(rows, bool) if valid is None else np.asarray(valid).reshape(rows) > 0
     if objective.counts_tokens:
-        # The targets each row's loss scores, none on a repeat that fills the batch (`VALID_ROWS`).
         tokens = np.asarray(objective.scored_tokens(batch), np.uint64).reshape(rows)
-        valid = batch.get(VALID_ROWS)
-        counted[TOKENS] = _TokenCount.words(tokens if valid is None else
-                                            np.where(np.asarray(valid).reshape(rows) > 0, tokens, 0))
+        counted[TOKENS] = _TokenCount.words(np.where(real, tokens, 0))
     if count_model:
-        # Partition the assembled scalar over the batch's row shards. A
-        # shared conditioning row is counted once, not once per example.
-        training = objective.training_flops(None, batch)
-        counted[TRAINING_FLOPS] = np.full((rows,), training / rows if rows else 0, np.float32)
+        # Partition the assembled scalar over the batch's real rows. A shared conditioning row is counted
+        # once, not once per example.
+        held = batch if real.all() else take_batch(batch, np.flatnonzero(real))
+        training = objective.training_flops(None, held) if real.any() else 0.0
+        counted[TRAINING_FLOPS] = np.where(real, training / max(int(real.sum()), 1), 0).astype(np.float32)
     return counted
 
 
