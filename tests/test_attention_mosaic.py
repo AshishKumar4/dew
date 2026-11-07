@@ -22,7 +22,7 @@ import pytest
 from attention_oracle import attention_terms
 from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
-from jax.sharding import Mesh
+from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
@@ -100,7 +100,7 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     64 of a slot's 128 queries, or queries first over keys its two consumers share on `FED`'s layout
     (`fused-shared-keys`), or keys first on the dQ launch's layout, each of its two consumers its own keys,
     their score cotangents exchanged for a shared dQ (`fused-shared-dq`, FlashAttention 3's width 128), its
-    producer adding it (`fused-producer-dq`)."""
+    producer adding it (`fused-producer-dq`); or the fast form at its derivation's tiles (`derived`)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family=WGMMA)
     if form == "fused-shared-keys":
@@ -115,6 +115,8 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     if form == "accurate":
         # Its derivation's: two launches, its dK/dV programs' column shares its dQ's two sums' choice.
         return True, None
+    if form == "derived":
+        return False, None
     columns = 2 if form == "accurate-halves" else 1
     return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, family=WGMMA,
                                                              **FED)
@@ -620,23 +622,36 @@ def test_the_backward_is_on_par_at_head_widths_interpreted(width, value_width):
                     value_width=value_width)
 
 
+DROPPING_FORWARDS = [(call, training, jnp.bfloat16) for call in CALLS
+                     for training in (template.Kept.NONE, template.Kept.SPLIT)]
+DROPPING_FORWARDS += [("causal", training, jnp.float16)
+                      for training in (template.Kept.NONE, template.Kept.SPLIT)]
+"""The dropping forward's cases: each call form, plain and training, over bf16; over fp16 a causal call's,
+whose dropped weights narrow as they are (`algebra.dropped_parts`), the walk bf16's otherwise."""
+
+
 @INTERPRETS
-@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
-@pytest.mark.parametrize("call", CALLS)
-def test_the_forward_is_on_par_dropping_interpreted(call, training):
+@pytest.mark.parametrize(("call", "training", "dtype"), DROPPING_FORWARDS,
+                         ids=[f"{call}-{training.name}-{jnp.dtype(dtype).name}"
+                              for call, training, dtype in DROPPING_FORWARDS])
+def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
     """The forward and the training forward under probability dropout, its draw the reference's bit for bit
-    (`template.Draw`), under the interpreter."""
-    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True,
-                   training=training, drop=True)
+    (`template.Draw`), over bf16 or fp16 operands, fp16's dropped weights narrowed as they are and summed in
+    place (`algebra.dropped_parts`), under the interpreter."""
+    _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True, training=training,
+                   drop=True)
 
 
 @INTERPRETS
-@pytest.mark.parametrize("form", [*HOOKED_FORMS, "fused"])
-def test_the_backward_is_on_par_dropping_interpreted(form):
+@pytest.mark.parametrize(("form", "dtype"), [*((form, jnp.bfloat16) for form in (*HOOKED_FORMS, "fused")),
+                                             ("derived", jnp.float16)],
+                         ids=lambda value: value if isinstance(value, str) else jnp.dtype(value).name)
+def test_the_backward_is_on_par_dropping_interpreted(form, dtype):
     """The backward in each form under probability dropout over a causal call, the fast form's one launch
     too (each consumer's tile its own draw), its D the forward's dropped split sums' about the anchor's
-    value as its draw keeps it (`algebra.anchor_multipliers`), under the interpreter."""
-    _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True)
+    value as its draw keeps it (`algebra.anchor_multipliers`), under the interpreter; over fp16 operands at
+    its derivation's tiles."""
+    _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True, dtype=dtype)
 
 
 @INTERPRETS
@@ -1380,14 +1395,10 @@ def test_a_width_split_backward_writes_its_score_parameters_gradients_once_inter
     _check_hooked_backward(hooks, form="accurate-halves", interpret=True, width=128)
 
 
-@lowers("sm90")
-@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
-@pytest.mark.parametrize("call", ["causal", "causal-documents-window", "runs-documents-valid"])
-def test_the_launches_lower_for_an_h100(call, accurate):
-    """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them: a
-    causal call, a spans one of documents, whose programs read its block map and ids, and one over a
-    decision row's runs, whose programs read each run's bounds; the forward under every hook too, whose
-    programs read each kind of parameter and the initial state."""
+def _lowered_call(call: str) -> tuple:
+    """A lowering test's call form `call` as abstract operands: its spans, its query and key `[B, S, H, 128]`
+    bf16 and a training forward's residuals' shapes, the compiled shape's causal call or a template core
+    case's (`CASES`, `RUN_CASES`) over four query heads and two key heads."""
     if call == "causal":
         rows, tokens, heads, kv_heads = SHAPES["compiled"]
         spans = template.spans(tokens, tokens, rows, causal=True)
@@ -1400,7 +1411,20 @@ def test_the_launches_lower_for_an_h100(call, accurate):
     rows_shape = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
     others = jax.ShapeDtypeStruct((rows, heads, tokens, 128), jnp.float32)
     split = template.Split(others, rows_shape, rows_shape, rows_shape)
-    residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32), split)
+    anchors = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32)
+    return spans, q, kv, (rows_shape, rows_shape, anchors, split)
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("call", ["causal", "causal-documents-window", "runs-documents-valid"])
+def test_the_launches_lower_for_an_h100(call, accurate):
+    """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them: a
+    causal call, a spans one of documents, whose programs read its block map and ids, and one over a
+    decision row's runs, whose programs read each run's bounds; the forward under every hook too, whose
+    programs read each kind of parameter and the initial state."""
+    spans, q, kv, residuals = _lowered_call(call)
+    tokens = q.shape[1]
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     score_mod, kinds, draw_hooks = score_hooks(FORWARD_HOOKS["all"][0], tokens, tokens, 128)
     params, initial = draw_hooks(0)
@@ -1417,6 +1441,24 @@ def test_the_launches_lower_for_an_h100(call, accurate):
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
+def test_the_launches_lower_for_a_v5e(call):
+    """The forward, the training forward and the backward on a v5e's MXU (`mosaic_tpu.MXU`, the route's Mosaic
+    mainloop on a TPU) lower for a TPU on this CPU, Pallas TPU's Mosaic lowering, as a TPU compiles them: a
+    causal call and a spans one of documents under a window, whose programs read its block map and ids."""
+    spans, q, kv, residuals = _lowered_call(call)
+    # An abstract mesh of one v5e device, which Pallas TPU's lowering reads its target from on any host.
+    device = AbstractDevice(device_kind=generation.gpu_target("v5e").device_kind, num_cores=1, platform="tpu")
+    mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with generation.assumed("v5e"), jax.sharding.use_abstract_mesh(mesh):
+        for training in (template.Kept.NONE, template.Kept.SPLIT):
+            entry = functools.partial(attention_mosaic.forward, spans=spans, hooks=None, residuals=training)
+            jax.jit(entry).trace(q, kv, kv).lower(lowering_platforms=("tpu",))
+        jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
+            q, k, v, spans, None, dout, residuals=residuals)).trace(q, kv, kv, q, residuals).lower(
+            lowering_platforms=("tpu",))
 
 
 APPROXIMATED_BY_MOSAIC = ("exp", "exp2", "log", "log2", "log1p", "tanh", "logistic", "sin", "cos", "sqrt",
@@ -1598,6 +1640,15 @@ def a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
 
 
 @ON_HOPPER
+def the_backward_at_its_faulting_geometry_is_on_par_on_an_h100():
+    """The full backward at the geometry whose two launches faulted on an H100 (row 2254: two rows of 4096
+    tokens, 32 query heads over 8 key heads, 128 wide, pinned at 64 x 64, two stages, one consumer), compiled
+    on an H100 on the published tip: finite and on par with the reference (check 1, row 2269)."""
+    with _pinned(backward=attention_mosaic.BackwardTiles(64, 64, 2, 1, family=WGMMA, **FED)):
+        _check_backward("full", (2, 4096, 32, 8), form="default", interpret=False, width=128)
+
+
+@ON_HOPPER
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("call", CALLS)
 def the_backward_is_on_par_on_an_h100(call, form):
@@ -1611,6 +1662,14 @@ def the_backward_is_on_par_on_an_h100(call, form):
 def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     """The backward in both forms under each score hook compiled on an H100."""
     _check_hooked_backward(hooks, form=form, interpret=False)
+
+
+@ON_HOPPER
+def the_backward_256_wide_under_a_softcap_is_on_par_on_an_h100():
+    """Gemma 2's backward, a softcap 256 wide, at its derivation's tiles (row 3704: one launch whose
+    consumers share a key block, `BackwardTiles.shared_keys`) compiled on an H100: on par with the reference
+    (check 1)."""
+    _check_hooked_backward("softcap", form="derived", interpret=False, width=256)
 
 
 def _counted(fn, *arrays) -> tuple[float, float]:
@@ -1776,10 +1835,13 @@ BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name 
 BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name in GATED
                   for width in (64, 128) for accurate in (False, True)
                   for hooks in BACKWARD_HOOKS if hooks != "none"]
+BACKWARD_GATE += [("sm90", 256, False, "softcap")]
 """The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
-call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
+call's head widths, each form, hookless; each score hook at the widths a hooked call's derivation takes
 whole, in each form (row 2281: its live set beside the step's; FS-A100CHECK1d: the accurate form under a
-row-indexed hook failed an A100's layout inference, a case no fast-form gate lowered)."""
+row-indexed hook failed an A100's layout inference, a case no fast-form gate lowered); and Gemma 2's, a
+softcap 256 wide on an H100, whose one launch's consumers share a key block within its block where its hook
+reserves no reduction scratch (row 3704, `hook_reduces`)."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):
@@ -2073,10 +2135,11 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
 
 @INTERPRETS
 @pytest.mark.parametrize("call", ["full", "causal"])
-def test_a_deterministic_backward_in_one_launch_holds_check_1_interpreted(call, with_deterministic_ops):
-    """The backward under --xla_gpu_deterministic_ops on a full or causal call, its one launch's adds each
-    in its turn (`Family.ticketed`: dQ's in its key tiles' order, grouped dK's and dV's in their query
-    heads'), its gradients the reference's (check 1), under the interpreter, whose programs run in turn."""
+def test_a_deterministic_backward_holds_check_1_interpreted(call, with_deterministic_ops):
+    """The backward under --xla_gpu_deterministic_ops on a full or causal call, at the tiles it derives
+    there: no launch's programs add across programs (row 4732: none waits on another), a key head's query
+    heads' dK and dV summed in their order; its gradients the reference's (check 1), under the
+    interpreter."""
     _check_backward(call, SHAPES["interpreted"], form=None, interpret=True)
 
 
@@ -2084,8 +2147,8 @@ def test_a_deterministic_backward_in_one_launch_holds_check_1_interpreted(call, 
 @pytest.mark.parametrize("width", [64, 128])
 def test_a_deterministic_backward_compiles_spill_free_as_its_model_decides(width, with_deterministic_ops):
     """The backward under --xla_gpu_deterministic_ops at its derived tiles of a causal call `width` wide,
-    its adds ordered across programs by semaphores (`Family.ticketed`), lowered and compiled by ptxas for an
-    H100 on this CPU: within its shared memory, spilling nothing, its register model's decision ptxas's."""
+    lowered and compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing, its
+    register model's decision ptxas's."""
     test_the_backward_compiles_spill_free_as_its_model_decides(generation_name="sm90", width=width,
                                                                accurate=False, hooks="none")
 

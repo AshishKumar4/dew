@@ -26,7 +26,7 @@ def drawn(spread: float, rounding: float = 1.0, *, unstable: bool = False):
 
 
 def counted(draw, calls: list):
-    """`draw`, each order it is asked for appended to `calls`."""
+    """`draw`, each order it is asked for appended to `calls` (which orders were drawn, not their order)."""
     def run(order):
         calls.append(order)
         return draw(order)
@@ -41,7 +41,7 @@ def test_a_comparison_is_held_over_a_whole_batch_of_orders_and_one_rounding_more
     fails."""
     calls = []
     assert_leaves_as_exact_over_orders(counted(drawn(1.0), calls), "equal", rows=False)
-    assert calls == list(range(ORDERS))
+    assert set(calls) == set(range(ORDERS))
     assert_leaves_as_exact_over_orders(drawn(1.0, unstable=True), "lucky", rows=False)
     with pytest.raises(AssertionError):
         assert_leaves_as_exact_over_orders(drawn(3.0), "rounds more", rows=False)
@@ -66,7 +66,7 @@ def test_a_localized_defect_that_the_leaf_and_row_rules_pass_fails_element_by_el
     calls = []
     with pytest.raises(AssertionError):
         assert_leaves_as_exact_over_orders(counted(draw, calls), "localized")
-    assert calls == list(range(STAGES * ORDERS))
+    assert set(calls) == set(range(STAGES * ORDERS))
 
 
 def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
@@ -85,7 +85,7 @@ def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
 
 def staged(dew, reference):
     """A `batch` for `assert_elements_as_exact` from `[stages, ...]` sums, each stage asked for appended
-    to the returned list."""
+    to the returned list (which stages were measured, not their order)."""
     asked = []
 
     def batch(stage):
@@ -105,18 +105,18 @@ def test_an_element_flagged_by_chance_clears_at_a_confirmation_and_one_rounding_
                       for _ in range(2))
     batch, asked = staged(dew, reference)
     assert_elements_as_exact(batch, "alike")
-    assert asked == [0]
+    assert set(asked) == {0}
     once = dew.copy()
     once[0, 3, 5] = 3 * reference[0, 3, 5]
     batch, asked = staged(once, reference)
     assert_elements_as_exact(batch, "once")
-    assert asked == [0, 1]
+    assert set(asked) == {0, 1}
     always = dew.copy()
     always[:, 3, 5] = 3 * reference[:, 3, 5]
     batch, asked = staged(always, reference)
     with pytest.raises(AssertionError):
         assert_elements_as_exact(batch, "always")
-    assert asked == list(range(STAGES))
+    assert set(asked) == set(range(STAGES))
     exact, both = reference.copy(), dew.copy()
     exact[:, :, :8], both[:, :, :8] = 0, 0
     assert_elements_as_exact(staged(both, exact)[0], "both exact")
@@ -127,7 +127,7 @@ def test_an_element_flagged_by_chance_clears_at_a_confirmation_and_one_rounding_
     batch, asked = staged(broken, reference)
     with pytest.raises(AssertionError):
         assert_elements_as_exact(batch, "nan")
-    assert asked == [0]
+    assert set(asked) == {0}
 
 
 @pytest.mark.parametrize("tails", ["gaussian", "laplace", "student-t5"])

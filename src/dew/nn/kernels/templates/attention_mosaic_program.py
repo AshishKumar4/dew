@@ -438,10 +438,12 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if hooks.drop is not None and (hooks.drop.queries is not None or hooks.drop.keys is not None):
         return DROPPING
-    if hooks.drop is not None and jnp.dtype(dtype) == jnp.dtype(jnp.float16):
-        # fp16's dropped weights take scaled parts (`algebra.weights_parts`), which the mainloop's register
-        # products do not take back (`mosaic.unscaled_part`).
-        return Refusal('dropout_dtype', "the Mosaic dropping walk takes bf16 operands, not float16")
+    if hooks.drop is not None and not algebra.drops_in_place(dtype, hooks.drop.bound):
+        # Dropped weights past the dtype's largest take scaled parts (`algebra.dropped_parts`), which the
+        # mainloop's sums in place do not take back (`mosaic.unscaled_part`).
+        return Refusal('dropout_rate', f"the Mosaic dropping walk takes {jnp.dtype(dtype).name} weights "
+                       f"within its range, not a multiplier of {hooks.drop.bound:g} (a rate of "
+                       f"{hooks.drop.rate:g})")
     if jnp.dtype(dtype) not in sixteen:
         return Refusal('dtype', f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}")
     if backward and not transposable(hooks):
@@ -471,20 +473,56 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
     return not any(_primitives(jaxpr) & APPROXIMATED for jaxpr in traced)
 
 
-def reducing(family: mosaic.Family, consumers: int, *hooks, guarded: bool = False, scaled: bool = False
-             ) -> int:
+def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, guarded: bool = False,
+             scaled: bool = False) -> int:
     """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
-    reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a hook's
-    unit row, which the fork selects by a reduction across warps (ledger 1428), and a `guarded` launch's
-    keys' value magnitudes, its tile's columns reduced across the warps holding them
-    (`Family.key_magnitudes`), or a launch's rows reduced to their block's flag (`guarded` too: the plain
-    launch that flags its rows, `attention_mosaic_forward._Flags`), or a `scaled` step's tile reduced to its
-    largest across the warps holding its rows (`algebra.running_parts`, an fp16 fused backward's), so every
-    warpgroup of a launch that runs a hook (`hooks`, its score and output hooks, None where it has none),
-    guards or scales; none otherwise."""
-    if guarded or scaled or any(hook is not None for hook in hooks):
+    reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a
+    `hooked` launch's hook's (`hook_reduces`: a unit row, which the fork selects by a reduction across warps,
+    ledger 1428; an output hook's, untraced), and a `guarded` launch's keys' value magnitudes, its tile's
+    columns reduced across the warps holding them (`Family.key_magnitudes`), or a launch's rows reduced to
+    their block's flag (`guarded` too: the plain launch that flags its rows,
+    `attention_mosaic_forward._Flags`), or a `scaled` step's tile reduced to its largest across the warps
+    holding its rows (`algebra.running_parts`, an fp16 fused backward's), so every warpgroup of a launch that
+    runs such a hook, guards or scales; none otherwise."""
+    if guarded or scaled or hooked:
         return family.warpgroups(consumers)
     return 0
+
+
+def hook_reduces(hooks: Hooks | None) -> bool:
+    """Whether the score hook may reduce across warps (`reducing`): traced, never run, on a tile with its
+    pullback, it forms or reads a value but a scalar or a whole tile (a unit row, `k_pos[:1, :]`, ledger
+    1428; a sum along an axis) or nests a computation but a call's (a branch, a loop); a fingerprint (a keyed
+    launch's hook) counted so. Gemma 2's softcap forms none, so its launches reserve no scratch: its
+    backward's one launch 256 wide on an H100 fits beside it (row 3704: 233,568 bytes with it, past the
+    block's 232,448). False without a hook."""
+    if hooks is None or hooks.score_mod is None:
+        return False
+    if not callable(hooks.score_mod):
+        return True
+    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    return _hook_reduces(hooks.score_mod, params)
+
+
+@functools.lru_cache(maxsize=256)
+def _hook_reduces(score_mod, params: tuple) -> bool:
+    """`hook_reduces` of `score_mod` under parameters of `params`' kinds and dtypes."""
+    tile = (TILE_SIDES[0], TILE_SIDES[0])
+    traced = _score_jaxprs(score_mod, params, tile, differentiated=True)
+    return any(_off_tile(jaxpr, tile) for jaxpr in traced)
+
+
+def _off_tile(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
+    """Whether an equation of `jaxpr` forms or reads a value but a scalar or a `tile`, or nests a computation
+    but a call's (a jitted helper's, a custom derivative's primal), whose own equations are read so."""
+    for eqn in jaxpr.eqns:
+        if any(getattr(var.aval, "shape", ()) not in ((), tile) for var in (*eqn.invars, *eqn.outvars)):
+            return True
+        nested = list(jax_core.jaxprs_in_params(eqn.params))
+        called = ("jaxpr" in eqn.params or "call_jaxpr" in eqn.params) and len(nested) == 1
+        if nested and not (called and not _off_tile(nested[0], tile)):
+            return True
+    return False
 
 
 def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
@@ -1020,16 +1058,17 @@ class _Program[T: (Tiles, BackwardTiles)]:
             # Read by position (`_spans_of`): no block map.
             return self._positions_reach(first, spans, row)
         block = lax.div(first, self.tiles.block_q)
-        full_lo, full_hi = spans.full_lo[row, block], spans.full_hi[row, block]
+        at = functools.partial(self._entry, row=row)
+        full_lo, full_hi = at(spans.full_lo, block), at(spans.full_hi, block)
 
         def whole(index):
             inside = (index >= full_lo) & (index < full_hi)
             if spans.query_doc is None or spans.key_doc is None:
                 return inside
-            doc = spans.query_doc[row, block]
-            return inside & (doc != 0) & (doc == spans.key_doc[row, index])
+            doc = at(spans.query_doc, block)
+            return inside & (doc != 0) & (doc == at(spans.key_doc, index))
 
-        return *self._sliced(spans.lo[row, block], spans.hi[row, block]), whole
+        return *self._sliced(at(spans.lo, block), at(spans.hi, block)), whole
 
     def _positions(self, first, spans: _Spans, row) -> list[tuple[jax.Array, ...]]:
         """The positions a query block from `first` holds rows of, in a call whose intervals each hold
@@ -1045,7 +1084,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
             # A position past the call's holds no row: read its last one's, unused.
             index = jnp.minimum(position, positions - 1)
             holds = (position < positions) & (position * self.per_span < first + self.tiles.block_q)
-            found.append((position, spans.start[row, index], spans.end[row, index], holds))
+            found.append((position, self._entry(spans.start, index, row=row),
+                          self._entry(spans.end, index, row=row), holds))
         return found
 
     def _positions_reach(self, first, spans: _Spans, row):
@@ -1083,6 +1123,13 @@ class _Program[T: (Tiles, BackwardTiles)]:
             start, end = jnp.where(mine, low, start), jnp.where(mine, high, end)
         return ((family.as_row(start), family.as_row(end)),), None
 
+    def _entry(self, ref, index, *, row):
+        """A block map's entry `ref[row, index]` as the family reads a launch's scalar (`Family.scalar_of`: a
+        GPU thread's load, a TPU core's copy into its scalar memory, whose operands stay in HBM, where a load
+        lowers on no core: a v5e's documents call refused to lower, "ANY memory space can only be accessed
+        using async_copy")."""
+        return self.family.scalar_of(ref.at[row, pl.ds(index, 1)])
+
     def _sliced(self, lo, hi) -> tuple[jax.Array, jax.Array]:
         """`[lo, hi)` key tiles, this program's slice of them (`split`): the `splits` contiguous slices of a
         query tile's tiles, as long as the others but for rounding, partition them; its whole range of one."""
@@ -1103,16 +1150,17 @@ class _Program[T: (Tiles, BackwardTiles)]:
         block = lax.div(k_first, self.tiles.block_k)
         full_lo, full_hi = spans.full_lo, spans.full_hi
         assert full_lo is not None and full_hi is not None, "a key block's walk reads its block map"
+        at = functools.partial(self._entry, row=row)
 
         def seen_whole(index):
-            inside = (block >= full_lo[row, index]) & (block < full_hi[row, index])
+            inside = (block >= at(full_lo, index)) & (block < at(full_hi, index))
             if spans.query_doc is None or spans.key_doc is None:
                 return inside
-            doc = spans.key_doc[row, block]
-            return inside & (doc != 0) & (doc == spans.query_doc[row, index])
+            doc = at(spans.key_doc, block)
+            return inside & (doc != 0) & (doc == at(spans.query_doc, index))
 
         assert spans.q_lo is not None and spans.q_hi is not None, "a key block's walk reads its readers"
-        return spans.q_lo[row, block], spans.q_hi[row, block], seen_whole
+        return at(spans.q_lo, block), at(spans.q_hi, block), seen_whole
 
     def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:
         """A key block's walk of query tiles `[lo, hi)` as `Family.walk`'s segments, `step` each: where its

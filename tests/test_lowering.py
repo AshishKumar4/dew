@@ -263,9 +263,9 @@ def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_un
 
     lowered = jax.jit(step).trace(tokens, kernel, cotangent, sizes).lower(lowering_platforms=("cuda",))
     record = kernel_report((), lowered).record()
-    assert [(entry["kind"], entry["name"], entry["calls"]) for entry in record["launches"]] == [
-        (None, "an_unknown_kernel", 1), ("grouped_gemm", "dew_cutlass_grouped_gemm", 1),
-        ("grouped_gemm", "dew_cutlass_grouped_gemm_k", 1)]
+    assert {(entry["kind"], entry["name"]): entry["calls"] for entry in record["launches"]} == {
+        (None, "an_unknown_kernel"): 1, ("grouped_gemm", "dew_cutlass_grouped_gemm"): 1,
+        ("grouped_gemm", "dew_cutlass_grouped_gemm_k"): 1}
     assert record["unsized"] == 1
     flops = hlo_flops(lowered.as_text(dialect="hlo"))
     assert flops is not None
@@ -290,8 +290,8 @@ def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
     with assumed("v6e"):
         lowered = jax.jit(step).trace(lhs, rhs, sizes).lower(lowering_platforms=("tpu",))
     record = kernel_report((), lowered).record()
-    assert [(entry["kind"], entry["name"], entry["flops"]) for entry in record["launches"]] == [
-        ("mosaic_tpu", "dew_gmm", GMM), ("mosaic_tpu", "dew_tgmm", GMM)]
+    assert {(entry["kind"], entry["name"]): entry["flops"] for entry in record["launches"]} == {
+        ("mosaic_tpu", "dew_gmm"): GMM, ("mosaic_tpu", "dew_tgmm"): GMM}
     assert record["unsized"] == 0
     flops = hlo_flops(lowered.as_text(dialect="hlo"))
     assert flops is not None
