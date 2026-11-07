@@ -721,6 +721,15 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
         # jsf-gate100b): a staged block's columns step in 32.
         return max(2 * 16, super().narrowest_columns(dtype))
 
+    def right_swizzle(self, dtype, columns: int) -> int:
+        # A 64-row product splits its N columns between two lane groups, each reading whole tiles of its
+        # right operand's swizzle (Mosaic GPU: "the M or N MMA instruction size was chosen to be 96, which is
+        # not a multiple of the tiling of the non-contracting dimension 64" at 192 columns, jsf-trace100b).
+        half = columns // 2
+        return next((swizzle for swizzle in (mosaic.SWIZZLE_BYTES, mosaic.SWIZZLE_BYTES // 2,
+                                             mosaic.NARROWEST_SWIZZLE_BYTES)
+                     if half % mosaic.swizzle_columns(dtype, swizzle) == 0), mosaic.NARROWEST_SWIZZLE_BYTES)
+
     def product_scratch(self, consumers: int, widths: tuple[int, ...]) -> dict:
         # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
         # groups, so a narrower product's is no column slice of a wider one's (Mosaic GPU's layout inference
