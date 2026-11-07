@@ -644,7 +644,8 @@ def test_scanned_dropout_uses_the_supplied_rng():
     assert largest_difference(first[1], changed[1]) > 1e-5
 
 
-def test_a_scanned_glm5_next_computes_its_unrolled_forward():
+@pytest.mark.parametrize("attempt", range(16))
+def test_a_scanned_glm5_next_computes_its_unrolled_forward(attempt):
     """GLM-5-Next's first three layers (Kimi Delta Attention, a dense MLP,
     hyper-connections) scan as one run under `scan_layers`. The scanned
     forward is the unrolled one's, call after call. On XLA:CPU it was off by
