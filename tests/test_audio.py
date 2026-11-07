@@ -22,9 +22,10 @@ from interop_support import gemma_features
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
+from dew.interop.towers.audio import audio_config, audio_weight_path, audio_weights
 from dew.interop.towers.gemma3n import translate_gemma3n_projector_weights
 from dew.interop.towers.gemma4 import translate_gemma4_projector_weights
-from dew.nn.audio import AudioLinear, Gemma3nAudio, audio_config, audio_weight_path, audio_weights
+from dew.nn.audio import AudioLinear, Gemma3nAudio
 from dew.nn.vision import Gemma3nProjector, Gemma4Projector
 from dew.registry import towers
 

@@ -74,6 +74,7 @@ from dew.interop.towers import (
     tower_layout,
     tower_variables,
 )
+from dew.interop.towers.audio import audio_config, audio_weights
 from dew.interop.towers.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
 from dew.interop.towers.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
 from dew.interop.towers.gemma4_unified import translate_gemma4_unified_vision_config
@@ -362,7 +363,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
         frame = _records.integer(audio.get("audio_embed_dim", 640), "audio_embed_dim")
         return {"audio": None, "audio_token_id": audio_token_id, "audio_soft_tokens": None,
                 "audio_projector": translate_gemma4_projector_config(audio, text_width, frame)}
-    encoder = audio_nn.audio_config(audio)
+    encoder = audio_config(audio)
     slots = None
     projector: Mapping[str, object]
     if isinstance(encoder, audio_nn.Gemma4Audio):
@@ -1132,7 +1133,7 @@ def read_wrapper(
         # A Gemma tower's tensors are named under its own map; any other's sit where its family declares
         # (`dew.interop.towers`).
         variables["audio_tower"], placed["audio_tower"] = (
-            audio_nn.audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
+            audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
             if isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio))
             else tower_variables(_kind_name(record, "audio"), tables["audio_tower"], param_dtype))
     if record.get("audio_projector") is not None:
@@ -1319,7 +1320,7 @@ def translate_denoiser_weights(
     the family's tied-head rule. Vision and audio prefixes have no counterpart
     and raise ValueError with the tensor name.
     """
-    from dew.nn.diffusion_gemma import translate_weights as translate_sc_weights
+    from dew.interop.diffusion_gemma import translate_self_conditioning as translate_sc_weights
 
     text_names, sc_names, _ = _denoiser_sources(hf_tensors, hf_tensors.__getitem__, text_only=True,
                                                 checked=checked)

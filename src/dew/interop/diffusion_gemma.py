@@ -40,7 +40,7 @@ from dew.interop.towers.gemma4 import (
     translate_gemma4_vision_config,
 )
 from dew.interop.unread import Stored
-from dew.interop.weights import nested
+from dew.interop.weights import Tree, nested, translate_parameters
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.diffusion_gemma import DiffusionGemma
@@ -104,6 +104,35 @@ def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
         raise ValueError("DiffusionGemma publishes no audio encoder")
     return DiffusionGemma(text=text, canvas_length=_integer(config, "canvas_length", 256),
                           conditioner=conditioner)
+
+
+def translate_self_conditioning(
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
+) -> Tree[Stored]:
+    """Self-conditioning parameters, cast per weight before the layout copy."""
+    paths = {
+        "pre_norm.weight": ("pre_norm", "scale"),
+        "gate_proj.weight": ("gate_proj", "kernel"),
+        "up_proj.weight": ("up_proj", "kernel"),
+        "down_proj.weight": ("down_proj", "kernel"),
+    }
+    seen = set()
+
+    def path_of(name: str) -> tuple[str, ...]:
+        bare = name.removeprefix("self_conditioning.")
+        if bare not in paths:
+            raise ValueError(f"unknown tensor name {name!r}")
+        path = paths[bare]
+        if path[0] in seen:
+            raise ValueError(f"duplicate self-conditioning tensor {name!r}")
+        seen.add(path[0])
+        return path
+
+    params = translate_parameters(hf_tensors, path_of, param_dtype)
+    missing = {path[0] for path in paths.values()} - seen
+    if missing:
+        raise ValueError(f"missing self-conditioning tensors for {sorted(missing)}")
+    return params
 
 
 def translate_weights(
