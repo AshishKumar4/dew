@@ -267,7 +267,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def roles(self, consumers: int) -> mosaic.Schedule:
         _one(consumers)
-        return mosaic.Schedule((mosaic.Role("consumer"),))
+        return mosaic.Schedule((mosaic.Role("consumer"),), axis=None)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,

@@ -1056,6 +1056,9 @@ class Schedule:
     back each (`HandOff`), so no template states an arrival count."""
     roles: tuple[Role, ...]
     handoffs: tuple[HandOff, ...] = ()
+    axis: str | None = "wg"
+    """The axis a program's warpgroups index along (`kernel`'s); None for a program with none (an sm80
+    program's, a TPU core's), whose one role runs at index 0."""
 
     def __post_init__(self):
         raised = [role for role in self.roles if role.weight]
@@ -1106,19 +1109,17 @@ class Schedule:
 
     def run[R](self, **bodies: Callable[..., R]) -> R | None:
         """Each role's body by its name: on a schedule of one role, `body(index)` on every warpgroup, its
-        index (the value it returns, a program's whose consumers keep theirs); otherwise each raised role's
-        `body(index)` on its warpgroups, its index among them, their registers raised to its share at the
-        launch's residency (`registers`, `_RESIDENT`), then the last warpgroup's, lowered to the least, its
-        role's `body()` or each warp role's on its warp, where the GPU's compile honors them
-        (`resources.RAISES_HONORED`)."""
+        index along `axis` (the value it returns, a program's whose consumers keep theirs); otherwise each
+        raised role's `body(index)` on its warpgroups, its index among them, their registers raised to its
+        share at the launch's residency (`registers`, `_RESIDENT`), then the last warpgroup's, lowered to the
+        least, its role's `body()` or each warp role's on its warp."""
         if set(bodies) != {role.name for role in self.roles}:
             raise ValueError(f"a schedule of {[role.name for role in self.roles]} given bodies for "
                              f"{sorted(bodies)}")
         if len(self.roles) == 1:
-            # One warpgroup's program has no warpgroup axis to read (an sm80 program's).
             role = self.roles[0]
-            return bodies[role.name](0 if role.count == 1 else lax.axis_index("wg"))
-        wg = lax.axis_index("wg")
+            return bodies[role.name](0 if self.axis is None else lax.axis_index(self.axis))
+        wg = lax.axis_index(self.axis)
         budgets = self.registers(_RESIDENT.get())
         first = 0
         for role in self.raised:
