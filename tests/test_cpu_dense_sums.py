@@ -12,6 +12,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew.nn import pairwise, precision
+from dew.nn.kernels import gemm
 
 
 def test_a_contractions_block_keeps_its_rounding_path_within_a_vectorized_dots():
@@ -88,16 +89,42 @@ def test_a_product_sums_blocked_where_its_rows_are_few_and_in_float64_where_many
         a, b, jax.lax.DotAlgorithmPreset.F16_F16_F16)))
 
 
+def test_a_layers_projection_alone_sums_as_a_vectorized_dot():
+    """A layer's projection (`gemm.dot_general`, a Dense's product past the template) takes the CPU's
+    vectorized-dot sum; a product the algebra derives or a mixer forms (`float32_dot_general` itself:
+    attention's `dP` and `D`, whose sums cancel bit for bit on a one-key row) keeps XLA's, as before."""
+    numbers = (((1,), (0,)), ((), ()))
+    operands = (jnp.ones((4, 96), jnp.float32), jnp.ones((96, 8), jnp.float32))
+
+    def chooses(product) -> bool:
+        def walked(jaxpr):
+            for equation in jaxpr.eqns:
+                yield equation.primitive.name
+                for value in equation.params.values():
+                    inner = getattr(value, "jaxpr", value)
+                    if isinstance(inner, jax.extend.core.Jaxpr):
+                        yield from walked(inner)
+
+        traced = jax.make_jaxpr(lambda a, b: product(a, b, numbers))(*operands)
+        return "platform_index" in set(walked(traced.jaxpr))
+
+    with jax.default_matmul_precision(precision.FP32_SUMS):
+        assert chooses(gemm.dot_general(precision.float32_dot_general))
+        assert not chooses(precision.float32_dot_general)
+
+
 @pytest.mark.parametrize("depth", [64, 128, 1024])
 def test_a_dense_layers_float32_product_on_a_cpu_is_as_exact_as_a_vectorized_dot(depth):
-    """A dense product in fixed float32 sums on a CPU (`precision.accumulated` of `jax.lax.dot_general`
+    """A dense layer's product in fixed float32 sums on a CPU (`gemm.dot_general` of `float32_dot_general`
     under `FP32_SUMS`, as row 4735's llama.cpp comparison runs Dew): bitwise `pairwise_dot_general`'s, and
     its value, its rows' gradient and its matrix's each on par (check 1) with a vectorized dot's
     accumulation on this CPU (`vectorized`: libggml's and a BLAS kernel's partial sums, a lane of each FMA
     in flight, summed as a tree), where XLA's one-chain dot was 2.0 to 6.1 times its error."""
     numbers = (((1,), (0,)), ((), ()))
-    dense = functools.partial(precision.accumulated,
-                              functools.partial(jax.lax.dot_general, dimension_numbers=numbers))
+
+    def dense(rows, matrix):
+        # A Dense layer's product past the template (`gemm.dot_general`).
+        return gemm.dot_general(precision.float32_dot_general)(rows, matrix, numbers)
 
     def draw(seed):
         rng = np.random.default_rng((depth, seed))
