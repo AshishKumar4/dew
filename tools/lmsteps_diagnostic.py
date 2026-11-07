@@ -33,6 +33,10 @@ torch.set_num_threads(1)
 root=Path.cwd()/"tests/fixtures/hf/qwen3-tiny"
 options=dict(lr_peak=1e-2,lr_init=1e-3,lr_end=1e-3,warmup=2)
 schedule=Cosine(peak_value=1e-2,warmup_steps=2,end_value=1e-3,init_value=1e-3)
+if "table" in mode:
+    table=np.array([warmup_cosine(i,init=.001,peak=.01,warmup=2,decay_steps=steps,end=.001)
+                    for i in range(steps)],np.float32)
+    Cosine.values=lambda self,steps,rates=None:lambda count:jnp.asarray(table)[jnp.minimum(count,steps-1)]
 solver=OptimConfig(optimizer="adamw",b1=.9,b2=.95,optimizer_opts={"eps":1e-8},learning_rate=schedule,weight_decay=.1,clip_grads=1.,param_groups=(ParamGroup("all",("*",)),)).build(steps)
 pre=Pretrained.load(str(root),dtype="float32",attention_impl="xla")
 trainer=Trainer(LMObjective(pre,width-1,ema_decay=None),solver,key=jax.random.key(0),mesh=MeshSpec(),checkpoints=None,tracker=None)
@@ -75,7 +79,7 @@ def dew(tokens):
             state,loss,_,_,_,commit=step(state,{TEXT_KEY:rows})
             out.append([float(loss),float(commit.norm)])
     return np.array(out)
-if mode in ("old","wide"):
+if not mode.endswith("summary"):
     from reference_error import as_given,seeds_for,assert_as_exact
     cache={}
     def get(seed):
@@ -86,13 +90,18 @@ if mode in ("old","wide"):
             if len(cache)%128==0:print("K EVALUATED",len(cache),flush=True)
         return cache[seed]
     split=sys.argv[7] if len(sys.argv)>7 else "pooled"
-    def leaves(a):
+    rates=np.array([warmup_cosine(i,init=.001,peak=.01,warmup=2,decay_steps=steps,end=.001)
+                    for i in range(steps)],np.float64)
+    rate_arms=[np.array([float(schedule.schedule(steps)(i)) for i in range(steps)]),
+               rates.astype(np.float32),rates]
+    def leaves(a,arm):
         if split=="loss":return {"loss":a[:,0]}
         if split=="steps":return {f"{k}-{s}":a[s,i] for s in range(steps) for i,k in enumerate(["loss","norm"])}
+        if split=="all":return {"loss":a[:,0],"norm":a[:,1],"lr":rate_arms[arm]}
         return {"loss":a[:,0],"norm":a[:,1]}
-    candidate=as_given(lambda seed:leaves(get(seed)[0]))
-    ref=as_given(lambda seed:leaves(get(seed)[1]))
-    truth=as_given(lambda seed:leaves(get(seed)[2]))
+    candidate=as_given(lambda seed:leaves(get(seed)[0],0))
+    ref=as_given(lambda seed:leaves(get(seed)[1],1))
+    truth=as_given(lambda seed:leaves(get(seed)[2],2))
     try:
         n=seeds_for(ref,lambda seed:(np.int32(seed),),"LM steps",dew_fn=candidate,truth_fn=truth,most=count)
         print("K DECLARED",n,flush=True)
