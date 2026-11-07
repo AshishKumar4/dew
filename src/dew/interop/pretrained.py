@@ -557,6 +557,17 @@ class Pretrained:
         """
         name_or_dir, trust_remote_code = _released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
                                                           mesh=mesh, layout=layout)
+        if _native(name_or_dir):
+            # A run's native release builds the model its run recorded (`ReleasedTask.source_of`).
+            built = {"attention_impl": attention_impl != "auto", "max_seq_len": max_seq_len is not None,
+                     "revision": revision is not None, "subfolder": subfolder is not None,
+                     "gguf_file": gguf_file is not None, "single_file": single_file is not None,
+                     "dduf_file": dduf_file is not None, "fallback": fallback is not None,
+                     "modeling_overrides": bool(modeling_overrides), "text_only": text_only,
+                     "prediction_depths": prediction_depths is not None, "dex": dex is not None,
+                     "precision": precision is not None, "scan_layers": scan_layers}
+            return _native_source(name_or_dir, [name for name, set_ in built.items() if set_], mesh=mesh,
+                                  layout=layout, dtype=dtype, param_dtype=param_dtype, on_host=on_host)
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
@@ -1340,6 +1351,43 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
                          source=source if media or gguf_path is None else None,
                          directory=directory if media else None)
     return None
+
+
+def _native(source: str | Path) -> bool:
+    """Whether `source` is a local directory holding a run's native release (`dew.inference.loading.
+    released_model`), whose files no family's loader reads: a saved run's export where no family's layout
+    states its model (`dew.interop.saved_sources.run_plan`) among them."""
+    from etils import epath
+
+    from dew.inference.loading import released_model
+
+    return os.path.isdir(source) and released_model(epath.Path(source))
+
+
+def _native_source(source: str | Path, built: Sequence[str], *, mesh: MeshSpec | Mesh | None,
+                   layout: Layout | None, dtype: DTypeLike | None,
+                   param_dtype: DTypeLike | Literal["auto"] | None, on_host: bool) -> Pretrained:
+    """The native release in `source` as the source a run starts from: its run's step
+    (`dew.inference.models.ReleasedRun`) as its task's bundle (`ReleasedTask.source_of`; row 4776: such a
+    release's record states no dtypes a family's load reads, and a run started from it raised KeyError),
+    placed on `mesh` under `layout`, or on the host (`on_host`), computing in `dtype` and stored in
+    `param_dtype` ("auto": as the release stores it). A load option that builds a family's model
+    another way (`built`) is refused: the release builds the model its run recorded. A load without
+    weights reads them whole, as a native release states no shapes apart from its tensors."""
+    from dew.inference.models import ReleasedRun
+    from dew.objectives.base import ReleasedTask
+
+    if built:
+        raise ValueError(f"{source} is a run's native release, which builds the model its run recorded; "
+                         f"load it without {', '.join(built)}")
+    run = ReleasedRun.of(str(source))
+    task = run.objective.saved_task
+    if task is None or not issubclass(task, ReleasedTask):
+        raise ValueError(f"{source} is the native release of a {run.objective.__name__} run, which declares "
+                         "no task a run starts from")
+    bundle = task.source_of(run, mesh=mesh, layout=layout, dtype=dtype,
+                            param_dtype=None if param_dtype == AUTO else param_dtype)
+    return replace(bundle, variables=jax.device_get(bundle.variables)) if on_host else bundle
 
 
 def _released_source(name_or_dir: str | Path, asked: bool | None, **release) -> tuple[str | Path, bool]:

@@ -62,6 +62,35 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
         load_diffusion_source(str(source))
 
 
+def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_release(tmp_path, monkeypatch):
+    """A decision run whose head's format holds no backbone of its own family (Laya's fresh head, whose
+    format holds ModernBERT alone, over Qwen 3.5) exports as its native release, and a second decision run
+    naming it (`--pretrained <run>`) starts from that release as from the run's own task: its head and
+    backbone the first run's final ones, its record the run and step it read, and its task answers (row
+    4776: the release's record states no dtypes a family's load reads, and the start raised KeyError)."""
+    from run_kinds import QWEN_TINY
+
+    from dew.decision import Choice, Decide
+    from dew.decision.formats import format_unstated
+    from dew.inference.tasks import saved_model
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    first = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN_TINY))
+    state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    assert format_unstated("laya", saved_model(SavedRun.pinned(str(source)).record, None).build()) is not None
+    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
+    started = run.prepare().objective.init(jax.random.key(0))
+    leaves_alike(started["params"], state.variables["params"])
+    second, _ = trained(run, tmp_path, "second", trainer={"checkpoint_final": True})
+    assert int(second.step) == 1
+    recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
+    assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
+    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    assert np.isclose(float(np.sum(answer.probabilities)), 1.0)
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_run_whose_mixture_no_family_writes_exports_and_loads_back_answering_as_its_run(tmp_path):
     """A language model run whose decoder routes one layer of two through a mixture of experts exports
