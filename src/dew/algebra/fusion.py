@@ -19,8 +19,8 @@ identity (`program._within`'s). A region's decision is held by its structure
 and the context it was weighed in (`_decided`), so every layer of a stack, and every retrace, weighs it once.
 A softmax attention (`attention_regions`) is found first and written as Dew's attention where a kernel of
 Dew's takes it, through the same splice (`_spliced`); a product inside it is none of the products' regions.
-An RMSNorm or SwiGLU no product's epilogue took (`norm_regions`) is written as Dew's where its fused kernel
-takes it, through the same splice.
+An RMSNorm or SwiGLU no product's epilogue took is written as Dew's where the e-graph proves the region
+computes Dew's call and its fused kernel takes it (`recognize`), through the same splice.
 """
 
 from __future__ import annotations
@@ -65,9 +65,9 @@ class Region(NamedTuple):
 def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     """`jaxpr` with each attention region a kernel of Dew's takes written as Dew's attention
     (`attention_regions`), each product region the template takes fused (the module's account), and each
-    RMSNorm and SwiGLU region the fused norms take written as Dew's (`norm_regions`); `jaxpr` itself where
+    RMSNorm and SwiGLU region the fused norms take written as Dew's (`recognize`); `jaxpr` itself where
     none is."""
-    from dew.algebra import attention_regions, norm_regions
+    from dew.algebra import attention_regions, recognize
     from dew.nn.kernels import fused_gemm
 
     index = Index(jaxpr)
@@ -79,15 +79,11 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
                 and _decided(jaxpr, region.places, region.inputs, region.outputs,
                              lambda region=region: _takes(fused_gemm, jaxpr, region))]
     held |= {place for region in products for place in region.places}
-    norms = [region for region in norm_regions.regions(index) if not held & set(region.places)
-             and _decided(jaxpr, region.places, _read(jaxpr, region.places), region.outputs,
-                          lambda region=region: norm_regions.taken(region))]
-    if not attention and not products and not norms:
+    written = recognize.recognized(jaxpr, index, frozenset(held))
+    if not attention and not products and not written:
         return jaxpr
-    written = [Written(region.places, region.operands, region.outputs, region.places[-1],
-                       module.written(region))
-               for module, found in ((attention_regions, attention), (norm_regions, norms))
-               for region in found]
+    written += [Written(region.places, region.operands, region.outputs, region.places[-1],
+                        attention_regions.written(region)) for region in attention]
     written += [Written(region.places, region.inputs, region.outputs, region.at,
                         _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm)) for region in products]
     return _spliced(jaxpr, written)
@@ -109,7 +105,7 @@ class Index:
     """A body's equations by the values they make (`producer`), each value's readers (`readers`: the places
     of the equations that read it), the values the body returns (`escaping`) and its constants' values where
     it holds them (`consts`): what the region finders read (`_regions`, `attention_regions.regions`,
-    `norm_regions.regions`)."""
+    `recognize.recognized`)."""
 
     def __init__(self, jaxpr: jcore.Jaxpr):
         self.jaxpr = jaxpr
@@ -299,11 +295,12 @@ def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
 _held: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
 
 
-def _decided(jaxpr: jcore.Jaxpr, places: Sequence[int], inputs: Sequence[jcore.Var],
-             outputs: Sequence[jcore.Var], decide: Callable[[], bool]) -> bool:
-    """A region's decision (`decide`), weighed once for its structure (`program.structure`'s, the algebra's
-    windows' key) in the context it is weighed in (`derive.context`: the mesh, the target, the numerics and
-    precision; and the kernel choices a call names), the latest `DECISIONS_HELD` held."""
+def _decided[Decision](jaxpr: jcore.Jaxpr, places: Sequence[int], inputs: Sequence[jcore.Var],
+                       outputs: Sequence[jcore.Var], decide: Callable[[], Decision]) -> Decision:
+    """A region's decision (`decide`: whether it is fused, or which of its calls is written), weighed once for
+    its structure (`program.structure`'s, the algebra's windows' key) in the context it is weighed in
+    (`derive.context`: the mesh, the target, the numerics and precision; and the kernel choices a call
+    names), the latest `DECISIONS_HELD` held."""
     from dew import _cache
     from dew.algebra import derive, program
 
