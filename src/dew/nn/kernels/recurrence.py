@@ -160,22 +160,32 @@ def salted_bf16(state, key, value):
 
 
 def update(state, query, key, value, decay, write, *, delta: bool):
-    """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` per key dimension `[...,
-    Dk]` (`exp(g)`) and `write` the write gate `[..., 1]`, a head's one: its output `[..., Dv]` and the
-    updated state.
-    The output reads the updated state, `q^T S'`, as the recurrence states it, with the delta rule and
-    without: the one-pass form `(q decay)^T S + (q . k) write (v - (k decay)^T S)` overflowed where
-    `q^T S'` stays finite, its `q . k` past fp32's largest at keys and queries of 2^80 against a write of
-    2^-80 (rows 1859 and 1962). The write gate scales the key before the write's outer product (`beta k`,
-    as the chunk form and fla write it), so the write's transpose, `(beta k) . q` against the output's
-    cotangent, takes the gate before the sum: after it, `k . q` past fp32's largest at keys and queries of
-    2^63 put an infinite value gradient where the chunk form's was finite (ledger 2470). The write formed
-    `[Dv, Dk]` and transposed, so its second order's sum over the keys runs along their last axis: formed
-    `[Dk, Dv]`, a grad of grad's value gradient summed 128 keys past fp32's largest at its prefix (4.4e38)
-    where float64's sum was 3.0e38 (the decode step's contract near the largest, 128-wide heads)."""
+    """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` its decay per key dimension `[...,
+    Dk]` or a head's `[..., 1]` (`exp(g)`) and `write` the write gate `[..., 1]`, a head's one: its output
+    `[..., Dv]` and the updated state.
+    Under a decay a key dimension the output reads the updated state, `q^T S'`. Under a head's, it reads
+    the state output-side, `g (q^T S) + (q . (beta k)) c` with the correction `c = v - g (k^T S)`: the
+    chunked form's reading (`recurrence_algebra.chunk_output`), the decay rounded once a sum, so its
+    rounding is a scale of the read, which a gated RMS norm after it cancels as it cancels the chunked
+    form's; read from `S' = g S + (beta k) c^T`, each entry's own rounding of `g S` put a gated delta net's
+    decode tokens 1.30 to 1.38 times the chunked form's distance from float64 through its output norm, its
+    draws to 6.3 times (qwen35-tiny's widths, probes/decode_vs_chunk.py; 1.01 read output-side).
+    The write gate scales the key before any sum it enters (`beta k`, as the chunk form and fla write it):
+    the one-pass form `(q decay)^T S + (q . k) write (v - (k decay)^T S)` overflowed where `q^T S'` stays
+    finite, its `q . k` past fp32's largest at keys and queries of 2^80 against a write of 2^-80 (rows 1859
+    and 1962), and the write's transpose, `(beta k) . q` against the output's cotangent, takes the gate
+    before the sum: after it, `k . q` past fp32's largest at keys and queries of 2^63 put an infinite value
+    gradient where the chunk form's was finite (ledger 2470)."""
+    written = key * write
+    if decay.shape[-1] == 1:
+        def read(x):
+            return jnp.sum(x[..., :, None] * state, axis=-2)
+
+        corrected = value - decay * read(key) if delta else value
+        updated = state * decay[..., :, None] + written[..., :, None] * corrected[..., None, :]
+        return decay * read(query) + jnp.sum(query * written, axis=-1, keepdims=True) * corrected, updated
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
-    written = corrected[..., :, None] * (key * write)[..., None, :]
-    updated = state * decay[..., :, None] + jnp.swapaxes(written, -1, -2)
+    updated = state * decay[..., :, None] + written[..., :, None] * corrected[..., None, :]
     return jnp.sum(query[..., :, None] * updated, axis=-2), updated
 
 
@@ -415,15 +425,16 @@ def normed(hooks: Hooks, out, given: dict, work):
 
 
 def _gates(hooks: Hooks, given: dict, work, key_width: int):
-    """The reference's decay per key dimension `[rows, Hv, Dk]` and write gate `[rows, Hv]`."""
+    """The reference's decay `[rows, Hv, Dk]` per key dimension, `[rows, Hv, 1]` a head's (none's one), and
+    write gate `[rows, Hv]`."""
     g, beta = log_gates(hooks, given, work)
     rows, heads = given['state'].shape[:2]
     if g is None:
-        decay = jnp.ones((rows, heads, key_width), work)
+        decay = jnp.ones((rows, heads, 1), work)
     else:
         decay = jnp.exp(g)
-        decay = decay[..., None] if hooks.decay == 'scalar' else decay
-        decay = jnp.broadcast_to(decay, (rows, heads, key_width))
+        decay = (decay[..., None] if hooks.decay == 'scalar'
+                 else jnp.broadcast_to(decay, (rows, heads, key_width)))
     write = jnp.ones((rows, heads), work) if beta is None else beta
     return decay, write
 
