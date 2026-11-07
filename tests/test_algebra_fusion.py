@@ -393,7 +393,7 @@ def _norms_written(fn, *shapes):
     with generation.assumed("sm90"):
         found = [region for region in norm_regions.regions(fusion.Index(closed.jaxpr))
                  if norm_regions.taken(region)]
-    written = [fusion.Written(region.places, region.operands, (region.output,), region.places[-1],
+    written = [fusion.Written(region.places, region.operands, region.outputs, region.places[-1],
                               norm_regions.written(region)) for region in found]
     return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(found)
 
