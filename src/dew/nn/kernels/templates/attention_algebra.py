@@ -1805,19 +1805,26 @@ def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
     return power2(x, expand(14.0 - exponent, x) if rows else 14.0 - exponent), exponent - 14.0
 
 
+def scaled_by(x: jax.Array, k: jax.Array) -> jax.Array:
+    """`x` times `2^k` for a scalar integral `k` within twice fp32's exponent range, as two scalar
+    powers of two, each within it (`exp2` of an integer, a GPU's exactly): no tile of exponent bits, which
+    held a 128-wide fp16 fused backward's dK and dV beside two int tiles a step, 286 registers live at its
+    peak and 2240 bytes spilled (et-c7512), and no bitcast of a scalar, which Mosaic GPU takes none of."""
+    half = jnp.floor(k * 0.5)
+    return x * jnp.exp2(half) * jnp.exp2(k - half)
+
+
 def running_parts(x: jax.Array, exponent: jax.Array, dtype=jnp.float16
                   ) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array]]:
     """An fp32 tile `x` as two `dtype` parts at a walk's running scale (a queries-first backward's dK's and
     dV's left operands, accumulated over its query tiles): the tile's largest exponent (two one-axis
     reductions, `_scaled`) joins the walk's running `exponent`, the largest so far (-inf before any), and
-    both parts are `x` times `2^(14 - exponent')`, the high part rounded and the low part its remainder
-    rounded at the same scale, so both products issue into one accumulator held at that scale. Returns the
-    new exponent, the power of two that takes the accumulator from the old scale to the new (`running_shift`:
-    0 before any tile, else at most 0) and the parts; a product of them is taken back by
+    both parts are `x` times `2^(14 - exponent')` (`scaled_by`), the high part rounded and the low part its
+    remainder rounded at the same scale, so both products issue into one accumulator held at that scale.
+    Returns the new exponent, the power of two that takes the accumulator from the old scale to the new
+    (0 before any tile, else at most 0) and the parts; a product of them is taken back by
     `running_restored`. A part's entries far below the running largest lose their low bits to `dtype`'s
-    subnormals, as an fp32 sum of them loses them to its rounding. Every power of two is built on a tile of
-    `x`'s shape (`power2`): Mosaic GPU bitcasts no scalar ("Scalars must be represented by non-vector
-    types", et-fp16lower)."""
+    subnormals, as an fp32 sum of them loses them to its rounding."""
     largest = jnp.max(jnp.max(jnp.abs(x), axis=-1))
     tile = jnp.ceil(jnp.log2(jnp.where(largest > 0, largest, 1.0)))
     # A GPU's approximate log2 flushes a subnormal largest to zero (`_scaled`, row 4464): such a tile, as an
@@ -1825,18 +1832,17 @@ def running_parts(x: jax.Array, exponent: jax.Array, dtype=jnp.float16
     tile = jnp.where((largest > 0) & finite(tile), tile, -jnp.inf)
     new = jnp.maximum(exponent, tile)
     shift = jnp.where(exponent == -jnp.inf, 0.0, exponent - jnp.where(new == -jnp.inf, 0.0, new))
-    scaled = power2(x, jnp.broadcast_to(jnp.where(new == -jnp.inf, 0.0, 14.0 - new), x.shape),
-                    reach=2 * 127)
+    scaled = scaled_by(x, jnp.where(new == -jnp.inf, 0.0, 14.0 - new))
     high = scaled.astype(dtype)
     return new, shift, (high, (scaled - high.astype(jnp.float32)).astype(dtype))
 
 
 def running_restored(value: jax.Array, exponent: jax.Array) -> jax.Array:
     """A product of `running_parts`' parts, or an accumulator of them, at the walk's scale taken back:
-    `value` times `2^(exponent - 14)`; itself where no tile moved the exponent, every part then zero. No
-    select of a scalar's condition over the tile: Mosaic GPU broadcasts none implicitly (et-fp16lower)."""
-    return power2(value, jnp.broadcast_to(jnp.where(exponent == -jnp.inf, 0.0, exponent - 14.0), value.shape),
-                  reach=2 * 127)
+    `value` times `2^(exponent - 14)` (`scaled_by`); itself where no tile moved the exponent, every part then
+    zero. No select of a scalar's condition over the tile: Mosaic GPU broadcasts none implicitly
+    (et-fp16lower)."""
+    return scaled_by(value, jnp.where(exponent == -jnp.inf, 0.0, exponent - 14.0))
 
 
 def restored(value: jax.Array, exponent: jax.Array) -> jax.Array:

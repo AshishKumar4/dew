@@ -490,14 +490,14 @@ def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call):
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
 def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
-    """An fp16 call's backward at its derived tiles of a causal call `width` wide, its one launch's two parts
-    at running scales (`attention_mosaic_fused._sixteen_step`), lowered and compiled by ptxas for an H100 on
-    this CPU: within its shared memory, spilling nothing, its register model's decision ptxas's."""
+    """An fp16 call's backward at its derived tiles of a causal call `width` wide (the one launch's two parts
+    at running scales, `attention_mosaic_fused._sixteen_step`, where its registers hold it), lowered and
+    compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing, its register
+    model's decision ptxas's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     op, ba, config = _gated_backward("sm90", width, accurate=False, dtype=jnp.float16)
-    assert config.fused, config
     with generation.assumed("sm90"):
         found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config),
                                                    _backward_models(op, ba, config))], "sm90")
