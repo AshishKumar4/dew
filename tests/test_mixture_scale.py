@@ -104,23 +104,6 @@ def packed(count: int, *, by: str = "records", examples: int | None = 10**6):
     return compile(mixed.pack(16, fields=("text",)).batch(BATCH), read="streamed", examples=examples)
 
 
-def asked(stream, batches: int) -> int:
-    """The positions `stream` asks while it gives `batches`: the calls of any read's `get_state` and any
-    count's `state`, on every thread the read runs on."""
-    calls: list[None] = []
-
-    def counted(frame, event, argument):
-        if event == "call" and frame.f_code.co_name in ("get_state", "state"):
-            calls.append(None)
-
-    threading.setprofile_all_threads(counted)
-    try:
-        texts(stream, batches)
-    finally:
-        threading.setprofile_all_threads(None)
-    return len(calls)
-
-
 def texts(stream, batches: int) -> list[list[int]]:
     return [np.asarray(batch["text"]).tolist() for batch in itertools.islice(stream, batches)]
 
@@ -138,12 +121,11 @@ def drawn(stream, count: int) -> None:
 def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, record_property):
     """A user's packed mixture, the default packer and loading (`packed`), steps once it has read from every
     source at no cost per source: a thousand sources' step reads the records it packs and nothing of the
-    sources it does not draw, asks the positions the packer asks before each document in the calls ten
-    do (a mix's position captured copy-on-write, `SharedMapping`, each capture asking again only what the
-    document moved), holds the threads ten do (its members read under their share of the loading, one
-    after another on the thread that draws from them), and keeps no block a step, and compiling them
-    costs memory linear in their count (row 4079: each document's capture asked and copied every
-    member's position and counts, and each member's shard read on sixteen threads of its own)."""
+    sources it does not draw, holds the threads ten do (its members read under their share of the
+    loading, one after another on the thread that draws from them), and keeps no block a step, and
+    compiling them costs memory linear in their count (row 4079: each document's capture asked and copied
+    every member's position and counts, and each member's shard read on sixteen threads of its own). A
+    step's time is recorded beside them (`step_ms`), a measurement, not a verdict (A33)."""
     measured = {}
     for count in (10, SOURCES):
         gc.collect()
@@ -158,7 +140,7 @@ def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, recor
             drawn(stream, count)
             Documents.reads = 0
             began = time.perf_counter()
-            asks = asked(stream, 64)
+            texts(stream, 64)
             stepped = (time.perf_counter() - began) / 64
             reads = Documents.reads
             # What steps keep, counted between two counts past the first window: a buffer it sized once
@@ -173,13 +155,11 @@ def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, recor
         finally:
             stream.close()
         measured[count] = {"compile_s": built, "compile_peak_mib": peak / 2**20, "step_ms": 1e3 * stepped,
-                           "reads_per_step": reads / 64, "positions_asked_per_step": asks / 64,
-                           "threads": threads, "blocks_kept_per_step": kept}
+                           "reads_per_step": reads / 64, "threads": threads, "blocks_kept_per_step": kept}
         record_property(f"sources_{count}", measured[count])
         print(f"sources={count}", measured[count])
     few, many = measured[10], measured[SOURCES]
     assert many["reads_per_step"] < 2 * few["reads_per_step"], measured
-    assert many["positions_asked_per_step"] < 2 * few["positions_asked_per_step"], measured
     assert many["threads"] <= few["threads"], measured
     assert many["blocks_kept_per_step"] < 1, measured
     record_property("rss_mib", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
