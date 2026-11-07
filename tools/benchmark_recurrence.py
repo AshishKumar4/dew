@@ -4,8 +4,8 @@ backward, timed in one GPU session for every arm that computes it, and one markd
 
 Arms, each on the same operands:
 
-- `template`: `recurrence_chunk.chunk`, its route as the GPU's row picks it (the conv is not in the
-  template yet: it has no template arm);
+- `template`: `recurrence_chunk.chunk`, its route as the GPU's row picks it (the short conv's is `hand`'s,
+  `linear.causal_conv1d`, the template's conv);
 - `mosaic`: the same call with the recurrence template named (`generation.chosen`), on the cells whose route
   takes a port (`recurrence_chunk.PORT_CELLS`, `SCAN_CELLS`) as on the rest;
 - `hand`: the kernel the template replaces, called directly: the delta rule's port (`fla_rule`,
@@ -18,13 +18,17 @@ Arms, each on the same operands:
 - `flashqla`: FlashQLA's TileLang kernels (`flash_qla.chunk_gated_delta_rule`, Hopper and Blackwell only),
   the gated delta rule's queries and keys a key head each, as its API takes them.
 
-An arm that runs out of memory records the error in its row.
+An arm that runs out of memory records the error in its row. Each arm records its peak device memory, the
+spec's bar beside its time (docs/design/kernel-templates.md): its forward's and its forward plus backward's,
+operands included, each arm a shape in a process of its own, so no other arm's or shape's buffers count
+(JAX's peak is a process's, and never falls).
 
-The JAX arms run in Dew's environment (`jax` mode) and the torch arms in their own (`torch` mode, which
-imports neither JAX nor Dew), one process each, one after another on the same GPU; `row` mode reads
-their JSON lines and prints the markdown rows. Each time is the median of `--repeats` synchronized
-calls after `--warmup`, in milliseconds; forward plus backward is one call returning the outputs and
-their VJP under the cotangents `do` and `dfinal`, as torch's backward runs after its forward.
+The JAX arms run in Dew's environment (`jax` mode, a process an arm and shape, which `jax` mode spawns) and
+the torch arms in their own (`torch` mode, which imports neither JAX nor Dew), one after another on the same
+GPU; `row` mode reads their JSON lines and prints the markdown rows. Each time is the median of
+`--repeats` synchronized calls after `--warmup`, in milliseconds; forward plus backward is one call
+returning the outputs and their VJP under the cotangents `do` and `dfinal`, as torch's backward runs after
+its forward.
 
 MFU is the shape's model FLOPs (`flops`: `dew.nn.flops`' recurrent function, the same count for every
 arm, chunk work excluded) over the time and the GPU's dense bf16 peak (`dew.nn.kernels.generation`'s
@@ -41,6 +45,7 @@ import dataclasses
 import datetime
 import json
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -87,6 +92,9 @@ decays above it (`operands`: at least -0.75 a token)."""
 ARMS = {'gdn': ('template', 'mosaic', 'hand', 'xla', 'fla', 'flashqla'),
         'kda': ('template', 'mosaic', 'hand', 'xla', 'fla'),
         'ssd': ('template', 'mosaic', 'hand', 'xla', 'mamba_ssm'), 'conv': ('hand', 'xla', 'fla')}
+
+JAX_ARMS = ('template', 'mosaic', 'hand', 'xla')
+"""The arms `jax` mode runs (`jax_arms`), each on the shapes whose `ARMS` list it."""
 
 
 def flops(shape: Shape) -> float:
@@ -137,8 +145,9 @@ def operands(shape: Shape, seed: int = 0) -> dict[str, np.ndarray]:
             'dfinal': normal(batch, shape.value_heads, shape.key_width, shape.value_width)}
 
 
-def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
-    """The JAX arms' times on `shape`, each forward and forward plus backward."""
+def jax_arms(name: str, shape: Shape, warmup: int, repeats: int, only: str) -> list[dict]:
+    """The JAX arm `only`'s times and peak memory on `shape`, forward and forward plus backward, its peak
+    the process's after each (`_jax_peak`), which `main` gives the arm alone."""
     import jax
     import jax.numpy as jnp
 
@@ -214,6 +223,8 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
 
     rows = []
     for arm, fn in arms.items():
+        if arm != only:
+            continue
         row = {'shape': name, 'arm': arm}
         rows.append(row)
         if refusals.get(arm):
@@ -227,7 +238,16 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
                 row[part] = 1e3 * statistics.median(measured)
             except jax.errors.JaxRuntimeError as error:
                 row[part], row['error'] = None, _failure(error)
+            row[part.replace('_ms', '_peak_mb')] = _jax_peak()
     return rows
+
+
+def _jax_peak() -> float | None:
+    """The process's peak device memory so far in MB (None where the backend keeps no statistics)."""
+    import jax
+
+    stats = jax.devices()[0].memory_stats()
+    return None if not stats or 'peak_bytes_in_use' not in stats else stats['peak_bytes_in_use'] / 2 ** 20
 
 
 def _failure(error: BaseException) -> str:
@@ -311,6 +331,7 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
 
     row = {'shape': name, 'arm': arm, 'device': torch.cuda.get_device_name()}
     for part, fn in (('fwd_ms', forward), ('fwd_bwd_ms', backward)):
+        torch.cuda.reset_peak_memory_stats()
         try:
             for _ in range(warmup):
                 fn()
@@ -327,6 +348,7 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
         except torch.OutOfMemoryError as error:
             row[part], row['error'] = None, _failure(error)
             torch.cuda.empty_cache()
+        row[part.replace('_ms', '_peak_mb')] = torch.cuda.max_memory_allocated() / 2 ** 20
     return row
 
 
@@ -350,16 +372,19 @@ def markdown(rows: list[dict], sha: str) -> list[str]:
             if row is None or row.get('fwd_ms') is None:
                 cells.append(f"{arm} {row.get('error', 'failed') if row else 'not run'}")
                 continue
-            parts = []
+            parts, peaks = [], []
             for key, factor in (('fwd_ms', 1), ('fwd_bwd_ms', 3)):
                 ms = row.get(key)
                 mfu = '' if ms is None or not peak else f" ({100 * factor * work / (ms * 1e-3) / peak:.1f}%)"
                 parts.append('n/a' if ms is None else f"{ms:.3f}{mfu}")
-            cells.append(f"{arm} {parts[0]} / {parts[1]}")
+                mb = row.get(key.replace('_ms', '_peak_mb'))
+                peaks.append('n/a' if mb is None else f"{mb:.0f}")
+            cells.append(f"{arm} {parts[0]} / {parts[1]} ({peaks[0]} / {peaks[1]} MB)")
         lines.append(f"- **Recurrence scoreboard, {name}** ({shape.kind}, B={shape.batch} T={shape.length} "
                      f"Hk={shape.key_heads} Hv={shape.value_heads} K={shape.key_width} V={shape.value_width} "
                      f"C={shape.chunk}, bf16) · {device} · {datetime.date.today().isoformat()} · `{sha}` · "
-                     f"fwd / fwd+bwd ms (MFU of {flops(shape) / 1e9:.1f} GFLOP fwd at the bf16 peak): "
+                     f"fwd / fwd+bwd ms (MFU of {flops(shape) / 1e9:.1f} GFLOP fwd at the bf16 peak; peak "
+                     f"memory MB): "
                      + '; '.join(cells))
     return lines
 
@@ -369,7 +394,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument('mode', choices=('jax', 'torch', 'row'))
     parser.add_argument('runs', nargs='?', help="row mode: the JSON lines the other modes wrote")
     parser.add_argument('--shape', default='all', help=f"one of {sorted(SHAPES)} or 'all'")
-    parser.add_argument('--arm', choices=('fla', 'flashqla', 'mamba_ssm'), help='torch mode: whose kernels')
+    parser.add_argument('--arm', choices=('fla', 'flashqla', 'mamba_ssm', *JAX_ARMS),
+                        help="torch mode's kernels; jax mode's one arm (else each in its own process)")
     parser.add_argument('--warmup', type=int, default=5)
     parser.add_argument('--repeats', type=int, default=20)
     parser.add_argument('--out', help='append JSON lines here as well as printing them')
@@ -383,9 +409,16 @@ def main(argv: list[str] | None = None) -> None:
     names = sorted(SHAPES) if args.shape == 'all' else [args.shape]
     for name in names:
         shape = SHAPES[name] if args.length is None else dataclasses.replace(SHAPES[name], length=args.length)
+        if args.mode == 'jax' and args.arm is None:
+            for arm in (arm for arm in ARMS[shape.kind] if arm in JAX_ARMS):
+                subprocess.run([sys.executable, __file__, 'jax', '--shape', name, '--arm', arm, '--warmup',
+                                str(args.warmup), '--repeats', str(args.repeats), '--sha', args.sha,
+                                *(['--out', args.out] if args.out else []),
+                                *(['--length', str(args.length)] if args.length else [])], check=False)
+            continue
         if args.mode == 'jax':
             import jax
-            found = jax_arms(name, shape, args.warmup, args.repeats)
+            found = jax_arms(name, shape, args.warmup, args.repeats, args.arm)
             for row in found:
                 row['device'] = jax.devices()[0].device_kind
         elif args.arm in ARMS[shape.kind]:
