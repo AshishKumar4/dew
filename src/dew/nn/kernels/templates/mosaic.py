@@ -1377,6 +1377,13 @@ class Issuer[Accumulator](abc.ABC):
     def column(self) -> plgpu_core.SomeLayout:
         """A column vector's layout: the accumulator's reduced over its rows."""
 
+    def right_swizzle(self, dtype, columns: int) -> int:
+        """The widest swizzle, in bytes, a product's right operand of `columns` columns of `dtype` may be
+        staged at: the one its rows fill (`resources.widest_swizzle`)."""
+        from dew.nn.kernels.templates import resources
+
+        return resources.widest_swizzle(dtype, columns)
+
     def product_scratch(self, consumers: int, widths: tuple[int, ...]) -> tuple | dict:
         """The memory a program's products take where the issuer keeps each product's accumulator itself
         (tcgen05's chunks: tensor memory of each product width in `widths` and a tensor-core barrier, a

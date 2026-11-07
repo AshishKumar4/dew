@@ -2178,7 +2178,7 @@ def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
     family = call.family
     swizzle = resources.widest_swizzle(call.given.stored, call.width)
     if not family.operands_in_registers:
-        swizzle = min(swizzle, resources.widest_swizzle(call.memories.stored, bv))
+        swizzle = min(swizzle, family.right_swizzle(call.memories.stored, bv))
     while swizzle > mosaic.NARROWEST_SWIZZLE_BYTES and (
             _output_held(call, bv, swizzle).registers(family, _addressed(staging, landing))
             > family.registers(1)):
