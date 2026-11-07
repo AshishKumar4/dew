@@ -23,11 +23,12 @@ from model_support import TINY_DECODER
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
 
-from dew.batch import FROZEN
+from dew.batch import FROZEN, merge
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
 from dew.lora import LoRA
+from dew.nn.backbones.decoder_stack import stacked_rows
 from dew.objectives.lm import LMObjective
 from dew.optim import (
     STACKED_OPTIMIZERS,
@@ -691,8 +692,7 @@ def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
     model = decoder(scan_layers=True)
     base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
-    mesh = MeshSpec(fsdp=2).build(jax.devices())
-    batch = shard_batch(mesh, token_rows(VOCAB, BATCH, SEQ + 1))
+    batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
     arms = []
     for stage_local in (True, False):
         run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables,
@@ -701,23 +701,31 @@ def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
         state, _, _ = run.place()
         step = run.compile(state, batch)
         arms.append((run, state, step, run.executable.memory_analysis().temp_size_in_bytes))
-    (run, rows, read, rows_temporaries), (_, stacked, restacked, stacked_temporaries) = arms
+    (run, rows, _, rows_temporaries), (_, _, _, stacked_temporaries) = arms
     assert "stages" in rows.variables["params"] and "stages" not in rows.variables[FROZEN]
     assert set(rows.variables[FROZEN]) == set(on_host(adapter.variables)[FROZEN])
     assert rows_temporaries < stacked_temporaries, (rows_temporaries, stacked_temporaries)
 
+    # The two programs a step's gradient runs, the rows read in place and the base stacked each step, on
+    # par (check 1): the gradient of the adapter's factors as they are stored, the base joined in as the
+    # objective joins it.
+    factors, frozen = on_host(run.stored(rows).variables["params"]), on_host(rows.variables[FROZEN])
+    (site,) = adapter.model.stage_sites({"params": merge(factors, frozen)}, 1)
+
+    def gradient(model, factors, frozen, *, staged: bool):
+        def loss(factors, text):
+            moving = site.view.stage_form("params", factors, stacked_rows) if staged else factors
+            return jnp.mean(model.apply({"params": merge(moving, frozen)}, text) ** 2)
+        return jax.jit(lambda text: jax.grad(loss)(factors, text))
+
     def draw(seed):
-        return (token_rows(VOCAB, BATCH, SEQ + 1, seed=seed)["text"],)
+        return (jnp.asarray(token_rows(VOCAB, 2, SEQ, seed=seed)["text"]),)
 
-    # Two programs, the rows read in place and the base stacked each step: their updates on par (check 1).
-    def updated(arm_step, state, held):
-        def update(text):
-            moved = arm_step(state, shard_batch(mesh, {"text": text}))[0]
-            return held(moved).variables["params"]
-        return update
-
-    assert_as_exact(updated(read, rows, run.stored), updated(restacked, stacked, lambda moved: moved),
-                    draw, "a frozen base read where it lies", seeds=ROWS_SEEDS)
+    wide = adapter.model.clone(dtype=jnp.float64)
+    assert_as_exact(gradient(adapter.model, factors, frozen, staged=True),
+                    gradient(adapter.model, factors, frozen, staged=False), draw,
+                    "a frozen base read where it lies", seeds=ROWS_SEEDS,
+                    truth_fn=gradient(wide, widened(factors), widened(frozen), staged=False))
     assert rows_temporaries < stacked_temporaries, (rows_temporaries, stacked_temporaries)
 
 
