@@ -2473,14 +2473,20 @@
      "repo": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
      "version": "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
      "runs": "fetched"
-    },
-    {
-     "repo": "pytorch/audio",
-     "version": "2.11.0",
-     "runs": "torchaudio"
     }
    ],
-   "note": "AudioTokenizerEncoder's pooled features and codes (tokenize_audio_batch, in one batch and in batches bounded at 30 frames) and MiMoAudioEncoder's embeddings, fp32 and float64 (model.npz); torchaudio's MelSpectrogram at MiMo-Audio-Tokenizer's mel_spectrogram settings, fp32 and float64 (mel.npz)."
+   "note": "AudioTokenizerEncoder's pooled features and codes (tokenize_audio_batch, in one batch and in batches bounded at 30 frames) and MiMoAudioEncoder's embeddings, fp32 and float64 (model.npz)."
+  },
+  "hf/mimo-audio-tiny/mel.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "pytorch/audio",
+     "revision": "2.11.0",
+     "runs": "torchaudio.transforms.MelSpectrogram"
+    }
+   ],
+   "note": "torchaudio's MelSpectrogram at MiMo-Audio-Tokenizer's mel_spectrogram settings, its log floored at 1e-7, run by tools/torchaudio_mel_worker.py mimo-mel on the CPU (torch and torchaudio 2.11.0+cpu, the filters and window built in the dtype computed in) over each seed's drawn tenth of a second of waveform, in float32 and float64; its outputs kept whole over 40 draws (8 declared seeds and their redraw)."
   },
   "hf/mimo-vision-tiny": {
    "tool": "tools/mimo_reference.py",
@@ -2648,16 +2654,27 @@
    "sources": [{"repo": "huggingface/transformers", "version": "93c8b7b485963a10800c91f55304db6be211c2bd", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.1", "runs": "torch"}],
    "tool": "tools/kda_reference.py"
   },
-  "jepa/vjepa.npz": {
-   "tool": "tools/vjepa_reference.py",
+  "jepa/published.npz": {
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "facebookresearch/jepa",
-     "version": "51c59d518fc63c08464af6de585f78ac0c7ed4d5",
-     "runs": "fetched"
+     "revision": "51c59d518fc63c08464af6de585f78ac0c7ed4d5",
+     "runs": "src/models vision_transformer and predictor"
     }
    ],
-   "note": "src/models (vision_transformer, predictor, utils) with src/masks/utils.py and src/utils/tensors.py fetched at the commit, SHA-256 checked; image mode, mask-token predictor, V-JEPA's own exact GELU; float32 and float64 (widened, float64 sincos tables) forward and gradients. Torch 2.14.0+cpu."
+   "note": "V-JEPA's image-mode encoder and mask-token predictor in its vit construction, narrowed (tests/test_jepa_source.py CASES), run by tools/vjepa_worker.py jepa-published on the CPU (torch 2.14.0+cpu, exact GELU) over each seed's drawn weights, images, disjoint context and target patches and cotangents: the context embeddings, the predictions and the gradients of the images and every trainable parameter, in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "jepa/variant.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "facebookresearch/jepa",
+     "revision": "51c59d518fc63c08464af6de585f78ac0c7ed4d5",
+     "runs": "src/models vision_transformer and predictor"
+    }
+   ],
+   "note": "V-JEPA's image-mode encoder and mask-token predictor with the constructors' own LayerNorm epsilon, MLP ratio 2, odd head counts and a two-channel image (tests/test_jepa_source.py CASES), run by tools/vjepa_worker.py jepa-variant on the CPU (torch 2.14.0+cpu, exact GELU) over each seed's drawn weights, images, disjoint context and target patches and cotangents: the context embeddings, the predictions and the gradients of the images and every trainable parameter, in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
   },
   "jit": {
    "tool": "tools/jit_reference.py",
@@ -3316,7 +3333,23 @@
      "runs": "torchvision"
     }
    ],
-   "note": "Fetches and executes upstream projection loss code, REPA's SILoss with train.py's loss composition and preprocess_raw_image, and iREPA's DINOv2Encoder.preprocess and spatial_zscore, with a stand-in network and encoder; SILoss's draws are DiffusionObjective's from jax.random.key(3). composed.npz also holds the fp32 gradient's RMS distance from float64 over 52 orders of the stand-in's hidden units (order 1 checked in float64 against the identity's gradient)."
+   "note": "Fetches and executes upstream projection loss code, REPA's SILoss with train.py's loss composition and iREPA's spatial_zscore, with a stand-in network and encoder; SILoss's draws are DiffusionObjective's from jax.random.key(3). composed.npz also holds the fp32 gradient's RMS distance from float64 over 52 orders of the stand-in's hidden units (order 1 checked in float64 against the identity's gradient)."
+  },
+  "repa/preprocessed.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "sihyun-yu/REPA",
+     "revision": "67f714503e3892f993844aab088ffc5791c92613",
+     "runs": "train.py preprocess_raw_image"
+    },
+    {
+     "repo": "End2End-Diffusion/iREPA",
+     "revision": "99ad4ac234efe8de52ce157120f72856e836d09f",
+     "runs": "ldm/vision_encoder.py DINOv2Encoder.preprocess and ldm/utils.py spatial_zscore"
+    }
+   ],
+   "note": "REPA's DINOv2 preprocessing (/255, ImageNet's normalization, bicubic to 224) and iREPA's, which each run checks agree, then iREPA's spatial_zscore at gamma 0.6, run by tools/repa_worker.py repa-preprocessing on the CPU (torch 2.14.0+cpu with torchvision) over each seed's two drawn 256-pixel images, in float32 and float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "repae": {
    "tool": "tools/repae_reference.py",
@@ -3452,16 +3485,49 @@
    ],
    "note": "Executes upstream modules under their own names with training-stack imports stubbed, tools/parity_rl.py:177,197,219."
   },
-  "router/vllm.npz": {
-   "tool": "tools/vllm_router_reference.py",
+  "router/kimi.npz": {
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "vllm-project/vllm",
-     "version": "v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607)",
-     "runs": "fetched"
+     "revision": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+     "runs": "grouped_topk"
     }
    ],
-   "note": "grouped_topk's own body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py at the commit (SHA-256 checked), torch.compile decorator dropped, torch path (fused kernel off, sorted top-k); float32 and float64 (widened return cast). Torch 2.14.0+cpu."
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-kimi on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "router/grouped.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/vllm",
+     "revision": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+     "runs": "grouped_topk"
+    }
+   ],
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-grouped on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "router/softmax.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/vllm",
+     "revision": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+     "runs": "grouped_topk"
+    }
+   ],
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-softmax on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
+  },
+  "router/unbiased.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/vllm",
+     "revision": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+     "runs": "grouped_topk"
+    }
+   ],
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-unbiased on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "schedules/betas.npz": {
    "tool": "tools/beta_schedule_reference.py",
@@ -3629,16 +3695,27 @@
    ],
    "note": "Fetches and executes published Router class."
   },
-  "uvit/bao.npz": {
-   "tool": "tools/uvit_reference.py",
+  "uvit/published.npz": {
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "baofff/U-ViT",
-     "version": "ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
-     "runs": "fetched"
+     "revision": "ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
+     "runs": "libs/uvit_t2i.py UViT and libs/timm.py"
     }
    ],
-   "note": "libs/uvit_t2i.py and libs/timm.py fetched at the commit, SHA-256 checked, math attention; float32 and float64 (widened) forward and gradients. Torch 2.14.0+cpu."
+   "note": "U-ViT's mscoco configuration narrowed (tests/test_uvit_source.py CASES) run by tools/uvit_worker.py uvit-published on the CPU (torch 2.14.0+cpu, math attention) over each seed's drawn weights, images, text states, times and cotangent: its output and the gradients of the image, the text and every parameter, in float32 and, its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "uvit/variant.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "baofff/U-ViT",
+     "revision": "ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
+     "runs": "libs/uvit_t2i.py UViT and libs/timm.py"
+    }
+   ],
+   "note": "U-ViT with the time MLP on, no output convolution and an odd number of heads (tests/test_uvit_source.py CASES) run by tools/uvit_worker.py uvit-variant on the CPU (torch 2.14.0+cpu, math attention) over each seed's drawn weights, images, text states, times and cotangent: its output and the gradients of the image, the text and every parameter, in float32 and, its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "v_loss/loss.npz": {
    "tool": "tools/v_loss_reference.py",
