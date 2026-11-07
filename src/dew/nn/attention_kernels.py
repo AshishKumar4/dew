@@ -157,9 +157,6 @@ class AttentionCase:
     dense_bias: bool
     """Whether the call's bias varies by query (`[B or 1, H or 1, Q, K]`), which the template reads a tile at
     a time (`template.Biased`)."""
-    row_bias: bool
-    """Whether that dense bias varies by batch row too (`[B, H or 1, Q, K]`); a table every row shares (T5's
-    `[1, H, Q, K]`) the Mosaic mainloop reads once a tile (`template.shared_place`)."""
     sinks: bool
     softcap: float | None
     arithmetic: bool
@@ -456,14 +453,6 @@ TEMPLATE_SUPPORTS = (
           "the call's bias is not 4-D one term a key or a query's every key, its rows and heads the call's "
           "or one for them all, or is wider than fp32, which the template's score hook reads it in",
           row=INHERENT),
-    _Need('dense_bias',
-          lambda case: not case.dense_bias or (not case.row_bias
-                                               and generation.gpu_target().architecture.wgmma),
-          "the call's bias varies by query: by batch row too, which the xla kernel runs 7% faster on an "
-          "H100, or a table every row shares on a GPU without warpgroup MMA, where the template's "
-          "Pallas-Triton mainloop reads it spread to every row, unmeasured; a shared table the warpgroup-MMA "
-          "Mosaic mainloop runs a third faster in half the memory (ET-DBIAS-h100; named, it runs)",
-          row='2625', kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
@@ -511,13 +500,17 @@ cover both. Every other call takes the template (`_attention_preferred`). Nothin
 list shrinks as the template wins."""
 
 
-def template_infers(width: int, causal: bool) -> bool:
-    """Whether the template's fp32 forward (its operands as bf16 parts) measured faster than xla's fp32
-    attention for a call no derivative is taken of, `width` wide (the 'float32 attention' cell's
-    'inference'): at width 64 everywhere (0.22 to 0.55 of xla's time, 8192 causal 3.54 against 16.47 ms) and
-    causal at 128 (0.57 to 0.80), at an RMS error from float64 30 to 60 times xla's lower; not at 128 full
-    (1.19 to 1.37 of xla's, one consumer of 64 columns, its QK products' parts run twice), nor at widths
-    unmeasured (M-ET-16, W18-gh200-1, GH200, CUPTI median of 7, 2048 and 8192 tokens)."""
+def template_infers(dtype, width: int, causal: bool) -> bool:
+    """Whether the template's forward measured faster than xla's attention for a call of `dtype` no
+    derivative is taken of, `width` wide, where its kernel is 'inference'. An fp32 call's (its operands as
+    bf16 parts, the 'float32 attention' cell's): at width 64 everywhere (0.22 to 0.55 of xla's time, 8192
+    causal 3.54 against 16.47 ms) and causal at 128 (0.57 to 0.80), at an RMS error from float64 30 to 60
+    times xla's lower; not at 128 full (1.19 to 1.37 of xla's, one consumer of 64 columns, its QK products'
+    parts run twice), nor at widths unmeasured (M-ET-16, W18-gh200-1, GH200, CUPTI median of 7, 2048 and
+    8192 tokens). A 16-bit call's, which takes 'inference' for its dense bias alone (`_attention_preferred`):
+    everywhere."""
+    if jnp.dtype(dtype) != jnp.float32:
+        return True
     return width == 64 or (width == 128 and causal)
 
 
@@ -525,9 +518,17 @@ def _attention_preferred(case: AttentionCase) -> str:
     """The kernel `case` runs where its cell declares no old route that takes it (`DECLARED`): the template
     on every GPU, which hands a call it does not take to the next kernel by legality; splash on a TPU, until
     a receipt (CELLS-v5e) measures the template there (theme A10); xla on a CPU, which has no instruction
-    family."""
-    del case
-    return {'gpu': 'template', 'tpu': 'tpu'}.get(generation.backend(), 'xla')
+    family. A bias that varies by query (`AttentionCase.dense_bias`) trains on the template where it is
+    causal on warpgroup MMA alone, and elsewhere infers on it and trains on xla's attention ('inference'):
+    the template's forward took 0.32 to 0.72 of xla's time on an H100 and 0.47 to 1.04 on an A100 in 22 to
+    73% less memory, a table every row shares or one a row, causal and full; its training step 0.62 to 0.96
+    causal on an H100, but 1.07 to 1.48 full there and 1.12 to 2.23 on an A100 (M-DD-8, W55-gh200 and
+    W57-a100: bf16, 32/8 heads x 128, 2048 and 8192 tokens, B 1 and 4)."""
+    backend = generation.backend()
+    if backend == 'gpu' and case.dense_bias and not (case.causal
+                                                     and generation.gpu_target().architecture.wgmma):
+        return 'inference'
+    return {'gpu': 'template', 'tpu': 'tpu'}.get(backend, 'xla')
 
 
 def _hosted(kernel: str) -> str:
@@ -561,7 +562,8 @@ form (`AttentionCase.form`): an accurate call runs the template, or the referenc
 decode call keeps its own kernels whatever the form (`DECODE`). The template comes last, after the
 reference path, which takes every call, so it runs where the preference names it or a call names it; and
 'inference' after it, the template for a call no derivative is taken of and xla's attention for one
-differentiated (`dew.nn.attention.forward_differentiable`'s `primal_alone`), where a cell declares it."""
+differentiated (`dew.nn.attention.forward_differentiable`'s `primal_alone`), where a cell declares it or
+a dense bias's preference names it."""
 
 
 
