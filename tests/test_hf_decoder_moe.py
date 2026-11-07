@@ -315,6 +315,42 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
             np.testing.assert_array_equal(np.asarray(exported[name]), stored[name])
 
 
+def _packed_run(source: Path, directory: Path, steps: int):
+    """A run of `steps` steps of the MXFP4 GPT-OSS at `source` served packed (`packed_experts`), its
+    parameters trained by SGD around its frozen banks, each step checkpointed, and the state it ends with."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+
+    loaded = Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=True)
+    objective = LMObjective(loaded.model, seq_len=8, ema_decay=None, variables=loaded.variables)
+    rows = [{"text": (np.arange(9, dtype=np.int32) + index) % PACKED_CONFIG["vocab_size"]}
+            for index in range(16)]
+    batches = compile(Memory(rows).shuffle(0).repeat().batch(8), read="memory",
+                      loading=Loading(workers=0, threads=1, read_buffer=1))
+    checkpoints = Checkpoints(str(directory), keep=3)
+    state = Trainer(objective, optax.sgd(1e-2), key=0, checkpoints=checkpoints).fit(
+        batches, steps=steps, checkpoint_every=1, log_every=100)
+    checkpoints.wait()
+    return state
+
+
+def test_a_resumed_run_over_packed_experts_trains_on_bitwise_as_an_uninterrupted_run(tmp_path):
+    """A run over an MXFP4 GPT-OSS served packed: two steps, a resume and a third land where three
+    uninterrupted steps do, every leaf of the state bitwise, the banks among them restored as written."""
+    source = _mxfp4_gpt_oss(tmp_path)
+    whole = _packed_run(source, tmp_path / "whole", 3)
+    _packed_run(source, tmp_path / "resumed", 2)
+    resumed = _packed_run(source, tmp_path / "resumed", 3)
+    for left, right in zip(jax.tree.leaves((whole.variables, whole.opt_state)),
+                           jax.tree.leaves((resumed.variables, resumed.opt_state)), strict=True):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
 @pytest.mark.network
 def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     """The released MXFP4 checkpoint through the loader, its weights in the bf16 the blocks decode to
