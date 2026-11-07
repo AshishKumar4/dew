@@ -1076,6 +1076,10 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
                                   np.asarray(adapter.model.apply(whole.variables, inputs)))
 
 
+UNEVEN_SEEDS = 8
+"""Check 1's declared seeds for layers adapted otherwise, scanned apart against the plain loop."""
+
+
 def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
     """A scanned stack runs its like layers as one module, `layers_0_1`; the
     adapter's targets are named per layer, so the branch resolves the run to
@@ -1105,8 +1109,16 @@ def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
     uneven = {**adapter.targets, ("params", "layers_1", "self_attn", "q_proj"): Target(2, 8.0)}
     looped = _rebound(adapter, decoder.model.clone(scan_layers=False), targets=uneven).model
     rerun = _rebound(adapter, decoder.model.clone(scan_layers=True), targets=uneven).model
-    np.testing.assert_array_equal(np.asarray(rerun.apply(variables, tokens)),
-                                  np.asarray(looped.apply(variables, tokens)))
+    wide = _rebound(adapter, decoder.model.clone(scan_layers=False, dtype=jnp.float64), targets=uneven).model
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), tokens.shape, 0, decoder.model.vocab_size),)
+
+    # Two programs, the runs scanned apart and the plain loop: on par (check 1).
+    assert_as_exact(jax.jit(lambda ids: rerun.apply(variables, ids)),
+                    jax.jit(lambda ids: looped.apply(variables, ids)), draw,
+                    "layers adapted otherwise as runs of their own", seeds=UNEVEN_SEEDS,
+                    truth_fn=jax.jit(lambda ids: wide.apply(widened(variables), ids)))
 
 
 # --------------------------------------------------------------------------

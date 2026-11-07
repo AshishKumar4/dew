@@ -1155,12 +1155,6 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     return held
 
 
-def _without(record: Mapping[str, JSON], names: tuple[str, ...]) -> dict[str, JSON]:
-    """`record` without a field of `names` wherever it nests one: a wrapper's language model's, a decision
-    run's backbone's among them (`_records.without_fields`)."""
-    return {key: _records.without_fields(value, names) for key, value in record.items() if key not in names}
-
-
 def _holds(config: "RunConfig", path: str) -> bool:
     """Whether `config` holds every record along the dotted `path` up to its field: false past an optional
     record it holds none of (a teacher of None)."""
@@ -1477,11 +1471,9 @@ class RunConfig:
 
     def built_fresh(self) -> None:
         """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
-        `Pretrained.load` builds of a source (`source_keywords`) reaches nothing such a run builds. How
-        its layers execute (`EXECUTED`), which a saved run records whatever its source, is no such word."""
-        unsourced = SourceOptions()
-        executed = {name: getattr(unsourced, name) for name in self.EXECUTED if hasattr(unsourced, name)}
-        if dataclasses.replace(self.source, **executed) != unsourced:
+        `Pretrained.load` builds of a source (`source_keywords`), how it scans its layers among it, reaches
+        nothing such a run builds, whose own fields say it (`--model.scan_layers`)."""
+        if self.source != SourceOptions():
             raise ValueError(f"--source says what a run builds of the source it loads, and this "
                              f"{type(self).__name__} loads none: its model is built from --model, whose "
                              "own fields say it; or start the run from a source")
@@ -1506,7 +1498,7 @@ class RunConfig:
         if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        before, now = (_without(record, self.EXECUTED)
+        before, now = (_records.without_fields(record, self.EXECUTED)
                        for record in (recorded._fields_record(), self._fields_record()))
         # A field the saved run left to its build and its record holds unresolved, which no checkpoint
         # states either (`earlier_option_writing`), is the one this build resolves (`BUILT`).
