@@ -97,7 +97,6 @@ def admitted(tmp_path_factory):
     return records, trainer, ahead
 
 
-@pytest.mark.shared_setup("admitted")
 def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_over_its_own_gpus(tmp_path):
     """A host's GPUs, serialized as their topology (`get_attached_topology(...).serialize()`, here of
     compile-only H100s at a stated 40 GiB) and read back elsewhere (`host_gpus`), are the GPUs XLA compiles
@@ -127,6 +126,25 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
     assert key(read) != key(compile_only_gpus("sm90", 2))
 
 
+def test_a_step_compiled_ahead_over_a_hosts_gpus_plans_within_the_memory_it_is_told_on_those_gpus(tmp_path,
+                                                                                                  monkeypatch):
+    """Over a host's own GPUs (`host_gpus`), a stated capacity reaches the planner alone: the step is planned
+    within it and compiled over the host's GPUs as serialized, not over a canonical target restated with it."""
+    from jax.experimental import topologies
+
+    from dew.training.ahead import compile_ahead, compile_only_gpus, host_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    serialized = tmp_path / "topology.bin"
+    serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm90", 1, 2**30))).serialize())
+    host = host_gpus("sm90", serialized, 1)
+    trainer = fine_tune(MeshSpec().build(host))
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30)
+    assert tuple(trainer.device_mesh.devices.flat) == host
+    assert ahead.capacity == 2**30 and ahead.plan is not None
+
+
+@pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
     plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""

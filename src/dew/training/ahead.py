@@ -164,7 +164,10 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     attached: XLA compiles over them as over that host's GPUs, the SKU's memory, clocks and multiprocessors
     its own, so a program compiled here keys the persistent cache as that host's compile of it does (its
     backend's platform version and topology fingerprint are the host's) and the host's run reads it. A
-    canonical target (`compile_only_gpus`) keys another entry: an A100's 80 GB against a 40 GB host's."""
+    canonical target (`compile_only_gpus`) keys another entry: its platform version is its device kind, and it
+    states zero bytes of memory, or the capacity it is given, where the host states its own.
+    The planner reads no memory off them: a compile ahead over them states the host's per GPU
+    (`compile_ahead`'s `capacity`) to plan within it."""
     # The CUDA plugin, which a serialized topology deserializes through, initialized as the generation's
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)
@@ -175,7 +178,18 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     if held != gpu_target(generation).generation:
         raise ValueError(f"the topology at {topology} holds {devices[0].device_kind} GPUs ({held}), not "
                          f"{generation}")
+    _HOSTED.update(devices[:count])
     return tuple(devices[:count])
+
+
+_HOSTED: set = set()
+"""The devices `host_gpus` read off a host's serialized topology (`hosted`)."""
+
+
+def hosted(device) -> bool:
+    """Whether `device` is one of a host's own GPUs as it serialized them (`host_gpus`): XLA reads its memory
+    off the topology, so no compile restates it."""
+    return device in _HOSTED
 
 
 @dataclasses.dataclass(frozen=True)
@@ -631,9 +645,8 @@ class AheadTarget:
         `topology` (`host_gpus`), the TPU topology's, which must hold `devices`, or `devices` GPUs of the
         generation at the stated capacity."""
         if self.topology is not None:
-            if self.capacity_gib is not None or self.multiprocessors is not None:
-                raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set no "
-                                 "capacity or multiprocessors with it")
+            if self.multiprocessors is not None:
+                raise ValueError("a host's topology states its GPUs' multiprocessors; set none with it")
             return host_gpus(self.generation, self.topology, self.devices)
         if ":" not in self.generation:
             return compile_only_gpus(self.generation, self.devices, self.capacity, self.multiprocessors)
@@ -770,7 +783,9 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         raise ValueError("a frontier lists the rungs that fit the GPUs' memory, which compile-only GPUs "
                          "do not state; name it (--trainer.compile-ahead.capacity-gib, compile_ahead's "
                          "capacity)")
-    if capacity is not None:
+    # Compile-only GPUs a capacity was not stated for state it now; a host's own state their memory to XLA
+    # already (`host_gpus`), and the planner alone reads `capacity`.
+    if capacity is not None and not hosted(devices[0]):
         mesh = trainer.device_mesh
         devices = compile_only_gpus(generation, len(devices), capacity,
                                     None if stated is None else stated.multiprocessors)
