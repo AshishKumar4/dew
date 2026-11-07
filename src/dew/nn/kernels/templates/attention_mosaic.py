@@ -929,6 +929,12 @@ def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, valu
         # added into dQ's (`operands.Issuer.summed`), beside the cotangents and both parts, formed first.
         fragments.append([cotangents[0], cotangents[1], cotangents[1],
                           (block_q, width // config.columns, jnp.float32)])
+    if accurate and (slopes or held):
+        # The accurate form's cotangents fp32 formed beside the keyed sums' weights fp32
+        # (`softmax_cotangents`), a score hook's slopes and parameters live until its pullback takes them
+        # (`gradient.pulled`): an H100's dQ at 64 x 64, width 64, spilled 128 bytes under a softcap and 208
+        # under alibi, a tile a slope past its model (acchook3).
+        fragments.append([cotangents[0], logits, *[logits] * slopes, *held])
     phases = resources.live_registers(family, carried, products, pullback, cotangents, *fragments)
     return phases + anchor + rows + vectors
 
@@ -1128,6 +1134,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 and config.queries_first and not (config.shared_keys or config.shared_dq)
                 and (ba.arguments["interpret"] or self._all_resident(ba, config, target))):
             return False
+        if (self.score_mod is not None and family is not None
+                and min(config.block_q, config.block_k) < family.role_rows):
+            # A score hook's tiles at a role's rows (`derived`'s fewer rows a consumer): a hooked call's tiles
+            # of fewer fail to lower.
+            return False
         if config.producer_dq and not config.shared_dq:
             # The producer adds a shared dQ's staged shares alone (`mosaic.Outbox`).
             return False
@@ -1238,7 +1249,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # launch's tiles that many rows a side (an A100's heads 256 wide: every 64-row tile's two stages of
         # queries and output cotangents beside its resident keys and values past its 166,912 bytes, the
         # two launches at 32 x 32 150,560, et-bwd256sm80).
-        for rows in (None, *fewer_rows(family)):
+        # Fewer rows a consumer for a call with no score hook: a hook's parameters and pullback tiles laid out
+        # at a role's rows, sliced at fewer, fail to lower (an A100's accurate dQ under a temperature at 32 x
+        # 32: "slice size (32) ... divisible by the tile size (64)", acchook3; FS-A100CHECK1d's row-indexed).
+        for rows in (None, *(fewer_rows(family) if self.score_mod is None else ())):
             walks = extents if rows is None else functools.partial(_sides, rows)
             for columns in (1, 2, 4):
                 for staged in (False, True):

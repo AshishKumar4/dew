@@ -2115,6 +2115,9 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
         return grads.query, grads.key, grads.value
 
     op, ba, config = _gated_backward(generation_name, width, accurate, hooks)
+    if config is None and accurate and hooks != "none":
+        pytest.skip(f"the accurate form under {hooks} derives no tile {width} wide on {generation_name}: "
+                    "its registers hold none, and the Pallas-Triton mainloop takes the call")
     assert config is not None, f"the Mosaic backward derives no config {width} wide on {generation_name}"
     with generation.assumed(generation_name):
         models = _backward_models(op, ba, config)
