@@ -12,10 +12,10 @@ def assert_as_exact_as_recorded(fixture, site: str, seeds: int, draw, dew, label
     """`dew(dtype, inputs)`, Dew's outputs at `dtype` on a seed's inputs `draw(seed)`, as exact as the
     reference's float32 run against its float64 run over `site`'s recording in `fixture` (check 1), Dew's
     float64 run its truth, held to the recorded truth's sketch (`indexed_recording`). A `host` computation
-    (a data processor on the host) runs as given, never compiled."""
+    (a data processor on the host, which no trace reads) runs as given, `dew(jnp.float32, inputs)` alone,
+    against a recording of the reference's outputs whole, its truth the recorded one."""
     if host:
-        drawn, reference, truth = indexed_recording(recording(fixture), site, seeds, inputs_of=draw,
-                                                    truth_fn=lambda inputs: dew(jnp.float64, inputs))
+        drawn, reference, truth = indexed_recording(recording(fixture), site, seeds, inputs_of=draw)
         assert_as_exact(as_given(lambda index, inputs: dew(jnp.float32, inputs)), reference, drawn, label,
                         seeds=seeds, truth_fn=truth)
         return
@@ -27,3 +27,10 @@ def assert_as_exact_as_recorded(fixture, site: str, seeds: int, draw, dew, label
     # (ledger 3900).
     assert_as_exact(as_given(lambda index, inputs: compiled(inputs)), reference, drawn, label, seeds=seeds,
                     truth_fn=truth)
+
+
+def assert_arms_as_recorded(arms, site: str, seeds: int, label: str, **options) -> None:
+    """`assert_as_exact_as_recorded` over a site's arms as tools/venv_reference.py reads them (a test's
+    `pipeline_arms`): its recording, its draw, Dew's run and its leaves."""
+    fixture, draw, dew, _ = arms
+    assert_as_exact_as_recorded(fixture, site, seeds, draw, dew, label, **options)

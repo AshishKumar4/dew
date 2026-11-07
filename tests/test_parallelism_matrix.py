@@ -1,39 +1,30 @@
 """Every model family on every objective class it takes, split by the layouts
 that split it differently, against one device on the eight-device CPU mesh.
 
-Each cell is one test. edm2's cells (`RUN_ONCE`) run their layout once
-(tools/layout_parity.py's `run` with no draws): the layout compiles and takes its first step, its
-sample the one-device reference's, its loss and gradient finite where the
-reference's are, and its FLOPs an even split, or it is refused as REFUSED
-states. Every other cell's test judges that first step's loss and gradient against one device by the
-floor judge, which states it works or is refused as well, so no second test runs it again
-(`layout_parity.floored`): each leaf within
-FLOOR_FACTOR of the reference's own deviation under reassociating its sums
-(its rows reordered and pooled, and the step's distance from float64), and
-its FLOPs an even split. The tool's check 1 over many draws (`run` with
-seeds, its CLI's judge) is no matrix test's judge while a cell's draws
-cannot shard across CI tasks: its cells ran past a task's target whole, so
-accuracy here keeps the floor judge the matrix ran before check 1, under
-its own test name. Each cell states what it does: it works, or it is
-refused by design for the reason REFUSED gives. A supported cell that
-refuses or mismatches fails, and so does a refused cell that runs, so a
-refusal is never read as a pass and a lifted one is never left unclaimed.
-CI spreads a slow model's cells over its tasks; the run-once cells one
-task runs share their model's reference draw, kept on disk under its
-content (`layout_parity.References`), and the floor cells share their
-model's reference and floors in the process (`layout_parity.floored`),
-so each is computed once a task. The models are the tool's zoo, sized
-so every layout divides them. Each row lists the layouts that split
-its model in a way no other row covers: a pair's second axis, a packed or
-masked column under a sequence split, a bidirectional exchange, a vision tower
-beside a pipelined decoder, a tensor or sequence axis over experts, a norm's
-statistics over groups of a split width, an attention gate of its own
-projection over split heads, and a data axis Explicit
+Each cell is one layout of one model, judged by the layout tool's check 1
+(tools/layout_parity.py's `run` over the model's draws, `judged`): over
+`SEEDS` draws of its global batch, each layout's first-step loss and
+gradient leaves are as near the step computed in float64 as one device's are,
+within PARITY, and its FLOPs are an even split; or the cell is refused by
+design for the reason REFUSED gives. A supported cell that refuses,
+mismatches or is inconclusive fails, and so does a refused cell that runs, so
+a refusal is never read as a pass and a lifted one is never left unclaimed.
+Each model's seeds are `seeds_for` paired over its layouts, its largest
+(armada vq-layout-size, 11-06). A model whose draws take past a task's target
+whole runs its cells as armada's map tasks and a judge (`check1_shards`), its
+seeds its mark's. Every cell of one task shares its model's reference draws,
+kept on disk under their content (`layout_parity.References`). The models are
+the tool's zoo, sized so every layout divides them. Each row lists the layouts
+that split its model in a way no other row covers: a pair's second axis, a
+packed or masked column under a sequence split, a bidirectional exchange, a
+vision tower beside a pipelined decoder, a tensor or sequence axis over
+experts, a norm's statistics over groups of a split width, an attention gate
+of its own projection over split heads, and a data axis Explicit
 (`MeshSpec.explicit`), alone and beside fsdp, wherever an operation is placed
-from its rows rather than its operands: the embedding's gather and scatter-add,
-GRPO's shifted scores, MDLM's mask draw, Mamba-1's and Mamba-2's states and
-conv histories, unpatchify, JEPA's repeat and covariance, and a vision tower's
-placed slots.
+from its rows rather than its operands: the embedding's gather and
+scatter-add, GRPO's shifted scores, MDLM's mask draw, Mamba-1's and Mamba-2's
+states and conv histories, unpatchify, JEPA's repeat and covariance, and a
+vision tower's placed slots.
 
 The tool draws every parameter an initializer leaves all zeros, so a
 DiT's zeroed output and modulations do not hide the layers above them
@@ -87,37 +78,34 @@ REFUSED: dict[tuple[str, str], str] = {
 """The cells refused by design, each with its reason."""
 
 
-RUN_ONCE: frozenset[tuple[str, str]] = frozenset({
-    ("edm2", "tensor4"), ("edm2", "fsdp2_tensor2"), ("edm2", "sequence4"),
-})
-"""The cells no accuracy test judges. edm2's zoo model joined the matrix with check 1 as its
-accuracy judge; the floor judge has never judged it, and one floor-judged cell of it runs 180 s
-alone on an armada CPU worker (measured 2026-10-28), past a task's target for a test no durations
-record holds. Its layouts run in the run-once test, and its accuracy returns with check 1 when a
-cell's draws shard across tasks, as every cell's does."""
+SEEDS: dict[str, int] = {
+    "dense_sft": 128, "dense_dpo": 64, "dense_mdlm": 128, "grouped": 64, "gated": 64, "moe_exchange": 64,
+    "mla_dpo": 16, "hybrid_sft": 128, "shared_tail": 32, "mamba1_packed": 8, "dense_packed": 32,
+    "rigel_packed": 128, "mmdit": 8, "dit": 8, "jepa": 128, "multimodal": 64, "dense": 64,
+}
+"""Each model's declared check-1 seeds whose cells run whole in one task: the largest of its layouts'
+`seeds_for` paired (armada vq-layout-size, 11-06). The sharded models' seeds are their marks'."""
 
 
 @pytest.fixture(scope="session")
 def references(tmp_path_factory):
-    """The layout tool this task's cells run and the reference draws its run-once cells share, each
-    kept on disk under its content (`layout_parity._cache_name`) when first computed, while the disk
-    keeps 4 GiB free, and read back by every later cell of its model. Its tool module is the one each
-    test runs: the states and references the tool holds in a process (`_initial`,
-    `layout_parity._floor_held`) live in that module, and `load` executes its file afresh, so a cell
-    that loaded its own would rebuild its model's initial state and floor reference itself, where its
-    task's first cell of the model built them."""
+    """The layout tool this task's cells run and the reference draws its cells share, each kept on disk
+    under its content (`layout_parity._cache_name`) when first computed, while the disk keeps 4 GiB free,
+    and read back by every later cell of its model. Its tool module is the one each test runs: the states
+    the tool holds in a process (`_initial`) live in that module, and `load` executes its file afresh, so a
+    cell that loaded its own would rebuild its model's initial state, where its task's first cell of the
+    model built it."""
     tool = load("layout_parity")
     return tool, tool.References(tmp_path_factory.mktemp("layout-draws"), prepare=True, reserve=4 << 30)
 
 
-def cells(*, judged: bool) -> list[tuple[str, str, int | None]]:
-    """The cells as a test's arguments, their layouts on every device but CELLS_ON_FOUR's, on four:
-    for the accuracy test (`judged`) every cell but the run-once ones (`RUN_ONCE`), and for the
-    run-once test those alone."""
+def cells(*models: str) -> list[tuple[str, str, int | None]]:
+    """The cells of `models` (every model's by default) as a test's arguments, their layouts on every
+    device but CELLS_ON_FOUR's, on four."""
     return [(model, layout, devices)
             for table, devices in ((CELLS, None), (CELLS_ON_FOUR, 4))
             for model, layouts in sorted(table.items()) for layout in layouts
-            if judged != ((model, layout) in RUN_ONCE)]
+            if not models or model in models]
 
 
 PARAMETER_AXES = ("fsdp", "tensor", "expert", "stage")
@@ -132,7 +120,7 @@ def split_draws() -> list[tuple[str, str, int | None]]:
     parameters is a program no other cell of the model's draws."""
     layouts = load("layout_parity").LAYOUTS
     seen, chosen = set(), []
-    for model, layout, devices in sorted(cells(judged=True) + cells(judged=False)):
+    for model, layout, devices in sorted(cells()):
         split = tuple(sorted((axis, size) for axis, size in layouts[layout].items()
                              if axis in PARAMETER_AXES and size > 1))
         if split and (model, layout) not in REFUSED and (model, split, devices) not in seen:
@@ -148,40 +136,97 @@ def named(cases) -> list[str]:
 
 def statuses(rows):
     """The rows' statuses, with what explains each, whole, where an assertion shows them."""
-    shown = ("layout", "status", "worst_leaf", "worst_ratio", "loss_error", "loss_bound", "flops_ratio",
-             "flops_bound", "reason", "error")
+    shown = ("layout", "status", "flops_ratio", "flops_bound", "reason", "error")
     return [row["status"] for row in rows], "\n".join(
         " ".join(f"{key}={row.get(key)}" for key in shown) for row in rows)
 
 
-@pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells(judged=False), ids=named(cells(judged=False)))
-def test_each_layout_of_a_model_runs_or_is_refused_as_stated(model, layout, devices, references):
-    """Each run-once layout (`RUN_ONCE`) compiles and takes its first step, its sample the one-device
-    reference's and its FLOPs an even split, or is refused for the reason REFUSED gives: a refused cell
-    that runs fails, as does a supported one that raises. EDM2's cells, the slowest, compile-bound, took 49
-    to 64 s each over CI's shared XLA cache on armada's 25/17 workers (62a555f178)."""
+def assert_matches_one_device(model, layout, devices, references, seeds: int, window: int = 1):
+    """A cell of the matrix: `layout`'s first step on `model` over `seeds` draws (each a `window` of
+    consecutive draws) on par with one device's (check 1, `layout_parity.judged`) and its FLOPs an even
+    split, or refused for the reason REFUSED gives."""
     tool, draws = references
     with jax.enable_x64(new_val=True):
-        rows = tool.run([model], (layout,), dtype="float32", seeds=0, mixture={}, objective={},
-                        references=draws, speak=lambda line: None, keep=lambda rows: None,
+        rows = tool.run([model], (layout,), dtype="float32", seeds=seeds, windows=window, mixture={},
+                        objective={}, references=draws, speak=lambda line: None, keep=lambda rows: None,
                         devices=devices)
     found, shown = statuses(rows)
     assert found == ["refused" if (model, layout) in REFUSED else "works"], shown
 
 
+UNSHARDED = cells(*SEEDS)
+
+
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells(judged=True), ids=named(cells(judged=True)))
-def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model, layout, devices,
-                                                                           references):
-    """Each layout's first step matches one device's by the floor judge (`layout_parity.floored`): its
-    loss and each gradient leaf within FLOOR_FACTOR of the reference's own deviation under reassociating
-    its sums, and its FLOPs an even split, or it is refused for the reason REFUSED gives."""
-    tool, _ = references
-    with jax.enable_x64(new_val=True):
-        rows = tool.floored(model, (layout,), dtype="float32", devices=devices)
-    found, shown = statuses(rows)
-    assert found == ["refused" if (model, layout) in REFUSED else "works"], shown
+@pytest.mark.parametrize(("model", "layout", "devices"), UNSHARDED, ids=named(UNSHARDED))
+def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layout, devices, references):
+    """Each layout's first step on par with one device's over its model's SEEDS draws (check 1), its FLOPs
+    an even split, or refused for the reason REFUSED gives."""
+    assert_matches_one_device(model, layout, devices, references, SEEDS[model])
+
+
+def marked_seeds(request) -> int:
+    """The seeds a sharded cell declares: its test's `check1_shards` mark's, which CI's plan reads."""
+    return request.node.get_closest_marker("check1_shards").kwargs["seeds"]
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("model", "layout", "devices"), cells("dense_grpo"), ids=named(cells("dense_grpo")))
+@pytest.mark.check1_shards(seeds=512, per_task=128)
+def test_a_grpo_decoders_layouts_match_one_device(model, layout, devices, references, request):
+    """The matrix's cells (`assert_matches_one_device`) of the dense GRPO decoder, its draws as map tasks:
+    its tensor4 cell judged 512 draws in 65 s whole (armada vq-layout-judge, 11-06)."""
+    assert_matches_one_device(model, layout, devices, references, marked_seeds(request))
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("model", "layout", "devices"), cells("moe_grpo"), ids=named(cells("moe_grpo")))
+@pytest.mark.check1_shards(seeds=512, per_task=64)
+def test_a_grpo_mixtures_layouts_match_one_device(model, layout, devices, references, request):
+    """The matrix's cells (`assert_matches_one_device`) of the GRPO mixture of experts, its draws as map
+    tasks."""
+    assert_matches_one_device(model, layout, devices, references, marked_seeds(request))
+
+
+ROUTED_TAIL = cells("routed_tail")
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("model", "layout", "devices"), ROUTED_TAIL, ids=named(ROUTED_TAIL))
+@pytest.mark.check1_shards(seeds=32, per_task=2)
+def test_a_routed_tails_pipeline_matches_one_device(model, layout, devices, references, request):
+    """The matrix's cell (`assert_matches_one_device`) of the routed tail's four stages, its draws as map
+    tasks: its 64-row batch (`layout_parity.PLACED_ROWS`) sized paired at 32 seeds in 1879 s (armada
+    vq-layout-size4, 11-06), a pipeline's draws slow on a CPU."""
+    assert_matches_one_device(model, layout, devices, references, marked_seeds(request))
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("model", "layout", "devices"), cells("unet"), ids=named(cells("unet")))
+@pytest.mark.check1_shards(seeds=128, per_task=24)
+def test_a_unets_layouts_match_one_device(model, layout, devices, references, request):
+    """The matrix's cells (`assert_matches_one_device`) of the U-Net, its draws as map tasks: its tensor4
+    cell judged 128 draws in 116 s whole (armada vq-layout-judge, 11-06)."""
+    assert_matches_one_device(model, layout, devices, references, marked_seeds(request))
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("model", "layout", "devices"), cells("edm2"), ids=named(cells("edm2")))
+@pytest.mark.check1_shards(seeds=512, per_task=64)
+def test_edm2s_layouts_match_one_device(model, layout, devices, references, request):
+    """The matrix's cells (`assert_matches_one_device`) of EDM2's magnitude-preserving U-Net, its draws as
+    map tasks: its fsdp2_tensor2 cell judged 512 draws in 117 s whole (armada vq-layout-judge, 11-06), where
+    the floor judge had left it out (rows 1323, 827)."""
+    assert_matches_one_device(model, layout, devices, references, marked_seeds(request))
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("model", "layout", "devices"), cells("edm2_level"), ids=named(cells("edm2_level")))
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_edm2s_level_conditioned_layouts_match_one_device(model, layout, devices, references, request):
+    """The matrix's cells (`assert_matches_one_device`) of EDM2's level-conditioned U-Net, its draws as map
+    tasks."""
+    assert_matches_one_device(model, layout, devices, references, marked_seeds(request))
 
 
 @pytest.mark.mesh(devices=8)

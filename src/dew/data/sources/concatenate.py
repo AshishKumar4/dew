@@ -107,11 +107,15 @@ class Concatenate(Dataset):
         countable = any(manifest.counted is not None for manifest in manifests) and all(
             manifest.counted is not None or all(shard.rows is not None for shard in manifest.shards)
             for manifest in manifests)
-        divisible = any(manifest.subdivide is not None for manifest in manifests)
+        divisible = [manifest for manifest in manifests if manifest.subdivide is not None]
+        # Its parts are fixed where every store it cuts cuts its own so (a Parquet store's row groups): a read
+        # by more readers than its shards cuts every store, past each one's shards.
         return ShardManifest(_joined(manifest.shards for manifest in manifests),
                              functools.partial(_read_joined, manifests), index_ordered=ordered,
                              subdivide=functools.partial(_subdivided, manifests) if divisible else None,
-                             counted=functools.partial(_counted, manifests) if countable else None)
+                             counted=functools.partial(_counted, manifests) if countable else None,
+                             fixed_parts=bool(divisible) and all(manifest.fixed_parts
+                                                                 for manifest in divisible))
 
 
 def _joined(shards: Iterable[Iterable[Shard]]) -> tuple[Shard, ...]:

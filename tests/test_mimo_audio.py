@@ -58,13 +58,14 @@ MEL_SEEDS = 8
 
 
 def mel_draw(seed: int) -> dict[str, np.ndarray]:
-    """A seed's half second of waveform at 24 kHz."""
-    return {"waveform": (np.random.default_rng([59, seed]).standard_normal(12000) * 0.3).astype(np.float32)}
+    """A seed's tenth of a second of waveform at 24 kHz: eleven frames, the recording's outputs whole within
+    what git keeps (tools/fetched_fixtures.py's IN_GIT)."""
+    return {"waveform": (np.random.default_rng([59, seed]).standard_normal(2400) * 0.3).astype(np.float32)}
 
 
-def mel_frames(dtype, inputs) -> dict:
-    """MiMo's log mel frames of a draw's waveform at `dtype` (`MiMoAudioTokenizer.mel`), on the host."""
-    return {"mel": MiMoAudioTokenizer().mel()(inputs["waveform"], np.dtype(dtype))}
+def mel_frames(_, inputs) -> dict:
+    """MiMo's log mel frames of a draw's waveform (`MiMoAudioTokenizer.mel`), float32 on the host."""
+    return {"mel": MiMoAudioTokenizer().mel()(inputs["waveform"])}
 
 
 def pipeline_arms(_):
@@ -73,8 +74,8 @@ def pipeline_arms(_):
 
 
 def test_log_mel_frames_are_as_exact_as_torchaudio():
-    """MiMo's 24 kHz, 128-mel frames of half a second from transformers' shared STFT and filters, on par
-    with torchaudio's MelSpectrogram over drawn waveforms (check 1)."""
+    """MiMo's 24 kHz, 128-mel frames from transformers' shared STFT and filters, on par with torchaudio's
+    MelSpectrogram over drawn waveforms (check 1), its float64 run recorded whole."""
     assert_as_exact_as_recorded(MEL, "mimo-mel", MEL_SEEDS, mel_draw, mel_frames, "log mel", host=True)
 
 

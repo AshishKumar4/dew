@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -218,10 +219,12 @@ def test_a_start_interrupted_before_its_command_runs_leaves_nothing_behind(tmp_p
 def test_a_start_interrupted_as_a_descriptor_opens_leaves_it_closed(opened, nth):
     """An interruption that lands the moment one of `start`'s descriptors opens (its own pipes, `os.pipe2`,
     or the one Popen opens to hear its child's execution, `os.pipe`), before anything holds it, closes it
-    and leaves no lifeline: the start lets it land once every descriptor it opened is held. A signal
-    raised as the call returns, its handler raising, is how one lands there (a Ctrl-C, a deadline's alarm);
-    a millisecond's alarm reached it rarely, leaking the pair (two trains' cleanup reds)."""
+    and leaves no lifeline once `start` raises: the signal reaches the main thread, whose handler raises
+    there, as a Ctrl-C or a deadline's alarm does, while the start runs on. A millisecond's alarm reached
+    that moment rarely, leaking the pair (two trains' cleanup reds)."""
     calls = {"seen": 0}
+    main = threading.main_thread().ident
+    assert main is not None
 
     def interrupt(number: int, frame: object) -> None:
         raise Interrupted
@@ -230,24 +233,23 @@ def test_a_start_interrupted_as_a_descriptor_opens_leaves_it_closed(opened, nth)
         if event == "c_return" and called is getattr(os, opened):
             calls["seen"] += 1
             if calls["seen"] == nth:
-                signal.raise_signal(signal.SIGALRM)
+                signal.pthread_kill(main, signal.SIGALRM)
 
     previous = signal.signal(signal.SIGALRM, interrupt)
     descriptors, held = len(os.listdir("/proc/self/fd")), lifelines()
     try:
+        # On whichever thread the start opens its descriptors.
         sys.setprofile(profile)
+        threading.setprofile(profile)
         with pytest.raises(Interrupted):
             try:
                 stop(start(["sleep", "600"]))
             finally:
                 sys.setprofile(None)
+                threading.setprofile(None)
     finally:
         signal.signal(signal.SIGALRM, previous)
     assert calls["seen"] >= nth
-    # A lifeline let go ends on its own pipe's close, a moment after.
-    deadline = time.monotonic() + 30
-    while lifelines() > held and time.monotonic() < deadline:
-        time.sleep(0.1)
     assert (len(os.listdir("/proc/self/fd")), lifelines()) == (descriptors, held)
 
 

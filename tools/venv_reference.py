@@ -72,13 +72,13 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                              "End2End-Diffusion/iREPA "
                                              "99ad4ac234efe8de52ce157120f72856e836d09f",
                                 "license": "MIT"},
+         "mimo-mel": {"test": "test_mimo_audio", "arms": "mel", "worker": "torchaudio_mel_worker.py",
+                      "reference": "pytorch/audio 2.11.0 MelSpectrogram", "license": "BSD-2-Clause",
+                      "distribution": ("torchaudio", "2.11.0+cpu"), "host": True, "outputs": True},
          **{"flaxdiff-" + case.replace("/", "-"): {
              "test": "test_flaxdiff_family_source", "arms": case, "worker": "flaxdiff_family_worker.py",
              "reference": "AshishKumar4/FlaxDiff 15c55b001304604147a2a8002a76cf5d4c32092f", "license": "MIT"}
             for case in importlib.import_module("flaxdiff_family_cases").CASES},
-         "mimo-mel": {"test": "test_mimo_audio", "arms": "mel", "worker": "torchaudio_mel_worker.py",
-                      "reference": "pytorch/audio 2.11.0 MelSpectrogram", "license": "BSD-2-Clause",
-                      "distribution": ("torchaudio", "2.11.0+cpu"), "host": True},
          **{f"multimodal-{family}": {"test": "test_multimodal_model", "arms": family,
                                      "worker": "multimodal_worker.py",
                                      "reference": "huggingface/transformers 5.16.1",
@@ -87,7 +87,8 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          **{f"codec-{family}-{kind}": {"test": "test_codec_checkpoints", "arms": f"{family}/{kind}",
                                        "worker": "codec_worker.py",
                                        "reference": "neuralmagic/compressed-tensors 0.17.1 with "
-                                                    "huggingface/transformers 5.16.1", "license": "Apache-2.0",
+                                                    "huggingface/transformers 5.16.1",
+                                       "license": "Apache-2.0",
                                        "distribution": ("compressed-tensors", "0.17.1")}
             for family, kind in (("nvfp4_qdq", "unrounded"), ("nvfp4_qdq", "e4m3"), ("storage", "fp8"),
                                  ("storage", "nvfp4"))},

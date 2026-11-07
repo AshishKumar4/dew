@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_runs import assert_as_exact_as_recorded
+from reference_runs import assert_arms_as_recorded
 from torch_layout import QKV, dew_leaf, join_qkv, node, split_qkv, torch_leaf
 
 from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
@@ -190,5 +190,4 @@ def pipeline_arms(case: str):
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_embeddings_predictions_and_every_gradient_are_as_exact_as_v_jepas(case):
     """Dew's embeddings, predictions and gradients as exact as V-JEPA's float32 against float64 (check 1)."""
-    fixture, draw, dew, _ = pipeline_arms(case)
-    assert_as_exact_as_recorded(fixture, f"jepa-{case}", JEPA_SEEDS[case], draw, dew, f"V-JEPA {case}")
+    assert_arms_as_recorded(pipeline_arms(case), f"jepa-{case}", JEPA_SEEDS[case], f"V-JEPA {case}")

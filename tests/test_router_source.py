@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_runs import assert_as_exact_as_recorded
+from reference_runs import assert_arms_as_recorded
 
 from dew.nn.moe import Router
 
@@ -122,5 +122,4 @@ def pipeline_arms(case: str):
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_router_chooses_and_weighs_as_vllm(case):
     """Dew's weight of every expert as exact as vLLM's float32 against float64 (check 1)."""
-    fixture, draw, dew, _ = pipeline_arms(case)
-    assert_as_exact_as_recorded(fixture, f"router-{case}", ROUTER_SEEDS[case], draw, dew, f"{case} router")
+    assert_arms_as_recorded(pipeline_arms(case), f"router-{case}", ROUTER_SEEDS[case], f"{case} router")

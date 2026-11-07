@@ -30,6 +30,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `joining()`), with Open MPI, Slurm, Cloud TPU, Kubernetes and `dew launch`'s pool built in. `prepare_process(cluster=...)`
   joins a scheduler's pool without `dew launch`, a scheduler of your own among them; `dew launch` reads the same
   environments, through public `jax.distributed.initialize` alone.
+- A decision run's question rows can ask a request's questions over one copy of its state (`--shared-state n`,
+  `QuestionLayout.shared_state`): a row holds the state once and up to `n` questions after it, each read as
+  its own row reads it, at its own row's positions, so a request of `q` questions reads its state once a row
+  rather than `q` times. `--siblings` lets each question also read the questions before it in its row. A
+  request that outgrows a row takes several, each repeating the state.
 - The `cuda12` and `cuda13` extras install `dew-cutlass` 0.1.0 (`dew-cutlass-cu12` or `dew-cutlass-cu13`, on
   Linux x86_64 and aarch64), Dew's build of CUTLASS's grouped GEMMs, whose kernels are Hopper's. On an sm90
   GPU (an H100, an H200 or a GH200) a mixture of experts' projection now runs CUTLASS on the two grouped cells

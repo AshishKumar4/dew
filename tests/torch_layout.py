@@ -58,14 +58,6 @@ def torch_leaf(path: tuple[str, ...], value: np.ndarray) -> np.ndarray:
     return torch_kernel(value) if path[-1] == "kernel" else value
 
 
-def case_arrays(arrays, case: str):
-    """A reference fixture's arrays of one case, written as `<case>/<name>`: a reader of them by
-    `name`, and the case's parameter names (`<case>/param.<name>`) in the file's order."""
-    prefix = f"{case}/param."
-    return (lambda name: arrays[f"{case}/{name}"]), [name.removeprefix(prefix) for name in arrays
-                                                     if name.startswith(prefix)]
-
-
 def node(tree, path: tuple[str, ...]):
     """The node at `path` in a nested tree."""
     for key in path:

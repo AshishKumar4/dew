@@ -2,7 +2,7 @@
 
 Over drawn weights, images, text states, times and a cotangent, Dew's UViT's output and the gradients of
 the cotangent's product with respect to the image, the text and every parameter are as exact as U-ViT's
-float32 run against its float64 run (check 1), each configuration of tools/uvit_worker.py's CASES its own
+float32 run against its float64 run (check 1), each configuration of CASES its own
 recording (tools/venv_reference.py's `uvit-<case>` sites), Dew's float64 run held to the recorded sketch.
 """
 
@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_runs import assert_as_exact_as_recorded
+from reference_runs import assert_arms_as_recorded
 from torch_layout import QKV, dew_leaf, join_qkv, node, split_qkv, torch_leaf
 
 from dew.nn.backbones.uvit import UViT
@@ -188,5 +188,4 @@ def pipeline_arms(case: str):
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_output_and_every_gradient_are_as_exact_as_u_vits(case):
     """Dew's output and gradients as exact as U-ViT's float32 against float64 (check 1)."""
-    fixture, draw, dew, _ = pipeline_arms(case)
-    assert_as_exact_as_recorded(fixture, f"uvit-{case}", UVIT_SEEDS[case], draw, dew, f"U-ViT {case}")
+    assert_arms_as_recorded(pipeline_arms(case), f"uvit-{case}", UVIT_SEEDS[case], f"U-ViT {case}")
