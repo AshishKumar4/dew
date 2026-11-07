@@ -397,6 +397,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
 
     takes_pairs = False
 
+    takes_register_left = False
+
     takes_block_scales = True
 
     operands_in_registers = False
@@ -717,6 +719,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
     # Mosaic GPU's tcgen05 lowering takes no TF32 operand ("Unsupported input element type: tf32",
     # jsf-gate100b): an fp32 product takes bf16 parts.
     takes_fp8 = True
+    takes_register_left = False
     rows = 64
     role_rows = 64
     widest_product = 256
