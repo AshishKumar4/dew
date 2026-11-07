@@ -24,11 +24,13 @@ def loaded(tmp_path: Path, monkeypatch):
 
 
 def interpreter(root: Path, version: str) -> None:
-    """The checkout's `.venv-<version>` python, as the CI image has it: here, this interpreter."""
+    """The checkout's `.venv-<version>` python and its py-spy, as the CI image has them: here, this
+    interpreter and its environment's."""
     venv = root / f".venv-{version}/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
+    (venv / "py-spy").symlink_to(Path(sys.executable).with_name("py-spy"))
 
 
 def written(root: Path, files: dict[str, str]) -> None:
