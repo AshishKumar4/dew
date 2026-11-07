@@ -1048,6 +1048,28 @@ def test_a_blackwells_mx_product_runs_the_template_named_for_it():
     _assert_launches("sm100", "mx projection", _mx_projection, 2, "dew_gmm")
 
 
+def _nvfp4_block_projection():
+    """An NVFP4 MoE projection, both operands E2M1 (`gemm.nvfp4_block_product`: 2048 deep, 768 wide, eight
+    experts of whole 128-row blocks) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def product(rows, matrices):
+        with generation.chosen(nvfp4_block="mosaic_gpu"):
+            operands = (gemm.NvFp4Block.quantized(rows), gemm.NvFp4Block.quantized(matrices))
+            return gemm.nvfp4_block_product(*operands, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
+                                            out_dtype=jnp.bfloat16)
+
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return product, (f32((8192, 2048)), f32((8, 768, 2048)))
+
+
+def test_a_blackwells_nvfp4_product_runs_the_template_named_for_it():
+    """An NVFP4 MoE projection, the template named, compiled for a compile-only B200: its program launches
+    the template's grouped product (`kernel_compile.Expected`), each sixteen depths of its E2M1 operands
+    scaled by their E4M3 scales in the block-scaled tensor cores' products (`kind::mxf4nvf4`, row 4519)."""
+    _assert_launches("sm100", "nvfp4 projection", _nvfp4_block_projection, 2, "dew_gmm")
+
+
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
     A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two
