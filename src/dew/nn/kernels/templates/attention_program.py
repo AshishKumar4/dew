@@ -35,21 +35,22 @@ def finished(spec: algebra.Forward, walked, keys_at: Callable[[jax.Array], algeb
              resumed: tuple[jax.Array, jax.Array, jax.Array] | None, *, training: bool, output_mod=None,
              output_params: tuple = ()) -> tuple:
     """A program's outputs from its walk (`walk`): the normalized output, its rows' maximum and denominator
-    (`algebra.finish`), and with `training` its anchor keys and split sums (`algebra.split_written`), a
-    guarded walk's live rows' from a normalized pass over its key tiles `bounds` at the walk's maximum and
-    denominator (`algebra.normalized_pass`, from the initial state's share)."""
-    kept = ()
-    state = walked
-    if training:
-        def normalized():
-            return algebra.normalized_pass(spec, walked, keys_at, rows, bounds,
-                                           None if resumed is None else (resumed[0], resumed[2]))
-
-        state, anchors, sums = algebra.split_written(walked, rows, normalized)
-        kept = (anchors, *sums)
+    (`algebra.finish`), and with `training` its anchor keys and split sums (`algebra.split_residuals`), a
+    guarded walk's live rows' from the normalized pass at the walk's final statistics and anchors
+    (`algebra.normalized_pass`, from the initial state's share)."""
+    state = algebra.joined(walked, rows) if training else walked
     out, m, denominator = algebra.finish(spec, state, initial=resumed is not None, output_mod=output_mod,
                                          output_params=output_params)
-    return (out, m, denominator, *kept)
+    if not training:
+        return out, m, denominator
+    split, arg, own, others_total = walked
+
+    def normalized():
+        return algebra.normalized_pass(spec, state.m, m, denominator, arg.key, keys_at, bounds,
+                                       split.acc.shape[-1],
+                                       None if resumed is None else (resumed[0], resumed[2]))
+
+    return (out, m, denominator, arg.key, *algebra.split_residuals(split, own, others_total, normalized))
 
 
 def off_anchor_pass(lo, hi, formed: Callable[[jax.Array], tuple[jax.Array, jax.Array, jax.Array]],
