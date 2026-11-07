@@ -46,7 +46,7 @@ from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
-from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
 from dew.objectives.base import Step
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES
 from dew.registry import ModelConfig

@@ -25,14 +25,8 @@ from reference_error import as_given, assert_as_exact, assert_rounds_where_the_r
 from reference_runs import assert_as_exact_as_recorded
 from tool_support import run_from
 
-from dew.nn.mimo_audio import (
-    AudioTokenizerEncoder,
-    MiMoAudioCodeEncoder,
-    MiMoAudioTokenizer,
-    batch_longest,
-    translate_mimo_audio_config,
-    translate_mimo_audio_weights,
-)
+from dew.interop.towers.mimo_audio import translate_mimo_audio_config, translate_mimo_audio_weights
+from dew.nn.mimo_audio import AudioTokenizerEncoder, MiMoAudioCodeEncoder, MiMoAudioTokenizer, batch_longest
 from dew.nn.norms import RMSNorm
 from dew.nn.quantizers import residual_quantize
 from dew.registry import towers
