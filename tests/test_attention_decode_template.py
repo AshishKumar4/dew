@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation
@@ -262,14 +262,14 @@ PAGE = 128
 
 
 @INTERPRETS
-@pytest.mark.parametrize("page", [PAGE, 16])
+@pytest.mark.parametrize("page", [PAGE, 16, 1])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
 def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page):
     """A decode step over a paged cache (pools `[KV, P, page, D]` and their page table, each row's pages in an
     order of its own, some the other row's neighbours), read by the template where its table maps each key
     tile, on par with the reference path over the cache gathered dense (check 1): pages of whole key tiles,
-    and pages of 16 keys, the docs' (docs/concepts/inference.md), several to a key tile, each loaded on its
-    own (`mosaic.Pieces`, row 3648)."""
+    and pages of 16 keys, the docs' (docs/concepts/inference.md), and of one, several to a key tile, its rows
+    gathered through the table a key at a time (`attention_mosaic_forward.paged_reads`, row 4772)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     per_row = KEYS // page
@@ -388,6 +388,27 @@ def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.
     totals.append(jnp.zeros_like(totals[0]))
     maximum, total = (jnp.transpose(jnp.stack(x, axis=1), (0, 3, 1, 2)) for x in (maxima, totals))
     return jnp.stack(outs, axis=1), maximum, total
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("page", [16, 4, 1])
+def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100(page):
+    """A decode step over a paged pool of `page` keys a page, fewer than its derived key tile holds, lowered
+    and compiled for an H100 (compile-only, `kernel_compile.lowered_for`): its key tiles' rows gathered
+    through the table by the loading warpgroup's cp.async copies (`gathered.Ring`, row 4772), whatever the
+    page, where pages under 8 keys derived no launch before."""
+    from kernel_compile import lowered_for
+
+    keys, kv_heads, width = 4096, 8, 128
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
+    query = jax.ShapeDtypeStruct((2, 1, 32, width), jnp.bfloat16)
+    pool = jax.ShapeDtypeStruct((kv_heads, 2 * keys // page, page, width), jnp.bfloat16)
+    table = jax.ShapeDtypeStruct((2, keys // page), jnp.int32)
+
+    def decode(query, key_pool, value_pool, table):
+        return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
+
+    assert "mosaic_gpu" in lowered_for(decode, (query, pool, pool, table), "sm90").compile().as_text()
 
 
 @pytest.mark.parametrize("slices", [1, 3, 7])

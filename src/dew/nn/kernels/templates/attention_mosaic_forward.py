@@ -131,15 +131,16 @@ def _stores_through_query(family: mosaic.Family, width: int, value_width: int, d
 
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
-                         pieces: int = 1, certified: bool = False, codes=None, parts: int = 1
-                         ) -> tuple[list, dict]:
+                         page: int | None = None, certified: bool = False, codes=None, parts: int = 1,
+                         interpret: bool = False) -> tuple[list, dict]:
     """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order: its consumers'
     query stages and their rows' status; each one's output stage where the value is not as wide as the query
     and as narrow, `out_dtype`, the query's by default (the output stores through the query's stage where it
     is), a training forward's its split sums' fp32 (`_Residuals`); a training forward's or a peak walk's
     anchor keys' stage; the query loads' barriers and
     the consumers' turns' barrier; and its key and value streams in `stages` slots (`Family.streams`), a
-    peak walk's keys alone, each slot loaded in `pieces` copies (a paged call's tile of several pages); the
+    peak walk's keys alone, a paged call's tile of several pages of `page` keys loaded as `paged_reads` reads
+    it (interpreted, a gathered tile a copy a row of each of its swizzled tiles' columns, `Ring.parts`); the
     query's stage at its swizzle (`query_swizzle`); a certify form's fp32 stage of a step's sums last
     (`certified_walk`). An fp32 call's `parts` (`MosaicForward.parts`) stage each tile's parts one above the
     other, the query's and each slot's rows `parts` times theirs, a part a copy of its own, its query loads a
@@ -171,8 +172,30 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     if not peaks:
         blocks["values"] = ((parts * block_k, value_width), stored)
     # The logits' product reads the keys transposed.
-    return scoped, family.streams(blocks, stages, consumers, swizzles=transposed_swizzles(tiles, "keys"),
-                                  copies=dict.fromkeys(blocks, pieces * parts))
+    swizzles = transposed_swizzles(tiles, "keys")
+    pieces = tiles.block_k // page if page is not None and page < tiles.block_k else 1
+    if pieces == 1 or not family.gathers_rows:
+        return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles,
+                                      copies=dict.fromkeys(blocks, pieces * parts))
+    if not interpret:
+        return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=tuple(blocks))
+    # A copy a row of each swizzled tile's columns (`mosaic.Ring.parts`), where no lane-level copy runs.
+    unit = {name: mosaic.swizzle_columns(stored, swizzles.get(name, mosaic.SWIZZLE_BYTES)) for name in blocks}
+    copies = {name: shape[0] * max(1, shape[1] // unit[name]) for name, (shape, _) in blocks.items()}
+    return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, copies=copies)
+
+
+def paged_reads(family: mosaic.Family, table: jax.Array, page: int, block_k: int) -> tuple[jax.Array, int]:
+    """A paged call's page table `[B, pages]` and its keys a page as its launch reads a key tile through them
+    (`_paged_views`): where a tile spans several pages and `family` gathers rows (`gathered.Ring`: the loading
+    warpgroup's cp.async copies, one copy a tile whatever the page), a table of one-key pages, each slot's row
+    of the pools (`table[b, s // page] * page + s % page`), so any page that divides the tile takes it, one
+    key a page (a page-1 pool's own); else the table and page as they are (whole tiles a page, or whole pages
+    a tile in pieces, `_pages_hold`)."""
+    if page >= block_k or not family.gathers_rows:
+        return table, page
+    rows = table[:, :, None] * page + jnp.arange(page, dtype=table.dtype)
+    return rows.reshape(table.shape[0], -1), 1
 
 
 def relays(family: mosaic.Family, tiles: Tiles, *, peaks: bool = False) -> bool:
@@ -380,7 +403,8 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     computed = query.dtype if scales is not None else value.dtype
     # A paged call's table, its rows' pages whole blocks of the call's, and its pools' page (`_launch`'s
     # `table`).
-    paged = None if call.table is None or call.page is None else (call.table, call.page)
+    paged = (None if call.table is None or call.page is None
+             else paged_reads(family, call.table, call.page, tiles.block_k))
 
     def launch(form: algebra.Forward, live: "jax.Array | _Flags | None", into: tuple | None = None
                ) -> "tuple[tuple, jax.Array, jax.Array] | tuple[tuple, None, _Flags]":
@@ -1741,12 +1765,11 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
     reuse = _stores_through_query(family, width, value_width, query.dtype, out_dtype)
-    # A paged call's key tile of several pages loaded a page at a time (`_paged_views`).
-    pieces = block_k // page if page is not None and page < block_k else 1
+    # A paged call's key tile of several pages loaded as its table reads it (`paged_reads`, `_paged_views`).
     scoped, rings = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
-                                         program.stages, peaks=peaks, out_dtype=out_dtype, pieces=pieces,
+                                         program.stages, peaks=peaks, out_dtype=out_dtype, page=page,
                                          certified=certified, codes=_codes_of(key, read.hooked.scales),
-                                         parts=parts)
+                                         parts=parts, interpret=bool(interpret))
     out_type = _out_types(batch, queries, heads, value_width * column_blocks, out_dtype, splits=splits,
                           peaks=peaks, training=training, finishes=finishes,
                           certified=steps if certified else 0, merges=merges, flags=flags)

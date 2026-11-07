@@ -1632,9 +1632,10 @@ class Transport[Allocated, Opened](abc.ABC):
     pages: `mosaic_sm80._run`)."""
 
     gathers_rows: bool = False
-    """Whether its producer warpgroup gathers a step's rows from a table (a gathered stream's `Rows` of one
-    row: `gathered.Ring`, its threads' cp.async copies; a ring family's); where not (mma.sync's pipeline, no
-    producer of its own), a gathered call is not its launch's."""
+    """Whether the warpgroup loading its rings gathers a step's rows from a table (a gathered stream's `Rows`
+    of one row: `gathered.Ring`, its threads' cp.async copies; a ring family's producer, or a consumer that
+    feeds its rings); where not (mma.sync's pipeline, whose `emit_pipeline` loads them), a gathered call is
+    not its launch's."""
 
     copies_vectors: bool = True
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
@@ -2168,7 +2169,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 gathered: tuple[str, ...] = ()) -> dict:
         from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `Ring`
 
-        return {name: gathered_rows.ring(shape, dtype, stages, consumers=consumers) if name in gathered
+        return {name: gathered_rows.ring(shape, dtype, stages, consumers=consumers,
+                                         swizzle=(swizzles or {}).get(name)) if name in gathered
                 else ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
                           swizzle=(swizzles or {}).get(name), copies=(copies or {}).get(name, 1))
                 for name, (shape, dtype) in blocks.items()}
@@ -2177,9 +2179,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         from dew.nn.kernels.templates import gathered  # it builds on `Ring`
 
         del views
-        # A gathered stream's load barriers are shared memory of its own (`gathered.ring`).
-        return {name: (Ring if isinstance(scoped['full'].dtype, plgpu_core.BarrierType) else gathered.Ring)(
-                    **scoped) for name, scoped in allocated.items()}
+        # A gathered stream's load barriers are shared memory of its own (`gathered.ring`), initialized here,
+        # where every warpgroup opens its rings before the roles split (`Ring.initialized`).
+        rings = {name: (Ring if isinstance(scoped['full'].dtype, plgpu_core.BarrierType) else gathered.Ring)(
+                     **scoped) for name, scoped in allocated.items()}
+        for ring_ in rings.values():
+            ring_.initialized()
+        return rings
 
     def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
         rings = tuple(streams.values())
@@ -2202,8 +2208,6 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
-        for ring_ in rings.values():
-            ring_.initialized()
         staging = self.output_staging(outputs, consumers)
 
         def producer():
