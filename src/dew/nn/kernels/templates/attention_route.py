@@ -106,19 +106,26 @@ def _on_gpu() -> bool:
     return generation.backend() == 'gpu' and generation.bf16_dot_runs()
 
 
-DROPS_NOT = ("the template's GPU mainloops draw no probability dropout yet (the Triton mainloop takes none, "
-             "and Mosaic's takes the weights hook next, ledger row 1521): a dropping call there runs the "
-             "plain-JAX mainloop, so the selector leaves it to the reference path")
-"""Why 'auto' leaves a dropping call on a GPU to the reference path (`drops`)."""
+def _on_mosaic() -> bool:
+    """Whether the Mosaic mainloop runs where calls are chosen for: a GPU's (`_on_gpu`) or a TPU core's, its
+    MXU bundle (`mosaic_tpu.MXU`, whose launches the attention programs take through the family's seams)."""
+    return _on_gpu() or generation.backend() == 'tpu'
 
 
-def drops() -> bool:
-    """Whether the route's own mainloop here draws probability dropout: the plain-JAX mainloop's, where it
-    runs every call (off a GPU, or on one before sm80, where the GPU mainloops do not run, `_on_gpu`). On an
-    sm80 or later GPU the route's mainloops are Triton's and Mosaic's, whose legality rules refuse a dropping
-    call (`attention_triton.refused`, `attention_mosaic.refused`), so it runs the plain-JAX one there
-    (`DROPS_NOT`)."""
-    return not _on_gpu()
+DROPS_NOT = ("the template's GPU mainloops draw probability dropout over bf16 operands alone (the "
+             "Mosaic dropping walk's, forward and fused backward; the Triton mainloop takes none): a "
+             "dropping call of another dtype there would run the plain-JAX mainloop, so the selector leaves "
+             "it to the reference path")
+"""Why 'auto' leaves a dropping call on a GPU of another dtype to the reference path (`drops`)."""
+
+
+def drops(dtype) -> bool:
+    """Whether the route's own mainloop here draws probability dropout over operands of `dtype`: the plain-JAX
+    mainloop's off a GPU (or on one before sm80, where the GPU mainloops do not run, `_on_gpu`), and the
+    Mosaic mainloop's dropping walk over bf16 operands on an sm80 or later GPU, its forward and its fused
+    backward (`attention_mosaic_program.refused`: fp16's dropped weights take scaled parts it does not take
+    back); another dtype there runs the plain-JAX one (`DROPS_NOT`)."""
+    return not _on_gpu() or jnp.dtype(dtype) == jnp.dtype(jnp.bfloat16)
 
 
 def _attending(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
@@ -149,26 +156,31 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 
 @dataclasses.dataclass(frozen=True)
 class _Pass:
-    """A pass of the template as its mainloop's selector reads it (`MAINLOOP`): whether it runs on a GPU,
-    why the Mosaic mainloop declines it (`attention_mosaic.forward_declined`, `backward_declined`, None where
-    it takes it) and why the Triton one refuses its spans (`attention_triton.refused`)."""
+    """A pass of the template as its mainloop's selector reads it (`MAINLOOP`): whether it runs on a GPU or
+    where the Mosaic mainloop runs (`_on_mosaic`), why the Mosaic mainloop declines it
+    (`attention_mosaic.forward_declined`, `backward_declined`, None where it takes it) and why the Triton one
+    refuses its spans (`attention_triton.refused`)."""
 
     on_gpu: bool
+    on_mosaic: bool
     mosaic: selection.Refusal | None
     triton: selection.Refusal | None
 
 
 _ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the call runs off a GPU",
                                        generation.INHERENT)
+_ON_MOSAIC = selection.Requirement[_Pass]('off_mosaic', lambda case: case.on_mosaic,
+                                          "the call runs on neither a GPU nor a TPU", generation.INHERENT)
 MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
-    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.analysed(
+    selection.Kernel[_Pass]('mosaic', (_ON_MOSAIC, selection.analysed(
         'declined', lambda case: case.mosaic, 'roadmap: the Mosaic template takes every call'))),
     selection.Kernel[_Pass]('triton', (_ON_GPU, selection.analysed(
         'spans', lambda case: case.triton, generation.INHERENT))),
     selection.Kernel[_Pass]('portable', (), generic=True),
-), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')
-"""The template's mainloops, the first that takes a pass: Mosaic GPU's, which a GPU prefers, the Pallas-Triton
-one's (a maintained backend, kernel-templates.md §0), the plain-JAX one's, which a CPU runs.
+), preferred=lambda case: 'mosaic' if case.on_mosaic else 'portable')
+"""The template's mainloops, the first that takes a pass: Mosaic's, which a GPU and a TPU prefer, the
+Pallas-Triton one's on a GPU (a maintained backend, kernel-templates.md §0), the plain-JAX one's, which a
+CPU runs.
 `generation.chosen(attention_mainloop=...)` names one for every pass in its block, which runs it or refuses it
 by name (`selection.select`); each pass reports its route, so the kernel-route audit sees a call on a GPU that
 leaves the Mosaic template, with Mosaic's own reason."""
@@ -180,7 +192,7 @@ def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks,
     the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting)."""
     on_gpu = _on_gpu()
     triton = (attention_triton.refused(spans, hooks) or unfitted()) if on_gpu else None
-    return selection.select(MAINLOOP, _Pass(on_gpu, declined, triton)).kernel
+    return selection.select(MAINLOOP, _Pass(on_gpu, _on_mosaic(), declined, triton)).kernel
 
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
@@ -196,7 +208,7 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     else:
         kept = Kept.SPLIT
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
-                                                 **form) if _on_gpu() else None
+                                                 **form) if _on_mosaic() else None
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
         attention_triton.unfitted, query, key, value, spans, hooks, residuals=kept, **form))
     if mainloop == 'mosaic':
@@ -234,7 +246,7 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     call = (query, key, value, spans, hooks, dout)
     form = {"scale": config.scale, "natural": config.natural, "accurate": config.accurate}
     rounded = config.operand_dtype is None
-    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_gpu()
+    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_mosaic()
                 else None)
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
         attention_triton.backward_unfitted, *call, residuals=residuals, scale=config.scale,
