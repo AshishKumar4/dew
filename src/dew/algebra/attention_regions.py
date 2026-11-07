@@ -203,12 +203,17 @@ a region the selector gives one of keeps the program's math (`taken`)."""
 def taken(region: Attention) -> bool:
     """Whether Dew's selector gives the region's call a kernel of its own (the template, FlashAttention,
     cuDNN; none of `KEPT`): the call traced over its operands' shapes (`written`), its attention route read
-    (`generation.routes`)."""
+    (`generation.routes`); not where a kernel a call names refuses it (`KernelRefused`)."""
     from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import KernelRefused
 
     shapes = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in region.operands]
     with generation.routes(alone=True) as found:
-        jax.eval_shape(written(region), *shapes)
+        try:
+            jax.eval_shape(written(region), *shapes)
+        except KernelRefused:
+            # A kernel a call names that does not take the region's call: the program's own math runs it.
+            return False
     return any(route.choice == "attention" and route.kernel not in KEPT for route in found)
 
 
