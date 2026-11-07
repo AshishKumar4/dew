@@ -973,20 +973,41 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
     return found
 
 
-def draws_of(mark: Mark) -> list[tuple[int, int]]:
-    """The units each map task of a site marked `mark` takes, at most its per_task each: together 0 to its
-    units, every seed both of check 1's stages draw, or every unit of a `shards` test's work; a check-1 site's
-    first stage (0 to its declared seeds, `timed`) and its second each in tasks of their own, the second's
-    `later` (`site_entries`); and its weighed check's units past them (`Mark.weighed`), at most
-    `weighed_per_task` a task, every one later."""
+def draws_of(mark: Mark, per_task: int | None = None, weighed_per_task: int | None = None
+             ) -> list[tuple[int, int]]:
+    """The units each map task of a site marked `mark` takes, at most its per_task each (`per_task` where
+    given, as `cut_draws` cuts finer): together 0 to its units, every seed both of check 1's stages draw, or
+    every unit of a `shards` test's work; a check-1 site's first stage (0 to its declared seeds, `timed`) and
+    its second each in tasks of their own, the second's `later` (`site_entries`); and its weighed check's
+    units past them (`Mark.weighed`), at most `weighed_per_task` a task, every one later."""
+    each = per_task or mark.per_task
     stages = [(0, mark.timed), (mark.timed, mark.units)] if mark.units > mark.timed else [(0, mark.units)]
-    spans = [(start, min(start + mark.per_task, stop)) for first, stop in stages
-             for start in range(first, stop, mark.per_task)]
+    spans = [(start, min(start + each, stop)) for first, stop in stages for start in range(first, stop, each)]
     if not mark.weighed:
         return spans
-    end = mark.units + mark.weighed
-    return spans + [(start, min(start + mark.weighed_per_task, end))
-                    for start in range(mark.units, end, mark.weighed_per_task)]
+    end, weighed = mark.units + mark.weighed, weighed_per_task or mark.weighed_per_task
+    return spans + [(start, min(start + weighed, end)) for start in range(mark.units, end, weighed)]
+
+
+def cut_draws(python: str, name: str, test: str, mark: Mark, measured: Mapping[str, float],
+              target: float) -> list[tuple[int, int]]:
+    """The spans of test file `name`'s site `test`'s map tasks (`draws_of`): its declared per_task each, or
+    fewer where its units' measured rate (`rate`, over the map tasks of any cut armada measured, the
+    unweighted check's and the weighed check's apart) puts a task of its declared cut past `target`: as many
+    as `target` holds at that rate, at least one, so no map task is the run's longest for its mark's cut
+    (row 4376: a 64-seed shard ran 966 s where every other group took 256 s or less). The task's own start
+    is among what the rate measured, so a cut converges from above on the one that fills the target. A cut
+    whose map tasks would pass what its judges' job takes (`MAX_INPUTS`) keeps the finest within it."""
+    def kept(units: int, declared: int, *, weighed: bool) -> int:
+        each = site_rate(python, name, test, mark, measured, weighed=weighed)
+        return declared if not each else max(1, min(declared, int(target // each), units))
+
+    per_task = kept(mark.units, mark.per_task, weighed=False)
+    weighed = kept(mark.weighed, mark.weighed_per_task, weighed=True) if mark.weighed else None
+    while len(draws_of(mark, per_task, weighed)) > MAX_INPUTS:
+        per_task = min(mark.per_task, per_task + 1)
+        weighed = None if weighed is None else min(mark.weighed_per_task, weighed + 1)
+    return draws_of(mark, per_task, weighed)
 
 
 def refused_sites(marked: Mapping[str, Mapping[str, Mark]]) -> None:
@@ -1025,6 +1046,18 @@ def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]],
     return sum(seconds for _, seconds in timed) / sum(units for units, _ in timed) if timed else None
 
 
+def site_rate(python: str, name: str, test: str, mark: Mark, measured: Mapping[str, float], *,
+              weighed: bool) -> float | None:
+    """The seconds a unit of test file `name`'s site `test` takes under `python` (`rate`), over its map tasks
+    of every cut its mark allows (`draws_of` at each per_task up to its declared one) that armada measured:
+    its weighed check's units apart from the rest (`weighed`), as they cost their own."""
+    declared = mark.weighed_per_task if weighed else mark.per_task
+    cuts = {span for each in range(1, declared + 1)
+            for span in (draws_of(mark, None, each) if weighed else draws_of(mark, each, None))
+            if (span[0] >= mark.units) == weighed}
+    return rate(python, name, test, sorted(cuts), measured)
+
+
 def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                  kept: Mapping[tuple[str, str], str], timings: dict, target: float,
                  eager: Container[tuple[str, str]] = ()) -> list[dict]:
@@ -1052,15 +1085,15 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
             if (name, test) in kept:
                 continue
             mark = held[test]
-            spans = draws_of(mark)
+            spans = cut_draws(python, name, test, mark, measured, target)
+            rates = {weighed: site_rate(python, name, test, mark, measured, weighed=weighed)
+                     for weighed in (False, True)}
             maps = []
             for start, stop in spans:
                 group = f"{test}.draws-{start}-{stop}"
                 task_name = site_task(python, name, test, (start, stop))
                 # A weighed check's units cost their own, at the rate of those of them armada measured.
-                weighed = start >= mark.units
-                kind = [span for span in spans if (span[0] >= mark.units) == weighed]
-                each = rate(python, name, test, kind, measured)
+                each = rates[start >= mark.units]
                 weight = measured.get(task_name) or (each * (stop - start) if each is not None else target)
                 # A check-1 site's second-stage seeds, drawn only where its judge's first stage asks for
                 # them (armada's `later`), or at once where its last judgement needed them (`eager`).
