@@ -145,8 +145,9 @@ def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_
 
 def test_a_bfloat16_decoders_step_compiles_ahead_for_an_a100():
     """A bfloat16 decoder's training step compiles ahead for an A100 (`compile_only_gpus("sm80")`): its
-    compile point keys each body's recognition by its equations' parameters, a derivative rule's trees among
-    them, which JAX holds unhashable (row 4783's head: "unhashable type: 'Unhashable'")."""
+    compile point keys each body's recognition by its equations' parameters, the custom VJP's rules its
+    recognized bodies hold among them, which JAX holds unhashable (row 4783's head: "unhashable type:
+    'Unhashable'")."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2,
