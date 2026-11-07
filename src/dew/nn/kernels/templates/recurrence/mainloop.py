@@ -558,10 +558,10 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     family = call.family
     staged, landed = _roles_staged(staging, landing, consumers)
     staged = (*staged, _landed(landed, family))
-    # The products' shared memory and barriers where the family keeps them (`Issuer.product_scratch`, which
-    # `launch_kernel` scopes beside the staging).
-    products = family.product_shared(family.product_scratch(consumers,
-                                                            _product_widths(blocks, staging, call.chunk)))
+    # The products' shared memory and barriers where the family keeps them (`Issuer.product_held`, of the
+    # scratch `launch_kernel` scopes beside the staging).
+    scoped = (consumers, _product_widths(blocks, staging, call.chunk), ())
+    products, addresses = family.product_held(scoped), family.product_addresses(scoped)
 
     def allocations(depth: int) -> dict:
         opened = {"walked": family.streams(blocks, depth, consumers, swizzles=swizzles)}
@@ -571,17 +571,18 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
 
     def scope(depth: int) -> resources.Scope:
         return allocation_scope(family, allocations(depth), (*staged, *products), reduces=reduces,
-                                after=after)
+                                after=after, addresses=addresses)
 
     return allocations, scope, staged, landed
 
 
 def allocation_scope(family: mosaic.Family, streams: dict, staged: tuple, *, reduces: bool = True,
-           after: tuple = ()) -> resources.Scope:
+                     after: tuple = (), addresses: int = 0) -> resources.Scope:
     """A program's allocations by lifetime (`resources.Scope`, whose bytes `resources.shared_bytes` counts as
     Mosaic GPU's resource estimate does): its `streams`' as the family states where they live
     (`Family.lifetimes`: the program's, or each walk's own), its `staged` tiles and barriers the program's,
-    the tiles it scopes `after` its walks (`final_memory_landing`), and whether it `reduces` across warps:
+    the tiles it scopes `after` its walks (`final_memory_landing`), its unaligned `addresses` (a tensor memory
+    allocation's, `Issuer.product_addresses`), and whether it `reduces` across warps:
     Mosaic GPU reserves the reduction scratch for a kernel with any reduction and none without (an A100's
     solve launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352)."""
     program, walks = list(jax.tree.leaves(staged)), []
@@ -589,7 +590,8 @@ def allocation_scope(family: mosaic.Family, streams: dict, staged: tuple, *, red
         held, walked = family.lifetimes(allocated)
         program += jax.tree.leaves(held)
         walks += walked
-    return resources.Scope(program=tuple(program), walks=tuple(walks), after=tuple(after), reduces=reduces)
+    return resources.Scope(program=tuple(program), walks=tuple(walks), after=tuple(after), reduces=reduces,
+                           addresses=addresses)
 
 
 def _inverse_flops(chunk: int) -> float:
@@ -761,10 +763,6 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         return recorded
 
     def entry(*arrays):
-        def scoped(staged, products, *, streams):
-            with family.products_in(products):
-                return run(staged, streams=streams)
-
         def run(staged, *, streams):
             *staged, lands = staged
             keys = _landing_keys(landing, family)
@@ -782,15 +780,15 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
             if walked is not None:
                 family.run(streams["walked"], walked, call.interpret)
 
-        # The products' own memory where the family's issuer keeps each (`Issuer.product_scratch`): a
+        # The products' own memory where the family's issuer keeps each (`Family.scoped`'s `products`): a
         # product's width is one of its tiles' (its streams', its staging's) or the chunk's.
-        products = family.product_scratch(consumers, _product_widths(blocks, staging, call.chunk))
+        products = (consumers, _product_widths(blocks, staging, call.chunk), ())
         if persistent:
-            family.scoped(scoped, staging, products, streams=streams)
+            family.scoped(run, staging, streams=streams, products=products)
         else:
             # An empty program scopes nothing (Mosaic GPU's interpreter takes a scope's allocations in turn).
             at = {axis: lax.axis_index(axis) for axis in grid_names}
-            pl.when(live(at, arrays))(lambda: family.scoped(scoped, staging, products, streams=streams))
+            pl.when(live(at, arrays))(lambda: family.scoped(run, staging, streams=streams, products=products))
 
     entry.__name__ = name
 

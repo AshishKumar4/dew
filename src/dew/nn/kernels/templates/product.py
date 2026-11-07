@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.precision import asks_default_precision
+from dew.nn.precision import asks_default_precision, exact_products
 
 HALF = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 """The 16-bit dtypes the kernels multiply exactly."""
@@ -47,11 +47,14 @@ def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
     `jax_default_matmul_precision`), multiplying in `compute` into `outputs`' dtypes from operands (or
     masters) of `operands`' dtypes. The kernels sum in fp32 and offset groups in int32, so x64 is
     refused, and an operand fp32 does not hold (a complex master), whose gradient they cannot write;
-    their fp32 products are TF32, which only the default precision asks for."""
+    their fp32 products are TF32, which only the default precision asks for. A declared dot algorithm
+    whose products are not `compute`'s whole ones (TF32's, bf16 parts of an fp32 product, F64's:
+    `precision.exact_products`) is refused too, forward and gradient alike: the kernels multiply
+    `compute` whole and sum in fp32, so a portable route computes it."""
     compute = jnp.dtype(compute)
     above = not asks_default_precision(precision, configured=True)
     return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs, compute=compute),
-                   _refusal(compute, operands, above))
+                   _refusal(compute, operands, above, precision))
 
 
 def promoted(*, above: bool, outputs: tuple, compute: Dtype | None = None) -> bool:
@@ -66,9 +69,13 @@ def promoted(*, above: bool, outputs: tuple, compute: Dtype | None = None) -> bo
     return above or (compute is not None and jnp.dtype(compute) in HALF)
 
 
-def _refusal(compute: jnp.dtype, operands: tuple, above: bool) -> str | None:
+def _refusal(compute: jnp.dtype, operands: tuple, above: bool, precision: PrecisionLike = None
+             ) -> str | None:
     if jax.config.jax_enable_x64:
         return "x64 widens the kernels' int32 group offsets"
+    if compute not in EIGHT and not exact_products(precision, compute):
+        return ("a declared dot algorithm narrows or widens the products, which the kernels multiply whole "
+                "with fp32 sums")
     # An operand fp32 holds is no complex one and none wider (8-bit floats promote implicitly to nothing).
     if any(jnp.issubdtype(dtype, jnp.complexfloating) or jnp.dtype(dtype).itemsize > 4
            for dtype in (compute, *operands)):

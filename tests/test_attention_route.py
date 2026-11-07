@@ -12,6 +12,7 @@ rows' arguments name.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -949,6 +950,27 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
     [refused] = attention_route.MAINLOOP.kernel("triton").failed(
         attention_route._Pass(on_gpu=True, on_mosaic=True, mosaic=None, triton=spans))
     assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
+
+
+def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_linear_in_its_tokens():
+    """On a CPU 'auto' routes a call by time, jax.nn's xla attention's scores counted against the device's
+    memory (`attention_kernels._xla_scores_fit`, `XLA_SCORE_BYTES` a score in a training step): a causal
+    fp32 training step of 8 heads 64 wide long enough that xla's scores would take four times the device's
+    share of the host's memory (`generation.host_memory_share`) compiles in temporaries below a byte a
+    score, the template's plain-JAX mainloop's, which grow with the tokens (row 4826)."""
+    from dew.nn.attention_kernels import XLA_SCORE_BYTES
+
+    heads, width = 8, 64
+    tokens = 1024 * -(-math.isqrt(4 * generation.host_memory_share() // (XLA_SCORE_BYTES * heads)) // 1024)
+    shape = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.float32)
+
+    def loss(query, key, value):
+        return jnp.sum(scaled_dot_product_attention(query, key, value, causal=True))
+
+    step = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+    analysis = step.lower(shape, shape, shape).compile().memory_analysis()
+    assert analysis is not None
+    assert analysis.temp_size_in_bytes < heads * tokens * tokens
 
 
 @pytest.mark.parametrize("differentiated", [False, True], ids=["inference", "training"])
