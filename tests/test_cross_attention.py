@@ -454,8 +454,11 @@ def test_the_blocks_train_beside_a_whole_source_where_it_is_not_frozen(source):
     for path, leaf in own.items():
         np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(leaf), err_msg=path)
     tokens = jnp.arange(8, dtype=jnp.int32)[None] % 256
+    # The block's layer runs apart from the others (`CausalTransformer.scanned_like`), as the source's plain
+    # loop runs every layer: the same program but for the zero-gated block.
     np.testing.assert_array_equal(np.asarray(attached.model.apply(attached.variables, tokens)),
-                                  np.asarray(source.model.apply(source.variables, tokens)))
+                                  np.asarray(source.model.clone(scan_layers=False).apply(source.variables,
+                                                                                         tokens)))
     lora = LoRA(rank=2, modules=("q_proj",))
     later = attached.adapt(lora, key=1)
     earlier = source.adapt(lora, key=1).with_cross_attention(cross, key=0, frozen=False)

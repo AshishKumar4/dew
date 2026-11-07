@@ -1455,7 +1455,10 @@ def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
     from dew.lora import AdapterSet, LoRA
 
     fixtures = Path(__file__).resolve().parent / "fixtures"
-    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+    # A layer at a time: bit for bit holds between two programs XLA fuses alike, which two scanned bodies of
+    # different operations need not be.
+    decoder = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference",
+                              scan_layers=False)
     fixture = LoRA.load(decoder.model, decoder.variables, fixtures / "lora" / "llama-tiny" / "adapter",
                         layouts=decoder.layouts)
     huge = dataclasses.replace(fixture, variables={**fixture.variables, "params": jax.tree.map(

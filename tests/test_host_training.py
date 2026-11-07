@@ -195,6 +195,8 @@ def test_decoder_scan_training_keeps_the_original_logical_state():
         state, _, _ = trainer.place()
         step = trainer.compile(state, data)
         state, *_ = step(state, data)
+        # A device layout's step holds the scan's run stacked (`StageLocal`); stored, it is the logical state.
+        state = trainer.stored(state)
         assert "layers_0" in state.variables["params"] and "layers_1" in state.variables["params"]
         assert "layers_0_1" not in state.variables["params"]
         states.append(state)

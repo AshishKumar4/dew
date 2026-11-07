@@ -542,8 +542,11 @@ def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, referenc
                                     ("params", "layers_1", "mlp", "up_proj")}
     assert {target.alpha for target in adapter.targets.values()} == {6.0}
     tokens = jnp.asarray(reference["input_ids"])
+    # Its layers' targets differ, so the adapted stack runs them apart (`CausalTransformer.scanned_like`),
+    # as the base's plain loop does: the same program but for the exact zero update.
     np.testing.assert_array_equal(np.asarray(adapter.model.apply(variables, tokens)),
-                                  np.asarray(decoder.model.apply(decoder.variables, tokens)))
+                                  np.asarray(decoder.model.clone(scan_layers=False).apply(decoder.variables,
+                                                                                          tokens)))
     a = variables["params"]["layers_1"]["mlp"]["up_proj"]["lora_A"]
     assert a.shape == (64, 3) and 0 < float(jnp.abs(a).max()) <= 1 / 8
     assert not bool(jnp.any(variables["params"]["layers_1"]["mlp"]["up_proj"]["lora_B"]))

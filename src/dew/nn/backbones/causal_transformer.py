@@ -849,11 +849,11 @@ class CausalTransformer(LinearProducts):
         self.specs = specs
         # What one scanned body shares: the layers' spec and how their variables are stored.
         structures = StackView.layer_structures(self.variables, self.num_layers)
-        self.scan_keys = tuple(zip(specs, structures, strict=True))
+        self.scan_keys = tuple(self.scanned_like(index, key)
+                               for index, key in enumerate(zip(specs, structures, strict=True)))
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
-        self.groups = scan_groups(tuple(self.scanned_like(index) for index in range(self.num_layers)),
-                                  self.bank_layers) if self.scan_layers else tuple(
+        self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
         self.mtp = self._prediction_depths(types, kinds, mixer_spec, gated_mlp, routed, wiring)
         if self.dspark is not None:
@@ -1019,17 +1019,19 @@ class CausalTransformer(LinearProducts):
                                      self._dex_start(index), spec.routed)
         return (spec.kind.mixer or self.layer_mixer).build(context)(parent=None)
 
-    def scanned_like(self, index: int) -> Hashable:
-        """What layer `index` runs as under a scan: its scan key (`scan_keys`), so like layers run as one
-        scanned run (`groups`). A method interceptor that gives a layer parameters of its own (an adapter's
-        factors and scales, `dew.lora`) keys it apart where they differ, so a run of layers adapted alike
-        stacks one factor pair, and a layer adapted otherwise runs a run of its own."""
-        return self.scan_keys[index]
+    def scanned_like(self, index: int, key: Hashable) -> Hashable:
+        """What layer `index`, of spec and stored structure `key`, runs and draws as under a scan (its entry
+        of `scan_keys`), so like layers run as one scanned run (`groups`, `run_period`). A method interceptor
+        that gives a layer parameters of its own (an adapter's factors and scales, `dew.lora`) keys it apart
+        where they differ, so a run of layers adapted alike stacks one factor pair, and a layer adapted
+        otherwise runs a run of its own."""
+        del index
+        return key
 
     def drawn_like(self, index: int) -> Hashable:
-        """What layer `index` draws as: what it runs as (`scanned_like`) and what its extension starts from
+        """What layer `index` draws as: its scan key (`scanned_like`) and what its extension starts from
         (`_dex_start`), so like layers draw under one scan."""
-        return (self.scanned_like(index), self._dex_start(index))
+        return (self.scan_keys[index], self._dex_start(index))
 
     @nn.nowrap
     def _dex_start(self, index: int) -> DexStart | None:
@@ -1936,13 +1938,14 @@ class CausalTransformer(LinearProducts):
                 held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
             for name, run in tree.get('stages', {}).items():
                 layers = group_layers(name)
-                if layers is not None and layers.start == 0 and 'layers_0' not in tree:
+                if layers is not None and layers.start == 0:
                     # The stage axis, a run's own layer axis; a periodic run's layer 0 at its first position.
+                    # Beside the leaves a stage-local state keeps on layer 0 itself (a frozen base joined in).
                     rows = 1 + (len(layers) > 1)
                     if run_period(self.scan_keys, 0, len(layers)) > 1:
                         run, rows = run['layers_0'], 2
-                    held = jax.tree.map(
-                        lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), run)
+                    held = merge(held, jax.tree.map(
+                        lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), run))
             if held:
                 variables[collection] = held
         return variables

@@ -189,7 +189,10 @@ def test_the_term_is_off_by_default():
     assert "mtp_ce" not in aux.metrics
     plain = {"params": {key: value for key, value in params["params"].items()
                         if key != "mtp_0"}}
-    plain_loss, _ = LMObjective(tiny(), SEQ).scalar_loss(plain, batch, step_at())
+    # Differentiated as the depths' model is, so both run one program's form: a scanned stack's forward
+    # under a gradient keeps its residuals, which a forward alone does not.
+    plain_loss, _ = jax.value_and_grad(
+        lambda p: LMObjective(tiny(), SEQ).scalar_loss(p, batch, step_at()), has_aux=True)(plain)[0]
     # The same trunk and head compute the same loss: the unused depths change no operation it takes.
     assert float(loss) == float(plain_loss)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(grads["params"]["mtp_0"]))

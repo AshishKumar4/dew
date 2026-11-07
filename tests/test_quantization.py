@@ -633,7 +633,9 @@ def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     differ by 3e-02.)"""
     pytest.importorskip("qwix")
     spec = Quantization(patterns=(".*_proj",))
-    model, qmodel, variables, ids = quantized_forward(spec)
+    # A layer at a time: bit for bit holds between two programs XLA fuses alike, which two scanned bodies
+    # of different operations need not be.
+    model, qmodel, variables, ids = quantized_forward(spec, scan_layers=False)
     served, served_variables = quantize_for_serving(model, variables, spec, ids)
     dtypes = {leaf.dtype for leaf in jax.tree.leaves(served_variables["params"])}
     assert jnp.dtype(jnp.int8) in dtypes
