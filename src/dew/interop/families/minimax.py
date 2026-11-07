@@ -24,23 +24,22 @@ no release has, is refused by name.
 """
 
 from collections.abc import Mapping
-from functools import partial
 
 from dew import _records
-from dew.interop.config_records import native_fields
+from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.decoder_config import ROPE_APART, DecoderSpelling, decoder_layout, place_ropes, read_only
 from dew.interop.decoder_parts import (
     MOE_NAMES,
     DecoderFamily,
     DecoderFields,
     RopeSpelling,
-    base_config,
     kind_mixers,
     kinds_of,
     read_partial_rope,
     refuse,
-    renamed_path,
     softmax_top_k,
     specified_layer_types,
+    spelled,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -115,6 +114,11 @@ def _layer_types(hf: Mapping[str, object], used: set[str], layers: int) -> tuple
     return types
 
 
+_DECODER = decoder_layout(DecoderSpelling(reads=frozenset()), rope=ROPE_APART)
+"""The shared decoder as MiniMax's classes declare it, none of its optional fields, its partial rotary read
+apart (`_minimax_config`)."""
+
+
 def _minimax_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     layers = _records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     types = _layer_types(hf, used, layers)
@@ -144,7 +148,9 @@ def _minimax_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     if factor * head_dim != rotary_dim or rotary_dim % 2 or not 0 < rotary_dim <= head_dim:
         refuse(f'rotary_dim {rotary_dim}', f'it turns an even part of each {head_dim}-wide head, '
                f'{factor} of it as the rotary states')
-    config = base_config({**hf, 'head_dim': head_dim}, used, rope=ropes, layer_types=types, reads=frozenset())
+    config = _DECODER.read({**hf, 'head_dim': head_dim}, used,
+                           NativeFields(CausalTransformer, {'layer_types': types}))
+    place_ropes(config, ropes)
     activation = _records.text(hf.get('hidden_act', 'silu'), 'hidden_act')
     if 'linear_attention' in types and activation not in ACTIVATIONS:
         refuse(f'hidden_act {activation!r}', f'the lightning projection takes {sorted(ACTIVATIONS)}')
@@ -170,22 +176,17 @@ def _lightning(model: CausalTransformer) -> list[LightningAttentionMixer]:
     return [mixer for mixer in kind_mixers(model) if isinstance(mixer, LightningAttentionMixer)]
 
 
-def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
-    """No config: no runtime outside Dew computes this family as its release does (the module docstring),
-    so a Hugging Face checkpoint of it would open as another model."""
-    raise ValueError("MiniMax-Text-01 and M1 write no Hugging Face checkpoint: transformers' MiniMax turns "
-                     "every dimension of a head and scales its lightning rates otherwise, and the release's "
-                     "own code does not import under transformers 5 (ledgers 2534, 2535)")
-
-
 MINIMAX = DecoderFamily(
     ('minimax', *_OWN),
-    _minimax_config,
+    # No runtime outside Dew computes this family as its release does (the module docstring), so a Hugging
+    # Face checkpoint of it would open as another model.
+    read_only(_minimax_config, "MiniMax-Text-01 and M1 write no Hugging Face checkpoint: transformers' "
+              "MiniMax turns every dimension of a head and scales its lightning rates otherwise, and the "
+              "release's own code does not import under transformers 5 (ledgers 2534, 2535)"),
     lambda fields: bool(_lightning(fields) or fields.normed_residual or fields.stream_multiplier != 1.0),
     'minimax',
     'MiniMaxForCausalLM',
-    _minimax_export,
-    weight_path=partial(renamed_path, MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
+    routes=spelled(MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
     preserve_source_layout=False,
     padding_idx=True,
     # MiniMaxConfig's defaults (configuration_minimax.py), the releases' own class's too.

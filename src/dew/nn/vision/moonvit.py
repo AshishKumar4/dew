@@ -12,6 +12,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew import _records
+from dew.interop.layouts import Route, Table
 from dew.interop.unread import Stored
 from dew.interop.weights import Tree, insert
 from dew.registry import Record
@@ -24,8 +25,16 @@ from .common import (
     TowerLayout,
     _vision_section,
     head_width,
+    tensor_routes,
 )
-from .vit import LearnedPositions, MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
+from .vit import (
+    PATCH_CONVOLUTION,
+    LearnedPositions,
+    MergeProjector,
+    VisionTransformer,
+    ViTLayout,
+    translate_vit_weights,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,25 +131,28 @@ _BLOCK_LINEARS = {"wqkv": ("self_attn", "qkv_proj"), "wo": ("self_attn", "o_proj
 _BLOCK_MLP = {"fc0": ("mlp", "up_proj"), "fc1": ("mlp", "down_proj")}
 
 
-def moonvit_path(hf_name: str) -> tuple[str, ...] | None:
-    """One MoonViT tensor name, its `vision_tower.` prefix off, into its path under `params`; the patch
-    convolution and the position table read apart (`_read_moonvit`); anything else raises
-    ValueError."""
-    if hf_name in ("patch_embed.proj.weight", _POSITIONS):
-        return None
-    if hf_name in _TENSORS:
-        return ("params", *_TENSORS[hf_name])
-    parts = hf_name.split(".")
-    if len(parts) >= 5 and parts[:2] == ["encoder", "blocks"] and parts[2].isdigit() and parts[-1] in (
-            "weight", "bias"):
-        block, leaf = f"blocks_{parts[2]}", parts[-1]
-        norm = parts[3] in ("norm0", "norm1")
-        found = (_BLOCK_LINEARS.get(parts[3]) if len(parts) == 5
-                 else _BLOCK_MLP.get(parts[4]) if len(parts) == 6 and parts[3] == "mlp" else None)
-        if found is not None:
-            return ("params", block, *found,
-                    ("scale" if norm else "kernel") if leaf == "weight" else "bias")
-    raise ValueError(f"unknown tensor name {hf_name!r}")
+_BLOCK = "encoder.blocks.{index}."
+_MOONVIT_ROUTES = Table(
+    Route(PATCH_CONVOLUTION, "params/patch_embed/kernel"),
+    Route(_POSITIONS, "params/position_table/embedding"),
+    *tensor_routes(_TENSORS),
+    *(Route(_BLOCK + f"{name}.{tensor}", "params/blocks_{index}/" + "/".join(
+        (*path, ("scale" if name.startswith("norm") else "kernel") if tensor == "weight" else "bias")))
+      for name, path in _BLOCK_LINEARS.items() for tensor in ("weight", "bias")),
+    *(Route(_BLOCK + f"mlp.{name}.{tensor}", "params/blocks_{index}/" + "/".join(
+        (*path, "kernel" if tensor == "weight" else "bias")))
+      for name, path in _BLOCK_MLP.items() for tensor in ("weight", "bias")))
+"""A MoonViT trunk's tensor names past `vision_tower.`, both ways; the patch convolution and the position
+table read and write folded (`_read_moonvit`, `_folded`)."""
+
+
+def _folded(tower: TowerBase) -> Mapping[str, tuple[int, ...]]:
+    """The patch convolution `[width, 3, patch, patch]` and the position table `[height, width, features]`
+    as the release stores them."""
+    assert isinstance(tower, MoonViT)
+    side = tower.init_pos_emb_height
+    return {PATCH_CONVOLUTION: (tower.vt_hidden_size, 3, tower.patch_size, tower.patch_size),
+            _POSITIONS: (side, side, tower.vt_hidden_size)}
 
 
 def _read_moonvit(tensors: Mapping[str, Stored], path_of: Callable[[str], tuple[str, ...] | None],
@@ -250,7 +262,7 @@ def translate_moonvit_projector_config(hf_config: Mapping[str, object], text_wid
         **after}}
 
 
-MoonViT.checkpoint = TowerLayout("vision_tower.", moonvit_path, read=_read_moonvit)
+MoonViT.checkpoint = TowerLayout("vision_tower.", _MOONVIT_ROUTES, read=_read_moonvit, shapes=_folded)
 MoonViTProjector.checkpoint = ProjectorLayout("mm_projector.", {
     "pre_norm.weight": ("norm", "scale"), "pre_norm.bias": ("norm", "bias"),
     "proj.0.weight": ("fc1", "kernel"), "proj.0.bias": ("fc1", "bias"),
