@@ -548,18 +548,18 @@ from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import compile_ahead, compile_only_gpus
 
 model = models.build(
-    "causal_transformer", vocab_size=512, emb_features=256, num_layers=2, num_heads=4, num_kv_heads=2,
-    head_dim=64, mlp_features=512, max_seq_len=256, dtype="bfloat16", attention_impl="template",
+    "causal_transformer", vocab_size=1024, emb_features=1024, num_layers=2, num_heads=8, num_kv_heads=2,
+    head_dim=128, mlp_features=8192, max_seq_len=512, dtype="bfloat16", attention_impl="template",
     layer_types=("linear_attention", "attention"),
     kinds={"attention": {}, "linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
         "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 64,
         "linear_value_head_dim": 64, "linear_conv_kernel_dim": 4}}}},
     mixture={"experts": 4, "top_k": 2, "layers": (1,)})
 mesh = MeshSpec(fsdp=2).build(compile_only_gpus(sys.argv[2], 2))
-trainer = Trainer(LMObjective(model, 256), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
+trainer = Trainer(LMObjective(model, 512), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                   layout=Layout(min_shard=256))
 with routes() as taken:
-    ahead = compile_ahead(trainer, token_rows(512, 4, 257), capacity=2**34)
+    ahead = compile_ahead(trainer, token_rows(1024, 8, 513), capacity=2**35)
 print(json.dumps({"substituted": list(ahead.substituted),
                   "kernels": sorted({(route.choice, route.kernel) for route in taken})}))
 """
@@ -571,7 +571,8 @@ step substituted and every kernel its routes took."""
 @pytest.mark.parametrize("generation", ["sm80", "sm90", "sm100"])
 def test_a_step_running_every_template_compiles_ahead_over_two_compile_only_gpus(generation):
     """A bf16 hybrid decoder's training step, a gated delta net's layer beside attention and a routed
-    experts' feed-forward under RMS norms and SwiGLU, compiled ahead for two compile-only GPUs of
+    experts' feed-forward under RMS norms and SwiGLU, its dense feed-forward wide enough that a kernel
+    gradient's last wave balances (`tail.balanced`), compiled ahead for two compile-only GPUs of
     `generation` over an FSDP mesh: every template it runs (the attention template's mainloop, the gated
     delta rule's Mosaic GPU recurrence, the grouped matmul's Mosaic GPU mainloop) derives, lowers and
     compiles there with no kernel lowered in another's place. A derivation, a selector or a rewrite that
