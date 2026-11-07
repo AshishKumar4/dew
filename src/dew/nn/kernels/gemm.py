@@ -519,14 +519,22 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         return out, ()
 
     def backward(saved, operands, cotangent, live):
-        # The cotangent at its own precision times the decoded values' transpose (exact in fp32), summed in
-        # fp32 at IEEE products, rounded once to the rows', each gathered row's summed back into the row it
-        # read: narrowed to bfloat16 first, 1 - 511/512 summed to 0 (audit A2).
+        # The cotangent at its own precision times the decoded values' transpose, rounded once to the rows',
+        # each gathered row's summed back into the row it read: the fp32 cotangent as three bfloat16 parts
+        # (their sum it, exactly), each part's product with the bfloat16 values exact and summed in fp32 by
+        # the packed kernel's own product, the parts' sums added in fp32 (narrowed to bfloat16 first,
+        # 1 - 511/512 summed to 0, audit A2).
         del saved
         rows, words, scales, sizes, gather = operands
-        d_rows = gemm(cotangent.astype(jnp.float32), decoded(words, scales).astype(jnp.float32),
-                      None if dense else sizes, transpose_rhs=True, out_dtype=rows.dtype,
-                      precision=jax.lax.Precision.HIGHEST, interpret_on_cpu=interpret)
+        matrices, remainder = decoded(words, scales), cotangent.astype(jnp.float32)
+        parts = []
+        for _ in range(3):
+            parts.append(remainder.astype(jnp.bfloat16))
+            remainder = remainder - parts[-1].astype(jnp.float32)
+        d_rows = functools.reduce(jnp.add, [
+            gemm(part, matrices, None if dense else sizes, transpose_rhs=True, out_dtype=jnp.float32,
+                 precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts]
+        ).astype(rows.dtype)
         if gather is not None:
             d_rows = jnp.zeros(rows.shape, d_rows.dtype).at[gather].add(d_rows)
         leaves = (d_rows, zero_from_primal(words), zero_from_primal(scales), zero_from_primal(sizes),
