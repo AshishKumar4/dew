@@ -722,8 +722,12 @@ class MxFp8:
 
     def decoded(self) -> jax.Array:
         """Its values, exactly, in float32 (`[..., depth]`): each code times its block's scale."""
-        scale = jnp.repeat(self.scales.astype(jnp.float32), MX_BLOCK, axis=-1)
-        return self.codes.astype(jnp.float32) * scale
+        return _block_values(self.codes, self.scales, MX_BLOCK)
+
+
+def _block_values(codes: jax.Array, scales: jax.Array, block: int) -> jax.Array:
+    """Block-scaled codes' values, exactly, in float32: each code times its `block` depths' scale."""
+    return codes.astype(jnp.float32) * jnp.repeat(scales.astype(jnp.float32), block, axis=-1)
 
 
 MXFP8_ROW = 'ledger 4519'
@@ -761,28 +765,33 @@ def mxfp8_product(lhs: MxFp8, matrices: MxFp8, group_blocks: jax.Array, *, out_d
     128-row blocks, in order (the block scales' tiles), the rows past them zero. Its selector (`MXFP8`) runs
     the template on Blackwell's block-scaled tensor cores where named (`mosaic_gpu.gmm`'s `mx_scales`), else
     the decoded operands' product in XLA."""
+    return _block_scaled(lhs, matrices, group_blocks, MXFP8, interpret_on_cpu).astype(out_dtype)
+
+
+def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, interpret: bool) -> jax.Array:
+    """A block-scaled grouped product summed in fp32 (`mxfp8_product`'s, `nvfp4_block_product`'s): `op`
+    selects the template on Blackwell's block-scaled tensor cores (`mosaic_gpu.gmm`'s `mx_scales`, the
+    operands' `codes` and their block `scales`, `mosaic_gpu.block_format`'s) where named and planned, else
+    the operands' block-scaled values (`decoded`: each exact in bfloat16 and in TF32, so DEFAULT's products
+    are exact) summed as XLA sums fp32 products."""
     sizes = (group_blocks * mosaic_gpu.STEP_SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicMxGmm()
     abstract = jax.ShapeDtypeStruct
     tile = _planned(launch, launch.bind(abstract(lhs.codes.shape, lhs.codes.dtype),
                                         abstract(matrices.codes.shape, matrices.codes.dtype),
                                         abstract(sizes.shape, jnp.int32), out_dtype='float32', trans_rhs=True,
-                                        interpret=interpret_on_cpu))
-    if selection.select(MXFP8, MxCase(tile)).kernel == 'mosaic_gpu':
-        assert tile is not None, "the selector names the template where it plans a tile"
-        summed = mosaic_gpu.gmm(lhs.codes, matrices.codes, sizes, tiles=tile, transpose_rhs=True,
-                                out_dtype=jnp.float32,
-                                multiprocessors=launch._launched(tile, interpret_on_cpu),
-                                interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
-                                mx_scales=(_scales_tiled(lhs.scales), _scales_tiled(matrices.scales)))
-        assert isinstance(summed, jax.Array), "an unpaired product has one output"
-    else:
-        # The decoded values in fp32 (each exact in bfloat16 and in TF32, so DEFAULT's products are
-        # exact), summed as XLA sums fp32 products.
-        summed = grouped_matmul.xla_ragged_dot(lhs.decoded(), jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
-                                               precision=jax.lax.Precision.DEFAULT,
-                                               preferred_element_type=jnp.float32)
-    return summed.astype(out_dtype)
+                                        interpret=interpret))
+    if selection.select(op, MxCase(tile)).kernel != 'mosaic_gpu':
+        return grouped_matmul.xla_ragged_dot(lhs.decoded(), jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
+                                             precision=jax.lax.Precision.DEFAULT,
+                                             preferred_element_type=jnp.float32)
+    assert tile is not None, "the selector names the template where it plans a tile"
+    summed = mosaic_gpu.gmm(lhs.codes, matrices.codes, sizes, tiles=tile, transpose_rhs=True,
+                            out_dtype=jnp.float32, multiprocessors=launch._launched(tile, interpret),
+                            interpret=grouped_matmul.INTERPRETED if interpret else False,
+                            mx_scales=(_scales_tiled(lhs.scales), _scales_tiled(matrices.scales)))
+    assert isinstance(summed, jax.Array), "an unpaired product has one output"
+    return summed
 
 
 def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
@@ -798,13 +807,24 @@ def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out
     return _mx_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
+def _recipe_value(form, product, x, w, group_blocks, out_dtype, interpret):
+    """A block-scaled recipe's value (`mxfp8_projection`'s, `nvfp4_projection`'s): `x` and `w` quantized
+    along the depth to `form`, their `product`."""
+    return product(form.quantized(x), form.quantized(jnp.swapaxes(w, 1, 2)), group_blocks,
+                   out_dtype=out_dtype, interpret_on_cpu=interpret)
+
+
+def _recipe_forward(value, x, w, group_blocks, out_dtype, interpret):
+    """A block-scaled recipe's forward: its `value`, the operands its backward reads."""
+    return value(x, w, group_blocks, out_dtype, interpret), (x, w, group_blocks)
+
+
 def _mx_value(x, w, group_blocks, out_dtype, interpret):
-    return mxfp8_product(MxFp8.quantized(x), MxFp8.quantized(jnp.swapaxes(w, 1, 2)), group_blocks,
-                         out_dtype=out_dtype, interpret_on_cpu=interpret)
+    return _recipe_value(MxFp8, mxfp8_product, x, w, group_blocks, out_dtype, interpret)
 
 
 def _mx_forward(x, w, group_blocks, out_dtype, interpret):
-    return _mx_value(x, w, group_blocks, out_dtype, interpret), (x, w, group_blocks)
+    return _recipe_forward(_mx_value, x, w, group_blocks, out_dtype, interpret)
 
 
 def _mx_backward(out_dtype, interpret, residuals, cotangent):
@@ -836,6 +856,126 @@ def _scales_tiled(scales: jax.Array) -> jax.Array:
     order = tuple(range(len(lead)))
     tiled = jnp.transpose(tiled, (*order, *(len(lead) + axis for axis in (0, 3, 2, 1, 4))))
     return tiled.reshape(*lead, rows // 128, columns // 4, 32, 16)
+
+
+NVFP4_BLOCK = 16
+"""The depths one NVFP4 block scale covers (tcgen05's block-scaled MMA's `scale_vec::4X`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class NvFp4Block:
+    """An NVFP4 operand as Blackwell's block-scaled tensor cores read it (row 4519's NVFP4 arm): `codes`
+    float4_e2m1fn `[..., depth]`, the depth K-major (last), each sixteen depths' E4M3 scale (`scales`,
+    `[..., depth / 16]`) and the tensor's fp32 `scale`: each value its code times its block's scale times
+    the tensor's (`NvFp4`'s values, laid as the products read them). Rows `[rows, depth]` or a grouped
+    product's matrices `[groups, width, depth]`."""
+
+    codes: jax.Array
+    scales: jax.Array
+    scale: jax.Array
+
+    @classmethod
+    def quantized(cls, x: jax.Array) -> "NvFp4Block":
+        """`x` (`[..., depth]`) as NVFP4 along its depth, `bits.nvfp4_quantized`'s rule (one tensor scale,
+        its largest magnitude over 6 x 448; each block's the least E4M3 at or above its largest magnitude
+        over 6 times it; each value rounded to E2M1, ties to even)."""
+        x = jnp.asarray(x, jnp.float32)
+        words, scales, scale = bits.nvfp4_quantized(x.reshape(-1, x.shape[-1]).T)
+        codes = _codes(words).T.reshape(x.shape).astype(jnp.float4_e2m1fn)
+        return cls(codes, scales.T.reshape(*x.shape[:-1], -1), scale)
+
+    @classmethod
+    def of(cls, matrix: NvFp4) -> "NvFp4Block":
+        """A stored NVFP4 matrix (`NvFp4`, `[depth, width]`, its codes in the packed kernel's staged order)
+        as the block-scaled products read it: `[1, width, depth]`, its depths in their own order."""
+        return cls(matrix.codes().T.astype(jnp.float4_e2m1fn)[None], matrix.scales[None], matrix.scale)
+
+    def decoded(self) -> jax.Array:
+        """Its block-scaled values, exactly, in float32 (`[..., depth]`): each code times its block's scale,
+        the tensor's apart (`scale`)."""
+        return _block_values(self.codes, self.scales, NVFP4_BLOCK)
+
+
+NVFP4_BLOCK_OP: selection.Op[MxCase] = selection.Op('nvfp4_block', (
+    selection.Kernel('mosaic_gpu', (
+        selection.Requirement(
+            'planned', lambda case: case.tile is not None, "the template plans no block-scaled tile here: "
+            "an NVFP4 product on a family whose products take block scales (tcgen05's), whole 128s of rows, "
+            "columns and depth", MXFP8_ROW),
+        selection.Requirement(
+            'measured', lambda case: False, "no receipt yet has the block-scaled template beat the decoded "
+            "operands' product", MXFP8_ROW, kind='measured'))),
+    selection.Kernel('xla', (), generic=True)))
+"""An NVFP4 block product's selector (`nvfp4_block_product`): the template's products scaling each block in
+the instruction where named (`generation.chosen(nvfp4_block='mosaic_gpu')`) and planned, past the measured
+requirement no receipt has met yet; else the decoded operands' product in XLA."""
+
+
+def nvfp4_block_product(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax.Array, *, out_dtype,
+                        interpret_on_cpu: bool = False) -> jax.Array:
+    """Each group's rows of `lhs` (`[rows, depth]`) times its matrix of `matrices` (`[groups, width,
+    depth]`, K-major), both NVFP4 (`NvFp4Block`): each code times its sixteen depths' scale, every product
+    exact in fp32, summed in fp32, times both tensor scales, rounded once to `out_dtype`. Group `g` holds
+    `group_blocks[g]` whole 128-row blocks, in order (the block scales' tiles). Its selector
+    (`NVFP4_BLOCK_OP`) runs the template on Blackwell's block-scaled tensor cores where named
+    (`mosaic_gpu.gmm`'s `mx_scales`, `kind::mxf4nvf4`), else the decoded operands' product in XLA."""
+    summed = _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu)
+    return (summed * (lhs.scale * matrices.scale)).astype(out_dtype)
+
+
+def nvfp4_quantized_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype,
+                            interpret_on_cpu: bool = False) -> jax.Array:
+    """`lhs · W` of a stored NVFP4 matrix `W` (`NvFp4`) with `lhs` quantized to NVFP4 too, as it is used
+    (`NvFp4Block.quantized`: an inference projection on Blackwell's block-scaled tensor cores, both operands
+    E2M1, row 4519's NVFP4 arm): `nvfp4_block_product` of the rows, padded to whole 128s, and the matrix
+    as one group. Unlike `nvfp4_product` (the rows in bfloat16), the rows round to E2M1 under their own
+    block scales: a run opts in by calling it."""
+    rows = lhs.reshape(-1, lhs.shape[-1])
+    padded = jnp.pad(rows, ((0, -rows.shape[0] % mosaic_gpu.STEP_SCALE_DEPTH), (0, 0)))
+    blocks = jnp.asarray([padded.shape[0] // mosaic_gpu.STEP_SCALE_DEPTH], jnp.int32)
+    out = nvfp4_block_product(NvFp4Block.quantized(padded), NvFp4Block.of(matrix), blocks,
+                              out_dtype=out_dtype, interpret_on_cpu=interpret_on_cpu)
+    return out[:rows.shape[0]].reshape(*lhs.shape[:-1], out.shape[-1])
+
+
+def nvfp4_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
+                     interpret_on_cpu: bool = False) -> jax.Array:
+    """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`) in the
+    NVFP4 recipe (row 2513: E2M1 every tensor, an E4M3 scale every 16 of each product's contraction under a
+    tensor scale): `x` and `w` quantized along the depth, their product `nvfp4_block_product`. Its gradients
+    are the recipe's own NVFP4 products, a surrogate of the quantized product's derivative (straight through
+    each rounding), as `mxfp8_projection`'s: the input's the cotangent and `w` quantized along the width;
+    the matrices' each group's rows and cotangent quantized along its tokens, their decoded values contracted
+    over the group's rows in fp32 (`gemm_t`). Group `g` holds `group_blocks[g]` whole 128-row blocks."""
+    return _nvfp4_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
+
+
+def _nvfp4_value(x, w, group_blocks, out_dtype, interpret):
+    return _recipe_value(NvFp4Block, nvfp4_block_product, x, w, group_blocks, out_dtype, interpret)
+
+
+def _nvfp4_forward(x, w, group_blocks, out_dtype, interpret):
+    return _recipe_forward(_nvfp4_value, x, w, group_blocks, out_dtype, interpret)
+
+
+def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
+    del out_dtype
+    x, w, group_blocks = residuals
+    d_x = nvfp4_block_product(NvFp4Block.quantized(cotangent), NvFp4Block.quantized(w), group_blocks,
+                              out_dtype=x.dtype, interpret_on_cpu=interpret)
+    sizes = (group_blocks * mosaic_gpu.STEP_SCALE_DEPTH).astype(jnp.int32)
+    # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 16 a scale,
+    # the tensor scales applied: a 128-row group's blocks hold whole 16s.
+    rows, cotangents = (NvFp4Block.quantized(operand.T) for operand in (x, cotangent))
+    d_w = gemm_t((rows.decoded() * rows.scale).T.astype(jnp.float32),
+                 (cotangents.decoded() * cotangents.scale).T.astype(jnp.float32), sizes, out_dtype=w.dtype,
+                 precision=jax.lax.Precision.HIGHEST, interpret_on_cpu=interpret)
+    return d_x, d_w, None
+
+
+# The NVFP4 recipe's gradient (`nvfp4_projection`): a derivative of Dew's choosing (`Surrogate`).
+_nvfp4_projection = contracted("test_an_nvfp4_projection_holds_every_reverse_order")(
+    declared_derivative(Surrogate(), _nvfp4_value, _nvfp4_forward, _nvfp4_backward, nondiff_argnums=(3, 4)))
 
 
 def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scale, *, out_dtype,

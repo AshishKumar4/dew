@@ -121,16 +121,27 @@ def an_mxfp8_product_is_on_par(case: tuple[str, ...]) -> None:
     assert ("mxfp8", "mosaic_gpu") in recorded and not unnamed, (sorted(recorded), unnamed)
 
 
-def recipe_truth(group_blocks, wide=jnp.float64) -> callable:
-    """The MXFP8 recipe's training step summed in `wide` (float64: `gemm.mxfp8_projection`'s truth):
-    `run(x, w)` quantizing as the recipe does (`gemm.MxFp8.quantized` along each product's contraction), each
-    group's product of the decoded values, its gradients the recipe's: the cotangent and the matrices
-    quantized along the width for the input's, the rows and the cotangent along the tokens for the
-    matrices'."""
+def mx_values(x: jax.Array) -> jax.Array:
+    """`x` quantized to MXFP8 along its last axis (`gemm.MxFp8`), its values."""
+    return gemm.MxFp8.quantized(x).decoded()
+
+
+def nvfp4_values(x: jax.Array) -> jax.Array:
+    """`x` quantized to NVFP4 along its last axis (`gemm.NvFp4Block`), its values, the tensor scale too."""
+    operand = gemm.NvFp4Block.quantized(x)
+    return operand.decoded() * operand.scale
+
+
+def recipe_truth(group_blocks, wide=jnp.float64, quantized=mx_values) -> callable:
+    """A block-scaled recipe's training step summed in `wide` (float64: `gemm.mxfp8_projection`'s truth, or
+    `gemm.nvfp4_projection`'s with `quantized` `nvfp4_values`): `run(x, w)` quantizing as the recipe does
+    (`quantized` along each product's contraction), each group's product of the values, its gradients the
+    recipe's: the cotangent and the matrices quantized along the width for the input's, the rows and the
+    cotangent along the tokens for the matrices'."""
     starts = np.cumsum([0, *(128 * np.asarray(group_blocks))])
 
     def decoded(values):
-        return gemm.MxFp8.quantized(values).decoded().astype(wide)
+        return quantized(values).astype(wide)
 
     @jax.custom_vjp
     def run(x, w):
