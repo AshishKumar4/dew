@@ -3,10 +3,11 @@
 Nothing here asserts reconstruction quality: what matters is the contract the
 samplers and input config depend on (the advertised latent geometry, video
 flattening, and the latent normalization seam). The last tests hold that
-contract to Diffusers' own VAE, posterior and SD3 pipeline normalization
-(tests/fixtures/vae/contract.npz, tools/autoencoder_contract_reference.py).
+contract to Diffusers' own VAE, posterior and SD3 pipeline normalization over drawn clips, Diffusers run
+in the test.
 """
 
+import functools
 import json
 import shutil
 from pathlib import Path
@@ -15,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
@@ -84,41 +85,93 @@ def test_latent_normalization_is_inverted_by_decode(autoencoder, image):
                         autoencoder.decode(autoencoder.params, raw_latent), atol=1e-5)
 
 
-@pytest.fixture(scope="module")
-def contract():
-    with np.load(FIXTURES / "contract.npz") as loaded:
-        return dict(loaded)
+CONTRACT_SEEDS = 8
+"""The contract's declared seeds, sized by `seeds_for` paired as its check confirmed them."""
+CLIP = (2, 3, 16, 16)
+"""A drawn clip's batch, frames, height and width."""
 
 
-@pytest.fixture(scope="module")
+@functools.cache
 def sd3_tiny():
     return StableDiffusionVAE(str(FIXTURES / "sd3-tiny"), dtype=jnp.float32)
 
 
-def test_a_clip_samples_and_normalizes_as_diffusers_does_frame_by_frame(contract, sd3_tiny):
-    """A clip's frames encoded as one `[B, T]` batch draw the latent SD3's
-    img2img pipeline draws for each frame as an image (`retrieve_latents`,
-    then `(z - shift) * scale`), from one standard normal draw, and their
-    normalized means are its: by the float64 rule, against Diffusers'
-    own VAE and posterior."""
-    batch, frames, height, width = json.loads(contract["meta"].tobytes())["clip"]
-    clip = jnp.asarray(contract["frames"]).reshape(batch, frames, height, width, 3)
-    sampled = sd3_tiny.encode(sd3_tiny.params, clip, key=jax.random.key(7))
-    mean = sd3_tiny.encode(sd3_tiny.params, clip)
-    assert sampled.shape[:2] == (batch, frames)
-    for name, value in (("latents", sampled), ("normalized_mean", mean)):
-        assert_as_exact_as_the_reference(np.asarray(value).reshape(-1, *value.shape[2:]),
-                                         contract[f"fp32.{name}"], contract[f"fp64.{name}"], name)
+def contract_draw(seed: int) -> tuple[dict[str, np.ndarray]]:
+    """A seed's clip of frames in [-1, 1], its key, and the standard normal Dew's encoder draws for that key
+    at the clip's latents (`noise`), which Diffusers' posterior samples from too."""
+    batch, frames, height, width = CLIP
+    clip = np.random.default_rng([71, seed]).uniform(-1, 1, (batch * frames, height, width, 3))
+    autoencoder = sd3_tiny()
+    shape = jax.eval_shape(lambda pixels: autoencoder.encode(autoencoder.params, pixels),
+                           jnp.zeros((batch, frames, height, width, 3))).shape
+    noise = jax.random.normal(jax.random.key(seed), (batch * frames, *shape[2:]), jnp.float32)
+    return ({"frames": clip.astype(np.float32), "key": np.asarray(seed, np.int32),
+             "noise": np.asarray(noise)},)
 
 
-def test_a_clip_decodes_as_diffusers_decodes_its_frames(contract, sd3_tiny):
-    """Normalized latents of a clip decode to what Diffusers' VAE decodes of
-    each frame's latent taken back SD3's way (`z / scale + shift`)."""
-    latents = jnp.asarray(contract["fp32.normalized_mean"])
-    clip = latents.reshape(2, 3, *latents.shape[1:])
-    decoded = sd3_tiny.decode(sd3_tiny.params, clip)
-    assert_as_exact_as_the_reference(np.asarray(decoded).reshape(-1, *decoded.shape[2:]),
-                                     contract["fp32.decoded"], contract["fp64.decoded"], "decoded")
+@as_given
+def contract_run(inputs) -> dict:
+    """The clip's frames encoded as one `[B, T]` batch: the latents drawn for its key and normalized, the
+    normalized means, and the frames those means decode to, each frame by frame."""
+    autoencoder = sd3_tiny()
+    clip = jnp.asarray(inputs["frames"], jnp.float32).reshape(*CLIP, 3)
+    sampled = autoencoder.encode(autoencoder.params, clip, key=jax.random.key(int(inputs["key"])))
+    mean = autoencoder.encode(autoencoder.params, clip)
+    decoded = autoencoder.decode(autoencoder.params, mean)
+    return {name: np.asarray(value).reshape(-1, *value.shape[2:])
+            for name, value in (("latents", sampled), ("normalized_mean", mean), ("decoded", decoded))}
+
+
+def diffusers_contract(*, wide: bool):
+    """Diffusers' own VAE over a draw's frames, each encoded as its own image, in float32 or (its float64 twin
+    under `torch_precision.widened`) float64: the latents SD3's img2img pipeline draws and normalizes
+    (`pipeline_stable_diffusion_3_img2img.py:700-702`: `retrieve_latents` of `vae.encode`, its
+    `randn_tensor` handed the draw's `noise`, then `(z - shift_factor) * scaling_factor`), the normalized
+    mean, and the frames its `vae.decode` makes of that mean taken back SD3's way
+    (`pipeline_stable_diffusion_3.py:1128`: `z / scaling_factor + shift_factor`), channels last."""
+    import contextlib
+    from unittest import mock
+
+    import torch
+    from diffusers import AutoencoderKL
+    from diffusers.models.autoencoders import vae as diffusers_vae
+    from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img import retrieve_latents
+
+    from tools.torch_precision import float64_twin, widened
+
+    model = AutoencoderKL.from_pretrained(FIXTURES / "sd3-tiny").eval()
+    model = float64_twin(model) if wide else model
+    dtype = torch.float64 if wide else torch.float32
+
+    def first(value):
+        return torch.from_numpy(np.ascontiguousarray(np.moveaxis(np.asarray(value), -1, 1))).to(dtype)
+
+    @as_given
+    def run(inputs):
+        config = model.config
+        with widened() if wide else contextlib.nullcontext(), torch.no_grad():
+            encoded = model.encode(first(inputs["frames"]))
+            epsilon = first(inputs["noise"])
+            with mock.patch.object(diffusers_vae, "randn_tensor", lambda shape, **options: epsilon):
+                drawn = retrieve_latents(encoded, sample_mode="sample")
+            mean = encoded.latent_dist.mean
+            normalized = (mean - config.shift_factor) * config.scaling_factor
+            outputs = {"latents": (drawn - config.shift_factor) * config.scaling_factor,
+                       "normalized_mean": normalized,
+                       "decoded": model.decode(
+                           normalized / config.scaling_factor + config.shift_factor).sample}
+        return {name: np.moveaxis(value.numpy(), 1, -1) for name, value in outputs.items()}
+    return run
+
+
+def test_a_clip_samples_normalizes_and_decodes_as_diffusers_does_frame_by_frame():
+    """A clip's frames encoded as one `[B, T]` batch draw the latent SD3's img2img pipeline draws for each
+    frame as an image (`retrieve_latents`, then `(z - shift) * scale`), from one standard normal draw, their
+    normalized means are its, and those means decode to what Diffusers' VAE decodes of each frame's latent
+    taken back SD3's way (`z / scale + shift`): on par with Diffusers' own VAE and posterior over drawn
+    clips (check 1), its float64 twin the truth."""
+    assert_as_exact(contract_run, diffusers_contract(wide=False), contract_draw, "the SD3 contract",
+                    seeds=CONTRACT_SEEDS, truth_fn=diffusers_contract(wide=True))
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures"

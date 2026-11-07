@@ -62,7 +62,7 @@
    "lane": "Training"
   },
   "tests/test_autoencoder.py": {
-   "comparisons": 6,
+   "comparisons": 4,
    "lane": "Training"
   },
   "tests/test_beam_search.py": {
@@ -234,19 +234,15 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_flaxdiff_family_source.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_flow_matching.py": {
    "comparisons": 1,
    "lane": "Training"
   },
-  "tests/test_flux2_source.py": {
-   "comparisons": 6,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_flux_source.py": {
-   "comparisons": 8,
+   "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
   "tests/test_gate_findings.py": {
@@ -534,7 +530,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_source.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_vae.py": {
@@ -673,10 +669,6 @@
    "comparisons": 15,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_wan_source.py": {
-   "comparisons": 11,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_wan_vae.py": {
    "comparisons": 9,
    "lane": "Models, Serving & RL"
@@ -728,10 +720,6 @@
   "tools/diffusers_source_reference.py": {
    "comparisons": 3,
    "lane": "Training"
-  },
-  "tools/flaxdiff_family_reference.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
   },
   "tools/gated_product_reference.py": {
    "comparisons": 1,
