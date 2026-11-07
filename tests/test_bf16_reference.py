@@ -39,21 +39,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from canvas_support import (
-    WORKFLOW,
-    canvas_draw,
-    dew_canvas,
-    transformers_canvas,
-    transformers_model as canvas_model,
-)
-from flax import linen as nn
 from interop_support import clearing_selections, fixture_ids, transformers_arms, transformers_model
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 from selection_margins import NARROW_MARGIN
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
-from dew.nn.gemma4_moe import Gemma4TextRouter
+from dew.nn.inputs import ModelInputs
 from dew.nn.kernels import generation
 from dew.nn.precision import ACCURATE
 
@@ -173,116 +166,110 @@ def assert_biases_sum_as_torch(name):
                     seeds=BIAS_SEEDS[name], truth_fn=torch_gradients(wide, float64))
 
 
-class PinnedRoutes:
-    """Each draw's expert choices as Dew's float64 run of the denoiser makes them, the prompt's prefill's and
-    the canvas's, router by router in the order they run (`chosen`); and the context that replays them in
-    Dew's run (`replayed`: through the router's own `routes`, by `flax.linen.intercept_methods`) and the
-    hooks that replay them in transformers' (`hooked`: each router's selection replaced, its weights the
-    run's own probabilities of the chosen experts, renormalized and scaled as the router scales them). The
-    gates' probabilities and every other value stay each arm's own arithmetic; routing itself is held by
-    tests/test_block_diffusion.py's float32 sites and the router tests (row 4739)."""
-
-    def __init__(self, config):
-        with jax.enable_x64(new_val=True):
-            model = adapter.build(config, dtype="float64", attention_impl="xla")
-            variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
-        self.truth = dew_canvas(model, variables, self._recording)
-        self.held: dict = {}
-        self.routes: list = []
-
-    def chosen(self, inputs) -> list:
-        """The float64 run's choices for `inputs`, computed once a draw."""
-        key = tuple(np.asarray(value).tobytes() for value in inputs)
-        if key not in self.held:
-            self.routes = []
-            with jax.enable_x64(new_val=True):
-                self.truth(*inputs)
-            self.held[key] = self.routes
-        return self.held[key]
-
-    def _recording(self):
-        def record(next_fun, args, kwargs, context):
-            made = next_fun(*args, **kwargs)
-            if isinstance(context.module, Gemma4TextRouter) and context.method_name == "__call__":
-                self.routes.append(np.asarray(made[-1]))
-            return made
-        return nn.intercept_methods(record)
-
-    def replayed(self, inputs):
-        """A context replaying `inputs`' choices into Dew's routers, in order."""
-        routes = iter(self.chosen(inputs))
-
-        def replay(next_fun, args, kwargs, context):
-            if isinstance(context.module, Gemma4TextRouter) and context.method_name == "__call__":
-                kwargs = {**kwargs, "routes": (jnp.asarray(next(routes)), None)}
-            return next_fun(*args, **kwargs)
-        return nn.intercept_methods(replay)
-
-    @contextlib.contextmanager
-    def hooked(self, network, inputs):
-        """transformers' routers of `network` replaying `inputs`' choices, in order, within the block."""
-        import torch
-
-        routes = iter(self.chosen(inputs))
-
-        def replay(module, _, output):
-            selected = torch.from_numpy(next(routes)).long().reshape_as(output[2])
-            weights = output[0].gather(-1, selected)
-            weights = weights / weights.sum(-1, keepdim=True) * module.per_expert_scale[selected]
-            return output[0], weights, selected
-
-        hooks = [module.register_forward_hook(replay) for name, module in network.named_modules()
-                 if name.endswith(".router")]
-        try:
-            yield
-        finally:
-            for hook in hooks:
-                hook.remove()
+def denoise(model, variables, prompt, canvas, **conditioning):
+    """One canvas scored over the prompt's cache: the prefill writes it, the
+    canvas reads it."""
+    media = conditioning.pop("media", None)
+    inputs = ModelInputs(jnp.asarray(prompt), *(media or ()))
+    cache = model.apply(variables, prompt.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
+    cache = model.apply({**variables, "cache": cache}, inputs,
+                        method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
+                        mutable=["cache"])[1]["cache"]
+    logits = model.apply({**variables, "cache": cache}, canvas, **conditioning)
+    return logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
 
 
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
-    """DiffusionGemma's shared text tree with routed experts, a sliding and a full layer, self-conditioning
-    and the vision conditioner in bfloat16: each canvas forward tests/test_block_diffusion.py holds in
-    float32 (bare, self-conditioned, image-conditioned), Dew's bfloat16 canvas logits on par with
-    transformers' own bfloat16 forward over drawn prompts, canvases, previous logits and pixels
-    (`canvas_draw`), both measured from the float64 twin of the stored float32 weights (check 1), each
-    bfloat16 arm's experts pinned to Dew's float64 run's choices (`PinnedRoutes`): bfloat16 moves the
-    routers' scores past every draw's least margin (over 512 draws a form, the pair movement 1.7 to 4.6
-    of the scores' scale against least margins of at most 0.15), so no margin precondition admits a draw,
-    and an unpinned draw's flips spread both arms' errors past check 1's resolution (row 4739)."""
-    import torch
-
-    config = json.loads((WORKFLOW / "config.json").read_text())
+    """DiffusionGemma's shared text tree with routed experts, a sliding and a
+    full layer, self-conditioning and the vision conditioner, each forward
+    the fp32 test in tests/test_block_diffusion.py makes, now in bf16."""
+    directory = FIXTURES / "diffusion-gemma-workflow"
+    config = json.loads((directory / "config.json").read_text())
+    tensors = load_file(str(directory / "model.safetensors"))
+    reference = {}
+    for name in ("reference.npz", "numerics.npz"):
+        with np.load(directory / name) as stored:
+            reference.update({key: stored[key] for key in stored.files})
     model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
-    variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
-    with np.load(WORKFLOW / "reference.npz") as stored:
-        reference = {key: stored[key] for key in stored.files}
-    stored = canvas_model(WORKFLOW)
-    narrow = copy.deepcopy(stored).to(torch.bfloat16)
-    reference_arm, truth = transformers_arms(narrow, transformers_canvas, source=stored)
-    pinned = PinnedRoutes(config)
+    variables, _ = adapter.translate_weights(tensors, config)
+    image = (reference["image_prompt"],
+             ({"image_indices": jnp.where(reference["image_prompt"] == 60, 0, -1)},
+              {"pixel_values": jnp.asarray(reference["pixels"])}))
+    runs = {
+        "bare": (reference["prompt"], {}),
+        "conditioned": (reference["prompt"], {"self_conditioning_logits": reference["previous"]}),
+        "image_logits": (image[0], {"media": image[1]}),
+    }
+    for name, (prompt, conditioning) in runs.items():
+        logits = denoise(model, variables, prompt, reference["canvas"], **conditioning)
+        assert_as_exact_as_the_reference(logits, reference[f"{name}_bf16"], reference[f"{name}_f64"],
+                                         f"workflow {name}")
+
+
+EXPERT_SEEDS = 16
+"""The expert site's declared seeds."""
+
+
+def test_the_diffusion_denoisers_experts_are_as_exact_as_the_reference_in_bf16():
+    """DiffusionGemma's routed experts' continuous math in bfloat16, on par with transformers' own
+    (`DiffusionGemmaTextExperts`) over drawn inputs, both measured from its float64 twin (check 1): its first
+    layer's experts, Dew's as the model builds them (read from one forward by `flax.linen.intercept_methods`),
+    over drawn hidden states, expert ids (each token's two distinct) and gates, given to both. The whole
+    model's bfloat16 site above stays on its recorded draw: its routers' bfloat16 scores move past every
+    draw's least margin, so no drawn routing is the float64 run's (row 4739); routing itself is held by
+    tests/test_block_diffusion.py's float32 sites and the router tests."""
+    import torch
+    from flax import linen as nn
+
+    from dew.nn.moe import ExpertMLP
+
+    directory = FIXTURES / "diffusion-gemma-workflow"
+    config = json.loads((directory / "config.json").read_text())
+    model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
+    variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
+    with np.load(directory / "reference.npz") as stored:
+        prompt = stored["prompt"]
+    held = []
+
+    def first(next_fun, args, kwargs, context):
+        if isinstance(context.module, ExpertMLP) and context.method_name == "__call__" and not held:
+            held.append((context.module.clone(parent=None), context.module.variables))
+        return next_fun(*args, **kwargs)
+
+    with nn.intercept_methods(first):
+        denoise(model, variables, prompt, prompt[:, :1])
+    experts, expert_variables = held[0]
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        DiffusionGemmaForBlockDiffusion,
+        DiffusionGemmaTextExperts,
+    )
+
+    # Eager experts: the grouped matmul has no float64 kernel.
+    loaded = DiffusionGemmaForBlockDiffusion.from_pretrained(str(directory), dtype=torch.float32,
+                                                             local_files_only=True, experts_implementation="eager")
+    network = next(module for module in loaded.modules() if isinstance(module, DiffusionGemmaTextExperts))
+    narrow = copy.deepcopy(network).to(torch.bfloat16)
+    tokens, width = 32, network.hidden_dim
+
+    def draw(seed):
+        rng = np.random.default_rng([4739, seed])
+        chosen = np.stack([rng.permutation(network.num_experts)[:2] for _ in range(tokens)]).astype(np.int32)
+        gates = rng.uniform(0.1, 1.0, (tokens, 2)).astype(np.float32)
+        hidden = rng.standard_normal((tokens, width)).astype(np.float32)
+        return hidden, chosen, gates / gates.sum(-1, keepdims=True)
 
     @as_given
-    def dew(*inputs):
-        canvas = dew_canvas(model, variables, lambda: pinned.replayed(inputs))
-        return {"logits": jnp.asarray(canvas(*inputs)["logits"], jnp.float32)}
+    def dew(hidden, chosen, gates):
+        out = experts.apply(expert_variables, jnp.asarray(hidden, jnp.bfloat16),
+                            jnp.asarray(gates, jnp.bfloat16), jnp.asarray(chosen))
+        return {"experts": jnp.asarray(out, jnp.float32)}
 
-    @as_given
-    def reference_pinned(*inputs):
-        with pinned.hooked(narrow, inputs):
-            return reference_arm(*inputs)
+    def run(module, hidden, chosen, gates):
+        dtype = next(module.parameters()).dtype
+        return {"experts": module(hidden.to(dtype), chosen, gates.to(dtype))}
 
-    draws = {"bare": canvas_draw(reference["prompt"], reference["canvas"], 64),
-             "conditioned": canvas_draw(reference["prompt"], reference["canvas"], 64, previous=True),
-             "image_logits": canvas_draw(reference["image_prompt"], reference["canvas"], 64,
-                                         pixels=reference["pixels"])}
-    for name, draw in draws.items():
-        assert_as_exact(dew, reference_pinned, draw, f"workflow {name} bfloat16 pinned routing",
-                        seeds=PINNED_SEEDS, truth_fn=truth)
-
-
-PINNED_SEEDS = 32
-"""The pinned site's declared seeds, sized by `seeds_for` paired: 32 for each form (row 4739)."""
+    reference, truth = transformers_arms(narrow, run, source=network)
+    assert_as_exact(dew, reference, draw, "workflow experts bfloat16", seeds=EXPERT_SEEDS, truth_fn=truth)
 
 
 def bfloat16(bits: np.ndarray) -> jax.Array:

@@ -73,6 +73,10 @@
    "comparisons": 7,
    "lane": "Models, Serving & RL"
   },
+  "tests/test_bf16_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
   "tests/test_block_diffusion.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"

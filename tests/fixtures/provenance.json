@@ -1008,6 +1008,16 @@
    ],
    "note": "Also calls hackable_diffusion 1.0.1 losses with kauldron 1.4.4 (tools/diffusion_gemma_sft_reference.py:4)."
   },
+  "hf/diffusion-gemma-workflow/numerics.npz": {
+   "tool": "tools/numerics_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ]
+  },
   "hf/diffusion-gemma-workflow/reference.npz": {
    "tool": "tools/diffusion_gemma_reference.py",
    "sources": [
