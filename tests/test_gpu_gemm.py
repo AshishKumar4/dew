@@ -8,8 +8,9 @@ one process (`gpu_flow`), each cell its own file's property:
   (test_gemm_blockwise).
 - The template takes gpt-oss's 2880-wide projection, its ragged stores' one-row rungs, as exactly as XLA's
   (test_grouped_gemm; row 4474).
-- A ring streams tiles of their own trip counts, and consumers feeding their own ring split a step, on an
-  H100 (test_mosaic_toolkit).
+- A ring streams tiles of their own trip counts, consumers feeding their own ring split a step, and every
+  read path of a warpgroup accumulator lands its products before a pure op on them (row 4346), on an H100
+  (test_mosaic_toolkit).
 - The shared GEMM mainloop runs on Blackwell's tcgen05, exactly, on a B200 or a B300, sm100 and sm103 alike
   (test_gemm_tcgen05).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
@@ -149,6 +150,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
                                  consumers), "sm90")
           for consumers in (1, 2)),
+        *(Cell(f"every warpgroup read lands its products: {path}",
+               functools.partial(mosaic_toolkit.every_warpgroup_read_lands_its_products_on_an_h100, path),
+               "sm90")
+          for path in mosaic_toolkit.READS),
         *(Cell(f"consumers feeding their own ring split a step: {consumers} consumers from {lo}",
                functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
                                  consumers, lo), "sm90")
