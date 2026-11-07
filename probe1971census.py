@@ -9,13 +9,16 @@ if mode=='candidate':
  def stream(self,op,name):
   if k._elementwise(op,name):
    deps={a for o in op.operands for a in self.atoms.of.get(o,()) if a is not None}
-   if len(deps)>len(self._lanes(op.results[0].type)):return False
+   keys={self.run[p] for p in self._read(op.operands) if p in self.run}
+   if len(keys)!=1 and len(deps)>len(self._lanes(op.results[0].type)):return False
   return old(self,op,name)
  k._Pass._streamed=stream
 cases=list(t.compiled_cases('sm90',{},[],{},only=t.GATE_GROUPS[index]))[:1]
 records=c.compile_mosaic_kernels(cases,'sm90',least=True)
 for record in records:
  print('K CASE',index,mode,record['name'],flush=True)
+ for name,model in record.get('lowered_models',{}).items():
+  print('K MODEL',mode,name,model.get('registers'),flush=True)
  if 'error' in record: print('K ERROR',record['error'],flush=True)
  for row in record.get('evidence',[]):
   print('K EVIDENCE',mode,row,flush=True)

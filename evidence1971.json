@@ -1,0 +1,38 @@
+{
+  "base": "3b3a2bc644",
+  "runs_are_not_the_solved_cause": {"baseline":330,"all_run_holds_disabled":330,"close_at_wait":330,"close_at_read":330},
+  "solved_ir": [
+    "%5889 = arith.addf %5143, %5871 : vector<2xf32> // model: 21 dependency atoms",
+    "%6617 = vector.interleave %6585, %6586 : vector<1xf32> -> vector<2xf32> // next WGMMA accumulator, 2 atoms",
+    "%6635 = arith.addf %5889, %6617 : vector<2xf32> // model: 23 dependency atoms",
+    "%7395 = arith.addf %6649, %7377 : vector<2xf32> // model: 25 dependency atoms",
+    "%8141 = arith.addf %7395, %8123 : vector<2xf32> // model: 27 dependency atoms"
+  ],
+  "measurements": {
+    "gdn_bf16_solved": {"before":330,"candidate":140,"ptxas_budget_use":121,"ptxas_least_cap":120},
+    "gdn_bf16_scan": {"before":262,"candidate":166,"ptxas_budget_use":248,"ptxas_least_cap":224},
+    "kda_bf16_intra": {"before":318,"candidate":129,"ptxas_budget_use":248,"ptxas_least_cap":176},
+    "gdn_fp32_solved": {"before":368,"candidate":146,"ptxas_budget_use":186,"ptxas_least_cap":184},
+    "gdn_fp32_states": {"before":278,"candidate":255,"ptxas_budget_use":248,"ptxas_least_cap":224},
+    "gdn_fp32_output": {"before":241,"candidate":200,"ptxas_budget_use":248,"ptxas_least_cap":192},
+    "kda_weighted_values": {"before":55,"candidate":55,"ptxas_budget_use":248,"ptxas_least_cap":88},
+    "wide_values_back": {"before":81,"candidate":81,"ptxas_budget_use":248,"ptxas_least_cap":80}
+  },
+  "jobs": {
+    "run_ablation":"20261107080927-8b067319",
+    "sum_trace":"20261107082231-83b0a58a",
+    "candidate_models":"20261107082823-15c4953e",
+    "candidate_tests":"20261107083026-463b4490",
+    "candidate_census":"20261107083131-6414374b",
+    "candidate_gate":"20261107083347-1ca0d32f"
+  },
+  "tests": {
+    "baseline_regression":{"failed":4},
+    "candidate_regression":{"passed":4},
+    "test_kernel_liveness":{"passed":23},
+    "test_kernel_compile_registers":{"passed":11},
+    "test_liveness_deferred_products":{"passed":9},
+    "sm90_recurrence_resource_gate":{"passed":3,"groups":[0,8,13]}
+  },
+  "limitation":"Candidate proves/removes the deferred-expression overcount; it is not a conservative upper bound. Scan, intra and fp32 solved fall below least spill-free caps; states remains above its 248 budget. Do not claim full row closure."
+}

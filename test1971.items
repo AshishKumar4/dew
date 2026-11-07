@@ -1,0 +1,3 @@
+candidate|tests/test_kernel_liveness.py
+candidate|tests/test_kernel_compile_registers.py
+candidate|tests/test_liveness_deferred_products.py
