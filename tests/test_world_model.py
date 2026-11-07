@@ -229,14 +229,18 @@ def test_a_tokenizers_patches_are_each_frames_row_major_pixels_whatever_its_lead
     np.testing.assert_array_equal(np.asarray(tokenizer._unpatchify(jnp.asarray(patches))), np.asarray(frames))
 
 
-def assert_lights_what_it_shows(tokenizer, variables, frames: np.ndarray) -> None:
+def assert_lights_what_it_shows(tokenizer, variables, frames: np.ndarray, mean: np.ndarray) -> None:
     """`tokenizer` at `variables` reconstructs lit shapes over a dark background, `frames` of -1 and 1:
     most of the shapes' pixels come back lit (above 0, their midpoint) and most of the background's dark,
-    where the mean frame, the reconstruction of a tokenizer whose latents hold no place, lights none."""
-    lit = np.asarray(jax.jit(tokenizer.apply)(variables, frames)) > 0
-    shown = frames > 0
+    where the `mean` frame of its training clips, the reconstruction of a tokenizer whose latents hold no
+    place, lights none; and its squared error is below the mean frame's, which a reconstruction lit in
+    the right places but faint would not be."""
+    rebuilt = np.asarray(jax.jit(tokenizer.apply)(variables, frames))
+    lit, shown = rebuilt > 0, frames > 0
     assert np.count_nonzero(lit & shown) > np.count_nonzero(~lit & shown)
     assert np.count_nonzero(~lit & ~shown) > np.count_nonzero(lit & ~shown)
+    assert not np.any(mean > 0)
+    assert np.mean(np.square(rebuilt - frames)) < np.mean(np.square(mean - frames))
 
 
 def test_a_tokenizer_reconstructs_the_moving_squares_it_trained_on():
@@ -273,7 +277,8 @@ def test_a_tokenizer_reconstructs_the_moving_squares_it_trained_on():
     tokenizer = CausalTokenizer((16, 16, 1), patch=4, width=32, depth=2, heads=2, latents=4, bottleneck=4)
     state = Trainer(TokenizerObjective(tokenizer), optax.adam(1e-3), key=jax.random.key(0)).fit(
         clips, steps=3000, log_every=3000)
-    assert_lights_what_it_shows(tokenizer, state.variables, held.reshape(-1, 16, 16, 1))
+    assert_lights_what_it_shows(tokenizer, state.variables, held.reshape(-1, 16, 16, 1),
+                                videos.reshape(-1, 16, 16, 1).mean(0))
 
 
 def test_a_world_models_tokenizer_rides_in_its_state_and_its_loss_reads_it_there():

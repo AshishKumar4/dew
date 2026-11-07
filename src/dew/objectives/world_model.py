@@ -130,10 +130,11 @@ class CausalTokenizer(nn.Module):
         self.patch_positions = self.param("patch_positions", nn.initializers.normal(0.02),
                                           (self.patches, self.width))
         head = self.width // self.heads
-        if self.positions == "rotary" and (head % 2 or head < 4):
+        if self.positions == "rotary" and head < 4:
             raise ValueError(f"a tokenizer's two-axis rotary turns a pair of channels or more for each axis, "
-                             f"and its heads are {head} wide; make width // heads even and at least 4")
-        # The rows' channels and the columns', each a whole number of pairs, as near halves as they split.
+                             f"and its heads are {head} wide; make width // heads at least 4")
+        # The rows' channels, a whole number of pairs, and the columns' the rest, as near halves as they
+        # split; an odd head's last channel is turned by neither (`dew.nn.rope.rotate`).
         rows = 2 * ((head + 2) // 4)
         axes = (rows, head - rows) if self.positions == "rotary" else None
         tokens = self.patches + self.latents

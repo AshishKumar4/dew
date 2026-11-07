@@ -52,4 +52,5 @@ def test_tutorial_12s_tokenizer_reconstructs_the_balls_it_was_trained_on():
     tokenizer = CausalTokenizer((32, 32, 1), width=128, depth=3, latents=16, bottleneck=8)
     state = Trainer(TokenizerObjective(tokenizer), optax.adam(3e-4), key=jax.random.key(9)).fit(
         clips, steps=8000, log_every=4000)
-    assert_lights_what_it_shows(tokenizer, state.variables, held.reshape(-1, 32, 32, 1))
+    assert_lights_what_it_shows(tokenizer, state.variables, held.reshape(-1, 32, 32, 1),
+                                videos.reshape(-1, 32, 32, 1).mean(0))
