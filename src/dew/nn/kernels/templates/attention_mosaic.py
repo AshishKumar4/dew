@@ -564,15 +564,11 @@ class MosaicForward(_Mainloop[Tiles]):
         value_width = config.columns or value_width
         steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
-        # A paged call's key tile of several pages loaded a page at a time, as its launch loads it (a
-        # cp.async stream's pages joined into one tile beside its slots, `Family.lifetimes`).
+        # A paged call's key tile of several pages loaded as its launch loads it (`paged_reads`).
         page = _page(ba)
-        # (A tile no whole pages fill no launch takes, `_pages_hold`: counted whole.)
-        pieces = (config.block_k // page if page is not None and page < config.block_k
-                  and config.block_k % page == 0 else 1)
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
-                                           min(config.stages, steps), out_dtype=out_dtype, pieces=pieces,
+                                           min(config.stages, steps), out_dtype=out_dtype, page=page,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
                                            parts=self.parts)
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
@@ -757,12 +753,14 @@ def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tupl
 
 def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
     """Whether a paged call's key tiles of `tile` keys lie in its pages of `page`: whole tiles a page, each
-    read where it lies (`attention_mosaic_forward._paged_views`), or whole pages a tile, each its own copy
-    into a slot's whole swizzled rows (`mosaic.Pieces`, `mosaic.TILE_ROWS`) where `family` loads a step's
-    block in pieces (`mosaic.Transport.copies_in_pieces`)."""
+    read where it lies (`attention_mosaic_forward._paged_views`), or whole pages a tile, its rows gathered
+    through the table where `family` gathers rows (`attention_mosaic_forward.paged_reads`), any page, else
+    each page its own copy into a slot's whole swizzled rows (`mosaic.Pieces`, `mosaic.TILE_ROWS`) where it
+    loads a step's block in pieces (`mosaic.Transport.copies_in_pieces`)."""
     if page % tile == 0:
         return True
-    return tile % page == 0 and page % mosaic.TILE_ROWS == 0 and family.copies_in_pieces
+    return tile % page == 0 and (family.gathers_rows
+                                 or (page % mosaic.TILE_ROWS == 0 and family.copies_in_pieces))
 
 
 def streams(query, target: generation.GpuTarget) -> bool:

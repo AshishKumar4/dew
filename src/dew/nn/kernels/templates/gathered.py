@@ -8,6 +8,8 @@ import functools
 import jax.numpy as jnp
 from jax._src.lib.mlir.dialects import gpu as mgpu_gpu, llvm as mgpu_llvm, nvvm as mgpu_nvvm
 from jax.experimental import pallas as pl
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
+from jax._src.state import types as state_types
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir as mgpu_ir
@@ -24,7 +26,16 @@ class Ring(mosaic.Ring):
     memory (`ring`: Pallas's barriers take no lane-level arrival); the consumers wait on it (`acquire`) and
     release the slot as any ring's. TMA lands a copy in whole tiles of rows, a row alone only by copies
     Mosaic's layout inference refuses, and from one thread a row a copy (about 5k clocks a step against 1k
-    of products); CUTLASS's sm90 gather is the producer warps' cp.async too."""
+    of products); CUTLASS's sm90 gather is the producer warps' cp.async too. The warpgroup that loads it
+    gathers it, a producer's or a consumer that feeds its rings (`fed.Feed`), its rows at the slot's swizzle
+    (`swizzle`)."""
+
+    @property
+    def swizzle(self) -> int:
+        """The bytes the slots' rows are swizzled at (`ring`'s `swizzle`)."""
+        transforms = self.smem.transforms if isinstance(self.smem, state_types.TransformedRef) else ()
+        return next((transform.swizzle for transform in transforms
+                     if isinstance(transform, plgpu_core.UnswizzleRef)), mosaic.SWIZZLE_BYTES)
 
     def initialized(self) -> None:
         stages = self.stages
@@ -43,9 +54,9 @@ class Ring(mosaic.Ring):
         height, width = self.block
         [depth] = rows.rest
         source = tokens.at[:, pl.ds(depth * width, width)]
-        swizzle = mosaic.swizzle_transforms(tokens.dtype, mosaic.SWIZZLE_BYTES)
-        copies = functools.partial(gathered_copies, swizzle=mosaic.SWIZZLE_BYTES)
-        refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(swizzle), plgpu.RefType())
+        transforms = mosaic.swizzle_transforms(tokens.dtype, self.swizzle)
+        copies = functools.partial(gathered_copies, swizzle=self.swizzle)
+        refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(transforms), plgpu.RefType())
         plgpu.inline_mgpu(arg_types=refs)(lambda ctx, *refs: copies(*refs))(
             source, rows.table.at[pl.ds(rows.start, height)], self.smem.at[slot],
             self.full.at[pl.ds(slot, 1)])
@@ -58,11 +69,11 @@ class Ring(mosaic.Ring):
         return self.smem.at[slot]
 
 
-def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, swizzle: int | None = None) -> dict:
     """A gathered `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, their rows
-    staged at the widest swizzle, a load mbarrier each in shared memory (`uint64`, `Ring.initialized`)
-    and a release barrier each that `consumers` arrive at."""
-    return {'smem': mosaic.staged((stages, *block), dtype, mosaic.SWIZZLE_BYTES),
+    staged at `swizzle` bytes (the widest where None), a load mbarrier each in shared memory (`uint64`,
+    `Ring.initialized`) and a release barrier each that `consumers` arrive at."""
+    return {'smem': mosaic.staged((stages, *block), dtype, swizzle or mosaic.SWIZZLE_BYTES),
             'full': plgpu.SMEM((stages,), jnp.uint64),
             'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
 
