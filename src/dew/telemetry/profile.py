@@ -439,7 +439,8 @@ class Profiler:
         of its own beside the caller's work (`dew.telemetry.export`), the capture already stopped, which
         `exported` waits for. A training run's window stops so, since converting a capture takes far longer
         than the steps it traced (row 2017: minutes for a 3-step window). A stop that failed exports at
-        once, so its manifest records why, as it raises."""
+        once, so its manifest records why, as it raises; so does one in a process its sandbox forbids to
+        create another (a live page's kernel)."""
         self._stop("completed", wait=wait)
 
     def _stop(self, body: str, *, wait: bool = True) -> None:
@@ -481,9 +482,14 @@ class Profiler:
         # memory the run holds; and it imports the Dew this process runs, first on its path.
         source = str(Path(__file__).resolve().parents[2])
         path = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
-        _exporting[capture] = subprocess.Popen(
-            [sys.executable, "-m", "dew.telemetry.export", str(capture), json.dumps(metadata)],
-            env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path})
+        try:
+            _exporting[capture] = subprocess.Popen(
+                [sys.executable, "-m", "dew.telemetry.export", str(capture), json.dumps(metadata)],
+                env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path})
+        except PermissionError:
+            # A process its sandbox forbids to create processes (a seccomp policy on fork and clone, a live
+            # page's kernel) converts its capture here, as a stop that waits does.
+            _export(capture, converter, metadata, failures)
 
     def __enter__(self) -> Self:
         return self.start()
