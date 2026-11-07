@@ -329,9 +329,9 @@ def _matched(graph: Graph, exp_place: int) -> Attention | None:
         return None
     region = region._replace(softcap=softcap, factor=factor, bias=bias)
     places = sorted(set(places))
-    # A mask or bias made before the region: none of its values (`Attention.operands`).
+    # A mask or bias made outside the region and before the place its call is written (its last).
     made_at = [graph.producer.get(var) for var in region.operands[3:]]
-    if any(place is not None and place >= places[0] for place in made_at):
+    if any(place is not None and (place in places or place > places[-1]) for place in made_at):
         return None
     inside = set(places)
     for place in places:
@@ -522,7 +522,8 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
             inner = _capped(graph, graph.uncast(kept, [], widening), [])[1]
             if (isinstance(other, jcore.Var) and other.aval.shape == atom.aval.shape
                     and _product_of(graph, inner)):
-                bias, atom = other, graph.uncast(kept, places, widening)
+                # The bias as the program holds it, its widening for the add the region's (jax.nn's).
+                bias, atom = graph.uncast(other, places, widening), graph.uncast(kept, places, widening)
                 places.append(added)
                 break
         else:

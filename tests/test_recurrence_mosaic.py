@@ -1272,32 +1272,37 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
 
 
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
-    """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, where a
-    required launch spills, its launch refused (`report.refuse_launch`) and the group derived and compiled
-    again, as a run's compile steps a spilling launch down to its derivation's next config (`report.settled`,
-    a spill sm_100a's ptxas makes of mma.sync's TMA-fed launches among them); the plans, refusals and launches
-    held apart those of the cases returned."""
+    """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
+    long as a required launch spills (at most `report.STEPS` times), its launch refused
+    (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps a spilling
+    launch down through its derivation's configs (`report.settled`): a launch whose every config spills
+    derives none and leaves the template (a B200's mma.sync launches sm_100a's ptxas spills at every
+    geometry, row 4727). `refused` holds the calls the template's own model refuses (its first derivation,
+    before any compile); the plans and launches held apart are those of the cases returned."""
     from kernel_compile import compile_mosaic_kernels
 
     launched: dict = {}
     cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
     found = compile_mosaic_kernels(cases, target)
-    spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ()) if kernel.get("spilled")}
-                for case, record in zip(cases, found, strict=True) if case.required}
-    spilling = {name: kernels for name, kernels in spilling.items() if kernels}
-    if not spilling:
-        return cases, found
-    # Refused as the run's compile refuses them: under the target, whose capacities the launch's identity
-    # reads.
-    with generation.assumed(generation.gpu_target(target)):
-        for name, kernels in spilling.items():
-            bound, tiles = launched[name]
-            report.refuse_launch(template.MOSAIC, bound, tiles, kernels)
-    plans.clear()
-    refused.clear()
-    apart.clear()
-    cases = compiled_cases(target, plans, refused, apart, only=group)
-    return cases, compile_mosaic_kernels(cases, target)
+    for _ in range(report.STEPS):
+        spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
+                                if kernel.get("spilled")}
+                    for case, record in zip(cases, found, strict=True) if case.required}
+        spilling = {name: kernels for name, kernels in spilling.items() if kernels}
+        if not spilling:
+            break
+        # Refused as the run's compile refuses them: under the target, whose capacities the launch's identity
+        # reads.
+        with generation.assumed(generation.gpu_target(target)):
+            for name, kernels in spilling.items():
+                bound, tiles = launched[name]
+                report.refuse_launch(template.MOSAIC, bound, tiles, kernels)
+        plans.clear()
+        apart.clear()
+        launched.clear()
+        cases = compiled_cases(target, plans, [], apart, only=group, launched=launched)
+        found = compile_mosaic_kernels(cases, target)
+    return cases, found
 
 
 def test_a_gated_delta_nets_ring_and_residency_are_one_choice():
