@@ -170,10 +170,7 @@ def stamps(root: str, hidden_inputs: tuple[str, ...]) -> dict[str, tuple[int, in
     return found
 
 
-def changed(before: dict[str, tuple[int, int, int, int]], after: dict[str, tuple[int, int, int, int]]
-            ) -> tuple[set[str], set[str]]:
-    """What changed between two `stamps` of a checkout: the files written, removed or made between them, and
-    the directories whose entries they changed (a made or removed file's), the checkout's own as `.`."""
-    files = {path for path, stamp in before.items() if after.get(path) != stamp} | (
-        after.keys() - before.keys())
-    return files, {os.path.dirname(path) or "." for path in before.keys() ^ after.keys()}
+def changed(before: dict[str, tuple[int, int, int, int]],
+            after: dict[str, tuple[int, int, int, int]]) -> set[str]:
+    """The files of a checkout written, removed or made between two `stamps` of it."""
+    return {path for path, stamp in before.items() if after.get(path) != stamp} | (after.keys() - before.keys())
