@@ -101,7 +101,6 @@ refused (`report`), its coverage partial. A target well under CI's keeps tasks s
 
 import argparse
 import ast
-import collections
 import concurrent.futures
 import contextlib
 import dataclasses
@@ -371,11 +370,8 @@ def contents(name: str) -> bytes:
 
 def probed(path: Path) -> bytes:
     """What an existence or size probe (followed.py's `PROBES`) answers of `path`: missing, a directory, or a
-    file with whether it executes and, but for a Python module, its size, the stat a probe reads beside its
-    kind. Its bytes are none of it: a file's edit of the same size reruns no prober, which reads it only by
-    opening it, its own input; its times are no checkout's to keep. A module's size is what its comments
-    make it, and its code is the input of whatever runs it (`code_unit`): `inspect.getsourcefile` probes
-    each module it names (train 668: a helper's comment edit re-keyed its 458 probers)."""
+    file, whether it executes and, but for a Python module (its code its runners' input, `code_unit`), its
+    size; never its bytes or times (train 668: a probed helper's comment edit re-keyed its 458 probers)."""
     if path.is_dir():
         return b"directory"
     if not path.is_file():
@@ -416,15 +412,12 @@ class Reading:
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
     def cut(self, name: str, count: int) -> list[list[str]]:
-        """Test file `name`'s recorded tests as split.py cuts them into `count` groups (`members`), from the
-        durations record read and parted by file once a reading, and each file's cut once (train 662's plan:
-        3,620 group keys each parsed the whole record, split its every node id, 95 million splits, and read
-        its file's marks again, a minute of its two)."""
+        """File `name`'s tests cut into `count` groups (`members`), the record parted by file once a reading
+        and each cut once (train 662's plan: 3,620 group keys each parsed the record, a minute of two)."""
         if self.durations is None:
-            parted: dict[str, dict[str, float]] = collections.defaultdict(dict)
+            self.durations = {}
             for node, seconds in durations_record().items():
-                parted[node.split("::")[0]][node] = seconds
-            self.durations = dict(parted)
+                self.durations.setdefault(node.split("::")[0], {})[node] = seconds
         if (name, count) not in self.cuts:
             held = sites(name)
             recorded = {node: seconds for node, seconds in self.durations.get(name, {}).items()
@@ -746,9 +739,8 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
         found = recorded(record_key(python, row(python, name, split), each, common), token)
         if found is None or found["depends"] is None:
             continue
-        # The key of the inputs the last run's record names, hashed here once: its own where it is fresh
-        # (`fresh`); else the last run is another commit's, and the key names the green run of exactly these,
-        # kept by it (`green_key`) whatever ran since.
+        # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
+        # these, kept by that key (`green_key`) whatever ran since.
         key = cache_key(common, name, split, found["depends"], reading)
         if found["key"] is not None and found["key"] == key:
             return found
@@ -1614,12 +1606,10 @@ def dumped(done: subprocess.Popen, stacks: Path) -> str:
 
 def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: float, grace: float,
                stacks: Path) -> tuple[int, str, bool, str, set[str] | None]:
-    """A task's pytest `command` run under `environment` to its `deadline`: its exit code, its output,
-    whether it passed the deadline, every thread's stack then (`dumped`), and the data files its processes
-    opened (`watched`), none where one of its group outlived the kill and may open more. pytest leads a
-    process group of its own, so what its tests start ends with it. Its output is streamed as it comes by a
-    reader of its own, which nothing waits on past pytest's end: a test's child holding the pipe open (a
-    pool worker, a server) cannot keep the verdict from being written."""
+    """A task's pytest `command` run to its `deadline`: its exit code, output, whether it passed the deadline,
+    its threads' stacks then (`dumped`) and the data files it opened (`watched`), none where its group
+    outlived the kill. pytest leads its own process group; its output streams through a reader nothing
+    waits on past its end, so a child holding the pipe open cannot keep the verdict from being written."""
     lines: list[str] = []
     # Every data file the task's processes open, held from before pytest starts until its group stopped
     # (`watched`): each is the input of every file the task runs.
@@ -1676,10 +1666,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
-    # A task that resumes keeps its progress (progress.py) and, recalled before, sets aside by their exact ids
-    # the tests its attempt passed (`resumed`, progress.py's `SET_ASIDE`), their seconds kept for the rows. A
-    # check-1 site's map task, whose artifacts are its judge's draws alone, a release check and a traced run
-    # resume none, and keep none.
+    # A resuming task keeps its progress and sets aside the tests its recalled attempt passed (`resumed`,
+    # SET_ASIDE); a site's map task (its artifacts its judge's draws), a release and a trace resume none.
     resumes = site is None and not release and coverage is None
     done_before = resumed(tests) if resumes else {}
     aside = out.with_name(f"{out.name}.set-aside.json")
