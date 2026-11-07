@@ -27,7 +27,7 @@ from dew.batch import FROZEN, merge
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
-from dew.lora import LoRA
+from dew.lora import Adapter, LoRA
 from dew.nn.backbones.decoder_stack import stacked_rows
 from dew.objectives.lm import LMObjective
 from dew.optim import (
@@ -676,6 +676,38 @@ def test_a_stage_local_lora_fit_merges_and_saves_as_every_layer_whole(tmp_path):
         adapter.save(variables, tmp_path / name)
         written.append({path.name: path.read_bytes() for path in sorted((tmp_path / name).iterdir())})
     assert written[0] == written[1]
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own():
+    """A LoRA run whose layers' adapters scale apart (one alpha on layers 0 and 1, another on 2 and 3, the
+    factors' shapes alike) runs them as two scanned runs (`CausalTransformer.scanned_like`), and its
+    one-stage state holds them so, as its forward reads them, where it planned one run of four the forward
+    never read; a state stacked so, handed to a run that does not scan, is read back onto its layers."""
+    model = decoder(scan_layers=True)
+    base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+    adapter = LoRA(rank=2, modules=("q_proj",), alpha=4.0).apply(model, base, key=1)
+    targets = {path: (dataclasses.replace(target, alpha=8.0) if any(f"layers_{index}" in path
+                                                                     for index in (2, 3)) else target)
+               for path, target in adapter.targets.items()}
+    uneven = Adapter.bound(model, adapter.variables, targets, adapter.rslora, adapter.dropout,
+                           adapter.layouts)
+    batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
+    run = trainer(uneven.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=uneven.variables)
+    run.validate(steps=1)
+    state, _, _ = run.place()
+    assert set(state.variables["params"]["stages"]) == {"layers_0_1", "layers_2_3"}
+    moved, loss, *_ = run.compile(state, batch)(state, batch)
+    assert np.isfinite(float(loss))
+    plain = Adapter.bound(model.clone(scan_layers=False), adapter.variables, targets, adapter.rslora,
+                          adapter.dropout, adapter.layouts)
+    looped = trainer(plain.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=plain.variables)
+    looped.validate(steps=1)
+    received = looped.staged(moved)
+    assert "stages" not in received.variables["params"]
+    for name, leaves in on_host(run.stored(moved).variables["params"]).items():
+        np.testing.assert_array_equal(np.asarray(jax.tree.leaves(leaves)[0]),
+                                      np.asarray(jax.tree.leaves(on_host(received.variables["params"])[name])[0]))
 
 
 ROWS_SEEDS = 8

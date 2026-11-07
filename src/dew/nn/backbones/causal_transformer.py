@@ -1858,9 +1858,24 @@ class CausalTransformer(LinearProducts):
         stage where no scan stacks a run (a stack that does not scan, or whose runs are one layer each)."""
         if self.loop is not None:
             return ()
-        bound = self if self.scope is not None else self.bind(jax.tree.map(
-            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
-        view = bound.stage_view(stages)
+        held = dict(dict(store).get('params', {})).get('stages', {})
+        if stages == 1 and held and not self.scan_layers:
+            # A one-stage state another run stacked, which this stack does not scan: its runs as stored, so
+            # it reads them back onto their layers.
+            runs = {layer: (found.start, len(found)) for found in map(group_layers, held) if found is not None
+                    for layer in found}
+            groups = tuple(sorted({runs.get(index, (index, 1)) for index in range(self.num_layers)}))
+            return (DecoderBank((), StackView(groups)),)
+        if self.scope is not None:
+            view = self.stage_view(stages)
+        else:
+            # Through the model's own `apply`, which an adapted model runs under its interceptor, so its runs
+            # split where its adapter's targets do (`scanned_like`), as its forward splits them.
+            view = self.apply(jax.tree.map(
+                lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store),
+                method=lambda module: module.stage_view(stages))
+            if not isinstance(view, StackView):
+                raise TypeError(f"expected the stack's view from the model, got {type(view).__name__}")
         if stages == 1 and not (self.scan_layers and any(count > 1 for _, count in view.groups)):
             return ()
         return (DecoderBank((), view),)
