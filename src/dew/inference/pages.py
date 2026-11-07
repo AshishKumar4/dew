@@ -70,6 +70,67 @@ def segment_hash(tokens: np.ndarray, page_size: int, shared: int, salt: bytes = 
     return hashlib.blake2b(b"segment" + previous + block.tobytes(), digest_size=16).digest()
 
 
+class HostTier:
+    """`slots` slots in host memory an evicted device entry goes to by its digest (a prefix page's hash, the
+    digest of the page a row state is kept after): a free slot, else the least recently kept one's, whose
+    entry is forgotten (`kept`). A slot an owed upload reads leaves the tier until the step's moves are
+    made (`read`, `drained`). Pages' and row states' host tiers each hold one (`Pages`, `States`)."""
+
+    def __init__(self, slots: int) -> None:
+        self.slots = slots
+        self._free: deque[int] = deque(range(slots))
+        self._held: OrderedDict[bytes, int] = OrderedDict()
+        """Each held entry's slot by its digest, least recently kept first."""
+        self._reading: list[int] = []
+        """Slots an owed upload still reads, free again once the moves are made."""
+
+    def __contains__(self, digest: bytes) -> bool:
+        return digest in self._held
+
+    def slot(self, digest: bytes) -> int:
+        """The slot holding `digest`'s entry."""
+        return self._held[digest]
+
+    def kept(self, digest: bytes) -> int | None:
+        """A slot to hold `digest`'s entry in: a free one, or the least recently kept one's, its entry
+        forgotten; None where the tier holds no slot an owed upload does not read."""
+        if self._free:
+            slot = self._free.popleft()
+        elif self._held:
+            slot = self._held.popitem(last=False)[1]
+        else:
+            return None
+        self._held[digest] = slot
+        return slot
+
+    def read(self, digest: bytes) -> int:
+        """Take `digest`'s slot out of the tier for an owed upload, which reads it before it is free."""
+        slot = self._held.pop(digest)
+        self._reading.append(slot)
+        return slot
+
+    def unread(self, digest: bytes, slot: int) -> None:
+        """Hand back `slot`, whose owed upload of `digest`'s entry will not run, the entry still in it."""
+        self._reading.remove(slot)
+        self._held[digest] = slot
+
+    def drop(self, digest: bytes) -> None:
+        """Forget `digest`'s entry, its slot free."""
+        slot = self._held.pop(digest, None)
+        if slot is not None:
+            self._free.append(slot)
+
+    def drained(self) -> None:
+        """The step's moves are made: the slots its uploads read are free."""
+        self._free.extend(self._reading)
+        self._reading = []
+
+    def forget(self) -> None:
+        """Hold no entry."""
+        self._free.extend(self._held.values())
+        self._held.clear()
+
+
 class States:
     """The row states a prefix's pages are read with: `count` entries, each one slot's state after a
     prompt's first full pages, named by the chain digest of the last of them (`prefix_hashes`), and `host`
@@ -82,14 +143,11 @@ class States:
         self.count = count
         self._free: deque[int] = deque(range(count))
         self._by_hash: OrderedDict[bytes, int] = OrderedDict()
-        self._host_free: deque[int] = deque(range(host))
-        self._on_host: OrderedDict[bytes, int] = OrderedDict()
-        """States held in host slots, by their page's digest, least recently used first."""
+        self.host = HostTier(host)
+        """States held in host slots, by their page's digest."""
         self._pinned: set[int] = set()
         """Entries a seated row restores from, an owed upload writes or an owed capture writes, kept from
         giving way until the step's moves are made (`drained`)."""
-        self._reading: list[int] = []
-        """Host slots an owed upload still reads, free again once the moves are made."""
         self.spills: list[tuple[int, int]] = []
         """The (entry, host slot) moves owed: an entry giving way, out to its slot."""
         self.uploads: list[tuple[int, int]] = []
@@ -98,7 +156,7 @@ class States:
     def __contains__(self, digest: bytes) -> bool:
         """Whether a state after `digest`'s page is held: in an entry, or in a host slot an entry can
         take it back into."""
-        return digest in self._by_hash or (digest in self._on_host and self._vacant())
+        return digest in self._by_hash or (digest in self.host and self._vacant())
 
     def _vacant(self) -> bool:
         return bool(self._free) or any(entry not in self._pinned for entry in self._by_hash.values())
@@ -110,8 +168,7 @@ class States:
             self._by_hash.move_to_end(digest)
             entry = self._by_hash[digest]
         else:
-            slot = self._on_host.pop(digest)
-            self._reading.append(slot)
+            slot = self.host.read(digest)
             entry = self._vacated()
             self.uploads.append((slot, entry))
             self._by_hash[digest] = entry
@@ -122,7 +179,7 @@ class States:
         """An entry to write the state after `digest`'s page into: a free one, or the least recently used
         one's, which goes to the host first; None where a state after that page is held already, the store
         holds none, or every entry is kept for the step."""
-        if digest in self._by_hash or digest in self._on_host or not self.count or not self._vacant():
+        if digest in self._by_hash or digest in self.host or not self.count or not self._vacant():
             return None
         entry = self._vacated()
         self._by_hash[digest] = entry
@@ -137,10 +194,8 @@ class States:
             return self._free.popleft()
         digest = next(held for held, entry in self._by_hash.items() if entry not in self._pinned)
         entry = self._by_hash.pop(digest)
-        slot = (self._host_free.popleft() if self._host_free else
-                self._on_host.popitem(last=False)[1] if self._on_host else None)
+        slot = self.host.kept(digest)
         if slot is not None:
-            self._on_host[digest] = slot
             self.spills.append((entry, slot))
         return entry
 
@@ -149,17 +204,14 @@ class States:
         entry = self._by_hash.pop(digest, None)
         if entry is not None:
             self._free.append(entry)
-        slot = self._on_host.pop(digest, None)
-        if slot is not None:
-            self._host_free.append(slot)
+        self.host.drop(digest)
 
     def drained(self) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
         """The moves owed before the next step's restores, spills first; the kept entries and the host
         slots the uploads read are free again after them."""
         owed = self.spills, self.uploads
         self.spills, self.uploads = [], []
-        self._host_free.extend(self._reading)
-        self._reading = []
+        self.host.drained()
         self._pinned.clear()
         return owed
 
@@ -167,8 +219,7 @@ class States:
         """Hold no state: the weights that wrote them are replaced."""
         self._free.extend(self._by_hash.values())
         self._by_hash.clear()
-        self._host_free.extend(self._on_host.values())
-        self._on_host.clear()
+        self.host.forget()
         self._pinned.clear()
 
 
@@ -197,13 +248,10 @@ class Pages:
         self.prefix_cache = prefix_cache
         self.states = states
         self.host = host
-        self._host_free: deque[int] = deque(range(host))
-        self._on_host: OrderedDict[bytes, int] = OrderedDict()
-        """Prefix pages held in host slots, by their hash, least recently used first."""
+        self._on_host = HostTier(host)
+        """Prefix pages held in host slots, by their hash."""
         self.transfers = Transfers()
         """The copies owed before the next step's program (`drained`)."""
-        self._reading: list[int] = []
-        """Host slots an owed upload still reads, free again once the copies are made."""
         self._landing: dict[int, tuple[int, bytes]] = {}
         """The device pages an owed upload writes, each with the host slot it reads and its page's hash:
         reclaimed before the copy, such a page's keys are still the slot's, which keeps them."""
@@ -243,7 +291,7 @@ class Pages:
         one (`-1 - slot`); None for none."""
         page = self._by_hash.get(digest)
         if page is None and digest in self._on_host:
-            page = -1 - self._on_host[digest]
+            page = -1 - self._on_host.slot(digest)
         return page
 
     def _matched(self, prompt: np.ndarray, salt: bytes,
@@ -322,9 +370,8 @@ class Pages:
         landing = {index: (-1 - page, hashes[index]) for index, page in enumerate(whole) if page < 0}
         if source is not None and source < 0:
             landing[len(whole)] = (-1 - source, segment_hash(prompt, self.size, held, salt))
-        for slot, digest in landing.values():
-            del self._on_host[digest]
-            self._reading.append(slot)
+        for _, digest in landing.values():
+            self._on_host.read(digest)
         pages = [page if index not in landing else self._uploaded(*landing[index])
                  for index, page in enumerate(whole)]
         if source is not None:
@@ -355,8 +402,7 @@ class Pages:
         """The copies owed before the next step's program, which its caller makes, spills first; the host
         slots the uploads read are free again after them."""
         owed, self.transfers = self.transfers, Transfers()
-        self._host_free.extend(self._reading)
-        self._reading = []
+        self._on_host.drained()
         self._landing.clear()
         copying, self._copying = self._copying, []
         self.release(copying)
@@ -418,8 +464,7 @@ class Pages:
         self._by_hash.clear()
         self._hash_of.clear()
         self._segments.clear()
-        self._host_free.extend(self._on_host.values())
-        self._on_host.clear()
+        self._on_host.forget()
         self._landing.clear()
         if self.states is not None:
             self.states.forget()
@@ -446,8 +491,7 @@ class Pages:
                 # Its upload has not run: the host slot keeps the page as it was.
                 slot, _ = landing
                 self.transfers.uploads.remove((slot, page))
-                self._reading.remove(slot)
-                self._on_host[digest] = slot
+                self._on_host.unread(digest, slot)
             elif not self._spilled(page, digest) and self.states is not None:
                 self.states.drop(digest)
         self._holders[page] += 1
@@ -457,12 +501,8 @@ class Pages:
         """Keep reclaimed `page`'s keys in a host slot under `digest`, a free slot or the least recently used
         one's, whose page is forgotten; whether a slot took it (none where every slot is read by an owed
         upload, or the pool keeps no host tier). A state kept after the page (`States`) stays with it."""
-        if self._host_free:
-            slot = self._host_free.popleft()
-        elif self._on_host:
-            slot = self._on_host.popitem(last=False)[1]
-        else:
+        slot = self._on_host.kept(digest)
+        if slot is None:
             return False
-        self._on_host[digest] = slot
         self.transfers.spills.append((page, slot))
         return True

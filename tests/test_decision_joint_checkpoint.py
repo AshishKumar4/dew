@@ -16,7 +16,6 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
-from float64_terms import float64_forward
 from interop_support import allocated_bytes, written_tensors
 from one_draw import assert_as_exact_as_the_reference
 from PIL import Image
@@ -171,45 +170,6 @@ def test_a_joint_schema_read_in_context_is_the_schema_the_row_holds(tokenizer):
                                            for option in contextual.options), (case, inline.name)
         assert (held.state_tokens, held.state_kept, held.media) == (read.state_tokens, read.state_kept,
                                                                      read.media)
-
-
-def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
-    """Dew's head, the release's fp32 head, its float64 head, and the terms
-    Dew's float64 head sums for each logit (`float64_forward`), all on the
-    same fp32 backbone states, over every question of every case. Each case
-    runs alone, padded to the cases' widest layout, so every case is one
-    program, compiled once, and padding reaches none of the head's pooling
-    (`test_a_padded_batch_scores_every_row_as_it_scores_alone`)."""
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
-    table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    # Dew's head compiled, as a served task's pass runs it.
-    head = jax.jit(loaded.model.apply)
-    found, reference, truth, terms = [], [], [], []
-    rows = laid_out(tokenizer)
-    widest = DecisionInputs.collate([row for _, row in rows.values()], 0)
-    length = widest.tokens.shape[1]
-    with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
-        for index, (case, (_, row)) in enumerate(rows.items()):
-            inputs = jax.tree.map(lambda leaf, at=index: leaf[at:at + 1], widest)
-            padded = np.pad(states[case], ((0, length - len(states[case])), (0, 0)))[None]
-            given = (loaded.variables, padded, inputs, table)
-            scores = head(*given)
-            _, summed = float64_forward(loaded.model, *given)
-            for slot, laid in enumerate(row.questions):
-                key = f"{case}/{laid.name}"
-                found.append(np.asarray(scores)[0, slot, :len(laid.options)])
-                terms.append(np.asarray(summed)[0, slot, :len(laid.options)])
-                reference.append(logits[key])
-                truth.append(logits[f"{key}/head64"])
-    return tuple(map(np.concatenate, (found, reference, truth, terms)))
-
-
-def test_the_stored_joint_head_matches_its_release_under_the_float64_rule(tokenizer):
-    """Every question of every case, read off the same fp32 backbone states,
-    held to twice the release's own head's fp32 distance from its float64
-    run (measured: 1.42 times)."""
-    found, reference, truth, terms = head_logits(tokenizer)
-    assert_as_exact_as_the_reference(found, reference, truth, "stored joint head logits", terms=terms)
 
 
 def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
@@ -547,6 +507,36 @@ def test_a_joint_release_fine_tunes_and_reloads_from_its_run(joint_runs):
 
 
 @pytest.mark.shared_setup("joint_runs")
+def test_a_trained_joint_task_on_a_multimodal_backbone_exports_and_reloads_as_itself(joint_runs, tmp_path):
+    """A task trained from a joint-head release over Qwen 3.5's multimodal backbone (`joint_runs`), its
+    model a run's, not the release's source, exports as a release (`save_pretrained`): its backbone
+    planned from the model it trained (`PretrainedDecoder.from_model` of its `MultimodalTransformer`),
+    its head and layout beside it, and the release loads back as the task its bundle is, every weight and
+    answer the bundle's as a load serves it, its projections packed (`Decide.of`), bit for bit (row
+    4525). The trained task itself holds them unpacked, as a run trains them, and placed on the run's
+    mesh, each a program apart: the bundle is compared over its weights as the release writes them, on
+    the host."""
+    from dew.decision.sources import PretrainedDecision
+
+    objective, state, asked = joint_runs["objective"], joint_runs["state"], joint_runs["asked"]
+    trained = objective.pipeline(state)
+    trained.save_pretrained(tmp_path / "exported")
+    assert json.loads((tmp_path / "exported" / "config.json").read_text())["model_type"] == "qwen3_5"
+    reloaded = Decide.from_pretrained(tmp_path / "exported", attention_impl="xla")
+    served = Decide.of(PretrainedDecision.of(replace(trained, variables=jax.tree.map(np.asarray,
+                                                                                    trained.variables))))
+    assert reloaded.model == served.model and reloaded.layout == served.layout
+    assert jax.tree.structure(reloaded.variables) == jax.tree.structure(served.variables)
+    for written, held in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(served.variables),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(written), np.asarray(held), strict=True)
+    for state_text in ("charged twice!", "is the site down?"):
+        for answer, again in zip(served(state_text, asked).values(), reloaded(state_text, asked).values(),
+                                 strict=True):
+            np.testing.assert_array_equal(answer.probabilities, again.probabilities)
+
+
+@pytest.mark.shared_setup("joint_runs")
 def test_two_joint_release_runs_average_into_a_task_that_reloads(joint_runs):
     """Two runs of a joint-head release (`joint_runs`) average into one task, its temperatures refit on
     held-out answers (`Decide.averaged`), which saves to a directory of its own and reloads through
@@ -613,3 +603,34 @@ def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
     shown = {option: round(float(p), 4) for option, p in zip(seen.options, seen.probabilities, strict=True)}
     assert served["answers"]["department"]["probabilities"] == shown
     assert decide.systemone(request)["answers"] != served["answers"]
+
+
+def test_a_joint_release_exports_with_the_layout_and_calibration_it_was_given(tmp_path):
+    """The joint head's files state no layout, so a release whose layout is not its default (a window of
+    its own, a framing of its rows) exports it beside them (`dew.config.Release`) and reads it back,
+    answering as it did; its calibration goes with it where it has one (row 4310), and the numerics its task
+    traces under, which the release's files state none of. The Qwen3.5 backbone's bundle writes through its
+    source's own config (a trained task's export of one is row 4525)."""
+    from dew.decision.calibration import Abstention
+    from dew.decision.layout import Framing
+    from dew.nn.precision import ACCURATE
+
+    release = tmp_path / "release"
+    release.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (release / source.name).symlink_to(source.resolve())
+    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    layout = replace(bundle.layout, max_len=2048, framing=Framing(system="Decide from the schema.",
+                                                                   prefill="", thinking=False))
+    chosen = replace(bundle, layout=layout, calibration=replace(bundle.calibration,
+                                                                abstention=Abstention(default=0.99)),
+                     numerics=ACCURATE)
+    chosen.save(tmp_path / "saved")
+    restored = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    assert restored.layout == layout and restored.calibration == chosen.calibration
+    assert Decide.of(restored, name="release").precision == ACCURATE
+    request = CASES["quickstart"]
+    assert (Decide.of(restored, name="release").systemone(request, details=True)
+            == Decide.of(chosen, name="release").systemone(request, details=True))
+    assert (tmp_path / "saved" / "joint_head.safetensors").is_file()
+

@@ -2,44 +2,104 @@
 them."""
 
 from collections.abc import Mapping
-from functools import partial
+from types import MappingProxyType
 
 import numpy as np
 
 from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import flag, four_wide, inert, integer, ungated
 from dew.interop.decoder_parts import (
     GPT_MLP,
     GPT_TRUNK,
     DecoderFamily,
     DecoderFields,
+    HeadRows,
     Packed,
     Renames,
-    decoder_tensors,
     fixed_attention_buffer,
-    hf_ungated,
     refuse,
-    renamed_name,
-    renamed_path,
-    ungated_mlp,
+    spelled,
 )
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.layouts import (
+    ConfigField,
+    ConfigLayout,
+    ConfigPart,
+    Restated,
+    Route,
+    Slot,
+    Spelled,
+    Table,
+    constant,
+    one_of,
+    unread,
+)
 from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.registry import Configured
 
 
-def _gpt_neo_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    layers = _records.integer(hf.get('num_layers', 24), 'num_layers')
-    hidden = _records.integer(hf.get('hidden_size', 2048), 'hidden_size')
-    positions = _records.integer(hf.get('max_position_embeddings', 2048), 'max_position_embeddings')
-    config = gpt2_config({**hf, 'n_embd': hidden, 'n_layer': layers,
-                           'n_head': hf.get('num_heads', 16), 'n_positions': positions,
-                           'n_inner': hf.get('intermediate_size') or 4 * hidden,
-                           'resid_pdrop': hf.get('resid_dropout', 0.),
-                           'embd_pdrop': hf.get('embed_dropout', 0.),
-                           'attn_pdrop': hf.get('attention_dropout', 0.)}, used)
-    stated = hf.get('attention_types', [[['global', 'local'], 12]])
+def _heads(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    """GPT-2's heads, every one its own key/value head, as wide as the residual over their count."""
+    used.add('n_head')
+    heads = _records.integer(hf_config.get('n_head', 12), 'n_head')
+    hidden = _records.integer(record['emb_features'], 'n_embd')
+    if hidden % heads:
+        refuse('n_embd/n_head', 'the hidden width must divide into whole attention heads')
+    record.update(num_heads=heads, num_kv_heads=heads, head_dim=hidden // heads)
+    return record
+
+
+def _positions(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    used.add('n_positions')
+    positions = _records.integer(hf_config.get('n_positions', 1024), 'n_positions')
+    record.update(position_embedding='learned', position_embedding_size=positions, max_seq_len=positions)
+    return record
+
+
+def _scaled(value: Configured, key: str) -> float | None:
+    """GPT-2's scale_attn_weights: the head width's root, or none at all (1.0)."""
+    return None if value is None or _records.boolean(value, key) else 1.0
+
+
+def gpt2_layout(activation: ConfigPart[CausalTransformer]) -> ConfigLayout[CausalTransformer]:
+    """GPT-2's decoder, both ways, its MLP's activation `activation` (GPT-1 spells it its own way)."""
+    return ConfigLayout(
+        integer('vocab_size', 'vocab_size', 50257), integer('n_embd', 'emb_features', 768),
+        integer('n_layer', 'num_layers', 12), ConfigPart(_heads, lambda model: {'n_head': model.num_heads}),
+        four_wide('n_inner'), activation,
+        ConfigPart(_positions, lambda model: {'n_positions': model.position_embedding_size
+                                              or model.max_seq_len}),
+        ConfigField('layer_norm_epsilon', 'norm_eps', 1e-5, parse=_records.number),
+        ConfigField('scale_attn_weights', 'attention_scale', default=True, parse=_scaled,
+                    spell=lambda scale: scale is None),
+        flag('tie_word_embeddings', 'tie_embeddings', default=True),
+        ConfigField('resid_pdrop', 'dropout_rate', 0.1, parse=_records.number),
+        ConfigField('embd_pdrop', 'embedding_dropout_rate', 0.1, parse=_records.number),
+        ConfigField('attn_pdrop', 'attention_dropout_rate', 0.1, parse=_records.number),
+        constant('mlp_bias', value=True), constant('norm_type', value='layer'),
+        constant('norm_bias', value=True), constant('qk_norm', value=False),
+        constant('attention_bias', value=True),
+        inert('add_cross_attention', 'GPT-2 cross attention has no decoder counterpart', neutral=False),
+        inert('scale_attn_by_inverse_layer_idx', 'the attention scale does not vary by layer', neutral=False),
+        inert('reorder_and_upcast_attn', 'the reordered GPT-2 attention arithmetic is not represented',
+              neutral=False),
+        unread('n_ctx', 'summary_type', 'summary_use_proj', 'summary_activation', 'summary_proj_to_labels',
+               'summary_first_dropout', 'use_cache', 'task_specific_params'))
+
+
+GPT2_CONFIG = gpt2_layout(ungated(
+    'activation_function', ('gelu_new', 'gelu_fast', 'gelu_pytorch_tanh', 'gelu', 'relu'), 'GPT-2'))
+"""GPT-2's config, both ways."""
+
+
+def _neo_pattern(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
+    """GPT-Neo's attention kinds, both ways: `attention_types`' repeated global and local lists, one kind a
+    layer, the local ones attending `window_size`."""
+    used.update(('attention_types', 'attention_layers', 'window_size'))
+    layers = _records.integer(record['num_layers'], 'num_layers')
+    stated = hf_config.get('attention_types', [[['global', 'local'], 12]])
     if not isinstance(stated, (list, tuple)):
         refuse('attention_types', 'GPT-Neo repeats lists of global/local attention kinds')
     pattern: list[str] = []
@@ -52,63 +112,69 @@ def _gpt_neo_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         pattern.extend(_records.strings(entry[0], 'attention_types') * repeats)
     if len(pattern) != layers or set(pattern) - {'global', 'local'}:
         refuse('attention_types', 'one global or local attention kind is required per layer')
-    if (hf.get('attention_layers') is not None
-            and _records.strings(hf['attention_layers'], 'attention_layers') != tuple(pattern)):
+    if (hf_config.get('attention_layers') is not None
+            and _records.strings(hf_config['attention_layers'], 'attention_layers') != tuple(pattern)):
         refuse('attention_layers', 'the expanded pattern must agree with attention_types')
-    used.update(('num_layers', 'num_heads', 'hidden_size', 'intermediate_size', 'max_position_embeddings',
-                 'attention_types', 'attention_layers', 'window_size', 'resid_dropout', 'embed_dropout',
-                 'attention_dropout', 'classifier_dropout'))
-    used.add('gradient_checkpointing')
-    config.update({
-        'attention_bias': False, 'o_proj_bias': True, 'attention_scale': 1.0,
-        'layer_types': tuple('full_attention' if kind == 'global' else 'sliding_attention'
-                             for kind in pattern),
-        'kinds': {'sliding_attention': native_fields(LayerKind)(
-            window=_records.integer(hf.get('window_size', 256), 'window_size'))}
-            if 'local' in pattern else {},
-    })
-    return config
+    record['layer_types'] = tuple('full_attention' if kind == 'global' else 'sliding_attention'
+                                  for kind in pattern)
+    record['kinds'] = ({'sliding_attention': native_fields(LayerKind)(
+        window=_records.integer(hf_config.get('window_size', 256), 'window_size'))}
+        if 'local' in pattern else {})
+    return record
+
+
+def _neo_pattern_written(model: CausalTransformer) -> Mapping[str, object]:
+    return {'attention_types': [[[('local' if kind == 'sliding_attention' else 'global')], 1]
+                                for kind in model.per_layer_types],
+            'window_size': (model.kind_of('sliding_attention').window
+                            if 'sliding_attention' in model.per_layer_types else 256)}
+
+
+GPT_NEO_CONFIG = ConfigLayout(
+    Restated(GPT2_CONFIG, own={'n_embd': 'hidden_size', 'n_layer': 'num_layers', 'n_head': 'num_heads',
+                                'n_positions': 'max_position_embeddings', 'n_inner': 'intermediate_size',
+                                'resid_pdrop': 'resid_dropout', 'embd_pdrop': 'embed_dropout',
+                                'attn_pdrop': 'attention_dropout'},
+             defaults={'num_layers': 24, 'hidden_size': 2048, 'num_heads': 16,
+                       'max_position_embeddings': 2048, 'resid_dropout': 0.0, 'embed_dropout': 0.0,
+                       'attention_dropout': 0.0}),
+    ConfigPart(_neo_pattern, _neo_pattern_written),
+    constant('attention_bias', value=False), constant('o_proj_bias', value=True),
+    constant('attention_scale', value=1.0), unread('classifier_dropout', 'gradient_checkpointing'))
+"""GPT-Neo's config, both ways: GPT-2's block under its own names, unscaled attention without q/k/v biases,
+and global and local layers."""
 
 
 _GPT_NEO_NAMES: Renames = (
     ('attn.attention.out_proj', 'self_attn.o_proj'), ('attn.attention', 'self_attn'), *GPT_TRUNK, *GPT_MLP)
 
 
-def _gpt_neo_export(model: CausalTransformer) -> Mapping[str, object]:
-    fields = dict(gpt2_export(model))
-    fields.update({
-        'hidden_size': model.emb_features, 'num_layers': model.num_layers, 'num_heads': model.num_heads,
-        'intermediate_size': model.hidden_features,
-        'max_position_embeddings': model.position_embedding_size or model.max_seq_len,
-        'attention_types': [[[('local' if kind == 'sliding_attention' else 'global')], 1]
-                            for kind in model.per_layer_types],
-        'window_size': (model.kind_of('sliding_attention').window
-                        if 'sliding_attention' in model.per_layer_types else 256),
-        'resid_dropout': model.dropout_rate, 'embed_dropout': model.embedding_dropout_rate,
-        'attention_dropout': model.attention_dropout_rate,
-    })
-    fields.update(dict.fromkeys(('n_embd', 'n_layer', 'n_head', 'n_inner', 'n_positions',
-                                 'scale_attn_weights', 'attn_pdrop', 'embd_pdrop', 'resid_pdrop',
-                                 'layer_types', 'sliding_window')))
-    return fields
-
-
-def _gptj_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    config = gpt2_config(hf, used)
-    head_dim = _records.integer(config['head_dim'], 'head_dim')
-    rotated = _records.integer(hf.get('rotary_dim', 64), 'rotary_dim')
+def _gptj_rotary_dim(hf_config: Mapping[str, object], used: set[str],
+                     record: DecoderFields) -> DecoderFields:
+    """GPT-J's rotary, both ways: an even prefix of `rotary_dim` of each head, turned on every layer and
+    scaled by the head width."""
+    used.update(('rotary_dim', 'rotary'))
+    head_dim = _records.integer(record['head_dim'], 'head_dim')
+    rotated = _records.integer(hf_config.get('rotary_dim', 64), 'rotary_dim')
     if rotated < 2 or rotated > head_dim or rotated % 2:
         refuse('rotary_dim', 'GPT-J rotates an even positive prefix of each attention head')
-    used.update(('rotary_dim', 'rotary', 'gradient_checkpointing', 'tokenizer_class'))
-    if hf.get('rotary', True) is not True or hf.get('scale_attn_weights', True) is not True:
+    if hf_config.get('rotary', True) is not True or hf_config.get('scale_attn_weights', True) is not True:
         refuse('rotary/scale_attn_weights', 'GPT-J rotates its heads and scales by their dimension')
-    config.update({
-        'position_embedding': 'rotary', 'position_embedding_size': None,
-        'partial_rotary_factor': rotated / head_dim, 'partial_rotary_type': 'default',
-        'attention_bias': False, 'parallel_residual': True, 'shared_parallel_norm': True,
-        'head_bias': True, 'tie_embeddings': bool(hf.get('tie_word_embeddings', False)),
-    })
-    return config
+    record.update(position_embedding='rotary', position_embedding_size=None,
+                  partial_rotary_factor=rotated / head_dim, partial_rotary_type='default')
+    return record
+
+
+GPTJ_CONFIG = ConfigLayout(
+    GPT2_CONFIG,
+    ConfigPart(_gptj_rotary_dim, lambda model: {
+        'rotary_dim': int(model.features_per_head * (model.partial_rotary_factor or 1.)),
+        'pad_token_id': None}),
+    constant('attention_bias', value=False), constant('parallel_residual', value=True),
+    constant('shared_parallel_norm', value=True), constant('head_bias', value=True),
+    flag('tie_word_embeddings', 'tie_embeddings', default=False),
+    unread('gradient_checkpointing', 'tokenizer_class'))
+"""GPT-J's config, both ways: GPT-2's block in parallel under one norm, its heads rotated."""
 
 
 # GPT-J's block has no second norm and its model no learned positions, so of
@@ -129,93 +195,37 @@ def _gptj_order(head_dim: int, rotated: int) -> np.ndarray:
                            np.arange(rotated, head_dim)))
 
 
+def _gptj_rotary(config: Mapping[str, object]) -> np.ndarray:
+    """A GPT-J head's rows as the shared rotate-half arithmetic reads them (`_gptj_order`), by the record."""
+    head_dim = _records.integer(config['head_dim'], 'head_dim')
+    # A model rotating every channel states no fraction (`_gptj_export` writes it as 1.0).
+    fraction = config.get('partial_rotary_factor')
+    rotated = int(head_dim * (1.0 if fraction is None
+                               else _records.number(fraction, 'partial_rotary_factor')))
+    return _gptj_order(head_dim, rotated)
+
+
+_GPTJ_ROWS = HeadRows(('.attn.q_proj.weight', '.attn.k_proj.weight'), _gptj_rotary)
+"""GPT-J's queries' and keys' rows, each head's rotary pairs interleaved where the shared arithmetic
+rotates halves."""
+
+
 def _gptj_prepare(tensors: Mapping[str, Stored],
                   config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
-    if config is None:
-        raise ValueError('GPT-J rotary storage requires translated head geometry')
-    head_dim = _records.integer(config['head_dim'], 'head_dim')
-    heads = _records.integer(config['num_heads'], 'num_heads')
-    rotated = int(head_dim * _records.number(config['partial_rotary_factor'], 'partial_rotary_factor'))
-    prepared = dict(tensors)
-    for name, tensor in tensors.items():
-        if name.endswith(('.attn.q_proj.weight', '.attn.k_proj.weight')):
-            grouped = tensor.reshape(heads, head_dim, *tensor.shape[1:])
-            prepared[name] = grouped[:, _gptj_order(head_dim, rotated)].reshape(tensor.shape)
-        elif fixed_attention_buffer(name, tensor, 'attn', (-1e9,)):
-            del prepared[name]
-    return prepared
+    """Check and drop the fixed attention buffers."""
+    return {name: tensor for name, tensor in tensors.items()
+            if not fixed_attention_buffer(name, tensor, 'attn', (-1e9,))}
 
 
-def _gptj_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if name.endswith(('.attn.bias', '.attn.masked_bias')):
-        return None
-    return renamed_path(_GPTJ_NAMES, name, config)
+def _buffers(*names: str) -> Route:
+    """A release's fixed attention buffers, by their names' last parts (`names`), which a load checks and
+    drops (`fixed_attention_buffer`): no leaf."""
+    return Route('{module}.{buffer}', None,
+                 MappingProxyType({'module': Slot(r'.+'), 'buffer': one_of(*names)}))
 
 
-def _gptj_export(model: CausalTransformer) -> Mapping[str, object]:
-    fields = dict(gpt2_export(model))
-    fields.update({
-        'rotary_dim': int(model.features_per_head * (model.partial_rotary_factor or 1.)),
-        'pad_token_id': None,
-    })
-    return fields
-
-
-def _gptj_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
-                         config: Mapping[str, object]) -> LazyTensors:
-    tensors = decoder_tensors(family, model, variables, config)
-    rotated = int(model.features_per_head * (model.partial_rotary_factor or 1.))
-    order = np.argsort(_gptj_order(model.features_per_head, rotated))
-
-    def build(name: str) -> np.ndarray:
-        tensor = tensors[name]
-        if name.endswith(('.attn.q_proj.weight', '.attn.k_proj.weight')):
-            grouped = tensor.reshape(model.num_heads, model.features_per_head, *tensor.shape[1:])
-            return grouped[:, order].reshape(tensor.shape)
-        return tensor
-
-    return LazyTensors(tensors.specs, build)
-
-
-def gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    hidden = _records.integer(hf.get('n_embd', 768), 'n_embd')
-    heads = _records.integer(hf.get('n_head', 12), 'n_head')
-    layers = _records.integer(hf.get('n_layer', 12), 'n_layer')
-    positions = _records.integer(hf.get('n_positions', 1024), 'n_positions')
-    used.update(('n_embd', 'n_head', 'n_layer', 'n_positions', 'n_inner',
-                 'vocab_size', 'activation_function', 'layer_norm_epsilon',
-                 'tie_word_embeddings', 'scale_attn_weights', 'scale_attn_by_inverse_layer_idx',
-                 'reorder_and_upcast_attn', 'add_cross_attention', 'n_ctx',
-                 'attn_pdrop', 'embd_pdrop', 'resid_pdrop', 'summary_type',
-                 'summary_use_proj', 'summary_activation', 'summary_proj_to_labels',
-                 'summary_first_dropout', 'use_cache', 'task_specific_params'))
-    if hf.get('add_cross_attention'):
-        refuse('add_cross_attention', 'GPT-2 cross attention has no decoder counterpart')
-    if hf.get('scale_attn_by_inverse_layer_idx'):
-        refuse('scale_attn_by_inverse_layer_idx', 'the attention scale does not vary by layer')
-    if hf.get('reorder_and_upcast_attn'):
-        refuse('reorder_and_upcast_attn', 'the reordered GPT-2 attention arithmetic is not represented')
-    activation = _records.text(hf.get('activation_function', 'gelu_new'), 'activation_function')
-    mlp = ungated_mlp(activation, ('gelu_new', 'gelu_fast', 'gelu_pytorch_tanh', 'gelu', 'relu'),
-                      'activation_function', 'GPT-2')
-    if hidden % heads:
-        refuse('n_embd/n_head', 'the hidden width must divide into whole attention heads')
-    return native_fields(CausalTransformer)(
-        vocab_size=_records.integer(hf.get('vocab_size', 50257), 'vocab_size'),
-        emb_features=hidden, num_layers=layers, num_heads=heads,
-        num_kv_heads=heads, head_dim=hidden // heads,
-        mlp_features=_records.integer(hf.get('n_inner') or 4 * hidden, 'n_inner'),
-        mlp=mlp, mlp_bias=True,
-        norm_type='layer', norm_bias=True,
-        norm_eps=_records.number(hf.get('layer_norm_epsilon', 1e-5), 'layer_norm_epsilon'),
-        qk_norm=False, attention_bias=True,
-        attention_scale=None if hf.get('scale_attn_weights', True) else 1.0,
-        position_embedding='learned', position_embedding_size=positions,
-        max_seq_len=positions, tie_embeddings=bool(hf.get('tie_word_embeddings', True)),
-        dropout_rate=_records.number(hf.get('resid_pdrop', 0.1), 'resid_pdrop'),
-        embedding_dropout_rate=_records.number(hf.get('embd_pdrop', 0.1), 'embd_pdrop'),
-        attention_dropout_rate=_records.number(hf.get('attn_pdrop', 0.1), 'attn_pdrop'),
-    )
+_GPTJ_ROUTES = Table(_buffers('attn.bias', 'attn.masked_bias'), spelled(_GPTJ_NAMES))
+"""GPT-J's names: GPT-2's trunk, its own block's (`_GPTJ_NAMES`); its buffers fill no leaf."""
 
 
 def _gpt2_prepare(tensors: Mapping[str, Stored],
@@ -246,79 +256,48 @@ _GPT2_PACKED = (
       for conv in ('attn.c_proj', 'mlp.c_fc', 'mlp.c_proj')))
 
 
-def _gpt2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    name = _nested(name)
-    # Alias inspection sees raw names before preparation, which validates and drops the buffers.
-    if name.endswith(('.attn.bias', '.attn.masked_bias')):
-        return None
-    return renamed_path(GPT2_NAMES, name, config)
-
-
-def gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
-    activation = hf_ungated(model.mlp, 'GPT-2')
-    config: dict[str, object] = {
-        'n_embd': model.emb_features, 'n_layer': model.num_layers, 'n_head': model.num_heads,
-        'n_inner': model.hidden_features, 'n_positions': model.position_embedding_size or model.max_seq_len,
-        'layer_norm_epsilon': model.norm_eps,
-        'activation_function': activation,
-        'scale_attn_weights': model.attention_scale is None,
-        'attn_pdrop': model.attention_dropout_rate,
-        'embd_pdrop': model.embedding_dropout_rate, 'resid_pdrop': model.dropout_rate,
-    }
-    config.update(dict.fromkeys((
-        'hidden_size', 'num_hidden_layers', 'num_attention_heads',
-        'num_key_value_heads', 'head_dim', 'intermediate_size',
-        'max_position_embeddings', 'rms_norm_eps', 'attention_bias', 'hidden_act', 'rope_theta')))
-    return config
+_GPT2_ROUTES = Table(
+    _buffers('attn.bias', 'attn.masked_bias'), spelled(GPT2_NAMES),
+    # The bare GPT2Model's names, which a load nests under the causal LM's `transformer.`.
+    Spelled((('h', 'transformer.h'), ('wte', 'transformer.wte'), ('wpe', 'transformer.wpe'),
+             ('ln_f', 'transformer.ln_f')), spelled(GPT2_NAMES)))
+"""GPT-2's names: the causal LM's, which an export writes, and the bare model's, which a load reads too;
+the old persistent causal buffers fill no leaf."""
 
 
 GPT_NEO = DecoderFamily(
-    ('gpt_neo',), _gpt_neo_config,
+    ('gpt_neo',), GPT_NEO_CONFIG,
     lambda fields: fields.position_embedding == 'learned' and fields.attention_scale == 1.0
                    and fields.attention_bias is False and fields.o_proj_bias is True,
-    'gpt_neo', 'GPTNeoForCausalLM', _gpt_neo_export,
-    weight_path=partial(renamed_path, _GPT_NEO_NAMES),
-    export_path=partial(renamed_name, _GPT_NEO_NAMES), preserve_source_layout=False,
+    'gpt_neo', 'GPTNeoForCausalLM',
+    routes=spelled(_GPT_NEO_NAMES), preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )
 
 GPTJ = DecoderFamily(
-    ('gptj',), _gptj_config,
+    ('gptj',), GPTJ_CONFIG,
     lambda fields: fields.shared_parallel_norm and fields.head_bias and not fields.attention_bias,
-    'gptj', 'GPTJForCausalLM', _gptj_export,
-    weight_path=_gptj_path, export_path=partial(renamed_name, _GPTJ_NAMES),
-    prepare=_gptj_prepare, export_weights=_gptj_export_weights, preserve_source_layout=False,
+    'gptj', 'GPTJForCausalLM',
+    routes=_GPTJ_ROUTES, head_rows=_GPTJ_ROWS, prepare=_gptj_prepare, preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )
 
-def _openai_gpt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """GPT-1's decoder (modeling_openai.py): GPT-2's attention, MLP and Conv1D layers, each block norming its
-    stream after each sublayer joins it (`n = ln_1(x + a)`, `h = ln_2(n + m)`) and the trunk ending in no
-    norm. Its `afn` 'gelu' is OpenAI's tanh GELU (`ACT_FNS`, gelu_new)."""
-    afn = _records.text(hf.get('afn', 'gelu'), 'afn')
-    spelled = {'gelu': 'gelu_new', 'relu': 'relu'}
-    if afn not in spelled:
-        refuse(f'afn={afn!r}', "GPT-1's MLP reads a tanh GELU ('gelu') or ReLU here")
+OPENAI_GPT_CONFIG = ConfigLayout(
     # GPT-1's blocks always scale by the head width and read none of GPT-2's other attention switches
     # (modeling_openai.py builds each Block with scale=True), whatever a config carries.
-    config = gpt2_config({**hf, 'activation_function': spelled[afn], 'n_inner': None,
-                          'vocab_size': hf.get('vocab_size', 40478),
-                          'n_positions': hf.get('n_positions', 512), 'scale_attn_weights': True,
-                          'scale_attn_by_inverse_layer_idx': False, 'reorder_and_upcast_attn': False,
-                          'add_cross_attention': False}, used)
+    Restated(gpt2_layout(ungated('afn', ('gelu_new', 'relu'), 'GPT-1',
+                                            spelled={'gelu': 'gelu_new', 'relu': 'relu'}, default='gelu')),
+             fixed={'n_inner': None, 'scale_attn_weights': True, 'scale_attn_by_inverse_layer_idx': False,
+                    'reorder_and_upcast_attn': False, 'add_cross_attention': False},
+             defaults={'vocab_size': 40478, 'n_positions': 512}),
+    constant('pre_norms', value=False), constant('post_residual_norms', value=True),
+    constant('final_norm', value=False),
     # The original release's `n_special`, which transformers' OpenAI GPT reads nowhere: its vocabulary
     # counts the special tokens.
-    used.update(('afn', 'predict_special_tokens', 'n_special'))
-    config.update({'pre_norms': False, 'post_residual_norms': True, 'final_norm': False})
-    return config
-
-
-def _openai_gpt_export(model: CausalTransformer) -> Mapping[str, object]:
-    fields = dict(gpt2_export(model))
-    activation = fields.pop('activation_function')
-    fields['afn'] = {'gelu_new': 'gelu', 'relu': 'relu'}[str(activation)]
-    fields.update(dict.fromkeys(('n_inner', 'scale_attn_weights', 'activation_function')))
-    return fields
+    unread('predict_special_tokens', 'n_special'))
+"""GPT-1's config, both ways (modeling_openai.py): GPT-2's attention, MLP and Conv1D layers, each block
+norming its stream after each sublayer joins it (`n = ln_1(x + a)`, `h = ln_2(n + m)`) and the trunk ending
+in no norm. Its `afn` 'gelu' is OpenAI's tanh GELU (`ACT_FNS`, gelu_new)."""
 
 
 def _openai_nested(name: str) -> str:
@@ -343,24 +322,23 @@ OPENAI_GPT_NAMES: Renames = (
 attention joins it and `ln_2` after the MLP (`post_residual_norms`), as OPT-350m's norms do."""
 
 
-def _openai_gpt_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    name = _openai_nested(name)
-    # Alias inspection sees raw names before preparation, which validates and drops the masks.
-    if name.endswith('.attn.bias'):
-        return None
-    return renamed_path(OPENAI_GPT_NAMES, name, config)
+_OPENAI_GPT_ROUTES = Table(
+    _buffers('attn.bias'), spelled(OPENAI_GPT_NAMES),
+    # The bare OpenAIGPTModel's names, which the original release stores.
+    Spelled((('h', 'transformer.h'), ('tokens_embed', 'transformer.tokens_embed'),
+             ('positions_embed', 'transformer.positions_embed')), spelled(OPENAI_GPT_NAMES)))
+"""GPT-1's names: the causal LM's, which an export writes, and the bare model's, which a load reads too;
+the fixed causal masks fill no leaf."""
 
 
 OPENAI_GPT = DecoderFamily(
     ('openai-gpt',),
-    _openai_gpt_config,
+    OPENAI_GPT_CONFIG,
     lambda fields: (fields.position_embedding == 'learned' and fields.post_residual_norms
                     and not fields.final_norm and fields.position_embedding_offset == 0),
     'openai-gpt',
     'OpenAIGPTLMHeadModel',
-    _openai_gpt_export,
-    weight_path=_openai_gpt_path,
-    export_path=partial(renamed_name, OPENAI_GPT_NAMES),
+    routes=_OPENAI_GPT_ROUTES,
     prepare=_openai_gpt_prepare,
     spelling=_openai_nested,
     packed=_GPT2_PACKED,
@@ -370,13 +348,11 @@ OPENAI_GPT = DecoderFamily(
 
 GPT2 = DecoderFamily(
     ('gpt2',),
-    gpt2_config,
+    GPT2_CONFIG,
     lambda fields: fields.position_embedding == 'learned',
     'gpt2',
     'GPT2LMHeadModel',
-    gpt2_export,
-    weight_path=_gpt2_path,
-    export_path=partial(renamed_name, GPT2_NAMES),
+    routes=_GPT2_ROUTES,
     prepare=_gpt2_prepare,
     spelling=_nested,
     packed=_GPT2_PACKED,

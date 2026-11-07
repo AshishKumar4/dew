@@ -12,6 +12,7 @@ import contextvars
 import dataclasses
 import functools
 import importlib
+import math
 from collections.abc import Callable
 from typing import Literal, get_args
 
@@ -66,7 +67,16 @@ from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
-from .precision import asks_default_precision, at_least_fp32, capped_logits, float32_einsum
+from .precision import (
+    asks_default_precision,
+    at_least_fp32,
+    at_precision,
+    capped_logits,
+    configurable_precision,
+    configured_precision,
+    exact_products,
+    float32_einsum,
+)
 from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
@@ -769,6 +779,12 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
 
 FORWARD_MODE = contextvars.ContextVar("forward_mode_attention", default=False)
 
+REVERSE_ONLY = ('cudnn', 'triton', 'flash', 'tpu', 'template')
+"""The kernels that define their reverse-mode derivative alone (`jax.custom_vjp`), its backward traced after
+the call: forward mode takes theirs from the reference path (`forward_differentiable`), and a call's stated
+precision is held over that backward (`at_precision`). The others are JAX's own products (xla) or state
+their own (decode), which their tangents and transposes keep."""
+
 
 @contextlib.contextmanager
 def forward_mode_attention():
@@ -860,7 +876,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             primal = 'template' if template_infers(query.dtype, query.shape[-1], causal) else 'xla'
             return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks,
                                           primal_alone=True)
-        if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu', 'template'):
+        if not FORWARD_MODE.get() or resolved not in REVERSE_ONLY:
             return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
         def fused(query, key, value, bias, sinks):
@@ -983,26 +999,43 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     if implementation not in ('decode', 'template'):
         mask = with_key_starts(mask, starts, key.shape[-3])
         starts = None
-    return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
-                            implementation, softcap=softcap, sinks=sinks,
-                            segment_ids=segment_ids, max_segments=max_segments,
-                            key_value_seq_lengths=lengths, key_value_seq_starts=starts,
-                            block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
-                            key_runs=key_runs,
-                            places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-                            dropout_places=dropout_places)
+
+    def fused(query, key, value, bias, sinks):
+        return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
+                                implementation, softcap=softcap, sinks=sinks,
+                                segment_ids=segment_ids, max_segments=max_segments,
+                                key_value_seq_lengths=lengths, key_value_seq_starts=starts,
+                                block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
+                                key_runs=key_runs,
+                                places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
+                                dropout_places=dropout_places)
+    # A kernel whose products take no precision of their own (jax.nn's xla attention, Pallas dots: the
+    # template's portable mainloop, splash and its flash fallback) multiplies at the call's stated
+    # precision: a reverse-only kernel's backward, traced after the call, held at it too (`at_precision`),
+    # and JAX's own products by the forward's scope alone, which their tangents and transposes keep, so
+    # forward mode differentiates them as written. A stated default is a floor the run's configured
+    # precision meets, and a kernel that states its own keeps it.
+    if implementation in REVERSE_ONLY and not asks_default_precision(precision):
+        return at_precision(precision)(fused)(query, key, value, bias, sinks)
+    with configured_precision(precision):
+        return fused(query, key, value, bias, sinks)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits: bool = False) -> bool:
     """Whether a call asks for arithmetic only the reference path performs.
 
     The four are what every fused kernel's requirements refuse
-    (`attention_kernels`' arithmetic requirement): a matmul precision other
-    than DEFAULT (a higher one, a dot algorithm or a preset of one), a
+    (`attention_kernels`' arithmetic requirement): a matmul precision, stated
+    or the run's configured one, that whole products of the query's dtype
+    with fp32 sums do not compute (`exact_products`: a dot algorithm that
+    narrows the operands or widens them; any level, a 16-bit operand's
+    exact products at 'highest' among them) or that no config names (a
+    pair, a dot algorithm: `configurable_precision`), which a fused kernel
+    whose products take none of their own runs at (`_attention_kernel`), a
     softmax outside fp32, a compute dtype other than the inputs', and logits
     formed from queries and keys widened to at least fp32 (`wide_logits`).
     """
-    return (not asks_default_precision(precision)
+    return (not exact_products(precision, query.dtype) or not configurable_precision(precision)
             or not force_fp32_for_softmax
             or (dtype is not None and jnp.dtype(dtype) != query.dtype)
             or wide_logits)
@@ -1031,7 +1064,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
     case = AttentionCase(
-        queries=q_len, keys=kv_len, heads=query.shape[-2], kv_heads=key.shape[-2],
+        queries=q_len, keys=kv_len, rows=math.prod(query.shape[:-3]), heads=query.shape[-2],
+        kv_heads=key.shape[-2],
         head_dim=query.shape[-1], dtype=jnp.dtype(query.dtype), key_dtype=jnp.dtype(key.dtype),
         causal=bool(causal), window=sliding_window,
         documents=None if segment_ids is None else 'cross' if cross else 'own',

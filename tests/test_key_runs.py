@@ -111,3 +111,62 @@ def test_a_layer_reading_key_runs_computes_what_it_computes_over_the_same_mask(k
                  sown, maxima)
 
 
+
+
+PROMPT, CALL = 6, 4
+"""A cached call of four tokens after a prompt of six."""
+
+
+@pytest.mark.parametrize("kinds", [{"full_attention": {}}, {"sliding_attention": {"window": 2}},
+                                   {"chunked_attention": {"chunk": 3}}], ids=["full", "window", "chunk"])
+def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mean(kinds):
+    """A cached call's key runs, the prompt's keys in the cache and the call's own, whose key positions
+    restart between the two runs, beside its keys' validity with a gap inside each run, computes what it
+    computes under the mask the runs and the validity mean, as a pairwise mask beside that validity does,
+    bitwise on the one kernel (xla's), a windowed
+    layer windowing each run over its own positions from the queries' (Block-SFT's denoising pass, row
+    1538). A layer naming the template traces it on an A100, where the template refuses a mask by its
+    inherent limit: the call builds none. A chunked layer counts the call's queries at their own places; a
+    call's keys' validity beside no runs or mask is refused, hiding nothing it would otherwise read."""
+    from dew.nn.kernels import generation
+
+    decoder = model(**kinds)
+    rows, slots = 2, TINY_DECODER["max_seq_len"]
+    prompt = jax.random.randint(jax.random.key(0), (rows, PROMPT), 0, VOCAB)
+    block = jax.random.randint(jax.random.key(2), (rows, CALL), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), prompt)
+    _, made = decoder.apply(params, rows, method=CausalTransformer.init_cache, mutable=["cache"])
+    # The prompt prefilled in one cached call.
+    _, prefilled = decoder.apply({**params, "cache": made["cache"]}, prompt, decode=True, mutable=["cache"])
+    cache = prefilled["cache"]
+    runs = jnp.broadcast_to(jnp.asarray([[0, PROMPT], [PROMPT, PROMPT + CALL]])[None, None],
+                            (rows, CALL, 2, 2))
+    places = jnp.concatenate([jnp.arange(PROMPT), jnp.arange(CALL), jnp.arange(slots - PROMPT - CALL)])
+    places = jnp.broadcast_to(places, (rows, slots))
+    valid = np.zeros((rows, slots), bool)
+    valid[:, :PROMPT + CALL] = True
+    valid[0, 2], valid[1, PROMPT + 1] = False, False
+    seen = dense(np.asarray(runs), slots) & valid[:, None, :]
+
+    def read(model, **visibility):
+        return model.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
+                           coordinates=coordinates(block.shape, positions=jnp.broadcast_to(jnp.arange(CALL),
+                                                                                           block.shape)),
+                           attention_key_positions=places, method=CausalTransformer.hidden_states,
+                           **visibility)[0]
+
+    spanned = {"attention_key_runs": runs, "attention_key_valid": jnp.asarray(valid)}
+    masked = read(decoder, attention_pairwise_mask=jnp.asarray(seen))
+    np.testing.assert_array_equal(np.asarray(read(decoder, **spanned)), np.asarray(masked))
+    # A pairwise mask takes the keys' validity too.
+    paired = read(decoder, attention_pairwise_mask=jnp.asarray(dense(np.asarray(runs), slots)),
+                  attention_key_valid=jnp.asarray(valid))
+    np.testing.assert_array_equal(np.asarray(paired), np.asarray(masked))
+    with pytest.raises(ValueError):
+        decoder.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
+                      attention_key_valid=jnp.asarray(valid))
+    if "chunked_attention" in kinds:
+        return
+    template = decoder.clone(dtype=jnp.bfloat16, attention_impl="template")
+    with generation.assumed("sm80"):
+        jax.eval_shape(lambda: read(template, **spanned))

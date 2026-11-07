@@ -180,6 +180,20 @@ class DecisionModel(HeadedModel):
         QK-Clip finds every layer's maxima where it finds its weights (row 1608)."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
                                            progress=progress, opened=opened)
+        logits, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
+                                             opened=opened)
+        if "qk" in opened:
+            sown = {**sown, "qk": {"backbone": sown.get("qk", {}), "head": head_sown.get("qk", {})}}
+        return logits, sown
+
+    def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
+                    spanned: jax.Array | None = None, *, train: bool = False,
+                    rngs: dict[str, jax.Array] | None = None,
+                    opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
+        """The head's option logits `[B, Q, K]` over the backbone's `states`, -inf past each question's
+        options, and what it sowed into the `opened` collections: the head's part of `observed_logits`,
+        which reads its questions' spans from `spanned`, the pass that holds them, where the head pools
+        them."""
         head = thaw(part(variables, "head"))
         clipped = "qk" in opened
         head_sown: dict = {}
@@ -208,9 +222,7 @@ class DecisionModel(HeadedModel):
             logits = _array(
                 applied(states, inputs, table, train=train, rngs=rngs) if spans is None
                 else applied(states, inputs, table, spanned=spans, train=train, rngs=rngs))
-        if clipped:
-            sown = {**sown, "qk": {"backbone": sown.get("qk", {}), "head": head_sown.get("qk", {})}}
-        return jnp.where(inputs.options, logits, -jnp.inf), sown
+        return jnp.where(inputs.options, logits, -jnp.inf), head_sown
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                        labels: tuple[tuple[int, ...], ...]) -> jax.Array:
