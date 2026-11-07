@@ -45,18 +45,8 @@ from reference_error import as_given, assert_as_exact, ieee_fixture
 from safetensors.numpy import load_file
 from tool_support import run_from
 
-from dew.nn.vision import (
-    gemma4,
-    llama4,
-    mimo,
-    muse_glimmer,
-    projector_layout,
-    projector_variables,
-    qwen35,
-    siglip,
-    tower_layout,
-    tower_variables,
-)
+from dew.interop.towers import projector_layout, projector_variables, tower_layout, tower_variables
+from dew.nn.vision import gemma4, llama4, mimo, muse_glimmer, qwen35, siglip
 from dew.registry import projectors, towers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"

@@ -87,6 +87,7 @@ from dew.interop.layouts import (
     one_of,
     unread,
 )
+from dew.interop.towers.moonvit import translate_moonvit_config, translate_moonvit_projector_config
 from dew.interop.unread import Stored, held, valued
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -95,7 +96,6 @@ from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dspark import DSpark
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mla import MLAMixer
-from dew.nn.vision.moonvit import translate_moonvit_config, translate_moonvit_projector_config
 from dew.registry import Configured
 
 # MiniMaxM2Config's default_theta (configuration_minimax_m2.py:74).

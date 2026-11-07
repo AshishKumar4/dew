@@ -39,12 +39,10 @@ exact-GELU MLP and lays the image out as its decoder reads it.
 Each family lives in its own module of this package (`siglip`, `llama4`,
 `gemma4`, `qwen35`, `mimo`, `muse_glimmer`, `lfm3`, `deepseek_v41`, `gemma3n`) over the
 bases in `common` and the shared trunk in `vit`,
-with its path map and its config and weight translators, and each family's
-classes say where their tensors sit (`TowerLayout`, `ProjectorLayout`), so the
-kinds `dew.registry` names are the one list of them. The package exports the
-classes a caller constructs or subclasses, and reads a kind's tensors through
-its class's layout (`tower_variables`, `projector_variables`). Each name is imported from its own module
-when first read, so a caller of one family's tower reads no other family's.
+and the kinds `dew.registry` names are the one list of them. Where a release stores a kind's tensors and
+config, both ways, is `dew.interop.towers`' (`tower_variables`, `projector_variables`). The package
+exports the classes a caller constructs or subclasses. Each name is imported from its own module when
+first read, so a caller of one family's tower reads no other family's.
 """
 
 from typing import TYPE_CHECKING
@@ -52,17 +50,7 @@ from typing import TYPE_CHECKING
 from dew._exports import lookup as _lookup
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
-    from dew.nn.vision.common import (
-        ProjectorBase,
-        ProjectorLayout,
-        TowerBase,
-        TowerGeometry,
-        TowerLayout,
-        projector_layout,
-        projector_variables,
-        tower_layout,
-        tower_variables,
-    )
+    from dew.nn.vision.common import ProjectorBase, TowerBase, TowerGeometry
     from dew.nn.vision.deepseek_v41 import DeepseekV41Projector, DeepseekV41Vision
     from dew.nn.vision.gemma3n import Gemma3nProjector, Gemma3nVision
     from dew.nn.vision.gemma4 import Gemma4Projector, Gemma4Vision, Gemma4VisionTransformer
@@ -76,14 +64,8 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
 
 _EXPORTS = {
     "ProjectorBase": "dew.nn.vision.common",
-    "ProjectorLayout": "dew.nn.vision.common",
     "TowerBase": "dew.nn.vision.common",
     "TowerGeometry": "dew.nn.vision.common",
-    "TowerLayout": "dew.nn.vision.common",
-    "projector_layout": "dew.nn.vision.common",
-    "projector_variables": "dew.nn.vision.common",
-    "tower_layout": "dew.nn.vision.common",
-    "tower_variables": "dew.nn.vision.common",
     "DeepseekV41Projector": "dew.nn.vision.deepseek_v41",
     "DeepseekV41Vision": "dew.nn.vision.deepseek_v41",
     "Gemma3nProjector": "dew.nn.vision.gemma3n",
@@ -131,17 +113,11 @@ __all__ = [
     "MuseGlimmerProjector",
     "MuseGlimmerVision",
     "ProjectorBase",
-    "ProjectorLayout",
     "Qwen35Projector",
     "Qwen35Vision",
     "SiglipVision",
     "TowerBase",
     "TowerGeometry",
-    "TowerLayout",
     "ViTLayout",
     "VisionTransformer",
-    "projector_layout",
-    "projector_variables",
-    "tower_layout",
-    "tower_variables",
 ]
