@@ -74,6 +74,7 @@ from dew.data.dataset import (
     PhasedStream,
     Reader,
     Records,
+    phase_stages,
     rows_of,
     take_batch,
 )
@@ -1302,7 +1303,8 @@ def _compile_phases(
             return built[index][0]
         return _compiled(staged_at(index, consumed), packed, host=host, resume=resume)
 
-    batches = [phase.build.batch for phase, _ in staged]
+    batches = tuple(phase.build.batch for phase, _ in staged)
+    stages = () if tokens else phase_stages(batches, (0, *(end for _, end in staged[:-1] if end is not None)))
 
     def training(partition: DataPartition) -> Iterator[Batch]:
         if not tokens:
@@ -1317,12 +1319,12 @@ def _compile_phases(
             return opened_reader
 
         phases = [(functools.partial(global_reader, index), end) for index, (_, end) in enumerate(built)]
-        return PhasedStream(phases, loading.stop_seconds, batches=batches,
+        return PhasedStream(phases, loading.stop_seconds, batches=batches, stages=stages,
                             tokens=source.ends if tokens else None)
 
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
     return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
-                               token_ends=source.ends if tokens else None,
+                               token_ends=source.ends if tokens else None, batches=batches, stages=stages,
                                widths=merge_facts(loaded.widths for loaded, _ in built))
 
 

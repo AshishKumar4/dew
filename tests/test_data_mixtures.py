@@ -16,6 +16,7 @@ the same claims in real processes with a real checkpoint between them.
 """
 
 import collections
+import contextlib
 import dataclasses
 import itertools
 import json
@@ -1398,10 +1399,22 @@ def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own():
         chained = accumulating().fit(compile(corpus.batch(batch), read="memory", loading=READ), steps=end,
                                      state=chained)
     assert_same(parameters(state), parameters(chained), "phases fitted one after another")
-    misplaced = compile(phases((corpora[0].batch(16), 3), (corpora[0].batch(8), None)), read="memory",
-                        loading=READ)
-    with pytest.raises(ValueError, match="inside an update of 2 steps"):
-        misplaced.train(DataPartition(window=2))
+    # A phase of another batch begins where an update does, at step 4 of updates of 2, and not at step 3.
+    for end, refused in ((4, False), (3, True)):
+        loader = compile(phases((corpora[0].batch(16), end), (corpora[0].batch(8), None)), read="memory",
+                         loading=READ)
+        with pytest.raises(ValueError) if refused else contextlib.nullcontext():
+            loader.train(DataPartition(window=2)).close()
+
+
+def test_an_epoch_over_phases_of_other_batches_counts_each_phases_steps_in_its_own_rows():
+    """A pass over one corpus read by phases of 8, then 4 records a step, the second from step 2, takes
+    its first 16 records in two steps and the other 48 in twelve (`Loader.stages`, `steps_through`), as a
+    ramp's stages count theirs: fourteen, where counting every step in the first phase's batch took
+    eight."""
+    corpus = Pipeline(Memory(Indexed(1, 64))).shuffle(0)
+    loader = compile(phases((corpus.batch(8), 2), (corpus.batch(4), None)), read="memory", loading=READ)
+    assert loader.steps_per_epoch == 14
 
 
 class TokenCounted(Regression):

@@ -6,6 +6,7 @@ eight CPU devices: the bytes each device reads and writes are the state's and th
 under one placement, whichever backend compiles it. What it costs and its executable are XLA's own;
 a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
+import contextlib
 import dataclasses
 import itertools
 import json
@@ -141,6 +142,25 @@ def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_
     ahead = compile_ahead(accumulating(mesh=MeshSpec().build(compile_only_gpus("sm90", 1))), batch,
                           capacity=2**30)
     assert ahead.starts
+
+
+def test_a_step_compiled_ahead_over_phases_of_other_batches_takes_a_split_that_cuts_each():
+    """A run over phases of 12, then 8 rows a step compiles its step ahead in a split that cuts every
+    phase's batch (`Trainer.reading`'s `Loader.batches`), as its fit plans it: a fixed split of 2 compiles,
+    and one of 3, which cuts the first phase's 12 rows and not the second's 8, is refused, where it was
+    compiled ahead for a run that then plans another program (row 4812's review)."""
+    from dew.data import Memory, phases
+    from dew.data.pipeline import Pipeline
+    from dew.data.compile import compile
+    from dew.mesh import LayoutRefused
+    from dew.training.ahead import compile_ahead, compile_only_gpus, first_step_batch
+
+    corpus = Pipeline(Memory(token_rows(VOCAB, 64, SEQ_LEN + 1))).repeat()
+    loader = compile(phases((corpus.batch(12), 2), (corpus.batch(8), None)), read="memory")
+    for split, refused in ((2, False), (3, True)):
+        trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=split)
+        with pytest.raises(LayoutRefused) if refused else contextlib.nullcontext():
+            compile_ahead(trainer, first_step_batch(trainer, loader, 4))
 
 
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):

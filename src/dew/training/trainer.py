@@ -455,8 +455,11 @@ class Trainer(Generic[Loss, Effects]):
         return self._key
 
     def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
-        """Take `loader`'s device steps, prefetch and clock (`clocked`), as fit and compile-ahead do."""
+        """Take `loader`'s device steps, prefetch and clock (`clocked`), and the batches its steps read, each
+        phase's (`Loader.batches`), which every split a plan takes cuts (`splits`), as fit and compile-ahead
+        do."""
         self._device, self._prefetch = loader.device, prefetch
+        self._rows = loader.batches or (loader.batch,)
         progress = self._config is not None and self._config.reads_progress()
         self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
                                  custom_progress=self.step is not None and progress)
@@ -1597,9 +1600,7 @@ class Trainer(Generic[Loss, Effects]):
             if self._ramp:
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
-            # The batches the run reads, each phase's, which every split it plans cuts (`splits`).
-            self._rows = (run.source.batches if isinstance(run.source, PhasedStream)
-                          else (plan.dataset.batch,))
+
             run.partition = partition
             run.train = self._prefetched(plan, run, run.source, position)
             run.source = None  # Lifetime transferred to the prefetch worker.
