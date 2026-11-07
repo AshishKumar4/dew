@@ -2098,8 +2098,37 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     )
     out = jax.lax.ragged_dot(
         jnp.where(grouped, tokens, 0), kernel, group_sizes, precision=precision,
-        preferred_element_type=preferred_element_type)
+        preferred_element_type=preferred_element_type,
+        out_sharding=ragged_placement(((tokens, 0), (kernel, kernel.ndim - 1))))
     return jnp.where(grouped, out, 0)
+
+
+def ragged_placement(sources: tuple) -> jax.sharding.NamedSharding | None:
+    """Where a ragged product lands where an operand's type places it on a mesh with Explicit axes, split or
+    not (`out_sharding`: JAX infers no placement for a ragged dot, "Explicit sharding inference for
+    ragged_dot_general is not currently implemented"): each output dimension placed as the operand
+    dimension it comes from (`sources`, each `(operand, axis)`, or None for one no operand dimension gives: a
+    group axis), a contraction's sum whole, a mesh axis placing two dimensions placing the first alone; None
+    where no operand's type names such a mesh."""
+    from dew.mesh import mesh_axes
+
+    def placed(operand):
+        sharding = jax.typeof(operand).sharding
+        explicit = isinstance(sharding, jax.sharding.NamedSharding) and sharding.mesh.explicit_axes
+        return sharding if explicit else None
+
+    shardings = [None if source is None else placed(source[0]) for source in sources]
+    mesh = next((each.mesh for each in shardings if each is not None), None)
+    if mesh is None:
+        return None
+    spec, used = [], set()
+    for source, each in zip(sources, shardings, strict=True):
+        axis = None if source is None else source[1] % source[0].ndim
+        entry = None if each is None or axis >= len(each.spec) else each.spec[axis]
+        axes = set(mesh_axes(entry)) if entry is not None else set()
+        spec.append(entry if axes and not axes & used else None)
+        used |= axes if spec[-1] is not None else set()
+    return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*spec))
 
 
 SCALE_DEPTH = 128

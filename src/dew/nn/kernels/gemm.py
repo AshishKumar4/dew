@@ -273,9 +273,12 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # dtype, summed in `wide`: a bf16 product is exact in fp32 either way, where operands widened first
         # made the GPU's product an fp32 one (an sm120's 4096-token gate_up weight gradient 5.91 ms against
         # 2.72 for the bf16 product).
+        # A sum over rows an Explicit axis splits lands whole (`ragged_placement`), the depth and width placed
+        # as the rows' and the cotangent's columns are.
         return jax.lax.ragged_dot_general(
             lhs, rhs.astype(lhs.dtype), group_sizes, _CONTRACTED_ROWS,
-            precision=precision, preferred_element_type=wide).astype(out_dtype)
+            precision=precision, preferred_element_type=wide,
+            out_sharding=grouped_matmul.ragged_placement((None, (lhs, 1), (rhs, 1)))).astype(out_dtype)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays, tables)
 
