@@ -191,13 +191,15 @@ def jax_attention(*, causal: bool):
     return attend
 
 
-def flax_attention(*, causal: bool):
-    """Flax's attention as a Flax model writes it, its causal mask built from the rows."""
+def flax_attention(*, causal: bool, wide: bool = True):
+    """Flax's attention as a Flax model writes it, its causal mask built from the rows, its softmax in
+    float32 where `wide` (`force_fp32_for_softmax`, the kernels' arithmetic) and Flax's default, the
+    operands' dtype, else."""
     from flax import linen as nn
 
     def attend(q, k, v):
         mask = nn.make_causal_mask(jnp.ones(q.shape[:2])) if causal else None
-        return nn.dot_product_attention(q, k, v, mask=mask)
+        return nn.dot_product_attention(q, k, v, mask=mask, force_fp32_for_softmax=wide)
     return attend
 
 
@@ -206,6 +208,17 @@ SPELLINGS = {"jax.nn causal, grouped": (jax_attention(causal=True), 2, True),
              "flax causal": (flax_attention(causal=True), 4, True),
              "flax": (flax_attention(causal=False), 4, False)}
 """Each plain program's attention, its key heads over 4 query heads, and whether it is causal."""
+
+
+def test_flaxs_default_attention_softmax_in_bfloat16_is_kept_as_written():
+    """Flax's attention at its default, its softmax in the operands' bfloat16, compiled through `dew.jit` on
+    an H100, runs as written: Dew's call computes it only with its softmax in bfloat16, which no kernel of
+    Dew's takes, so no region is written as a kernel's (row 4783)."""
+    import dew
+
+    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
+    with generation.assumed("sm90"):
+        assert not _attention_routes(lambda: dew.jit(flax_attention(causal=True, wide=False)).trace(*shapes))
 
 
 def _attention_routes(trace) -> list[str]:
