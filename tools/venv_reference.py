@@ -79,12 +79,14 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
              "test": "test_flaxdiff_family_source", "arms": case, "worker": "flaxdiff_family_worker.py",
              "reference": "AshishKumar4/FlaxDiff 15c55b001304604147a2a8002a76cf5d4c32092f", "license": "MIT"}
             for case in importlib.import_module("flaxdiff_family_cases").CASES},
-         **{f"codec-storage-{kind}": {"test": "test_codec_checkpoints", "arms": f"storage/{kind}",
-                                      "worker": "codec_worker.py",
-                                      "reference": "neuralmagic/compressed-tensors 0.17.1 with "
-                                                   "huggingface/transformers 5.16.1", "license": "Apache-2.0",
-                                      "distribution": ("compressed-tensors", "0.17.1")}
-            for kind in ("fp8", "nvfp4")},
+         **{f"codec-{family}-{kind}": {"test": "test_codec_checkpoints", "arms": f"{family}/{kind}",
+                                       "worker": "codec_worker.py",
+                                       "reference": "neuralmagic/compressed-tensors 0.17.1 with "
+                                                    "huggingface/transformers 5.16.1",
+                                       "license": "Apache-2.0",
+                                       "distribution": ("compressed-tensors", "0.17.1")}
+            for family, kinds in (("storage", ("fp8", "nvfp4")), ("nvfp4_qdq", ("unrounded", "e4m3")))
+            for kind in kinds},
          "qwen-image-export": {"test": "test_qwen_image_source", "arms": "export",
                                "worker": "qwen_image_export_reference.py",
                                "reference": "huggingface/diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c",
