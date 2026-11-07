@@ -540,14 +540,16 @@ def at_iteration(variables: Mapping[str, Mapping], layer: jax.Array) -> dict:
 
 
 class Gathered(NamedTuple):
-    """Expert-sorted rows read where they lie: row `i` is `tokens[rows[i]]` (`_sorted_locally`'s slots of a
-    dispatch that scales no input, for a `project` that takes them: `expert_dispatch`'s `gathers`). The
-    expert projections multiply them through the template's gathered rows (`gemm.gemm`'s `gather`: Mosaic
-    GPU's producer reads each slot's token where it lies, no sorted copy of the tokens made, row 1376); any
-    other use reads them gathered (`gathered`)."""
+    """Expert-sorted rows read where they lie: row `i` is `tokens[rows[i]]`, slot `slots[i]`
+    (`_sorted_locally`'s slots of a dispatch that scales no input, for a `project` that takes them:
+    `expert_dispatch`'s `gathers`). The expert projections multiply them through the template's gathered
+    rows (`gemm.gemm`'s `gather`: Mosaic GPU's producer reads each slot's token where it lies, no sorted
+    copy of the tokens made, row 1376), any other use reading them gathered (`gathered`); the last
+    projection writes each row at its slot (`gemm.gemm`'s `scatter`), the slots in token order."""
 
     tokens: jax.Array
     rows: jax.Array
+    slots: jax.Array
 
 
 def gathered(x: jax.Array | Gathered) -> jax.Array:
@@ -557,7 +559,8 @@ def gathered(x: jax.Array | Gathered) -> jax.Array:
 
 def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | Layered, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
-                      precision: PrecisionLike, bias: jax.Array | None = None) -> jax.Array:
+                      precision: PrecisionLike, bias: jax.Array | None = None,
+                      scatter: jax.Array | None = None) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
@@ -574,7 +577,8 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | Layered, grou
     row's expert: row 3963), rounded to the compute dtype as an operand is, its
     gradient summed over each expert's rows in at least fp32 before it meets
     the bias's own dtype. `Gathered` rows are read where they lie (`gemm.gemm`'s `gather`), but by a
-    stack's layer or a run's recipe, which take them gathered.
+    stack's layer or a run's recipe, which take them gathered; with `scatter`, each output row lands at its
+    entry's row (`gemm.gemm`'s `scatter`, a permutation).
 
     Every implementation runs the GEMM template
     (`dew.nn.kernels.gemm.gemm`), which selects each of its
@@ -594,7 +598,7 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | Layered, grou
     layout.
     """
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
-    tokens, rows = x if isinstance(x, Gathered) else (x, None)
+    tokens, rows = (x.tokens, x.rows) if isinstance(x, Gathered) else (x, None)
     compute = canonicalize_dtype(tokens, stack, *(() if bias is None else (bias,)), dtype=dtype)
     # The run's low-precision recipe takes the experts' product where their role takes it, the matrices'
     # values the compute dtype's held in the master's, so their gradient keeps the master dtype.
@@ -604,12 +608,13 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | Layered, grou
             jnp.asarray(gathered(x), compute), matrices, group_sizes, out_dtype=compute,
             bias=None if bias is None else rounded_operand(bias, compute)))
     if recipe is not None:
-        return recipe
+        return recipe if scatter is None else jnp.zeros_like(recipe).at[scatter].set(recipe,
+                                                                                    unique_indices=True)
     if layer is not None and rows is not None:
         tokens, rows = gathered(x), None
     with _named(implementation):
         return gemm.gemm(tokens, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
-                         layer=layer, gather=rows, **_biased(bias, compute))
+                         layer=layer, gather=rows, scatter=scatter, **_biased(bias, compute))
 
 
 def _biased(bias: jax.Array | None, compute) -> dict:
@@ -640,7 +645,7 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     the rows' and both matrices' however a matrix is held; a stack's layer (`Layered`) is multiplied
     apart, the template pairing no stacked layer. `Gathered` rows are read where they lie, as
     `expert_projection` reads them."""
-    tokens, rows = x if isinstance(x, Gathered) else (x, None)
+    tokens, rows = (x.tokens, x.rows) if isinstance(x, Gathered) else (x, None)
     compute = canonicalize_dtype(tokens, *(kernel.stack if isinstance(kernel, Layered) else kernel
                                            for kernel in (first, second)), dtype=dtype)
     if (isinstance(first, Layered) or isinstance(second, Layered)
@@ -756,8 +761,9 @@ def expert_dispatch[Parameters](
 
     `gathers`, for a `project` whose expert projections take `Gathered` rows
     (`ExpertMLP`'s), hands it the slots of a dispatch that sorts them where
-    they are and scales no input as the tokens and the rows each reads, no
-    sorted copy of the tokens made (row 1376).
+    they are and scales no input as the tokens, the rows each reads and the
+    slots each lands at, no sorted copy of the tokens made, and takes its rows
+    back in slot order, no un-permute (row 1376).
     """
     if dispatch not in EXPERT_DISPATCHES:
         raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {dispatch!r}")
@@ -955,24 +961,24 @@ def _sorted_locally(
         x: jax.Array, indices: jax.Array, parameters: object,
         input_weights: jax.Array | None, *, num_experts: int, gathers: bool = False) -> jax.Array:
     """Project every slot of `x`'s tokens where they are: sort the slots by
-    expert, gather their token rows (or, `gathers`, hand `project` the tokens
-    and the rows each slot reads, `Gathered`, where no input is scaled) and
-    put the results back in slot order. A dropped slot's sentinel id sorts
-    last, outside every group, and its row comes back zero."""
+    expert, gather their token rows and put the results back in slot order
+    (or, `gathers`, hand `project` the tokens, the rows each slot reads and the
+    slot each lands at, `Gathered`, where no input is scaled, and take its rows
+    in slot order). A dropped slot's sentinel id sorts last, outside every
+    group, and its row comes back zero."""
     top_k = indices.shape[-1]
     tokens = x.reshape(-1, x.shape[-1])
     experts = indices.ravel()
-    order = jnp.argsort(experts)
-    rows = (order // top_k).astype(jnp.int32)
-    grouped: jax.Array | Gathered
+    order = jnp.argsort(experts).astype(jnp.int32)
+    sizes = jnp.bincount(experts, length=num_experts)
     if gathers and input_weights is None:
-        grouped = Gathered(tokens, rows)
-    elif input_weights is None:
-        grouped = tokens[rows]
-    else:
-        grouped = tokens[rows] * input_weights.ravel()[order][:, None].astype(tokens.dtype)
-    projected = project(grouped, jnp.bincount(experts, length=num_experts),
-                        experts[order], parameters)
+        projected = project(Gathered(tokens, order // top_k, order), sizes, experts[order], parameters)
+        projected = jnp.where((experts < num_experts)[:, None], projected, 0)
+        return projected.reshape(*indices.shape, projected.shape[-1])
+    grouped = tokens[order // top_k]
+    if input_weights is not None:
+        grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
+    projected = project(grouped, sizes, experts[order], parameters)
     projected = jnp.where((experts[order] < num_experts)[:, None], projected, 0)
     return projected[jnp.argsort(order)].reshape(*indices.shape, projected.shape[-1])
 
@@ -1125,22 +1131,26 @@ class ExpertMLP(nn.Module):
 
     def _project(self, tokens: jax.Array | Gathered, sizes: jax.Array, _expert_ids: jax.Array,
                  kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> jax.Array:
-        def linear(x: jax.Array | Gathered, kernel: jax.Array) -> jax.Array:
+        def linear(x: jax.Array | Gathered, kernel: jax.Array, scatter: jax.Array | None = None) -> jax.Array:
             return jnp.asarray(expert_projection(
-                x, kernel, sizes, dtype, self.implementation, self.precision))
+                x, kernel, sizes, dtype, self.implementation, self.precision, scatter=scatter))
+
+        # Gathered rows' slots: the last projection writes each row at its slot (`Gathered`).
+        slots = tokens.slots if isinstance(tokens, Gathered) else None
 
         # The same residual names as the dense MLP's, so one remat policy
         # covers both (mixer_base.RESIDUALS).
         if self.activation == 'relu2':
             up = checkpoint_name(linear(tokens, kernels[0]), 'up_proj')
             hidden = relu2(up)
-            return checkpoint_name(linear(hidden, kernels[1]), 'down_proj')
+            return checkpoint_name(linear(hidden, kernels[1], slots), 'down_proj')
         # The gate and up projections read the same rows: one paired product (`paired_projections`).
         gate, up = paired_projections(tokens, kernels[0], kernels[1], sizes, dtype, self.implementation,
                                       self.precision)
         gate, up = checkpoint_name(gate, 'gate_proj'), checkpoint_name(up, 'up_proj')
         gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
-        return checkpoint_name(linear(gated_product(self.activation)(gate, up), kernels[2]), 'down_proj')
+        hidden = gated_product(self.activation)(gate, up)
+        return checkpoint_name(linear(hidden, kernels[2], slots), 'down_proj')
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
         wide = at_least_fp32(slots.dtype)
