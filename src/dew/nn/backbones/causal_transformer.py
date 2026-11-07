@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import jax
@@ -683,13 +683,18 @@ class CausalTransformer(LinearProducts):
     def stored_view(self, store: Variables) -> StackView:
         """How `store` holds this decoder's layer stack (`bank_sites`), as a decoder bound to its shapes
         plans its runs (`SteppedFeedForward`)."""
+        return self._view_of(store, lambda module: StackView(module.groups))
+
+    @nn.nowrap
+    def _view_of(self, store: Variables, read: Callable[[Self], StackView]) -> StackView:
+        """`read` of this decoder bound to `store`'s shapes: through the model's own `apply`, which an
+        adapted model runs under its interceptor, so its runs split where its adapter's targets do
+        (`scanned_like`), as its forward splits them. Flax types `apply`'s result as anything, which the
+        view is narrowed from."""
         if self.scope is not None:
-            return StackView(self.groups)
-        # Through the model's own `apply`, which an adapted model runs under its interceptor, so its runs
-        # split where its adapter's targets do (`scanned_like`).
+            return read(self)
         view = self.apply(jax.tree.map(
-            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store),
-            method=lambda module: StackView(module.groups))
+            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store), method=read)
         if not isinstance(view, StackView):
             raise TypeError(f"expected the stack's view from the model, got {type(view).__name__}")
         return view
@@ -1865,16 +1870,7 @@ class CausalTransformer(LinearProducts):
         # scanning would (its periods among them): read as that stack's, it goes back onto its layers.
         held = 'stages' in dict(dict(store).get('params', {}))
         model = self.clone(scan_layers=True) if stages == 1 and held and not self.scan_layers else self
-        if model.scope is not None:
-            view = model.stage_view(stages)
-        else:
-            # Through the model's own `apply`, which an adapted model runs under its interceptor, so its runs
-            # split where its adapter's targets do (`scanned_like`), as its forward splits them.
-            view = model.apply(jax.tree.map(
-                lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store),
-                method=lambda module: module.stage_view(stages))
-            if not isinstance(view, StackView):
-                raise TypeError(f"expected the stack's view from the model, got {type(view).__name__}")
+        view = model._view_of(store, lambda module: module.stage_view(stages))
         if stages == 1 and not (model.scan_layers and any(count > 1 for _, count in view.groups)):
             return ()
         return (DecoderBank((), view),)
@@ -2234,10 +2230,9 @@ class CausalTransformer(LinearProducts):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def with_scanned_layers(self, scanned: bool = True) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`), or a layer at a
-        time where not `scanned`."""
-        return self.clone(scan_layers=scanned)
+    def with_scanned_layers(self) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
+        return self.clone(scan_layers=True)
 
     @nn.nowrap
     def reads_progress(self) -> bool:
