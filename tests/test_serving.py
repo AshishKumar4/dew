@@ -1446,7 +1446,7 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
     assert_as_exact(served, alone("float32"), draw, label, seeds=count, truth_fn=alone("float64"))
 
 
-BASE_ROW_SEEDS = 16
+BASE_ROW_SEEDS = 32
 """Check 1's declared seeds for an adapter set's base row against the base model, sized by `seeds_for` on
 armada."""
 

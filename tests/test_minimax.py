@@ -81,7 +81,7 @@ def test_a_scanned_minimax_decodes_as_its_plain_loop():
                     'scanned MiniMax decode', seeds=SCAN_SEEDS, truth_fn=truth)
 
 
-LEGACY_SEEDS = 16
+LEGACY_SEEDS = 8
 """Check 1's declared seeds for a record of a kind a lightning layer against the record of one kind, sized
 by `seeds_for` on armada."""
 

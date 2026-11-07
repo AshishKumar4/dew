@@ -29,8 +29,8 @@ def tokens(rng, length=12, rows=2):
     return jax.random.randint(rng, (rows, length), 0, VOCAB)
 
 
-SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 512, 'block decode': 32, 'block repeat': 64,
-         'one pass': 64}
+SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 512, 'block decode': 32, 'block repeat': 32,
+         'one pass': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 

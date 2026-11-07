@@ -38,9 +38,10 @@ def case(request):
     return directory, Pretrained.load(directory, dtype="float32", attention_impl="reference"), reference
 
 
-APART_SEEDS = 16
+APART_SEEDS = 8
 """Check 1's declared seeds for the prepared tree of members scaled apart against the loaded one, sized by
-`seeds_for` on armada."""
+`seeds_for` paired on armada: the two trees share the loaded members' rounding, and the reference compared
+with itself does not resolve within 512 seeds."""
 VIEW_SEEDS = 8
 """Each view's declared check-1 seeds against the plain loop, sized by `seeds_for` paired on armada."""
 

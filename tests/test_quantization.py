@@ -623,7 +623,7 @@ def test_a_recorded_kernel_no_rule_matches_multiplies_by_its_own_recipe():
         activations.apply(served_variables, ids)
 
 
-SERVED_INT8_SEEDS = 16
+SERVED_INT8_SEEDS = 8
 """Check 1's declared seeds for the int8 served forward against the training one, sized by `seeds_for` on
 armada."""
 

@@ -530,7 +530,7 @@ def test_muon_steps_an_adapted_head_whose_factors_it_splits_between_its_optimize
         assert not np.array_equal(np.asarray(after), np.asarray(before)), jax.tree_util.keystr(path)
 
 
-IDENTITY_SEEDS = 16
+IDENTITY_SEEDS = 8
 """Check 1's declared seeds for a fresh adapter against its base, sized by `seeds_for` on armada."""
 
 
