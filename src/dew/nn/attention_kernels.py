@@ -489,9 +489,11 @@ DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
                  "full (CELLS-a100, CUPTI, 11 interleaved rounds)"),
     ('mma.sync', 'float32 attention'): (
-        'xla', "the template's fp32 training step at Qwen3-8B's widths, 1 x 1024, does not compile on an "
-               "A100 (its Triton launch asks 182272 bytes of shared memory, past the 166912 a block holds: "
-               "CELLS-a100), where jax.nn's xla attention runs"),
+        'xla', "the template's fp32 training step at Qwen3-8B's widths, 1 x 1024, did not compile on an "
+               "A100 (its Triton launch asked 182272 bytes of shared memory, past the 166912 a block holds: "
+               "CELLS-a100), where jax.nn's xla attention runs; it compiles since (147456 bytes, causal and "
+               "full, et-fp32a100 at 4f10564940), and its time against xla's is M-ET-28's to measure, as "
+               "the H100's cell measured xla 12 times as fast"),
 }
 """Attention's declared cells (bible §4, owner 10-25; `Op.declared`), by (instruction family, kind of call)
 (`AttentionCase.cell`): where an old route measured faster than the template, the old route and its receipt.
