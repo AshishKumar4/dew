@@ -555,11 +555,11 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     both read."""
     family = call.family
     staged, landed = _roles_staged(staging, landing, consumers)
-    # The products' shared memory and barriers where the family keeps them (`Issuer.product_scratch`), its
-    # tensor memory none of a multiprocessor's shared memory.
+    staged = (*staged, _landed(landed, family))
+    # The products' shared memory and barriers where the family keeps them (`Issuer.product_scratch`, which
+    # `launch_kernel` scopes beside the staging), its tensor memory none of a multiprocessor's shared memory.
     products = tuple(leaf for leaf in jax.tree.leaves(family.product_scratch(
         consumers, _product_widths(blocks, staging))) if getattr(leaf, "memory_space", None) != plgpu.TMEM)
-    staged = (*staged, _landed(landed, family), *products)
 
     def allocations(depth: int) -> dict:
         opened = {"walked": family.streams(blocks, depth, consumers, swizzles=swizzles)}
@@ -568,7 +568,8 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
         return opened
 
     def scope(depth: int) -> resources.Scope:
-        return allocation_scope(family, allocations(depth), staged, reduces=reduces, after=after)
+        return allocation_scope(family, allocations(depth), (*staged, *products), reduces=reduces,
+                                after=after)
 
     return allocations, scope, staged, landed
 
