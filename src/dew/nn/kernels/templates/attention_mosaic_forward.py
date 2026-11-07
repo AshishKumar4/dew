@@ -1151,7 +1151,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     state_rows = (row, head, pl.ds(first, tiles.block_q))
     start, live, merged = _started(program, spec, guard, hooked, state_rows, first, value_width,
                                    training=residuals is not None, merges=merging is not None)
-    pl.when(consumer == 1)(turn)
+    pl.when(consumer > 0)(turn)
     # The queries' intervals and ids read once, before the walk (`_query_bounds`).
     held = None if spans is None else program.bounds(first, spans, row)
 
@@ -1519,7 +1519,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, place[0])
     q = _query_of(program, q_view, q_smem, q_loaded)
-    pl.when(consumer == 1)(turn)
+    pl.when(consumer > 0)(turn)
     held = None if spans is None else program.bounds(first, spans, place[0])
 
     def step(index, slots, arg, accumulators):
