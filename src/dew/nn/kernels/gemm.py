@@ -61,7 +61,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
          prologue=None, prologue_operands: tuple = (), epilogue=None, epilogue_operands: tuple = (),
          out_dtype, out_dtypes: tuple | None = None, precision: PrecisionLike = None,
          interpret_on_cpu: bool = False, prologue_jvp=None, compute=None, layer: jax.Array | None = None,
-         paired: jax.Array | None = None, gather: jax.Array | None = None):
+         paired: jax.Array | None = None, gather: jax.Array | None = None,
+         scatter: jax.Array | None = None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
     (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in
@@ -85,11 +86,16 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     `lhs[gather]`, read where they lie: a mixture of experts' tokens in their own order, the router's sort
     fused into the rows' loads where Mosaic GPU's launch takes the call (its producer's gather, row 1376),
     gathered by XLA elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every
-    slot reads)."""
+    slot reads). `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at
+    each output's row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
+    (`mosaic.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
+    gather."""
     if paired is not None and layer is not None:
         raise ValueError("a paired product takes no stacked layer")
     if gather is not None and (group_sizes is None or prologue is not None or layer is not None):
         raise ValueError("gathered rows are a grouped call's, with no prologue or stacked layer")
+    if scatter is not None and group_sizes is None:
+        raise ValueError("scattered rows are a grouped call's")
     if compute is not None and prologue is not None:
         raise ValueError("a prologue's operand is multiplied in its own dtype, not a named `compute`")
     straight = compute is not None
@@ -105,17 +111,17 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     plain = {'transpose_rhs': transpose_rhs, 'interpret_on_cpu': interpret_on_cpu, 'precision': precision,
              'dense': dense}
 
-    def value(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather):
+    def value(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter):
         return _gemm(lhs.astype(compute), rhs, group_sizes, prologue, prologue_arrays, prologue_axes,
                      epilogue, epilogue_arrays, epilogue_axes, dtypes, several=several, paired=paired,
-                     first=first, gather=gather, **plain)
+                     first=first, gather=gather, scatter=scatter, **plain)
 
-    def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather):
+    def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter):
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
         lhs = lhs if gather is None else lhs[gather]
-        return xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes, prologue,
-                            prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes, dtypes,
-                            several, paired=paired, first=first)
+        return _scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
+                                       prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
+                                       epilogue_axes, dtypes, several, paired=paired, first=first), scatter)
 
     def forward(*operands):
         return value(*operands), ()
@@ -124,10 +130,12 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         return _pulled(operands, cotangent, live)
 
     def _pulled(operands, cotangent, live):
-        tokens, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather = operands
+        tokens, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter = operands
         # Gathered rows' gradients are the rows' own, gathered once here, the rows' cotangent summed back
-        # into the tokens they read.
+        # into the tokens they read; scattered rows' cotangents are read where the rows landed, a gather.
         lhs = tokens if gather is None else tokens[gather]
+        if scatter is not None:
+            cotangent = jax.tree.map(lambda d: d[scatter], cotangent)
         # The operands a reverse pass differentiates, by their place among the operands' leaves: a frozen
         # matrix's kernel gradient, or an operand no reverse pass reaches, is never formed.
         wanted = set(live)
@@ -160,13 +168,15 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                   *(d_prologue or (None,) * len(prologue_arrays)),
                   *(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)),
                   *gradients[1:], *(() if first is None else (zero_from_primal(first),)),
-                  *(() if gather is None else (zero_from_primal(gather),))]
+                  *(() if gather is None else (zero_from_primal(gather),)),
+                  *(() if scatter is None else (zero_from_primal(scatter),))]
         return tuple(leaves[index] for index in live)
 
     differentiable = contracted("test_a_grouped_gemm_holds_every_order")(
         generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
                                    live_cotangents=True, kind=KernelGlue()))
-    return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather)
+    return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
+                          scatter)
 
 
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,
@@ -1041,12 +1051,15 @@ def _dtypes(hook, tile, sides: tuple) -> tuple[str, ...]:
 def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
           epilogue_axes, dtypes, *, several: bool, transpose_rhs: bool, interpret_on_cpu: bool,
           precision: PrecisionLike, dense: bool = False, paired: jax.Array | None = None,
-          first: jax.Array | None = None, gather: jax.Array | None = None, summed_as: tuple = ()):
+          first: jax.Array | None = None, gather: jax.Array | None = None, scatter: jax.Array | None = None,
+          summed_as: tuple = ()):
     """`gemm`'s value, on grouped operands; `summed_as`, the outputs of the product whose accumulator it
     recomputes (a reverse pass's, at fp32), whose sums it repeats (`product.promoted`: an fp32 output's
     exact sums, a 16-bit one's not); `first`, a stacked `rhs`'s matrix its first group reads
-    (`_grouped`); `gather`, the rows of `lhs` its rows are (`gemm`'s)."""
-    def kernel(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, *, interpret):
+    (`_grouped`); `gather`, the rows of `lhs` its rows are, and `scatter`, the outputs' rows they land at
+    (`gemm`'s)."""
+    def kernel(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter, *,
+               interpret):
         before_sides, before_axes, before_broadcast = _launchable(prologue_arrays, prologue_axes)
         after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
         hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
@@ -1057,30 +1070,40 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         product = declared(lhs.dtype, precision, outputs=summed_as or dtypes, operands=(lhs.dtype, rhs.dtype))
         call = grouped_matmul.gmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, before_sides, after_sides,
                                        None if paired is None else paired.astype(lhs.dtype), first, gather,
-                                       out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
+                                       scatter, out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
                                        interpret=interpret, promoted=product.promoted, dense=dense)
         # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program; a paired one no
         # launch takes whole its two products apart, each through the launches that take it (`_apart`).
         launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
         if launch is grouped_matmul.APART:
-            return _apart(lhs if gather is None else lhs[gather], (rhs, paired), group_sizes, prologue,
-                          prologue_arrays, prologue_axes, epilogue,
-                          epilogue_arrays, epilogue_axes, dtypes, several=several,
-                          summed_as=summed_as or dtypes,
-                          transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu, precision=precision,
-                          dense=dense)
+            return _scattered(_apart(lhs if gather is None else lhs[gather], (rhs, paired), group_sizes,
+                                     prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
+                                     epilogue_axes, dtypes, several=several, summed_as=summed_as or dtypes,
+                                     transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu,
+                                     precision=precision, dense=dense), scatter)
         if not callable(launch):
-            return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather)
+            return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
+                            scatter)
         return launch()
 
-    def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather):
-        lhs = lhs if gather is None else lhs[gather]
-        return xla_mainloop(XlaConfig(transpose_rhs, precision, dense=dense), lhs, rhs, group_sizes, prologue,
+    def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter):
+        config = XlaConfig(transpose_rhs, precision, dense=dense)
+        outs = xla_mainloop(config, lhs if gather is None else lhs[gather], rhs, group_sizes, prologue,
                             prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes, dtypes,
                             several, paired=paired, first=first)
+        return _scattered(outs, scatter)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
-                       epilogue_arrays, paired, first, gather)
+                       epilogue_arrays, paired, first, gather, scatter)
+
+
+def _scattered(outs, scatter: jax.Array | None):
+    """`outs` (one output or a tuple), each row `i` written at row `scatter[i]` (`gemm`'s `scatter`, a
+    permutation, so every row is written once), as XLA's program and a launch's stores give them; as they
+    are without one."""
+    if scatter is None:
+        return outs
+    return jax.tree.map(lambda out: jnp.zeros_like(out).at[scatter].set(out, unique_indices=True), outs)
 
 
 def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,

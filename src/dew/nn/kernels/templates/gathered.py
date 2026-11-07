@@ -1,12 +1,14 @@
-"""A gathered ring (`Ring`): a stream whose rows each lie where a table says, a mixture of experts' tokens
-read in their own order (row 1376), loaded by the producer warpgroup's cp.async copies through
-`inline_mgpu`'s lane-level code (Pallas's warpgroup semantics reach no thread's own copy or mbarrier)."""
+"""Rows where a table says (row 1376): a gathered ring (`Ring`), a stream whose rows each lie where a table
+says, a mixture of experts' tokens read in their own order, loaded by the producer warpgroup's cp.async
+copies, and a scattered store (`scattered_rows`), an output's rows each written where a permutation says,
+both through `inline_mgpu`'s lane-level code (Pallas's warpgroup semantics reach no thread's own copy,
+address or mbarrier)."""
 
 import dataclasses
 import functools
 
 import jax.numpy as jnp
-from jax._src.lib.mlir.dialects import gpu as mgpu_gpu, llvm as mgpu_llvm, nvvm as mgpu_nvvm
+from jax._src.lib.mlir.dialects import gpu as mgpu_gpu, llvm as mgpu_llvm, nvvm as mgpu_nvvm, scf as mgpu_scf
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -136,3 +138,73 @@ def gathered_copies(source, rows, slot, barrier, *, swizzle: int) -> None:
     mgpu_nvvm.cp_async_mbarrier_arrive(tracked.get_ptr())
     mgpu_utils.warpgroup_barrier()
     tracked.arrive(predicate=mgpu_utils.single_thread_predicate(mgpu_utils.ThreadSubset.WARPGROUP))
+
+
+def scattered_rows(smem, out: mosaic.Scattered, row_start, first, stored, column) -> None:
+    """Rows `first` to `first + stored` of `smem` (`[rows, width]`, unswizzled: a consumer's staged share of
+    a tile, `mosaic.staged_rows`) each written to its row of `out` (`out.table[row_start + r]`, a negative
+    entry nowhere) at `column`: by the warpgroup's threads, each a 16-byte piece of a row at a time
+    (`_scattered_pieces`), or interpreted, a row at a time."""
+    rows, width = smem.shape
+    table = out.table.at[pl.ds(row_start, rows)]
+    dest = out.ref.at[:, pl.ds(column, width)]
+    if out.interpreted:
+        @pl.loop(first, first + stored)
+        def _(row):
+            token = table[row]
+
+            @pl.when(token >= 0)
+            def _():
+                dest[pl.ds(token, 1), :] = smem[pl.ds(row, 1), :]
+        return
+    scalar = plgpu.Layout.WG_SPLAT(())
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), plgpu.RefType(), scalar, scalar))(
+        lambda ctx, *refs: _scattered_pieces(*refs[:3], splat_value(refs[3]), splat_value(refs[4])))(
+            smem, table, dest, jnp.asarray(first, jnp.int32), jnp.asarray(stored, jnp.int32))
+
+
+def _scattered_pieces(smem, table, dest, first, stored) -> None:
+    """`scattered_rows`' lane-level copy: the warpgroup's threads met (the share staged by all of them),
+    then each of the share's 16-byte pieces, thread `t` taking pieces `t`, `t + 128`, ..., read from shared
+    memory and written to its row's place in `dest` where its row is stored (`first` <= r < `first +
+    stored`, its table entry not negative), the threads met again before the buffer is written."""
+    i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
+    index = mgpu_ir.IndexType.get()
+    element = mgpu_ir.MemRefType(smem.type).element_type
+    rows, width = mgpu_ir.MemRefType(smem.type).shape
+    lanes = 16 * 8 // mgpu_utils.bitwidth(element)
+    per_row = width // lanes
+    pieces = rows * per_row
+    [row_stride, column_stride], _ = mgpu_ir.MemRefType(dest.type).get_strides_and_offset()
+    vector = mgpu_ir.VectorType.get((4,), i32)
+    source = mgpu_utils.memref_ptr(smem)
+    base = mgpu_llvm.addrspacecast(mgpu_llvm.PointerType.get(address_space=1), mgpu_utils.memref_ptr(dest))
+    thread = mgpu_arith.remui(mgpu_arith.index_cast(i32, mgpu_gpu.thread_id(mgpu_gpu.Dimension.x)),
+                              mgpu_utils.c(128, i32))
+    mgpu_utils.warpgroup_barrier()
+    end = mgpu_arith.addi(first, stored)
+    for turn in range(-(-pieces // 128)):
+        piece = mgpu_arith.addi(thread, mgpu_utils.c(128 * turn, i32))
+        row = mgpu_arith.divui(piece, mgpu_utils.c(per_row, i32))
+        lane = mgpu_arith.remui(piece, mgpu_utils.c(per_row, i32))
+        inside = mgpu_arith.andi(
+            mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, piece, mgpu_utils.c(pieces, i32)),
+            mgpu_arith.andi(mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.sge, row, first),
+                            mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, row, end)))
+        branch = mgpu_scf.IfOp(inside)
+        with mgpu_ir.InsertionPoint(branch.then_block):
+            token = mgpu_memref.load(table, [mgpu_arith.index_cast(index, row)])
+            nonnegative = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.sge, token, mgpu_utils.c(0, i32))
+            stored_here = mgpu_scf.IfOp(nonnegative)
+            with mgpu_ir.InsertionPoint(stored_here.then_block):
+                offset = mgpu_arith.addi(mgpu_arith.muli(row, mgpu_utils.c(width, i32)),
+                                         mgpu_arith.muli(lane, mgpu_utils.c(lanes, i32)))
+                value = mgpu_llvm.load(vector, mgpu_utils.getelementptr(source, [offset], element))
+                place = mgpu_arith.addi(
+                    mgpu_arith.muli(mgpu_arith.extsi(i64, token), mgpu_utils.c(row_stride, i64)),
+                    mgpu_arith.muli(mgpu_arith.extui(i64, mgpu_arith.muli(lane, mgpu_utils.c(lanes, i32))),
+                                    mgpu_utils.c(column_stride, i64)))
+                mgpu_llvm.store(value, mgpu_utils.getelementptr(base, [place], element))
+                mgpu_scf.YieldOp([])
+            mgpu_scf.YieldOp([])
+    mgpu_utils.warpgroup_barrier()

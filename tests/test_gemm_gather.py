@@ -22,7 +22,7 @@ def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
     refused (`Family.gathers_rows`)."""
     with generation.assumed("sm90"):
         a_gathered_product_is_on_par(grouped_matmul.INTERPRETED)
-        a_gathered_product_is_on_par(grouped_matmul.INTERPRETED, paired=True)
+        a_gathered_product_is_on_par(grouped_matmul.INTERPRETED, paired=True, scattered=True)
     tokens, table = jnp.zeros((200, 128), jnp.bfloat16), jnp.zeros((256,), jnp.int32)
     with generation.assumed("sm80"), pytest.raises(ValueError):
         mosaic_gpu.gmm(tokens, jnp.zeros((4, 128, 256), jnp.bfloat16),
@@ -32,12 +32,13 @@ def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
                        gather=table)
 
 
-def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False):
+def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False, scattered: bool = False):
     """A grouped product whose rows are gathered from the tokens by a table (`gmm`'s `gather`: a MoE's sort
     fused into the rows' loads, row 1376), its groups ragged, one empty, rows past them, a token read by
     several slots and some by none, on par with XLA's ragged dot of the gathered rows (check 1), from
     float64: on this GPU (test_gpu_gemm's cell, the producer's cp.async gather), or `interpret`ed; `paired`,
-    a second matrix's product beside it."""
+    a second matrix's product beside it; `scattered`, each row stored at its entry of a permutation (`gmm`'s
+    `scatter`: the MoE's un-permute fused into the stores)."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
 
@@ -47,19 +48,21 @@ def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False):
         table = jnp.asarray(rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 106)])),
                             jnp.int32)
         matrices = jnp.asarray(rng.normal(size=(2, 4, 128, 256)) / np.sqrt(128), jnp.bfloat16)
-        return tokens, table, matrices
+        slots = jnp.asarray(rng.permutation(256), jnp.int32)
+        return tokens, table, matrices, slots
 
-    def dew(tokens, table, matrices):
+    def dew(tokens, table, matrices, slots):
         outs = mosaic_gpu.gmm(tokens, matrices[0], sizes, tiles=tiles, transpose_rhs=False,
                               out_dtype=jnp.float32, out_dtypes=(jnp.float32,) * 2 if paired else None,
                               multiprocessors=4, interpret=interpret, gather=table,
-                              paired=matrices[1] if paired else None)
+                              paired=matrices[1] if paired else None, scatter=slots if scattered else None)
         return jnp.stack(outs) if paired else outs
 
-    def plain(tokens, table, matrices, wide=jnp.float32):
+    def plain(tokens, table, matrices, slots, wide=jnp.float32):
         rows = tokens[table].astype(wide)
         outs = [jax.lax.ragged_dot(rows, matrix.astype(wide), sizes, preferred_element_type=wide)
                 for matrix in matrices[:2 if paired else 1]]
+        outs = [jnp.zeros_like(out).at[slots].set(out) if scattered else out for out in outs]
         return jnp.stack(outs) if paired else outs[0]
 
     assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "a gathered grouped product", seeds=SEEDS,
@@ -70,7 +73,7 @@ def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False):
 def test_a_gathered_product_lowers_for_cuda(paired):
     """A gathered grouped product on a compile-only H100 lowers through Mosaic GPU: its producer's
     cp.async gather and its load barriers' lane-level arrivals and parity waits (`gathered.Ring`), plain and
-    paired."""
+    paired, the paired one's rows stored at a permutation's entries (`gathered.scattered_rows`)."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
     product = functools.partial(mosaic_gpu.gmm, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
@@ -78,7 +81,8 @@ def test_a_gathered_product_lowers_for_cuda(paired):
                                 interpret=False)
 
     def gathered(tokens, matrices, table):
-        return product(tokens, matrices[0], sizes, gather=table, paired=matrices[1] if paired else None)
+        return product(tokens, matrices[0], sizes, gather=table, paired=matrices[1] if paired else None,
+                       scatter=table if paired else None)
 
     with generation.assumed("sm90"):
         jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
