@@ -1086,17 +1086,23 @@ def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
     )
 
 
-def take_row_fields(batch: Batch, indices: np.ndarray) -> Batch:
-    """`batch`'s rows at `indices` in the fields that hold one value a row (`rows_of`'s rows: a list or
-    tuple of them, an array along its leading axis), and every other field as it is: a value for the whole
-    step, a shared conditioning row, a host count (`dew.batch.ConsumedCount`)."""
-    rows = rows_of(batch)
+def row_field(column: object, rows: int) -> bool:
+    """Whether a batch's field `column` holds one value a row of its `rows` (`rows_of`): a list or tuple of
+    that many, an array along its leading axis; any other field holds one value for the whole step (a
+    step-wide array, a shared conditioning row, a host count, `dew.batch.ConsumedCount`). The one test of
+    it, which `take_row_fields`, `Objective.scored_tokens` and `dew.distributed.batches.shared_host_fields`
+    read."""
+    if isinstance(column, list | tuple):
+        return len(column) == rows
+    return np.shape(column)[:1] == (rows,)
 
-    def taken(column):
-        aligned = (len(column) == rows if isinstance(column, list | tuple)
-                   else bool(np.ndim(column)) and np.shape(column)[0] == rows)
-        return take_rows(column, indices) if aligned else column
-    return jax.tree.map(taken, batch, is_leaf=lambda column: isinstance(column, list | tuple))
+
+def take_row_fields(batch: Batch, indices: np.ndarray) -> Batch:
+    """`batch`'s rows at `indices` in the fields that hold one value a row (`row_field`), and every other
+    field as it is."""
+    rows = rows_of(batch)
+    return jax.tree.map(lambda column: take_rows(column, indices) if row_field(column, rows) else column,
+                        batch, is_leaf=lambda column: isinstance(column, list | tuple))
 
 
 class Unstacked(ValueError):

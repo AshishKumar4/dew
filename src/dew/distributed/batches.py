@@ -28,7 +28,7 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from dew._cleanup import attempted
 from dew._coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.batch import Batch
-from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
+from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable, row_field
 from dew.distributed.placement import Placement, placeable, placed_bytes, placed_shapes
 from dew.mesh import SEQUENCE_AXIS, batch_axes
 from dew.nn.inputs import filled_validity
@@ -287,9 +287,8 @@ def shared_host_fields(mesh: Mesh, host: Batch, origins: np.ndarray, rows: int) 
 
     def gathered(*columns):
         first = columns[0]
-        # A field of one value for the whole batch, not one a row (`rows_of`), is every share's alike.
-        rowed = len(first) == rows if isinstance(first, list | tuple) else np.shape(first)[:1] == (rows,)
-        if not rowed:
+        # A field of one value for the whole batch, not one a row (`row_field`), is every share's alike.
+        if not row_field(first, rows):
             return first
         values = [columns[position][place] for position, place in zip(share, row, strict=True)]
         if not isinstance(first, np.ndarray):
