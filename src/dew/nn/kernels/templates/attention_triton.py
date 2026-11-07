@@ -241,12 +241,20 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         written(walk(spec, None))
         return
     live = live_ref[...] > 0
+    walks = jnp.max(live.astype(jnp.int32)) > 0
 
-    @pl.when(jnp.max(live.astype(jnp.int32)) > 0)
+    @pl.when(walks)
     def _():
         # Only a program one of whose rows walks again does: each of those rows shifts as it needs; every
         # other row's outputs are the plain launch's (`_fwd`'s `kept`).
         written(walk(spec, live))
+
+    @pl.when(jnp.logical_not(walks))
+    def _():
+        # A program none of whose rows walks again writes its outputs zero, which `kept` takes the plain
+        # launch's in place of: no output is left unwritten (NSNAN-2).
+        for ref in (out_ref, *residual_refs):
+            ref[...] = jnp.zeros(ref.shape, ref.dtype)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -342,7 +350,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
 
         def launched(form: algebra.Forward, live: jax.Array | None, into=None):
             # The call in `form` (`algebra.walked_launches`' launch): plain, its outputs, its rows' running
-            # maxima and overflows; with `live`, those rows walked again, the other rows' outputs unwritten.
+            # maxima and overflows; with `live`, those rows walked again, the programs none of whose rows walk
+            # writing their outputs zero (`_forward_kernel`).
             del into
             if live is None:
                 *out, maxima, over = launch(

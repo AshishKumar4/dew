@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import INTERPRETS
 from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import (
     CASES,
@@ -862,6 +863,32 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
     assert len(found) == 2
     assert not failures(found), "\n".join(failures(found))
     assert all(record["shared"] > 0 for record in found), found
+
+
+@INTERPRETS
+@pytest.mark.parametrize("residuals", [False, True], ids=["output", "residuals"])
+def test_every_output_the_guarded_rewalk_declares_is_written_interpreted(residuals):
+    """The guarded rewalk writes every output it declares (NSNAN-2): a causal call whose second query block's
+    weighted values pass fp32's largest (its keys from 32 on bf16 values near their largest, equal logits)
+    and whose first block's do not, so the rewalk's first block walks nothing and writes its outputs zero,
+    which the plain launch's replace (`kept`). Under JAX's NaN check (`jax.debug_nans`), which the
+    interpreter's unwritten outputs (NaN) trip, run op by op so the check reads each launch's outputs: its
+    outputs bit for bit the unchecked run's."""
+    rows, queries, width = 1, 64, 64
+    spans = template.spans(queries, queries, rows, causal=True)
+    query = jnp.zeros((rows, queries, 1, width), jnp.bfloat16)
+    value = jnp.ones((rows, queries, 1, width), jnp.float32).at[:, 32:].set(3.0e38).astype(jnp.bfloat16)
+
+    def forward():
+        with tuning.pinned({attention_triton.TritonForward: PINNED[0]}):
+            return attention_triton.forward(query, query, value, spans, residuals=residuals,
+                                            interpret=True)
+
+    unchecked = jax.tree.leaves(forward())
+    with jax.debug_nans(new_val=True):
+        checked = jax.tree.leaves(forward())
+    for ours, theirs in zip(checked, unchecked, strict=True):
+        assert np.asarray(ours).tobytes() == np.asarray(theirs).tobytes()
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
