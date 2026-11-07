@@ -1,6 +1,7 @@
 """The GEMM template's gathered rows (row 1376): a grouped product whose rows are read from the tokens where a
 table says, a mixture of experts' sort fused into the rows' loads (`mosaic_gpu.gmm`'s `gather`)."""
 
+import dataclasses
 import functools
 
 import jax
@@ -100,3 +101,42 @@ def test_a_gathered_products_table_covers_every_tile_its_schedule_walks():
     _, gathered, m, extent = mosaic_gpu._walked_rows(jnp.zeros((200, 128), jnp.bfloat16), table, tiles,
                                                      transpose_lhs=False, dense=False, bounded=True)
     assert gathered.shape[0] == extent == mosaic_gpu.row_extent(m, tiles.block_m) > m
+
+
+def test_a_grouped_products_depth_split_sums_as_its_walk_apart():
+    """A grouped product's depth split (row 3622's lever: a decode step's experts' one wave of tiles, each
+    run a share of the depth, the fp32 partials summed): over small integers, bitwise the unsplit product,
+    its groups ragged with one empty and rows past them zero, interpreted as an H100's."""
+    rng = np.random.default_rng(31)
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 512)), jnp.bfloat16)
+    matrices = jnp.asarray(rng.integers(-3, 4, size=(4, 512, 256)), jnp.bfloat16)
+    sizes = jnp.asarray([10, 0, 17, 9], jnp.int32)
+    tiles = mosaic_gpu.Tiles(64, 128, 64, 2, 1, warpgroups=1, family='wgmma')
+
+    def product(splits):
+        return mosaic_gpu.gmm(tokens, matrices, sizes, tiles=dataclasses.replace(tiles, splits=splits),
+                              transpose_rhs=False, out_dtype=jnp.float32, multiprocessors=4,
+                              interpret=grouped_matmul.INTERPRETED)
+
+    with generation.assumed("sm90"):
+        np.testing.assert_array_equal(np.asarray(product(4)), np.asarray(product(1)))
+
+
+def test_a_hoppers_moe_decode_splits_its_experts_depth():
+    """A MoE decode step on an H100 (DeepSeek-V3's down projection: 2048 deep, 7168 wide, eight of 256
+    experts active a token, one token's slots, row 3622): the derived tile splits its depth over the wave
+    (`MosaicGmm._decode_split`), legally; a prefill's rows keep it unsplit."""
+    launch = grouped_matmul.MosaicGmm()
+
+    def derived(rows):
+        bound = launch.bind(jax.ShapeDtypeStruct((rows, 2048), jnp.bfloat16),
+                            jax.ShapeDtypeStruct((256, 2048, 7168), jnp.bfloat16),
+                            jax.ShapeDtypeStruct((256,), jnp.int32), out_dtype="bfloat16", trans_rhs=False,
+                            interpret=False)
+        target = generation.gpu_target()
+        tile = launch.derived(bound, target)
+        assert tile is not None and launch.legal(bound, tile, target), tile
+        return tile
+
+    with generation.assumed("sm90"):
+        assert derived(8).splits > 1 and derived(8192).splits == 1
