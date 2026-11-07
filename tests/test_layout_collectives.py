@@ -24,6 +24,7 @@ def _worker(hold: float = 8):
 
     jax.config.update("jax_enable_x64", True)
     tool = load("layout_parity")
+    _, case = tool.model_case("jepa", "float32", {}, {})
     armed, released = threading.Event(), threading.Event()
     entered = (threading.Event(), threading.Event())
 
@@ -53,7 +54,6 @@ def _worker(hold: float = 8):
         draw(index, matrix).block_until_ready()
     collective(values).block_until_ready()
 
-    _, case = tool.model_case("jepa", "float32", {}, {})
     judge = tool.Judge(case, tool.References(), "a collective after the draws ahead")
     judge.AHEAD = 1
 
