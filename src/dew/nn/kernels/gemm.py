@@ -887,38 +887,47 @@ measured requirement no receipt has met yet; else the decoded operands' product 
 
 
 def mxfp8_product(lhs: MxFp8, matrices: MxFp8, group_blocks: jax.Array, *, out_dtype,
-                  interpret_on_cpu: bool = False) -> jax.Array:
+                  interpret_on_cpu: bool = False, gather: jax.Array | None = None) -> jax.Array:
     """Each group's rows of `lhs` (`[rows, depth]`) times its matrix of `matrices` (`[groups, width, depth]`,
     K-major), both MXFP8 (`MxFp8`): each value its code times its 32 depths' scale, every product exact in
     fp32, summed in fp32 and rounded once to `out_dtype` (row 4519). Group `g` holds `group_blocks[g]` whole
     128-row blocks, in order (the block scales' tiles), the rows past them zero. Its selector (`MXFP8`) runs
     the template on Blackwell's block-scaled tensor cores where named (`mosaic_gpu.gmm`'s `mx_scales`), else
-    the decoded operands' product in XLA."""
-    return _block_scaled(lhs, matrices, group_blocks, MXFP8, interpret_on_cpu).astype(out_dtype)
+    the decoded operands' product in XLA. `gather`, int32 `[rows]`, makes the rows `lhs`'s rows at its entries
+    (`gemm`'s `gather`, a mixture of experts' tokens): their codes read where they lie, their scales by the
+    same table (`_block_scaled`)."""
+    return _block_scaled(lhs, matrices, group_blocks, MXFP8, interpret_on_cpu, gather).astype(out_dtype)
 
 
-def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, interpret: bool) -> jax.Array:
+def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, interpret: bool,
+                  gather: jax.Array | None = None) -> jax.Array:
     """A block-scaled grouped product summed in fp32 (`mxfp8_product`'s, `nvfp4_block_product`'s): `op`
     selects the template on Blackwell's block-scaled tensor cores (`mosaic_gpu.gmm`'s `mx_scales`, the
     operands' `codes` and their block `scales`, `mosaic_gpu.block_format`'s) where named and planned, else
     the operands' block-scaled values (`decoded`: each exact in bfloat16 and in TF32, so DEFAULT's products
-    are exact) summed as XLA sums fp32 products."""
+    are exact) summed as XLA sums fp32 products. Gathered rows (`gather`) are the template's gather
+    (tcgen05's load warp's, row 1376) and their block scales the same table's rows of `lhs.scales`, gathered
+    as every call's scales are laid out anew for the products (`_scales_tiled`), a sixteenth or a
+    thirty-second of the rows' bytes (row 4851)."""
     sizes = (group_blocks * mosaic_gpu.STEP_SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicMxGmm()
     abstract = jax.ShapeDtypeStruct
-    tile = _planned(launch, launch.bind(abstract(lhs.codes.shape, lhs.codes.dtype),
+    rows = (lhs.codes.shape[0] if gather is None else gather.shape[0], lhs.codes.shape[1])
+    tile = _planned(launch, launch.bind(abstract(rows, lhs.codes.dtype),
                                         abstract(matrices.codes.shape, matrices.codes.dtype),
                                         abstract(sizes.shape, jnp.int32), out_dtype='float32', trans_rhs=True,
                                         interpret=interpret))
     if selection.select(op, MxCase(tile)).kernel != 'mosaic_gpu':
-        return grouped_matmul.xla_ragged_dot(lhs.decoded(), jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
+        values = lhs.decoded() if gather is None else lhs.decoded()[gather]
+        return grouped_matmul.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
     assert tile is not None, "the selector names the template where it plans a tile"
+    scales = lhs.scales if gather is None else lhs.scales[gather]
     summed = mosaic_gpu.gmm(lhs.codes, matrices.codes, sizes, tiles=tile, transpose_rhs=True,
                             out_dtype=jnp.float32, multiprocessors=launch._launched(tile, interpret),
-                            interpret=grouped_matmul.INTERPRETED if interpret else False,
-                            mx_scales=(_scales_tiled(lhs.scales), _scales_tiled(matrices.scales)))
+                            interpret=grouped_matmul.INTERPRETED if interpret else False, gather=gather,
+                            mx_scales=(_scales_tiled(scales), _scales_tiled(matrices.scales)))
     assert isinstance(summed, jax.Array), "an unpaired product has one output"
     return summed
 
@@ -1042,14 +1051,15 @@ requirement no receipt has met yet; else the decoded operands' product in XLA.""
 
 
 def nvfp4_block_product(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax.Array, *, out_dtype,
-                        interpret_on_cpu: bool = False) -> jax.Array:
+                        interpret_on_cpu: bool = False, gather: jax.Array | None = None) -> jax.Array:
     """Each group's rows of `lhs` (`[rows, depth]`) times its matrix of `matrices` (`[groups, width,
     depth]`, K-major), both NVFP4 (`NvFp4Block`): each code times its sixteen depths' scale, every product
     exact in fp32, summed in fp32, times both tensor scales, rounded once to `out_dtype`. Group `g` holds
     `group_blocks[g]` whole 128-row blocks, in order (the block scales' tiles). Its selector
     (`NVFP4_BLOCK_OP`) runs the template on Blackwell's block-scaled tensor cores where named
-    (`mosaic_gpu.gmm`'s `mx_scales`, `kind::mxf4nvf4`), else the decoded operands' product in XLA."""
-    summed = _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu)
+    (`mosaic_gpu.gmm`'s `mx_scales`, `kind::mxf4nvf4`), else the decoded operands' product in XLA; `gather`
+    as `mxfp8_product`'s."""
+    summed = _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, gather)
     return (summed * (lhs.scale * matrices.scale)).astype(out_dtype)
 
 
