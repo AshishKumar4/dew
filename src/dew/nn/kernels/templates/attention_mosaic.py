@@ -902,18 +902,18 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
               *, scale: float | None = None, natural: bool = NATURAL, interpret: bool = False):
     """The forward's certify form at the tiles its call derives (`MosaicForward.derived`), its walk the plain
-    one (no P·V a step late): `certified_walk`'s output and its state after each key tile. Off in
-    production; tests/attention_witness.py holds each state to one step's enclosure of the one before. A call
-    no config holds raises the reason the forward declines it (`MosaicForward.declined`: an unqualified
-    family's, or the device's block and registers)."""
+    one (no P·V a step late): those tiles, and `certified_walk`'s output and its state after each of their key
+    tiles. Off in production; tests/attention_witness.py holds each state to one step's enclosure of the one
+    before. A call no config holds raises the reason the forward declines it (`MosaicForward.declined`: an
+    unqualified family's, or the device's block and registers)."""
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     ba = op.bind(*args, residuals=Kept.NONE, interpret=interpret)
     target = generation.gpu_target()
     config = op.derived(ba, target)
     if config is None:
         raise ValueError(f"the Mosaic forward declines the call: {op.declined(ba, target)}")
-    return certified_walk(query, key, value, spans, hooks or Hooks(), scale=op.scale, natural=op.natural,
-                          tiles=config, interpret=interpret)
+    return config, certified_walk(query, key, value, spans, hooks or Hooks(), scale=op.scale,
+                                  natural=op.natural, tiles=config, interpret=interpret)
 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
