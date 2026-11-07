@@ -103,60 +103,86 @@ independently by `seeds_for` on armada (2026-10-21), on the draw with a memory e
 document starting on a chunk's first token."""
 
 
+def hosted(x, dtype=jnp.float32) -> jax.Array:
+    """A float64 NumPy draw rounded once to fp32, then to `dtype`, as JAX takes it. A recorded site's draws
+    (`fla_sites`) are NumPy's, their arithmetic float64's, the same bits on any host and jaxlib: JAX's
+    draws and their transcendentals on a host CPU were not (JS-DIGEST-a100: an A100 node drew two
+    gpu-geometry sites' inputs apart from the recording's, where a cpu-geometry one's matched)."""
+    return jnp.asarray(np.asarray(x, np.float64).astype(np.float32)).astype(dtype)
+
+
+def sigmoid(x):
+    """The logistic function of a float64 draw (`hosted`)."""
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def softplus(x):
+    """`log(1 + e^x)` of a float64 draw (`hosted`)."""
+    return np.logaddexp(0.0, x)
+
+
+def unit(x):
+    """A float64 draw's vectors over its last axis scaled to unit length (`hosted`)."""
+    return x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
+
+
+def cotangents(operands: Chunk, seed: int) -> tuple[jax.Array, jax.Array]:
+    """Cotangents of `operands`' output `[B, S, Hv, Dv]`, in their values' dtype, and of their final memory
+    `[B, Hv, Dk, Dv]`, fp32: normals of the seed's own stream (`hosted`)."""
+    normal = np.random.default_rng([seed, 101]).standard_normal
+    batch, length, heads, width = operands.value.shape
+    return (hosted(normal((batch, length, heads, width)), operands.value.dtype),
+            hosted(normal((batch, heads, operands.key.shape[-1], width))))
+
+
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
          value_heads: int = VALUE_HEADS) -> tuple[Chunk]:
-    """A sequence's operands for `hooks` from `seed`, its keys' and values' dimensions each permuted
-    by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
+    """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
+    permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
     and values (`NORMED_WIDTH` wide under the norm), a log decay a head or a key dimension in (-1, 0),
     a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, and with
     `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
     chunk's first token."""
-    keys = jax.random.split(jax.random.key(seed), 8)
     rng = np.random.default_rng(seed)
+    normal = np.random.default_rng([seed, 1]).standard_normal
     width = VALUE_WIDTH if hooks.output is None else NORMED_WIDTH
     key_order, value_order = rng.permutation(KEY_WIDTH), rng.permutation(width)
-    query = jax.random.normal(keys[0], (ROWS, length, KEY_HEADS, KEY_WIDTH))
-    key = jax.random.normal(keys[1], (ROWS, length, KEY_HEADS, KEY_WIDTH))
-    key = key / jnp.linalg.norm(key, axis=-1, keepdims=True)
-    value = jax.random.normal(keys[2], (ROWS, length, value_heads, width))
-    shape = (ROWS, length, value_heads, KEY_WIDTH) if hooks.decay == 'vector' else (ROWS, length, value_heads)
-    log_decay = -jax.nn.softplus(jax.random.normal(keys[3], shape) - 1.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (ROWS, length, value_heads)))
-    skip = jax.random.normal(keys[5], (value_heads,))
+    query = normal((ROWS, length, KEY_HEADS, KEY_WIDTH))[..., key_order]
+    key = unit(normal((ROWS, length, KEY_HEADS, KEY_WIDTH)))[..., key_order]
+    value = normal((ROWS, length, value_heads, width))[..., value_order]
+    vector = hooks.decay == 'vector'
+    log_decay = -softplus(normal((ROWS, length, value_heads) + ((KEY_WIDTH,) if vector else ())) - 1.0)
+    if vector:
+        log_decay = log_decay[..., key_order]
+    written = normal((ROWS, length, value_heads))
+    beta = sigmoid(written)
+    skip = normal((value_heads,))
+    state = (0.3 * normal((ROWS, value_heads, KEY_WIDTH, width)))[:, :, key_order][..., value_order]
     gates = {}
     if hooks.gates is not None:
         # Pre-activations: the gate and beta raw, `log_a` and `bias` a head's.
-        heads = jax.random.split(keys[6], 3)
-        gates = {'gate': jax.random.normal(heads[0], (ROWS, length, value_heads)),
-                 'log_a': 0.5 * jax.random.normal(heads[1], (value_heads,)),
-                 'bias': jax.random.normal(heads[2], (value_heads,))}
-        beta = jax.random.normal(keys[4], (ROWS, length, value_heads))
+        gates = {'gate': hosted(normal((ROWS, length, value_heads))),
+                 'log_a': hosted(0.5 * normal((value_heads,))), 'bias': hosted(normal((value_heads,)))}
+        beta = written
     if hooks.rated:
         # The step through softplus is the write gate; the rate is `A = -exp(A_log)`, a head's.
-        beta = jax.nn.softplus(jax.random.normal(keys[4], (ROWS, length, value_heads)) - 1.0)
-        gates = {'rate': -jnp.exp(0.5 * jax.random.normal(keys[6], (value_heads,)))}
+        beta = softplus(written - 1.0)
+        gates = {'rate': hosted(-np.exp(0.5 * normal((value_heads,))))}
     epilogue = {}
     if hooks.output is not None:
-        norms = jax.random.split(keys[7], 2)
-        epilogue = {'z': jnp.take(jax.random.normal(norms[0], (ROWS, length, value_heads, width)),
-                                  value_order, axis=-1),
-                    'weight': jnp.take(1.0 + 0.1 * jax.random.normal(norms[1], (width,)), value_order)}
-    query, key = (jnp.take(x, key_order, axis=-1) for x in (query, key))
-    value = jnp.take(value, value_order, axis=-1)
-    if hooks.decay == 'vector':
-        log_decay = jnp.take(log_decay, key_order, axis=-1)
-    state = 0.3 * jax.random.normal(jax.random.fold_in(jax.random.key(seed), 8),
-                                    (ROWS, value_heads, KEY_WIDTH, width))
-    state = jnp.take(jnp.take(state, key_order, axis=2), value_order, axis=3)
+        epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
+                    'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
     starts = None
     if packed:
-        starts = (jnp.zeros((ROWS, length), bool).at[0, jnp.array([0, 23, 40])].set(True)
-                  .at[1, jnp.array([9, 48])].set(True))
+        starts = np.zeros((ROWS, length), bool)
+        starts[0, [0, 23, 40]] = True
+        starts[1, [9, 48]] = True
+        starts = jnp.asarray(starts)
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
-    return (Chunk(query, key, value, log_decay=log_decay if plain else None,
-                  beta=beta if reads_beta else None, skip=skip if hooks.skip else None, state=state,
-                  starts=starts, **gates, **epilogue),)
+    return (Chunk(hosted(query), hosted(key), hosted(value), log_decay=hosted(log_decay) if plain else None,
+                  beta=hosted(beta) if reads_beta else None, skip=hosted(skip) if hooks.skip else None,
+                  state=hosted(state), starts=starts, **gates, **epilogue),)
 
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):

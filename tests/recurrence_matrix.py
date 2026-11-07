@@ -170,22 +170,24 @@ TPU_CASES = (
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change)."""
 
 
-def _on_par(family: str, case: tuple[str, ...]) -> None:
+def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> None:
     """The chunked op's training step of `case` on its GPU, its kernel named, on par with its reference's
-    (`_reference`; check 1, the recurrence a token at a time in float64 the truth): the output, the final
-    memory and every operand's gradient. Its routes are its family's (`CHOICES`)."""
+    (`_reference`; check 1, the recurrence a token at a time in float64 the truth) over `seeds` draws: the
+    output, the final memory and every operand's gradient. Its routes are its family's (`CHOICES`)."""
     named = dict(zip(AXES[family], case, strict=True))
     hooks, starts = FORMS[named["form"]], _starts(named)
 
     def truth(operands):
         return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
 
+    step = jax.jit(_step(named, named["kernel"]))
+    # Its routes read from one draw's step: a check-1 site's judge pools its map tasks' records, running none.
     with generation.routes() as found:
-        assert_as_exact(jax.jit(_step(named, named["kernel"])), jax.jit(_step(named, _reference(named))),
-                        functools.partial(_drawn, named), "-".join(case), seeds=FEWEST_SEEDS,
-                        truth_fn=with_gradients(truth))
+        jax.block_until_ready(step(*_drawn(named, 0)))
     assert {route.choice for route in found} <= CHOICES
     assert any(route.kernel == named["kernel"] for route in found)
+    assert_as_exact(step, jax.jit(_step(named, _reference(named))), functools.partial(_drawn, named),
+                    "-".join(case), seeds=seeds, truth_fn=with_gradients(truth))
 
 
 @cell("recurrence", covers=lambda case: dict(zip(AXES["recurrence"], case, strict=True)))
