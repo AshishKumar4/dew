@@ -532,8 +532,15 @@ def _attention_preferred(case: AttentionCase) -> str:
     template whatever its bias, as 'inference' takes the fast form alone (xla's attention computes no
     other). A call only spans express (`AttentionCase.spans_only`: block groups, key validity, runs or counted
     places) runs the template on every backend, which alone reads them: every other kernel refuses it and the
-    reference path builds its dense mask, `[B, 1, S, S]` (rows 1495, 1953)."""
+    reference path builds its dense mask, `[B, 1, S, S]` (rows 1495, 1953). A call whose products a
+    quantized model's rule owns (`_products_quantized`) runs the reference path, whose products are whole."""
     backend = generation.backend()
+    if _products_quantized():
+        # A quantized model's rule owns the call's products, quantizing the weights by each row's largest,
+        # which only a whole row of them states: the reference path forms them so, a walk over the keys
+        # never (the derivation refused an int8 CLIP tower's walk, "a walked reduction read other than by
+        # a monoid").
+        return 'reference'
     if case.spans_only:
         return 'template'
     if (backend == 'gpu' and case.dense_bias and case.form == "fast"
@@ -542,6 +549,21 @@ def _attention_preferred(case: AttentionCase) -> str:
     if backend not in ('gpu', 'tpu'):
         return 'xla' if _xla_scores_fit(case) else 'template'
     return {'gpu': 'template', 'tpu': 'tpu'}.get(backend, 'xla')
+
+
+def _products_quantized() -> bool:
+    """Whether a quantized model's rule owns this call's products: a Qwix rule matching `dot_general` at
+    the module calling it, as the trace of a quantized model's method holds one (`dew._cache.QUANTIZED_TRACE`,
+    `qwix.pallas.get_current_rule`, Qwix's query for code that runs its own kernels). An adapter's or an
+    input quantizer's interception owns its projections alone, never the attention's products."""
+    from dew._cache import QUANTIZED_TRACE
+    from dew.nn.dense import QWIX
+
+    if QUANTIZED_TRACE.value is None or not QWIX:
+        return False
+    from qwix import pallas as qwix_pallas
+
+    return qwix_pallas.get_current_rule("dot_general") is not None
 
 
 XLA_SCORE_BYTES = 12
