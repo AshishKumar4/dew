@@ -315,6 +315,10 @@ class AheadOfTime:
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
+        if "starts" not in vars(step):
+            raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
+                             "programs (`starts`), whose run would compile them on its devices; compile it "
+                             "ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         _current(path, "step", [step.executable, *sampled])
         return step
@@ -799,11 +803,13 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
 
 def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned
                              ) -> dict[str, Executable]:
-    """The programs a run of `trainer` compiles before and at its first step besides the step, compiled for
-    the target over their arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement
-    (`start_lowered`), for a run that starts afresh, and the first step's narrowed copies of its weights
-    where the plan reads some (`narrowed`). Each by its program's digest, through the kernel templates'
-    reports as every compile is."""
+    """The programs a run of `trainer` compiles to start, before its first step runs, besides the step,
+    compiled for the target over their arguments' shapes (`AheadOfTime.starts`): its fresh state's build
+    and placement (`start_lowered`), for a run that starts afresh, and the first step's narrowed copies of
+    its weights where the plan reads some (`narrowed`). Each by its program's digest, through the kernel
+    templates' reports as every compile is. The programs a fit runs on its steps' results (its counters,
+    its logs' copies, an accumulating window's first allocation, its evaluations) compile on its devices
+    still (row 4752)."""
     from dew.training.distributed import start_lowered
     from dew.training.narrow import narrowed
 

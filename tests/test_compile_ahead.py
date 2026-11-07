@@ -353,6 +353,8 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
     was compiled for, refuses to load it, and a run reproducing it derives its launches for its GPU only on
     one of as many multiprocessors, as a balanced tail's grid past the GPU's residency can wait on a
     program that never starts (row 3606)."""
+    import pickle
+
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
     ahead = compile_ahead(fine_tune(MeshSpec(fsdp=2).build(compile_only_gpus("sm80", 2))),
@@ -362,6 +364,13 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
     assert loaded == ahead
     with pytest.raises(ValueError):
         loaded.loaded()
+    # A step saved before steps carried their start's programs is refused as it loads, never an
+    # AttributeError as its run places its state.
+    earlier = dataclasses.replace(ahead)
+    vars(earlier).pop("starts")
+    (tmp_path / "earlier.dew-aot").write_bytes(pickle.dumps(earlier))
+    with pytest.raises(ValueError):
+        AheadOfTime.load(tmp_path / "earlier.dew-aot")
     assert loaded.derived_for(loaded.target) == loaded.target
     fewer = dataclasses.replace(loaded.target, multiprocessors=loaded.target.multiprocessors - 6)
     with pytest.raises(ValueError):

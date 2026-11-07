@@ -472,6 +472,22 @@ def test_a_slope_reaches_a_custom_vjp_only_through_the_operands_it_feeds():
     assert not _reaches_custom_vjp(stopped, {stopped.invars[0]})
 
 
+def test_a_hook_reads_its_places_as_a_vector_only_where_every_run_of_it_reads_them():
+    """A score hook's places are a vector broadcast only where it surely reads them (`score_places`): through
+    a jitted helper input by input, and never through a loop's body, which may run no step (a scan of none)
+    or read its carries a step later, an unread vector's iota finding no layout (row 2977); a tile of
+    places serves every hook (row 4025: a call read where every reader reads it, `dew.nn.programs.called`)."""
+    def helper(score, q_pos, k_pos):
+        return jax.jit(lambda score, places: score + places.astype(score.dtype))(score, q_pos)
+
+    def looped(score, q_pos, k_pos):
+        return jax.lax.scan(lambda carry, _: (carry + q_pos.astype(carry.dtype), None), score, None,
+                            length=0)[0]
+
+    assert attention_mosaic_program.score_places(template.Hooks(helper)) == (True, False)
+    assert attention_mosaic_program.score_places(template.Hooks(looped)) == (False, False)
+
+
 @INTERPRETS
 def test_the_plain_jax_backward_takes_the_kept_outputs_residuals():
     """The plain-JAX mainloop's backward from residuals a Mosaic training forward keeps its output in
