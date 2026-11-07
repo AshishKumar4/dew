@@ -648,6 +648,9 @@ class FitSearch[LossT, EffectsT]:
     capacity: int | None = None
     """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
     compiled ahead for it states them (`AheadTarget.capacity`)."""
+    host: bool = False
+    """Whether `mesh` is over a host's own GPUs as it serialized them (`dew.training.ahead.host_gpus`), which
+    compile with that host's run's options (`deviceless_options`)."""
     derive: Callable[[int, bool], Candidate] | None = None
     """The step at a split, at the objective's rung and `narrow`, traced and not lowered, for its derived
     footprint (`dew.training.footprint`), which picks the search's first rung (`derived_start`); None
@@ -689,7 +692,8 @@ class FitSearch[LossT, EffectsT]:
                                                              else [record]))
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
         # target compiles them (`deviceless_options`), as the step's own (`options`) are made.
-        self.required = deviceless_options(self.mesh, compiler_options(*self.objective.towers()) or None)
+        self.required = deviceless_options(self.mesh, compiler_options(*self.objective.towers()) or None,
+                                           self.host)
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan found by the split-and-rung search, and every compile it made, its
@@ -965,7 +969,8 @@ class FitSearch[LossT, EffectsT]:
         else the step's own (`options`), each under the compile-only policy (`deviceless_options`), which
         the search alone applies, so a step whose options are its towers' own is that rung's program
         (`climb`)."""
-        return self.required if self.xla_defaults else deviceless_options(self.mesh, self.options(candidate))
+        return self.required if self.xla_defaults else deviceless_options(self.mesh, self.options(candidate),
+                                                                          self.host)
 
     def measured(self, split: int, candidate: Candidate) -> tuple[
             jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe]:

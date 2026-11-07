@@ -139,15 +139,16 @@ def test_a_step_compiled_ahead_over_a_hosts_gpus_plans_within_the_memory_it_is_t
     serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm90", 1, 2**30))).serialize())
     host = host_gpus("sm90", serialized, 1)
     trainer = fine_tune(MeshSpec().build(host))
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30)
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30, host=True)
     assert tuple(trainer.device_mesh.devices.flat) == host
     assert ahead.capacity == 2**30 and ahead.plan is not None
 
 
 def test_the_planner_compiles_over_a_hosts_gpus_with_the_options_its_run_compiles_with(tmp_path):
-    """A host's own GPUs (`host_gpus`) compile with the options the host's run on attached GPUs does, its
-    autotuning kept, so the planner's programs key the cache entry that run reads; a canonical target's skip the
-    autotuning nothing can time there (`deviceless_options`)."""
+    """A planner told its mesh is over a host's own GPUs (`host_gpus`, `deviceless_options`' `host`) compiles
+    with the options the host's run on attached GPUs does, its autotuning kept, so its programs key the cache
+    entry that run reads; over a canonical target, even after a host's in the same process, it skips the
+    autotuning nothing can time there."""
     from jax.experimental import topologies
     from jax.sharding import Mesh
 
@@ -157,9 +158,12 @@ def test_the_planner_compiles_over_a_hosts_gpus_with_the_options_its_run_compile
     canonical = compile_only_gpus("sm90", 1, 2**30)
     serialized = tmp_path / "topology.bin"
     serialized.write_bytes(topologies.TopologyDescription(list(canonical)).serialize())
-    over = lambda devices: deviceless_options(Mesh(np.asarray(devices), ("data",)), None)  # noqa: E731
-    assert over(host_gpus("sm90", serialized, 1)) is None
-    assert over(canonical) == {"xla_gpu_autotune_level": 0}
+    def over(devices, host: bool):
+        return deviceless_options(Mesh(np.asarray(devices), ("data",)), None, host)
+
+    # A canonical target after a host's, in one process, still skips the autotuning: nothing is kept between.
+    assert over(host_gpus("sm90", serialized, 1), host=True) is None
+    assert over(canonical, host=False) == {"xla_gpu_autotune_level": 0}
 
 
 @pytest.mark.shared_setup("admitted")

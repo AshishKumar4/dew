@@ -983,7 +983,7 @@ class Trainer(Generic[Loss, Effects]):
 
     @ruled
     def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None, capacity: int | None,
-                       frontier: bool = False) -> Planned:
+                       frontier: bool = False, host: bool = False) -> Planned:
         """The shared device-step planner: its record and chosen rung, with `frontier` the rungs above it
         (`FitSearch.above`). The caller reads its lowering before releasing it (`compile`) or serializing its
         executable (`compile_ahead`)."""
@@ -992,7 +992,8 @@ class Trainer(Generic[Loss, Effects]):
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule, held_objects():
-            planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity, frontier)
+            planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity, frontier,
+                                           host)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
@@ -1053,12 +1054,13 @@ class Trainer(Generic[Loss, Effects]):
 
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
                  trials: Trials | None, capacity: int | None,
-                 frontier: bool) -> tuple[Planned, StepFlops | None]:
+                 frontier: bool, host: bool = False) -> tuple[Planned, StepFlops | None]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the first that
         fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the objective at its rung,
         and a microbatch's FLOPs (`plan_flops`). A plan recorded beside the compilation cache
         (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung; `capacity`
-        the bytes a device that states none holds (`FitSearch.capacity`); `frontier` asks the rungs above."""
+        the bytes a device that states none holds (`FitSearch.capacity`); `frontier` asks the rungs above;
+        `host` says `mesh` is over a host's own GPUs (`FitSearch.host`)."""
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
@@ -1084,7 +1086,7 @@ class Trainer(Generic[Loss, Effects]):
             lower, lambda candidate: step_options(
                 self.objective, candidate.micro, candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
-            else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
+            else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity, host=host,
             derive=None if recorded is not None else functools.partial(lower, lowering=False))
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)

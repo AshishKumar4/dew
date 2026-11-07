@@ -75,7 +75,6 @@ from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
-from dew.training.compiled_program import HOSTED, hosted
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
@@ -167,8 +166,9 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     backend's platform version and topology fingerprint are the host's) and the host's run reads it. A
     canonical target (`compile_only_gpus`) keys another entry: its platform version is its device kind, and it
     states zero bytes of memory, or the capacity it is given, where the host states its own.
-    The planner reads no memory off them: a compile ahead over them states the host's per GPU
-    (`compile_ahead`'s `capacity`) to plan within it."""
+    A compile ahead over them says so (`compile_ahead`'s `host`), so its planner compiles with the host's
+    run's options, and states the host's memory per GPU (`capacity`) to plan within it: the planner reads
+    none off them."""
     # The CUDA plugin, which a serialized topology deserializes through, initialized as the generation's
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)
@@ -179,7 +179,6 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     if held != gpu_target(generation).generation:
         raise ValueError(f"the topology at {topology} holds {devices[0].device_kind} GPUs ({held}), not "
                          f"{generation}")
-    HOSTED.update(devices[:count])
     return tuple(devices[:count])
 
 
@@ -663,7 +662,7 @@ class AheadTarget:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
         ahead = compile_ahead(trainer, first_step_batch(trainer, loader, steps, examples, resume),
-                              self.capacity, frontier=self.frontier)
+                              self.capacity, frontier=self.frontier, host=self.topology is not None)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -735,7 +734,8 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
 
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
-                                   capacity: int | None = None, *, frontier: bool = False) -> AheadOfTime:
+                                   capacity: int | None = None, *, frontier: bool = False,
+                                   host: bool = False) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only devices its
     mesh is built over, GPUs of one CUDA generation (`compile_only_gpus`) or a TPU topology's
     (`compile_only_tpus`), and never run. The planner `Trainer.compile` uses
@@ -747,8 +747,9 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     among (the module's docstring). `capacity` states bytes per GPU; absent it, memory fit is unknown rather
     than measured. The GPU it compiles for is the one the mesh's compile-only GPUs state, as XLA compiles
     over them: their generation and multiprocessors (`compile_only_gpus`' `multiprocessors`, `built_target`),
-    which the step's launches derive for and it records. Profiling, tuning and rollout require execution and
-    are refused."""
+    which the step's launches derive for and it records; with `host`, the mesh is over a host's own GPUs
+    (`host_gpus`), which keep their stated memory and compile with that host's run's options. Profiling,
+    tuning and rollout require execution and are refused."""
     if capacity is not None and capacity <= 0:
         raise ValueError("compile-ahead capacity must be positive bytes per GPU")
     if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
@@ -774,9 +775,9 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         raise ValueError("a frontier lists the rungs that fit the GPUs' memory, which compile-only GPUs "
                          "do not state; name it (--trainer.compile-ahead.capacity-gib, compile_ahead's "
                          "capacity)")
-    # Compile-only GPUs a capacity was not stated for state it now; a host's own state their memory to XLA
-    # already (`host_gpus`), and the planner alone reads `capacity`.
-    if capacity is not None and not hosted(devices[0]):
+    # Compile-only GPUs a capacity was not stated for state it now; a host's own (`host`) state their memory
+    # to XLA already, and the planner alone reads `capacity`.
+    if capacity is not None and not host:
         mesh = trainer.device_mesh
         devices = compile_only_gpus(generation, len(devices), capacity,
                                     None if stated is None else stated.multiprocessors)
@@ -792,7 +793,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     on = generation if stated is None else stated
     with assumed(on), uncached() if on_tpus else contextlib.nullcontext(), routes() as taken:
         target = gpu_target()
-        planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity, frontier)
+        planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity, frontier,
+                                         host)
     if missing := substituted(taken):
         _log.warning("the step compiled ahead for %s holds kernels this host cannot lower: %s", generation,
                      "; ".join(missing))

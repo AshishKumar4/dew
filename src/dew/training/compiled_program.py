@@ -63,17 +63,6 @@ def lowering_platform(device) -> str:
     return "rocm" if "rocm" in str(device.client.platform_version).lower() else "cuda"
 
 
-HOSTED: set = set()
-"""The compile-only GPUs read off a host's own serialized topology (`dew.training.ahead.host_gpus`, `hosted`)."""
-
-
-def hosted(device) -> bool:
-    """Whether compile-only `device` is one of a host's own GPUs as it serialized them
-    (`dew.training.ahead.host_gpus`): XLA reads their memory off the topology, and a program compiled over them is
-    to key the cache that host's run reads."""
-    return device in HOSTED
-
-
 def deviceless(device) -> bool:
     """Whether `device` is a compile-only target, no device of a running backend: one of a topology JAX
     compiles for without a device (`compile_only_runtime`, `jax.experimental.topologies`)."""
