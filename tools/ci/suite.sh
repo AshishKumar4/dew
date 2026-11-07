@@ -23,13 +23,15 @@
 #   POOL             the suite's pool (none: .armada.json's), and BACKGROUND, 1 for a run that takes a bounded share
 #                    of the fleet with a longer deadline
 #   PROVEN           non-empty where the commit was proven green already: nothing runs
-#   OUT              where the clients' logs, the jobs' ids (jobs.txt) and the gangs' outcome (gangs.outcome) are
-#                    kept (default: a new directory)
+#   OUT              where the clients' logs, the jobs' ids (jobs.txt) and the gangs' outcome (gangs.outcome,
+#                    success or failure, absent where no gang ran) are kept (default: a new directory)
 set -u
 sha=$1
 armada=${ARMADA:-armada}
 out=${OUT:-$(mktemp -d)}
 mkdir -p "$out"
+# The gangs' outcome is this run's alone, and none where no gang runs (GANGLESS, PROVEN).
+rm -f "$out/gangs.outcome"
 priority=${PRIORITY:+--priority=$PRIORITY}
 echo "the test cache's policy: ${DEW_TEST_CACHE:-}"
 # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell reaches it and it cancels

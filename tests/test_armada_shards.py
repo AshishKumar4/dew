@@ -106,9 +106,9 @@ def entry_task(ci, monkeypatch, entry: dict, out: Path, artifacts: Path | None =
     return ci.main()
 
 
-def planned(ci, target: float = 300.0) -> dict[str, dict]:
-    """The plan's 3.12 entries by their task names."""
-    return {entry["name"]: entry for entry in ci.plan(target, {}) if entry["python"] == "3.12"}
+def planned(ci, target: float = 300.0, timings: dict | None = None) -> dict[str, dict]:
+    """The plan's 3.12 entries by their task names, under armada's measures `timings` (none by default)."""
+    return {entry["name"]: entry for entry in ci.plan(target, timings or {}) if entry["python"] == "3.12"}
 
 
 def runs(root: Path) -> list[int]:
@@ -500,12 +500,13 @@ def cached_checkout(ci, tmp_path: Path, monkeypatch, cache_worker, site: str) ->
     return out
 
 
-def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool) -> None:
+def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool, target: float = 300.0,
+               timings: dict | None = None) -> None:
     """Site `site`'s run as armada runs it with the test cache on, each task recording its rows: its map
     tasks, its later ones too where `later` (its judge's first stage asked for them), then its judge over
-    those, and the file's own row."""
+    those, and the file's own row, as the plan for `target` under armada's measures `timings` cuts them."""
     out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker, site)
-    entries = list(planned(ci).values())
+    entries = list(planned(ci, target, timings).values())
     [judge] = [entry for entry in entries if "after" in entry]
     inputs = tmp_path / ".verdict/inputs"
     drawn = [entry for name in judge["after"] for entry in entries
@@ -551,6 +552,21 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
     maps = [entry for entry in ran if "after" not in entry]
     assert {ci.session.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
     assert maps and set(again["after"]) == {entry["name"] for entry in maps}
+
+
+def test_a_judge_after_a_cut_finer_than_declared_is_kept_on_what_its_map_tasks_drew(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A site cut finer than its mark declares (its measured rate past the target, `cut_draws`) is judged over
+    the map tasks that ran, and its judge keys on their inputs whatever their spans, so it is kept whole as a
+    judge after its declared cut is, and a module only its draws ran, changed, plans it again (the review of
+    row 4376: a judge read its declared cut's map tasks alone, found none, and kept no key)."""
+    first = ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))
+    run_cached(ci, tmp_path, monkeypatch, cache_worker, SITE, later=True, target=30.0,
+               timings={"rows": {first: 40.0}})
+    # 10 s a seed: 3 a task within 30 s, 8 map tasks where the declared cut makes 3.
+    assert runs(tmp_path) == [1, 8, 1]
+    ran = replanned_once_its_draws_change(ci, tmp_path)
+    assert {ci.session.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
 
 
 def test_a_judge_green_on_its_first_stage_is_kept_though_its_later_map_tasks_never_ran(

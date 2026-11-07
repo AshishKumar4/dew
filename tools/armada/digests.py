@@ -27,15 +27,16 @@ def _followed():
 followed = _followed()
 
 
-def code_of(name: str, data: bytes | None = None) -> bytes:
-    """The hash of Python file `name`'s code, or of `data` as its text where given (a commit's, which
-    `policy` compares): its syntax tree, with no comment, no docstring and no line number, so a change of
-    what the harness says of itself re-keys no row (row 2730: a docstring edit to a SHARED module ran the
-    suite cold); its bytes' where it does not parse, or b"missing"."""
+def code_of(name: str) -> bytes:
+    """The hash of Python file `name`'s code (`code_digest`), or b"missing"."""
     path = Path(name)
-    if data is None and not path.is_file():
-        return b"missing"
-    data = path.read_bytes() if data is None else data
+    return code_digest(path.read_bytes(), name) if path.is_file() else b"missing"
+
+
+def code_digest(data: bytes, name: str) -> bytes:
+    """The hash of Python text `data` (file `name`'s, at any commit) as code: its syntax tree, with no
+    comment, no docstring and no line number, so a change of what the harness says of itself re-keys no row
+    (row 2730: a docstring edit to a SHARED module ran the suite cold); its bytes' where it does not parse."""
     try:
         tree = ast.parse(data, name)
     except SyntaxError:

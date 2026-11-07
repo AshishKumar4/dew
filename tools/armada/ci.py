@@ -35,7 +35,8 @@ every row it holds is red, so a hang is graded, with what pytest reports as
 it is interrupted, rather than leaving the task without a verdict. A check-1
 site too long for one task, marked check1_shards(seeds, per_task) on its test
 (`sites`), runs apart from its file's tasks as armada's map and judge
-(`site_entries`): map tasks of per_task of its seeds each, which draw them into
+(`site_entries`): map tasks of per_task of its seeds each, or fewer where their
+measured seconds put a task past the group target (`cut_draws`), which draw them into
 their artifacts and judge nothing, and a judge that waits on them, pools their
 draws from its inputs and reports the site's row, `<file>#<test>`, as a run
 that drew every seed itself would; a map task that does not pass exits 1, and
@@ -222,9 +223,10 @@ SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools
           "src/dew/_cleanup.py", "tools/armada/split.py", "tools/armada/executed.py",
           "tools/armada/followed.py", "tools/armada/lifetime.py", "tools/armada/watched.py",
           "tools/armada/progress.py")
-"""The files every test file's key covers whole, beside every lock (a GPU node builds its environment
-from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
-and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
+"""The files every test file's key covers whole, a Python module by its code (`code_of`), beside every
+lock (a GPU node builds its environment from its CUDA lock), the environment's own inputs, which
+.armada.json names (`environment_files`), and .armada.json's parts a test process sees (`armada_seen`):
+what every test process runs or reads,
 the session it runs in, the process group it runs as and the plugins loaded into it among them. The
 plan's own code (this file) runs outside the tests, so a change to it reruns none of them; nor does
 the durations record (`session.DURATIONS`), which only a split file's groups are cut from, so a
@@ -826,19 +828,19 @@ round (train 149: 30 task-hours, twice)."""
 
 
 def policy(base: str) -> str:
-    """The test cache's policy (DEW_TEST_CACHE) for this checkout's change from `base`: 'off', every file
-    run, for a change to what every test process runs or reads (`SHARED`, a lock, the environment's
-    files) or to a file the records do not place (`PLACED`); else 'on', each file run where its inputs
-    changed. A tool is such an input of each file whose run executed or read it, which its key hashes, so
-    a changed tool runs those files again and no other (train 115 reran its whole suite for five tools
-    no pulled head had touched, under a policy that reran every file that read any tool)."""
-    changed = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], check=True,
+    """The test cache's policy (DEW_TEST_CACHE) for this checkout's change from `base`: 'off', every file run,
+    for a change to what every test process runs or reads (`SHARED`, a Python module of it by its code, as
+    `shared` keys it; a lock, the environment's files) or to a file the records do not place (`PLACED`); else
+    'on', each file run where its inputs changed. A tool is such an input of each file whose run executed or
+    read it, which its key hashes, so a changed tool runs those files again and no other (train 115 reran its
+    whole suite for five tools no pulled head had touched, under a policy that reran every file that read any
+    tool)."""
+    changed = subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"], check=True,
                              capture_output=True, text=True).stdout.split()
     if ".armada.json" in changed:
-        before = subprocess.run(["git", "show", f"{base}:.armada.json"], capture_output=True, text=True,
-                                check=False)
+        before = at_commit(base, ".armada.json")
         armada = Path(".armada.json")
-        if armada_seen(before.stdout if before.returncode == 0 else None) == armada_seen(
+        if armada_seen(None if before is None else before.decode()) == armada_seen(
                 armada.read_text() if armada.is_file() else None):
             changed.remove(".armada.json")  # where and when tasks run, never what a test sees
     whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".armada.json",
@@ -854,9 +856,16 @@ def policy(base: str) -> str:
 
 
 def same_code(base: str, name: str) -> bool:
-    """Whether Python file `name` is the same code at commit `base` as in this checkout (`code_of`)."""
-    before = subprocess.run(["git", "show", f"{base}:{name}"], capture_output=True, check=False)
-    return before.returncode == 0 and Path(name).is_file() and code_of(name, before.stdout) == code_of(name)
+    """Whether Python file `name` is the same code at commit `base` as in this checkout (`code_of`): a file
+    added or removed since is not."""
+    before = at_commit(base, name)
+    return before is not None and Path(name).is_file() and digests.code_digest(before, name) == code_of(name)
+
+
+def at_commit(commit: str, name: str) -> bytes | None:
+    """File `name`'s bytes at `commit`, or None where it holds none."""
+    found = subprocess.run(["git", "show", f"{commit}:{name}"], capture_output=True, check=False)
+    return found.stdout if found.returncode == 0 else None
 
 
 def borrowed(timings: dict, python: str) -> dict:
@@ -989,24 +998,25 @@ def draws_of(mark: Mark, per_task: int | None = None, weighed_per_task: int | No
     return spans + [(start, min(start + weighed, end)) for start in range(mark.units, end, weighed)]
 
 
-def cut_draws(python: str, name: str, test: str, mark: Mark, measured: Mapping[str, float],
-              target: float) -> list[tuple[int, int]]:
-    """The spans of test file `name`'s site `test`'s map tasks (`draws_of`): its declared per_task each, or
-    fewer where its units' measured rate (`rate`, over the map tasks of any cut armada measured, the
-    unweighted check's and the weighed check's apart) puts a task of its declared cut past `target`: as many
-    as `target` holds at that rate, at least one, so no map task is the run's longest for its mark's cut
-    (row 4376: a 64-seed shard ran 966 s where every other group took 256 s or less). The task's own start
-    is among what the rate measured, so a cut converges from above on the one that fills the target. A cut
-    whose map tasks would pass what its judges' job takes (`MAX_INPUTS`) keeps the finest within it."""
-    def kept(units: int, declared: int, *, weighed: bool) -> int:
-        each = site_rate(python, name, test, mark, measured, weighed=weighed)
+def cut_draws(mark: Mark, rates: Mapping[bool, float | None], target: float) -> list[tuple[int, int]]:
+    """The spans of a site's map tasks (`draws_of`): its declared per_task each, or fewer where its units'
+    measured rate (`site_rate`, the unweighted check's and the weighed check's apart, `rates` by whether
+    weighed) puts a task of its declared cut past `target`: as many as `target` holds at that rate, at least
+    one, so no map task is the run's longest for its mark's cut (row 4376: a 64-seed shard ran 966 s where
+    every other group took 256 s or less). Its tasks' starts are among what the rate measures, so a cut
+    converges from above on the one that fills the target. A kind whose finer cut would pass what its
+    judges' job takes (`MAX_INPUTS`, the two kinds' tasks together) keeps the finest of its own within it."""
+    def fitting(units: int, declared: int, each: float | None) -> int:
         return declared if not each else max(1, min(declared, int(target // each), units))
 
-    per_task = kept(mark.units, mark.per_task, weighed=False)
-    weighed = kept(mark.weighed, mark.weighed_per_task, weighed=True) if mark.weighed else None
-    while len(draws_of(mark, per_task, weighed)) > MAX_INPUTS:
-        per_task = min(mark.per_task, per_task + 1)
-        weighed = None if weighed is None else min(mark.weighed_per_task, weighed + 1)
+    per_task = fitting(mark.units, mark.per_task, rates[False])
+    weighed = fitting(mark.weighed, mark.weighed_per_task, rates[True]) if mark.weighed else None
+    while per_task < mark.per_task and len(
+            draws_of(mark, per_task, mark.weighed_per_task or None)) > MAX_INPUTS:
+        per_task += 1
+    while weighed is not None and weighed < mark.weighed_per_task and len(
+            draws_of(mark, per_task, weighed)) > MAX_INPUTS:
+        weighed += 1
     return draws_of(mark, per_task, weighed)
 
 
@@ -1049,20 +1059,20 @@ def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]],
 def site_rate(python: str, name: str, test: str, mark: Mark, measured: Mapping[str, float], *,
               weighed: bool) -> float | None:
     """The seconds a unit of test file `name`'s site `test` takes under `python` (`rate`), over its map tasks
-    of every cut its mark allows (`draws_of` at each per_task up to its declared one) that armada measured:
-    its weighed check's units apart from the rest (`weighed`), as they cost their own."""
-    declared = mark.weighed_per_task if weighed else mark.per_task
-    cuts = {span for each in range(1, declared + 1)
-            for span in (draws_of(mark, None, each) if weighed else draws_of(mark, each, None))
-            if (span[0] >= mark.units) == weighed}
-    return rate(python, name, test, sorted(cuts), measured)
+    of any cut armada measured, by their names (`site_task`), each span read from its name's end: its weighed
+    check's units apart from the rest (`weighed`), as they cost their own."""
+    prefix = f"{site_task(python, name, test)}-draws-"
+    spans = [(int(start), int(stop)) for task in measured if task.startswith(prefix)
+             for start, _, stop in [task[len(prefix):].partition("-")]]
+    return rate(python, name, test, [span for span in spans if (span[0] >= mark.units) == weighed], measured)
 
 
 def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                  kept: Mapping[tuple[str, str], str], timings: dict, target: float,
                  eager: Container[tuple[str, str]] = ()) -> list[dict]:
     """The plan's entries for each site of `marked` (`sites`, by its file) under `python`: a map task each
-    `per_task` of its units (`draws_of`), which runs its test over them alone, records their draws among its
+    `per_task` of its units, or fewer where their measured rate puts a task past `target` (`cut_draws`),
+    which runs its test over them alone, records their draws among its
     artifacts and judges nothing; and its judge, which runs once they all passed (armada's `after`), pools
     their draws from its inputs and reports the site's row as a run that drew every unit itself would. A site
     whose judge's row ran green on exactly these inputs (`kept`, `reusable`) has none: a kept task reads its
@@ -1085,9 +1095,9 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
             if (name, test) in kept:
                 continue
             mark = held[test]
-            spans = cut_draws(python, name, test, mark, measured, target)
             rates = {weighed: site_rate(python, name, test, mark, measured, weighed=weighed)
                      for weighed in (False, True)}
+            spans = cut_draws(mark, rates, target)
             maps = []
             for start, stop in spans:
                 group = f"{test}.draws-{start}-{stop}"
@@ -1268,9 +1278,9 @@ def red_as(kind: str, nodes: list[str]) -> dict:
 
 
 STALE = "stale"
-"""The outcome of a row its plan kept on a green record its task did not find and did not run (`stale_row`):
-no verdict of its tests, which the queue runs again as a row of its own (land.sh), never red and never a flaky
-row of its owner's."""
+"""The kind of a row its plan kept on a green record its task did not find and did not run (`stale_row`): no
+verdict of its tests, so not passed (armada reads its exit 1 so), which the queue runs again as a row of its
+own before it grades any red (land.sh), never a red of its tests and never a flaky row of its owner's."""
 
 
 def stale_row(python: str, name: str, group: str, why: str) -> dict:
@@ -1282,12 +1292,15 @@ def stale_row(python: str, name: str, group: str, why: str) -> dict:
             **red_as(STALE, [])}
 
 
-def recorded_seconds(name: str, group: str) -> float:
-    """Test file `name`'s recorded seconds (the durations record), its group `group`'s tests' alone where it
-    has one (`members`)."""
-    record = durations_record()
-    nodes = members(name, group) if group else [node for node in record if node.split("::", 1)[0] == name]
-    return sum(record.get(node, 0.0) for node in nodes)
+def stale_cost(name: str, group: str, reading: Reading) -> float:
+    """What a kept row of test file `name` (in `group`'s group) costs a task that runs it, its record not
+    found: its tests' recorded seconds, its check-1 sites' aside, which run apart (`own_tests`; a group's,
+    `members`), each its least time, and what a run cold adds to them (`COLD_SECONDS`), as the plan weighs a
+    cold row; a file the record does not name, that alone."""
+    reading.cut(name, 1)
+    own = own_tests(name, (reading.durations or {}).get(name, {}))
+    nodes = members(name, group, reading) if group else list(own)
+    return sum(own.get(node, 0.0) for node in nodes) + COLD_SECONDS
 
 
 def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
@@ -1580,12 +1593,13 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
     if kept:
         # A row its plan kept that this task did not find (its record replaced since) runs here only where
-        # its recorded seconds fit what is left of the task's deadline, in turn; any other is said stale, not
-        # run (`STALE`), which the queue runs again as a row of its own, neither red nor flaky (Main,
-        # 2026-11-07; row 4468: 163 of a kept task's 165 rows ran out its deadline one after another).
-        left, fitting = deadline - (time.monotonic() - began), []
+        # what it costs run cold fits what is left of the task's deadline, in turn (`stale_cost`); any other
+        # is said stale, not run (`STALE`), which the queue runs again as a row of its own, neither a red of
+        # its tests nor flaky (Main, 2026-11-07; row 4468: 163 of a kept task's 165 rows ran out its deadline
+        # one after another).
+        left, fitting, reading = deadline - (time.monotonic() - began), [], Reading()
         for name in tests:
-            cost = recorded_seconds(name, group)
+            cost = stale_cost(name, group, reading)
             if name in kept and cost > left:
                 rows.append(stale_row(python, name, group, f"its {cost:.0f} s past the {left:.0f} s left"))
                 continue
@@ -1733,19 +1747,32 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
         kept.parent.mkdir(parents=True, exist_ok=True)
         kept.write_text(json.dumps(depends))
         return depends
-    found = {path.name: json.loads(path.read_text())
-             for path in armada_dir("ARMADA_INPUTS", INPUTS).rglob("*.inputs.json")}
+    # Its map tasks' inputs by the spans they drew, whatever cut the plan made of its units (`cut_draws`).
+    prefix, suffix = f"{site_task(python, name, test)}-draws-", ".inputs.json"
+    found = {tuple(int(end) for end in path.name[len(prefix):-len(suffix)].split("-")):
+             json.loads(path.read_text())
+             for path in armada_dir("ARMADA_INPUTS", INPUTS).rglob(f"{prefix}*{suffix}")}
     mark = sites(name).get(test)
-    named = {span: f"{site_task(python, name, test, span)}.inputs.json"
-             for span in (draws_of(mark) if mark else [])}
     # A judge's later map tasks ran only where its first stage asked for them (`site_entries`), all of them:
-    # one that judged without them judged over its first stage's alone.
-    later = [span for span in named if mark and span[0] >= mark.timed]
-    supplied = [span for span in named if span not in later or any(named[each] in found for each in later)]
-    drawn = [found.get(named[span]) for span in supplied]
-    if depends is None or not drawn or any(each is None for each in drawn):
+    # one that judged without them judged over its first stage's alone. Each stage it judged over is its
+    # units whole, so a map task missing from it is not known.
+    first = sorted(span for span in found if mark and span[0] < mark.timed)
+    later = sorted(span for span in found if mark and span[0] >= mark.timed)
+    if (depends is None or mark is None or not drawn_whole(first, 0, mark.timed)
+            or (later and not drawn_whole(later, mark.timed, mark.units + mark.weighed))
+            or any(found[span] is None for span in (*first, *later))):
         return None
-    return sorted({*depends, *(path for each in drawn for path in each)})
+    return sorted({*depends, *(path for span in (*first, *later) for path in found[span])})
+
+
+def drawn_whole(spans: list[tuple[int, int]], start: int, stop: int) -> bool:
+    """Whether sorted `spans` draw units `start` to `stop` each once, end to end."""
+    at = start
+    for begin, end in spans:
+        if begin != at:
+            return False
+        at = end
+    return at == stop and bool(spans)
 
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,

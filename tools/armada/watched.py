@@ -21,8 +21,8 @@ import select
 import struct
 import threading
 
-OPEN, MOVED_TO, CREATE, DELETE_SELF, MOVE_SELF, UNMOUNT, OVERFLOW, IGNORED, DIRECTORY = (
-    0x20, 0x80, 0x100, 0x400, 0x800, 0x2000, 0x4000, 0x8000, 0x40000000)
+OPEN, MOVED_TO, CREATE, DELETE_SELF, MOVE_SELF, UNMOUNT, OVERFLOW, IGNORED, ONLYDIR, DIRECTORY = (
+    0x20, 0x80, 0x100, 0x400, 0x800, 0x2000, 0x4000, 0x8000, 0x1000000, 0x40000000)
 LOST = DELETE_SELF | MOVE_SELF | UNMOUNT | OVERFLOW | IGNORED
 """The events after which a watch no longer sees what it watched: its directory gone, moved or unmounted
 (the kernel then drops the watch, IN_IGNORED), or events lost to the queue's overflow."""
@@ -112,20 +112,29 @@ class Writes:
     """The watch of one directory for the files that arrive in it, made or moved or linked in, read on demand
     (`gained`): JAX's compilation cache, whose programs a test file's run compiled (tests/remote_cache.py),
     known without listing a directory of hundreds of thousands (row 3496: 281 listings took 727 s of a
-    1,074 s task). `watching` is false where the watch could not be made."""
+    1,074 s task). `watching` is false where the watch could not be made (no inotify, no such directory)."""
 
     def __init__(self, directory: str) -> None:
         libc = ctypes.CDLL(None, use_errno=True)
-        self.fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
-        if self.fd >= 0 and libc.inotify_add_watch(self.fd, directory.encode(), CREATE | MOVED_TO) < 0:
+        start = getattr(libc, "inotify_init1", None)
+        self.fd = start(os.O_NONBLOCK | os.O_CLOEXEC) if start is not None else -1
+        watched = CREATE | MOVED_TO | ONLYDIR
+        if self.fd >= 0 and libc.inotify_add_watch(self.fd, directory.encode(), watched) < 0:
             os.close(self.fd)
             self.fd = -1
         self.watching = self.fd >= 0
 
     def gained(self) -> set[str] | None:
-        """The names that arrived in the directory since the last call; None where the kernel's queue
-        overflowed meanwhile (fs.inotify.max_queued_events), so not every one is known."""
+        """The names that arrived in the directory since the last call; None where not every one is known:
+        the kernel's queue overflowed meanwhile (fs.inotify.max_queued_events), or the watch was lost (its
+        directory gone, moved or unmounted) or closed."""
         found = events(self.fd)
-        if any(mask & OVERFLOW for _, mask, _ in found):
+        if self.fd < 0 or any(mask & LOST for _, mask, _ in found):
             return None
         return {name for _, _, name in found if name}
+
+    def close(self) -> None:
+        """The watch ended, its descriptor closed: `gained` knows nothing after."""
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1

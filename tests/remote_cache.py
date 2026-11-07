@@ -80,6 +80,8 @@ GROUP = re.compile(r"^(?P<path>.+?)/(?P<index>\d+)-of-(?P<count>\d+)(?P<rest>(?:
 """A split group's bundle: its file, its group G of N (`bundle`) and any worker after it."""
 SUFFIX = "-cache"
 """What JAX's cache names a program's file after its key (jax/_src/lru_cache.py)."""
+STAGING = ".staging"
+"""The directory within the cache where a restored program is written before it is linked in whole."""
 UNREACHABLE = (OSError, r2.R2Error)
 """A request the Worker did not answer as asked (`r2.R2Error`), or a local read or write of the cache
 directory that fails (an OSError)."""
@@ -104,8 +106,9 @@ class RemoteCache:
         self.seen: set[str] | None = None
         """The programs in the directory when the current bundle's run began or last moved on: listed once,
         then kept by what arrives in it (`writes`)."""
-        # JAX makes its cache directory at its first write, after this: made here, so the watch has it. One
-        # that cannot be made (a file in its place) is one the watch cannot watch: the remote is left alone.
+        # The directory the watch watches, there before it (conftest's `enable_compilation_cache` makes it; a
+        # caller that names a new one has it made here). One that cannot be made (a file in its place) cannot
+        # be watched: the remote is left alone.
         with contextlib.suppress(OSError):
             self.directory.mkdir(parents=True, exist_ok=True)
         self.writes = WATCHED.Writes(str(self.directory))
@@ -167,12 +170,14 @@ class RemoteCache:
         arrived = self.writes.gained()
         if self.file is None or self.seen is None:
             return
-        programs = self._programs() if arrived is None else self.seen | {
-            name.removesuffix(SUFFIX) for name in arrived
-            if name.endswith(SUFFIX) and not name.startswith(".")}
+        if arrived is None:
+            programs = self._programs()
+            fresh, self.seen = programs - self.seen, programs
+        else:
+            fresh = {name.removesuffix(SUFFIX) for name in arrived if name.endswith(SUFFIX)} - self.seen
+            self.seen |= fresh
         written = self.written.setdefault(self.file, [])
-        written += sorted(programs - self.seen - set(written))
-        self.seen = programs
+        written += sorted(fresh - set(written))
 
     def opened(self, file: str) -> None:
         """Bundle `file` in the local cache, and the programs compiled from here on its."""
@@ -269,9 +274,13 @@ class RemoteCache:
         return entries
 
     def _seeded(self, key: str, value: bytes) -> bool:
-        """`value` as program `key`'s file, written to a name of its own and linked in whole, so a
-        reader sees all of it or none; False, writing nothing, where the directory has it already."""
-        handle, staged = tempfile.mkstemp(prefix=".", suffix=".partial", dir=self.directory)
+        """`value` as program `key`'s file, written to a name of its own beside the directory's programs (its
+        STAGING, which the watch does not see, so a restored program is one event, not two) and linked in
+        whole, so a reader sees all of it or none; False, writing nothing, where the directory has it
+        already."""
+        staging = self.directory / STAGING
+        staging.mkdir(exist_ok=True)
+        handle, staged = tempfile.mkstemp(prefix=".", suffix=".partial", dir=staging)
         try:
             with os.fdopen(handle, "wb") as written:
                 written.write(value)
@@ -354,6 +363,7 @@ class RemoteCache:
         while (self.uploads.unfinished_tasks and self.uploader.is_alive()
                and time.monotonic() - began < seconds):
             time.sleep(0.1)
+        self.writes.close()
 
 
 def bundle(node: str, group: str | None, worker: str | None) -> str:
