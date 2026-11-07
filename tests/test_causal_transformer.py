@@ -47,6 +47,9 @@ from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.nn.mixers.mamba2 import Mamba2Mixer
+from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
 
@@ -901,16 +904,25 @@ def test_a_packed_document_reads_like_the_document_alone(rng):
                     truth_fn=alone(float64(model)))
 
 
-@pytest.mark.parametrize("layout", [None, KVCache(page_size=4)], ids=["dense", "paged"])
-def test_a_packed_prefill_decodes_its_last_document_as_that_document_alone(layout):
+@pytest.mark.parametrize(("mixer", "layout"), [
+    (None, None), (None, KVCache(page_size=4)),
+    (GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
+                        linear_value_head_dim=8), None),
+    (ParallelMixer(branches=(ParallelBranch("mamba", Mamba2Mixer(num_heads=4, head_dim=8, state_size=8,
+                                                                  n_groups=1, chunk_size=4), 1.3, 0.7),
+                             ParallelBranch("attention", AttentionMixer(), 0.8, 0.6))), None)],
+    ids=["dense", "paged", "gated-delta", "mamba2-beside-attention"])
+def test_a_packed_prefill_decodes_its_last_document_as_that_document_alone(mixer, layout):
     """A row of two documents and its padding (segment 0) prefilled into a cache (`segment_ids`), then
     single-token steps continuing its last document, each naming its one document (a call's first continues
     its row's last, `dew.batch.Coordinates.starts`): every layer reads each document's own keys over the
-    cache (`dew.nn.kv_cache.DOCUMENTS`) and the padding writes none, so the second document's prefill logits
+    cache (`dew.nn.kv_cache.DOCUMENTS`), each recurrent layer resets its state at the document's start, and
+    the padding writes none, so the second document's prefill logits
     and every step's are on par (check 1) with the second document prefilled alone into a cache of its own
     and decoded the same steps, the truth one uncached float64 call over that document and the steps'
     tokens."""
-    model = tiny(**({} if layout is None else {"kv_cache": layout}))
+    model = tiny(**({} if layout is None else {"kv_cache": layout}),
+                 **({} if mixer is None else {"mixer": mixer}))
     first, second, padding, steps = 6, 4, 2, 3
     prompt = first + second + padding
     segment_ids = jnp.asarray([[1] * first + [2] * second + [0] * padding] * 2)
@@ -948,7 +960,7 @@ def test_a_packed_prefill_decodes_its_last_document_as_that_document_alone(layou
         return wide.apply(params, tokens)
 
     assert_as_exact(packed, alone, drawn(model, length=prompt + steps),
-                    f"packed prefill decoded {'dense' if layout is None else 'paged'}",
+                    f"packed prefill decoded {type(mixer).__name__} {'dense' if layout is None else 'paged'}",
                     seeds=SEEDS['packed alone'], truth_fn=truth)
 
 
@@ -1662,9 +1674,7 @@ def test_a_parallel_layer_reads_its_branches_initializers_and_indexers():
     publishes what its later layers read (`MixerBase.publishes`); and a latent attention branch carrying
     an indexer is the decoder's indexed mixer, which an indexer's training reads."""
     from dew.nn.deepseek_v4 import DeepseekV4Mixer
-    from dew.nn.mixers.mamba2 import Mamba2Mixer
     from dew.nn.mixers.mlp import MLPMixer
-    from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
     from dew.nn.mla import MLAMixer
 
     def beside(name, mixer):
