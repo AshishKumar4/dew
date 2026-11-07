@@ -71,9 +71,12 @@ PLACES = "cached_places"
 GROUPS = {"image_groups": "cached_image_groups", "block_groups": "cached_block_groups"}
 """Each cached key's image or block group (`dew.nn.inputs.AttentionMetadata`), kept beside the key where a
 layer reads it (`Append.groups`), by the field's name."""
+DOCUMENTS = "cached_documents"
+"""Each cached key's document, numbered from 1 along its row (`Append.documents`), which every cache keeps:
+a cached call's tokens read their own document's keys alone, however many a row holds."""
 SCALES = frozenset({"key_scale", "value_scale"})
 """A quantized pool's scale leaves (`scale_shape`)."""
-POOLED = frozenset({"cached_key", "cached_value", *SCALES, PLACES, *GROUPS.values()})
+POOLED = frozenset({"cached_key", "cached_value", *SCALES, PLACES, DOCUMENTS, *GROUPS.values()})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
 ROUNDING_KEYS = "rounding_keys"
 """A per-row cache leaf, each row's key data of its stochastic-rounding stream `[rows, words]`, which a
@@ -465,6 +468,7 @@ class KVStore:
         held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
         if places:
             module.variable("cache", PLACES, jnp.zeros, held, jnp.int32)
+        module.variable("cache", DOCUMENTS, jnp.zeros, held, jnp.int32)
         for name in groups:
             module.variable("cache", GROUPS[name], jnp.full, held, -1, jnp.int32)
         return store
@@ -588,6 +592,15 @@ class KVStore:
         """Every slot's kept place, `[rows, capacity]`."""
         return self._read_slots(PLACES)
 
+    def write_documents(self, documents: jax.Array, positions: jax.Array) -> None:
+        """Keep the tokens' `documents` `[rows, tokens]` at their slots `positions`, where their keys go."""
+        self._write(DOCUMENTS, functools.partial(self._written, values=documents[..., None].astype(jnp.int32),
+                                                 positions=positions))
+
+    def read_documents(self) -> jax.Array:
+        """Every slot's kept document, `[rows, capacity]`, 0 where none was written."""
+        return self._read_slots(DOCUMENTS)
+
     def write_groups(self, name: str, groups: jax.Array, positions: jax.Array) -> None:
         """Keep the tokens' groups of field `name` `[rows, tokens]` at their slots `positions`, where their
         keys go (`GROUPS`)."""
@@ -626,6 +639,11 @@ class KVStore:
                 leaves.append((name, codes))
                 scales.append((scale_name, scale))
         leaves += [(GROUPS[field], held[:, None].astype(jnp.int32)) for field, held in (groups or {}).items()]
+        # Each token continues its row's last document (`Append.documents`), the row's first 1.
+        kept = self.read_documents()
+        before = jnp.arange(kept.shape[-1])[None, :] < positions[:, None]
+        last = jnp.max(jnp.where(before, kept[jnp.clip(rows, 0, kept.shape[0] - 1)], 0), axis=-1)
+        leaves.append((DOCUMENTS, jnp.maximum(last, 1)[:, None]))
         size = self.layout.page_size
         # A paged pool's scales `[heads, pages, page]` written as its groups are, a dense cache's head-major
         # `[rows, heads, capacity]` at each token's row and slot (`scale_shape`).
@@ -1157,6 +1175,24 @@ class Append:
         if self.allocated:
             self.store.write_places(jnp.broadcast_to(places, self.positions.shape), self.positions)
         return self.store.read_places()
+
+    def documents(self, segments: jax.Array | None) -> jax.Array:
+        """Store the call's tokens' documents beside their keys and return every slot's, `[rows, capacity]`:
+        a call's `segments` `[rows, tokens]` (`dew.batch.Coordinates.segments`, from 1, 0 padding; None,
+        one document a row) numbered on from the row's, its first document continuing the row's last as
+        its first token continues the row's state (`Coordinates.starts`), the row's first document 1. So a
+        later call reads its own document's keys alone (`dew.nn.mixers.attention`), and a call never names
+        a document before the row's last: one whose state a recurrent layer no longer holds."""
+        if self.allocated:
+            held = self.store.read_documents()
+            slots = jnp.arange(held.shape[-1])[None, :]
+            first = jnp.min(jnp.where(self.positions >= 0, self.positions, held.shape[-1]), axis=-1,
+                            keepdims=True)
+            last = jnp.max(jnp.where(slots < first, held, 0), axis=-1, keepdims=True)
+            own = (self.positions >= 0).astype(jnp.int32) if segments is None else jnp.asarray(segments,
+                                                                                               jnp.int32)
+            self.store.write_documents(jnp.where(own > 0, jnp.maximum(last, 1) + own - 1, 0), self.positions)
+        return self.store.read_documents()
 
     def groups(self, name: str, groups: jax.Array | None) -> jax.Array:
         """Store the call's tokens' groups of field `name` `[rows, tokens]` beside their keys, -1 where it

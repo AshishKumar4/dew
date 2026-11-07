@@ -45,6 +45,7 @@ from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kernels.generation import chosen
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
+from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
@@ -900,17 +901,46 @@ def test_a_packed_document_reads_like_the_document_alone(rng):
                     truth_fn=alone(float64(model)))
 
 
-def test_a_packed_row_refuses_a_decode_cache(rng):
-    """A cache stores no document ids, so a packed row appended to one would attend across its
-    documents: the model refuses it, and runs the same row and positions into a cache without
-    its segments."""
-    model = tiny()
-    ids, segment_ids, positions = packed_pair(rng)
-    params = nn.unbox(model.init(rng, ids))
-    model.apply(params, ids, decode=True, positions=positions, mutable=["cache"])
-    with pytest.raises(ValueError):
-        model.apply(params, ids, decode=True, positions=positions, segment_ids=segment_ids,
-                    mutable=["cache"])
+@pytest.mark.parametrize("layout", [None, KVCache(page_size=4)], ids=["dense", "paged"])
+def test_a_packed_prefill_decodes_its_last_document_as_that_document_alone(layout):
+    """A row of two documents prefilled into a cache (`segment_ids`), then single-token steps continuing its
+    last document: every layer reads each document's own keys over the cache (`dew.nn.kv_cache.DOCUMENTS`),
+    so the second document's prefill logits and every step's are on par (check 1) with the second document
+    prefilled alone into a row of its own and decoded the same steps, the truth that run in float64."""
+    model = tiny(**({} if layout is None else {"kv_cache": layout}))
+    first, second, steps = 6, 4, 3
+    segment_ids = jnp.asarray([[1] * first + [2] * second] * 2)
+    positions = jnp.asarray([list(range(first)) + list(range(second))] * 2)
+
+    def packed(model):
+        def run(params, ids):
+            prefill, state = model.apply(params, ids[:, :first + second], decode=True, positions=positions,
+                                         segment_ids=segment_ids, mutable=["cache"])
+            logits = [prefill[:, first:]]
+            for step in range(steps):
+                token = first + second + step
+                out, state = model.apply({**params, **state}, ids[:, token:token + 1], decode=True,
+                                         positions=jnp.full((2, 1), second + step),
+                                         segment_ids=jnp.full((2, 1), 2), mutable=["cache"])
+                logits.append(out)
+            return jnp.concatenate(logits, axis=1)
+        return jax.jit(run)
+
+    def alone(model):
+        def run(params, ids):
+            prefill, state = model.apply(params, ids[:, first:first + second], decode=True, mutable=["cache"])
+            logits = [prefill]
+            for step in range(steps):
+                token = first + second + step
+                out, state = model.apply({**params, **state}, ids[:, token:token + 1], decode=True,
+                                         mutable=["cache"])
+                logits.append(out)
+            return jnp.concatenate(logits, axis=1)
+        return jax.jit(run)
+
+    assert_as_exact(packed(model), alone(model), drawn(model, length=first + second + steps),
+                    f"packed prefill decoded {'dense' if layout is None else 'paged'}",
+                    seeds=SEEDS['packed alone'], truth_fn=alone(float64(model)))
 
 
 def test_padding_in_a_packed_row_reaches_no_query(rng):
