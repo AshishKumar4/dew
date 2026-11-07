@@ -477,7 +477,8 @@ def test_the_reference_filling_with_minus_infinity_is_the_written_out_program(he
         q, k, v, mask=mask, scale_logits=True, mask_fill=-jnp.inf,
         implementation="reference"))(query, key, value)
     written = jax.jit(_written_out)(query, key, value, mask)
-    np.testing.assert_array_equal(np.asarray(ours), np.asarray(written))
+    # Widened, which is exact, so NumPy's comparison takes a NaN for a NaN (bfloat16's it does not).
+    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(written, np.float32))
     assert np.isnan(np.asarray(ours, np.float32))[0, [3, 7]].all()
 
 
