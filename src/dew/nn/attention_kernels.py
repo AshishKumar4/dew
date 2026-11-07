@@ -133,6 +133,8 @@ class AttentionCase:
 
     queries: int
     keys: int
+    rows: int = 1
+    """The calls' rows, every leading axis of `[B, T, N, D]`'s `B` (a batch, a sequence's chunks)."""
     heads: int
     kv_heads: int
     head_dim: int
@@ -537,7 +539,26 @@ def _attention_preferred(case: AttentionCase) -> str:
     if (backend == 'gpu' and case.dense_bias and case.form == "fast"
             and not (case.causal and generation.gpu_target().architecture.wgmma)):
         return 'inference'
+    if backend not in ('gpu', 'tpu'):
+        return 'xla' if _xla_scores_fit(case) else 'template'
     return {'gpu': 'template', 'tpu': 'tpu'}.get(backend, 'xla')
+
+
+XLA_SCORE_BYTES = 12
+"""The temporaries jax.nn's xla attention holds a score in a CPU training step: its fp32 logits, weights and
+their cotangents, 12.5 MiB at 4 x 256 x 4 x 32 and 1544 MiB at 1 x 4096 x 8 x 64 (12.5 and 12.1 bytes a score,
+et-cpuattn at 7f128f431f), the template's plain-JAX mainloop 2.7 and 41.7 MiB."""
+
+
+def _xla_scores_fit(case: AttentionCase) -> bool:
+    """Whether a call on a CPU runs jax.nn's xla attention, the faster there (a training step's time 0.3 to
+    0.7 of the template's plain-JAX mainloop's at 4 x 256 x 4 x 32, 1 x 512 x 4 x 64, 2 x 1024 x 8 x 64 and
+    1 x 4096 x 8 x 64, 1.1 at 1 x 2048 x 3 x 32, et-cpuattn; row 4826 makes the mainloop competitive):
+    where its scores' temporaries (`XLA_SCORE_BYTES` a score) fit the device's memory, the host's physical
+    memory over its local devices, which share it; else the template, whose temporaries grow with the
+    sequence, not its square."""
+    scores = case.rows * case.heads * case.queries * case.keys
+    return scores * XLA_SCORE_BYTES <= generation.host_memory_share()
 
 
 def _hosted(kernel: str) -> str:

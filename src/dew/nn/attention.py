@@ -12,6 +12,7 @@ import contextvars
 import dataclasses
 import functools
 import importlib
+import math
 from collections.abc import Callable
 from typing import Literal, get_args
 
@@ -1063,7 +1064,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
     case = AttentionCase(
-        queries=q_len, keys=kv_len, heads=query.shape[-2], kv_heads=key.shape[-2],
+        queries=q_len, keys=kv_len, rows=math.prod(query.shape[:-3]), heads=query.shape[-2],
+        kv_heads=key.shape[-2],
         head_dim=query.shape[-1], dtype=jnp.dtype(query.dtype), key_dtype=jnp.dtype(key.dtype),
         causal=bool(causal), window=sliding_window,
         documents=None if segment_ids is None else 'cross' if cross else 'own',
