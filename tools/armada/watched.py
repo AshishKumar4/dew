@@ -21,8 +21,8 @@ import select
 import struct
 import threading
 
-OPEN, MOVED_TO, CREATE, DELETE_SELF, MOVE_SELF, UNMOUNT, OVERFLOW, IGNORED, ONLYDIR, DIRECTORY = (
-    0x20, 0x80, 0x100, 0x400, 0x800, 0x2000, 0x4000, 0x8000, 0x1000000, 0x40000000)
+MODIFY, OPEN, MOVED_TO, CREATE, DELETE_SELF, MOVE_SELF, UNMOUNT, OVERFLOW, IGNORED, ONLYDIR, DIRECTORY = (
+    0x2, 0x20, 0x80, 0x100, 0x400, 0x800, 0x2000, 0x4000, 0x8000, 0x1000000, 0x40000000)
 LOST = DELETE_SELF | MOVE_SELF | UNMOUNT | OVERFLOW | IGNORED
 """The events after which a watch no longer sees what it watched: its directory gone, moved or unmounted
 (the kernel then drops the watch, IN_IGNORED), or events lost to the queue's overflow."""
@@ -43,6 +43,10 @@ class Opens:
         self.root = root
         self.blind = False
         self.opened: set[str] = set()
+        self.changed: set[str] = set()
+        """The files the task's processes wrote or moved in over another, of any kind (`closed`)."""
+        self.made: set[str] = set()
+        """The files the task's processes made, which no run read before them."""
         self.watched: dict[int, str] = {}
         libc = ctypes.CDLL(None, use_errno=True)
         self.fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
@@ -52,7 +56,8 @@ class Opens:
         for top in ("tests", "src"):
             for directory, names, _ in os.walk(os.path.join(root, top)):
                 names[:] = [name for name in names if name != "__pycache__" and not name.startswith(".")]
-                watch = libc.inotify_add_watch(self.fd, directory.encode(), OPEN | DELETE_SELF | MOVE_SELF)
+                watch = libc.inotify_add_watch(self.fd, directory.encode(),
+                                               OPEN | MODIFY | CREATE | MOVED_TO | DELETE_SELF | MOVE_SELF)
                 if watch < 0:
                     # The kernel holds no more watches (fs.inotify.max_user_watches): blind, its descriptor
                     # closed, so `closed` neither waits on a reader nor reads one.
@@ -74,15 +79,22 @@ class Opens:
         for watch, mask, name in events(self.fd):
             if mask & LOST:
                 self.blind = True
-            elif mask & OPEN and watch in self.watched and name and not mask & DIRECTORY \
-                    and not name.endswith((".py", ".pyc")):
-                path = os.path.join(self.watched[watch], name)
-                if path not in SKIPPED:
-                    self.opened.add(path)
+                continue
+            if watch not in self.watched or not name or mask & DIRECTORY:
+                continue
+            path = os.path.join(self.watched[watch], name)
+            if mask & CREATE:
+                self.made.add(path)
+            if mask & (MODIFY | MOVED_TO):
+                self.changed.add(path)
+            if mask & OPEN and not name.endswith((".py", ".pyc")) and path not in SKIPPED:
+                self.opened.add(path)
 
     def closed(self) -> set[str] | None:
         """Every data file opened since the watch was set, relative to the checkout, read once the task's
-        processes stopped; None where the watch was blind at any time. The watch is closed."""
+        processes stopped; None where the watch was blind at any time, or where the processes changed a file
+        that was there before them and that they opened, or a module (row 2559: a key hashes the bytes a run
+        left, not those it read), by any writer, a native one's among them. The watch is closed."""
         if self.fd >= 0:
             self.stopped.set()
             self.reader.join()
@@ -90,7 +102,9 @@ class Opens:
         if self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
-        return None if self.blind else self.opened
+        changed = self.changed - self.made
+        read = changed & self.opened or {path for path in changed if path.endswith(".py")}
+        return None if self.blind or read else self.opened
 
 
 def events(fd: int) -> list[tuple[int, int, str]]:

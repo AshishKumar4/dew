@@ -39,7 +39,7 @@ HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes",
 """The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings,
 thresh's annotations), each the input of the files that read it alone; any other hidden entry (.git, an
 environment, a cache) is none."""
-READS = {"open", "os.listdir", "os.scandir"}
+READS = {"open", "os.listdir", "os.scandir", "os.rename"}
 LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
 """The cgroup files that set a process's execution limits, by the input a run that read one keys, which host.py's
 `limit` reads the binding value of."""
@@ -80,6 +80,10 @@ VISIT = "visit"
 """A switch of the owner of what runs (`switch`): a file's tests begin, or the session's end does."""
 UNOPENED = "unopened:"
 """What a process whose GPU backend never opened logs instead of its peak: why, as jax said."""
+WROTE = "wrote:"
+"""What a write of a checkout file is logged as where the file was there before the process made it
+(`wrote`): no input, but a run that both read and wrote a file keeps no key (`recorded`), as its key would
+hash the bytes the run left, not those it read (row 2559)."""
 EVIDENCE = (READ, STARTED, PEAK, CLOSED, VISIT, UNOPENED)
 """What a log holds beside the record's inputs."""
 decided: dict[types.CodeType, bool] = {}
@@ -167,14 +171,19 @@ def read(event: str, args: tuple, root: str) -> str | None:
     record is the code it ran (`code_unit`). An open relative to a directory descriptor is `opening`'s to
     place. The interpreter audits the main script's open from no frame at all."""
     path = args[0]
+    if event == "os.rename":
+        # A file moved in over another replaces what a reader read there.
+        return None if isinstance(args[1], int) else wrote(os.path.abspath(os.fsdecode(args[1])), root)
     if isinstance(path, int):
         return None
     if event == "open":
         mode, flags = args[1], args[2]
         written = any(letter in mode for letter in "wax+") if mode is not None else (
             flags & os.O_ACCMODE != os.O_RDONLY)
-        if written or (mode is None and getattr(placing, "relative", False)):
+        if mode is None and getattr(placing, "relative", False):
             return None
+        if written:
+            return wrote(os.path.abspath(os.fsdecode(path)), root)
         # The source loader's read of the module's text on its way to compiling it (its get_code beneath
         # get_data), not a caller's get_source or get_data, nor a sourceless loader's bytecode, nor
         # zipimport's archive, which are the module's only text.
@@ -194,6 +203,29 @@ def read(event: str, args: tuple, root: str) -> str | None:
     if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
         return LIMITS[os.path.basename(name)]
     return placed(name, root)
+
+
+def wrote(name: str, root: str) -> str | None:
+    """`WROTE` and checkout file `name`, which a run writes, where it was there before this process made it;
+    None for a file outside the checkout or one this process made, which no run could have read before it."""
+    place = placed(name, root)
+    if place is None or place in made:
+        return None
+    # Asked as no probe of the run's (`probed`'s guard): a write is no read.
+    held = getattr(placing, "probing", False)
+    placing.probing = True
+    try:
+        there = os.path.lexists(name)
+    finally:
+        placing.probing = held
+    if not there:
+        made.add(place)
+        return None
+    return f"{WROTE}{place}"
+
+
+made: set[str] = set()
+"""The checkout files this process made (`wrote`)."""
 
 
 def placed(name: str, root: str) -> str | None:
@@ -646,10 +678,14 @@ def recorded(path: Path) -> dict[str, dict]:
             f"{STARTED}unfollowed" in shared
         whole = closed and not unfollowed and child["followed"] and shared_child["followed"]
         inputs = {item for _, item in before if not item.startswith(EVIDENCE)} | {
-            item for item in shared if not item.startswith(EVIDENCE)}
+            item for item in shared if not item.startswith(EVIDENCE)} | child["files"] | shared_child["files"]
+        # A file the run wrote is no input; one it read too keeps no key (`WROTE`).
+        writes = {item[len(WROTE):] for item in inputs if item.startswith(WROTE)}
+        inputs = {item for item in inputs if not item.startswith(WROTE)}
+        read = {item.removeprefix(PROBED).partition(CODE)[0] for item in inputs}
         held = [each for each in (*peaks, child["peak"], shared_child["peak"]) if each is not None]
         out[file] = {
-            "depends": sorted(inputs | child["files"] | shared_child["files"]) if whole else None,
+            "depends": sorted(inputs) if whole and not writes & read else None,
             "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
             "peak": max(held) if len(files) == 1 and whole and held else None,
