@@ -219,11 +219,13 @@ def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: s
     whose keys a tree's runs name whether held or not."""
     wide = float64_twin(model)
     rows = 2
+    # One program draws every seed's weights, where an eager init compiles each of its operations.
+    initialized = jax.jit(model.init)
 
     def draw(seed):
         key = jax.random.fold_in(jax.random.key(4527), seed)
         ids = jax.random.randint(key, (rows, PROMPT + len(tree)), 0, VOCAB)
-        params = nn.unbox(model.init(jax.random.fold_in(jax.random.key(1), seed), ids))
+        params = nn.unbox(initialized(jax.random.fold_in(jax.random.key(1), seed), ids))
         return params, ids[:, :PROMPT], ids[:, PROMPT:]
 
     @jax.jit
