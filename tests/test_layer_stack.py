@@ -999,10 +999,12 @@ def test_scanned_dropout_uses_the_supplied_rng():
 def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     """GLM-5-Next's first three layers (Kimi Delta Attention, a dense MLP,
     hyper-connections) scan as one run under `scan_layers`: the scanned
-    forward is the unrolled one's. XLA:CPU once ran this scan's chunk loop
-    from an uninitialized carry (row 1701), off by 8.7, 10.1 or NaN in about
-    60% of compilations; at the current build 96 compilations ran right with
-    no barrier (jsf-1701)."""
+    forward is the unrolled one's. XLA:CPU's XNNPACK matrix packer (at XLA's
+    pinned 0a66ebb5) over-reads a zero matrix aliased as an all-zero-stride
+    scalar view (ynnpack/subgraph/dot.cc:613-636, fixed in XNNPACK 0e7357e2):
+    with the chunk loop's zero state fused there, the scan was off by 8.7,
+    10.1 or NaN in about 60% of compilations (row 1701). Dew's zero state now
+    reaches the loop materialized: 96 compilations ran right (jsf-1701)."""
     loaded = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
     unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
