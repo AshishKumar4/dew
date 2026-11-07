@@ -128,8 +128,9 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
 
 def test_a_step_compiled_ahead_over_a_hosts_gpus_plans_within_the_memory_it_is_told_on_those_gpus(tmp_path,
                                                                                                   monkeypatch):
-    """Over a host's own GPUs (`host_gpus`), a stated capacity reaches the planner alone: the step is planned
-    within it and compiled over the host's GPUs as serialized, not over a canonical target restated with it."""
+    """Over a host's own GPUs (`host_gpus`), a stated capacity reaches the planner alone: the step is
+    planned within it and compiled over the host's GPUs as serialized, not over a canonical target restated
+    with it."""
     from jax.experimental import topologies
 
     from dew.training.ahead import compile_ahead, compile_only_gpus, host_gpus
