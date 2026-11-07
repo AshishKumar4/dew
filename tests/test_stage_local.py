@@ -190,14 +190,15 @@ def draw(seed):
     return token_rows(VOCAB, BATCH, SEQ + 1, seed=seed)["text"], np.int64(seed)
 
 
-def initials(model, optimizer, variables=None):
+def initials(model, optimizer, variables=None, *, ema: float | None = 0.9):
     """Each seed's own initial state: one device's (`Trainer.initial_state`), its variables and EMA
     drawn again by the seed's key, or `variables(seed)`, its optimizer state the one every draw starts
     from, which no rule here reads parameter values to make. No draw starts where another does, so
     what one fixed state rounds alike on every draw (an Adam step's few near-tied gradients) is no
     factor every draw shares. Each seed's is made once, outside float64, by one compiled draw."""
     with jax.enable_x64(new_val=False):
-        one = trainer(model, optimizer, MeshSpec(), 1, variables=None if variables is None else variables(0))
+        one = trainer(model, optimizer, MeshSpec(), 1, variables=None if variables is None else variables(0),
+                      ema=ema)
         one.validate(steps=STEPS)
         start = one.initial_state()
     init = jax.jit(model.init)
@@ -210,9 +211,9 @@ def initials(model, optimizer, variables=None):
                          if variables is None else variables(seed))
                 # The run's own tree and dtypes, which a draw of the same model holds.
                 drawn = jax.tree.map(lambda held, new: jnp.asarray(new, held.dtype), start.variables, drawn)
-                ema = None if start.ema is None else {name: jax.tree.map(jnp.copy, drawn[name])
-                                                      for name in start.ema}
-                made[seed] = dataclasses.replace(start, variables=drawn, ema=ema)
+                averaged = None if start.ema is None else {name: jax.tree.map(jnp.copy, drawn[name])
+                                                           for name in start.ema}
+                made[seed] = dataclasses.replace(start, variables=drawn, ema=averaged)
         return made[seed]
     return initial
 
@@ -231,7 +232,7 @@ def on_host(tree):
 
 
 def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variables=None, exact: bool = False,
-            stage_local: bool = True):
+            stage_local: bool = True, ema: float | None = 0.9):
     """`STEPS` steps of `model` from the seed's state (`initial`) on the batch a draw gives, over
     `mesh`, its pipelined runs stage-local or whole on every stage (`stage_local`), its step compiled
     once for every draw, returning the variables, optimizer state and EMA as a checkpoint holds them,
@@ -244,7 +245,7 @@ def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variable
         if not built:
             held = model.clone(dtype=jnp.float64) if exact else model
             built.append(trainer(held, optimizer, mesh, devices, variables=variables,
-                                 stage_local=stage_local))
+                                 stage_local=stage_local, ema=ema))
             built[0].validate(steps=STEPS)
         steps = built[0]
         start = initial(int(seed))
