@@ -1638,6 +1638,22 @@ class CausalTransformer(LinearProducts):
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
+        x = self._entered(tokens, train, decode, input_embeddings, attention_metadata)
+        ple = self._layer_inputs(tokens, x, routed_experts, routed)
+        residual = self.looped(
+            self._expand(x),
+            train=train,
+            decode=decode,
+            per_layer_input=ple,
+            attention_metadata=attention_metadata,
+        )
+        return self._exited(residual)
+
+    def _entered(self, tokens, train: bool, decode: bool, input_embeddings,
+                 attention_metadata) -> jax.Array:
+        """The stack's input: the tokens' scaled embeddings (or the caller's `input_embeddings`), their
+        learned positions, the embeddings' norm and dropout; the unscaled embeddings a prediction depth
+        reads sown where a caller opens their collection."""
         x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
@@ -1663,14 +1679,12 @@ class CausalTransformer(LinearProducts):
             prepared = self._prepared(self.stream_embeddings(tokens), input_embeddings)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
-        ple = self._layer_inputs(tokens, x, routed_experts, routed)
-        residual = self.looped(
-            self._expand(x),
-            train=train,
-            decode=decode,
-            per_layer_input=ple,
-            attention_metadata=attention_metadata,
-        )
+        return x
+
+    def _exited(self, residual) -> tuple[jax.Array, jax.Array]:
+        """The final normalized states and the prediction depths' input from the stack's output `residual`:
+        its streams collapsed, normed and scaled as the head reads them, sown where a caller opens the last
+        layer's or the depths' collection."""
         if not self.is_initializing() and self.is_mutable_collection(_FINAL):
             # The last layer's output as the stack returns it whatever runs it (`layer_state`),
             # before a model that carries several residual copies collapses them; it costs

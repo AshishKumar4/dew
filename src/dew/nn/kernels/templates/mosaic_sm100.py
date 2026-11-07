@@ -715,7 +715,7 @@ def _issuing(load: Callable[[], None], products: Callable[[], None]) -> None:
         pl.when(warp == MMA_WARP)(products)
 
 
-class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer["Accumulator | jax.Array"]):
+class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | jax.Array]):
     """tcgen05's issuer for 64-row tiles a consumer holds in registers (the recurrence's chunks, row 4747):
     each product into a scoped 64-row fp32 accumulator in tensor memory (one CTA's M=64 MMA, the half-lane
     layout `tcgen05.tmem_half_lane_layout`), its left operand from shared memory or, written there first,
@@ -769,6 +769,11 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer["Accumulator | 
                     for _ in range(consumers)) for depth, dtype in dict.fromkeys(lefts)},
                 "done": plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True)}
 
+    def product_addresses(self, products: tuple | None) -> int:
+        # Its accumulators' tensor memory keeps its address in a word: every launch's compile was those 4
+        # bytes past its plan (the sm100 gate, jsf-g100fix).
+        return 0 if products is None else resources.TMEM_ADDRESS_BYTES
+
     def product_shared(self, scratch) -> tuple:
         # Its accumulators are tensor memory: its padded right operands, its staged left operands and its
         # barrier are shared memory, as `product_scratch` allocates them.
@@ -812,8 +817,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer["Accumulator | 
                  ) -> Accumulator | jax.Array:
         if not isinstance(acc, Accumulator):
             # A sum the walk carries in registers: the product in a fresh accumulator, added to it.
-            return acc + self.summed((acc.shape[0], acc.shape[1]),
-                                     lambda fresh: self.products(fresh, lhs, rhs, interpret), interpret)
+            return acc + self.summed(acc.shape, lambda fresh: self.products(fresh, lhs, rhs, interpret),
+                                     interpret)
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
         if rhs.shape[1] < PADDED:
             rhs = self._padded(rhs)
@@ -845,7 +850,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer["Accumulator | 
         # tensor core reads it as it runs). A sum the walk carries in registers takes the parts' products
         # in a fresh accumulator, added to it (`summed`).
         if not isinstance(acc, Accumulator):
-            return acc + self.summed((acc.shape[0], acc.shape[1]), lambda fresh: self.register_products(
+            return acc + self.summed(acc.shape, lambda fresh: self.register_products(
                 fresh, parts, rhs, interpret), interpret)
         _, done = self._scratch(acc.shape[1])
         for part in parts:

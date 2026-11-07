@@ -849,7 +849,8 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     from kernel_compile import compile_mosaic_kernels
 
     target = 'sm90'
-    family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
+    facts = generation.gpu_target(target)
+    family = template.bundle(facts)
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256)
     bound = template.MOSAIC.bind(*args, None, max_segments=None, floor=None, bound=1.0)
     with generation.assumed(facts):
@@ -886,7 +887,8 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     from dew.nn.kernels.lowered import kernel_calls
 
     target = 'sm90'
-    family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
+    facts = generation.gpu_target(target)
+    family = template.bundle(facts)
     lengths = (4089, 4096)
     operands = {length: resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, length) for length in lengths}
     with generation.assumed(facts):
@@ -1081,7 +1083,10 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
     bound call and tiles by its label into `launched` where given (`stepped_down`)."""
     from fla_gdn_support import KernelCase
 
-    family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
+    # The bundle the template derives on (`template.bundle`): a gate compiling and modelling another, an
+    # sm100's mma.sync where its calls take tcgen05's chunks, stated a solve's family its launch did not run.
+    facts = generation.gpu_target(target)
+    family = template.bundle(facts)
     rows, length = 1, 256
     shared = generation.shared_budget(facts)
 

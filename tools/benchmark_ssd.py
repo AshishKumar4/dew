@@ -34,7 +34,7 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-from dew.nn.kernels.recurrence_chunk import chunk_delta_rule
+from dew.nn.kernels.recurrence_chunk import Tiles, xla_mainloop
 from dew.nn.kernels.ssd import _chunk_scan, ssd_kernel_runs
 from dew.telemetry.benchmark import largest_difference, samples
 
@@ -97,9 +97,10 @@ def kernel_platform(config: BenchmarkConfig) -> str:
 def portable_scan(x, B, C, a, carried, chunk_size: int):
     """The scan as the recurrence template's portable math runs it, on `_chunk_scan`'s operands
     (`x` scaled by `dt`, `B` and `C` a head each, `a` the per-step `A dt`, `carried` `[B, H, P, N]`):
-    `chunk_delta_rule` without the delta rule, every write gate one."""
-    out, final = chunk_delta_rule(C, B, x, a[..., None], jnp.ones(a.shape, a.dtype),
-                                  jnp.swapaxes(carried, -1, -2), chunk_size, delta=False, scale=1.0)
+    the plain-JAX mainloop (`xla_mainloop`) without the delta rule, every write gate one."""
+    out, final = xla_mainloop(Tiles(chunk_size), C, B, x, a, jnp.ones(a.shape, a.dtype),
+                              jnp.swapaxes(carried, -1, -2), scale=1.0, delta=False,
+                              dtype=jnp.promote_types(x.dtype, jnp.float32))
     return out, jnp.swapaxes(final, -1, -2)
 
 

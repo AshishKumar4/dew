@@ -38,7 +38,7 @@ from jax.sharding import PartitionSpec as P
 from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
-from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
+from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent
 
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
@@ -132,18 +132,20 @@ def weighs_one(top_k: int, normalized: bool, weight_sum_min: float | None = None
     return (top_k == 1 and normalized and not weight_sum_min) or single_softmax
 
 
-@contracted("test_a_routers_differentiation_report_holds_every_order")
-@functools.partial(jax.custom_jvp, nondiff_argnums=(0,))
-def _differentiated[Tree](report: Callable[[], None], tree: Tree) -> Tree:
-    """`tree` itself, calling `report` where a trace differentiates it: JAX traces a custom tangent rule
-    only for a differentiated input."""
+def _unchanged[Tree](report: Callable[[], None], tree: Tree) -> Tree:
+    """`tree` itself, whatever reads it."""
     return tree
 
 
-@_differentiated.defjvp
 def _reported(report, primals, tangents):
     report()
     return primals[0], tangents[0]
+
+
+_differentiated = contracted("test_a_routers_differentiation_report_holds_every_order")(
+    declared_tangent(Protected(), _unchanged, _reported, nondiff_argnums=(0,)))
+"""`tree` itself, calling `report` where a trace differentiates it: JAX traces a custom tangent rule only
+for a differentiated input. Its tangent is the input's, the span kept as it is (`Protected`)."""
 
 
 def fixed_router(path: tuple[str, ...], params: jax.Array | Variables) -> None:
