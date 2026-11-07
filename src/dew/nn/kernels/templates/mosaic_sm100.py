@@ -24,6 +24,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -551,7 +552,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     (JAX's `blackwell_ragged_dot_mgpu.py`'s schedule, CUTLASS's sm100 persistent GEMM)."""
 
     consumers = 1
-    gathers_rows = False  # its rings and roles are its own (`streams`, `persist`), a load warp's, no gather
+    gathers_rows = True  # its load warp's TMA four-row gathers (`gathered.Committed`, row 1376)
 
     turns = 2
     """The accumulator turns a launch's tensor memory holds: an epilogue reads one while the products fill
@@ -569,13 +570,16 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()) -> dict:
-        if gathered:
-            raise NotImplementedError("tcgen05's load warp gathers no rows (`gathers_rows`)")
+        from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `mosaic.Ring`
+
         if multicast:
             raise NotImplementedError("tcgen05's pair of CTAs shares a product, not a multicast ring "
                                       "(`Topology`; not yet a stream of this bundle's)")
-        streams = {name: mosaic.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
-                                     copies=(copies or {}).get(name, 1), released_by_products=True)
+        # A gathered stream's rows are its load warp's four-row gathers (`gathered.Committed`).
+        streams = {name: gathered_rows.ring(shape, dtype, stages, released_by_products=True)
+                   if name in gathered else
+                   mosaic.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
+                               copies=(copies or {}).get(name, 1), released_by_products=True)
                    for name, (shape, dtype) in blocks.items()}
         # A block-scale stream's slots each pair with the tensor memory its products read them from: its
         # block's rows (`[rows / 128, depth / 128, 32, 16]`) by its depth's scales, a slot's columns each.
@@ -586,9 +590,13 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         return streams
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict:
+        from dew.nn.kernels.templates import gathered  # it builds on `mosaic.Ring`
+
         del views
-        return {name: ScaleRing(**scoped) if 'tmem' in scoped else CommittedRing(**scoped)
-                for name, scoped in allocated.items()}
+        # A gathered stream's load barriers are shared memory of its own (`gathered.ring`).
+        return {name: ScaleRing(**scoped) if 'tmem' in scoped
+                else CommittedRing(**scoped) if isinstance(scoped['full'].dtype, plgpu_core.BarrierType)
+                else gathered.Committed(**scoped) for name, scoped in allocated.items()}
 
     def roles_of(self, table: tuple, *, load: Callable[[], None], products: Callable[[], None]) -> None:
         """Each of a program's warpgroups its role (`mosaic.tabled`): the template's `table`, `(count,
@@ -613,6 +621,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             raise ValueError(f"a tcgen05 accumulator is {self.rows} rows on one CTA, not {sorted(rows)}")
         del in_flight  # the products' commit releases each step's slots
         rings = self.opened(streams)
+        for ring in rings.values():
+            ring.initialized()
         staging = self.output_staging(outputs, consumers)
         width = sum(shape[1] for shape in accumulators)
         offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]
