@@ -190,11 +190,13 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
 
     @pl.when(active_ref[token.row] == 0)
     def _():
-        def copied(k, tile, carry):
-            token.stored(state_out, tile, k)
+        def copied(i, carry):
+            tiles = [token.tile(state_ref, i * UNROLLED + u) for u in range(UNROLLED)]
+            for u, tile in enumerate(tiles):
+                token.stored(state_out, tile, i * UNROLLED + u)
             return carry
 
-        _walked(key_width, lambda k: token.tile(state_ref, k), copied, None)
+        lax.fori_loop(0, key_width // UNROLLED, copied, None)
         token.stored(out_ref, jnp.zeros((block.heads, block.columns), jnp.float32))
         if conv is not None:
             conv.write(conv.held())
@@ -359,12 +361,12 @@ def _softplus(x):
 
 
 def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
-    """`recurrence.update` over the block's column of the state, `UNROLLED` keys a turn (`_walked`), read from
-    `state_ref` (its delta rule's correction a pass of its own, which reads it again) and written to
-    `state_out` as it is held (`recurrence._held`): the output `q^T S'`. Each key dimension's vectors are read
-    from `vectors` as each head's scalars (`_key_entry`) and each sum over the keys a pairwise tree
-    (`_tree_added`). Every key's entry held at once, a 128-key column spilled 1260 to 1276 bytes a thread
-    (sm80, sm90; the fused step's compile, jsf-r06j)."""
+    """`recurrence.update` over the block's column of the state, read from `state_ref` (its delta rule's
+    correction a pass of its own, which reads it again) and written to `state_out` as it is held
+    (`recurrence._held`): the output `q^T S'`. Each key dimension's vectors are read from `vectors` as each
+    head's scalars (`_key_entry`) and each sum over the keys a pairwise tree (`_summed_keys`). Every key's
+    entry held at once, a 128-key column spilled 1260 to 1276 bytes a thread (sm80, sm90; the fused step's
+    compile, jsf-r06j)."""
     key_width = state_ref.shape[2]
 
     def entry(which, k):
@@ -373,16 +375,12 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
     def row(k):
         return token.tile(state_ref, k)
 
-    levels = key_width.bit_length()
-    empty = tuple(jnp.zeros_like(value) for _ in range(levels))
     corrected = value
     if hooks.delta:
-        def correction(k, tile, partials):
-            return _tree_added(partials, k, (entry(1, k) * entry(2, k)) * tile)
+        corrected = value - _summed_keys(key_width, row, lambda k, tile: (entry(1, k) * entry(2, k)) * tile,
+                                         value)
 
-        corrected = value - _walked(key_width, row, correction, empty)[-1]
-
-    def updated(k, tile, partials):
+    def updated(k, tile):
         entry_k = tile * entry(2, k) + (entry(1, k) * write) * corrected
         # Held as `recurrence._held` holds it: bf16 rounded stochastically, salted by its key and value, the
         # key's entry laid over the block as the entry is (a scalar's bit cast lowers to no vector).
@@ -390,9 +388,9 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
         kept = (recurrence.salted_bf16(entry_k, keyed, value) if state_out.dtype == jnp.bfloat16
                 else entry_k)
         token.stored(state_out, kept, k)
-        return _tree_added(partials, k, entry(0, k) * entry_k)
+        return entry(0, k) * entry_k
 
-    return _walked(key_width, row, updated, empty)[-1]
+    return _summed_keys(key_width, row, updated, value)
 
 
 UNROLLED = 16
@@ -401,17 +399,22 @@ their loads overlap: a key a turn, each row's load latency was the step's, one r
 0.038 ms on an A100 against the Triton step's 0.016 (M-JS-18). A turn holds a register a key's row."""
 
 
-def _walked(key_width: int, read, body, carry):
-    """`body(k, read(k), carry)` over the keys in order, `UNROLLED` keys a turn of a rolled loop, each turn's
-    reads issued before its first use."""
-    def turn(i, carry):
+def _summed_keys(key_width: int, read, term, like: jax.Array):
+    """`sum_k term(k, read(k))` over the keys, each `like`'s shape, in XLA's pairwise order, `UNROLLED` keys a turn of a rolled
+    loop, each turn's reads issued before its first use: a turn's terms by a pairwise tree of its own (each
+    an aligned subtree of the whole), the turns' sums added into the tree above them by the turn's index
+    (`_tree_added`), the index's choices a turn's rather than a key's."""
+    def turn(i, partials):
         base = i * UNROLLED
         tiles = [read(base + u) for u in range(UNROLLED)]
-        for u, tile in enumerate(tiles):
-            carry = body(base + u, tile, carry)
-        return carry
+        terms = [term(base + u, tile) for u, tile in enumerate(tiles)]
+        while len(terms) > 1:
+            terms = [terms[j] + terms[j + 1] for j in range(0, len(terms), 2)]
+        return _tree_added(partials, i, terms[0])
 
-    return lax.fori_loop(0, key_width // UNROLLED, turn, carry)
+    turns = key_width // UNROLLED
+    empty = tuple(jnp.zeros_like(like) for _ in range(turns.bit_length()))
+    return lax.fori_loop(0, turns, turn, empty)[-1]
 
 
 def _tree_added(partials: tuple, index, term) -> tuple:

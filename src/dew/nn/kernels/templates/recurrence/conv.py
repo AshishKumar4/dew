@@ -99,13 +99,18 @@ class _Piece:
             return inside
         return inside & (self.valid_ref[self.row, jnp.clip(token, 0, self.length - 1)] != 0)
 
-    def window(self, token):
-        """`token`'s inputs, oldest first, each of another document zero, and its document."""
-        document = self.owner(token)
-        found = [self.input(token - self.count + 1 + tap) for tap in range(self.count)]
-        owners = [self.owner(token - self.count + 1 + tap) for tap in range(self.count)]
-        return [_kept(theirs == document, value)
-                for value, theirs in zip(found, owners, strict=True)]
+    def read(self, token):
+        """`token`'s input and its document, as a window slides over them (`window`)."""
+        return self.input(token), self.owner(token)
+
+    @staticmethod
+    def window(read):
+        """A token's window from its `count` tokens' reads (`read`), oldest first, the token last: each input
+        of another document zero. A walk slides it a token at a time, one token's read a step: read anew, a
+        window's `count` inputs and documents a token put an A100's conv training step at 2.65 ms against
+        the Triton conv's 1.81 (M-JS-18)."""
+        document = read[-1][1]
+        return [_kept(theirs == document, value) for value, theirs in read]
 
     def preactivation(self, window):
         total = window[0] * self.taps[0]
@@ -144,9 +149,10 @@ def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: in
                        local=lax.axis_index("channels") * scan.THREADS, length=length, count=count,
                        tokens=tokens)
 
-        def token(i, carry):
+        def token(i, held):
             t = piece.start + i
-            out = _activated(piece.preactivation(piece.window(t)), activation)[0]
+            read = [*held, piece.read(t)]
+            out = _activated(piece.preactivation(piece.window(read)), activation)[0]
             if head is not None:
                 out = out * scan.inverse_norm(out, eps, exchanged, interpret=interpret)
             out = _kept(piece.kept(t), out)
@@ -155,9 +161,9 @@ def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: in
             def _():
                 plgpu.store(out_ref.at[piece.row, t, piece.local], out.astype(out_ref.dtype),
                             optimized=False)
-            return carry
+            return read[1:]
 
-        lax.fori_loop(0, tokens, token, None)
+        lax.fori_loop(0, tokens, token, [piece.read(piece.start - count + 1 + j) for j in range(count - 1)])
 
     name = _named("short_conv", first, width)
     launched = mosaic.kernel(entry, out_type=jax.ShapeDtypeStruct((rows, length, width), dtype),
@@ -239,10 +245,11 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
         return grad
 
     def token(i, carry):
-        later, owners, sums = carry
+        held, later, owners, sums = carry
         t = piece.start + tokens + count - 2 - i
-        window = piece.window(t)
-        grad, document = gradient(t, window), piece.owner(t)
+        read = [piece.read(t - count + 1), *held]
+        window = piece.window(read)
+        grad, document = gradient(t, window), read[-1][1]
         owned = (t < piece.start + tokens) & (t < length)
         sums = [*(total + _kept(owned, grad * inputs)
                   for total, inputs in zip(sums[:-1], window, strict=True)), sums[-1] + _kept(owned, grad)]
@@ -254,10 +261,12 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
         @pl.when(owned)
         def _():
             plgpu.store(dx_ref.at[piece.row, t, piece.columns], dx.astype(dx_ref.dtype), optimized=False)
-        return [grad, *later[:-1]], [document, *owners[:-1]], sums
+        return read[:-1], [grad, *later[:-1]], [document, *owners[:-1]], sums
 
-    carry = ([zero] * (count - 1), [jnp.int32(-2)] * (count - 1), [zero] * (count + 1))
-    _, _, sums = lax.fori_loop(0, tokens + count - 1, token, carry)
+    last = piece.start + tokens + count - 2
+    held = [piece.read(last - count + 2 + j) for j in range(count - 1)]
+    carry = (held, [zero] * (count - 1), [jnp.int32(-2)] * (count - 1), [zero] * (count + 1))
+    *_, sums = lax.fori_loop(0, tokens + count - 1, token, carry)
     for tap in range(count):
         plgpu.store(dw_ref.at[piece.row, block, tap, piece.columns], sums[tap], optimized=False)
     plgpu.store(db_ref.at[piece.row, block, piece.columns], sums[count], optimized=False)
