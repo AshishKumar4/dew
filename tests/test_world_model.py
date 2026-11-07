@@ -229,6 +229,16 @@ def test_a_tokenizers_patches_are_each_frames_row_major_pixels_whatever_its_lead
     np.testing.assert_array_equal(np.asarray(tokenizer._unpatchify(jnp.asarray(patches))), np.asarray(frames))
 
 
+def assert_lights_what_it_shows(tokenizer, variables, frames: np.ndarray) -> None:
+    """`tokenizer` at `variables` reconstructs lit shapes over a dark background, `frames` of -1 and 1:
+    most of the shapes' pixels come back lit (above 0, their midpoint) and most of the background's dark,
+    where the mean frame, the reconstruction of a tokenizer whose latents hold no place, lights none."""
+    lit = np.asarray(jax.jit(tokenizer.apply)(variables, frames)) > 0
+    shown = frames > 0
+    assert np.count_nonzero(lit & shown) > np.count_nonzero(~lit & shown)
+    assert np.count_nonzero(~lit & ~shown) > np.count_nonzero(lit & ~shown)
+
+
 def test_a_tokenizer_reconstructs_the_moving_squares_it_trained_on():
     """A tokenizer trained on clips of one lit square moving over a dark frame (512 clips of 4 frames of
     16 by 16 pixels, a 3 by 3 square stepping diagonally and bouncing off the walls) for 3,000 updates of
@@ -263,11 +273,7 @@ def test_a_tokenizer_reconstructs_the_moving_squares_it_trained_on():
     tokenizer = CausalTokenizer((16, 16, 1), patch=4, width=32, depth=2, heads=2, latents=4, bottleneck=4)
     state = Trainer(TokenizerObjective(tokenizer), optax.adam(1e-3), key=jax.random.key(0)).fit(
         clips, steps=3000, log_every=3000)
-    frames = held.reshape(-1, 16, 16, 1)
-    lit = np.asarray(jax.jit(tokenizer.apply)(state.variables, frames)) > 0
-    shown = frames > 0
-    assert np.count_nonzero(lit & shown) > np.count_nonzero(~lit & shown)
-    assert np.count_nonzero(~lit & ~shown) > np.count_nonzero(lit & ~shown)
+    assert_lights_what_it_shows(tokenizer, state.variables, held.reshape(-1, 16, 16, 1))
 
 
 def test_a_world_models_tokenizer_rides_in_its_state_and_its_loss_reads_it_there():
