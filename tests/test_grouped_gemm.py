@@ -356,6 +356,79 @@ def test_an_amperes_gpt_oss_projection_routes_to_a_kernel_that_lowers(product):
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"}, routes
 
 
+def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_leaves_partial():
+    """gpt-oss's expert kernel gradient (2880 deep and wide: 2880 divides by no cooperative wgmma tile's 128
+    rows) on an H100 derives a two-consumer 128-row tile, its last row tile half past the depth
+    (`mosaic_gpu.ragged_rows`; row 2295: one consumer's 64 x 192 tile ran 1.79x Triton's time), and that
+    launch lowers for CUDA; interpreted at a smaller depth no 128 rows divide (320), its value bitwise the
+    gradient at a tile that divides it, each partial share's rows past the depth stored nowhere. A depth a
+    cooperative tile divides keeps whole tiles."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((128,), jnp.int32)
+    launch = grouped_matmul.MosaicTgmm()
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        bound = launch.bind(bf16((32768, 2880)), bf16((32768, 2880)), sizes, (), out_dtype="float32",
+                            interpret=False)
+        tile = launch.derived(bound, target)
+        assert tile is not None and tile.warpgroups == 2 and tile.block_m == 128 and 2880 % 128, tile
+        lowered = functools.partial(mosaic_gpu.tgmm, tiles=tile, out_dtype=jnp.float32, multiprocessors=132,
+                                    interpret=False)
+        jax.jit(lowered).trace(bf16((4096, 2880)), bf16((4096, 2880)), jax.ShapeDtypeStruct((16,), jnp.int32)
+                               ).lower(lowering_platforms=("cuda",))
+        whole = launch.derived(launch.bind(bf16((32768, 2048)), bf16((32768, 2880)), sizes, (),
+                                           out_dtype="float32", interpret=False), target)
+        assert whole is not None and 2048 % whole.block_m == 0, whole
+        rng = np.random.default_rng(37)
+        tokens = jnp.asarray(rng.integers(-3, 4, size=(300, 320)), jnp.bfloat16)
+        cotangent = jnp.asarray(rng.integers(-3, 4, size=(300, 128)), jnp.bfloat16)
+        groups = jnp.asarray([100, 0, 150, 30], jnp.int32)
+
+        def gradient(block_m, warpgroups):
+            tiles = mosaic_gpu.Tiles(block_m, 128, 64, 2, 1, warpgroups=warpgroups, family="wgmma")
+            return np.asarray(mosaic_gpu.tgmm(tokens, cotangent, groups, tiles=tiles, out_dtype=jnp.float32,
+                                              multiprocessors=4, interpret=grouped_matmul.INTERPRETED))
+
+        np.testing.assert_array_equal(gradient(128, 2), gradient(64, 1))
+    # A share's rows past a 264-deep depth at 72 a share: the store's least rung a power of two (8).
+    narrow = mosaic_gpu.Tiles(192, 64, 32, 2, 1, family="mma.sync")
+    assert mosaic_gpu._tgmm_place(264, 192, 0, narrow)[-1] == 8
+
+
+def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain_product_takes():
+    """A paired product's input gradient (row 2164) adds its first product into the second's epilogue
+    (`gemm._added`) where that hook keeps the second on the launch its plain product takes (`_keeps_launch`:
+    an H100's warpgroup MMA counts the hook), else in XLA (an A100's mma.sync counts none, so the hook would
+    move it to Triton); either way the same sum rounded once: interpreted on an H100 through the template,
+    the paired projection's input gradient bitwise the two products' fp32 sum rounded to the rows' dtype."""
+    rng = np.random.default_rng(41)
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(200, 128)), jnp.bfloat16)
+    first, second = (jnp.asarray(rng.integers(-3, 4, size=(3, 128, 128)), jnp.bfloat16) for _ in range(2))
+    cotangents = tuple(jnp.asarray(rng.integers(-3, 4, size=(200, 128)), jnp.bfloat16) for _ in range(2))
+    sizes = jnp.asarray([70, 0, 120], jnp.int32)
+    prior = jnp.zeros((200, 128), jnp.float32)
+    options = {"interpret_on_cpu": True, "precision": None, "transpose_rhs": True, "dense": False,
+               "first": None, "gather": None}
+    for generation_name, keeps in (("sm90", True), ("sm80", False)):
+        with generation.assumed(generation_name):
+            assert gemm._keeps_launch(cotangents[1], second, sizes, prior, jnp.bfloat16, (jnp.bfloat16,),
+                                      options) is keeps
+    # The template named on an A100: the hooked call is refused, so the parts are added in XLA, no error.
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        assert not gemm._keeps_launch(cotangents[1], second, sizes, prior, jnp.bfloat16, (jnp.bfloat16,),
+                                      options)
+
+    def paired(tokens):
+        return gemm.gemm(tokens, first, sizes, out_dtype=jnp.bfloat16, out_dtypes=(jnp.bfloat16,) * 2,
+                         paired=second, interpret_on_cpu=True)
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        [d_tokens] = jax.vjp(paired, tokens)[1](cotangents)
+    wide = sum(jax.lax.ragged_dot(d.astype(jnp.float32), jnp.swapaxes(m, 1, 2).astype(jnp.float32), sizes)
+               for d, m in zip(cotangents, (first, second), strict=True))
+    np.testing.assert_array_equal(np.asarray(d_tokens), np.asarray(wide.astype(jnp.bfloat16)))
+
+
 def ragged_draw(seed):
     """The ragged sizes' rows, matrices and cotangent in bf16, at a seed (`operands`)."""
     x, w, dy, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)

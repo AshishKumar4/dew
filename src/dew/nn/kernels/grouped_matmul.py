@@ -805,7 +805,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                                   candidate=lambda tile: (self.candidate(ba, tile, target)
                                                           and (admits is None or admits(tile))),
                                   launch_of=lambda tile: self.launch_of(ba, tile), grouped=depth is not None,
-                                  depths=self.STEPS)
+                                  depths=self.STEPS, ragged=self._ragged(ba, layouts[0]))
+
+    def _ragged(self, ba, family: mosaic.Family) -> bool:
+        """Whether the launch's tiles may leave its output's rows a partial last tile (`mosaic_gpu.derived`'s
+        `ragged`): none but a kernel gradient's (`MosaicTgmm`)."""
+        del ba, family
+        return False
 
     def neighbours(self, ba, config: mosaic_gpu.Tiles) -> tuple[mosaic_gpu.Tiles, ...]:
         # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
@@ -1248,7 +1254,7 @@ class MosaicTgmm(_Mosaic):
         depth, _, width = self._generated_extents(ba)
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
         steps = -(-tokens.shape[0] // tile.block_k)
-        return mosaic_gpu.balanced_tail(tile, (depth // tile.block_m, width // tile.block_n), steps,
+        return mosaic_gpu.balanced_tail(tile, (-(-depth // tile.block_m), width // tile.block_n), steps,
                                         (tokens.dtype.itemsize, cotangent.dtype.itemsize), target,
                                         _multiprocessors(target) * tile.programs) is not None
 
@@ -1297,7 +1303,20 @@ class MosaicTgmm(_Mosaic):
 
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
         rows, _, width = self._generated_extents(ba)
-        return rows % config.block_m == 0 and width % config.block_n == 0
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        return (rows % config.block_m == 0 or self._ragged(ba, family)) and width % config.block_n == 0
+
+    def _ragged(self, ba, family: mosaic.Family) -> bool:
+        # A depth no cooperative tile's rows divide takes a partial last row tile where the family's loads
+        # past the depth read zeros (TMA's, `Family.bounded_loads`; row 2295: GPT-OSS's 2880, which held one
+        # consumer's 64 x 192 tile alone, 1.79x Triton's time on an H100, where every other model's kernel
+        # gradient, a cooperative tile, ran 0.78-0.92 of it, FSCELLS1).
+        # A depth some cooperative tile divides keeps its whole tiles.
+        rows, _, _ = self._generated_extents(ba)
+        cooperative = family.role_rows * min(family.consumers, mosaic_gpu.CONSUMERS)
+        prologue = ba.arguments['hooks'].prologue
+        return (family.bounded_loads and rows % cooperative != 0
+                and mosaic_gpu.ragged_rows(rows, prologue=prologue, k_major=self.K_MAJOR))
 
     def _streamed_rows(self, ba, config: mosaic_gpu.Tiles) -> tuple[int, ...]:
         # Both operands stream a step's rows (the tokens): `block_k` of them each.
@@ -2123,7 +2142,7 @@ def ragged_placement(sources: tuple) -> jax.sharding.NamedSharding | None:
         return None
     spec, used = [], set()
     for source, each in zip(sources, shardings, strict=True):
-        axis = None if source is None else source[1] % source[0].ndim
+        axis = 0 if source is None else source[1] % source[0].ndim
         entry = None if each is None or axis >= len(each.spec) else each.spec[axis]
         axes = set(mesh_axes(entry)) if entry is not None else set()
         spec.append(entry if axes and not axes & used else None)
