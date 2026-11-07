@@ -565,10 +565,11 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
     scale = None
     if (multiplied := graph.made(atom, "mul")) is not None:
         a, b = eqns[multiplied].invars
-        if graph.constant(b) is not None and np.ndim(graph.constant(b)) == 0:
-            scale, atom = float(graph.constant(b)), a
-        elif graph.constant(a) is not None and np.ndim(graph.constant(a)) == 0:
-            scale, atom = float(graph.constant(a)), b
+        for factor, other in ((b, a), (a, b)):
+            value = graph.constant(factor)
+            if value is not None and np.ndim(value) == 0:
+                scale, atom = float(value), other
+                break
         else:
             return nothing
         places.append(multiplied)

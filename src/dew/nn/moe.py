@@ -597,12 +597,13 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | Layered, grou
     tokens, rows = x if isinstance(x, Gathered) else (x, None)
     compute = canonicalize_dtype(tokens, stack, *(() if bias is None else (bias,)), dtype=dtype)
     # The run's low-precision recipe takes the experts' product where their role takes it, the matrices'
-    # values the compute dtype's held in the master's, so their gradient keeps the master dtype.
-    matrices = rounded_operand(stack if layer is None else stack[layer], compute)
+    # values the compute dtype's held in the master's, so their gradient keeps the master dtype. A stack's
+    # layer is cut only for it: elsewhere the grouped matmul reads the layer in place.
     with projection_role("experts"):
         recipe = (None if recipe_role() is None else gemm.recipe_projection(
-            jnp.asarray(gathered(x), compute), matrices, group_sizes, out_dtype=compute,
-            bias=None if bias is None else rounded_operand(bias, compute)))
+            jnp.asarray(gathered(x), compute),
+            rounded_operand(stack if layer is None else stack[layer], compute), group_sizes,
+            out_dtype=compute, bias=None if bias is None else rounded_operand(bias, compute)))
     if recipe is not None:
         return recipe
     if layer is not None and rows is not None:
