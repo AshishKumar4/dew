@@ -29,15 +29,19 @@ if lifetime.log is None:
 # deadline passes, on the SIGUSR2 ci.py's `tested` sends then, before its interrupt: a stall names its call
 # site, one in collection or a fixture's setup too, which pytest's report of the interrupt cannot (2026-11-03:
 # a group stalled 28 minutes in a read with no deadline, its row saying only that no tests ran). A file of its
-# own, so no output after it pushes it out of the row. No timer: a dump that kills the process, as walking a
-# running thread may, comes only once the task is past its deadline, and a healthy run is never dumped. This
+# own, so no output after it pushes it out of the row. No timer: a dump comes only once the task is past its
+# deadline, and a healthy run is never dumped. This
 # process's id beside it, which `tested` sends the signal to: pytest's own, past a launcher before it (a
 # release check's `uv run`, which passes no SIGUSR2 on), written whole once the dump is registered, as the
 # signal ends a process that has not registered it. Taken out of the environment, so no pytest a test starts
 # writes over either.
 if stacks := os.environ.pop("DEW_STACKS", None):
-    faulthandler.register(signal.SIGUSR2, file=os.open(stacks, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
-                          all_threads=True)
+    # A Python handler, which holds the GIL while it walks every thread: faulthandler's native one walks the
+    # other threads' frames as they change and killed the process mid-dump (CPython issue 116008; 2026-11-07,
+    # a group of interpreted kernels past its deadline died of a segmentation fault with no report).
+    written = os.open(stacks, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    signal.signal(signal.SIGUSR2,
+                  lambda signum, frame: faulthandler.dump_traceback(written, all_threads=True))
     with open(f"{stacks}.part", "w") as pid:
         pid.write(str(os.getpid()))
     os.replace(f"{stacks}.part", f"{stacks}.pid")
