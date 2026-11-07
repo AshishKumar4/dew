@@ -839,7 +839,8 @@ class PretrainedDecoder(Pretrained):
 
         layout = source_layout(model)
         if isinstance(layout, Unwritable):
-            raise TypeError(f"{type(model).__name__} has no Hugging Face layout Dew writes: {layout.reason}")
+            raise decoder_parts.ExportRefused(
+                f"{type(model).__name__} has no Hugging Face layout Dew writes: {layout.reason}")
         if isinstance(model, MediaWrapper):
             wrapper = from_record(MultimodalTransformer, model)
             return cls(wrapper, variables, None, layout.config, None,
