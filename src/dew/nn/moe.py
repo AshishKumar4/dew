@@ -950,9 +950,9 @@ def _dispatched[Parameters](
             x, indices, parameters, input_weights)[:rows]
 
 
-def _sorted_locally[Parameters](
-        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
-        x: jax.Array, indices: jax.Array, parameters: Parameters,
+def _sorted_locally(
+        project: Callable[..., jax.Array],
+        x: jax.Array, indices: jax.Array, parameters: object,
         input_weights: jax.Array | None, *, num_experts: int, gathers: bool = False) -> jax.Array:
     """Project every slot of `x`'s tokens where they are: sort the slots by
     expert, gather their token rows (or, `gathers`, hand `project` the tokens
@@ -964,9 +964,13 @@ def _sorted_locally[Parameters](
     experts = indices.ravel()
     order = jnp.argsort(experts)
     rows = (order // top_k).astype(jnp.int32)
-    grouped = Gathered(tokens, rows) if gathers and input_weights is None else tokens[rows]
-    if input_weights is not None:
-        grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
+    grouped: jax.Array | Gathered
+    if gathers and input_weights is None:
+        grouped = Gathered(tokens, rows)
+    elif input_weights is None:
+        grouped = tokens[rows]
+    else:
+        grouped = tokens[rows] * input_weights.ravel()[order][:, None].astype(tokens.dtype)
     projected = project(grouped, jnp.bincount(experts, length=num_experts),
                         experts[order], parameters)
     projected = jnp.where((experts[order] < num_experts)[:, None], projected, 0)

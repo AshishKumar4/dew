@@ -48,6 +48,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
+from typing import Any
 
 import jax
 from jax import lax, numpy as jnp
@@ -1337,8 +1338,8 @@ class _Decoding:
     columns, depth]` bfloat16), and with `consumers` sharing them, its own share of the columns (`wg`'s),
     after which they meet (`met`)."""
 
-    buffers: object
-    wg: object
+    buffers: Any
+    wg: Any
     consumers: int
 
     def decode(self, index, slots, interpret: bool):

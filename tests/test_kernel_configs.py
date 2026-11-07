@@ -973,8 +973,9 @@ def _gathered_projection():
     sizes = jnp.full((8,), 256, jnp.int32)
 
     def product(tokens, table, first, second):
-        return gemm.gemm(tokens, first, sizes, out_dtype=jnp.bfloat16, out_dtypes=(jnp.bfloat16,) * 2,
-                         paired=second, gather=table)
+        # Both projections, stacked: the gate's and the up's.
+        return jnp.stack(gemm.gemm(tokens, first, sizes, out_dtype=jnp.bfloat16,
+                                   out_dtypes=(jnp.bfloat16,) * 2, paired=second, gather=table))
 
     return product, (jax.ShapeDtypeStruct((1024, 2048), jnp.bfloat16),
                      jax.ShapeDtypeStruct((2048,), jnp.int32),
