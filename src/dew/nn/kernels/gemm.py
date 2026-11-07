@@ -737,28 +737,41 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
 
 
 def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, placed) -> jax.Array:
-    """`recipe_projection` of rows an Explicit mesh axis splits (row 4854): each device's rows its own
+    """`recipe_projection` of rows an Explicit mesh axis splits (rows 4854, 4859): each device's rows its own
     projection (`jax.shard_map` over the axes splitting the rows), laid in whole 128-row blocks of its own
-    as a data-parallel recipe quantizes them, the matrix and bias whole on every device and their
-    gradients summed over the devices (shard_map's transpose). A grouped projection's sizes count the
-    rows of all devices together, so no device's rows are whole groups: refused."""
-    if group_sizes is not None:
-        raise ValueError("a recipe's experts take their rows whole: an Explicit mesh axis splits these, "
-                         "and their groups' sizes count every device's rows")
+    as a data-parallel recipe quantizes them, the matrices and bias whole on every device and their
+    gradients summed over the devices (shard_map's transpose). Experts' sizes count every device's rows
+    together, each group's after the last's: a device's groups are its share of each (`_local_sizes`)."""
     from dew.mesh import mesh_axes
 
+    names = mesh_axes(placed.spec[0])
     split = jax.sharding.PartitionSpec(placed.spec[0], None)
     whole = jax.sharding.PartitionSpec()
+    extra = tuple(each for each in (group_sizes, bias) if each is not None)
 
-    def projected(rows, matrix, *bias):
-        return recipe_projection(rows, matrix, out_dtype=out_dtype, bias=bias[0] if bias else None)
+    def projected(rows, matrix, *extra):
+        sizes = None if group_sizes is None else _local_sizes(extra[0], rows.shape[0], names)
+        held = extra[1:] if group_sizes is not None else extra
+        out = recipe_projection(rows, matrix, sizes, out_dtype=out_dtype, bias=held[0] if held else None)
+        assert out is not None, "the recipe takes the projection on every device as on the whole"
+        return out
 
     # The recipe's own loops start their sums typed for no device (`grouped_matmul.step_scaled`'s carry), so
     # the program is not checked for the devices' varying values (`check_vma`); each device's rows are its
     # own by the specs, and the whole operands' gradients sum over the devices as shard_map transposes them.
-    return jax.shard_map(projected, mesh=placed.mesh, in_specs=(split, whole, *(whole,) * (bias is not None)),
-                         out_specs=split, axis_names=frozenset(mesh_axes(placed.spec[0])), check_vma=False)(
-        rows, matrix, *(() if bias is None else (bias,)))
+    return jax.shard_map(projected, mesh=placed.mesh, in_specs=(split, whole, *(whole,) * len(extra)),
+                         out_specs=split, axis_names=frozenset(names), check_vma=False)(rows, matrix, *extra)
+
+
+def _local_sizes(group_sizes: jax.Array, count: int, names: tuple) -> jax.Array:
+    """A device's share of each group of `group_sizes` (counting every device's rows, each group's after the
+    last's), its `count` rows the device's run of them (`names`' index along the rows): each group's rows
+    within the device's, so the device's rows in groups are a prefix of its own, as `recipe_projection`
+    takes them."""
+    first = jax.lax.axis_index(names) * count
+    ends = jnp.cumsum(group_sizes.astype(jnp.int32))
+    starts = ends - group_sizes.astype(jnp.int32)
+    return jnp.clip(ends - first, 0, count) - jnp.clip(starts - first, 0, count)
 
 
 def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -1373,18 +1386,11 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
     (`gemm`'s)."""
     def kernel(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter, *,
                interpret):
-        before_sides, before_axes, before_broadcast = _launchable(prologue_arrays, prologue_axes)
-        after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
-        hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
-                                     tuple(dtype.name for dtype in dtypes) if several else None,
-                                     prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast,
-                                     prologue_dtypes=_dtypes(prologue, lhs, before_sides),
-                                     epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides))
-        product = declared(lhs.dtype, precision, outputs=summed_as or dtypes, operands=(lhs.dtype, rhs.dtype))
-        call = grouped_matmul.gmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, before_sides, after_sides,
-                                       None if paired is None else paired.astype(lhs.dtype), first, gather,
-                                       scatter, out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
-                                       interpret=interpret, promoted=product.promoted, dense=dense)
+        call, product = _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
+                                   epilogue_arrays, epilogue_axes, dtypes, several=several,
+                                   transpose_rhs=transpose_rhs, interpret=interpret, precision=precision,
+                                   dense=dense, paired=paired, first=first, gather=gather, scatter=scatter,
+                                   summed_as=summed_as)
         # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program; a paired one no
         # launch takes whole its two products apart, each through the launches that take it (`_apart`).
         launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
@@ -1408,6 +1414,27 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
                        epilogue_arrays, paired, first, gather, scatter)
+
+
+def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
+               epilogue_axes, dtypes, *, several: bool, transpose_rhs: bool, interpret: bool,
+               precision: PrecisionLike, dense: bool, paired, first, gather, scatter, summed_as: tuple):
+    """`_gemm`'s grouped call of its operands (`grouped_matmul.gmm_call`'s launches, arguments and options)
+    and the product it declares: one construction for the launch it runs and for a reverse pass's question
+    of which launch a call would run (`_keeps_launch`)."""
+    before_sides, before_axes, before_broadcast = _launchable(prologue_arrays, prologue_axes)
+    after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
+    hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
+                                 tuple(dtype.name for dtype in dtypes) if several else None,
+                                 prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast,
+                                 prologue_dtypes=_dtypes(prologue, lhs, before_sides),
+                                 epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides))
+    product = declared(lhs.dtype, precision, outputs=summed_as or dtypes, operands=(lhs.dtype, rhs.dtype))
+    call = grouped_matmul.gmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, before_sides, after_sides,
+                                   None if paired is None else paired.astype(lhs.dtype), first, gather,
+                                   scatter, out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
+                                   interpret=interpret, promoted=product.promoted, dense=dense)
+    return call, product
 
 
 def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
@@ -1453,20 +1480,64 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     summed as the gradient's own dtype sums (`_gemm`'s `summed_as`); each cotangent's rows read at
     `plain`'s `gather` where given (a scattered product's cotangent, read where its rows landed).
     A gathered product's `lhs` is its tokens, whose dtype alone is read (no prologue rewrites its rows)."""
-    out = (jnp.dtype(lhs.dtype),) if len(matrices) == 1 else (at_least_fp32(lhs.dtype),)
     options = {'interpret_on_cpu': plain['interpret_on_cpu'], 'precision': plain['precision'],
                'transpose_rhs': not plain['transpose_rhs'], 'dense': plain['dense'], 'first': plain['first'],
                'gather': plain['gather']}
-    d_operand = functools.reduce(jnp.add, (jnp.asarray(_gemm(d, matrix.astype(compute), group_sizes, None, (),
-                                                             (), None, (), (), out, several=False,
-                                                             summed_as=(lhs.dtype,), **options))
-                                           for d, matrix in zip(d_products, matrices, strict=True)))
+    # A paired product's first product, wide, is added in the second's epilogue (`_added`): the same sum,
+    # rounded once, with no pass of XLA's own between them (row 2164: FSPAIRED2's 0.42 ms add); where that
+    # hook would move the second product off the launch its plain product runs on (a family whose register
+    # model counts no hooks: mma.sync's, tcgen05's), the two are added in XLA as before.
+    wide, d_operand = at_least_fp32(lhs.dtype), None
+    for at, (d, matrix) in enumerate(zip(d_products, matrices, strict=True)):
+        out = wide if at < len(matrices) - 1 or (at and prologue is not None) else jnp.dtype(lhs.dtype)
+        matrix = matrix.astype(compute)
+        if d_operand is not None and _keeps_launch(d, matrix, group_sizes, d_operand, out, (lhs.dtype,),
+                                                   options):
+            d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), _added, (d_operand,),
+                                          (('rows', 'columns'),), (out,), several=False,
+                                          summed_as=(lhs.dtype,), **options))
+            continue
+        product = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), None, (), (),
+                                    (out if d_operand is None else wide,), several=False,
+                                    summed_as=(lhs.dtype,), **options))
+        d_operand = product if d_operand is None else (d_operand + product).astype(out)
+    assert d_operand is not None, "a product has a matrix"
     if prologue is None:
         return d_operand.astype(lhs.dtype), ()
     d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes, group_sizes,
                                              d_operand)
     return d_lhs.astype(lhs.dtype), tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays,
                                                                                 strict=True))
+
+
+def _added(acc, prior):
+    """An accumulator plus a wide product before it (`_input_cotangents`' paired sum)."""
+    return acc + prior
+
+
+def _keeps_launch(lhs, rhs, group_sizes, prior, out, summed_as: tuple, options: dict) -> bool:
+    """Whether `lhs @ rhs` with `prior` added in its epilogue (`_added`) runs on the launch its plain product
+    runs on (`grouped_matmul.GROUPED`'s choice, read without reporting it: `selection.selected`), each the
+    call `_gemm` makes of it (`_gemm_call`), its output `out`; options as `_gemm`'s (`_input_cotangents`').
+    A hooked call a chosen kernel refuses keeps nothing (its plain products run apart, added in XLA)."""
+    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if group_sizes is None else group_sizes
+    kernels = []
+    for epilogue, after in ((None, ()), (_added, (prior,))):
+        call, product = _gemm_call(lhs, rhs, group_sizes, None, (), (), epilogue, after,
+                                   (('rows', 'columns'),) * len(after), (out,), several=False,
+                                   transpose_rhs=options['transpose_rhs'], interpret=interpret,
+                                   precision=options['precision'], dense=options['dense'], paired=None,
+                                   first=options['first'], gather=options['gather'], scatter=None,
+                                   summed_as=summed_as)
+        case = grouped_matmul.grouped_case(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
+        try:
+            kernels.append(selection.selected(grouped_matmul.GROUPED, case).name)
+        except selection.KernelRefused:
+            if epilogue is None:
+                raise
+            return False
+    return kernels[0] == kernels[1]
 
 
 def _kernel_gradient(lhs, d_product, matrix, group_sizes, prologue, prologue_arrays, prologue_axes, compute,
