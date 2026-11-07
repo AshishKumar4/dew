@@ -1048,8 +1048,8 @@ def launches() -> Iterator[None]:
 
 class Seen(list[Launch]):
     """The launches traced under `seen`, each its op and keyed arguments, in the order they traced, and
-    `taken`, the config each took as it traced (`KernelOp._chosen`: a pin, a pick, the nearest pick or
-    its heuristic) and the arguments it took it for (its own shapes, which its heuristic reads), in the
+    `taken`, the config each took as it traced (`KernelOp._chosen`: a pin, its own key's pick or its
+    heuristic) and the arguments it took it for (its own shapes, which its heuristic reads), in the
     same order."""
 
     def __init__(self) -> None:
