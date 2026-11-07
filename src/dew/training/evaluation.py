@@ -275,7 +275,7 @@ class Evaluation:
             key: int | jax.Array, metrics: Sequence[Metric] = (),
             step: int | jax.Array = 0, averaged: Variables | None = None,
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
-            schedule_step: int | jax.Array | None = None, loss: bool = False,
+            schedule_step: int | jax.Array | np.ndarray | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None, warm: bool = False,
             updates: int | jax.Array | None = None,
             scored_to: str | os.PathLike[str] | None = None) -> Evaluation:
@@ -365,7 +365,8 @@ class Evaluation:
 
     @classmethod
     def _episodes(cls, episodes: Episodes, variables: Variables, *, key: jax.Array, step: int | jax.Array,
-                  schedule_step: int | jax.Array | None, updates: int | jax.Array | None, split: str,
+                  schedule_step: int | jax.Array | np.ndarray | None, updates: int | jax.Array | None,
+                  split: str,
                   warm: bool, metrics: Sequence[Metric], training: Mapping[str, jax.Array] | None
                   ) -> Evaluation:
         """`run`'s evaluation of a split scored by its episodes: its metrics checked and agreed as a data
@@ -487,7 +488,7 @@ def _agree_configuration(
                 lambda: [checked(), loss, training, warm])
 
 
-def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | None,
+def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | np.ndarray | None,
            averaged: Variables | None, training: Mapping[str, jax.Array] | None = None,
            updates: int | jax.Array | None = None) -> tuple[int, Step, tuple[int, ...], dict[str, float]]:
     """Draw the event's clocks and RNG, and the identity every rank reports.

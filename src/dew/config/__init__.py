@@ -1120,7 +1120,10 @@ def earlier_none_of_the_above(record: Mapping[str, object]) -> Mapping[str, obje
     they drew; a run saved since records its own (row 2938: the default became 3). Carried to 1.0 (ledger
     1552)."""
     named = registry.class_record(record)
-    objective = None if named is None else named[1].get("objective")
+    if named is None:
+        return record
+    _, fields = named
+    objective = fields.get("objective")
     if not isinstance(objective, Mapping) or not isinstance(objective.get("name"), str):
         return record
     stated, defaulted = objective.get("fields", {}), objective.get("defaults", {})
@@ -1129,7 +1132,7 @@ def earlier_none_of_the_above(record: Mapping[str, object]) -> Mapping[str, obje
             or not isinstance(defaulted, Mapping) or "none_of_the_above_options" in {*stated, *defaulted}):
         return record
     earlier = {**objective, "defaults": {**defaulted, "none_of_the_above_options": 0}}
-    return {**record, "fields": {**named[1], "objective": earlier}}
+    return {**record, "fields": {**fields, "objective": earlier}}
 
 
 def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoints) -> Mapping[str, object]:
@@ -1871,23 +1874,38 @@ class RunConfig:
         earlier shape of a saved run is (`earlier_run`), and its data plan version, where it resumes no
         run that recorded one, this Dew's (`PLAN_VERSIONS`): the one place a run's version is resolved,
         on each path a run trains by (`prepare`, and `readied`, which a run trained in Python reaches
-        alone), before its data compiles or its record is written. Its other fields as they are where it
-        resumes no run (`TrainerConfig.resumes`) or leaves none to its build."""
+        alone), before its data compiles or its record is written; and each class it names, its model's
+        and its objective's, with every argument it leaves unstated as the saved run recorded it
+        (`_defaulted_as`), so a default changed since resumes the run as it trained (row 2938). Its
+        other fields as they are where it resumes no run (`TrainerConfig.resumes`)."""
         trainer = self.trainer
         built = self.BUILT if paths is None else paths
         unset = [path for path in built if _holds(self, path) and _recorded_at(self, path) is None]
         run = self
-        if unset and trainer.name is not None and trainer.resume != "never" and trainer.resumes():
+        if trainer.name is not None and trainer.resume != "never" and trainer.resumes():
             with trainer.checkpoints(trainer.name) as checkpoints:
                 saved = self._saved_record(trainer.directory(trainer.name), checkpoints)
             recorded = None if saved is None else self._saved_as(saved)
             # A field of a record the saved run held none of (a teacher it had not) takes nothing.
             if recorded is not None:
                 run = self.override({path: _recorded_at(recorded, path) for path in unset
-                                     if _holds(recorded, path)})
+                                     if _holds(recorded, path)})._defaulted_as(recorded)
         if "data_plan_version" in built and run.data_plan_version is None:
             run = dataclasses.replace(run, data_plan_version=PLAN_VERSIONS[-1])
         return run
+
+    def _defaulted_as(self, recorded: Self) -> Self:
+        """This run with each class it names (`Registered`: its model, its objective) that `recorded`, the
+        saved run it resumes, names too, defaulting every argument it leaves unstated as `recorded` did:
+        the defaults a run records are the ones it trained under (`Registered.defaults`), and an argument
+        the class gained since keeps the default it takes now."""
+        changed = {}
+        for field in dataclasses.fields(self):
+            mine, theirs = getattr(self, field.name), getattr(recorded, field.name, None)
+            if isinstance(mine, Registered) and isinstance(theirs, Registered) and mine.name == theirs.name:
+                kept = {name: value for name, value in theirs.defaults.items() if name not in mine.fields}
+                changed[field.name] = dataclasses.replace(mine, defaults={**mine.defaults, **kept})
+        return dataclasses.replace(self, **changed) if changed else self
 
     def build_run(self) -> Prepared:
         """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
