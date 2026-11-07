@@ -59,7 +59,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.algebra import bits
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
-from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, sides_extended, sides_padded
+from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, scattered, sides_extended, sides_padded
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -558,8 +558,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     block_n, block_k = tiles.block_n, tiles.block_k
     if transpose_lhs and (not dense or prologue is not None):
         raise ValueError("a transposed lhs is a dense call's without a prologue")
-    k, rows = lhs.shape if transpose_lhs else lhs.shape[::-1]
-    matrices, k2, n = rhs.shape
+    (k, rows), (matrices, k2, n) = lhs.shape if transpose_lhs else lhs.shape[::-1], rhs.shape
     # A dense call's one matrix is its one group, its sizes unread (a TPU core's dense launch passes none).
     g = matrices if group_sizes is None else group_sizes.shape[0]
     if transpose_rhs:
@@ -576,8 +575,9 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     accumulators = 1 if paired is None else 2
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     if k == 0:
-        outs = _of_no_depth((rows, n), group_sizes, accumulators, epilogue, epilogue_operands, epilogue_axes,
-                            dtypes)
+        # A scattered product's rows where its table says, as its stores put them.
+        outs = scattered(_of_no_depth((rows, n), group_sizes, accumulators, epilogue, epilogue_operands,
+                                      epilogue_axes, dtypes), scatter)
         return outs if out_dtypes else outs[0]
     plain = all(each is None for each in (prologue, epilogue, paired, scales)) and not transpose_lhs
     _mx_refused(mx_scales, tiles, family_of(tiles, lhs.dtype), transpose_rhs=transpose_rhs,
