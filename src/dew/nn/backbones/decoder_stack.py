@@ -174,9 +174,12 @@ def _rows_read(tree, index: jax.Array):
     return unflatten_dict(flat)
 
 
-_ROWS_RECOMPUTED = jax.checkpoint_policies.save_anything_except_these_names(LAYER_ROWS)
-"""What a scanned run's body that reads rows keeps for the backward: all its layer keeps, but the rows it read
-(`_rows_read`), which the backward reads again from the iteration's index."""
+def _ROWS_RECOMPUTED(primitive: jax.extend.core.Primitive, *_, **params) -> bool:
+    """What a scanned run's body that reads rows keeps for the backward: all its layer keeps, but the rows it
+    read (`_rows_read`, named `LAYER_ROWS`), which the backward reads again from the iteration's index. JAX
+    0.12's `save_anything_except_these_names` saves every value, the names it is given among them, which kept
+    each iteration's rows among the scan's residuals (row 4751)."""
+    return not (primitive.name == 'name' and params.get('name') == LAYER_ROWS)
 
 
 def _rows_joined(variables: Mapping[str, Mapping], index: jax.Array) -> dict:
