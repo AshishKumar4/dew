@@ -1576,8 +1576,8 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
     # A process of the group still running may yet open a file: no record of this task keeps a key.
     closed = opens.closed()
     reader.join(10)
-    written = watched.changed(before, watched.stamps(os.getcwd(), followed.HIDDEN_INPUTS))
-    return done.returncode, "".join(lines), expired, dump, None if left else closed, written
+    wrote = watched.changed(before, watched.stamps(os.getcwd(), followed.HIDDEN_INPUTS))
+    return done.returncode, "".join(lines), expired, dump, None if left else closed, wrote
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
@@ -1633,8 +1633,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               **({progress.SET_ASIDE: str(aside)} if resumes else {})})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    returncode, output, expired, dump, opened, written = ran_pytest(command, environment, deadline, grace,
-                                                                    stacks)
+    returncode, output, expired, dump, opened, wrote = ran_pytest(command, environment, deadline, grace,
+                                                                  stacks)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
@@ -1693,7 +1693,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # under its requirement's overlay and on the whole suite's run alone, nor the census's, nor a resumed
         # one's, whose earlier attempt's opens no record holds.
         record(python, ran, log, common, network, opened,
-               set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), written)
+               set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
     return 0
 
 
@@ -1733,10 +1733,10 @@ def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
             for parent in path.parents if parent == digests.FIXTURES or digests.FIXTURES in parent.parents}
 
 
-def wrote_inputs(depends: list[str], written: Container[str]) -> bool:
+def wrote_inputs(depends: list[str], changed: Container[str]) -> bool:
     """Whether a file of `depends`, a run's inputs (followed.py's records: a file read or probed, a module's
-    unit run), is among `written`; a directory's listing (a lookup's) is none, as a file made in it is new."""
-    return any(item.removeprefix(followed.PROBED).partition(followed.CODE)[0] in written
+    unit run), is among `changed`; a directory's listing (a lookup's) is none, as a file made in it is new."""
+    return any(item.removeprefix(followed.PROBED).partition(followed.CODE)[0] in changed
                for item in depends if not item.startswith(followed.LOOKUP))
 
 
@@ -1789,13 +1789,13 @@ def drawn_whole(spans: list[tuple[int, int]], start: int, stop: int) -> bool:
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
            opened: set[str] | None = None, unkeyed: Container[str] = (),
-           written: Container[str] = ()) -> None:
+           changed: Container[str] = ()) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
     they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
     reads, `gpu_needs` the memory. A green row keeps its key too, which `reused` reads it back by; a red
     row has none, so a later run never reuses an earlier green row of its file; nor has one that read a file
-    the task's processes wrote (`written`, `watched.changed`), whose key would hash the bytes they left, not
+    the task's processes wrote (`changed`, `watched.changed`), whose key would hash the bytes they left, not
     those it read (row 2559). A check-1 site's judge keeps its map tasks' inputs with its own
     (`site_inputs`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
@@ -1811,7 +1811,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
         if ran["depends"] is not None:
-            ran = {**ran, "depends": None if opened is None or wrote_inputs(ran["depends"], written) else
+            ran = {**ran, "depends": None if opened is None or wrote_inputs(ran["depends"], changed) else
                    sorted({*ran["depends"], *opened})}
         ran = {**ran, "depends": site_inputs(python, row_["name"], ran["depends"])}
         if row_["exitCode"] == 0 and name not in executed:
