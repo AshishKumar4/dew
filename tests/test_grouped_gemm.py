@@ -681,3 +681,14 @@ def test_no_row_tile_reads_past_its_operands_allocation(sizes, row_tile):
     assert reads <= mosaic_gpu.row_extent(rows, row_tile)
     if sizes == [120, 8]:
         assert reads > -(-rows // row_tile) * row_tile  # past the row-tile padding that held before
+
+
+@pytest.mark.parametrize("groups", [1, 4])
+def test_the_tuners_group_sizes_route_every_row(groups):
+    """The tuner's draw of a launch's group sizes (`_GroupedLaunch.operands`) routes every row: a grouped
+    call's first group empty, as a step routes them, and a dense call's one group whole, which emptying left
+    sized from a zero sum (W28-a100-2's NaN sizes)."""
+    specs = [jax.ShapeDtypeStruct((300, 64), jnp.bfloat16),
+             jax.ShapeDtypeStruct((groups, 64, 64), jnp.bfloat16), jax.ShapeDtypeStruct((groups,), jnp.int32)]
+    sizes = np.asarray(grouped_matmul.MosaicGmm().operands(specs, 0)[2])
+    assert sizes.sum() == 300 and (sizes >= 0).all() and (groups == 1 or sizes[0] == 0), sizes
