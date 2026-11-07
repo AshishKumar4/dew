@@ -229,6 +229,59 @@ def test_a_tokenizers_patches_are_each_frames_row_major_pixels_whatever_its_lead
     np.testing.assert_array_equal(np.asarray(tokenizer._unpatchify(jnp.asarray(patches))), np.asarray(frames))
 
 
+def assert_lights_what_it_shows(tokenizer, variables, frames: np.ndarray, mean: np.ndarray) -> None:
+    """`tokenizer` at `variables` reconstructs lit shapes over a dark background, `frames` of -1 and 1:
+    most of the shapes' pixels come back lit (above 0, their midpoint) and most of the background's dark,
+    where the `mean` frame of its training clips, the reconstruction of a tokenizer whose latents hold no
+    place, lights none; and its squared error is below the mean frame's, which a reconstruction lit in
+    the right places but faint would not be."""
+    rebuilt = np.asarray(jax.jit(tokenizer.apply)(variables, frames))
+    lit, shown = rebuilt > 0, frames > 0
+    assert np.count_nonzero(lit & shown) > np.count_nonzero(~lit & shown)
+    assert np.count_nonzero(~lit & ~shown) > np.count_nonzero(lit & ~shown)
+    assert not np.any(mean > 0)
+    # Its squared error fell below the mean frame's: their difference's sign.
+    assert np.mean(np.square(mean - frames)) - np.mean(np.square(rebuilt - frames)) > 0
+
+
+def test_a_tokenizer_reconstructs_the_moving_squares_it_trained_on():
+    """A tokenizer trained on clips of one lit square moving over a dark frame (512 clips of 4 frames of
+    16 by 16 pixels, a 3 by 3 square stepping diagonally and bouncing off the walls) for 3,000 updates of
+    16 clips reconstructs the squares of 8 held-out clips: most of their pixels come back lit (above 0,
+    the midpoint of the frame's -1 and its square's 1) and most of the background dark. Its tokens know
+    their places by Dreamer 4's rotary positions (row 4669): by learned vectors alone it lit 68 of their 288
+    square pixels, the mean frame's reconstruction tutorial 12 showed at its own scale, where rotary
+    positions light 285 (armada at 29c4ba287c)."""
+    import itertools
+
+    import optax
+
+    from dew.data.dataset import Loader
+    from dew.objectives.world_model import CausalTokenizer, TokenizerObjective
+    from dew.training import Trainer
+
+    def squares(rows, seed):
+        rng = np.random.default_rng(seed)
+        videos = np.full((rows, 4, 16, 16, 1), -1.0, np.float32)
+        for video in videos:
+            place, step = rng.integers(0, 14, 2), rng.choice([-1, 1], 2)
+            for frame in video:
+                frame[place[0]:place[0] + 3, place[1]:place[1] + 3] = 1.0
+                step = np.where((place + step < 0) | (place + step > 13), -step, step)
+                place = place + step
+        return videos
+
+    videos, held = squares(512, 0), squares(8, 1)
+    clips = Loader(train=lambda partition: ({"video": videos[start:start + 16]}
+                                            for start in itertools.cycle(range(0, 512, 16))),
+                   val=None, records=512, batch=16)
+    tokenizer = CausalTokenizer((16, 16, 1), patch=4, width=32, depth=2, heads=2, latents=4, bottleneck=4)
+    state = Trainer(TokenizerObjective(tokenizer), optax.adam(1e-3), key=jax.random.key(0)).fit(
+        clips, steps=3000, log_every=3000)
+    assert_lights_what_it_shows(tokenizer, state.variables, held.reshape(-1, 16, 16, 1),
+                                videos.reshape(-1, 16, 16, 1).mean(0))
+
+
 def test_a_world_models_tokenizer_rides_in_its_state_and_its_loss_reads_it_there():
     """The world model's frozen tokenizer is state (row 4148: it lived on the objective, a compiled constant
     outside the tree placement and checkpoints share): the drawn tree holds the given weights beside the

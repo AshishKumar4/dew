@@ -18,7 +18,9 @@ and context frames at signal level 1 - `tau_ctx` when generating.
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable, Mapping, Sequence
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -37,22 +39,27 @@ RMS_EPSILON = 1e-6
 were drawn with)."""
 
 
-def _block(width: int, heads: int, tokens: int, name: str) -> DecoderBlock:
+def _block(width: int, heads: int, tokens: int, name: str, *,
+           rotary_axes: tuple[int, ...] | None = None) -> DecoderBlock:
     """A pre-RMSNorm tower layer (`dew.nn.text_encoders.clip_layer`) of `width` features over `tokens`
-    tokens: unrotated attention of `heads` biased heads, each head's queries and keys RMS-normed, under the
+    tokens: attention of `heads` biased heads, each head's queries and keys RMS-normed, under the
     call's pairwise mask (`AttentionMetadata.pairwise_mask`), its logits formed in at least float32
     (`wide_logits`), as TSSM's blocks attend; then a biased SwiGLU of four times the width."""
     return clip_layer(width, heads, 4 * width, tokens, activation="swiglu", eps=RMS_EPSILON, norm_type="rms",
-                      norm_bias=False, qk_norm=True, wide_logits=True, name=name)
+                      norm_bias=False, qk_norm=True, wide_logits=True, name=name, rotary_axes=rotary_axes)
 
 
-def _attended(blocks: Sequence[DecoderBlock], tokens: jax.Array, mask: jax.Array) -> jax.Array:
+def _attended(blocks: Sequence[DecoderBlock], tokens: jax.Array, mask: jax.Array, *,
+              positions: jax.Array | None = None) -> jax.Array:
     """`tokens` `[..., S, D]` through `blocks`, each token reading the tokens `mask` `[S, S]` lets it, any
     leading axes of the tokens batch axes it is shared across, flattened into one for the blocks and
     restored."""
     *lead, count, width = tokens.shape
     flat = tokens.reshape(-1, count, width)
-    metadata = AttentionMetadata(pairwise_mask=jnp.broadcast_to(mask, (flat.shape[0], count, count)))
+    metadata = AttentionMetadata(
+        pairwise_mask=jnp.broadcast_to(mask, (flat.shape[0], count, count)),
+        rotary_positions=None if positions is None else jnp.broadcast_to(
+            positions, (flat.shape[0], count, positions.shape[-1])))
     for block in blocks:
         flat = block(flat, attention_metadata=metadata)
     return flat.reshape(*lead, count, width)
@@ -62,7 +69,16 @@ class CausalTokenizer(nn.Module):
     """A frame `[..., H, W, C]` in [-1, 1] to latents `[..., latents, bottleneck]` and back, one frame
     at a time (Section 3.1): patches of `patch` pixels and `latents` learned tokens through `depth`
     blocks, the latents to `bottleneck` channels through a tanh; the decoder's readout tokens, one a
-    patch, attend to themselves and the latents, the latents only to latents."""
+    patch, attend to themselves and the latents, the latents only to latents.
+
+    `positions` is how its tokens know where they are. "rotary", Dreamer 4's (Section 3.1), rotates
+    every attention's queries and keys by each token's place on the frame's patch grid, a patch at its
+    row and column and a latent at the centre of its cell of a near-square grid over the same extent
+    (`_grid`), beside the learned vectors each patch adds after its masking, so a masked patch keeps its
+    place; and RMS-normalizes the latents before the squeeze. "learned" is the learned vectors alone,
+    added before a patch is masked, no normalization: the tokenizer runs were saved with before
+    (`dew.config.earlier.earlier_tokenizer_positions`), whose latents carried no place a decoder could read
+    and reconstructed the mean frame (row 4669)."""
 
     frame: tuple[int, int, int]
     patch: int = 4
@@ -71,6 +87,7 @@ class CausalTokenizer(nn.Module):
     heads: int = 4
     latents: int = 16
     bottleneck: int = 8
+    positions: Literal["rotary", "learned"] = "rotary"
 
     @property
     def patches(self) -> int:
@@ -90,6 +107,21 @@ class CausalTokenizer(nn.Module):
         frames = unpatchify(patches.reshape(-1, count, size), self.patch, *self.frame)
         return frames.reshape(*lead, *self.frame)
 
+    def _grid(self) -> tuple[jax.Array, jax.Array]:
+        """Each patch's and each latent's place `[count, 2]` on the frame's patch grid, as rows and
+        columns: a patch at its own, row-major as `_patchify` lays them; a latent at the centre of its
+        cell of the most nearly square grid of `latents` cells over the same extent, row-major, so the
+        two meet on one plane (an unscaled latent grid did not reconstruct, row 4669)."""
+        height, width = self.frame[0] // self.patch, self.frame[1] // self.patch
+        index = jnp.arange(self.patches)
+        patches = jnp.stack([index // width, index % width], -1).astype(jnp.float32)
+        rows = max(divisor for divisor in range(1, math.isqrt(self.latents) + 1)
+                   if self.latents % divisor == 0)
+        columns = self.latents // rows
+        index = jnp.arange(self.latents)
+        cells = jnp.stack([index // columns, index % columns], -1).astype(jnp.float32)
+        return patches, (cells + 0.5) * jnp.asarray([height / rows, width / columns]) - 0.5
+
     def setup(self) -> None:
         self.embed = nn.Dense(self.width)
         self.mask_token = self.param("mask_token", nn.initializers.normal(0.02), (self.width,))
@@ -97,14 +129,22 @@ class CausalTokenizer(nn.Module):
                                         (self.latents, self.width))
         self.patch_positions = self.param("patch_positions", nn.initializers.normal(0.02),
                                           (self.patches, self.width))
+        head = self.width // self.heads
+        if self.positions == "rotary" and head < 4:
+            raise ValueError(f"a tokenizer's two-axis rotary turns a pair of channels or more for each axis, "
+                             f"and its heads are {head} wide; make width // heads at least 4")
+        # The rows' channels, a whole number of pairs, and the columns' the rest, as near halves as they
+        # split; an odd head's last channel is turned by neither (`dew.nn.rope.rotate`).
+        rows = 2 * ((head + 2) // 4)
+        axes = (rows, head - rows) if self.positions == "rotary" else None
         tokens = self.patches + self.latents
-        self.encoder = [_block(self.width, self.heads, tokens, f"encoder_{index}")
+        self.encoder = [_block(self.width, self.heads, tokens, f"encoder_{index}", rotary_axes=axes)
                         for index in range(self.depth)]
         self.squeeze = nn.Dense(self.bottleneck)
         self.unsqueeze = nn.Dense(self.width)
         self.readout_tokens = self.param("readout_tokens", nn.initializers.normal(0.02),
                                          (self.patches, self.width))
-        self.decoder = [_block(self.width, self.heads, tokens, f"decoder_{index}")
+        self.decoder = [_block(self.width, self.heads, tokens, f"decoder_{index}", rotary_axes=axes)
                         for index in range(self.depth)]
         self.pixels = nn.Dense(self.patch * self.patch * self.frame[2])
 
@@ -115,21 +155,29 @@ class CausalTokenizer(nn.Module):
                *, masked: jax.Array | None = None) -> jax.Array:
         """Each frame's latents; each patch `masked` `[..., patches]` replaced by the mask token, or with
         `mask_rate` `[...]` each with that frame's probability, drawn from `key`."""
-        x = self.embed(self._patchify(frames)) + self.patch_positions
+        rotary = self.positions == "rotary"
+        x = self.embed(self._patchify(frames)) + (0 if rotary else self.patch_positions)
         if mask_rate is not None:
             if key is None:
                 raise ValueError("masking a tokenizer's patches draws from a key")
             masked = jax.random.uniform(key, x.shape[:-1]) < mask_rate[..., None]
         if masked is not None:
             x = jnp.where(masked[..., None], self.mask_token, x)
+        # A rotary tokenizer's masked patch keeps its place.
+        x = x + self.patch_positions if rotary else x
         lead = x.shape[:-2]
         latent = jnp.broadcast_to(self.latent_tokens, (*lead, *self.latent_tokens.shape))
         tokens = jnp.concatenate([x, latent], -2)
         count = self.patches
         index = jnp.arange(tokens.shape[-2])
         # Latents read everything; patches read only patches.
-        tokens = _attended(self.encoder, tokens, (index[:, None] >= count) | (index[None, :] < count))
-        return jnp.tanh(self.squeeze(tokens[..., count:, :]))
+        patches, cells = self._grid()
+        tokens = _attended(self.encoder, tokens, (index[:, None] >= count) | (index[None, :] < count),
+                           positions=jnp.concatenate([patches, cells], 0) if rotary else None)
+        encoded = tokens[..., count:, :]
+        if rotary:
+            encoded = encoded * jax.lax.rsqrt(jnp.mean(jnp.square(encoded), -1, keepdims=True) + RMS_EPSILON)
+        return jnp.tanh(self.squeeze(encoded))
 
     def decode(self, latents: jax.Array) -> jax.Array:
         lead = latents.shape[:-2]
@@ -138,7 +186,10 @@ class CausalTokenizer(nn.Module):
         index = jnp.arange(tokens.shape[-2])
         count = self.latents
         # Latents read only latents; readout tokens read themselves and the latents.
-        tokens = _attended(self.decoder, tokens, (index[None, :] < count) | (index[:, None] >= count))
+        patches, cells = self._grid()
+        tokens = _attended(self.decoder, tokens, (index[None, :] < count) | (index[:, None] >= count),
+                           positions=jnp.concatenate([cells, patches], 0) if self.positions == "rotary"
+                           else None)
         return self._unpatchify(self.pixels(tokens[..., count:, :]))
 
 
