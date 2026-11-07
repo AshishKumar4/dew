@@ -23,7 +23,6 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
     from dew.decision.data import Example, Group, GroupedExamples, corpus, decisions, mixture
     from dew.decision.head import DecisionHead, Head, JointSchemaHead, LabelReadout, SlotReadout
-    from dew.decision.laya import LayaCheckpoint
     from dew.decision.layout import (
         Again,
         AnswerCue,
@@ -116,7 +115,6 @@ _EXPORTS = {
     "LabelReadout": "dew.decision.head",
     "Labels": "dew.decision.layout",
     "Laid": "dew.decision.layout",
-    "LayaCheckpoint": "dew.decision.laya",
     "Layout": "dew.decision.layout",
     "LogLoss": "dew.decision.scoring",
     "MacroF1": "dew.decision.metrics",
@@ -206,7 +204,6 @@ __all__ = [
     "LabelReadout",
     "Labels",
     "Laid",
-    "LayaCheckpoint",
     "Layout",
     "LogLoss",
     "MacroF1",
