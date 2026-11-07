@@ -61,11 +61,22 @@ def geometry(case: dict) -> tuple[int, int]:
     return case["shape"] if "shape" in case else core_geometry(case)
 
 
+FORWARD_TILES = tuple(attention_triton.Tiles(block_q, block_k, attention_triton.WARPS,
+                                            attention_triton.STAGES)
+                      for block_q in attention_triton.EXTENTS for block_k in attention_triton.EXTENTS)
+"""Every forward tile a derivation or a pin may run (`TritonForward.derived`, `tuning.pinned`): each of the
+extents by each."""
+
+BACKWARD_TILES = tuple(attention_triton.BackwardTiles(block_q, block_k, attention_triton.WARPS,
+                                                      attention_triton.STAGES, attention_triton.WARPS,
+                                                      attention_triton.STAGES)
+                       for block_q in attention_triton.EXTENTS for block_k in attention_triton.EXTENTS)
+"""Every backward tile a derivation or a pin may run (`TritonBackward.derived`), both launches at each."""
+
 PINNED = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
           attention_triton.Tiles(128, 64, 4, 2))
-"""The configs each case runs at on the CPU, where interpreting every tile the derivation takes
-(`FORWARD_TILES`) would take hours; a GPU runs each (`every_config_on_a_gpu`, a cell of
-tests/test_gpu_attention.py)."""
+"""The configs each case runs at on the CPU, where interpreting every tile (`FORWARD_TILES`) would take
+hours; a GPU runs each (`every_config_on_a_gpu`, a cell of tests/test_gpu_attention.py)."""
 
 
 def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 32):
@@ -220,7 +231,7 @@ def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, val
 
 
 def every_config_on_a_gpu(config, case):
-    """Every tile the forward's derivation takes (`FORWARD_TILES`), bf16, every hook: over causal
+    """Every tile a derivation or a pin may run (`FORWARD_TILES`), bf16, every hook: over causal
     documents under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
     check({**CASES, **IRREGULAR}[case], HOOKS["all"], jnp.bfloat16, config, residuals=True)
 
@@ -664,7 +675,7 @@ def test_the_backward_walks_many_key_tiles(case):
 
 
 def every_backward_config_on_a_gpu(config, case):
-    """Every tile the backward's derivation takes (`BACKWARD_TILES`), bf16, a softcap, sinks and
+    """Every tile a derivation or a pin may run (`BACKWARD_TILES`), bf16, a softcap, sinks and
     ALiBi, over causal documents under a window and over the irregular full and causal calls (`IRREGULAR`):
     each the launch holds at the call (`TritonBackward.legal`: its threads within their registers, its
     programs within a block's shared memory) on par with the reference, and each other refused where it is

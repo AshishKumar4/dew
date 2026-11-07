@@ -84,8 +84,10 @@ class Tiles:
     whether a dense product runs swapped (`swapped`, CUTLASS's and cuBLAS's swap of A and B): its matrix the
     MMA's rows and the call's rows its columns, `block_m` then the matrix's and `block_n` the call's rows,
     where those are fewer than a role's (`grouped_matmul.MosaicGmm.derived`); and the steps of each chunk
-    of a dense walk after which the programs walking a round of its tiles meet (`raster`, `raster_steps`),
-    0 where they walk apart."""
+    of a dense walk after which the programs walking a round of its tiles meet (`raster`, `_met`), 0 where
+    they walk apart: a pin's alone, as a program waiting at a GPU-scope count for peers another kernel keeps
+    off their multiprocessors hangs, which only a cooperative launch rules out (row 4732), so no derivation
+    takes one."""
     block_m: int
     block_n: int
     block_k: int
@@ -1780,31 +1782,6 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
 
     candidates = range(1, max(steps // (tiles.stages + 1), 1) + 1)
     return min((splits for splits in candidates if split_runs(steps, splits)), key=walk)
-
-
-RASTER_REACH = 5
-"""Dew: the L2s of panels a dense walk reads (`raster_steps`) past which its programs, walking apart, drift
-along the depth out of the L2's reach of the panels they share: an A100's 8192 x 5120 input gradient held an
-83.5% L2 hit at 5.1 of them (depth 40960) and fell to 72.9% at 5.6 and 60.5% at 6.3, its DRAM reads 1 to 2.1
-to 4.3x for 1 to 1.1 to 1.25x the depth (M-FS-6, W17-a100-counters-1)."""
-
-
-def raster_steps(tiles: Tiles, *, rows: int, depth: int, width: int, itemsizes: tuple[int, int],
-                 programs: int, l2_bytes: int | None) -> int:
-    """Dew: the steps of each chunk after which a dense walk's programs meet (`Tiles.raster`, `_met`): a
-    round of the snake's tiles (`programs` at once) reads about 2 sqrt(programs) panels, its rows' blocks
-    and its columns' (`itemsizes` bytes), `block_k` deep a step; where its whole walk reads more than
-    `RASTER_REACH` L2s of them, the most steps (a power of two, at least the ring's stages and one more)
-    whose panels fill at most half the L2; 0 where it reads fewer, the call fills one round, a chunk would
-    hold the whole walk, or the device states no L2."""
-    output = -(-rows // tiles.block_m) * (width // tiles.block_n)
-    steps = depth // tiles.block_k
-    side = math.isqrt(programs)
-    panels = side * (tiles.block_m * itemsizes[0] + tiles.block_n * itemsizes[1]) * tiles.block_k
-    if l2_bytes is None or output <= programs or panels * steps <= RASTER_REACH * l2_bytes:
-        return 0
-    chunk = max(1 << max((l2_bytes // 2 // panels).bit_length() - 1, 0), tiles.stages + 1)
-    return chunk if chunk < steps else 0
 
 
 def _sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
