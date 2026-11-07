@@ -70,14 +70,16 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
                                    launches: str | None, lowering: bool = True, *,
                                    mesh: Mesh | AbstractMesh | None = None,
                                    platforms: tuple[str, ...] | None = None, capacity: int | None = None,
-                                   footprint: Footprint | None = None) -> Candidate:
+                                   footprint: Footprint | None = None, derived: bool = True) -> Candidate:
     """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
     alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
     `launches` are its kernel launches where a record holds them, which settle their configs before it
     lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records them
     (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`lowered_for`). `capacity` is
     the bytes a device that states none holds (`FitSearch.capacity`), at which its footprint is judged;
-    `footprint`, the one its derivation traced, which it keeps (`FitSearch.footprints`)."""
+    `footprint`, the one its derivation traced, which it keeps (`FitSearch.footprints`). One whose
+    executable is a step compiled ahead derives none (not `derived`): its compile judged the
+    derivation where it was compiled, and a run handed it does none of that work on its devices."""
     trainer = stepping.trainer
     micro = microbatch_shapes(batch, split)
     shapes, copies, prepared = prepared_for(stepping, state, micro, schedule, split, narrow)
@@ -100,7 +102,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
     # The batch as shapes with the placement it is read under, whoever lowers it: a lowering over the host
     # arrays a step compiled ahead reads (`first_step_batch`) and one over the placed arrays a run steps
-    # are two texts of one program (`dew.training.ahead.program_of`), the types of a helper call's
+    # are two texts of one program (`dew.nn.kernels.options.program_digest`), the types of a helper call's
     # arguments, their shardings among them, telling its functions apart in the module.
     given = placed_shapes(batch, placement)
     lower = Routed(functools.partial(
@@ -120,7 +122,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
         if staging_measured and not lowering:
             jitted.trace(*apart(prepared), given, part)
     window = split * trainer.accumulation
-    if footprint is None and shapes is not None and mesh is None:
+    if derived and footprint is None and shapes is not None and mesh is None:
         footprint = candidate_footprint(
             trainer.objective, stepping.model_shapes(micro), window, prepared, held,
             (local_devices(trainer.device_mesh) or [*trainer.device_mesh.devices.flat])[0], split,

@@ -38,7 +38,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
-import hashlib
 import importlib.metadata
 import json
 import logging
@@ -71,7 +70,7 @@ from dew.nn.kernels.generation import (
     routes,
     tpu,
 )
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import collecting, owned_program, program_digest, shapes_of, taking
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
@@ -80,6 +79,8 @@ from dew.training.profiling import pgle_runs
 if TYPE_CHECKING:
     from dew.checkpoints import Resume
     from dew.data.dataset import DataPartition, Loader
+    from dew.training._fit import Start
+    from dew.training.planning import Planned
     from dew.training.trainer import Trainer
 
 _log = logging.getLogger(__name__)
@@ -204,21 +205,22 @@ class Executable:
 @dataclasses.dataclass(frozen=True)
 class AheadProgram:
     """A program compiled ahead beside a step (`AheadOfTime.sampled`): its executable (`Executable`) and the
-    program it was compiled from (`program_of`), which a run that takes it lowers too (`taken`)."""
+    program it was compiled from (`program_digest`), which a run that takes it lowers too (`taken`)."""
 
     program: str
     executable: Executable
 
     @staticmethod
     def of(program: str, compiled: jax.stages.Compiled) -> AheadProgram:
-        """`compiled`, the executable `program` (`program_of`) compiled to, as a program compiled ahead."""
+        """`compiled`, the executable `program` (`program_digest`) compiled to, as a program compiled
+        ahead."""
         return AheadProgram(program, Executable.of(compiled))
 
     def taken(self, lowered: jax.stages.Lowered, devices: list) -> jax.stages.Compiled:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered`: refused
         where that is another program than this one, and admitted as a compiled one is
         (`dew.communicators.admit`)."""
-        if program_of(lowered) != self.program:
+        if program_digest(lowered) != self.program:
             raise ValueError("the sampled step compiled ahead is another program than the one this run "
                              "compiles: compile it ahead from this run's config, with its inspection")
         return self.executable.loaded(devices)
@@ -228,7 +230,7 @@ class AheadProgram:
 class AheadOfTime:
     """A training step compiled for `devices` devices of `generation` (`compile_ahead`), compile-only
     GPUs of a CUDA generation or a TPU topology's of its chip ('v5e'): the executable,
-    serialized, the program it was compiled from (`program`, `program_of`), and what it costs.
+    serialized, the program it was compiled from (`program`, `program_digest`), and what it costs.
     `flops` are its matmuls' and convolutions' on one device, read off its optimized program as a
     run's are (`dew.telemetry.instrumentation.step_flops`, which
     counts the cuBLAS and cuDNN calls XLA's own cost analysis cannot see into), None where it runs a
@@ -240,7 +242,7 @@ class AheadOfTime:
     devices: int
     mesh: dict[str, int]
     program: str
-    """The step's program as it lowered (`program_of`), which a run that loads it lowers too (`taken`)."""
+    """The step's program as it lowered (`program_digest`), which a run that loads it lowers too (`taken`)."""
     executable: Executable
     flops: StepFlops | None
     argument_bytes: int
@@ -283,6 +285,27 @@ class AheadOfTime:
     """Each kernel its routes lowered another in place of, as this host lowers no such kernel (`substituted`:
     FlashAttention without its wheel, cuDNN with no GPU attached): where any, the program is not the one the
     target's GPU runs, which a measure of the target's compile reads as unsupported (tools/perf_gate.py)."""
+    starts: dict[str, Executable] = dataclasses.field(default_factory=dict)
+    """The programs a run builds its fresh state with before its first step and that step's own copies of
+    its weights (`dew.training.distributed.start_lowered`, the narrowed copies), compiled for the target
+    beside the step, by their programs' digests (`program_digest`): a run handed the step runs each of
+    these as compiled here (`taking`), so its devices compile nothing before and at its first step, its
+    placement included (Main, 11-07: an attention step compiled ahead still compiled its placement on the
+    GPU, 5-7 s)."""
+
+    def taking(self) -> contextlib.AbstractContextManager[None]:
+        """The block a run handed this step builds its start and its first step's copies in: each program
+        of `starts` that it lowers runs as compiled here, loaded onto this process's devices as the step
+        is (`loaded`), where it would have compiled it (`dew.nn.kernels.options.taking`)."""
+        def load(executable: Executable) -> Callable[[], jax.stages.Compiled]:
+            def loaded() -> jax.stages.Compiled:
+                found = jax.devices()
+                if self.built is not None:
+                    self.built.held(found)
+                return executable.loaded(found)
+            return loaded
+
+        return taking({digest: load(executable) for digest, executable in self.starts.items()})
 
     @property
     def peak_bytes(self) -> int:
@@ -312,6 +335,10 @@ class AheadOfTime:
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
+        if "starts" not in vars(step):
+            raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
+                             "programs (`starts`), whose run would compile them on its devices; compile it "
+                             "ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         _current(path, "step", [step.executable, *sampled])
         return step
@@ -353,7 +380,7 @@ class AheadOfTime:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
         that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
         that differs, which the executable would not run as the run's step."""
-        if program_of(lowered) != self.program:
+        if program_digest(lowered) != self.program:
             raise ValueError("the step compiled ahead is another program than the one this run compiles "
                              "first: compile it ahead from this run's config and data "
                              "(--trainer.compile-ahead), with this Dew, and no plan recorded for another "
@@ -590,11 +617,6 @@ def handed(ahead: AheadOfTime | None) -> Iterator[None]:
         yield
 
 
-def program_of(lowered: jax.stages.Lowered) -> str:
-    """A step's program as `lowered` holds it, its text's digest: two lowerings of one step agree."""
-    return hashlib.sha256(lowered.as_text().encode()).hexdigest()
-
-
 @dataclasses.dataclass(frozen=True)
 class AheadTarget:
     """Where a configured run compiles its first step ahead and saves it, then exits, training nothing
@@ -787,6 +809,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     with assumed(on), uncached() if on_tpus else contextlib.nullcontext(), routes() as taken:
         target = gpu_target()
         planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity, frontier)
+        starts = started(trainer, start, planned)
     if missing := substituted(taken):
         _log.warning("the step compiled ahead for %s holds kernels this host cannot lower: %s", generation,
                      "; ".join(missing))
@@ -798,11 +821,87 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
     return AheadOfTime(
-        generation, len(devices), dict(trainer.device_mesh.shape), program_of(lowered),
+        generation, len(devices), dict(trainer.device_mesh.shape), program_digest(lowered),
         Executable.of(compiled),
         flops=step_flops(compiled),
         argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
         temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices)),
-        refusals=report.refused_launches(), sampled=sampled, substituted=tuple(missing))
+        refusals=report.refused_launches(), sampled=sampled, substituted=tuple(missing), starts=starts)
+
+
+def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned
+                             ) -> dict[str, Executable]:
+    """The programs a run of `trainer` compiles besides its step, compiled for the target over their
+    arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement (`start_lowered`), for
+    a run that starts afresh, the first step's narrowed copies of its weights where the plan reads some
+    (`narrowed`), and what its steps run on their results, each called as the run calls it, over the
+    step's results' shapes (`collecting`): an accumulating window's first allocation (`Trainer._window_of`),
+    a split step's whole (`whole_step`), its counters (`bookkeep`), a sampled step's latest sample
+    (`latest`), its log's copies (`copied`) and its logged tokens' sum (`added_tokens`). Each by its
+    program's digest, through the kernel templates' reports as every compile is. Its evaluations compile
+    on its devices still (row 4752)."""
+    from dew.training.distributed import start_lowered
+    from dew.training.narrow import narrowed
+
+    lowerings: list[Callable[[], jax.stages.Lowered]] = []
+    if start.resume is None and not trainer.host_master:
+        key = jax.ShapeDtypeStruct(start.key.shape, start.key.dtype)
+        lowerings.append(lambda: start_lowered(trainer._staged_start, start.initializer, key, start.abstract,
+                                               start.shardings, start.through, trainer.device_mesh))
+    candidate = planned.candidate
+    if candidate.copies:
+        # The variables as the run's first step holds them, placed as its start placed them.
+        variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                                             sharding=sharding),
+                                 start.abstract.variables, start.shardings.variables)
+        lowerings.append(lambda: owned_program(lambda variables: narrowed(variables, candidate.copies),
+                                               *trainer.objective.towers(),
+                                               out_shardings=candidate.shardings.compute).lower(variables))
+
+    def kept(lower: Callable[[], jax.stages.Lowered]) -> tuple[str, Executable]:
+        # A program a refused launch's config relowers is keyed by the program it compiled, as the run's
+        # compile point lowers it past the refusals the step carries (`OuterProgram.compiled`).
+        lowered = [lower()]
+
+        def relower() -> jax.stages.Lowered:
+            lowered.append(lower())
+            return lowered[-1]
+        executable = report.compiled(lowered[0], relower=relower)
+        return program_digest(lowered[-1]), Executable.of(executable)
+    collected = _results_programs(trainer, start, planned)
+    return {**dict(map(kept, lowerings)), **{digest: Executable.of(executable)
+                                             for digest, executable in collected.items()}}
+
+
+def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned
+                                       ) -> dict[str, jax.stages.Compiled]:
+    """The programs a run's steps run on their results and its state, compiled where the run's own code
+    calls them over shapes (`collecting`), by digest: `started`'s last part."""
+    from dew.distributed.placement import placed_shapes
+    from dew.state import apart, together
+    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
+    from dew.training.planning import whole_step
+
+    candidate, split = planned.candidate, planned.split
+    placed = placed_shapes(start.abstract, start.shardings)
+    window = split * trainer.accumulation
+    frozen = apart(placed)[1]
+    # A sampled step's results hold its summaries (`Committed.inspected`), which its programs read too.
+    steps = [planned.executable] + ([] if planned.sampled is None else [planned.sampled.executable])
+    with collecting() as collected:
+        if trainer._builds_window(placed, candidate, window):
+            trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
+        for step in steps:
+            moving, loss, aux, finite, accepted, committed = shapes_of(step.out_info)
+            if split > 1:
+                loss, aux, finite, accepted, committed = whole_step(
+                    [(loss, aux, finite, accepted, committed)] * split)
+            book = book_shapes(loss)
+            counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))
+            if committed is not None and committed.inspected is not None:
+                latest((committed.count, committed.inspected), (committed.count, committed.inspected))
+            added_tokens(counted.tokens, counted.tokens)
+            copied(together(moving, frozen))
+    return collected
