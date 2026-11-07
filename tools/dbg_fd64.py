@@ -50,8 +50,11 @@ for k in ra:
 with w.applying(case,"float64") as apply:
     ref = apply(params,{k:v for k,v in inputs.items() if not k.startswith("param.")})
 ours = t.computing(case)(jnp.float64,inputs)
+failures = []
 for k in ours:
     a,b=np.asarray(ref[k]),np.asarray(ours[k])
     print("K FINAL",k,"rms",float(np.sqrt(np.mean((a-b)**2))),"rel",float(np.linalg.norm(a-b)/np.linalg.norm(a)))
-    if mode == "fixed":
-        assert np.linalg.norm(a-b)/np.linalg.norm(a) < 1e-14, k
+    if np.linalg.norm(a-b)/np.linalg.norm(a) >= 1e-14:
+        failures.append(k)
+print("K ROUNDING_CHECK", "FAIL" if failures else "PASS", failures)
+assert not failures, failures
