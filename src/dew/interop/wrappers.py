@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import jax.numpy as jnp
 
 from dew import _records
+from dew._records import JSON
 from dew.interop.decoder_parts import ExportRefused
 from dew.interop.layouts import ConfigLayout, SourceLayout, Unwritable
 from dew.interop.safetensors_io import LazyTensors
@@ -226,10 +227,11 @@ def _refuse_lossy(wrapper: MultimodalTransformer, config: Mapping[str, object]) 
                             f"{', '.join(f'{name}={theirs.get(name)!r}' for name in lost)}")
 
 
-def _computed(record: object) -> object:
+def _computed(record: JSON) -> JSON:
     """A part's `record` as what it computes: every class record in it without its numerics fields
-    (`hf_decoders.NUMERICS_FIELDS`), which a decoder's comparison skips too (`refuse_rebuilt`), so a
-    projection built in a run's dtype exports as its family writes it (row 4776's review)."""
+    (`hf_decoders.NUMERICS_FIELDS`), which a decoder's comparison skips too (`refuse_rebuilt`). A wrapper
+    computes its parts in its own numerics (`dew.nn.multimodal._conditioner_modules`), so a projection
+    built in a run's dtype is the computation its family writes (row 4776's review)."""
     from dew.interop.hf_decoders import NUMERICS_FIELDS
 
     if isinstance(record, Mapping):
