@@ -178,3 +178,75 @@ def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew
         expected = jax.jit(plain)(*operands)
         assert_equal(outside(*operands), expected)
         assert_equal(inside(*operands), expected)
+
+
+def jax_attention(*, causal: bool):
+    """jax.nn's attention as a plain program writes it (its XLA form)."""
+    def attend(q, k, v):
+        return jax.nn.dot_product_attention(q, k, v, is_causal=causal, implementation="xla")
+    return attend
+
+
+def flax_attention(*, causal: bool):
+    """Flax's attention as a Flax model writes it, its causal mask built from the rows."""
+    from flax import linen as nn
+
+    def attend(q, k, v):
+        mask = nn.make_causal_mask(jnp.ones(q.shape[:2])) if causal else None
+        return nn.dot_product_attention(q, k, v, mask=mask)
+    return attend
+
+
+def input_masked(q, k, v):
+    """jax.nn's attention under a mask drawn from the queries, which the compile point leaves as written."""
+    rows = (q[..., :1] > 0).transpose(0, 2, 1, 3)
+    mask = jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1]))
+    return jax.nn.dot_product_attention(q, k, v, mask=mask, implementation="xla")
+
+
+SPELLINGS = {"jax.nn causal, grouped": (jax_attention(causal=True), 2),
+             "jax.nn, grouped": (jax_attention(causal=False), 2),
+             "flax causal": (flax_attention(causal=True), 4), "flax": (flax_attention(causal=False), 4)}
+"""Each plain program's attention and its key heads over 4 query heads."""
+
+
+def _attention_routes(trace) -> list[str]:
+    """The kernels the attention routes `trace()` reports name."""
+    with generation.routes() as found:
+        trace()
+    return [route.kernel for route in found if route.choice == "attention"]
+
+
+@pytest.mark.parametrize("spelling", list(SPELLINGS))
+def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
+    """A plain JAX or Flax program's softmax attention (`dew.algebra.attention_regions`) compiled through
+    `dew.jit` on an H100 runs the kernel Dew's selector gives the call (FlashAttention, or the template a call
+    names), where the program as written runs XLA's; on this host, its output and gradients under the
+    template (its portable mainloop) on par with the program as written (check 1)."""
+    from attention_oracle import attention_on_par
+    from contract_support import normal_drawn
+
+    import dew
+
+    attend, key_heads = SPELLINGS[spelling]
+    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),
+              *(jax.ShapeDtypeStruct((2, 128, key_heads, 64), jnp.bfloat16),) * 2)
+    with generation.assumed("sm90"):
+        assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
+        assert "flash" in _attention_routes(lambda: dew.jit(attend).trace(*shapes))
+        with generation.chosen(attention="template"):
+            assert "template" in _attention_routes(lambda: dew.jit(attend).trace(*shapes))
+    draw = normal_drawn(37, (2, 64, 4, 32), (2, 64, key_heads, 32), (2, 64, key_heads, 32), (2, 64, 4, 32),
+                        dtype=jnp.bfloat16)
+    with generation.chosen(attention="template"):
+        attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {spelling}")
+
+
+def test_a_plain_programs_attention_under_a_mask_of_its_inputs_stays_as_written():
+    """Attention under a mask the program draws from its inputs is no region of Dew's (its mask read at no
+    compile): `dew.jit` runs it as written, its attention XLA's own on an H100."""
+    import dew
+
+    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
+    with generation.assumed("sm90"):
+        assert not _attention_routes(lambda: dew.jit(input_masked).trace(*shapes))
