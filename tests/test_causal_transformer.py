@@ -904,9 +904,11 @@ def test_a_packed_document_reads_like_the_document_alone(rng):
 @pytest.mark.parametrize("layout", [None, KVCache(page_size=4)], ids=["dense", "paged"])
 def test_a_packed_prefill_decodes_its_last_document_as_that_document_alone(layout):
     """A row of two documents prefilled into a cache (`segment_ids`), then single-token steps continuing its
-    last document: every layer reads each document's own keys over the cache (`dew.nn.kv_cache.DOCUMENTS`),
-    so the second document's prefill logits and every step's are on par (check 1) with the second document
-    prefilled alone into a row of its own and decoded the same steps, the truth that run in float64."""
+    last document, each naming its one document (a call's first continues its row's last,
+    `dew.batch.Coordinates.starts`): every layer reads each document's own keys over the cache
+    (`dew.nn.kv_cache.DOCUMENTS`), so the second document's prefill logits and every step's are on par
+    (check 1) with the second document prefilled alone into a row of its own and decoded the same steps, the
+    truth that run in float64."""
     model = tiny(**({} if layout is None else {"kv_cache": layout}))
     first, second, steps = 6, 4, 3
     segment_ids = jnp.asarray([[1] * first + [2] * second] * 2)
@@ -921,7 +923,7 @@ def test_a_packed_prefill_decodes_its_last_document_as_that_document_alone(layou
                 token = first + second + step
                 out, state = model.apply({**params, **state}, ids[:, token:token + 1], decode=True,
                                          positions=jnp.full((2, 1), second + step),
-                                         segment_ids=jnp.full((2, 1), 2), mutable=["cache"])
+                                         segment_ids=jnp.ones((2, 1), jnp.int32), mutable=["cache"])
                 logits.append(out)
             return jnp.concatenate(logits, axis=1)
         return jax.jit(run)

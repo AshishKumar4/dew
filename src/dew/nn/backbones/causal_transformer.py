@@ -2444,8 +2444,10 @@ class CausalTransformer(LinearProducts):
     def packed_cache_refusal(self) -> str | None:
         """Why a cached call of several documents a row would read them together in some layer, or None:
         every layer's mixer reads its documents apart over its cache (`MixerBase.packed_cache_refusal`;
-        a cache keeps each key's document, `dew.nn.kv_cache.DOCUMENTS`). A row's later steps continue its
-        last document, naming it (`Coordinates.segments`) where the row holds several."""
+        a cache keeps each key's document, `dew.nn.kv_cache.DOCUMENTS`). A call's documents are its own,
+        numbered from 1, its first continuing its row's last (`Coordinates.starts`): a row's later steps
+        continue its last document, each naming its one (`Coordinates.segments` of 1), which reads that
+        document's keys alone; a step naming none reads every key its row holds."""
         types = self.per_layer_types
         default = self.layer_mixer
         for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
