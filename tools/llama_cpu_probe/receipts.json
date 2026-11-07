@@ -1,0 +1,51 @@
+{
+  "head": "d20045a8bd8dff1eb922c9192ad149621bab2243",
+  "runner": "probe runner <probe.py> <label> d20045a8bd8dff1eb922c9192ad149621bab2243 <items>",
+  "platform": "AMD EPYC 25/17 x86-64-v4; JAX 0.12.0.1.post60; CPU",
+  "seeds": 40,
+  "reference_rms": 8.939943725801698e-8,
+  "baseline_rms": 1.578530772896083e-7,
+  "baseline_ratio": 1.7657054913447197,
+  "baseline_interval": [1.697, 1.839],
+  "ggml_same_precision_counterfactual": {
+    "description": "Replace only all 15 dense projections with pinned libggml's public ggml_mul_mat + CPU graph compute, one thread; every other Dew op unchanged.",
+    "rms": 9.343027625674891e-8,
+    "ratio": 1.0450879683626917,
+    "local_error_ratio_xla_over_ggml_64_reduction": [2.012276393295701, 2.131007356780892],
+    "local_error_ratio_xla_over_ggml_128_reduction": [2.6553506592315985, 2.67996725848497]
+  },
+  "counterfactual_ratios": {
+    "all_dots_float64_then_float32": 0.7334714320781393,
+    "dense_dots_float64_then_float32": 0.7889289347253046,
+    "attention_dots_float64_then_float32": 1.7343761095308754,
+    "rmsnorm_float64_then_float32": 1.6669936187344725,
+    "rotary_multiply_float64_then_float32": 1.7569901935630847,
+    "softmax_float64_then_float32": 1.7274078370274102,
+    "suite_wide_cpu_default_highest": 0.7334714320781393,
+    "wide_disabled_default_highest": 1.7657054913447197,
+    "qk_projections_only": 1.746473279843288,
+    "v_projections_only": 1.5420775801624147,
+    "out_projections_only": 1.5867460171859329,
+    "mlp_projections_only": 1.5331750573672867,
+    "mlp_down_projections_only": 1.655125485561853,
+    "lm_head_only": 1.6241970589172687,
+    "layer0_projections_only": 1.3233548059179296,
+    "layer1_projections_only": 1.5607197649937719
+  },
+  "dew_float64_vs_recorded_transformers_float64_rms": 3.2016529807688663e-16,
+  "gate_probe": {"baseline": "GateFailure 1.766 over 40 seeds [1.697,1.839]", "wide": "PASS", "note": "wide changes only reference_error.summed_as_run to a highest scope; unchanged reference, truth, draws and test body"},
+  "local_dot_findings": {"xla_equals_torch_and_numpy_error": "All 15 dense sites on the same float32 operands, pooled 40 seeds; ratio exactly 1.0", "xla_matches_sequential_float32_fma": "100% of outputs at every one of the 15 dense sites for seed 0", "note": "The long-reduction Laya 2.3x XLA versus MKL finding is not reproduced at these 64/128 reductions."},
+  "jobs": {
+    "baseline_and_policy": "20261107123211-37b615c1",
+    "wide": "20261107123334-3e91f802",
+    "operator_counterfactuals": "20261107123328-89debd14",
+    "rotary_correct_module": "20261107123642-d58a9f7c",
+    "local_dot_comparison": "20261107123409-c0b7b1cd",
+    "actual_test_red_green": "20261107123517-c86a204b",
+    "projection_counterfactuals": "20261107123821-86c56e3a",
+    "highest_and_float64_controls": "20261107123843-3be4f524",
+    "reduction_order": "20261107123906-6df74769",
+    "ggml_same_operands_and_counterfactual": "20261107123753-c6571fbb"
+  },
+  "limitations": ["No GPU result measured.", "Rotary counterfactual widens rotation arithmetic on the existing angle tables; it does not replace the tables.", "The first policy job's wide item used an enum where JAX requires a string and failed; the corrected wide job passed."]
+}
