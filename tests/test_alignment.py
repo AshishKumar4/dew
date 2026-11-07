@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 from diffusion_support import TanhLayer
 from flax import linen as nn
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact_over_orders, distance
+from reference_runs import assert_as_exact_as_recorded
 
 from dew.diffusion import presets
 from dew.inference import TextToImage
@@ -104,7 +104,12 @@ def test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean(kind):
 
 
 COMPOSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "composed.npz")
-PREPROCESSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "preprocessed.npz")
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "repa" / "preprocessed.npz"
+"""tools/venv_reference.py's `repa-preprocessing` recording (tools/repa_worker.py)."""
+PREPROCESSED_SEEDS = 8
+"""Its declared seeds, sized by `seeds_for` paired as the recording confirmed them."""
+OUTPUTS = ("dinov2", "zscore")
+"""The leaves `dew` gives, the site's recorded leaves."""
 
 
 class Network(nn.Module):
@@ -216,19 +221,28 @@ class Unchanged(nn.Module):
         return pixels
 
 
-@pytest.mark.parametrize("spatial_norm", [None, 0.6], ids=["repa", "irepa"])
-def test_the_encoders_input_is_repas_and_irepas_dinov2_preprocessing(spatial_norm):
-    """256-pixel images to an encoder of 224: REPA's `preprocess_raw_image`
-    ("dinov2") and iREPA's `DINOv2Encoder.preprocess`, which agree (the
-    reference checks), /255, ImageNet's normalization and torch's bicubic
-    resize, and under iREPA its `spatial_zscore` (gamma 0.6) of the
-    features, held to the published float64 run by the float64 rule."""
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's two 256-pixel images."""
+    return {"pixels": np.random.default_rng([231, seed]).integers(0, 256, (2, 256, 256, 3), dtype=np.uint8)}
+
+
+def dew(dtype, inputs) -> dict:
+    """The alignment's targets at `dtype`, read through `Unchanged` at 224 pixels: the preprocessed pixels
+    as REPA's features (`dinov2`), and their iREPA spatial z-score at gamma 0.6 (`zscore`)."""
     from dew.inputs import unit_range
 
-    alignment = Alignment("block", encoder=Unchanged(), resolution=224, spatial_norm=spatial_norm)
-    targets = alignment.targets({}, unit_range(PREPROCESSED["pixels"]))
-    name = "dinov2" if spatial_norm is None else "zscore"
-    assert_as_exact_as_the_reference(targets, PREPROCESSED[name], PREPROCESSED[f"{name}_f64"], name)
+    images = unit_range(jnp.asarray(inputs["pixels"]).astype(dtype))
+    return {name: Alignment("block", encoder=Unchanged(), resolution=224, spatial_norm=norm).targets(
+        {}, images) for name, norm in (("dinov2", None), ("zscore", 0.6))}
+
+
+def test_the_encoders_input_is_repas_and_irepas_dinov2_preprocessing():
+    """256-pixel images to an encoder of 224: REPA's `preprocess_raw_image` ("dinov2") and iREPA's
+    `DINOv2Encoder.preprocess`, which agree (the reference checks), /255, ImageNet's normalization and
+    torch's bicubic resize, and under iREPA its `spatial_zscore` (gamma 0.6) of the features, on par with
+    the published code over drawn images (check 1, tools/repa_worker.py's recording)."""
+    assert_as_exact_as_recorded(FIXTURE, "repa-preprocessing", PREPROCESSED_SEEDS, draw, dew,
+                                "DINOv2 preprocessing")
 
 
 def test_a_layer_the_model_lacks_is_refused():

@@ -42,6 +42,22 @@ WorkloadWork = loaded("dew_workload", SOURCE / "telemetry/workload.py").Workload
 trace = loaded("dew_trace", SOURCE / "telemetry/trace.py")
 
 
+def device_memory(stats: Sequence[Mapping[str, int]]) -> dict[str, list[int | None]]:
+    """A run record's memory, of each local device's allocator `stats` (`Device.memory_stats`): its peak and
+    its limit, None where the device states none, never a 0 it did not measure (row 4597: a CPU states no
+    peak)."""
+    return {"peak_allocated_bytes": [found.get("peak_bytes_in_use") for found in stats],
+            "bytes_limit": [found.get("bytes_limit") for found in stats]}
+
+
+def stated_peak_gib(peaks: Sequence[int | None]) -> float | None:
+    """The largest of a record's device `peaks` its devices stated, in GiB; None where none stated one, as
+    `dew.training.memory.peak_memory_gib` reads live devices (train 679's review: a CPU run's summary and
+    compare.py raised on its None peaks)."""
+    stated = [peak for peak in peaks if peak is not None]
+    return max(stated) / 2**30 if stated else None
+
+
 def peak_flops(device_kind: str) -> float | None:
     return gpu_target(device_kind).bf16_peak
 

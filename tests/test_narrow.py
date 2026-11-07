@@ -141,7 +141,8 @@ def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False, see
 
 
 def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
-             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None, dex=False, seed=0):
+             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None, dex=False, seed=0,
+             observe=None):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     `copies` on or off on this device's generation, on `mesh` with every
@@ -156,8 +157,9 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     many rows, whose shape the trainer plans apart. A `dex` decoder's first
     layer is a differential pair (`_decoder`). `seed` draws the batch and the
     start; a float64 process trains a float64 decoder (a check-1 truth,
-    `_on_par_with_the_plain_update`). Returns the state, each step's loss and
-    the trainer, its plan the last shape's."""
+    `_on_par_with_the_plain_update`). `observe(objective, state, batch)` sees
+    each step's state and batch before the step. Returns the state, each
+    step's loss and the trainer, its plan the last shape's."""
     from dew.batch import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
     wide = x64()
@@ -178,6 +180,8 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     losses = []
     for index, current in enumerate(trained + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded):
         step, read = steps_by[bool(long) and index % 2 == 1]
+        if observe is not None:
+            observe(objective, state, current if read is None else read)
         state, loss, *_ = step(state, current if read is None else read)
         losses.append(np.asarray(loss))
     return state, losses, trainer
@@ -196,19 +200,33 @@ def _on_par_with_the_plain_update(optimizer, label: str, **options):
         return (np.int32(seed),)
 
     def clears(inputs):
-        """Whether a mixture's start routes the seed's batch with a margin (`selection_margins.MARGIN`): a
-        top-2 flip between the arms and the float64 truth decides by rounding, which no precision bounds."""
+        """Whether a mixture's run routes with a margin (`selection_margins.MARGIN`) at every step: the
+        parameters each step reads and the batch it reads, through the training forward and the inference
+        one, over the plain run. A top-2 flip between the arms and the float64 truth decides by rounding,
+        which no precision bounds."""
         import selection_margins
+        from arm_arithmetic import summed_as_run
 
+        from dew.algebra import passes
         from dew.batch import TEXT_KEY
-        from dew.training import Trainer
+        from dew.objectives.base import model_rngs
 
-        seed = int(inputs[0])
-        objective, batch = _decoder(mixture=True, rows=options.get("rows", 8), seed=seed)
-        variables = Trainer(objective, optimizer(), key=jax.random.key(seed)).initial_state().variables
-        routed = jax.jit(lambda tree, tokens: objective.token_scores(tree, tokens, routing=True).routing)
-        sown = jax.device_get(routed(variables, batch[TEXT_KEY]))
-        return selection_margins.routing_margin(sown, variables.get("moe", {}), 2) >= selection_margins.MARGIN
+        margins = []
+
+        def observe(objective, state, current):
+            scored = jax.jit(lambda tree, tokens, train: objective.token_scores(
+                tree, tokens, routing=True, train=train,
+                rngs=model_rngs(jax.random.key(0), training=train)).routing, static_argnums=2)
+            variables = jax.device_get(state.variables)
+            for train in (True, False):
+                sown = jax.device_get(scored(variables, current[TEXT_KEY], train))
+                margins.append(selection_margins.routing_margin(sown, variables.get("moe", {}), 2))
+
+        # Under the reference arm's arithmetic (`summed_as_run`, the algebra pass off), so the steps it
+        # checks are the ones the reference runs.
+        with summed_as_run(), passes(on=False):
+            _trained(optimizer(), copies=False, seed=int(inputs[0]), observe=observe, **options)
+        return min(margins) >= selection_margins.MARGIN
 
     if options.get("mixture"):
         import selection_margins

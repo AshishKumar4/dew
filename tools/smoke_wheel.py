@@ -26,14 +26,17 @@ artifact it then uploads; CI's package job runs it on every push.
 from __future__ import annotations
 
 import argparse
-import email.parser
 import runpy
 import subprocess
 import sys
 import tempfile
 import venv
-import zipfile
 from pathlib import Path
+
+from packaging.requirements import Requirement
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check_distribution
 
 INDEX = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/dew/_builds.py"))[
     "PACKAGE_INDEX"]
@@ -89,12 +92,10 @@ def run(*command: str | Path, cwd: Path) -> None:
 
 
 def requirements(wheel: Path) -> list[str]:
-    """The requirements `wheel` installs with no extra, as its metadata states them (Requires-Dist)."""
-    with zipfile.ZipFile(wheel) as archive:
-        [name] = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
-        metadata = email.parser.BytesParser().parsebytes(archive.read(name))
-    return [requirement for requirement in metadata.get_all("Requires-Dist", [])
-            if "extra ==" not in requirement.partition(";")[2]]
+    """The requirements `wheel` installs with no extra on this machine (its Requires-Dist, as
+    tools/check_distribution.py reads it, each marker evaluated with no extra named)."""
+    return [line for line in check_distribution.requirements(wheel)
+            if (marker := Requirement(line).marker) is None or marker.evaluate({"extra": ""})]
 
 
 def smoke(wheel: Path, lowest: bool) -> None:
