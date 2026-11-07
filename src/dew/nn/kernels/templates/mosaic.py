@@ -1012,6 +1012,15 @@ def converts(dtype) -> bool:
     return architecture is not None and "8bit" in architecture.tensor_rates
 
 
+def swizzle_of(ref) -> int:
+    """The swizzle, in bytes, a shared-memory ref's rows are staged at (`staged`): 0 where it is staged plain
+    (`UNSWIZZLED`)."""
+    if not isinstance(ref, state_types.TransformedRef):
+        return UNSWIZZLED
+    return max((transform.swizzle for transform in ref.transforms
+                if isinstance(transform, plgpu_core.UnswizzleRef)), default=UNSWIZZLED)
+
+
 def staged(shape: tuple, dtype, swizzle: int | None = None):
     """A shared-memory block of `shape` whose rows are staged at `swizzle` bytes: as layout inference stages
     them where unstated (the widest that fits); otherwise in 8-row tiles of the swizzle's row, explicitly,
@@ -2179,8 +2188,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         from dew.nn.kernels.templates import gathered  # it builds on `Ring`
 
         del views
-        # A gathered stream's load barriers are shared memory of its own (`gathered.ring`), initialized here,
-        # where every warpgroup opens its rings before the roles split (`Ring.initialized`).
+        # A gathered stream's load barriers are shared memory of its own (`gathered.ring`), initialized here:
+        # a program opens its rings once, every warpgroup before the roles split (`Ring.initialized`; its
+        # gathered rings' users, a forward's `_launched` and `persist`, open them so).
         rings = {name: (Ring if isinstance(scoped['full'].dtype, plgpu_core.BarrierType) else gathered.Ring)(
                      **scoped) for name, scoped in allocated.items()}
         for ring_ in rings.values():

@@ -102,15 +102,25 @@ def test_a_256_wide_decode_step_whose_split_launch_does_not_fit_is_on_par_interp
                     "template decode 256 wide bfloat16", seeds=SEEDS)
 
 @INTERPRETS
+@pytest.mark.parametrize("page", [None, 4])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
-def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interpreted(call):
+def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interpreted(call, page):
     """A decode step whose first row's query is 2^16 times a drawn one (its folded logits past
     `algebra.FOLD_REACH`, where the fold's rounding moves its weights) and whose second row's is drawn: the
     first row walked again in the natural form by the masked launch (`algebra.walked_launches`), the second
-    kept folded, each on par with the reference path (check 1)."""
+    kept folded, each on par with the reference path (check 1); over a dense cache, and a paged pool of
+    4-key pages, whose rewalk at its own tiles reads them through the one-key table its gather does
+    (`attention_mosaic_forward.paged_reads`)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     drawn = _drawn(positions, heads, kv_heads, jnp.bfloat16)
+    table = None if page is None else jnp.asarray(
+        np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page), jnp.int32)
+
+    def pooled(cache):
+        # [B, K, KV, D] as pools [KV, P, page, D] holding each row's keys at the pages its table names.
+        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
+        return pages[:, jnp.argsort(table.reshape(-1))]
 
     def draw(seed: int):
         query, key, value, _ = drawn(seed)
@@ -118,10 +128,14 @@ def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interprete
 
     def ours(query, key, value):
         with generation.assumed("sm90"):
-            return attention_decode.attend(query, key, value, spans, interpret=True)
+            if table is None:
+                return attention_decode.attend(query, key, value, spans, interpret=True)
+            return attention_decode.attend(query, pooled(key), pooled(value), spans, interpret=True,
+                                           table=table)
 
     assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
-                    f"template decode past the fold's reach {call}", seeds=SEEDS)
+                    f"template decode past the fold's reach {call} {'dense' if page is None else page}",
+                    seeds=SEEDS)
 
 
 @INTERPRETS

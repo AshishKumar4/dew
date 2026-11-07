@@ -8,8 +8,6 @@ import functools
 import jax.numpy as jnp
 from jax._src.lib.mlir.dialects import gpu as mgpu_gpu, llvm as mgpu_llvm, nvvm as mgpu_nvvm
 from jax.experimental import pallas as pl
-from jax._src.pallas.mosaic_gpu import core as plgpu_core
-from jax._src.state import types as state_types
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir as mgpu_ir
@@ -33,9 +31,7 @@ class Ring(mosaic.Ring):
     @property
     def swizzle(self) -> int:
         """The bytes the slots' rows are swizzled at (`ring`'s `swizzle`)."""
-        transforms = self.smem.transforms if isinstance(self.smem, state_types.TransformedRef) else ()
-        return next((transform.swizzle for transform in transforms
-                     if isinstance(transform, plgpu_core.UnswizzleRef)), mosaic.SWIZZLE_BYTES)
+        return mosaic.swizzle_of(self.smem)
 
     def initialized(self) -> None:
         stages = self.stages

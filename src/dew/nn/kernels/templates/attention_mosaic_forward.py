@@ -140,7 +140,8 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     anchor keys' stage; the query loads' barriers and
     the consumers' turns' barrier; and its key and value streams in `stages` slots (`Family.streams`), a
     peak walk's keys alone, a paged call's tile of several pages of `page` keys loaded as `paged_reads` reads
-    it (interpreted, a gathered tile a copy a row of each of its swizzled tiles' columns, `Ring.parts`); the
+    it (`interpret`ed, a gathered tile a copy a row of each of its swizzled tiles' columns, `Ring.parts`:
+    the model prices the compiled launch's gather, `MosaicForward.staged_bytes` asking no interpretation); the
     query's stage at its swizzle (`query_swizzle`); a certify form's fp32 stage of a step's sums last
     (`certified_walk`). An fp32 call's `parts` (`MosaicForward.parts`) stage each tile's parts one above the
     other, the query's and each slot's rows `parts` times theirs, a part a copy of its own, its query loads a

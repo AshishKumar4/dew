@@ -81,14 +81,6 @@ def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     return mosaic.swizzle_transforms(dtype, mosaic.copied_swizzle(shape, dtype))
 
 
-def _swizzle(ref) -> int:
-    """The swizzle, in bytes, a shared-memory operand's rows are staged at: 0 where it is staged plain."""
-    if not isinstance(ref, state_types.TransformedRef):
-        return mosaic.UNSWIZZLED
-    return max((transform.swizzle for transform in ref.transforms
-                if isinstance(transform, plgpu_core.UnswizzleRef)), default=mosaic.UNSWIZZLED)
-
-
 def _depth_granule(ref, axis: int, instruction: int) -> int:
     """The depth slice a ref's staging allows: one MMA, or a whole swizzle along its tiled columns (no
     narrower slice of a swizzled tile lowers, FS-NARROW-LOWER1)."""
@@ -98,7 +90,7 @@ def _depth_granule(ref, axis: int, instruction: int) -> int:
                      and transform.permutation == (1, 0) for transform in ref.transforms) % 2
     if axis != (0 if transposed else 1):
         return instruction
-    return max(instruction, mosaic.swizzle_columns(ref.dtype, _swizzle(ref)))
+    return max(instruction, mosaic.swizzle_columns(ref.dtype, mosaic.swizzle_of(ref)))
 
 
 class Slots:
@@ -360,7 +352,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # unchanged (FS-C1-NARROW1-a100).
         instruction = self.fragment_depth(int(rhs.shape[0]))
         lhs_depth = max(_depth_granule(lhs, 1, instruction),
-                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=_swizzle(lhs)))
+                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=mosaic.swizzle_of(lhs)))
         rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
