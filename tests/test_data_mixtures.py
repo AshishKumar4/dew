@@ -1373,9 +1373,9 @@ def test_phases_of_other_batches_each_read_their_own_steps_in_their_own_rows():
 
 
 def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own(tmp_path):
-    """A fit accumulating updates of two steps over phases of 8, then 4, then 8 records a step, each phase's
+    """A fit accumulating updates of two steps over phases of 16, then 8, then 16 records a step, each phase's
     end at an update's (`DataPartition.window`), steps each batch in a program of its own and trains as a
-    fit of one step an update over the same records, its phases batched by 16, 8 and 16: each update pools
+    fit of one step an update over the same records, its phases batched by 32, 16 and 32: each update pools
     one batch's microbatches. A phase of another batch that begins inside an update is refused, naming the
     update."""
     from dew.telemetry.compiles import Compiles
@@ -1392,11 +1392,11 @@ def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own(tmp
         return trainer.fit(compile(chain, read="memory", loading=READ), steps=steps)
 
     with Compiles("step") as compiles:
-        accumulated = fitted(tmp_path / "accumulated", (8, 4, 8), 8, 2)
+        accumulated = fitted(tmp_path / "accumulated", (16, 8, 16), 8, 2)
     assert int(accumulated.step) == 8 and compiles.count == 2
-    whole = fitted(tmp_path / "whole", (16, 8, 16), 4, 1)
+    whole = fitted(tmp_path / "whole", (32, 16, 32), 4, 1)
     assert_same(parameters(accumulated), parameters(whole), "updates of two microbatches a phase")
-    misplaced = compile(phases((first.batch(8), 3), (first.batch(4), None)), read="memory", loading=READ)
+    misplaced = compile(phases((first.batch(16), 3), (first.batch(8), None)), read="memory", loading=READ)
     with pytest.raises(ValueError, match="inside an update of 2 steps"):
         misplaced.train(DataPartition(window=2))
 
