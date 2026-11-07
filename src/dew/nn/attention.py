@@ -22,7 +22,15 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 
-from .attention_kernels import ATTENTION, DECODE, TPU_BACKEND, AttentionCase, decodes, flash_target
+from .attention_kernels import (
+    ATTENTION,
+    DECODE,
+    TPU_BACKEND,
+    AttentionCase,
+    decodes,
+    flash_target,
+    template_infers,
+)
 from .attention_masks import (
     combined_attention_mask,
     key_spans,
@@ -734,6 +742,17 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                         starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
                         key_runs=key_runs,
                         places=places)
+    if resolved == 'inference':
+        # A call no derivative is taken of on the template where it measured faster, a differentiated one's
+        # forward and derivatives xla's (`attention_kernels.template_infers`).
+        def ran(implementation):
+            def run(query, key, value, bias, sinks):
+                return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation)
+            return run
+
+        primal = 'template' if template_infers(query.shape[-1], causal) else 'xla'
+        return _read_nothing(forward_differentiable(ran(primal), ran('xla'), query, key, value, bias, sinks,
+                                                    primal_alone=True), live)
     if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu', 'template'):
         return _read_nothing(call(query, key, value, bias=bias, sinks=sinks, implementation=resolved), live)
 
@@ -746,7 +765,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     return _read_nothing(forward_differentiable(fused, reference, query, key, value, bias, sinks), live)
 
 
-def forward_differentiable(value, tangent, *arrays, precision: str | None = None):
+def forward_differentiable(value, tangent, *arrays, precision: str | None = None, primal_alone: bool = False):
     """`value(*arrays)`, whose JVP is `tangent`'s: a kernel that defines only
     its reverse-mode derivative, or none, takes its derivatives from a
     reference computing the same function, reverse mode as the transposed JVP.
@@ -755,7 +774,9 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
     is not differentiated by TF32 ones; None leaves the products at the
     caller's. Only the arrays a derivative moves are the reference's tangents: a known zero stays
     out of its derivative, where a product's own derivative (`dew.nn.precision.accumulated`'s on a
-    CPU) takes its moving operands alone."""
+    CPU) takes its moving operands alone. With `primal_alone`, `value` runs a call no derivative is taken
+    of, and a differentiated call's output is `tangent`'s too: its forward and its derivatives one
+    kernel's (an fp32 inference call's template beside xla's training, `attention_kernels.DECLARED`)."""
     from jax.custom_derivatives import SymbolicZero
 
     def attending(*arrays):
@@ -763,8 +784,8 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
 
     def rule(primals, tangents):
         live = [index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero)]
-        output = attend(*primals)
         if not live:
+            output = tangent(*primals) if primal_alone else attend(*primals)
             return output, jax.tree.map(jnp.zeros_like, output)
 
         def moved(*moving):
@@ -774,9 +795,9 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
             return tangent(*arrays)
 
         with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
-            differentiated = jax.jvp(moved, tuple(primals[index] for index in live),
-                                     tuple(tangents[index] for index in live))[1]
-        return output, differentiated
+            taken, differentiated = jax.jvp(moved, tuple(primals[index] for index in live),
+                                            tuple(tangents[index] for index in live))
+        return (taken if primal_alone else attend(*primals)), differentiated
 
     attend = contracted("test_a_fused_attention_call_in_forward_mode_holds_every_order")(
         declared_tangent(KernelGlue(), attending, rule, symbolic_zeros=True))

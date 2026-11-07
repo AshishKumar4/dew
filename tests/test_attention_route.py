@@ -354,6 +354,29 @@ def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_refere
                     seeds=SEEDS)
 
 
+@pytest.mark.parametrize(("width", "causal"), [(64, False), (128, True), (128, False)])
+def test_an_fp32_call_on_an_h100_infers_on_the_template_and_trains_on_xla(width, causal):
+    """An fp32 attention call lowered for an H100: one no derivative is taken of runs the template's Mosaic
+    launch where its forward measured faster than xla's (width 64, and causal at 128:
+    `attention_kernels.template_infers`) and xla's attention at 128 full; a differentiated one runs xla's
+    alone, forward and backward, whatever its width (the 'float32 attention' cell's 'inference')."""
+    from kernel_compile import lowered_for
+    shape = jax.ShapeDtypeStruct((1, 512, 2, width), jnp.float32)
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=causal)
+
+    def trained(query, key, value, dout):
+        out, pull = jax.vjp(attend, query, key, value)
+        return out, pull(dout)
+
+    def launches(fn, arity):
+        return "mosaic_gpu" in lowered_for(fn, (shape,) * arity, "sm90").as_text()
+
+    assert launches(attend, 3) == (width == 64 or causal)
+    assert not launches(trained, 4)
+
+
 @pytest.mark.parametrize("name", ["block-causal-documents-window", "valid-documents-window-places"])
 def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
