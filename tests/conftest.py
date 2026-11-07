@@ -16,6 +16,7 @@ import lane_environment
 
 # The lane's environment, before JAX reads it.
 os.environ.update(lane_environment.configured(os.environ))
+import float64_terms
 import hypothesis
 import jax
 import pytest
@@ -39,7 +40,6 @@ hypothesis.settings.load_profile("dew")
 # reuses the first one's compilations. DEW_TEST_NO_CACHE=1 measures the cold
 # cost; the numbers in docs/performance.md were taken with it set.
 _remote = None
-_cached = False
 if os.environ.get("DEW_TEST_NO_CACHE"):
     # JAX's own switch, which a run's setup reads too (`dew._cache.persist_compilations`), for this
     # process and the processes its tests start.
@@ -62,8 +62,16 @@ else:
         for _name in ("jax_compilation_cache_dir", "jax_persistent_cache_min_compile_time_secs",
                       "jax_persistent_cache_min_entry_size_bytes", "jax_persistent_cache_enable_xla_caches"):
             os.environ[_name.upper()] = str(getattr(jax.config, _name))
-        _cached = True
+        # On armada, where each task's container starts cold, a cache the tasks share.
+        _remote = remote_cache.install_from_environment()
 
+# XLA parses XLA_FLAGS once, at the first compile, not when the backend
+# opens. A test that edits the variable, such as `without_deterministic_ops`
+# or the apply_xla_flags tests, would otherwise hand its flags to the whole
+# run whenever it happens to run first: the cuda lane then loses
+# --xla_gpu_deterministic_ops and its bitwise checks see two compilations of
+# one forward disagree. Compiling here fixes the flags set above.
+jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 
 def bundle(node) -> str:
@@ -87,35 +95,17 @@ def pytest_configure(config):
     network-marked tests, which reach the Hub and a GPU node's memory and run on the network lane (`ci.py
     gpu-lane --network`), set aside, counted as deselected. So a plain `pytest tests/test_x.py`, or an armada
     map of it, grades what CI grades, never a real checkpoint's download on a container's disk (gpt-oss-20b's
-    filled one, 2026-10-31). A run that names its marks, an empty expression included, chooses. And a run that
-    runs tests installs the shared compilation cache, before its collection restores the first bundle."""
-    global _remote
+    filled one, 2026-10-31). A run that names its marks, an empty expression included, chooses."""
     if not _marks_named(config):
         config.option.markexpr = load("session", "tools/armada").SELECTION[1]
-    # On armada, where each task's container starts cold, a cache the tasks share (its bundles keyed by the
-    # device, so installing it opens the backend): none for a collection that runs no test.
-    if _cached and not config.option.collectonly:
-        _remote = remote_cache.install_from_environment()
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_runtestloop(session):
-    """Compile once before the first test, which fixes the flags set above: XLA parses XLA_FLAGS once, at
-    the first compile, not when the backend opens, and a test that edits the variable, such as
-    `without_deterministic_ops` or the apply_xla_flags tests, would otherwise hand its flags to the whole
-    run whenever it happens to run first: the cuda lane then loses --xla_gpu_deterministic_ops and its
-    bitwise checks see two compilations of one forward disagree. Here, not at import, so a process that only
-    collects (CI's planner, a job's prepare) opens no backend and starts none of its threads."""
-    if not session.config.option.collectonly:
-        jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 
 def pytest_collectstart(collector):
     """A module's bundle of the shared cache, restored as it is collected, before its tests run; none for a
-    collection that runs no test (`--collect-only`, ci.py's `collect`), which installs no shared cache
-    (`pytest_configure`) and compiles nothing a bundle holds (train 459: 6 GB of programs for 140 files none
-    of whose tests ran, 735 s of a 54 s collection)."""
-    if _remote is not None and isinstance(collector, pytest.Module):
+    collection that runs no test (`--collect-only`, ci.py's `collect`), which compiles nothing a bundle holds
+    (train 459: 6 GB of programs for 140 files none of whose tests ran, 735 s of a 54 s collection)."""
+    running = not collector.config.option.collectonly
+    if _remote is not None and running and isinstance(collector, pytest.Module):
         _remote.opened(bundle(collector))
 
 
@@ -194,9 +184,9 @@ class Unheld(NamedTuple):
 def release_unheld(requirement: str, test: str) -> Unheld | None:
     """Why this interpreter cannot run `test`, marked release_env(`requirement`): a release's own code under
     the package it pins apart from the suite's, a requirement or a wheel's path as CI's release task hands
-    it to its overlay (tools/armada/session.py's `pytest_command`); or None where it holds that package. The
-    reason names CI's own release operation, which runs the test's file under that overlay, where the
-    release's own loader would fail opaquely in its subprocess (row 3576)."""
+    it to its overlay (tools/armada/ci.py `pytest_command`); or None where it holds that package. The reason
+    names CI's own release operation, which runs the test's file under that overlay, where the release's
+    own loader would fail opaquely in its subprocess (row 3576)."""
     from importlib.metadata import PackageNotFoundError, version
 
     from packaging.requirements import Requirement
@@ -265,12 +255,11 @@ the kernel's limit, leaving the next test the other half to compile in; None whe
 
 def release() -> None:
     """Release every compiled executable JAX holds, and the code XLA mapped for it, the float64 terms
-    walk's traces and compiled runs among them (`float64_terms.released`, where a test loaded the walk),
-    and those Dew's own programs keep past jit's caches (`dew.nn.kernels.options.release`)."""
+    walk's traces and compiled runs among them (`float64_terms.released`), and those Dew's own programs
+    keep past jit's caches (`dew.nn.kernels.options.release`)."""
     from dew.nn.kernels import options
 
-    if (terms := sys.modules.get("float64_terms")) is not None:
-        terms.released()
+    float64_terms.released()
     options.release()
     jax.clear_caches()
     gc.collect()
