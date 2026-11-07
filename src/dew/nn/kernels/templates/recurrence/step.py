@@ -400,10 +400,10 @@ their loads overlap: a key a turn, each row's load latency was the step's, one r
 
 
 def _summed_keys(key_width: int, read, term, like: jax.Array):
-    """`sum_k term(k, read(k))` over the keys, each `like`'s shape, in XLA's pairwise order, `UNROLLED` keys a turn of a rolled
-    loop, each turn's reads issued before its first use: a turn's terms by a pairwise tree of its own (each
-    an aligned subtree of the whole), the turns' sums added into the tree above them by the turn's index
-    (`_tree_added`), the index's choices a turn's rather than a key's."""
+    """`sum_k term(k, read(k))` over the keys, each `like`'s shape, in XLA's pairwise order, `UNROLLED` keys
+    a turn of a rolled loop, each turn's reads issued before its first use: a turn's terms by a pairwise tree
+    of its own (each an aligned subtree of the whole), the turns' sums added into the tree above them by the
+    turn's index (`_tree_added`), the index's choices a turn's rather than a key's."""
     def turn(i, partials):
         base = i * UNROLLED
         tiles = [read(base + u) for u in range(UNROLLED)]

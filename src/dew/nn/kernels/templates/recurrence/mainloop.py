@@ -1159,6 +1159,35 @@ def _shifted_keys(call: Call, tiles, keys: jax.Array, prefix: tuple):
                            for i in range(3))
 
 
+def _intra_prefix(call: Call, scanned, decays: jax.Array, keys: int) -> tuple:
+    """A key block's prefix halves (`algebra.scanned_prefix`) of its `decays` `[CHUNK, keys]`, staged in
+    `scanned` (each half's `CHUNK` zero rows, then its running pair, which the shifts read), left there at
+    rows `CHUNK` on and returned in the accumulator's layout. The scan's steps run in a row-major layout,
+    each thread's columns consecutive, whose transfers at any row offset touch every bank once: in the
+    accumulator's, a fragment's 8 rows `keys` words apart shared 8 banks (19.0M bank conflicts on loads in a
+    GH200's Kimi Linear intra launch, M-JS-17); the decay laid in and the prefix out once each."""
+    def half_at(half, rows):
+        return scanned.at[half, rows]
+
+    def stage(pair):
+        # A thread reads other threads' rows: the last shift's reads done before the rows are written again,
+        # and the writes made visible before they are read (`mosaic.synced`).
+        mosaic.synced(call.interpret)
+        for half, value in enumerate(pair):
+            plgpu.store(half_at(half, pl.ds(CHUNK, CHUNK)), value, optimized=False)
+        mosaic.synced(call.interpret)
+        return lambda shift: tuple(_rows_of(half_at(half, pl.ds(CHUNK - shift, CHUNK)), keys)
+                                   for half in (0, 1))
+
+    mosaic.synced(call.interpret)
+    for half in (0, 1):
+        plgpu.store(half_at(half, pl.ds(0, CHUNK)), call.family.zeros((CHUNK, keys)), optimized=False)
+    plgpu.store(half_at(0, pl.ds(CHUNK, CHUNK)), decays, optimized=False)
+    mosaic.synced(call.interpret)
+    stage(algebra.scanned_prefix(_rows_of(half_at(0, pl.ds(CHUNK, CHUNK)), keys), stage, chunk=CHUNK))
+    return tuple(call.family.tile_of(half_at(half, pl.ds(CHUNK, CHUNK))) for half in (0, 1))
+
+
 def _rows_of(ref, keys: int) -> jax.Array:
     """A `[CHUNK, keys]` tile of plain shared rows read in a row-major layout (`plgpu.Layout.WG_STRIDED`):
     each thread its consecutive words, a warp's transfer a contiguous run."""
@@ -1235,45 +1264,16 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
         summed_at, padded = (rest[0], rest[1:]) if outputs > 1 else (None, rest)
         sums, prefixes = outs[:outputs], outs[outputs:]
 
-        def half_at(half, rows):
-            """The scan's `half` at `rows`, its row's `keys` columns."""
-            return scanned.at[half, rows]
-
         def step(index, slots, totals, accumulators):
             slots.acquire_all()
-
-            def stage(pair):
-                # The running pair at rows `CHUNK` on; the `CHUNK` rows above it zero, which its shifts read.
-                # A thread reads other threads' rows: the last shift's reads done before the rows are written
-                # again, and the writes made visible before they are read (`mosaic.synced`).
-                mosaic.synced(call.interpret)
-                for half, value in enumerate(pair):
-                    plgpu.store(half_at(half, pl.ds(CHUNK, CHUNK)), value, optimized=False)
-                mosaic.synced(call.interpret)
-                return lambda shift: tuple(_rows_of(half_at(half, pl.ds(CHUNK - shift, CHUNK)), keys)
-                                           for half in (0, 1))
-
-            mosaic.synced(call.interpret)
-            for half in (0, 1):
-                plgpu.store(half_at(half, pl.ds(0, CHUNK)), family.zeros((CHUNK, keys)), optimized=False)
-            # The scan's steps in a row-major layout, each thread's columns consecutive, whose transfers at
-            # any row offset touch every bank once: in the accumulator's, a fragment's 8 rows `keys` words
-            # apart shared 8 banks (19.0M bank conflicts on loads in a GH200's Kimi Linear intra launch,
-            # M-JS-17); the decay laid in and the prefix out once each.
-            plgpu.store(half_at(0, pl.ds(CHUNK, CHUNK)), stream_tile(slots, "decays", gates).value(),
-                        optimized=False)
-            mosaic.synced(call.interpret)
-            prefix = algebra.scanned_prefix(_rows_of(half_at(0, pl.ds(CHUNK, CHUNK)), keys), stage,
-                                            chunk=CHUNK)
-            stage(prefix)
-            prefix = tuple(family.tile_of(half_at(half, pl.ds(CHUNK, CHUNK))) for half in (0, 1))
+            prefix = _intra_prefix(call, scanned, stream_tile(slots, "decays", gates).value(), keys)
             for half, ref in zip(prefix if scored else (), prefixes, strict=True):
                 gates.store(ref, half, row, CHUNK, h * width + index * keys, keys, family=family,
                             smem=landing["prefix"])
 
             def at_token(token):
                 """The prefix halves at the chunk's `token`, a column's vectors, from the staged scan."""
-                return tuple(family.columns_of(half_at(half, CHUNK + token)) for half in (0, 1))
+                return tuple(family.columns_of(scanned.at[half, CHUNK + token]) for half in (0, 1))
 
             def operand(name):
                 return stream_tile(slots, name, call.given).value().astype(jnp.float32)
