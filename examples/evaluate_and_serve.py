@@ -45,18 +45,15 @@ import tyro
 
 import dew
 from dew.artifacts import uint8_pixels
-from dew.config import TrainerConfig
-from dew.config.lm import LMRunConfig
 from dew.data import ByteTokenizer, Loading, Memory, presets, text
 from dew.data.sources import TokenFiles
 from dew.eval import FID, CLIPScore
 from dew.inference import RunProcessor, TextGeneration, TextToImage
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.lm import LMObjective, Perplexity
+from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.optim import OptimConfig
-from dew.registry import ModelConfig
 from dew.sampling import Sampling
-from dew.training import Evaluation
+from dew.training import Checkpoints, Evaluation, Trainer
 
 GREEDY = Sampling(temperature=0.0)
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -108,8 +105,8 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
     """A two-step byte-level LM run and the held-out tokens it validated on.
 
     The same shape tests/test_inference.py's `make_lm_run` builds: a tiny
-    causal decoder and its checkpoint, whose record names the model, the
-    byte tokenizer the objective decodes through and the preview budget.
+    causal decoder trained in Python and its checkpoint, which records the
+    model, the byte tokenizer the objective decodes through and the preview budget.
     """
     play = "to be or not to be, that is the question. " * 200
     # The held-out tokens as the store `--tokens` names, as `dew data export --tokenizer byte` writes one.
@@ -120,19 +117,17 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
     model = CausalTransformer(emb_features=16, num_layers=1, num_heads=2, head_dim=8, mlp_features=32,
                               vocab_size=256, max_seq_len=48, dtype=jnp.float32,
                               attention_impl="reference")
-    run = LMRunConfig(
-        model=ModelConfig.from_model(model),
-        data=Memory([{"text": play[:6000]}]).repeat().pipe(
-            presets.lm, "byte", seq_len=32, batch=4, pack=None, eos=False).loading(loading),
-        validation=TokenFiles(str(held)).pipe(presets.token_windows, seq_len=32, batch=4).loading(loading),
-        max_new_tokens=8,
-        optim=OptimConfig(learning_rate=1e-3),
-        trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=2,
-                              log_every=1, eval_every=None, checkpoint_every=2,
-                              multi_host=False, compilation_cache_dir=None))
-    objective = LMObjective(model, 32, ema_decay=0.9, processor=RunProcessor(ByteTokenizer()))
-    run.train(objective, run.data, validation=run.validation, name="smoke")
-    return Path(run.trainer.checkpoint_dir) / "smoke", held
+    tokenizer = ByteTokenizer()
+    objective = LMObjective(model, 32, ema_decay=0.9, processor=RunProcessor(tokenizer),
+                            samples=Samples(tokenizer.encode("to be"), 8, decode=tokenizer.decode))
+    run_dir = out / "checkpoints" / "smoke"
+    trainer = Trainer(objective, OptimConfig(learning_rate=1e-3), key=jax.random.key(0),
+                      checkpoints=Checkpoints(str(run_dir)))
+    data = Memory([{"text": play[:6000]}]).repeat().pipe(presets.lm, "byte", seq_len=32, batch=4, pack=None,
+                                                         eos=False).loading(loading)
+    validation = TokenFiles(str(held)).pipe(presets.token_windows, seq_len=32, batch=4).loading(loading)
+    trainer.fit(data, validation=validation, steps=2, log_every=1, checkpoint_every=2)
+    return run_dir, held
 
 
 def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:

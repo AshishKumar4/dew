@@ -375,16 +375,18 @@ def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_
 
 
 def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
-    """Full-weight SFT over packed conversations: the run record `dew.pipeline`
-    reads, and the Hugging Face directory `Pretrained.from_run(...).save(...)` writes beside it."""
+    """Full-weight SFT over packed conversations, built and trained in Python: the run directory
+    `dew.pipeline` reads back as a text task, and the Hugging Face directory
+    `PretrainedDecoder.from_run(...).save(...)` writes beside it."""
+    import dew
+
     smoke("sft_gemma4", tmp_path)
 
     export = tmp_path / "export"
     assert {entry.name for entry in export.iterdir()} >= {
         "config.json", "generation_config.json", "model.safetensors"}
-    run = tmp_path / "checkpoints" / tmp_path.name
-    objective = json.loads((run / "run.json").read_text())["fields"]["objective"]
-    assert objective["name"] == "dew.objectives.lm.objective:LMObjective"
+    task = dew.pipeline(str(tmp_path / "checkpoints" / tmp_path.name))
+    assert task("t5 t7", 2, key=0).text[0] is not None
     assert (export / "tokenizer_config.json").is_file()
     assert "tokenizer_name" not in json.loads((export / "generation_config.json").read_text())
 
@@ -400,8 +402,8 @@ def test_sft_gemma4_validates_on_conversations_it_never_trains_on(tmp_path):
 
     example = load("sft_gemma4", "examples")
     config, tokenizer, chat = example.smoke_config(example.Config(smoke=True, out=tmp_path))
-    run = example.run_config(config, tokenizer, chat)
-    data = compile(run.data, validation=run.validation, provision=True)
+    train, validation = example.windows(config, tokenizer, chat)
+    data = compile(train, validation=validation, provision=True)
     vocabulary = AutoTokenizer.from_pretrained(tokenizer)
     words = [{token for turn in turns
               for token in vocabulary.encode(turn["content"], add_special_tokens=False)}

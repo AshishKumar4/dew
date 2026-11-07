@@ -28,18 +28,15 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-from dew.config import TrainerConfig
-from dew.config.lm import LMRunConfig
-from dew.data import HFTokenizer, Loading, presets
+from dew.data import Dataset, HFTokenizer, Loading, presets
 from dew.data.chat import Role
 from dew.data.sources import Read, source as data_source
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.optim import OptimConfig
-from dew.registry import ModelConfig
-from dew.state import TrainState
-from dew.training import MeshSpec, prepare_process
+from dew.sampling import Sampling
+from dew.training import Checkpoints, MeshSpec, Trainer, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_MODEL = FIXTURES / "hf/gemma4-ple"
@@ -94,35 +91,21 @@ def smoke_config(config: Config) -> tuple[Config, str, str]:
     return small, str(SMOKE_VOCAB), str(write_conversations(SMOKE_CONVERSATIONS, config.out))
 
 
-def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
-    """Everything the run is but its model, which the checkpoint decides
-    (`main` records the loaded one)."""
-    smoke = config.smoke
+def windows(config: Config, tokenizer: str, chat: str) -> tuple[Dataset, Dataset]:
+    """The run's training windows and its validation's: every conversation but the first `held_out`
+    rendered with the checkpoint's chat template and packed, and those first ones alone."""
     # A row budget is the split slice `datasets` already understands.
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
     # A Hub split is downloaded and prepared where the run first reads it; a local file, as the
     # smoke run's, reads as it is.
     train, held = data_source(chat, split=split).holdout(records=config.held_out)
-    loading = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1) if smoke else Loading(workers=4)
-    windows = {"seq_len": config.sequence_length, "batch": config.batch_size, "messages": config.column}
-    return LMRunConfig(
-        data=(train.shuffle(seed=0).repeat().pipe(presets.sft, tokenizer, **windows, long="chunk")
-              .read(config.data_read).loading(loading)),
-        validation=(held.pipe(presets.sft, tokenizer, **windows, records=config.batch_size)
-                    .read(config.data_read).loading(loading)),
-        tokenizer=tokenizer,
-        max_new_tokens=4 if smoke else 64,
-        optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
-                          clip_grads=1.0),
-        # A smoke run stays out of any process pool; a real run joins one
-        # when a cluster started it and runs alone otherwise.
-        trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
-                              steps=config.steps,
-                              accumulation=config.accumulation, log_every=1 if smoke else 20,
-                              eval_every=config.steps, checkpoint_every=config.steps,
-                              multi_host=False if smoke else None,
-                              compilation_cache_dir=None if smoke else
-                              TrainerConfig().compilation_cache_dir))
+    loading = (Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1) if config.smoke
+               else Loading(workers=4))
+    shape = {"seq_len": config.sequence_length, "batch": config.batch_size, "messages": config.column}
+    return ((train.shuffle(seed=0).repeat().pipe(presets.sft, tokenizer, **shape, long="chunk")
+             .read(config.data_read).loading(loading)),
+            (held.pipe(presets.sft, tokenizer, **shape, records=config.batch_size)
+             .read(config.data_read).loading(loading)))
 
 
 def main(config: Config) -> Path:
@@ -130,17 +113,15 @@ def main(config: Config) -> Path:
         config, tokenizer, chat = smoke_config(config)
     else:
         tokenizer, chat = config.model, config.dataset
+    data, validation = windows(config, tokenizer, chat)
+    # A smoke run stays out of any process pool; a real run joins one when a cluster started it and runs
+    # alone otherwise.
+    prepare_process(multi_host=False if config.smoke else None)
 
-    run = run_config(config, tokenizer, chat)
-    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
-                    run.trainer.compilation_cache_dir)
-    # Only now: counting devices opens the backend, which has to come after
-    # the pool forms, and a pool's count is every process's devices.
-    run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
-
+    new_tokens = 4 if config.smoke else 64
     source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
                                     attention_impl="xla" if config.smoke else "auto",
-                                    max_seq_len=config.sequence_length + run.max_new_tokens,
+                                    max_seq_len=config.sequence_length + new_tokens,
                                     on_host=True)  # the trainer places it over its fsdp mesh
     words = HFTokenizer(tokenizer)
     # The run decodes through this tokenizer, so its checkpoints record its name.
@@ -148,19 +129,20 @@ def main(config: Config) -> Path:
         source, config.sequence_length,
         loss_role=Role.ASSISTANT,
         processor=RunProcessor(words),
-        samples=Samples(words.encode("user : hello "), run.max_new_tokens,
-                        sampling=run.sampling, decode=words.decode))
+        samples=Samples(words.encode("user : hello "), new_tokens,
+                        sampling=Sampling(temperature=0.8, top_k=40), decode=words.decode))
 
-    # run.json records the model as loaded, so `dew.pipeline` and the export
-    # rebuild the checkpoint's own architecture at the precision it trained in.
-    run = replace(run, model=ModelConfig.from_model(source.model))
+    run_dir = config.out / "checkpoints" / config.out.name
+    # Only now: counting devices opens the backend, which has to come after the pool forms, and a pool's
+    # count is every process's devices.
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
+                                             clip_grads=1.0).build(config.steps),
+                      key=jax.random.key(0), mesh=MeshSpec(fsdp=jax.device_count()),
+                      accumulation=config.accumulation, checkpoints=Checkpoints(str(run_dir)))
+    state = trainer.fit(data, validation=validation, steps=config.steps, log_every=1 if config.smoke else 20,
+                        eval_every=config.steps, checkpoint_every=config.steps, metrics=[Perplexity()])
 
-    name = config.out.name
-    state: TrainState = run.train(objective, run.data, validation=run.validation, name=name,
-                                  metrics=(Perplexity(),),
-                                  summary={"model": dict(source.model_config)})
-
-    run_dir = Path(run.trainer.checkpoint_dir) / name
+    # The checkpoint records the decoder as it was loaded, so the export rebuilds its own architecture.
     export = config.out / "export"
     PretrainedDecoder.from_run(str(run_dir)).save(export)
     print(f"trained {int(state.step)} steps; run {run_dir}; exported {export}")

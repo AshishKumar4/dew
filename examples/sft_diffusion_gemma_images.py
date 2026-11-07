@@ -35,16 +35,15 @@ import tyro
 
 import dew
 from dew.batch import VALID_ROWS
-from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, Source, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
+from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.objectives.lm import Perplexity
 from dew.optim import Cosine, OptimConfig
-from dew.registry import ModelConfig
-from dew.training import MeshSpec, prepare_process
+from dew.training import Checkpoints, MeshSpec, Trainer, prepare_process
 
 EOS, PAD, IMAGE = 256, 257, 258
 """The ids past the 256 bytes: end of caption, padding and the image placeholder."""
@@ -245,37 +244,30 @@ def main(config: Config) -> Path:
     config = sized(config)
     (config.out / "data").mkdir(parents=True, exist_ok=True)
     parts = splits(config)
-    train, test = image_data(config, parts)
     labels = class_names(parts)
     record = model_config(config)
     model = build(record, dtype="float32" if config.smoke else "bfloat16")
-    run = RunConfig(
-        model=ModelConfig.from_model(model), data=train, validation=test,
-        objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
-                                                      "pad_token_id": PAD, "eos_token_ids": (EOS,)}),
-        optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, learning_rate=Cosine(
-            peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
-            end_value=config.learning_rate / 20)),
-        # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
-        trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=2 if config.smoke else 1,
-                              steps=config.steps,
-                              log_every=1 if config.smoke else 100, eval_every=config.eval_every,
-                              checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1),
-                              multi_host=False, compilation_cache_dir=None))
-    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
-                    run.trainer.compilation_cache_dir)
-    objective = run.objective.build(model=model)
+    objective = BlockDiffusionObjective(model, prompt_length=config.prompt_tokens, pad_token_id=PAD,
+                                        eos_token_ids=(EOS,))
+    optimizer = OptimConfig(weight_decay=0.05, clip_grads=1.0, learning_rate=Cosine(
+        peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
+        end_value=config.learning_rate / 20)).build(config.steps)
+    name = "flowers-caption"
+    run_dir = config.out / "checkpoints" / name
+    prepare_process(multi_host=False)
+    # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
+    trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
+                      checkpoints=Checkpoints(str(run_dir), keep=2 if config.smoke else 1))
     data = caption_data(config, parts, labels)
     started = time.perf_counter()
-    name = "flowers-caption"
-    state = run.train(objective, data, name=name, metrics=(Perplexity(),),
-                      summary={"dataset": config.dataset, "classes": len(labels)})
+    state = trainer.fit(data, steps=config.steps, log_every=1 if config.smoke else 100,
+                        eval_every=config.eval_every, checkpoint_every=config.eval_every,
+                        metrics=[Perplexity()])
     trained = time.perf_counter()
 
     # The other half, from the files alone: the run directory loads as the
     # canvas task its objective saved, and it captions every test image, as
     # the trained model in this process does.
-    run_dir = Path(run.trainer.checkpoint_dir) / name
     restored = dew.pipeline(str(run_dir))
     live = objective.pipeline(state)
     captions = captioned(restored, data, config, labels)
