@@ -483,6 +483,35 @@ def test_a_request_with_images_reads_its_context_beside_them():
                               scored(reading, [("one two three", "ten")], images))
 
 
+def test_a_context_reading_tasks_bundle_carries_its_cross_attention_and_refuses_to_export(tmp_path):
+    """A task whose backbone reads its decision context through cross-attention is a bundle a run starts
+    from (`PretrainedDecision.of`), its backbone its source family's carrying the cross-attention, so the
+    task it declares again (`Decide.released`) is the task, model and every weight; its release, which no
+    family writes, is refused as it is written (row 4776's review: the bundle was refused as it was made,
+    and a run from such a run's native release could not start)."""
+    from dew.data.text import HFTokenizer
+    from dew.decision import JointLayout
+    from dew.decision.sources import PretrainedDecision
+
+    directory = LLAMA.parent / "qwen38-dense-tiny"
+    source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    tokenizer = HFTokenizer(str(directory), local_files_only=True)
+    layout = JointLayout(max_len=1024)
+    objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 32), key=0),
+                                  tokenizer=tokenizer, layout=layout)
+    task = Decide(objective.model, opened(objective.init(jax.random.key(0))), layout, tokenizer,
+                  objective.specials, processor=source.processor)
+    bundle = PretrainedDecision.of(task)
+    again = Decide.released(bundle)
+    assert again.model == task.model
+    assert jax.tree.structure(again.variables) == jax.tree.structure(task.variables)
+    for read, held in zip(jax.tree.leaves(again.variables), jax.tree.leaves(task.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(read), np.asarray(held), strict=True)
+    with pytest.raises(ValueError):
+        bundle.save(tmp_path / "saved")
+    assert not (tmp_path / "saved" / "config.json").exists()
+
+
 def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
     """With `context_encoder="backbone"` the cross-attention reads the backbone's final states over the
     context, its own pass (`encode_context`): the decision states are the backbone's over the row with
