@@ -245,8 +245,8 @@ def test_the_diffusion_denoisers_experts_are_as_exact_as_the_reference_in_bf16()
     )
 
     # Eager experts: the grouped matmul has no float64 kernel.
-    loaded = DiffusionGemmaForBlockDiffusion.from_pretrained(str(directory), dtype=torch.float32,
-                                                             local_files_only=True, experts_implementation="eager")
+    loaded = DiffusionGemmaForBlockDiffusion.from_pretrained(
+        str(directory), dtype=torch.float32, local_files_only=True, experts_implementation="eager")
     network = next(module for module in loaded.modules() if isinstance(module, DiffusionGemmaTextExperts))
     narrow = copy.deepcopy(network).to(torch.bfloat16)
     tokens, width = 32, network.hidden_dim
