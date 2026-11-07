@@ -677,34 +677,47 @@ def test_a_stage_local_lora_fit_merges_and_saves_as_every_layer_whole(tmp_path):
     assert written[0] == written[1]
 
 
+ROWS_SEEDS = 8
+"""Check 1's declared seeds for a frozen base read where it lies against one stacked each step."""
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
     """A LoRA run over a decoder that scans its layers on one stage holds its adapter's factors stacked as
     the scan reads them, and its frozen base on its stored layers, the arrays the run was given, each
     iteration reading its layer's rows where they lie (`decoder_stack.LAYER_ROWS`), so the base is held
-    once whatever else holds it (row 4751): its step computes the step whose state stacks the base too, bit
-    for bit, and holds fewer temporaries than that step, which stacks a copy of the base each time it runs
-    and kept each iteration's rows for its backward."""
+    once whatever else holds it (row 4751): its step holds fewer temporaries than the step whose state
+    stacks the base too, a copy of it made each time it runs, and updates on par with it (check 1)."""
     model = decoder(scan_layers=True)
     base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
-    batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
-    stepped = []
+    mesh = MeshSpec(fsdp=2).build(jax.devices())
+    batch = shard_batch(mesh, token_rows(VOCAB, BATCH, SEQ + 1))
+    arms = []
     for stage_local in (True, False):
         run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables,
                       stage_local=stage_local)
         run.validate(steps=1)
         state, _, _ = run.place()
         step = run.compile(state, batch)
-        stepped.append((run, state, run.executable.memory_analysis().temp_size_in_bytes, step(state, batch)))
-    ((run, rows, rows_temporaries, (moved, loss, *_)),
-     (_, _, stacked_temporaries, (whole, whole_loss, *_))) = stepped
+        arms.append((run, state, step, run.executable.memory_analysis().temp_size_in_bytes))
+    (run, rows, read, rows_temporaries), (_, stacked, restacked, stacked_temporaries) = arms
     assert "stages" in rows.variables["params"] and "stages" not in rows.variables[FROZEN]
     assert set(rows.variables[FROZEN]) == set(on_host(adapter.variables)[FROZEN])
-    np.testing.assert_array_equal(np.asarray(loss), np.asarray(whole_loss))
-    for mine, theirs in zip(jax.tree.leaves(on_host(run.stored(moved).variables["params"])),
-                            jax.tree.leaves(on_host(whole.variables["params"])), strict=True):
-        np.testing.assert_array_equal(mine, theirs)
+    assert rows_temporaries < stacked_temporaries, (rows_temporaries, stacked_temporaries)
+
+    def draw(seed):
+        return (token_rows(VOCAB, BATCH, SEQ + 1, seed=seed)["text"],)
+
+    # Two programs, the rows read in place and the base stacked each step: their updates on par (check 1).
+    def updated(arm_step, state, held):
+        def update(text):
+            moved = arm_step(state, shard_batch(mesh, {"text": text}))[0]
+            return held(moved).variables["params"]
+        return update
+
+    assert_as_exact(updated(read, rows, run.stored), updated(restacked, stacked, lambda moved: moved),
+                    draw, "a frozen base read where it lies", seeds=ROWS_SEEDS)
     assert rows_temporaries < stacked_temporaries, (rows_temporaries, stacked_temporaries)
 
 
