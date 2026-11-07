@@ -722,8 +722,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     prologue_operands, epilogue_operands = sides
     m, n, k, g = shape
     block_m, block_n, block_k, consumers = tiles.block_m, tiles.block_n, tiles.block_k, tiles.warpgroups
-    pair = tiles.cluster
-    share = block_m // consumers
+    pair, share = tiles.cluster, block_m // consumers
     part = (share, block_n)
     # A stream for each operand that follows the steps, but a vector a family does not copy, which its
     # step reads from global memory; a prologue side operand without depth is loaded once a tile.
@@ -1541,10 +1540,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
 @tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
                       'prologue_axes', 'exact_sums', 'tail', 'k_major'))
 def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
-                      multiprocessors: int, interpret, prologue, prologue_operands: tuple,
-                      prologue_axes: tuple, exact_sums: bool,
-                      tail: tail_of.Tail | None = None, k_major: bool = False,
-                      step_scales: tuple | None = None) -> jax.Array:
+                   multiprocessors: int, interpret, prologue, prologue_operands: tuple, prologue_axes: tuple,
+                   exact_sums: bool, tail=None, k_major: bool = False, step_scales=None) -> jax.Array:
     """Dew: `tgmm`'s product at a tile `tiles.warpgroups` consumer roles compute, each its share of the depth
     by all the columns, one MMA a step (two: CUTLASS's cooperative sm90 schedule), on its instruction
     family's bundle (`family_of`), its streams running across the persistent loop's tiles where the family
@@ -1618,8 +1615,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                     hook = (None if prologue is None
                             else (prologue, prologue_axes, stepped, fixed, fixed_refs, read_refs))
                     return _staged_halves(family, [slots[name] for name in names], (index, *group),
-                                          (mine_depth, mine_columns), hook,
-                                          halves)
+                                          (mine_depth, mine_columns), hook, halves)
 
                 # An empty group's tile reads none and stores zeros.
                 scaling = _tgmm_scaling(step_scales is not None, mine_depth)
@@ -1656,8 +1652,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
         jax.ShapeDtypeStruct((multiprocessors, 2, consumers, *part), jnp.float32),)
     kernel = family.kernel(body, out_type=(out_type, *workspace),
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
-                           consumers=consumers,
-                           interpret=interpret, approx_math=False, name="dew_tgmm",
+                           consumers=consumers, interpret=interpret, approx_math=False, name="dew_tgmm",
                            resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands,
                                                    out_type))
