@@ -132,8 +132,10 @@ def _runs(query_ids: jax.Array | None, key_ids: jax.Array | None, batch: int, qu
     def row(wanted, held):
         order = jnp.argsort(held, stable=True)
         ordered = held[order]
-        return (order.astype(jnp.int32), jnp.searchsorted(ordered, wanted, side="left").astype(jnp.int32),
-                jnp.searchsorted(ordered, wanted, side="right").astype(jnp.int32))
+        # Each search's log2(K) steps unrolled into one program (`dew.nn.documents._searched`).
+        return (order.astype(jnp.int32),
+                jnp.searchsorted(ordered, wanted, side="left", method="scan_unrolled").astype(jnp.int32),
+                jnp.searchsorted(ordered, wanted, side="right", method="scan_unrolled").astype(jnp.int32))
 
     return jax.vmap(row)(query_ids, key_ids)
 
@@ -158,7 +160,8 @@ def _searched(values: jax.Array, lo: jax.Array, hi: jax.Array, wanted: jax.Array
         return jnp.where(live & right, middle + 1, low), jnp.where(live & ~right, middle, high)
 
     steps = max(values.shape[1], 1).bit_length()
-    return jax.lax.fori_loop(0, steps, step, (lo, hi))[0]
+    # Unrolled into one program: a loop ran each step as a launch of its own (`dew.nn.documents._searched`).
+    return jax.lax.fori_loop(0, steps, step, (lo, hi), unroll=True)[0]
 
 
 def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_window: int | None = None,
