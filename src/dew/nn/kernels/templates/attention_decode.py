@@ -198,9 +198,9 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     across programs (`merges`), else in XLA from their fp32 states (`algebra.merged_slices`), and unpacked.
     Its logits folded where the algebra folds them, the rows the fold's reach or the headroom guard rewalks
     walked again natural over those rows alone, with no branch read on the host (`MosaicForward.masked`, row
-    1978). A quantized cache's keys and values are its codes (int8 or an FP8) and `scales` their keys' and values'
-    `[B, KV, K]` fp32 in each row's key order (a dense cache's head-major scales, a paged pool's gathered by
-    its table), dequantized in the walk (`attention_mosaic.forward`'s `scales`, ledger 3624)."""
+    1978). A quantized cache's keys and values are its codes (int8 or an FP8) and `scales` their keys' and
+    values' `[B, KV, K]` fp32 in each row's key order (a dense cache's head-major scales, a paged pool's
+    gathered by its table), dequantized in the walk (`attention_mosaic.forward`'s `scales`, ledger 3624)."""
     hooks = Hooks() if hooks is None else hooks
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
