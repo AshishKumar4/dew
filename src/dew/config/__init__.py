@@ -1704,11 +1704,9 @@ class RunConfig:
 
     def built_fresh(self) -> None:
         """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
-        `Pretrained.load` builds of a source (`source_keywords`) reaches nothing such a run builds. How
-        its layers execute (`EXECUTED`), which a saved run records whatever its source, is no such word."""
-        unsourced = SourceOptions()
-        executed = {name: getattr(unsourced, name) for name in self.EXECUTED if hasattr(unsourced, name)}
-        if dataclasses.replace(self.source, **executed) != unsourced:
+        `Pretrained.load` builds of a source (`source_keywords`), how it scans its layers among it, reaches
+        nothing such a run builds, whose own fields say it (`--model.scan_layers`)."""
+        if self.source != SourceOptions():
             raise ValueError(f"--source says what a run builds of the source it loads, and this "
                              f"{type(self).__name__} loads none: its model is built from --model, whose "
                              "own fields say it; or start the run from a source")

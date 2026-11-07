@@ -177,11 +177,13 @@ def _rows_read(tree, index: jax.Array):
 
 def _rows_recomputed(remat: RematPolicy | None) -> Callable[..., bool]:
     """What a scanned run's body that reads rows keeps for the backward: what its layer's own remat keeps
-    (`remat`: everything where it has none, `RematPolicy.checkpoint_policy` otherwise, nothing where that is
-    None), but never the rows it read (`_rows_read`, named `LAYER_ROWS`), which the backward reads again from
-    the iteration's index. JAX 0.12's `save_anything_except_these_names` saves every value, the names it is
-    given among them, which kept each iteration's rows among the scan's residuals (row 4751)."""
-    layer = ((lambda *_, **__: True) if remat is None
+    (`remat`: everything where it runs no remat, which a block that recomputes named residuals alone does
+    too, recomputing them itself (`RematPolicy.recompute`, `DecoderBlock.__call__`);
+    `RematPolicy.checkpoint_policy` otherwise, nothing where that is None, the full rung), but never the rows
+    it read (`_rows_read`, named `LAYER_ROWS`), which the backward reads again from the iteration's index.
+    JAX 0.12's `save_anything_except_these_names` saves every value, the names it is given among them, which
+    kept each iteration's rows among the scan's residuals (row 4751)."""
+    layer = ((lambda *_, **__: True) if remat is None or remat.recompute
              else remat.checkpoint_policy() or jax.checkpoint_policies.nothing_saveable)
 
     def policy(primitive: jax.extend.core.Primitive, *avals, **params) -> bool:
@@ -918,20 +920,26 @@ class StackView:
                 if (name := self._inside_name(first, count, prefix)) is not None
                 and (period := self._period(first, count)) > 1]
 
+    def _stacked_groups(self) -> list[tuple[tuple[str, ...], list[str]]]:
+        """Every group of stored layers the view stacks into one leaf, named run and periodic position
+        alike: `(keys, layers)`, its names below `stages` (a run's inside name, and a periodic run's position
+        after it) and its stored layers in their rows' order."""
+        return [((name,), layers) for name, layers, _ in self._named_runs()] + [
+            ((name, f'{prefix}{offset}'), layers) for name, prefix, positions in self._periodic_runs()
+            for offset, layers in enumerate(positions)]
+
     def holds(self, tree: Mapping) -> bool:
         """Whether `tree`, a collection's subtree where the stack is stored, holds some run of the view,
         on its stored layers or stacked by stage (`stage_form`)."""
         staged = tree.get('stages', {})
-        runs = [(name, layers) for name, layers, _ in self._named_runs()] + [
-            (name, [layer for position in positions for layer in position])
-            for name, _, positions in self._periodic_runs()]
-        return any(name in staged or any(layer in tree for layer in layers) for name, layers in runs)
+        return any(keys[0] in staged or any(layer in tree for layer in layers)
+                   for keys, layers in self._stacked_groups())
 
     def splits(self, tree: Mapping) -> bool:
-        """Whether `tree` holds some of a run's stored layers and not the others, as a collection
-        that keeps part of a stack (layers frozen by index) does."""
+        """Whether `tree` holds some of a group's stored layers and not the others (`_stacked_groups`), as
+        a collection that keeps part of a stack (layers frozen by index) does."""
         return any(0 < sum(layer in tree for layer in layers) < len(layers)
-                   for _, layers, _ in self._named_runs())
+                   for _, layers in self._stacked_groups())
 
     def run_layers(self, name: str) -> tuple[list[str], int] | None:
         """The stored layers of the run named `name` inside, in `stage_form`'s order, and how many
