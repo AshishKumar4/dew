@@ -240,7 +240,8 @@ def assert_lights_what_it_shows(tokenizer, variables, frames: np.ndarray, mean: 
     assert np.count_nonzero(lit & shown) > np.count_nonzero(~lit & shown)
     assert np.count_nonzero(~lit & ~shown) > np.count_nonzero(lit & ~shown)
     assert not np.any(mean > 0)
-    assert np.mean(np.square(rebuilt - frames)) < np.mean(np.square(mean - frames))
+    # Its squared error fell below the mean frame's: their difference's sign.
+    assert np.mean(np.square(mean - frames)) - np.mean(np.square(rebuilt - frames)) > 0
 
 
 def test_a_tokenizer_reconstructs_the_moving_squares_it_trained_on():
