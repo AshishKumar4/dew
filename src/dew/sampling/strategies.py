@@ -74,6 +74,8 @@ class Draws:
     row's count and the slots above it carry no likelihood. `terminated`
     marks a row a stopping criterion ended, as opposed to one that ran out
     of budget or that a length limit cut short (`decoding.Finish`).
+    `margins`, `[rows, budget]`, is how decisively a search chose at each
+    step, where it was asked to report it (`Beam.margins`), else None.
     """
 
     tokens: jax.Array
@@ -81,6 +83,7 @@ class Draws:
     behavior_log_probs: jax.Array
     raw_log_probs: jax.Array
     terminated: jax.Array
+    margins: jax.Array | None = None
 
 
 Advance = Callable[[DecoderState, jax.Array, jax.Array], DecoderState]
@@ -369,6 +372,16 @@ class Beam:
     `DecodeOps.reindex`, so a branched beam decodes exactly like a
     separately selected prefix. Parameters are never mapped.
 
+    `margins` asks the search to report how decisively it chose: at each
+    step, the smallest relative gap between the last score one of its
+    rankings kept and the first it passed over, among the candidates, the
+    live beams and the completed set (`Draws.margins`,
+    `Generation.margins`, each prompt's for every one of its rows); a step
+    a prompt no longer extends reports infinity. A margin under the
+    rounding of the scores' arithmetic means a run at another precision
+    could have chosen otherwise. Without it the search's program is
+    unchanged.
+
     `n` is how many completed beams to return, which is separate from the
     search width, and an `n` larger than `width` raises `ValueError`. A
     selected path is a search result and not a draw, so its behaviour log
@@ -380,6 +393,7 @@ class Beam:
     length_penalty: float = struct.field(pytree_node=False, default=1.0)
     early_stopping: bool | str = struct.field(pytree_node=False, default=False)
     stop_ids: int = struct.field(pytree_node=False, default=1)
+    margins: bool = struct.field(pytree_node=False, default=False)
 
     def __post_init__(self) -> None:
         if type(self.width) is not int or self.width < 1:
@@ -403,6 +417,18 @@ class Beam:
         return _beam_search(state, start, ops, transform, stopping, budget, n, self)
 
 
+def _ranked(scores: jax.Array, k: int, margins: bool):
+    """`lax.top_k(scores, k)`'s values and indices, and where `margins` the gap between the k-th score and
+    the next over the larger of the two's magnitudes, else None; infinite where the next is a dead slot's
+    (`DEAD`, an empty completed slot or a beam no longer scored), which no live hypothesis is near."""
+    if not margins:
+        return (*lax.top_k(scores, k), None)
+    values, index = lax.top_k(scores, k + 1)
+    kept, passed = values[..., k - 1], values[..., k]
+    scale = jnp.maximum(jnp.maximum(jnp.abs(kept), jnp.abs(passed)), jnp.finfo(values.dtype).tiny)
+    return values[..., :k], index[..., :k], jnp.where(passed > DEAD / 2, (kept - passed) / scale, jnp.inf)
+
+
 def _beam_rows(parent, prompts: int, width: int):
     """Cache rows of a `[prompts, count]` parent-beam index."""
     return (parent + jnp.arange(prompts)[:, None] * width).reshape(-1)
@@ -421,8 +447,9 @@ def _beam_continue(state: DecoderState, beams: StepState, ops: DecodeOps, parent
 
 
 def _completed(done: Completed, search: Beam, top, extending, position: int, *,
-               best, hit, ended, tokens, raw) -> Completed:
-    """The `width` best completed hypotheses, after this step's arrivals.
+               best, hit, ended, tokens, raw) -> tuple[Completed, jax.Array | None]:
+    """The `width` best completed hypotheses, after this step's arrivals, and their ranking's margin where
+    the search reports them (`_ranked`).
 
     A candidate joins the set at its length-penalized score, and only the
     ones a criterion ended this step, in the live half of the ranking, can
@@ -435,7 +462,7 @@ def _completed(done: Completed, search: Beam, top, extending, position: int, *,
     normalized = normalized + (blocked | ~extending).astype(jnp.float32) * DEAD
     normalized = normalized + (~(hit & top)).astype(jnp.float32) * DEAD
     merged = jnp.concatenate([done.score, normalized], axis=1)
-    order = lax.top_k(merged, width)[1]
+    _, order, margin = _ranked(merged, width, search.margins)
     return Completed(
         score=jnp.take_along_axis(merged, order, axis=1),
         tokens=gather_positions(jnp.concatenate([done.tokens, tokens], axis=1), order),
@@ -446,7 +473,7 @@ def _completed(done: Completed, search: Beam, top, extending, position: int, *,
                              jnp.full((prompts, keep), position + 1, jnp.int32)], axis=1),
             order, axis=1),
         terminated=jnp.take_along_axis(
-            jnp.concatenate([done.terminated, ended & top], axis=1), order, axis=1))
+            jnp.concatenate([done.terminated, ended & top], axis=1), order, axis=1)), margin
 
 
 class _BeamCarry(NamedTuple):
@@ -480,8 +507,9 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
     top = (jnp.arange(keep) < width)[None, :]
 
     def step(carry: _BeamCarry, position):
-        best, index, chosen, vocab = _beam_candidates(carry.state, carry.beams, transform, carry.live, real,
-                                                      carry.extending, prompts, width, keep)
+        best, index, chosen, vocab, ranked = _beam_candidates(carry.state, carry.beams, transform, carry.live,
+                                                              real, carry.extending, prompts, width, keep,
+                                                              search.margins)
         parent, token = index // vocab, (index % vocab).astype(jnp.int32)
 
         branch = _beam_rows(parent, prompts, width)
@@ -498,12 +526,13 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         traced = traced.at[:, :, position].set(chosen)
 
         alive = best + hit.astype(jnp.float32) * DEAD
-        forward = lax.top_k(alive, width)[1]
+        _, forward, kept = _ranked(alive, width, search.margins)
         state, beams, selected = _beam_continue(carry.state, carry.beams, ops, parent, token, forward,
                                                 real, prompts, width)
 
-        done = _completed(carry.done, search, top, carry.extending & (position < limit), position,
-                          best=best, hit=hit, ended=ended, tokens=grown, raw=traced)
+        searching = carry.extending & (position < limit)
+        done, completed = _completed(carry.done, search, top, searching, position,
+                                     best=best, hit=hit, ended=ended, tokens=grown, raw=traced)
 
         live = gather_positions(alive, forward)
         # `never` estimates the best score still reachable from the whole
@@ -515,20 +544,24 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         state = ops.advance(state, selected, real)
         drawn = gather_positions(grown, forward).reshape(prompts * width, budget)
         scored = gather_positions(traced, forward).reshape(prompts * width, budget)
-        return _BeamCarry(state, beams, live, drawn, scored, extending, done), None
+        margin = None if ranked is None else jnp.where(
+            searching[:, 0], jnp.minimum(jnp.minimum(ranked, kept), completed), jnp.inf)
+        return _BeamCarry(state, beams, live, drawn, scored, extending, done), margin
 
     initial = _beam_start(state, start, ops, prompts, width, budget)
-    finished, _ = lax.scan(step, initial, jnp.arange(budget))
-    return _beam_draws(finished.done, start, prompts, n, budget)
+    finished, margins = lax.scan(step, initial, jnp.arange(budget))
+    return _beam_draws(finished.done, start, prompts, n, budget,
+                       None if margins is None else jnp.repeat(margins.T, n, axis=0))
 
 
 def _beam_candidates(state: DecoderState, beams: StepState, transform, live, real, extending,
-                     prompts: int, width: int, keep: int):
+                     prompts: int, width: int, keep: int, margins: bool):
     """The best `keep` continuations of the live beams, over all of them.
 
     Returns each candidate's running score, the flat `beam * vocab` index it
-    came from, the model's own log probability of its token, and the
-    vocabulary that index is read against. A beam that is real, still scored
+    came from, the model's own log probability of its token, the
+    vocabulary that index is read against, and the ranking's margin where
+    `margins` asks for it (`_ranked`). A beam that is real, still scored
     and worth extending has to hold a distribution; one that is not is
     refused rather than searched.
     """
@@ -541,9 +574,10 @@ def _beam_candidates(state: DecoderState, beams: StepState, transform, live, rea
     checkify.check(jnp.all(wellformed(scores).reshape(prompts, width) | ~genuine),
                    "the transform chain left a live beam without a distribution to search")
     vocab = scores.shape[-1]
-    best, index = lax.top_k((scores.reshape(prompts, width, vocab)
-                             + live[:, :, None]).reshape(prompts, width * vocab), keep)
-    return best, index, jnp.take_along_axis(raw.reshape(prompts, width * vocab), index, axis=1), vocab
+    best, index, margin = _ranked((scores.reshape(prompts, width, vocab)
+                                   + live[:, :, None]).reshape(prompts, width * vocab), keep, margins)
+    return (best, index, jnp.take_along_axis(raw.reshape(prompts, width * vocab), index, axis=1), vocab,
+            margin)
 
 
 def _beam_start(state: DecoderState, start: StepState, ops: DecodeOps, prompts: int,
@@ -572,15 +606,16 @@ def _beam_start(state: DecoderState, start: StepState, ops: DecodeOps, prompts: 
                   jnp.zeros((prompts, width), bool)))
 
 
-def _beam_draws(done: Completed, start: StepState, prompts: int, n: int, budget: int) -> Draws:
-    """The best `n` completed hypotheses per prompt, as output rows."""
+def _beam_draws(done: Completed, start: StepState, prompts: int, n: int, budget: int,
+                margins: jax.Array | None) -> Draws:
+    """The best `n` completed hypotheses per prompt, as output rows, with the search's `margins`."""
     lengths = jnp.where(start.active[:, None], done.length, 0)[:, :n]
     valid = jnp.arange(budget)[None, None, :] < lengths[:, :, None]
     return Draws(done.tokens[:, :n].reshape(prompts * n, budget),
                  valid.reshape(prompts * n, budget),
                  jnp.zeros((prompts * n, budget), jnp.float32),
                  jnp.where(valid, done.raw[:, :n], 0.0).reshape(prompts * n, budget),
-                 (done.terminated[:, :n] & start.active[:, None]).reshape(prompts * n))
+                 (done.terminated[:, :n] & start.active[:, None]).reshape(prompts * n), margins)
 
 
 @struct.dataclass
