@@ -840,6 +840,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     the keys' and the values' `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads
     the keys and values they dequantize to, each converted to the query's dtype in its program (`_Codes`).
     """
+    if residuals is Kept.SPLIT:
+        # The training walk reads an interval a query (`KeySpans.per_query`); the inference walk by position.
+        spans = spans.per_query()
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
                              subtracted=subtracted, merges=merges, scales=scales)
@@ -851,6 +854,7 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                      residuals: Kept = Kept.NONE) -> Refusal | None:
     """Why `forward` runs no call of these arrays compiled on this device, or None
     (`MosaicForward.declined`)."""
+    spans = spans.per_query() if residuals is Kept.SPLIT else spans
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
 
@@ -1387,8 +1391,9 @@ def backward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans:
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
                    dout: jax.Array, residuals: tuple, *, scale: float | None, natural: bool,
                    accurate: bool, rounded: bool = True) -> tuple[MosaicBackward, tuple]:
-    """`backward`'s op and its arguments, a dropping call's draw among them (`_forward_call`)."""
-    hooks = Hooks() if hooks is None else hooks
+    """`backward`'s op and its arguments, a dropping call's draw among them (`_forward_call`), its spans an
+    interval a query (`KeySpans.per_query`)."""
+    hooks, spans = Hooks() if hooks is None else hooks, spans.per_query()
     op = MosaicBackward(score_mod=hooks.score_mod,
                         score_kinds=tuple(param.kind for param in hooks.score_params),
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
