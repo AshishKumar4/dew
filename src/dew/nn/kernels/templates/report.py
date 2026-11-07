@@ -281,6 +281,13 @@ def spilled(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozense
         return registry.refused.get(identity, frozenset())
 
 
+def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kernels) -> None:
+    """`op`'s launch of `arguments` at `config` refused in this context as a compile that found `kernels`
+    spilling refuses it (`settled`), so its derivation takes the next config: a compile gate's, which
+    compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727)."""
+    _record((_identity(op, arguments), config), None, frozenset(kernels))
+
+
 def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
     """Every (launch identity, config, spilled kernel names) refused in this context (a `refusals` scope's or
     the process's), ordered. A validated plan can hand them to another process explicitly (`refuse` within
