@@ -809,6 +809,10 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     one and starts the next, taken as 0 within it, so no span's sum holds a vanished token's (a prefix
     holding -2**127 twice is -inf; one holding -2**70 loses a later -1 to its rounding, its decay 1 in place
     of `exp(-1)`), and each span through one is zero."""
+    # The declared exponent is one rounded value. Inlining its producer (for example a rate times a
+    # write gate) into TwoSum allows a fused multiply-add to change the rounding on one residual path.
+    # Keep that boundary before forming its compensated prefix.
+    exponents = lax.optimization_barrier(exponents)
     vanished = exponents <= vanishing(exponents.dtype, base2)
     high, low = _compensated(jnp.where(vanished, 0.0, exponents), restarts=vanished)
     segments = jnp.cumsum(vanished.astype(jnp.int32), axis=0)
