@@ -701,32 +701,12 @@ def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order(sc
     no slot reads zero) bitwise the projection of the rows gathered first, plain and paired; `scattered`,
     each row written at its entry of a permutation (`scatter`), bitwise those rows put there after, its
     cotangents read back through it; a gathered dense or stacked call, and a scattered dense one, refused."""
-    from dew.nn.kernels import gemm
-
     rng = np.random.default_rng(3)
     tokens = jnp.asarray(rng.normal(size=(40, 64)), jnp.float32)
-    table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
-    slots = jnp.asarray(rng.permutation(72), jnp.int32) if scattered else None
     matrices = jnp.asarray(rng.normal(size=(2, 3, 64, 32)) / 8, jnp.float32)
+    a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered)
+    table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
     sizes = jnp.asarray([20, 0, 44], jnp.int32)
-
-    def fused(tokens, first, second):
-        return gemm.gemm(tokens, first, sizes, out_dtype=jnp.float32, out_dtypes=(jnp.float32,) * 2,
-                         paired=second, gather=table, scatter=slots)
-
-    def apart(tokens, first, second):
-        outs = gemm.gemm(tokens[table], first, sizes, out_dtype=jnp.float32, out_dtypes=(jnp.float32,) * 2,
-                         paired=second)
-        return outs if slots is None else tuple(jnp.zeros_like(out).at[slots].set(out) for out in outs)
-
-    operands = (tokens, matrices[0], matrices[1])
-    tangents = tuple(jnp.asarray(rng.normal(size=operand.shape), jnp.float32) for operand in operands)
-    cotangent = tuple(jnp.asarray(rng.normal(size=(72, 32)), jnp.float32) for _ in range(2))
-    for check in (lambda f: f(*operands), lambda f: jax.jvp(f, operands, tangents),
-                  lambda f: jax.vjp(f, *operands)[1](cotangent)):
-        jax.tree.map(np.testing.assert_array_equal, check(fused), check(apart))
-    unread = np.setdiff1d(np.arange(40), np.asarray(table))
-    assert np.all(np.asarray(jax.vjp(fused, *operands)[1](cotangent)[0])[unread] == 0)
     for refused in ({"group_sizes": None}, {"layer": jnp.asarray(0, jnp.int32)}):
         with pytest.raises(ValueError):
             arguments = {"group_sizes": sizes, **refused}
@@ -736,3 +716,50 @@ def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order(sc
     with pytest.raises(ValueError):
         gemm.gemm(tokens, matrices[0, 0], None, out_dtype=jnp.float32,
                   scatter=jnp.arange(40, dtype=jnp.int32))
+
+
+@pytest.mark.parametrize("scattered", [False, True])
+def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scattered):
+    """`a_gathered_projection_is_its_gathered_rows_projection` through the template on an H100, interpreted
+    (row 1376's reverse pass): the kernel gradient reads the tokens through the gather table and a
+    scattered product's cotangent through its slots (`gemm_t`'s `gather`), and the input gradient reads
+    that cotangent through the slots (`gemm`'s `gather`), none of them gathered first. Integer values, so
+    every sum is exact whatever tile each launch derives, and each side's one rounding the same."""
+    rng = np.random.default_rng(5)
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 128)), jnp.bfloat16)
+    matrices = jnp.asarray(rng.integers(-3, 4, size=(2, 3, 128, 128)), jnp.bfloat16)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered,
+                                                              interpret_on_cpu=True)
+
+
+def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, *, scattered: bool,
+                                                          interpret_on_cpu: bool = False):
+    """The projection of `tokens[gather]` (72 slots of 40 tokens, three groups, one empty, rows past them),
+    its value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a
+    token no slot reads zero), bitwise the projection of the rows gathered first, paired; `scattered`, each
+    row written at its entry of a permutation, bitwise those rows put there after, its cotangents read
+    back through it. Tangents and cotangents are integers."""
+    table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
+    slots = jnp.asarray(rng.permutation(72), jnp.int32) if scattered else None
+    sizes = jnp.asarray([20, 0, 44], jnp.int32)
+    options = {"out_dtype": jnp.float32, "out_dtypes": (jnp.float32,) * 2,
+               "interpret_on_cpu": interpret_on_cpu}
+
+    def fused(tokens, first, second):
+        return gemm.gemm(tokens, first, sizes, paired=second, gather=table, scatter=slots, **options)
+
+    def apart(tokens, first, second):
+        outs = gemm.gemm(tokens[table], first, sizes, paired=second, **options)
+        return outs if slots is None else tuple(jnp.zeros_like(out).at[slots].set(out) for out in outs)
+
+    operands = (tokens, matrices[0], matrices[1])
+    tangents = tuple(jnp.asarray(rng.integers(-2, 3, size=operand.shape), operand.dtype)
+                     for operand in operands)
+    cotangent = tuple(jnp.asarray(rng.integers(-2, 3, size=(72, matrices.shape[-1])), jnp.float32)
+                      for _ in range(2))
+    for check in (lambda f: f(*operands), lambda f: jax.jvp(f, operands, tangents),
+                  lambda f: jax.vjp(f, *operands)[1](cotangent)):
+        jax.tree.map(np.testing.assert_array_equal, check(fused), check(apart))
+    unread = np.setdiff1d(np.arange(tokens.shape[0]), np.asarray(table))
+    assert np.all(np.asarray(jax.vjp(fused, *operands)[1](cotangent)[0])[unread] == 0)
