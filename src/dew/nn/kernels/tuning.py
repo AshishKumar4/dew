@@ -604,7 +604,7 @@ class KernelOp(tokamax.Op):
         the packed Qwen3.5-0.8B step's 330 s compile on an A100 (ledger 554)."""
         def shaped(name: str, value):
             if name in self.ROWS and value is not None:
-                return bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
+                return _bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
             # NumPy operands (an unpacked delta rule's chunk and span descriptors) key as JAX's do.
             return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
                                 if isinstance(leaf, (jax.Array, np.ndarray)) else leaf, value)
@@ -625,7 +625,7 @@ class KernelOp(tokamax.Op):
 
     def _get_autotuning_cache_key(self, ba: tokamax.BoundArguments) -> Mapping[str, object]:
         key = super()._get_autotuning_cache_key(ba)
-        return type(key)({name: bucketed(spec) if name in self.ROWS and spec is not None
+        return type(key)({name: _bucketed(spec) if name in self.ROWS and spec is not None
                           else self.traced(name, spec) if name in self.HOOKS else spec
                           for name, spec in key.items()})
 
@@ -868,7 +868,7 @@ def _pick(ba: tokamax.BoundArguments) -> Timings | None:
     return stored if isinstance(stored, Timings) and stored.fastest_config in ba.autotuning_configs else None
 
 
-def bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
     """`spec` with its leading (token) axis at the next power of two."""
     return jax.ShapeDtypeStruct((1 << max(spec.shape[0] - 1, 0).bit_length(), *spec.shape[1:]), spec.dtype)
 

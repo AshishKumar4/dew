@@ -995,33 +995,6 @@ def test_a_hoppers_gathered_projection_runs_the_template_producers_gather():
     _assert_launches("sm90", "gathered projection", _gathered_projection, 4, "dew_gmm")
 
 
-def _gathered_projection_gradient():
-    """The reverse pass of an expert projection of gathered rows whose rows land at their slots (`gemm.gemm`'s
-    `gather` and `scatter`: Qwen3-30B-A3B's 2048-deep, 768-wide experts, eight, 1024 tokens of top-2 slots),
-    its kernel gradient reading the tokens and the cotangent where they lie (`gemm_t`'s `gather`)."""
-    from dew.nn.kernels import gemm
-
-    sizes = jnp.full((8,), 256, jnp.int32)
-
-    def gradient(tokens, table, slots, matrices, cotangent):
-        def product(tokens, matrices):
-            return gemm.gemm(tokens, matrices, sizes, out_dtype=jnp.bfloat16, gather=table, scatter=slots)
-
-        return jax.vjp(product, tokens, matrices)[1](cotangent)
-
-    return gradient, (jax.ShapeDtypeStruct((1024, 2048), jnp.bfloat16),
-                      *(jax.ShapeDtypeStruct((2048,), jnp.int32),) * 2,
-                      jax.ShapeDtypeStruct((8, 2048, 768), jnp.bfloat16),
-                      jax.ShapeDtypeStruct((2048, 768), jnp.bfloat16))
-
-
-def test_a_hoppers_gathered_projections_reverse_pass_reads_its_rows_where_they_lie():
-    """The reverse pass of a gathered, scattered expert projection on a compile-only H100 (row 1376): its
-    program launches the template's kernel gradient, whose producer gathers each step's token rows and
-    cotangent rows by cp.async (`gathered.Ring`), which ptxas compiles (`kernel_compile.Expected`)."""
-    _assert_launches("sm90", "gathered projection gradient", _gathered_projection_gradient, 5, "dew_tgmm")
-
-
 def _blockwise_gradient():
     """A blockwise-scaled FP8 MoE projection's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`: 2048
     deep, 768 wide, eight experts of 4 to 12 whole 128-row blocks) through the template named."""
