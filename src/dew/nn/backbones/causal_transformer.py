@@ -689,14 +689,14 @@ class CausalTransformer(LinearProducts):
     def _view_of(self, store: Variables, read: Callable[[Self], StackView]) -> StackView:
         """`read` of this decoder bound to `store`'s shapes: through the model's own `apply`, which an
         adapted model runs under its interceptor, so its runs split where its adapter's targets do
-        (`scanned_like`), as its forward splits them. Flax types `apply`'s result as anything, which the
-        view is narrowed from."""
+        (`scanned_like`), as its forward splits them. The view comes back as `read` returns it: Flax types
+        `apply`'s result as anything or a pair."""
         if self.scope is not None:
             return read(self)
-        view = self.apply(jax.tree.map(
-            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store), method=read)
-        if not isinstance(view, StackView):
-            raise TypeError(f"expected the stack's view from the model, got {type(view).__name__}")
+        views: list[StackView] = []
+        shapes = jax.tree.map(lambda x: jax.ShapeDtypeStruct(jnp.shape(x), jnp.result_type(x)), store)
+        self.apply(shapes, method=lambda module: views.append(read(module)))
+        (view,) = views
         return view
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
