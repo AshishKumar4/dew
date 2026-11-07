@@ -85,6 +85,25 @@ if refused:
     sys.exit("the step loaded in a process whose XLA computes otherwise")
 """
 """A fresh process training from the step at argv[1], or, argv[2] "refused", one its loader must refuse."""
+QUIET = """
+import sys
+
+import jax
+from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
+from token_support import token_rows
+
+from dew.telemetry.compiles import Compiles
+from dew.training import MeshSpec
+from dew.training.ahead import AheadOfTime
+
+run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True, split=2)
+with Compiles(None) as compiles:
+    assert int(run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=3, log_every=1).step) == 3
+compiled = [(program.name, program.where) for program in compiles.programs if program.kind == "compiled"]
+assert not compiled, compiled
+"""
+"""A fresh process training three logged steps of two microbatches from the step at argv[1], compiling
+nothing on its GPU."""
 COMPUTING = "--xla_gpu_enable_fast_min_max=true"
 """An XLA flag that changes what a program computes, which a process loading programs compiled without it is
 refused for (`BuildTarget.held`)."""
@@ -134,6 +153,20 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
         with assumed(built_target(generation, own.multiprocessors)):
             here = np.asarray(owned_program(function)(*arrays[name]))
         assert ahead[name].dtype == here.dtype and ahead[name].tobytes() == here.tobytes(), name
+
+
+def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_through_its_logged_steps(tmp_path):
+    """A run handed its step compiled ahead for this GPU, two microbatches a step, trains three logged
+    steps in a fresh process compiling nothing on the GPU: its start, its window's allocation, its split
+    step's whole, its counters, its log's copies and its logged tokens' sum were compiled with the step
+    (`AheadOfTime.starts`; row 4752)."""
+    own = BuildTarget.of(jax.devices()[:1])
+    target = MeshSpec().build(compile_only_gpus(own.generation, 1, multiprocessors=own.multiprocessors))
+    compile_ahead(fine_tune(target, xla=True, split=2), token_rows(VOCAB, BATCH, SEQ_LEN + 1)).save(
+        tmp_path / "step.dew-aot")
+    (tmp_path / "quiet.py").write_text(QUIET)
+    subprocess.run([sys.executable, str(tmp_path / "quiet.py"), str(tmp_path / "step.dew-aot")],
+                   env=environment_of(tmp_path), check=True)
 
 
 def test_a_step_compiled_ahead_for_this_gpu_trains_here_and_is_refused_where_xla_computes_otherwise(

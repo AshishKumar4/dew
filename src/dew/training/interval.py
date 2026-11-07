@@ -27,12 +27,14 @@ from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
+from dew.state import TrainState
 from dew.telemetry.instrumentation import (
     NO_FLOPS,
     StepFlops,
     compilation_cache_counts,
     model_flops_utilization,
 )
+from dew.training.diloco import learning_rate_of
 from dew.training.display import EXAMPLES_CONSUMED_SCALAR, TrainingDisplay
 from dew.training.inspection import Summaries, logged
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
@@ -88,17 +90,37 @@ class Book(NamedTuple):
     scored: jax.Array
 
 
+def _zeros(loss: jax.Array | jax.ShapeDtypeStruct) -> tuple[np.ndarray, ...]:
+    """A fresh interval's counters (`Book`'s fields) for a step whose loss is `loss`, on the host."""
+    dtype = at_least_fp32(loss.dtype)
+    return (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32), np.zeros((), dtype),
+            np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32), np.zeros((2,), np.uint32))
+
+
 def fresh_book(loss: jax.Array) -> Book:
     """Return the counters a fresh logging interval starts from, on the device the step returns `loss` on.
 
     Counters on any other device would move to the step's devices at every count,
     and `bookkeep` would compile again.
     """
-    dtype = at_least_fp32(loss.dtype)
-    zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
-             np.zeros((), dtype), np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32),
-             np.zeros((2,), np.uint32))
-    return Book(*jax.device_put(zeros, loss.sharding))
+    return Book(*jax.device_put(_zeros(loss), loss.sharding))
+
+
+def book_shapes(loss: jax.ShapeDtypeStruct) -> Book:
+    """`fresh_book`'s counters as shapes, for a step whose loss is the shape `loss`: what a run compiled
+    ahead compiles `bookkeep` over (`dew.training.ahead.started`)."""
+    return Book(*(jax.ShapeDtypeStruct(zero.shape, zero.dtype, sharding=loss.sharding)
+                  for zero in _zeros(loss)))
+
+
+def booked(book: Book, fresh: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None,
+           aux: Mapping[str, jax.Array]) -> tuple:
+    """`bookkeep`'s arguments for a step's results, its counters `book` and those of a fresh interval
+    `fresh`: a run's tokens are its committed updates' (`Committed.tokens`); a step of one's own
+    (`Trainer(step=)`), which reports no commit, is its own update."""
+    tokens = aux.get(TOKENS, fresh.tokens) if committed is None else committed.tokens
+    return (book, loss, finite, committed, aux.get(TRAINING_FLOPS, fresh.training), tokens,
+            aux.get(TOKENS, fresh.scored))
 
 
 @program
@@ -222,9 +244,6 @@ class Interval:
         self.model_counted |= TRAINING_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
-        # A run's tokens are its committed updates' (`Committed.tokens`); a step of one's own
-        # (`Trainer(step=)`), which reports no commit, is its own update.
-        tokens = aux.get(TOKENS, self.fresh.tokens) if committed is None else committed.tokens
         if committed is not None and committed.inspected is not None:
             # The latest sample that committed: a sampled step whose window did not commit holds zeros,
             # which keep the one before, chosen on the device, the whole vector at once.
@@ -235,9 +254,7 @@ class Interval:
                 count, held = self.inspected
                 self.inspected = (jnp.where(fresh, committed.count, count), jax.tree.map(
                     lambda new, old: jnp.where(fresh, new, old), committed.inspected, held))
-        self.book = bookkeep(self.book, loss, finite, committed,
-                             aux.get(TRAINING_FLOPS, self.fresh.training), tokens,
-                             aux.get(TOKENS, self.fresh.scored))
+        self.book = bookkeep(*booked(self.book, self.fresh, loss, finite, committed, aux))
 
     def streak(self) -> jax.Array | None:
         """The longest streak of non-finite losses since the last call, on
@@ -323,7 +340,7 @@ class Interval:
                 self.watched.append((step, loss))
         taken = Taken(step, self, dataclasses.replace(self), reading, done)
         if self.tokens_counted and book is not None:
-            self.logged_tokens = book.tokens if self.logged_tokens is None else _added_tokens(
+            self.logged_tokens = book.tokens if self.logged_tokens is None else added_tokens(
                 self.logged_tokens, book.tokens)
         self.since_log, self.samples, self.computed = 0, 0, 0
         self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
@@ -382,7 +399,7 @@ class TokenClock:
 
 
 @program
-def _added_tokens(left: jax.Array, right: jax.Array) -> jax.Array:
+def added_tokens(left: jax.Array, right: jax.Array) -> jax.Array:
     return _TokenCount.add(left, right)
 
 
@@ -396,6 +413,12 @@ def held(rate: jax.typing.ArrayLike | None,
     def copied(leaf: jax.typing.ArrayLike) -> jax.Array:
         return jnp.copy(jax.device_put(jnp.asarray(leaf), jax.memory.Space.Device))
     return None if rate is None else copied(rate), None if scale is None else copied(scale)
+
+
+def copied(state: TrainState) -> tuple[jax.Array | None, jax.Array | None]:
+    """`held`'s copies of `state`'s learning rate (`learning_rate_of`) and loss scale, which a log reads:
+    the run's call and a run compiled ahead's alike (`dew.training.ahead.started`)."""
+    return held(learning_rate_of(state), None if state.scale is None else state.scale.scale)
 
 
 @runtime_checkable

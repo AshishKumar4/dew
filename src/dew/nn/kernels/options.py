@@ -187,6 +187,32 @@ def taking(programs: Taken) -> Iterator[None]:
         yield
     finally:
         _TAKEN.reset(token)
+
+
+_COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = contextvars.ContextVar(
+    "dew_collected_programs", default=None)
+
+
+def shapes_of(tree):
+    """`tree`'s arrays or shapes as their shapes, dtypes, shardings and weak types, the layouts left the
+    arrays' own, as a call over arrays of those shardings lowers (`collecting`)."""
+    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding,
+                                                          weak_type=getattr(leaf, "weak_type", False)), tree)
+
+
+@contextlib.contextmanager
+def collecting() -> Iterator[dict[str, jax.stages.Compiled]]:
+    """Within the block, a call of a program through Dew's compile point (`OuterProgram`) compiles it over
+    its arguments, shapes where a caller hands shapes (`jax.ShapeDtypeStruct`), and answers with its
+    results' shapes (`shapes_of`), running nothing: the mapping it yields holds each executable by its
+    program's digest (`program_digest`). A run compiled ahead compiles so the programs it runs on its
+    step's results, the code that runs them called as the run calls it (`dew.training.ahead.started`)."""
+    collected: dict[str, jax.stages.Compiled] = {}
+    token = _COLLECTED.set(collected)
+    try:
+        yield collected
+    finally:
+        _COLLECTED.reset(token)
 """Every program alive (`OuterProgram`), whose executables `release` drops."""
 
 
@@ -283,6 +309,8 @@ class OuterProgram:
             return self._nested(*args, **kwargs)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self._eager(*args, **kwargs)
+        if _COLLECTED.get() is not None:
+            return shapes_of(self.compiled(*args, **kwargs).out_info)
         key, dynamic, named = self._keyed(args, kwargs)
         ready = self._ready.get(key)
         return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
@@ -323,12 +351,12 @@ class OuterProgram:
         afresh where a kernel spills."""
         from dew.nn.kernels.templates import report
 
-        relowered: list[jax.stages.Wrapped] = []
+        relowered: list[tuple[jax.stages.Wrapped, jax.stages.Lowered]] = []
 
         def relower() -> jax.stages.Lowered:
             fresh = self._jitted()
             lowered = self._traced(fresh, args, kwargs).lower()
-            relowered.append(fresh)
+            relowered.append((fresh, lowered))
             return lowered
         lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
@@ -337,7 +365,9 @@ class OuterProgram:
         executable = report.compiled(lowered, relower=relower)
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
-            self.jitted = relowered[-1]
+            self.jitted, lowered = relowered[-1]
+        if (collected := _COLLECTED.get()) is not None:
+            collected[program_digest(lowered)] = executable
         return executable
 
     def lower(self, *args, **kwargs) -> jax.stages.Lowered:

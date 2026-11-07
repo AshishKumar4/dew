@@ -70,7 +70,7 @@ from dew.nn.kernels.generation import (
     routes,
     tpu,
 )
-from dew.nn.kernels.options import owned_program, program_digest, taking
+from dew.nn.kernels.options import collecting, owned_program, program_digest, shapes_of, taking
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
@@ -803,13 +803,14 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
 
 def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned
                              ) -> dict[str, Executable]:
-    """The programs a run of `trainer` compiles to start, before its first step runs, besides the step,
-    compiled for the target over their arguments' shapes (`AheadOfTime.starts`): its fresh state's build
-    and placement (`start_lowered`), for a run that starts afresh, and the first step's narrowed copies of
-    its weights where the plan reads some (`narrowed`). Each by its program's digest, through the kernel
-    templates' reports as every compile is. The programs a fit runs on its steps' results (its counters,
-    its logs' copies, an accumulating window's first allocation, its evaluations) compile on its devices
-    still (row 4752)."""
+    """The programs a run of `trainer` compiles besides its step, compiled for the target over their
+    arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement (`start_lowered`), for
+    a run that starts afresh, the first step's narrowed copies of its weights where the plan reads some
+    (`narrowed`), and what its steps run on their results, each called as the run calls it, over the
+    step's results' shapes (`collecting`): an accumulating window's first allocation (`Trainer._window_of`),
+    a split step's whole (`whole_step`), its counters (`bookkeep`), its log's copies (`copied`) and its
+    logged tokens' sum (`added_tokens`). Each by its program's digest, through the kernel templates'
+    reports as every compile is. Its evaluations compile on its devices still (row 4752)."""
     from dew.training.distributed import start_lowered
     from dew.training.narrow import narrowed
 
@@ -838,4 +839,30 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
             return lowered[-1]
         executable = report.compiled(lowered[0], relower=relower)
         return program_digest(lowered[-1]), Executable.of(executable)
-    return dict(map(kept, lowerings))
+    collected = _results_programs(trainer, start, planned)
+    return {**dict(map(kept, lowerings)), **{digest: Executable.of(executable)
+                                             for digest, executable in collected.items()}}
+
+
+def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned
+                                       ) -> dict[str, jax.stages.Compiled]:
+    """The programs a run's steps run on their results and its state, compiled where the run's own code
+    calls them over shapes (`collecting`), by digest: `started`'s last part."""
+    from dew.distributed.placement import placed_shapes
+    from dew.state import apart, together
+    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied
+    from dew.training.planning import whole_step
+
+    candidate, split = planned.candidate, planned.split
+    placed = placed_shapes(start.abstract, start.shardings)
+    window = split * trainer.accumulation
+    with collecting() as collected:
+        if window > 1 and trainer.step is None:
+            trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
+        moving, *results = shapes_of(planned.executable.out_info)
+        loss, aux, finite, _, committed = results if split == 1 else whole_step([tuple(results)] * split)
+        book = book_shapes(loss)
+        counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))
+        added_tokens(counted.tokens, counted.tokens)
+        copied(together(moving, apart(placed)[1]))
+    return collected

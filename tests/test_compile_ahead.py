@@ -73,6 +73,27 @@ def test_a_program_compiled_ahead_runs_in_place_of_compiling():
     assert [program.kind for program in compiles.programs].count("compiled") == 1
 
 
+def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_where_handed():
+    """A program called within `collecting` over shapes compiles there, keyed by its program's digest, and
+    answers with its results' shapes, running nothing; handed to a call of the program over arrays of those
+    shapes (`taking`), its executable runs in place of compiling: how a run compiled ahead compiles what
+    its steps run on their results, called as the run calls it (row 4752)."""
+    from dew.nn.kernels.options import collecting, owned_program, taking
+
+    placed = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    values = jax.device_put(np.arange(4, dtype=np.float32), placed)
+    with collecting() as collected, Compiles(None) as compiles:
+        shapes = owned_program(lambda values: values * 2 + 1)(jax.ShapeDtypeStruct((4,), jnp.float32,
+                                                                                    sharding=placed))
+    assert (shapes.shape, shapes.dtype, shapes.sharding) == ((4,), jnp.float32, placed)
+    assert len(collected) == [program.kind for program in compiles.programs].count("compiled") == 1
+    handed = {digest: lambda executable=executable: executable for digest, executable in collected.items()}
+    with taking(handed), Compiles(None) as compiles:
+        answered = owned_program(lambda values: values * 2 + 1)(values)
+    assert [program.kind for program in compiles.programs].count("compiled") == 0
+    np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
+
+
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
     """A compile-only GPU with stated memory takes the run's own fit search, whose one fitting
     program is the saved executable, not another compile outside the report. The report records
