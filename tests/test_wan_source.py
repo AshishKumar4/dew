@@ -97,8 +97,10 @@ def source_model(source, name):
 
     from tools.torch_precision import float64_twin
 
+    # The variant's checkpoint stores no affine weight for its query and key norms, which this Diffusers
+    # models as ones: built in full, they start at ones rather than unloaded.
     narrow = WanTransformer3DModel.from_pretrained(source / name / "transformer", torch_dtype=torch.float32,
-                                                   local_files_only=True).eval()
+                                                   local_files_only=True, low_cpu_mem_usage=False).eval()
     return narrow, float64_twin(narrow)
 
 
