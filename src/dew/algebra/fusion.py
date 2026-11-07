@@ -214,7 +214,9 @@ def _regions(index: Index) -> list[Region]:
         members = set(places)
         for place in list(places[1:]):
             for var in jaxpr.eqns[place].invars:
-                source = producer.get(var) if isinstance(var, jcore.Var) else None
+                if not isinstance(var, jcore.Var):
+                    continue
+                source = producer.get(var)
                 if (source is not None and source not in members and source not in claimed
                         and jax_name(jaxpr.eqns[source].primitive) in CAPTURED
                         and readers[var] <= members and var not in escaping):
