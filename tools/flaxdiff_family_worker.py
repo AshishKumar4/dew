@@ -58,10 +58,9 @@ FILES = {
     "video_dit": "cecd0c05fa53f2078cf5dc7fcc5e55232be3cc9bb722de43429997616d377bac",
     "unet_3d": "ec1323014ec4cedcccac84c7dfe6af46a1dbed9bb1fd8a5a9493a4063916ea6a",
 }
-FOURIER = ("jax.random.normal(jax.random.PRNGKey(42), (self.features // 2, ), dtype=jnp.float64) "
-           "* self.scale")
-"""common.py's Fourier frequencies as the float64 copy reads them, which take the float32 copy's instead
-(`fourier_table`)."""
+FOURIER = "jnp.asarray(freqs, dtype=jnp.float64) * self.scale"
+"""common.py's Fourier frequencies as the float64 copy reads them (`jnp.float32` read as float64 first),
+which take the float32 copy's instead (`fourier_table`)."""
 
 
 @functools.cache
@@ -89,6 +88,9 @@ def flaxdiff(wide: bool) -> dict[str, types.ModuleType]:
         source = local.read_text()
         if wide:
             source = source.replace("jnp.float32", "jnp.float64").replace("np.float32", "np.float64")
+            if stem == "common" and source.count(FOURIER) != 1:
+                raise ValueError(f"common.py at {COMMIT} draws its Fourier frequencies otherwise than "
+                                 f"{FOURIER!r}")
             source = source.replace(FOURIER, "FOURIER_TABLE(self.features, self.scale)")
         name = f"flaxdiff.models.{stem}"
         module = types.ModuleType(name)
