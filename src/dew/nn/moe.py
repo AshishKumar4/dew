@@ -35,6 +35,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
+from dew import quantization
 from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
@@ -701,13 +702,18 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | Layered, grou
     layout.
     """
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
+    packed = isinstance(stack, gemm.NvFp4)
+    if packed and layer is not None:
+        raise ValueError("a packed expert bank (`gemm.NvFp4`) is read whole, never as a scanned stack's "
+                         "layer")
     tokens, rows = (x.tokens, x.rows) if isinstance(x, Gathered) else (x, None)
-    compute = canonicalize_dtype(tokens, stack, *(() if bias is None else (bias,)), dtype=dtype)
+    compute = canonicalize_dtype(tokens, _held(stack), *(() if bias is None else (bias,)), dtype=dtype)
     # The run's low-precision recipe takes the experts' product where their role takes it, the matrices'
     # values the compute dtype's held in the master's, so their gradient keeps the master dtype. A stack's
-    # layer is cut only for it: elsewhere the grouped matmul reads the layer in place.
+    # layer is cut only for it: elsewhere the grouped matmul reads the layer in place. A packed bank is its
+    # checkpoint's own codes, frozen, its product the NVFP4 one (`gemm.nvfp4_product`) under any recipe.
     with projection_role("experts"):
-        recipe = (None if recipe_role() is None else gemm.recipe_projection(
+        recipe = (None if recipe_role() is None or packed else gemm.recipe_projection(
             jnp.asarray(gathered(x), compute),
             rounded_operand(stack if layer is None else stack[layer], compute), group_sizes,
             out_dtype=compute, bias=None if bias is None else rounded_operand(bias, compute)))
@@ -750,17 +756,24 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     apart, the template pairing no stacked layer. `Gathered` rows are read where they lie, as
     `expert_projection` reads them."""
     tokens, rows = (x.tokens, x.rows) if isinstance(x, Gathered) else (x, None)
-    compute = canonicalize_dtype(tokens, *(kernel.stack if isinstance(kernel, Layered) else kernel
+    compute = canonicalize_dtype(tokens, *(_held(kernel.stack if isinstance(kernel, Layered) else kernel)
                                            for kernel in (first, second)), dtype=dtype)
     if (isinstance(first, Layered) or isinstance(second, Layered)
-            or recipe_role() is not None):
-        # A stack's layer, or a run's low-precision recipe, takes each product apart (`expert_projection`).
+            or isinstance(first, gemm.NvFp4) or isinstance(second, gemm.NvFp4) or recipe_role() is not None):
+        # A stack's layer, a packed bank (its product the NVFP4 one, which pairs with none), or a run's
+        # low-precision recipe, takes each product apart (`expert_projection`).
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
                 expert_projection(x, second, group_sizes, compute, implementation, precision))
     with _named(implementation):
         gate, up = gemm.gemm(tokens, first, group_sizes, compute=compute, out_dtype=compute,
                              out_dtypes=(compute, compute), precision=precision, paired=second, gather=rows)
     return gate, up
+
+
+def _held(kernel):
+    """What an expert matrix's compute dtype reads of `kernel`: a packed bank's dtype, the one its decode
+    yields (`gemm.NvFp4.dtype`), else the array."""
+    return kernel.dtype if isinstance(kernel, gemm.NvFp4) else kernel
 
 
 def _named(implementation: str) -> contextlib.AbstractContextManager:
@@ -796,13 +809,14 @@ class ExpertLinear(nn.Module):
                                   self.get_variable(BANKED_EXPERTS, 'layer'))
             return
         # With the expert dimension as a batch axis, fan_in is per expert and
-        # every expert initialises like the matching Dense of a dense MLP.
-        self.kernel = self.param(
+        # every expert initialises like the matching Dense of a dense MLP. A served checkpoint's packed
+        # bank stands in for it where its collection holds one (`quantization.expert_matrix`).
+        self.kernel = quantization.expert_matrix(self, 'kernel', lambda: self.param(
             'kernel',
             declared(normal_kernel(self.init_std, nn.initializers.variance_scaling(
                 1.0, 'fan_in', 'truncated_normal', in_axis=-2, out_axis=-1,
                 batch_axis=(0,)))['kernel_init'], self.kernel_axes),
-            (self.num_experts, self.in_features, self.features), jnp.float32)
+            (self.num_experts, self.in_features, self.features), jnp.float32))
 
 
 def capacity_positions(indices: jax.Array, num_experts: int,
@@ -927,7 +941,7 @@ def expert_compute_dtype(x: jax.Array, *parameters: jax.Array, dtype: Dtype | No
     and every product accumulates in fp32, as a bf16 checkpoint's reference
     runs it; promoted, each layer's experts were copied to fp32, 14.35 GiB
     of live temporaries serving gpt-oss-20b over four RTX 3090s."""
-    compute = canonicalize_dtype(x, *parameters, dtype=dtype)
+    compute = canonicalize_dtype(x, *map(_held, parameters), dtype=dtype)
     stored = {parameter.dtype for parameter in parameters}
     if dtype is None and len(stored) == 1:
         (kind,) = stored
@@ -1191,10 +1205,13 @@ def _widened[Tree](parameters: Tree) -> Tree:
     """Floating parameters at least fp32, so a cotangent summed across
     devices is summed before its master dtype rounds it."""
     def widen(leaf):
+        if isinstance(leaf, gemm.NvFp4):
+            # A packed bank is frozen: its codes, block scales and tensor scales are read as they are.
+            return leaf
         if jnp.issubdtype(leaf.dtype, jnp.floating):
             return leaf.astype(at_least_fp32(leaf.dtype))
         return leaf
-    return jax.tree.map(widen, parameters)
+    return jax.tree.map(widen, parameters, is_leaf=lambda leaf: isinstance(leaf, gemm.NvFp4))
 
 
 EXPERT_AXES: Mapping[str, LogicalAxes] = {
@@ -1311,9 +1328,11 @@ class ExpertMLP(nn.Module):
         compute = expert_compute_dtype(x, *(kernel.stack if isinstance(kernel, Layered) else kernel
                                             for kernel in kernels), dtype=self.dtype)
         project = functools.partial(self._project, dtype=compute)
+        # Each leaf's axes: a packed bank's three its own (`quantization.expert_leaf_axes`).
+        axes = tuple(leaf for kernel, name in zip(kernels, names, strict=True)
+                     for leaf in quantization.expert_leaf_axes(kernel, EXPERT_AXES[name]))
         slots = expert_dispatch(
-            project, x, indices, kernels,
-            tuple(EXPERT_AXES[name] for name in names), num_experts=self.num_experts, dispatch=self.dispatch,
+            project, x, indices, kernels, axes, num_experts=self.num_experts, dispatch=self.dispatch,
             initializing=self.is_initializing(), output_dtype=compute,
             input_weights=weights if self.scale_inputs else None,
             capacity_factor=self.capacity_factor, gathered_project=project)
