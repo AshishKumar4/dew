@@ -990,15 +990,17 @@ class _Routes:
 
 
 @contextlib.contextmanager
-def routes() -> Iterator[list[Route]]:
+def routes(*, alone: bool = False) -> Iterator[list[Route]]:
     """Collect every `Route` a dispatch reports while code runs or traces in the block, in order: what
     a step's trace within `assumed(target)` on a CPU shows of that target's kernels. Each block is a
     fresh collection JAX keys its traces on (`dew._cache.KERNEL_ROUTES`), so a function traced before
-    traces, and reports, again; a block nested in another reports to both."""
+    traces, and reports, again; a block nested in another reports to both, unless `alone` (a decision
+    that traces a call it may not take, the compile point's, whose routes no program runs)."""
     from dew import _cache
 
     collected = _Routes()
-    with _cache.KERNEL_ROUTES((*_cache.KERNEL_ROUTES.value, collected)):
+    enclosing = () if alone else _cache.KERNEL_ROUTES.value
+    with _cache.KERNEL_ROUTES((*enclosing, collected)):
         yield collected.found
 
 

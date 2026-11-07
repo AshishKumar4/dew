@@ -8,7 +8,8 @@ An RMSNorm is a row's root mean square, its inverse times the row and an optiona
     m = sum(x * x, -1) / D       its statistics in float32 at least (`x` widened before it), the square a
                                  `square`, `integer_pow` of 2 or a product of the row with itself
     r = rsqrt(m + eps)           eps a constant
-    y = x * r                    the inverse broadcast along the row
+    y = x * r                    the inverse broadcast along the row, or the inverse times the weight first
+                                 (Flax's `mul *= scale`)
     y = y * w   or   (1 + w)     a weight of the row's width (`scale_offset`), before the cast or after it
                                  (`scale_after_cast`), or none
     y = cast(y)
@@ -133,11 +134,12 @@ def _rms(graph: Graph, place: int) -> Norm | None:
     if (row is None or tuple(eqns[reduced].params["axes"]) != (row.aval.ndim - 1,)
             or not np.isclose(float(width), row.aval.shape[-1]) or np.dtype(row.aval.dtype).itemsize < 4):
         return None
-    # The statistics laid back along the row and multiplied into it.
-    normed = _along_row(graph, reduced, place, row, places)
-    if normed is None:
+    # The statistics laid back along the row and multiplied into it, a weight beside them where Flax's is.
+    along = _along_row(graph, reduced, place, row, places)
+    if along is None:
         return None
-    weight, offset, after_cast, output = _weighted(graph, normed, places)
+    normed, first = along
+    weight, offset, after_cast, output = _weighted(graph, normed, places, first)
     source = graph.uncast(row, places, widening)
     places = sorted(set(places))
     operands = (source,) if weight is None else (source, weight)
@@ -181,13 +183,16 @@ def _squared(graph: Graph, atom, places: list[int]):
 
 
 def _along_row(graph: Graph, reduced: int, inverse: int, row, places: list[int]):
-    """The product of `row` and its statistics laid back along it, its value: the row reduction at `reduced`
-    followed forward through the statistics' equations (`places`, the inverse square root at `inverse`
-    among them) and then layouts and casts alone (added to `places`), each value read once, its axes tracked
-    (`_relabeled`) so each of the row's leading axes lies where it did and its feature axis is broadcast;
-    None where they do not (another row's statistics, or the statistics laid along the features)."""
+    """`(product, weight)`: the product of `row` and its statistics laid back along it, and the weight
+    multiplied into the statistics before it (Flax's, `(w, offset)`; None where none is), the row reduction
+    at `reduced` followed forward through the statistics' equations (`places`, the inverse square root at
+    `inverse` among them) and then layouts, casts and that one weight alone (added to `places`), each value
+    read once, its axes tracked (`_relabeled`) so each of the row's leading axes lies where it did and its
+    feature axis is broadcast; None where they do not (another row's statistics, or the statistics laid
+    along the features)."""
     eqns, known = graph.jaxpr.eqns, set(places)
     atom, labels, after = eqns[reduced].outvars[0], list(range(row.aval.ndim - 1)), False
+    weight = None
     while True:
         readers = graph.readers[atom]
         if len(readers) != 1 or atom in graph.escaping:
@@ -195,14 +200,27 @@ def _along_row(graph: Graph, reduced: int, inverse: int, row, places: list[int])
         (reader,) = readers
         eqn = eqns[reader]
         name = jax_name(eqn.primitive)
-        if after and name == "mul" and row in eqn.invars:
+        other = next((var for var in eqn.invars if var is not atom), None)
+        # The row itself, or the same input widened again for the product (Flax's statistics and product
+        # each widen it).
+        cast: list[int] = []
+        if (after and name == "mul" and isinstance(other, jcore.Var) and other.aval.shape == row.aval.shape
+                and graph.uncast(other, cast, widening) is graph.uncast(row, [], widening)):
             rank = row.aval.ndim
             if len(labels) != rank or labels[-1] is not None or not all(
                     labels[a] in (a, None) and (labels[a] == a or row.aval.shape[a] == 1)
                     for a in range(rank - 1)):
                 return None
+            places += [*cast, reader]
+            return eqn.outvars[0], weight
+        if after and name == "mul" and weight is None:
+            weight = None if other is None else _row_weight(graph, other, row.aval.shape[-1], places)
+            if weight is None or eqn.outvars[0].aval.shape != row.aval.shape:
+                return None
+            # The weight lies along the features alone (`_row_weight`), the statistics along the rest.
             places.append(reader)
-            return eqn.outvars[0]
+            atom = eqn.outvars[0]
+            continue
         if (reader not in known if not after else name not in LAYOUTS):
             return None
         labels = _relabeled(graph, eqn, atom, labels)
@@ -246,12 +264,15 @@ def _relabeled(graph: Graph, eqn: jcore.JaxprEqn, atom, labels: list) -> list | 
     return None
 
 
-def _weighted(graph: Graph, normed, places: list[int]) -> tuple[jcore.Var | None, bool, bool, jcore.Var]:
+def _weighted(graph: Graph, normed, places: list[int], first=None
+              ) -> tuple[jcore.Var | None, bool, bool, jcore.Var]:
     """The weight the normalized row takes and how (`(weight, offset, after_cast, output)`): a product with a
     weight broadcast along the row (one more than it where `offset`), before the row's last cast or after it,
-    or none; the region's output its last value."""
+    or none, or `first`, the one the statistics took before the row (`_along_row`); the region's output its
+    last value."""
     eqns, atom, cast = graph.jaxpr.eqns, normed, False
-    weight = offset = None
+    weight, offset = first if first is not None else (None, None)
+    weight_after_cast = False
     while len(graph.readers[atom]) == 1 and atom not in graph.escaping:
         (reader,) = graph.readers[atom]
         eqn = eqns[reader]

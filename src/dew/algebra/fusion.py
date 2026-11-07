@@ -304,7 +304,9 @@ def _decided(jaxpr: jcore.Jaxpr, places: Sequence[int], inputs: Sequence[jcore.V
     window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
     key = (program.structure(window), derive.context(), _cache.KERNEL_CHOICES.value)
     if key not in _held:
-        _held[key] = decide()
+        # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
+        with generation.routes(alone=True):
+            _held[key] = decide()
         if len(_held) > DECISIONS_HELD:
             _held.popitem(last=False)
     _held.move_to_end(key)
