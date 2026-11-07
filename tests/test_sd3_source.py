@@ -351,4 +351,5 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
                        pooled_projections=tensor(condition.pooled), timestep=tensor([0.5])).sample
         return output.permute(0, 2, 3, 1).numpy()
 
-    assert_export_recomputes(export, forward, call, draw, "trained SD3")
+    assert_export_recomputes(forward, lambda wide: consumer.denoiser(export, call, wide=wide), draw,
+                             "trained SD3")
