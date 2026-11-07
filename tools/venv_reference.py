@@ -82,8 +82,7 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          **{f"multimodal-{family}": {"test": "test_multimodal_model", "arms": family,
                                      "worker": "multimodal_worker.py",
                                      "reference": "huggingface/transformers 5.16.1",
-                                     "license": "Apache-2.0", "distribution": ("transformers", "5.16.1"),
-                                     "host": True}
+                                     "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")}
             for family in ("gemma4", "qwen35", "llama4", "gemma3n")},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,

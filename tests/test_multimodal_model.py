@@ -494,64 +494,83 @@ LEARNING_RATE = 1e-4
 """The SGD step's rate, tools/multimodal_reference.py's."""
 
 
-def drawing(family: str):
-    """`draw(seed)` of `family`: three images of its recorded images' shape, one in the first row and two in
-    the second, and for a family that hears, waveforms of its recorded clips' lengths."""
-    references, checkpoint = FAMILIES[family]
-    shape = np.load(FIXTURE.parent / references / "raw_images.npy").shape
-    clips = [np.load(path).shape for path in sorted((FIXTURE.parent / checkpoint).glob("waveform_*.npy"))]
-
-    def draw(seed: int) -> dict[str, np.ndarray]:
-        rng = np.random.default_rng([493, seed])
-        return {"images": rng.integers(0, 256, shape, dtype=np.uint8),
-                **{f"audio_{clip}": (rng.standard_normal(length) * 0.1).astype(np.float32)
-                   for clip, length in enumerate(clips)}}
-    return draw
-
-
-def computing(family: str, *, slipped: bool = False):
-    """`dew(dtype, inputs)` of `family`, on the host: the family's processor over a draw's prompts, images
-    and audio, then at `dtype` (the model rebuilt in float64 for a float64 run, `ModelConfig.with_dtype`)
-    its logits at every valid position, the summed next-token loss, its pixel gradient in the reference's
-    image order (`_real_pixels`) and the logits after one SGD step on every parameter, each compiled. A
-    `slipped` run takes each family's characteristic slip (`_wrong_inputs`) into its logits and one layer's
-    gradient with its sign flipped (`_one_layer_negated`) into its step."""
+def processed(family: str):
+    """The family's checkpoint loaded, its prompts, and `process(images, clips)`: its processor over them,
+    one image in the first row and two in the second."""
     references, checkpoint = FAMILIES[family]
     loaded = Pretrained.load(FIXTURE.parent / checkpoint, dtype="float32", attention_impl="reference")
     prompts = json.loads((FIXTURE.parent / references / "prompts.json").read_text())
 
+    def process(images, clips):
+        return loaded.processor(prompts, images=[[images[0]], [images[1], images[2]]], audio=clips or None)
+    return loaded, process
+
+
+def drawing(family: str):
+    """`draw(seed)` of `family`: three images of its recorded images' shape, one in the first row and two in
+    the second, and for a family that hears, waveforms of its recorded clips' lengths, which the reference's
+    processor reads; and their encoding by the family's own processor, each leaf `dew.<index>` in its
+    tree's order (`encoding`), which Dew reads."""
+    references, checkpoint = FAMILIES[family]
+    shape = np.load(FIXTURE.parent / references / "raw_images.npy").shape
+    clips = [np.load(path).shape for path in sorted((FIXTURE.parent / checkpoint).glob("waveform_*.npy"))]
+    _, process = processed(family)
+
+    def draw(seed: int) -> dict[str, np.ndarray]:
+        rng = np.random.default_rng([493, seed])
+        raw = {"images": rng.integers(0, 256, shape, dtype=np.uint8),
+               **{f"audio_{clip}": (rng.standard_normal(length) * 0.1).astype(np.float32)
+                  for clip, length in enumerate(clips)}}
+        leaves = jax.tree.leaves(process(raw["images"], [raw[f"audio_{clip}"] for clip in range(len(clips))]))
+        return {**raw, **{f"dew.{index}": np.asarray(leaf) for index, leaf in enumerate(leaves)}}
+    return draw
+
+
+def computing(family: str, *, slipped: bool = False):
+    """`dew(dtype, inputs)` of `family`: over a draw's encoding (`drawing`), at `dtype` (the model rebuilt in
+    float64 for a float64 run, `ModelConfig.with_dtype`), its logits at every valid position, the summed
+    next-token loss, its pixel gradient in the reference's image order (`_real_pixels`, over the encoding's
+    image counts, which every draw shares) and the logits after one SGD step on every parameter. A `slipped`
+    run takes each family's characteristic slip (`_wrong_inputs`) into its logits and one layer's gradient
+    with its sign flipped (`_one_layer_negated`) into its step."""
+    loaded, process = processed(family)
+    references, checkpoint = FAMILIES[family]
+    waveforms = sorted((FIXTURE.parent / checkpoint).glob("waveform_*.npy"))
+    sample = process(np.load(FIXTURE.parent / references / "raw_images.npy"),
+                     [np.load(path) for path in waveforms])
+    tree = jax.tree.structure(sample)
+
     def dew(dtype, inputs) -> dict:
-        images = inputs["images"]
-        clips = sorted(name for name in inputs if name.startswith("audio_"))
-        processed = loaded.processor(prompts, images=[[images[0]], [images[1], images[2]]],
-                                     audio=[inputs[name] for name in clips] or None)
+        encoded = jax.tree.unflatten(tree, [inputs[f"dew.{index}"] for index in range(tree.num_leaves)])
         model = (loaded.model if dtype == jnp.float32
                  else ModelConfig.from_model(loaded.model).with_dtype("float64").build())
-        processed, variables = jax.tree.map(
+        encoded, variables = jax.tree.map(
             lambda leaf: jnp.asarray(leaf, dtype) if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating)
-            else leaf, (processed, loaded.variables))
-        valid = jnp.asarray(processed.token_fields["attention_mask"], bool)[..., None]
-        forward = jax.jit(lambda variables, given: model.apply(variables, given.tokens, **given.kwargs()))
-        objective = LMObjective(model, processed.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
+            else leaf, (encoded, loaded.variables))
+        valid = jnp.asarray(encoded.token_fields["attention_mask"], bool)[..., None]
+        objective = LMObjective(model, encoded.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
         step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
 
+        def forward(variables, given):
+            return model.apply(variables, given.tokens, **given.kwargs())
+
         def loss(params, pixels):
-            conditioning = {**processed.conditioning, "pixel_values": pixels}
-            data = dataclasses.replace(processed, conditioning=conditioning)
+            conditioning = {**encoded.conditioning, "pixel_values": pixels}
+            data = dataclasses.replace(encoded, conditioning=conditioning)
             statistics, _ = objective.loss({**variables, "params": params}, {"text": data}, step)
             return objective.reduce_loss(statistics)[0]
 
-        value, (gradient, pixels) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
-            variables["params"], processed.conditioning["pixel_values"])
+        value, (gradient, pixels) = jax.value_and_grad(loss, argnums=(0, 1))(
+            variables["params"], encoded.conditioning["pixel_values"])
         if slipped:
             gradient = _one_layer_negated(gradient)
         optimizer = optax.sgd(LEARNING_RATE)
         updates, _ = optimizer.update(gradient, optimizer.init(variables["params"]), variables["params"])
         trained = {**variables, "params": optax.apply_updates(variables["params"], updates)}
-        given = _wrong_inputs(family, processed) if slipped else processed
+        given = _wrong_inputs(family, encoded) if slipped else encoded
         return {"logits": jnp.where(valid, forward(variables, given), 0), "loss": value,
-                "pixel_gradient": _real_pixels(processed, pixels),
-                "updated_logits": jnp.where(valid, forward(trained, processed), 0)}
+                "pixel_gradient": _real_pixels(sample, pixels),
+                "updated_logits": jnp.where(valid, forward(trained, encoded), 0)}
     return dew
 
 
@@ -570,10 +589,10 @@ def test_a_familys_logits_loss_pixel_gradient_and_step_are_on_par_with_its_refer
     pytest.importorskip("torchvision", reason="the vision extra supplies the actual processors")
     recording, draw, dew, _ = pipeline_arms(family)
     site = f"multimodal-{family}"
-    assert_as_exact_as_recorded(recording, site, FAMILY_SEEDS[family], draw, dew, family, host=True)
+    assert_as_exact_as_recorded(recording, site, FAMILY_SEEDS[family], draw, dew, family)
     with pytest.raises(GateFailure):
         assert_as_exact_as_recorded(recording, site, FAMILY_SEEDS[family], draw,
-                                    computing(family, slipped=True), f"{family} slipped", host=True)
+                                    computing(family, slipped=True), f"{family} slipped")
 
 
 def test_source_trained_export_and_frozen_buffers_match_reference(family_source, tmp_path):
