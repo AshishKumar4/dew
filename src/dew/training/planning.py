@@ -624,7 +624,7 @@ class FitSearch[LossT, EffectsT]:
     that keeps its residuals in pinned host memory ('minimal_offloaded') keeps as many on the device as
     'full' does (`tests/test_remat_rungs.py`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
     132,296), so it fits nowhere 'full' does not, and a run takes it by its own remat."""
-    lower: Callable[[int, bool, Footprint | None], Candidate]
+    lower: Callable[[int, bool, Footprint | None, bool], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
     objective: Objective[LossT, EffectsT]
     mesh: Mesh
@@ -827,14 +827,16 @@ class FitSearch[LossT, EffectsT]:
 
     def lowering(self, split: int) -> Candidate:
         """The step at `split` at the objective's rung and the search's `narrow`, lowered, with the
-        footprint the derivation traced of it where it read it (`footprints`)."""
-        return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)))
+        footprint the derivation traced of it where it read it (`footprints`); one the step compiled ahead
+        serves (`ahead`) derives none, its compile having judged the derivation where it was compiled."""
+        return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)),
+                          self.ahead is None)
 
     def relowering(self, split: int) -> Candidate:
         """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), its footprint traced
         again: the kernel's next config can change the buffers the derivation traced at its first (a
         Triton attention backward's partial gradients, a block of queries each)."""
-        return self.lower(split, self.narrow, None)
+        return self.lower(split, self.narrow, None, self.ahead is None)
 
     def candidate_key(self, split: int, narrow: bool) -> tuple[str, int]:
         """The step at `split` and `narrow` at the objective's rung, as the derivation's judgments keep it."""

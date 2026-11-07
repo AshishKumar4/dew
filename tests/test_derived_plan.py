@@ -174,7 +174,7 @@ def bare_search(objective):
     the test's to set (`judged_at`), and a compile it asks raises `Asked` naming the rung it asked at."""
     from dew.training.planning import FitSearch
 
-    def asked(split, narrow, footprint=None):
+    def asked(split, narrow, footprint=None, derived=True):
         raise Asked(search.remat_rung())
 
     search = FitSearch(lower=asked, options=lambda candidate: None, objective=objective,
