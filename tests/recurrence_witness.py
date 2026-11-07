@@ -747,6 +747,21 @@ class Run:
                     point(self.entered(n, head)) if carry is None else carry)
 
 
+def route_rounding(delta: bool, dtype) -> bool:
+    """The rounding a witnessed call's route resolves at JAX's own default precision, as a model trains and
+    the witnessed routes run (an fp32 call's rounds by the precision, `recurrence_chunk.fast_rounding`): the
+    delta rule's route's (`chunk_rounding`), else the template called directly at the rated scan's
+    (`fast_rounding`). Resolved at the suite's configured precision instead, an fp32 call's witness took
+    three parts where its route took two ('the certify build is the production program')."""
+    import jax
+
+    from dew.nn.kernels import recurrence_chunk
+
+    with jax.default_matmul_precision(None):
+        return (recurrence_chunk.chunk_rounding(delta, dtype) if delta
+                else recurrence_chunk.fast_rounding(dtype))
+
+
 def laid_chunks(length: int, starts, max_segments: int | None, chunk: int) -> np.ndarray:
     """The chunks of `chunk` tokens a call of one row of `length` tokens lays its tokens in, `[N, 2]`: each
     chunk's first token and its count, in the launches' order (`chunked_launch.sequences`, the mainloop's
@@ -800,8 +815,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     dtype = jnp.result_type(q, k, v)
     scale = k.shape[-1] ** -0.5 if delta else 1.0
     if rounded is None:
-        # As the delta rule's route resolves it for every form it runs (`recurrence_chunk.chunk`).
-        rounded = recurrence_chunk.chunk_rounding(delta, dtype)
+        rounded = route_rounding(delta, dtype)
     family = mainloop.family_of(dtype) or bundles.INTERPRETED
     # The parts its operands and passed values take (`chunk_forward.prepared`'s `given` and `held`): one of a
     # 16-bit value; an fp32 one's three, or under the fast forms its family's (`mainloop._fast_parts`).
@@ -1409,7 +1423,7 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
     do = jnp.asarray(rng.standard_normal(v.shape), dtype)
     dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
     scale = run.scale
-    rounded = recurrence_chunk.chunk_rounding(delta, dtype)
+    rounded = route_rounding(delta, dtype)
     family = mainloop.family_of(dtype) or bundles.INTERPRETED
     interpret = generation.backend() != "gpu"
 
@@ -1651,7 +1665,7 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
     rng = np.random.default_rng([2084, seed])
     do = jnp.asarray(rng.standard_normal(v.shape), dtype)
     dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
-    scale, rounded = run.scale, recurrence_chunk.chunk_rounding(delta=True, dtype=dtype)
+    scale, rounded = run.scale, route_rounding(True, dtype)
     family = mainloop.family_of(dtype) or bundles.INTERPRETED
     interpret = generation.backend() != "gpu"
 

@@ -426,6 +426,14 @@ def _reverse_launched(call: Call, batch: int, bv: int, walked_width: int, *, gat
 
 
 @lowered_once
+def _reverse_staging(call: Call, held: Parts, bv: int) -> tuple:
+    """The reverse walk's staged right operands, `held` (`_reverse`'s): a key slice's memory operand
+    `[block, bv]` and, where a chunk is wider than a key slice, the chunk's `[C, bv]` apart; then the decayed
+    output gradient's second part."""
+    shapes = dict.fromkeys(((call.block, bv), (call.chunk, bv)))
+    return (*staging_tiles(held, *shapes), (plgpu.SMEM((call.chunk, bv), held.stored),))
+
+
 def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, tiles: Tiles, *, scale: float,
              skip=None, memory=None):
     """`(dh [chunks * HV * Dk, Dv], dv [R, HV * Dv], dh0 [B * HV * Dk, Dv])`: the gradient of the memory each
@@ -483,7 +491,6 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
 
         def step(role):
             (*staged, (second,)), lands = roled(role)
-            # A key slice's memory operand and, where a chunk is wider than a key slice, the chunk's apart.
             sliced, chunked = staged[0], staged[-1]
             # The decayed output gradient fp32 as two parts against the queries (fla's split product, 16 of
             # its significand's bits): one part put the initial memory's gradient 5 to 7 times the port's
@@ -537,8 +544,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=(1, 2), work=work,
                          held=_reverse_held(call, bv, gates=gates, skips=skips), consumers=walkers,
                          live=lambda at, refs: refs[8][at["sequences"], 1] > 0,
-                         staging=(*staging_tiles(held, *dict.fromkeys(((call.block, bv), (chunk, bv)))),
-                                  (plgpu.SMEM((chunk, bv), held.stored),)),
+                         staging=_reverse_staging(call, held, bv),
                          once=finals,
                          landing={**memory_landing(call, bv), "corrected": grads.landing(chunk, bv),
                                   **final_landing},
