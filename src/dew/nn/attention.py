@@ -386,10 +386,12 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     GPU. `wide_logits` computes the logits from the query and keys widened to
     at least fp32 and scales them after the product, as DeepSeek V4 does
     (modeling_deepseek_v4.py:708-736); the value product stays in the inputs'
-    dtype. `scale_logits` scales the fp32 logits of the query and keys in their
-    own dtype after the product, `float32_einsum(query, key) * D ** -0.5`, the
-    rest of the pipeline as it is: jax.nn's xla form and the fused kernels' own,
-    where flax's scales the query before it.
+    dtype. `scale_logits` forms the logits of the query and keys in their own
+    dtype as fp32 (the product's preferred type) and scales them after it, by
+    `D ** -0.5` in fp32, the mask and softmax reading them in fp32: jax.nn's xla
+    form (`jax.nn.dot_product_attention`) and the fused kernels' own, where
+    flax's scales the query before the product and rounds its logits to its
+    dtype.
     """
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
@@ -401,18 +403,22 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         scaled_query, scoring = query, key
     else:
         scaled_query, scoring = query / jnp.sqrt(width).astype(dtype), key
+    # jax.nn's logits are its product's fp32 sums, never rounded to the operands' dtype.
+    formed = at_least_fp32(dtype) if scale_logits else None
     if sinks is None:
         scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
-        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=precision)
+        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=precision,
+                                preferred_element_type=formed)
     elif kv_heads == 1:
         # One key/value head (DeepSeek V4's): the query heads are a free dim beside the rows, and no
         # size-one head axis rides as a batch dim, which had XLA transpose the fp32 query for the
         # product (a V4 layer's training step on an H100, batch 4 by 2048: 2 GiB more and 5% slower).
-        logits = float32_einsum('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :], precision=precision)
+        logits = float32_einsum('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :], precision=precision,
+                                preferred_element_type=formed)
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
-        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=precision).reshape(
-            *rows, heads, length, keys)
+        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=precision,
+                                preferred_element_type=formed).reshape(*rows, heads, length, keys)
     if wide_logits or scale_logits:
         logits = logits * width ** -0.5
     if softcap is not None:
