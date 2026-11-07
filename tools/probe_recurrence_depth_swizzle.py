@@ -17,7 +17,9 @@ def staged(call,keys):
  return (pairs,jax.tree.map(narrow,squares),gated,*other),landing
 kb._key_pairs_staged=staged
 target,index=sys.argv[1],int(sys.argv[2])
-for case in t.compiled_cases(target,{},[],{},only=t.GATE_GROUPS[index]):
+cases=t.compiled_cases(target,{},[],{},only=t.GATE_GROUPS[index])
+print('K TARGET',target,'GROUP',index,'CASES',len(cases),flush=True)
+for case in cases:
  print('K CASE',case.name,flush=True)
  record={'name':case.name}
  with tempfile.TemporaryDirectory() as d:
