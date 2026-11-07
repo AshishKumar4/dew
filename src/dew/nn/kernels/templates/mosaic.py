@@ -2415,8 +2415,6 @@ def arrived(counter, contributors) -> jax.Array:
     semaphores alike)."""
     scalar = plgpu.Layout.WG_SPLAT(())
 
-    @plgpu.inline_mgpu(arg_types=(plgpu.RefType(), scalar),
-                       return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))
     def ticket(ctx, ref, count):
         del ctx
         i32 = ir.IntegerType.get_signless(32)
@@ -2439,7 +2437,9 @@ def arrived(counter, contributors) -> jax.Array:
             result_types=i32, has_side_effects=True, convergent=True)
         return mgpu_fragments.FragmentedArray.splat(last, (), is_signed=True)
 
-    return ticket(counter, jnp.asarray(contributors, jnp.int32))
+    inline = plgpu.inline_mgpu(arg_types=(plgpu.RefType(), scalar),
+                               return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))
+    return inline(ticket)(counter, jnp.asarray(contributors, jnp.int32))
 
 
 def summing(shape: tuple[int, ...], consumers: int) -> dict:
