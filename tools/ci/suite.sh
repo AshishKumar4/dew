@@ -52,7 +52,7 @@ if [ -z "${PROVEN:-}" ] && [ -z "${GANGLESS:-}" ]; then
     --pool="$(echo "$items" | python3 -c 'import json, sys; print(sum(gang["gang"] for gang in json.load(sys.stdin)))')" \
     --deadline=$side --gang-start-timeout=300 $priority --label="${LABEL:-$sha}" -- python3 tools/armada/ci.py pytest \
     --python="$(tr -d '\n' < .python-version)" --report=/tmp/dew-gang.xml \
-    -- -k "{select}" --basetemp=/tmp/dew-gang tests/test_multihost.py > "$out/gangs.log" 2>&1 &
+    -- -s -k "{select}" --basetemp=/tmp/dew-gang tests/test_multihost.py > "$out/gangs.log" 2>&1 &
   gangs=$!
 fi
 # Its own deadline sits above what every file takes on its containers when no row is cached: 2700 s; a cold suite

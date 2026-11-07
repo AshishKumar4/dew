@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 import test_multiprocess as single
-from process_support import report_of, spawn, terminate, worker_env
+from process_support import relayed, report_of, spawn, terminate, worker_env
 
 test_a_real_token_budget_agrees_across_processes_after_logging_ticks = (
     single.test_a_real_token_budget_agrees_across_processes_after_logging_ticks)
@@ -221,20 +221,18 @@ def lost_host(sequence: int, tmp_path: Path) -> list:
     return [alive, outcome, time.monotonic() - killed]
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
 def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
     """`command` as this rank's process of a pool of one process per rank, joined at rank0 as `dew launch`
     leaves a pool (DEW_PROCESS_COUNT, DEW_PROCESS_ID, JAX_COORDINATOR_ADDRESS) on `devices` CPU devices each:
-    its output, once it exited 0."""
+    its output, once it exited 0, relayed to the rank's log as it comes (`relayed`)."""
     sequence = next(POOLS)
     env = {**worker_env(devices), "DEW_PROCESS_COUNT": str(WORLD), "DEW_PROCESS_ID": str(RANK),
            "JAX_COORDINATOR_ADDRESS": f"rank0:{COORDINATOR + sequence}"}
     together(sequence)
-    ran = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout)
+    ran = relayed(command, env, timeout=timeout)
     exits = exchange(sequence, ran.returncode)
-    assert exits == [0] * WORLD, f"rank exits {exits}\n{ran.stdout[-6000:]}\n{ran.stderr[-6000:]}"
-    return ran.stdout
+    assert exits == [0] * WORLD, f"rank exits {exits}\n{ran.output[-12000:]}"
+    return ran.output
 
 @pytest.mark.distributed
 @pytest.mark.parametrize("model", MODELS)
