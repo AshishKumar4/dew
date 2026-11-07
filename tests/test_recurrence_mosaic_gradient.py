@@ -15,8 +15,8 @@ import numpy as np
 import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
-from reference_error import with_gradients
-from test_recurrence_chunk import chunk_on
+from reference_error import assert_as_exact, with_gradients
+from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -34,7 +34,7 @@ from test_recurrence_mosaic import (
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
-from dew.nn.kernels.templates import bundles
+from dew.nn.kernels.templates import bundles, mosaic_sm100
 from dew.nn.kernels.templates.recurrence import mainloop, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
 from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
@@ -186,6 +186,33 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     the_template_is_as_exact_as_fla(rule, recorded_site(case, dtype),
                                     label=f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}',
                                     under=under)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+@pytest.mark.parametrize('case', ['one sequence', 'packed documents'])
+def test_tcgen05s_chunks_train_as_wgmma_does_interpreted(case):
+    """The template's training step at a B200's derived tiles on its bundle (tcgen05's 64-row products into
+    tensor memory read back in the WGMMA layout, `mosaic_sm100.CHUNKS`, interpreted: Mosaic GPU's interpreter
+    models tensor memory and tcgen05's products) on par from float64 with the same tiles on wgmma's bundle
+    (check 1, the truth the recurrence a token at a time in float64): its output, final memory and every
+    operand's gradient in bf16 (row 4747). Wgmma's arm is held to recorded fla-core
+    (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
+    hooks, dtype = case_hooks(case), jnp.bfloat16
+    (sample, _) = drawn(dtype, 0, **geometry(case))
+    tiles = template.MOSAIC.derived(template_call(sample, hooks), generation.gpu_target('sm100'))
+    assert tiles is not None
+
+    def on(family):
+        def rule(given):
+            return template.mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta,
+                                        given.state, tiles=tiles, family=family, delta=hooks.delta,
+                                        scale=given.key.shape[-1] ** -0.5, floor=hooks.floor,
+                                        bound=hooks.inverse_bound, rounded=True)
+        return jax.jit(with_gradients(rule))
+
+    assert_as_exact(on(mosaic_sm100.CHUNKS), on(bundles.INTERPRETED), functools.partial(drawn, dtype,
+                    **geometry(case)), f'tcgen05 chunks training, {case}', seeds=8,
+                    truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
 
 
 def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
