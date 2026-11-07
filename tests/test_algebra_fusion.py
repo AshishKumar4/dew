@@ -687,7 +687,7 @@ def test_the_compile_point_writes_a_program_by_its_own_values(name):
     """Each program (`WRITTEN_AS_PROGRAMS`), written after the others in either order, writes the norms it
     holds and computes what it does as written, bit for bit: a region is the call's only where the call
     computes the region's own arithmetic."""
-    from contract_support import normal_drawn
+    from contract_support import normal_draw
 
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
     names = list(WRITTEN_AS_PROGRAMS)
@@ -696,7 +696,7 @@ def test_the_compile_point_writes_a_program_by_its_own_values(name):
     program, norms = WRITTEN_AS_PROGRAMS[name]
     written, found = _norms_written(program, *shapes)
     assert found == norms
-    x, w = normal_drawn(4783, (256, 256), (256,), dtype=jnp.bfloat16)
+    x, w = normal_draw(4783, (256, 256), (256,), dtype=jnp.bfloat16)
     for ours, theirs in zip(jax.tree.leaves(written(x, w)), jax.tree.leaves(program(x, w)), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
@@ -704,26 +704,26 @@ def test_the_compile_point_writes_a_program_by_its_own_values(name):
 def test_a_stream_read_before_its_norm_computes_as_written():
     """A residual stream another value reads before its norm, compiled through the rewrite, computes as
     written bit for bit: the stream's sum stays where its first reader needs it."""
-    from contract_support import normal_drawn
+    from contract_support import normal_draw
 
     rows = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
     shapes = (rows, rows, jax.ShapeDtypeStruct((256,), jnp.bfloat16))
     written, _ = _norms_written(_stream_read_early, *shapes)
-    x, branch, w = normal_drawn(4784, (256, 256), (256, 256), (256,), dtype=jnp.bfloat16)
+    x, branch, w = normal_draw(4784, (256, 256), (256, 256), (256,), dtype=jnp.bfloat16)
     for ours, theirs in zip(written(x, branch, w), _stream_read_early(x, branch, w), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
 def test_a_norm_of_a_stopped_row_passes_no_gradient_to_it():
     """A norm of a row whose gradient the program stops, rewritten, passes the row no gradient, as written."""
-    from contract_support import normal_drawn
+    from contract_support import normal_draw
 
     def program(x, w):
         return _norm_of(jax.lax.stop_gradient(x), w).astype(jnp.float32).sum()
 
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.float32), jax.ShapeDtypeStruct((256,), jnp.float32))
     written, _ = _norms_written(program, *shapes)
-    x, w = normal_drawn(4785, (256, 256), (256,))
+    x, w = normal_draw(4785, (256, 256), (256,))
     assert not np.any(np.asarray(jax.grad(written)(x, w)))
 
 
