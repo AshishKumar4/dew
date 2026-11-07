@@ -516,18 +516,21 @@ def follow() -> None:
     sys.addaudithook(audited)
 
 
-def gpu_memory() -> tuple[int, int] | str:
-    """The GPU pool this process held and the most memory it used, read as its last atexit before jax's
-    backend closes; or why the backend never opened, as jax said, where it holds none."""
+def gpu_memory(backend: str = "gpu") -> tuple[int, int] | str:
+    """The pool this process held on `backend`'s devices and the most memory it used, read as its last atexit
+    before jax's backend closes; or why it cannot say: the backend never opened, as jax said, or no device
+    states the most it used (a backend whose allocator keeps no peak), never a peak of 0 it did not read."""
     import jax
 
     try:
-        devices = jax.local_devices(backend="gpu")
+        devices = jax.local_devices(backend=backend)
     except RuntimeError as error:  # the backend failed to open, and holds no pool
         return " ".join(str(error).split())
     stats = [device.memory_stats() or {} for device in devices]
-    return (sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats),
-            max(stat.get("peak_bytes_in_use", 0) for stat in stats))
+    peaks = [stat["peak_bytes_in_use"] for stat in stats if "peak_bytes_in_use" in stat]
+    if not peaks:
+        return f"no {backend} device states the most memory it used (peak_bytes_in_use)"
+    return sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats), max(peaks)
 
 
 def logged(path: Path) -> dict:

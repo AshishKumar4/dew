@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from process_support import raised
 from reference_error import assert_as_exact, assert_computes_the_oracle, assert_same_artifact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
@@ -637,6 +638,15 @@ def test_a_shared_draw_cache_computes_past_its_disk_reserve_and_keeps_nothing_th
         assert computed.loss == kept.loss and any(Path(directory).iterdir())
 
 
+def test_a_gpu_memory_read_where_no_device_states_its_peak_says_so_never_a_peak_of_0():
+    """CI's recorder reads the most memory a test process used from its devices' allocators
+    (`followed.gpu_memory`); where none states it (the CPU's, an allocator keeping no peak) it says so, which
+    the recorder writes as no memory known, never a peak of 0 it did not read (train 657's review)."""
+    followed = load("followed", "tools/armada")
+    # A reason, in place of the (pool, peak) it cannot read.
+    assert isinstance(followed.gpu_memory("cpu"), str)
+
+
 def test_the_layout_parity_command_runs_its_main(tmp_path):
     """`python tools/layout_parity.py` runs the tool, which refuses `--prepare` with no `--references`
     directory to write, where a script whose entry point is gone exits 0 having checked nothing."""
@@ -644,7 +654,8 @@ def test_the_layout_parity_command_runs_its_main(tmp_path):
                "--seeds", "0", "--prepare"]
     finished = subprocess.run(command, capture_output=True, text=True, timeout=600, cwd=tmp_path)
     # Its refusal is a SystemExit of its own, no traceback's error, and it wrote nothing.
-    assert finished.returncode == 1 and not any(tmp_path.iterdir()), finished.stderr[-2000:]
+    assert finished.returncode == 1 and not raised(finished) and not any(tmp_path.iterdir()), (
+        finished.stderr[-2000:])
 
 
 def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
