@@ -400,19 +400,26 @@ class Pretrained:
         processor = None if task is None or task.processor is None else load_processor(task.processor, model)
         trained = models[model_config.name]
         if trained is CausalTransformer or isinstance(model, MediaWrapper):
-            # A wrapper's bundle is its family's release layout (`PretrainedDecoder.from_model`).
+            # A wrapper's bundle is its family's release layout (`PretrainedDecoder.from_model`). A run's
+            # cross-attention is its source's extension, which no family writes: the bundle is its
+            # source's, carrying the run's model, as `with_cross_attention` attaches it, and `save`
+            # refuses it.
             decoder = model if isinstance(model, MediaWrapper) else from_record(CausalTransformer, model)
+            crossing = isinstance(decoder, CausalTransformer) and decoder.cross_attention is not None
             generation = (masked_generation_config(budget, None, held.eos_token_ids)
                           if isinstance(held, MaskedSettings) else
                           generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
                           else None)
-            bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
-                                                          generation_config=generation), processor=processor)
+            bundle = replace(PretrainedDecoder.from_model(
+                decoder.with_cross_attention(None) if crossing else decoder, variables, tokenizer=tokenizer,
+                generation_config=generation), processor=processor)
+            if crossing:
+                bundle = replace(bundle, model=decoder)
             if isinstance(held, MaskedSettings):
                 # A masked run's model is a decoder: no wrapper denoises.
                 bundle = PretrainedMaskedDecoder(
-                    from_record(CausalTransformer, model), bundle.variables, bundle.processor, bundle.config,
-                    bundle.source,
+                    from_record(CausalTransformer, decoder), bundle.variables, bundle.processor,
+                    bundle.config, bundle.source,
                     bundle.model_config, bundle.generation_config,
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
         elif trained is models["diffusion_gemma"]:
@@ -810,16 +817,15 @@ class PretrainedDecoder(Pretrained):
     def from_model(cls, model: nn.Module, variables: Variables, *,
                    tokenizer: str | decoders.ExportTokenizer | None = None,
                    generation_config: Mapping[str, object] | None = None) -> PretrainedDecoder:
-        """Wrap a decoder trained in Dew as a bundle that `save` writes in its family's Hugging Face layout.
+        """Wrap a model trained in Dew as a bundle that `save` writes in its family's Hugging Face layout.
 
-        The config is derived from the native computation, and every variable
-        collection is encoded through the matching family. That is the same encoder a
-        loaded source of the derived family exports through, so both write the same
-        weights. Gemma 4 writes frozen or trainable layer-scalar values into HF
-        buffers; reloading that layout reproduces the computation, but not which
-        scalars were trainable. The config is derived from a `causal_transformer`'s
-        fields, so any other model is refused. A decoder with cross-attention or DEX takes the
-        config of the decoder they extend and runs as a bundle, but `save` refuses it.
+        The layout is the one every writer asks (`layouts.source_layout`): a wrapper's family's release
+        layout, or a decoder's family's, the one its fields match, a differential extension and a
+        low-rank adapter written as the decoder they extend; a model it cannot write is refused here,
+        saying why. A decoder's every variable collection is encoded through the matching family, the
+        same encoder a loaded source of the family exports through, so both write the same weights.
+        Gemma 4 writes frozen or trainable layer-scalar values into HF buffers; reloading that layout
+        reproduces the computation, but not which scalars were trainable.
 
         `tokenizer` is the vocabulary the weights were trained with, as an object or
         by name. `save` writes its files next to the weights, so the directory that
@@ -827,33 +833,25 @@ class PretrainedDecoder(Pretrained):
         what generation_config.json records; None uses the native defaults with
         the exported model's cache mode.
         """
-        if isinstance(model, MediaWrapper):
-            # A wrapper is written in its family's release layout (`wrappers.wrapper_layout`), its
-            # language model's under its text family's.
-            from dew.interop.wrappers import wrapper_layout
+        from dew.interop.layouts import source_layout
 
+        layout = source_layout(model)
+        if isinstance(layout, Unwritable):
+            raise TypeError(f"{type(model).__name__} has no Hugging Face layout Dew writes: {layout.reason}")
+        if isinstance(model, MediaWrapper):
             wrapper = from_record(MultimodalTransformer, model)
-            layout = wrapper_layout(wrapper)
-            if isinstance(layout, Unwritable):
-                raise TypeError(f"a {wrapper.family} wrapper has no Hugging Face layout Dew writes: "
-                                f"{layout.reason}")
             return cls(wrapper, variables, None, layout.config, None,
                        record_fields(wrapper, MultimodalTransformer),
                        dict(decoders.GENERATION_DEFAULTS) if generation_config is None else generation_config,
                        export_adapter=lambda _, values, __: layout.tensors(values), tokenizer=tokenizer)
-        try:
-            decoder = from_record(CausalTransformer, model)
-        except ValueError as error:
-            raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout") from error
-        # Cross-attention blocks and DEX have no layout in any family: the config is the decoder's they
-        # extend, and `export` refuses the extensions themselves.
-        config = decoders.export_config(decoder.with_cross_attention(None).with_dex(None))
-        built = record_fields(decoder, CausalTransformer)
-        return cls(decoder, variables, None, config, None, built,
-                   {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
+        decoder = from_record(CausalTransformer, model)
+        # The layout's own writer reads a decoder bundle's export (`source_layout`), which encodes through
+        # its family.
+        return cls(decoder, variables, None, layout.config, None, record_fields(decoder, CausalTransformer),
+                   {**decoders.GENERATION_DEFAULTS,
+                    'use_cache': layout.config.get('use_cache', decoder.causal)}
                    if generation_config is None else generation_config,
-                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer,
-                   code=decoders.release_code(decoder))
+                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer, code=layout.code)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.

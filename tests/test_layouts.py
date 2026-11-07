@@ -2,7 +2,6 @@
 same declaration, and a model its family's layout holds written from its own fields and read back as
 itself (`source_layout`)."""
 
-import dataclasses
 import json
 from pathlib import Path
 
@@ -10,7 +9,7 @@ import numpy as np
 import pytest
 from model_support import flat_tree
 
-from dew.interop import Pretrained, PretrainedDecoder, decoder_parts, hf_decoders
+from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
 from dew.interop.codecs import SIDECARS
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.layouts import (
@@ -53,8 +52,6 @@ def test_every_registered_family_reads_and_writes_by_its_one_layout():
     and its writer derive: a family holds no reader or writer of its own beside them, the second inverse
     of a path, a config field or a weight a family once kept and drifted from (ledger 1026, 1411, 4562,
     4570, 4571)."""
-    fields = {field.name for field in dataclasses.fields(decoder_parts.DecoderFamily)}
-    assert not fields & {"weight_path", "export_path", "export_weights", "export_fields", "translate_config"}
     for family in ENTRIES:
         assert all(isinstance(node, ROUTES) for node in declared(family.routes)), family.model_types
         assert all(isinstance(node, CONFIGS) for node in declared(family.config)), family.model_types

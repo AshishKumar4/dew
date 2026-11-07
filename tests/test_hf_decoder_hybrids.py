@@ -102,14 +102,14 @@ def test_the_router_bias_lands_in_the_moe_collection():
     and the loaded model selects on it: zeroing the bias moves the logits by
     2.1 on deepseek-v3-tiny.
     """
-    from dew.interop.decoder_parts import dew_path
+    from dew.interop.families.deepseek import DEEPSEEK_V3
     from dew.interop.sources import load_shards
 
     directory = FIXTURES / "deepseek-v3-tiny"
     config = translate_config(fixture_config("deepseek-v3-tiny"))
     tensors = load_shards(directory)
     name = 'model.layers.1.mlp.gate.e_score_correction_bias'
-    assert dew_path(name, config) == (
+    assert DEEPSEEK_V3.weight_path(name, config) == (
         'moe', 'layers_1', 'mlp', 'gate', 'e_score_correction_bias')
 
     variables = translate_weights(tensors, config)
