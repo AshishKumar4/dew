@@ -1623,6 +1623,15 @@ def a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
 
 
 @ON_HOPPER
+def the_backward_at_its_faulting_geometry_is_on_par_on_an_h100():
+    """The full backward at the geometry whose two launches faulted on an H100 (row 2254: two rows of 4096
+    tokens, 32 query heads over 8 key heads, 128 wide, pinned at 64 x 64, two stages, one consumer), compiled
+    on an H100 on the published tip: finite and on par with the reference (check 1, row 2269)."""
+    with _pinned(backward=attention_mosaic.BackwardTiles(64, 64, 2, 1, family=WGMMA, **FED)):
+        _check_backward("full", (2, 4096, 32, 8), form="default", interpret=False, width=128)
+
+
+@ON_HOPPER
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("call", CALLS)
 def the_backward_is_on_par_on_an_h100(call, form):
