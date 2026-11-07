@@ -568,8 +568,9 @@ class Pretrained:
         (`codecs.mxfp4_tensor_powers`) is held packed (`dew.nn.kernels.gemm.NvFp4`, exactly its MXFP4
         values) in the `QUANTIZATION` collection under its matrix's name, which the expert layers read
         (`dew.quantization.expert_matrix`) and an export decodes (`decoded_expert_banks`); one that is
-        not stays dense, named in the load's log. Refused beside another source format, a mesh or
-        layout, or `scan_layers`.
+        not stays dense, named in the load's log. A bank is a registered dataclass, so a mesh places its
+        leaves by its dense matrix's axes and a scan stacks and slices each as it does a dense matrix
+        (`scan_layers`). Refused beside another source format.
         A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
         name_or_dir, trust_remote_code = released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
@@ -604,11 +605,6 @@ class Pretrained:
                      prediction_depths: int | None, dex: DifferentialExtension | None,
                      precision: Numerics | str | None, scan_layers: bool, packed_experts: bool) -> Self:
         """`load` of a source a family's loader reads, its every option as `load` states it."""
-        if packed_experts and scan_layers:
-            # A scan stacks a period's layers along a leading axis of each leaf, which a bank's three would
-            # take as its experts' (row 4861).
-            raise ValueError("packed_experts serves each layer's banks apart; scan_layers stacks them, which "
-                             "no bank takes yet (row 4861)")
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
