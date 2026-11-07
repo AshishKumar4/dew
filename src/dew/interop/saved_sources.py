@@ -330,12 +330,13 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
     release's record states no dtypes a family's load reads, and a run started from it raised KeyError),
     placed on `mesh` under `layout`, or on the host (`on_host`), every tree of it, computing in `dtype`
     and stored in `param_dtype` ("auto": as the release stores it). A load option that builds a
-    family's model another way (`building`, set where truthy) is refused, as the release builds the model
-    its run recorded, and so is a bundle of another kind than `kind`."""
+    family's model another way (`building`, set where neither None nor False, a 0 among them) is
+    refused, as the release builds the model its run recorded, and so is a bundle of another kind than
+    `kind`."""
     from dew.inference.models import ReleasedRun
     from dew.objectives.base import ReleasedTask
 
-    built = [name for name, value in building.items() if value]
+    built = [name for name, value in building.items() if value is not None and value is not False]
     if built:
         raise ValueError(f"{source} is a run's native release, which builds the model its run recorded; "
                          f"load it without {', '.join(built)}")

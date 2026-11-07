@@ -569,9 +569,9 @@ class Pretrained:
                                  param_dtype=param_dtype, on_host=on_host, building={
                 "attention_impl": attention_impl != "auto", "max_seq_len": max_seq_len, "revision": revision,
                 "subfolder": subfolder, "gguf_file": gguf_file, "single_file": single_file,
-                "dduf_file": dduf_file, "fallback": fallback, "modeling_overrides": modeling_overrides,
-                "text_only": text_only, "prediction_depths": prediction_depths, "dex": dex,
-                "precision": precision, "scan_layers": scan_layers})
+                "dduf_file": dduf_file, "fallback": fallback, "text_only": text_only,
+                "modeling_overrides": modeling_overrides or None, "prediction_depths": prediction_depths,
+                "dex": dex, "precision": precision, "scan_layers": scan_layers})
         return cls._from_family(
             name_or_dir, trust_remote_code, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,
