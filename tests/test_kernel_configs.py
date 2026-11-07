@@ -949,6 +949,14 @@ def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, name
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 
+def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
+    """An NVFP4 projection at a decode step's 16 rows on a compile-only H100, no kernel named
+    (`gemm.NVFP4_CELLS`' H100 decode cell, receipt W7-gh200-8-M-NS-8-h100: 2.4-4.5x the matrix decoded once a
+    call): its program launches the template's packed product (`kernel_compile.Expected`, its route
+    evidence)."""
+    _assert_launches("sm90", "nvfp4 16 rows", functools.partial(_nvfp4_projected, 16, None), 1, "dew_gmm")
+
+
 def _blockwise_gradient():
     """A blockwise-scaled FP8 MoE projection's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`: 2048
     deep, 768 wide, eight experts of 4 to 12 whole 128-row blocks) through the template named."""
