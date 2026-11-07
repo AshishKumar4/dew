@@ -9,6 +9,15 @@ import test_flaxdiff_family_source as t
 
 case = sys.argv[1].replace("-", "/", 1)
 mode = sys.argv[2] if len(sys.argv) > 2 else "baseline"
+if mode == "fixed":
+    import inspect
+    import dew.nn.attention_blocks as ab
+    import dew.nn.backbones.unet as ub
+    source=inspect.getsource(ab.stage_attention)
+    assert source.count("stage.dtype or dtype or jnp.float32")==1
+    namespace={}
+    exec(source.replace("stage.dtype or dtype or jnp.float32","stage.dtype or dtype"),ab.__dict__,namespace)
+    ab.stage_attention=ub.stage_attention=namespace["stage_attention"]
 _, cls, config, _, _ = t.CASES[case]
 inputs = t.drawing(case)(0)
 params = {k.removeprefix("param."): jnp.asarray(v, jnp.float64)
@@ -68,4 +77,9 @@ for k in rc:
 for _,k,a,b in sorted(bad,reverse=True)[:5]:
     report("WORST_PARAM "+k,a,b)
 report("FINAL_output",ra,da)
-report("FINAL_gradients",jnp.concatenate([a.ravel() for a in rr]),jnp.concatenate([a.ravel() for a in dd]))
+gr=jnp.concatenate([a.ravel() for a in rr])
+gd=jnp.concatenate([a.ravel() for a in dd])
+report("FINAL_gradients",gr,gd)
+passed=np.linalg.norm(np.asarray(ra-da))/np.linalg.norm(np.asarray(ra))<1e-14 and np.linalg.norm(np.asarray(gr-gd))/np.linalg.norm(np.asarray(gr))<1e-14
+print("K",mode,"ROUNDING_CHECK","PASS" if passed else "FAIL")
+assert passed
