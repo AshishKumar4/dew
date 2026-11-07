@@ -124,11 +124,11 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     the forward's derived config at the key tile its memory-bound walk streams at least
     (`MosaicForward.streaming`) and its slices; None where no launch of it derives.
     One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
-    nothing). Else as many as its programs' residency holds at once (`MosaicForward.resident`: its
-    registers', its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter
-    slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
-    (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
-    whole step took 13). Where the family waits across programs (`Family.fixes_up`), the launch merges the
+    nothing). Else as many as keep the device's stream in flight (`MosaicForward.streamed`, at most those its
+    residency holds, `MosaicForward.resident`), but each slice at least twice its ring's stages of key tiles:
+    a shorter slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to
+    hide them (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where
+    cuDNN's whole step took 13). Where the family waits across programs (`Family.fixes_up`), the launch merges the
     slices in the last one's program, the initial state with them (`MosaicForward.merges`); elsewhere each
     slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config derived for them."""
     found = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
@@ -151,10 +151,11 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
             return Plan(config, 1, merges=False)
         config, op, ba = found
     longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
-    # The most slices whose programs the device holds at once, none past it: one program past them waits a
-    # whole walk for a slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a
-    # second wave as long as the first), and a merging launch's every program resident.
-    slices = max(1, min(processors * op.resident(ba, config, target) // programs, longest))
+    # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`, at
+    # most those it holds), none past them: one program past those it holds waits a whole walk for a slot
+    # (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a second wave as long as
+    # the first), and one past those that stream it only lengthens the merge.
+    slices = max(1, min(processors * op.streamed(ba, config, target) // programs, longest))
     return Plan(config, slices, merges=slices > 1 and bundle_of(config, query.dtype).fixes_up)
 
 
