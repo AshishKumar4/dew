@@ -174,7 +174,11 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
         return None
     places.append(sub)
     logits, centre = eqns[sub].invars
-    axis = _rows_maximum(graph, centre, logits, places)
+    logits_places: list[int] = []
+    scaled, mask, perm = _unmasked(graph, logits, logits_places)
+    if perm is None:
+        return None
+    axis = _rows_maximum(graph, centre, logits, scaled, perm, places)
     if axis is None:
         return None
     # The normalizer: a reader of the exponential (or its cast) sums it over the keys and divides.
@@ -196,10 +200,6 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
     product = (reader, weights)
     second, weights_read = product
     places.append(second)
-    logits_places: list[int] = []
-    scaled, mask, perm = _unmasked(graph, logits, logits_places)
-    if perm is None:
-        return None
     places += logits_places
     first, query, key, query_width, key_width, layout = _scaled_product(graph, scaled, places)
     if first is None:
@@ -216,12 +216,14 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
     return region._replace(places=tuple(places))
 
 
-def _rows_maximum(graph: _Graph, centre, logits, places: list[int]) -> int | None:
-    """The keys axis where `centre` is `logits`' largest over it, broadcast back, held from its gradient and
-    raised to a constant (jax.nn's `initial`) in any order, through casts; None where it is not."""
+def _rows_maximum(graph: _Graph, centre, logits, scaled, perm: tuple[int, ...], places: list[int]) -> int | None:
+    """The keys axis (the softmax's layout, `logits`') where `centre` is the logits' largest over it,
+    broadcast back, held from its gradient, raised to a constant (jax.nn's `initial`) and laid out again in
+    any order, through casts: a maximum of `logits` itself, or of `scaled` before the layout `perm` moved it
+    (jax.nn's vmapped softmax over a grouped call); None where it is not."""
     eqns, atom = graph.jaxpr.eqns, centre
     while True:
-        place = graph.made(atom, "broadcast_in_dim", "stop_gradient", "max", *CASTS)
+        place = graph.made(atom, "broadcast_in_dim", "stop_gradient", "max", "transpose", *CASTS)
         if place is None:
             break
         eqn = eqns[place]
@@ -234,10 +236,16 @@ def _rows_maximum(graph: _Graph, centre, logits, places: list[int]) -> int | Non
             atom = eqn.invars[0]
         places.append(place)
     reduced = graph.made(atom, "reduce_max")
-    if reduced is None or eqns[reduced].invars[0] is not logits or len(eqns[reduced].params["axes"]) != 1:
+    if reduced is None or len(eqns[reduced].params["axes"]) != 1:
         return None
-    places.append(reduced)
-    return int(eqns[reduced].params["axes"][0])
+    axis, read = int(eqns[reduced].params["axes"][0]), eqns[reduced].invars[0]
+    if read is logits:
+        places.append(reduced)
+        return axis
+    if read is graph.uncast(scaled, []) or read is scaled:
+        places.append(reduced)
+        return perm.index(axis)
+    return None
 
 
 def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int | None:
@@ -273,6 +281,9 @@ def _unmasked(graph: _Graph, logits, places: list[int]):
     entries, or is laid out otherwise than broadcast."""
     eqns, rank, nothing = graph.jaxpr.eqns, logits.aval.ndim, (None, None, None)
     identity = tuple(range(rank))
+    if (moved := graph.made(logits, "transpose")) is not None:
+        places.append(moved)
+        return eqns[moved].invars[0], True, tuple(int(d) for d in eqns[moved].params["permutation"])
     place = graph.made(logits, "jit", "pjit", "select_n")
     if place is None:
         return logits, True, identity
@@ -317,6 +328,8 @@ def _laid(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
             axes = tuple(axes[d] for d in permutation)
         elif name == "select_n":
             return axes if atom.aval.ndim == rank or index == 0 else None
+        elif name == "ne" and index == 0 and any(isinstance(v, jcore.Literal) and v.val == 0 for v in eqn.invars):
+            pass  # a float mask's predicate, x != 0: the mask's value read as booleans (`_unmasked`'s astype)
         elif name not in CASTS:
             return None
         atom = eqn.outvars[0]
