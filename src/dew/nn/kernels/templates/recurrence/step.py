@@ -20,7 +20,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import recurrence, tuning
+from dew.nn.kernels import recurrence, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, scan
 from dew.nn.precision import L2NORM_EPS, rms_weighted
 
@@ -267,11 +267,9 @@ class _Conv:
         streams = []
         for window, (first, width) in zip(windows, self.pieces, strict=True):
             weights = [self._load(taps.at[j], first, width).astype(jnp.float32) for j in range(len(window))]
-            pre = window[0] * weights[0]
-            for inputs, weight in zip(window[1:], weights[1:], strict=True):
-                pre = pre + inputs * weight
-            if self.conv.bias:
-                pre = pre + self._load(self.inputs['conv_bias'], first, width).astype(jnp.float32)
+            bias = (self._load(self.inputs['conv_bias'], first, width).astype(jnp.float32) if self.conv.bias
+                    else None)
+            pre = short_conv.preactivation(window, weights, bias)
             # SiLU as the reference's, the input times its sigmoid.
             streams.append(pre if self.conv.activation is None else pre * _sigmoid(pre))
         return tuple(streams)
@@ -403,7 +401,9 @@ def _summed_keys(key_width: int, read, term, like: jax.Array):
     """`sum_k term(k, read(k))` over the keys, each `like`'s shape, in XLA's pairwise order, `UNROLLED` keys
     a turn of a rolled loop, each turn's reads issued before its first use: a turn's terms by a pairwise tree
     of its own (each an aligned subtree of the whole), the turns' sums added into the tree above them by the
-    turn's index (`_tree_added`), the index's choices a turn's rather than a key's."""
+    turn's index (`_tree_added`), the index's choices a turn's rather than a key's; the subtrees a count of
+    turns not a power of two leaves held (each set bit's level) summed last, the earlier on the left. The
+    top subtree alone dropped the last 128 of 384 keys (audit 2026-11-07, A18)."""
     def turn(i, partials):
         base = i * UNROLLED
         tiles = [read(base + u) for u in range(UNROLLED)]
@@ -414,16 +414,22 @@ def _summed_keys(key_width: int, read, term, like: jax.Array):
 
     turns = key_width // UNROLLED
     empty = tuple(jnp.zeros_like(like) for _ in range(turns.bit_length()))
-    return lax.fori_loop(0, turns, turn, empty)[-1]
+    held = lax.fori_loop(0, turns, turn, empty)
+    levels = [level for level in reversed(range(turns.bit_length())) if (turns >> level) & 1]
+    total = held[levels[0]]
+    for level in levels[1:]:
+        total = total + held[level]
+    return total
 
 
 def _tree_added(partials: tuple, index, term) -> tuple:
-    """The `index`-th of a power of two's terms added into the pairwise tree of the ones before (`partials`,
-    a complete subtree's sum a level, `index`'s set bits the levels held): the term carried up the held
-    levels, each the earlier sum on the left, and left at the first free one; the last term leaves the total
-    at the top. XLA's reduction sums pairwise: a thread's running sum of 128 keys' terms put the fused step's
-    output at 1.55 to 1.61 times the XLA form's distance from float64 (jsf-r06h). Each level's choice is the
-    loop index's, laid over the vectors (`mosaic.laid`)."""
+    """The `index`-th term added into the pairwise tree of the ones before (`partials`, a complete subtree's
+    sum a level, `index`'s set bits the levels held): the term carried up the held levels, each the earlier
+    sum on the left, and left at the first free one; after a power of two's terms the total is the top
+    level's, else each set bit's level holds a subtree (`_summed_keys` sums them). XLA's reduction sums
+    pairwise: a thread's running sum of 128 keys' terms put the fused step's output at 1.55 to 1.61 times the
+    XLA form's distance from float64 (jsf-r06h). Each level's choice is the loop index's, laid over the
+    vectors (`mosaic.laid`)."""
     carry, active, found = term, jnp.ones((), bool), []
     for level, partial in enumerate(partials):
         held = ((index >> level) & 1) == 1

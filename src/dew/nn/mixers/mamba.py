@@ -289,6 +289,8 @@ class MambaMixer(MixerBase):
     """
 
     residuals = ('context', 'scan', 'conv')
+    # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
+    packed_cache = True
 
     intermediate_size: int = 1536
     state_size: int = 16

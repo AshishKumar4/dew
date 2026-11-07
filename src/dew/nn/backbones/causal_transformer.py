@@ -45,6 +45,7 @@ from dew.batch import (
     real_slots,
     shifted_span,
     token_coordinates,
+    with_validity,
 )
 from dew.mesh import LayoutRefused
 from dew.nn.attention import AttentionImpl
@@ -122,7 +123,7 @@ from ..protocols import (
 from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
-from . import decoder_counts
+from . import decoder_counts, decoder_refusals
 from .decoder_block import (
     DECODER_REMAT,
     REMAT_POLICIES,
@@ -1610,6 +1611,11 @@ class CausalTransformer(LinearProducts):
         - `progress` is a training step's (`dew.nn.progress`), which its DEX
           layers anneal over; None is the run's end, outside a training step.
         """
+        if decode and coordinates is not None and coordinates.max_segments > 1:
+            # A cache keeps a packed row's real tokens alone (`real_slots`): its padding writes no key and
+            # moves no recurrent state, its documents' starts counted over its real tokens.
+            laid = {COORDINATES_FIELD: coordinates}
+            coordinates = with_validity(laid, real_slots(laid, tokens.shape[:2]))[COORDINATES_FIELD]
         attention_metadata = self._attention_metadata(
             tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
             attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
@@ -1704,10 +1710,10 @@ class CausalTransformer(LinearProducts):
                              "visibility; pass one")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
-        if decode and coordinates is not None and coordinates.max_segments > 1:
-            raise ValueError(
-                "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
-                "call would attend across documents; prefill each document into a row of its own")
+        if decode and coordinates is not None and coordinates.max_segments > 1 and (
+                refusal := decoder_refusals.packed_cache(self)) is not None:
+            raise ValueError(f"packed rows cannot append to this decoder's cache, which would read their "
+                             f"documents together ({refusal}); prefill each document into a row of its own")
         engram_ids = (None if self.engram is None else self.engram_hashes(tokens, coordinates, decode,
                                                                           media_mask))
         if context is not None and context.segments is not None:
@@ -2416,62 +2422,28 @@ class CausalTransformer(LinearProducts):
         return fixed_router_owners(self)
 
     @nn.nowrap
+    def layer_mixers(self) -> tuple[tuple[MixerBase, MixerContext], ...]:
+        """Each layer's mixer and the context it is built with, in order (`decoder_refusals`)."""
+        types, default = self.per_layer_types, self.layer_mixer
+        return tuple((spec.kind.mixer or default, self.mixer_context(
+            spec.kind, spec.layer_type, spec.kv_shared, spec.dex, self._dex_start(index), spec.routed))
+            for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)))
+
+    @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
-        """A cache rebuilt per request, a reader beyond the token, a context
-        read beside the tokens, or a layer whose mixer, over the context it is
-        built with, would not run the mixed call as the separate calls would
-        (`MixerBase.mixed_refusal`)."""
-        position = self.cache_rebuild_position
-        if position is not None:
-            return (f'LongRoPE crossing position {position} requires separate admission so each '
-                    'request keeps its own table and rebuild history')
-        if self.cross_attention is not None:
-            return ("cross-attention reads each row's own context, which the mixed call's one row of "
-                    "every slot's tokens does not seat")
-        if self.position_embedding == "learned" or self.engram is not None or self.hash_layers:
-            return "a learned position embedding, n-gram or hash routing reads beyond the token"
-        types = self.per_layer_types
-        default = self.layer_mixer
-        for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
-            refusal = (spec.kind.mixer or default).mixed_refusal(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex,
-                                   self._dex_start(index), spec.routed))
-            if refusal is not None:
-                return f"layer {index}: {refusal}"
-        return None
+        """Why a serving step's mixed call cannot admit this decoder (`decoder_refusals.mixed_admission`)."""
+        return decoder_refusals.mixed_admission(self)
 
     @nn.nowrap
     def generation_refusal(self) -> str | None:
-        """Why a generation loop cannot continue this decoder's rows, or None
-        (`dew.nn.protocols.Generating`): its sparse layers' mixture, or a mixer it
-        names (`declared_mixers`: a layer kind's, a prediction depth's or the
-        drafter's), that refuses it (`Mixture.generation_refusal`,
-        `MixerBase.generation_refusal`)."""
-        refusal = None if self.mixture is None else self.mixture.generation_refusal()
-        for mixer in self.declared_mixers:
-            refusal = refusal or mixer.generation_refusal()
-        return refusal
+        """Why a generation loop cannot continue this decoder's rows (`decoder_refusals.generation`)."""
+        return decoder_refusals.generation(self)
 
     @nn.nowrap
     def split_prefill_refusal(self) -> str | None:
-        """A cache rebuilt per request from its whole prompt, or a loop's shared cache that a later
-        pass rewrites, whose earlier tokens hold the last pass's keys: a prompt's later piece would
-        read those where its whole prefill reads each pass's own. One pass, or a block whose layers
-        keep no cache (`MixerBase.keeps_cache`), rewrites nothing."""
-        position = self.cache_rebuild_position
-        if position is not None:
-            return (f'LongRoPE crossing position {position} rebuilds a request\'s cache from its whole '
-                    'prompt; serve it with whole-prompt dense admission')
-        loop = self.loop
-        first, end = (0, self.num_layers) if loop is None or loop.layers is None else loop.layers
-        rewritten = any((self.kind_of(kind).mixer or self.layer_mixer).keeps_cache
-                        for kind in self.per_layer_types[first:end])
-        if loop is not None and loop.shared_cache and loop.steps > 1 and rewritten:
-            return ("a loop's shared cache holds only the last pass's keys of the tokens before a "
-                    "call, where the whole prompt's prefill reads each pass's own; keep a cache a "
-                    "pass (Loop.shared_cache=False, Dory's recurrent_kv_cache_mode 'per_loop') for "
-                    "chunked prefill or prefix reuse")
-        return None
+        """Why a prompt's later piece would not read what its whole prefill reads
+        (`decoder_refusals.split_prefill`)."""
+        return decoder_refusals.split_prefill(self)
 
     @property
     def layer_mixer(self) -> MixerBase:

@@ -290,6 +290,17 @@ class MixerBase:
         unless its configuration chooses the path it runs."""
         return self.residuals
 
+    packed_cache = False
+    """Whether the mixer this kind builds reads a packed row's documents apart over its cache: its keys by
+    the documents the cache keeps (`dew.nn.kv_cache.DOCUMENTS`), or its state reset at each document's start
+    (`dew.batch.Coordinates.starts`), so a cached call of several documents a row reads each its own."""
+
+    def packed_cache_refusal(self) -> str | None:
+        """Why the mixer this kind builds would read a packed row's documents together over its cache, or
+        None: unless it declares `packed_cache` or keeps no cache."""
+        return (None if self.packed_cache or not self.keeps_cache
+                else f"{type(self).__name__}'s cache, which reads a row's documents together")
+
     def mixed_refusal(self, ctx: MixerContext) -> str | None:
         """Why the mixer this kind builds over `ctx` would not run a server's
         mixed call as the separate calls would, or None: by default, unless

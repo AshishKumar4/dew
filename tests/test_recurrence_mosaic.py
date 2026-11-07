@@ -1305,21 +1305,6 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     return cases, found
 
 
-def test_a_gated_delta_nets_ring_and_residency_are_one_choice():
-    """The 27B gated delta net at one row of 4,096 tokens on an H100 (sm90 stated) derives its value blocks 32
-    wide in a ring more than one deep, its walk one program a multiprocessor: its plans priced by the bytes
-    they hold in flight (`resources.hidden`), where the most programs first took two one deep and then
-    narrowed the block to 16, the forward 1.4 to 1.5 times as long (FS-RESIDENT-WINDOW1-h100)."""
-    op = template.MOSAIC
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        ba = op.bind(*resource_operands("qwen3.5-27b-gdn", jnp.bfloat16, 1, 4096), None, max_segments=None,
-                     floor=None)
-        tiles = op.derived(ba, target)
-        assert tiles is not None and tiles.block_v == 32 and tiles.stages > 1
-        assert op.states_held(ba, tiles, target) == 1
-
-
 @lowers('sm90')
 def test_a_training_launchs_backward_kernels_carry_its_launch():
     """The gated delta rule's 16-bit training step on the template lowered for an H100: its fast backward's

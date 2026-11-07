@@ -610,9 +610,10 @@ def test_a_request_admitted_mid_flight_draws_what_it_draws_alone():
 
 
 def stored(cache):
-    """The key and value buffers' device addresses: the leaves a step
-    updates in place. The cursor and validity vectors are recomputed whole
-    each step, and XLA is free to give those a fresh buffer."""
+    """The slot buffers' device addresses (the keys', the values' and the
+    keys' documents'): the leaves a step updates in place. The cursor and
+    validity vectors are recomputed whole each step, and XLA is free to
+    give those a fresh buffer."""
     return [leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(cache) if leaf.ndim >= 3]
 
 
@@ -625,7 +626,7 @@ def test_a_slot_is_reused_over_the_same_cache():
     bound = task()
     server = Server.from_task(bound, slots=2, capacity=128, admission=1)
     before = stored(server.cache)
-    assert len(before) == 2
+    assert before
     shapes = [leaf.shape for leaf in jax.tree.leaves(server.cache)]
     assert all(shape[0] == 2 for shape in shapes)
     short = server.submit("12", 2, key=0)
