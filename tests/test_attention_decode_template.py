@@ -257,6 +257,37 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
                     f"verify block of {drafts} through the route", seeds=SEEDS)
 
 
+def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
+    """A GPU cell (tests/test_gpu_attention.py): a decode step over a paged pool of `page` keys a page, fewer
+    than its key tile holds, compiled on this GPU, its tiles' rows gathered through the table by the loading
+    warpgroup's cp.async copies (`gathered.Ring`, row 4772), 32 query heads over 8 key heads over 4096 keys
+    in a shuffled table: on par with the reference path over the pool gathered dense (check 1)."""
+    keys, kv_heads = 4096, 8
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
+    per_row = keys // page
+    table = jnp.asarray(np.random.default_rng(page).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
+
+    def gathered(pool):
+        rows = pool[:, table]
+        return jnp.transpose(rows, (1, 2, 3, 0, 4)).reshape(2, keys, kv_heads, pool.shape[-1])
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (2, 1, 32, 128), jnp.bfloat16)
+        pools = (jax.random.normal(stream, (kv_heads, 2 * per_row, page, 128), jnp.bfloat16)
+                 for stream in streams[1:])
+        return (query, *pools)
+
+    def ours(query, key_pool, value_pool):
+        return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
+
+    def reference(query, key_pool, value_pool):
+        return template.reference(query, gathered(key_pool), gathered(value_pool), spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"paged decode of {page}-key pages on a GPU",
+                    seeds=SEEDS)
+
+
 PAGE = 128
 """A paged cache's keys a page: whole key tiles of the derived decode launch's."""
 
