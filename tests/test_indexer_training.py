@@ -525,6 +525,9 @@ def test_the_warmup_trains_through_the_trainer():
     # The state fit starts from: the jitted init, whose initializers fuse
     # differently from an eager one at the last bit.
     initial, _, _ = trainer.place()
+    # On its stored layers, as fit returns the state (`Trainer.stored`), the step holding the scan's runs
+    # stacked.
+    initial = trainer.stored(initial)
 
     state = trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None),
                         steps=3, log_every=1)
