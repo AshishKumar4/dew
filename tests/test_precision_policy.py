@@ -835,7 +835,7 @@ def test_an_fp32_delta_rules_route_computes_the_runs_declared_products():
     from dew.nn.kernels.recurrence_chunk import Chunk, chunk
     from dew.nn.kernels.templates import product
     from dew.nn.kernels.templates.recurrence import mainloop
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     rows, length, heads, width = 1, 128, 2, 64
     operands = [jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 3 + [
