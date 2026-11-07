@@ -160,7 +160,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         weighted = functools.partial(_weighted, rows=anchor_rows) if residuals else None
         return algebra.walked(spec, walk, finished, weighted)
 
-    mapped = jax.lax.map(program, jnp.arange(blocks * batch * heads))
+    mapped = jax.lax.map(program, jnp.arange(blocks * batch * heads), batch_size=batch * heads)
     return _unmapped(mapped, (blocks, batch, heads, block_q, value_width), residuals=residuals)
 
 
@@ -381,7 +381,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                                                 accurate=accurate)
         return dq, (delta, anchor, m, denominator, mass), chosen, _written(grads, score_kinds)
 
-    dq, rows_out, chosen, written = jax.lax.map(program, jnp.arange(blocks * batch * heads))
+    dq, rows_out, chosen, written = jax.lax.map(program, jnp.arange(blocks * batch * heads),
+                                                batch_size=batch * heads)
     return _dq_outputs(dq, rows_out, chosen, written, score_kinds, blocks, batch, heads, queries)
 
 
@@ -480,7 +481,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         return dk, dv, tuple(next(keyed) if kind == Kind.KEY else next(columns_of)
                              for kind in score_kinds if kind in DKV_GRADS)
 
-    dk, dv, written = jax.lax.map(program, jnp.arange(blocks * batch * heads))
+    dk, dv, written = jax.lax.map(program, jnp.arange(blocks * batch * heads), batch_size=batch * heads)
     return _dkv_laid_out(dk, dv, written, [kind for kind in score_kinds if kind in DKV_GRADS],
                          batch=batch, heads=heads, queries=queries, keys=keys, block_k=block_k)
 
