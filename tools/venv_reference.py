@@ -75,6 +75,27 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          "mimo-mel": {"test": "test_mimo_audio", "arms": "mel", "worker": "torchaudio_mel_worker.py",
                       "reference": "pytorch/audio 2.11.0 MelSpectrogram", "license": "BSD-2-Clause",
                       "distribution": ("torchaudio", "2.11.0+cpu"), "host": True, "outputs": True},
+         **{"flaxdiff-" + case.replace("/", "-"): {
+             "test": "test_flaxdiff_family_source", "arms": case, "worker": "flaxdiff_family_worker.py",
+             "reference": "AshishKumar4/FlaxDiff 15c55b001304604147a2a8002a76cf5d4c32092f", "license": "MIT"}
+            for case in importlib.import_module("flaxdiff_family_cases").CASES},
+         **{f"codec-storage-{kind}": {"test": "test_codec_checkpoints", "arms": f"storage/{kind}",
+                                      "worker": "codec_worker.py",
+                                      "reference": "neuralmagic/compressed-tensors 0.17.1 with "
+                                                   "huggingface/transformers 5.16.1", "license": "Apache-2.0",
+                                      "distribution": ("compressed-tensors", "0.17.1")}
+            for kind in ("fp8", "nvfp4")},
+         "qwen-image-export": {"test": "test_qwen_image_source", "arms": "export",
+                               "worker": "qwen_image_export_reference.py",
+                               "reference": "huggingface/diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c",
+                               "license": "Apache-2.0", "distribution": ("transformers", "5.17.0")},
+         **{f"wan-{case}": {"test": "test_wan_source", "arms": case, "worker": "wan_worker.py",
+                            "reference": "huggingface/diffusers 0.34.0", "license": "Apache-2.0",
+                            "distribution": ("diffusers", "0.34.0")} for case in ("published", "variant")},
+         **{f"wan-bf16-{case}": {"test": "test_wan_source", "arms": f"bf16/{case}", "worker": "wan_worker.py",
+                                 "reference": "huggingface/diffusers 0.34.0", "license": "Apache-2.0",
+                                 "distribution": ("diffusers", "0.34.0"), "narrow": "bfloat16"}
+            for case in ("published", "variant")},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",
@@ -84,8 +105,9 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
 """Each site's test module (its `FIXTURE`, `draw`, `dew` and `OUTPUTS`, or, with `arms`, its
 `pipeline_arms(arms)`, which gives the four), worker and reference, the distribution and version its
 environment must hold, where the reference is one, and the device its worker's float32 run takes, the CPU
-unless named; `host` where its `dew` runs on the host as given (a pipeline's walk, its own programs
-inside), and `outputs` where the recording keeps the outputs whole."""
+unless named; `narrow` the precision the reference's narrow run and Dew's take where not float32; `host`
+where its `dew` runs on the host as given (a pipeline's walk, its own programs inside), and `outputs` where
+the recording keeps the outputs whole."""
 
 
 def site_arms(site: str):
@@ -123,8 +145,9 @@ def recording(site: str, python: str, source: str | None, given=None) -> dict[st
             reference, truth = arms(answer, "case.")
             return tuple({leaf: arm[leaf] for leaf in outputs} for arm in (reference, truth))
 
-        dew = ((lambda inputs: run(jnp.float32, inputs)) if known.get("host")
-               else jax.jit(lambda inputs: run(jnp.float32, inputs)))
+        narrow = getattr(jnp, known.get("narrow", "float32"))
+        dew = ((lambda inputs: run(narrow, inputs)) if known.get("host")
+               else jax.jit(lambda inputs: run(narrow, inputs)))
         return record_case(site, draw, evaluate, store_inputs=False, summary=not known.get("outputs"),
                            dew=dew)
 

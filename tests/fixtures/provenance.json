@@ -273,18 +273,66 @@
   "codecs/storage/fp8/reference.npz": {
    "tool": "tools/nvfp4_storage_reference.py",
    "sources": [
-    {"repo": "vllm-project/compressed-tensors", "version": "0.17.1", "runs": "compressed_tensors"},
-    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+    {
+     "repo": "vllm-project/compressed-tensors",
+     "version": "0.17.1",
+     "runs": "compressed_tensors"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
    ],
    "note": "Torch 2.14.0+cpu; same-file from_pretrained fp32 logits and float64 forward over the reader's decoded weights. Weight QDQ removal is checked bit for bit before widening."
+  },
+  "codecs/storage/fp8/recording.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/compressed-tensors",
+     "version": "0.17.1",
+     "runs": "compressed_tensors"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The weight-only FP8 checkpoint's logits by compressed-tensors' own CPU reader, run by tools/codec_worker.py codec-storage-fp8 over each seed's two drawn rows of ids, in float32 (weight QDQ off) and on its float64 twin; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "codecs/storage/nvfp4/reference.npz": {
    "tool": "tools/nvfp4_storage_reference.py",
    "sources": [
-    {"repo": "vllm-project/compressed-tensors", "version": "0.17.1", "runs": "compressed_tensors"},
-    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+    {
+     "repo": "vllm-project/compressed-tensors",
+     "version": "0.17.1",
+     "runs": "compressed_tensors"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
    ],
    "note": "Torch 2.14.0+cpu. CT's NVFP4 decompress always returns bf16 weights; from_pretrained(dtype=float32) cannot run its mixed-dtype first forward. A bf16 reader checks redundant weight QDQ removal bit for bit. The fp32 reader keeps dense checkpoint tensors in fp32 and promotes only its decoded bf16 Linear weights before fp32/float64 forwards. Each weight's direct fp32 dequantize is recorded under /unrounded and must round to the published bf16 decode bit for bit. Dew uses that published bf16 decode."
+  },
+  "codecs/storage/nvfp4/recording.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "vllm-project/compressed-tensors",
+     "version": "0.17.1",
+     "runs": "compressed_tensors"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The weight-only NVFP4 checkpoint's logits by compressed-tensors' own CPU reader, run by tools/codec_worker.py codec-storage-nvfp4 over each seed's two drawn rows of ids, in float32 (weight QDQ off) and on its float64 twin; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
 
   "codecs/compressed_tensors_mxfp4.npz": {
@@ -3171,7 +3219,7 @@
    "note": "src/pytorch_fid/inception.py at the commit (SHA-256 checked): InceptionV3(resize_input, normalize_input, use_fid_inception) over torchvision's Inception3 narrowed by 16 through its BasicConv2d, release weights not fetched, every weight drawn; pool3 features of 8-bit images upsampled and downsampled, float32 and float64. Torch 2.14.0+cpu."
   },
   "qwen_image_export.npz": {
-   "tool": "tools/qwen_image_export_reference.py",
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "huggingface/diffusers",
@@ -3184,7 +3232,12 @@
      "runs": "transformers"
     }
    ],
-   "note": "A Dew export of the committed Qwen-Image 2.1 pipeline (transformer perturbed by a seeded draw), loaded whole by QwenImage21Pipeline with clean per-component loading reports; the transformer's pipeline call in float32 and float64 (diffusers_wan_reference.float64) on fixed inputs; the export's SHA-256 per file. Torch 2.14.0+cpu, the qwen-image reference environment."
+   "note": "A Dew export of the committed Qwen-Image 2.1 pipeline (transformer perturbed by a seeded draw, tools/qwen_image_export_reference.py perturbed_export), loaded whole by QwenImage21Pipeline with clean per-component loading reports, its transformer's pipeline call run by the same tool as the worker of tools/venv_reference.py's qwen-image-export site over each seed's drawn packed latents, prompt states and times, in float32 and float64 (torch 2.14.0+cpu, torchvision); kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw). The export's SHA-256 per file is qwen_image_export.json."
+  },
+  "qwen_image_export.json": {
+   "tool": "tools/qwen_image_export_reference.py",
+   "sources": [],
+   "note": "The SHA-256 of every file of the Dew export qwen_image_export.npz records Diffusers' reading of (perturbed_export), which tests/test_qwen_image_source.py holds the export it writes to."
   },
   "qwen_image_source.tar.xz": {
    "tool": "tools/diffusers_qwen_image_reference.py",
@@ -3790,6 +3843,50 @@
     }
    ],
    "note": "Float64 oracle widens upstream float32 casts, tools/diffusers_wan_reference.py:95."
+  },
+  "wan/published.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "WanTransformer3DModel"
+    }
+   ],
+   "note": "The published tiny Wan transformer of tests/fixtures/wan_transformer.tar.xz run by tools/wan_worker.py wan-published on the CPU (Diffusers 0.34.0, the cohort that saved it; torch 2.14.0+cpu) over each seed's drawn latents, prompt states and cotangent at the fixture's times: the flow and the gradients of the latents, the prompt states and every parameter, in float32 and, on its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "wan/published-bf16.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "WanTransformer3DModel"
+    }
+   ],
+   "note": "The published tiny Wan transformer read in bfloat16 by Diffusers 0.34.0 (its time embedder kept in float32), run by tools/wan_worker.py wan-bf16-published over each seed's drawn latents and prompt states: the flow in bfloat16 and, on its float64 twin, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "wan/variant.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "WanTransformer3DModel"
+    }
+   ],
+   "note": "The variant tiny Wan transformer of tests/fixtures/wan_transformer.tar.xz run by tools/wan_worker.py wan-variant on the CPU (Diffusers 0.34.0, the cohort that saved it; torch 2.14.0+cpu) over each seed's drawn latents, prompt states and cotangent at the fixture's times: the flow and the gradients of the latents, the prompt states and every parameter, in float32 and, on its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "wan/variant-bf16.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "WanTransformer3DModel"
+    }
+   ],
+   "note": "The variant tiny Wan transformer read in bfloat16 by Diffusers 0.34.0 (its time embedder kept in float32), run by tools/wan_worker.py wan-bf16-variant over each seed's drawn latents and prompt states: the flow in bfloat16 and, on its float64 twin, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "wan_vae.tar.xz": {
    "tool": "tools/diffusers_wan_vae_reference.py",

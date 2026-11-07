@@ -1,25 +1,19 @@
 """The DiT family and the UNets, image and video, against FlaxDiff's own models.
 
-tools/flaxdiff_family_reference.py builds tiny SimpleDiT, SimpleUDiT,
-SimpleMMDiT, HierarchicalMMDiT, Unet, VideoDiT and UNet3D models from
-FlaxDiff's model modules at a pinned commit, moves every parameter off its
-initialization, and records each model's output on images (or clips), times
-and text states and, against a fixed cotangent, the gradients of the image,
-the text and every parameter: in float32 and in float64, the truth both
-float32 runs are measured from (tests/fixtures/flaxdiff_family/family.npz). Dew's
-models on the same weights and Fourier table are held to
-tests/reference_error.py's rule: no further from float64 than twice the
-float32 reference. The UNet variant uses the same rule over 52 spatial
-channel orders, since a single output or gradient draw has too few
-independent rounding directions. Each order's float64 reference computes
-the original output and gradient within 1e-12 relative error.
+tools/flaxdiff_family_worker.py builds tiny SimpleDiT, SimpleUDiT, SimpleMMDiT, HierarchicalMMDiT, Unet,
+VideoDiT and UNet3D models from FlaxDiff's model modules at a pinned commit (tools/flaxdiff_family_cases.py's
+CASES). Over drawn weights, images (or clips), times, text states and cotangents, Dew's models' outputs and
+the gradients of the cotangent's product with respect to the image, the text and every parameter are as
+exact as FlaxDiff's float32 run against its float64 run (check 1), each case its own recording
+(tools/venv_reference.py's `flaxdiff-<model>-<config>` sites), Dew's float64 run held to the recorded sketch,
+with the Fourier table FlaxDiff draws as Dew's constant.
 
-The DiTs average the text over every position, as FlaxDiff's do: Dew builds
-them with `text_pooling="all"`, and is handed a padded mask the pooling
-must ignore. The MM-DiTs and the VideoDiT, which pool the real tokens, get
-no padding.
+The DiTs average the text over every position, as FlaxDiff's do: Dew builds them with
+`text_pooling="all"`, and is handed a padded mask the pooling must ignore. The MM-DiTs and the VideoDiT,
+which pool the real tokens, get no padding.
 """
 
+import json
 from pathlib import Path
 
 import jax
@@ -27,10 +21,10 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from float64_terms import float64_terms
-from interop_support import fixture_with_meta, recorded_gradients
+from interop_support import recorded_gradients
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import assert_as_exact_over_orders, distance, widened
+from reference_runs import assert_as_exact_as_recorded
+from torch_layout import node
 
 from dew.interop.flaxdiff import SCAN_PROJECTION, scan_projection
 from dew.nn.attention_blocks import Stage
@@ -41,12 +35,17 @@ from dew.nn.backbones.unet3d import UNet3D
 from dew.nn.backbones.uvit import SimpleUDiT
 from dew.nn.backbones.video_dit import VideoDiT
 from dew.nn.dit import TextContext
+from tools.flaxdiff_family_cases import CASES
 
-FIXTURE = Path(__file__).resolve().parent / "fixtures" / "flaxdiff_family" / "family.npz"
-CASES = ("simple_dit/published", "simple_dit/variant", "simple_udit/published", "simple_udit/variant",
-         "simple_mmdit/published", "simple_mmdit/variant", "hierarchical_mmdit/published",
-         "hierarchical_mmdit/variant", "unet/published", "unet/variant", "video_dit/published",
-         "video_dit/variant", "unet_3d/published", "unet_3d/variant")
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "flaxdiff_family"
+LAYOUT = json.loads((FIXTURES / "layout.json").read_text())
+"""Each case's FlaxDiff parameters' shapes by '/'-joined path, and the Fourier table its FourierEmbedding
+draws, the model's constant (tools/flaxdiff_family_worker.py --layout)."""
+FAMILY_SEEDS = {**dict.fromkeys(CASES, 8), "simple_dit/variant": 64, "unet/variant": 16,
+                "unet_3d/published": 128}
+"""Each case's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
+OUTPUTS = ("output", "gradients")
+"""The leaves `dew` gives, each site's recorded leaves."""
 MODELS = {"SimpleDiT": SimpleDiT, "SimpleUDiT": SimpleUDiT, "SimpleMMDiT": SimpleMMDiT,
           "HierarchicalMMDiT": HierarchicalMMDiT, "Unet": Unet, "VideoDiT": VideoDiT, "UNet3D": UNet3D}
 UNETS = ("Unet", "UNet3D")
@@ -75,11 +74,6 @@ MMDIT_LAYERS = {"ada_proj": "linear", "layers_0": "up_proj", "layers_2": "down_p
 # FlaxDiff's six modulation pieces (scale_mlp, shift_mlp, gate_mlp, scale,
 # shift, gate) in SD3's order (shift, scale, gate, shift_mlp, scale_mlp, gate_mlp).
 MODULATION_ORDER = (4, 3, 5, 1, 0, 2)
-
-
-@pytest.fixture(scope="module")
-def reference():
-    return fixture_with_meta(FIXTURE)
 
 
 def dew_model(cls: str, config: dict):
@@ -145,8 +139,8 @@ def to_dew(cls: str, name: str, value: np.ndarray, patch_size: int | None = None
         return value
     module, leaf = name.split("/")[1], name.split("/")[-1]
     if module.endswith("_ada"):
-        pieces = np.split(value, 6, axis=-1)
-        return np.concatenate([pieces[index] for index in MODULATION_ORDER], axis=-1)
+        pieces = jnp.split(value, 6, axis=-1)
+        return jnp.concatenate([pieces[index] for index in MODULATION_ORDER], axis=-1)
     if module[4:] in ("to_q", "to_k", "to_v"):
         return value.reshape(*value.shape[:-2], -1)
     if module[4:] == "out" and leaf == "kernel":
@@ -159,8 +153,8 @@ def from_dew(cls: str, name: str, value: np.ndarray, shape: tuple[int, ...]) -> 
     if PROJECTIONS.keys() & set(name.split("/")):
         return value[None, None]
     if mmdit_block(cls, name) and name.split("/")[1].endswith("_ada"):
-        pieces = np.split(value, 6, axis=-1)
-        return np.concatenate([pieces[MODULATION_ORDER.index(index)] for index in range(6)], axis=-1)
+        pieces = jnp.split(value, 6, axis=-1)
+        return jnp.concatenate([pieces[MODULATION_ORDER.index(index)] for index in range(6)], axis=-1)
     return value.reshape(shape)
 
 
@@ -178,96 +172,96 @@ def nest(flat: dict[tuple[str, ...], np.ndarray]) -> dict:
     return tree
 
 
-def unet_channels(name: str, value: np.ndarray, order: np.ndarray) -> np.ndarray:
-    """Reorder the variant UNet's eight spatial channels, keeping each
-    concatenated skip stream whole. Its norms are RMS norms. Every attention
-    stage projects in and out, so only the projections' spatial sides move;
-    the attention heads, time embedding and text keep their own order."""
-    parts = name.split("/")
-    if "Attention" in parts or parts[0] == "TimeProjection_0":
-        return value
-    if any(part.startswith("project_in") for part in parts):
-        return np.take(value, order, axis=-2)
-    if any(part.startswith("project_out") for part in parts):
-        return np.take(value, order, axis=-1)
-    for axis in range(value.ndim):
-        size = value.shape[axis]
-        if size in (len(order), 2 * len(order)):
-            channels = np.concatenate([order + start for start in range(0, size, len(order))])
-            value = np.take(value, channels, axis=axis)
-    return value
+def drawing(case: str):
+    """`draw(seed)` of `case`: weights at their initializer's scale, the norms' scales about one and the
+    biases off zero, two images (or clips), times, text states and a cotangent of the output, under FlaxDiff's
+    paths."""
+    _, _, config, image, text = CASES[case]
+
+    def draw(seed: int) -> dict[str, np.ndarray]:
+        rng = np.random.default_rng([269, seed])
+        drawn = {}
+        for path, shape in LAYOUT[case]["params"].items():
+            leaf = path.split("/")[-1]
+            if leaf == "scale":
+                value = rng.normal(1.0, 0.3, shape)
+            elif leaf == "kernel":
+                fan_in = shape[0] if len(shape) == 3 else np.prod(shape[:-1])
+                value = rng.normal(0.0, 1.0, shape) / np.sqrt(fan_in)
+            else:
+                value = rng.normal(0.0, 0.3, shape)
+            drawn[f"param.{path}"] = value.astype(np.float32)
+        return {**drawn, "image": rng.standard_normal((2, *image)).astype(np.float32),
+                "times": rng.uniform(-1.5, 1.5, 2).astype(np.float32),
+                "text": rng.standard_normal((2, *text)).astype(np.float32),
+                "probe": rng.standard_normal((2, *image[:-1], config["output_channels"])).astype(np.float32)}
+    return draw
 
 
-@pytest.mark.parametrize("case", CASES)
-def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case):
-    arrays, meta = reference
-    cls, config = meta["cases"][case]["class"], meta["cases"][case]["config"]
-
-    def part(name):
-        return arrays[f"{case}/{name}"]
-
-    prefix = f"{case}/param."
-    names = sorted(name.removeprefix(prefix) for name in arrays if name.startswith(prefix))
-    params = nest({dew_path(cls, name): to_dew(cls, name, part(f"param.{name}").view(ml_dtypes.bfloat16)
-                                                    .astype(np.float32), config.get("patch_size"))
-                   for name in names})
-    constants = nest({(*fourier_path(cls), "frequencies"): part("fourier_table")})
+def computing(case: str):
+    """`dew(dtype, inputs)` of `case`: Dew's model's output at `dtype` under a draw's weights, and the
+    gradients tools/flaxdiff_family_worker.py gives, in its order."""
+    _, cls, config, _, _ = CASES[case]
+    names = sorted(LAYOUT[case]["params"])
     model = dew_model(cls, config)
-    image, text, times = (jnp.asarray(part(name)) for name in ("image", "text", "times"))
-    mask = np.ones(text.shape[:2], np.float32)
-    if cls in ("SimpleDiT", "SimpleUDiT"):
-        mask[0, -2:] = 0
+    table = np.asarray(LAYOUT[case]["fourier"], np.float32)
 
-    def forward(params, image, text):
-        return model.apply({"params": params, "constants": constants}, image, times,
-                           TextContext(text, jnp.asarray(mask)))
+    def dew(dtype, inputs) -> dict:
+        params = nest({dew_path(cls, name): to_dew(cls, name, jnp.asarray(inputs[f"param.{name}"], dtype),
+                                                   config.get("patch_size")) for name in names})
+        constants = nest({(*fourier_path(cls), "frequencies"): jnp.asarray(table, dtype)})
+        image, text, times = (jnp.asarray(inputs[name], dtype) for name in ("image", "text", "times"))
+        mask = np.ones(text.shape[:2], np.float32)
+        if cls in ("SimpleDiT", "SimpleUDiT"):
+            mask[0, -2:] = 0
 
-    def evaluated(params, image=image, text=text):
+        def forward(params, image, text):
+            return model.apply({"params": params, "constants": constants}, image, times,
+                               TextContext(text, jnp.asarray(mask, dtype)))
+
         output, pullback = jax.vjp(forward, params, image, text)
-        return output, pullback(jnp.asarray(part("probe"), output.dtype))
+        grad_params, grad_image, grad_text = pullback(jnp.asarray(inputs["probe"], dtype))
+        native = [grad_image, grad_text, *(from_dew(cls, name, node(grad_params, dew_path(cls, name)),
+                                                    LAYOUT[case]["params"][name]) for name in names)]
+        return {"output": output, "gradients": jnp.concatenate([jnp.ravel(value) for value in native])}
+    return dew
 
-    def leaf(tree, path):
-        for key in path:
-            tree = tree[key]
-        return np.asarray(tree)
 
-    def source_order(precision: str) -> np.ndarray:
-        return recorded_gradients(part, precision, ("image", "text"), names)
+def site(case: str) -> str:
+    """tools/venv_reference.py's site of `case`: `flaxdiff-<model>-<config>`."""
+    return "flaxdiff-" + case.replace("/", "-")
 
-    def gradient_order(gradients, back=None):
-        grad_params, grad_image, grad_text = gradients
-        native = [np.asarray(grad_image), np.asarray(grad_text)]
-        for name in names:
-            value = from_dew(cls, name, leaf(grad_params, dew_path(cls, name)), part(f"param.{name}").shape)
-            native.append(value if back is None else unet_channels(name, value, back))
-        return np.concatenate([np.ravel(value) for value in native])
 
-    if case == "unet/variant":
-        # The variant concentrates its rounding in a few directions. Spatial
-        # channel orders move those roundings without moving the function;
-        # the reference tool checks every order's output and gradient in float64.
-        with np.load(FIXTURE.with_name("orders.npz")) as drawn:
-            orders, reference_output, reference_gradients = (drawn[key] for key in
-                                                            ("orders", "output", "gradients"))
-        run = jax.jit(evaluated)
-        output_distances, gradient_distances = [], []
-        truth_gradients = source_order("fp64")
-        for order in orders:
-            moved = nest({dew_path(cls, name): to_dew(cls, name, unet_channels(
-                name, part(f"param.{name}").view(ml_dtypes.bfloat16).astype(np.float32), order))
-                          for name in names})
-            output, gradients = run(moved)
-            output_distances.append(distance(output, part("fp64.output")))
-            gradient_distances.append(distance(gradient_order(gradients, np.argsort(order)), truth_gradients))
-        assert_as_exact_over_orders(output_distances, reference_output, f"{case} output")
-        assert_as_exact_over_orders(gradient_distances, reference_gradients, f"{case} gradients")
-    else:
-        output, gradients = evaluated(params)
-        # Dew's own path in float64 on the CPU: each entry's terms, what its sums add (`float64_terms`).
-        with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
-            _, (output_terms, gradient_terms) = float64_terms(evaluated, *widened((params, image, text)))
-        assert_as_exact_as_the_reference(output, part("fp32.output"), part("fp64.output"), f"{case} output",
-                                         terms=output_terms)
-        assert_as_exact_as_the_reference(gradient_order(gradients), source_order("fp32"),
-                                         source_order("fp64"), f"{case} gradients",
-                                         terms=gradient_order(gradient_terms))
+def pipeline_arms(case: str):
+    """tools/venv_reference.py's site of `case`: its recording, draw, Dew run and leaves."""
+    return FIXTURES / f"{case.replace('/', '-')}.npz", drawing(case), computing(case), OUTPUTS
+
+
+ONE_DRAW = "unet_3d/variant"
+"""The case its recording over seeds did not resolve within 512 seeds (row 4763), held by the one-draw rule
+on main's recorded draw (`unet_3d-variant-one-draw.npz`, FlaxDiff's run of it in float32 and float64)."""
+RECORDED = [case for case in CASES if case != ONE_DRAW]
+
+
+@pytest.mark.parametrize("case", RECORDED)
+def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(case):
+    """Dew's output and gradients as exact as FlaxDiff's float32 against float64 (check 1)."""
+    fixture, draw, dew, _ = pipeline_arms(case)
+    assert_as_exact_as_recorded(fixture, site(case), FAMILY_SEEDS[case], draw, dew, f"FlaxDiff {case}")
+
+
+def test_the_unet3d_variant_is_as_exact_as_flaxdiffs_on_its_recorded_draw():
+    """The UNet3D variant's output and every gradient, Dew's run (`computing`) on its recorded draw, as near
+    FlaxDiff's float64 run as FlaxDiff's float32 run is (the one-draw rule, row 4752)."""
+    with np.load(FIXTURES / "unet_3d-variant-one-draw.npz") as stored:
+        part = dict(stored)
+    names = sorted(LAYOUT[ONE_DRAW]["params"])
+    inputs = {**{f"param.{name}": part[f"param.{name}"].view(ml_dtypes.bfloat16).astype(np.float32)
+                 for name in names},
+              **{name: part[name] for name in ("image", "text", "times", "probe")}}
+    found = jax.jit(lambda drawn: computing(ONE_DRAW)(jnp.float32, drawn))(inputs)
+    for leaf in ("output", "gradients"):
+        reference, truth = ((part[f"{precision}.output"] if leaf == "output"
+                             else recorded_gradients(part.__getitem__, precision, ("image", "text"), names))
+                            for precision in ("fp32", "fp64"))
+        assert_as_exact_as_the_reference(np.asarray(found[leaf]), reference, truth, f"{ONE_DRAW} {leaf}")
