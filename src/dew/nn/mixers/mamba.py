@@ -208,7 +208,8 @@ class Mamba(nn.Module):
             def rule(convolved, held):
                 return self._scan(convolved, starts=None, valid=None, held=held)
 
-            out = tree_scan(self, mixed, taps, bias, tree, rule, (), state_dtype=wide, dtype=wide)
+            out = tree_scan(self, mixed, taps, bias, tree, rule, (), valid=valid, state_dtype=wide,
+                            dtype=wide)
         else:
             out = held_scan(self, mixed, taps, bias, self._scan,
                             (self.intermediate_size, self.state_size),

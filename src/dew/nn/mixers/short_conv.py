@@ -108,7 +108,8 @@ class GatedShortConv(nn.Module):
             # Each token over its path, from the held history; the cache left as it was for the replay.
             if held is None:
                 raise ValueError("a tree call reads a row's cache, which a decode call allocates first")
-            convolved = tree_conv(mixed, taps, bias, held.value, tree, dtype=mixed.dtype, activation=False)
+            convolved = tree_conv(mixed, taps, bias, held.value, tree, valid=valid, dtype=mixed.dtype,
+                                  activation=False)
             return self.out_proj(gate_out * checkpoint_name(convolved, 'conv'))
         if started is not None:
             started.value = started.value | (jnp.ones((batch,), bool) if valid is None

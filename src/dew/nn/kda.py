@@ -222,8 +222,8 @@ class KimiDeltaAttention(nn.Module):
                 query, key, value = (part.reshape(B, 1, self.num_heads, self.head_dim) for part in convolved)
                 return decode_delta_rule(query, key, value, g, beta, held)
 
-            out = tree_scan(self, projected, taps, None, tree, along, (g, beta), state='recurrent_state',
-                            state_dtype=wide, parts=heads, dtype=wide)
+            out = tree_scan(self, projected, taps, None, tree, along, (g, beta), valid=valid,
+                            state='recurrent_state', state_dtype=wide, parts=heads, dtype=wide)
         elif shards > 1:
             if decode:
                 raise LayoutRefused(f"Kimi delta attention under a sequence axis of {shards} runs whole "

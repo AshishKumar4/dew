@@ -377,7 +377,8 @@ class Mamba2(nn.Module):
             def rule(convolved, step, held):
                 return scan(convolved, dt=step, heads=heads, held=held)
 
-            out = tree_scan(self, mixed, taps, bias, tree, rule, (dt,), state_dtype=wide, dtype=compute)
+            out = tree_scan(self, mixed, taps, bias, tree, rule, (dt,), valid=valid, state_dtype=wide,
+                            dtype=compute)
             return self.out_proj(self._gated(out, gate))
         if shards > 1:
             if decode:
