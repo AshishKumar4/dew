@@ -377,6 +377,18 @@ class Rows:
     rows: int
 
 
+@dataclasses.dataclass(frozen=True)
+class Scattered:
+    """An output whose row `i` lands at row `table[i]` of `ref` (a product's rows written where a
+    permutation says, `staged_rows`: a mixture of experts' slots in token order, row 1376), `table` an int32
+    ref over the stored rows, a negative entry a row stored nowhere (padding); `interpreted`, copied a row at
+    a time, where no lane-level code runs."""
+
+    ref: Any
+    table: Any
+    interpreted: bool = False
+
+
 def viewed(view: tuple, block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
     `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
@@ -606,9 +618,15 @@ def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column
     """`value` written to the shared buffer `smem` in its dtype (`write`: its issuer's, `Issuer.written`),
     made visible to TMA, and its rows `first` to `first + stored` stored to `o_gmem` at row
     `row_start + first` and `column` (`store_rows`); the copies stay in flight (the caller waits before
-    `smem` is written again)."""
+    `smem` is written again). A `Scattered` output's rows each land where its table says, copied by the
+    warpgroup's threads (`gathered.scattered_rows`), done when it returns."""
     write(smem, value)
     plgpu.commit_smem()
+    if isinstance(o_gmem, Scattered):
+        from dew.nn.kernels.templates import gathered  # it builds on `Ring`
+
+        gathered.scattered_rows(smem, o_gmem, row_start, first, stored, column)
+        return
     store_rows(smem, o_gmem, row_start, first, stored, column, most, least)
 
 
