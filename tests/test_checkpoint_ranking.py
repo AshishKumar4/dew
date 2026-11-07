@@ -879,9 +879,9 @@ def test_a_validation_pass_scores_the_head_model_and_context_it_runs_under():
     for bit: after its objective tiles its head, after a model that predicts otherwise replaces its own at
     the same variables and input shapes (as the fit ladder replaces it), and under each context the model
     traces in (`trace_context`: the layout's rules, the pipeline's microbatch count). Each change traces
-    its program afresh and a return to one traces none, as the public seam counts (`Compiles`, whose
-    traces no persistent cache answers; row 4406). The tiled head's loss on par with the whole head's is
-    test_lm_head's."""
+    its validation loss's program afresh and a return to one traces none, as the public seam counts
+    (`Compiles` of `validated_loss`, whose traces no persistent cache answers; row 4406). The tiled head's
+    loss on par with the whole head's is test_lm_head's."""
     from flax import linen as nn
 
     from dew.mesh import DEFAULT_RULES
@@ -900,7 +900,7 @@ def test_a_validation_pass_scores_the_head_model_and_context_it_runs_under():
     variables = objective.init(jax.random.key(0))
 
     def scored(scorer):
-        with Compiles(None) as compiles:
+        with Compiles("validated_loss") as compiles:
             loss = Evaluation.run(scorer, variables, lambda partition: iter([batch]), key=jax.random.key(0),
                                   loss=True).scores['val/loss']
         return loss, [program.kind for program in compiles.programs].count("traced")
