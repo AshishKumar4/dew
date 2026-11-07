@@ -115,12 +115,28 @@ def test_a_gathered_product_lowers_for_cuda(paired):
 
 @pytest.mark.parametrize("splits", [1, 2])
 def test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_says(splits):
-    """A kernel gradient's gathered operands on an H100, interpreted (`mosaic_gpu.tgmm`'s `gather`, row
-    1376: the tokens a mixture of experts' slots read, and a scattered product's cotangent at its slots):
-    bitwise the same tile's gradient of the rows gathered first, the tokens' rows alone and both operands',
-    its groups ragged, one empty, rows past them, its depth split or not, at 257 rows (a table padded to
-    whole steps, an ungathered operand to 8 rows); a gathered operand beside a prologue on the rows, and on
-    mma.sync (no producer warpgroup), refused."""
+    """`a_gathered_kernel_gradient_is_its_gathered_rows_gradient` on an H100, interpreted; a gathered operand
+    beside a prologue on the rows, and on mma.sync (no producer warpgroup), refused."""
+    with generation.assumed("sm90"):
+        tokens, cotangent, table = a_gathered_kernel_gradient_is_its_gathered_rows_gradient(
+            grouped_matmul.INTERPRETED, splits)
+        with pytest.raises(ValueError):
+            mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
+                            tiles=mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
+                            out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
+                            gather=(table, None), prologue=lambda rows: rows)
+    with generation.assumed("sm80"), pytest.raises(ValueError):
+        mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
+                        tiles=mosaic_gpu.Tiles(128, 128, 32, 3, 1, family="mma.sync"), out_dtype=jnp.float32,
+                        multiprocessors=4, interpret=grouped_matmul.INTERPRETED, gather=(table, None))
+
+
+def a_gathered_kernel_gradient_is_its_gathered_rows_gradient(interpret=False, splits: int = 1) -> tuple:
+    """A kernel gradient's gathered operands (`mosaic_gpu.tgmm`'s `gather`, row 1376: the tokens a mixture of
+    experts' slots read, and a scattered product's cotangent at its slots), bitwise the same tile's gradient
+    of the rows gathered first, the tokens' rows alone and both operands', its groups ragged, one empty, rows
+    past them, its depth split or not, at 257 rows (a table padded to whole steps, an ungathered operand to
+    8 rows). Integers, every sum exact. Its tokens, cotangent and table."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma', splits=splits)
     sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
     rng = np.random.default_rng(11)
@@ -129,19 +145,14 @@ def test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_say
     table = jnp.asarray(table, jnp.int32)
     cotangent = jnp.asarray(rng.integers(-3, 4, size=(257, 128)), jnp.bfloat16)
     slots = jnp.asarray(rng.permutation(257), jnp.int32)
-    gradient = functools.partial(mosaic_gpu.tgmm, group_sizes=sizes, tiles=tiles, out_dtype=jnp.float32,
-                                 multiprocessors=4, interpret=grouped_matmul.INTERPRETED)
-    with generation.assumed("sm90"):
-        for tables, rows, columns in (((table, None), tokens[table], cotangent),
-                                      ((table, slots), tokens[table], cotangent[slots])):
-            np.testing.assert_array_equal(np.asarray(gradient(tokens, cotangent, gather=tables)),
-                                          np.asarray(gradient(rows, columns)))
-        with pytest.raises(ValueError):
-            gradient(tokens, cotangent, gather=(table, None), prologue=lambda rows: rows)
-    with generation.assumed("sm80"), pytest.raises(ValueError):
-        mosaic_gpu.tgmm(tokens, cotangent, sizes,
-                        tiles=mosaic_gpu.Tiles(128, 128, 32, 3, 1, family="mma.sync"), out_dtype=jnp.float32,
-                        multiprocessors=4, interpret=grouped_matmul.INTERPRETED, gather=(table, None))
+    gradient = jax.jit(functools.partial(mosaic_gpu.tgmm, group_sizes=sizes, tiles=tiles,
+                                         out_dtype=jnp.float32, multiprocessors=4 if interpret else 132,
+                                         interpret=interpret))
+    for tables, rows, columns in (((table, None), tokens[table], cotangent),
+                                  ((table, slots), tokens[table], cotangent[slots])):
+        np.testing.assert_array_equal(np.asarray(gradient(tokens, cotangent, gather=tables)),
+                                      np.asarray(gradient(rows, columns)))
+    return tokens, cotangent, table
 
 
 def test_a_gathered_kernel_gradients_key_meets_its_table_and_rows_at_one_count():
@@ -178,11 +189,18 @@ def test_a_gathered_kernel_gradient_lowers_for_cuda():
 
 
 def test_a_blackwells_gathered_product_reads_its_rows_by_its_load_warps_gathers():
-    """A gathered, scattered grouped product on an sm100, interpreted (row 1376): tcgen05's bundle takes it
-    (on the GPU its load warp's TMA four-row gathers, `gathered.Committed`; interpreted each row a copy), its
-    value bitwise the product of the rows gathered first and put at their slots after; and its kernel
-    gradient's tables on the next issuer (mma.sync's TMA rings, `bundles.groups`), bitwise the gradient of
-    the rows gathered first. Integers, every sum exact in the bf16 output."""
+    """`a_blackwells_gathered_product_is_its_gathered_rows_product` on an sm100, interpreted (each row a copy
+    where the GPU's load warp gathers four)."""
+    with generation.assumed("sm100"):
+        a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu=True)
+
+
+def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu: bool = False):
+    """A gathered, scattered grouped product on a Blackwell GPU (row 1376): tcgen05's bundle takes it (its
+    load warp's TMA four-row gathers, `gathered.Committed`), its value bitwise the product of the rows
+    gathered first and put at their slots after; and its kernel gradient's tables on the next issuer
+    (mma.sync's TMA rings, `bundles.groups`), bitwise the gradient of the rows gathered first. Integers,
+    every sum exact in the bf16 output."""
     from dew.nn.kernels import gemm
 
     rng = np.random.default_rng(13)
@@ -192,23 +210,23 @@ def test_a_blackwells_gathered_product_reads_its_rows_by_its_load_warps_gathers(
     slots = jnp.asarray(rng.permutation(384), jnp.int32)
     cotangent = jnp.asarray(rng.integers(-1, 2, size=(384, 256)), jnp.bfloat16)
     sizes = jnp.asarray([128, 0, 200], jnp.int32)
-    options = {"out_dtype": jnp.bfloat16, "precision": "default", "interpret_on_cpu": True}
+    options = {"out_dtype": jnp.bfloat16, "precision": "default", "interpret_on_cpu": interpret_on_cpu}
     derived, original = [], mosaic_gpu.gmm
 
     def recorded(*args, tiles, **kwargs):
         derived.append(tiles)
         return original(*args, tiles=tiles, **kwargs)
 
-    with generation.assumed("sm100"), pytest.MonkeyPatch.context() as patched:
+    with pytest.MonkeyPatch.context() as patched:
         patched.setattr(mosaic_gpu, "gmm", recorded)
         got = jax.jit(lambda: gemm.gemm(tokens, matrices, sizes, gather=table, scatter=slots, **options))()
         assert {tile.family for tile in derived} == {"tcgen05"}
         apart = jax.jit(lambda: gemm.gemm(tokens[table], matrices, sizes, **options))()
         np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.zeros_like(apart).at[slots].set(apart)))
         gradient = jax.jit(lambda: gemm.gemm_t(tokens, cotangent, sizes, out_dtype=jnp.float32, gather=(
-            table, slots), precision="default", interpret_on_cpu=True))()
+            table, slots), precision="default", interpret_on_cpu=interpret_on_cpu))()
         expected = jax.jit(lambda: gemm.gemm_t(tokens[table], cotangent[slots], sizes, out_dtype=jnp.float32,
-                                               precision="default", interpret_on_cpu=True))()
+                                               precision="default", interpret_on_cpu=interpret_on_cpu))()
     np.testing.assert_array_equal(np.asarray(gradient), np.asarray(expected))
 
 
