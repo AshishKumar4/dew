@@ -225,3 +225,20 @@ def test_a_convolution_padding_an_empty_sequence_reads_nothing():
 
     program = jax.make_jaxpr(padded)(jax.ShapeDtypeStruct((1, 6), jnp.int32))
     assert causality_refusal(program, 0, 6, (0,)) is None
+
+
+@pytest.mark.parametrize("name", ["previous token", "a left shift by slice and concatenate"])
+def test_a_walk_under_a_compile_only_mesh_evaluates_its_indices_on_this_host(name):
+    """A walk proven as a step compiled ahead traces it, under its devices' mesh (a compile-only GPU's,
+    whose devices run nothing here), evaluates the indices a gather or a slice reads on this host
+    (`programs.on_host`) and proves what it proves outside it."""
+    import numpy as np
+
+    from dew.training.ahead import compile_only_gpus
+
+    function = {**ADMITTED, **REFUSED}[name]
+    program = jax.make_jaxpr(function)(jnp.zeros((1, LENGTHS[0]), jnp.int32))
+    outside = causality_refusal(program, 0, LENGTHS[0], (0,))
+    with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("h100", 1)), ("data",))):
+        inside = causality_refusal(program, 0, LENGTHS[0], (0,))
+    assert (inside is None) == (outside is None) == (name in ADMITTED)

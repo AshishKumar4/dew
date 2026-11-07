@@ -1414,3 +1414,18 @@ def test_binding_new_encoder_weights_encodes_both_branches_with_them(tmp_path):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
     np.testing.assert_array_equal(rebound(prompts, steps=8, key=0).host().images,
                                   fresh(prompts, steps=8, key=0).host().images)
+
+
+def test_a_served_walks_initial_state_traces_under_a_compile_only_mesh():
+    """A served walk's initial state (`TextToImage`'s `_initial`) traced under its devices' mesh, a
+    compile-only GPU's whose devices run nothing here, makes its grid on this host (`programs.on_host`)."""
+    from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
+    from dew.inference.images import _initial
+    from dew.training.ahead import compile_only_gpus
+
+    process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
+    grid = tuple(float(time) for time in np.asarray(process.times(4)))
+    sample = jax.ShapeDtypeStruct((1, 4, 4, 1), jnp.float32)
+    key = jax.eval_shape(lambda: jax.random.key(0))
+    with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("h100", 1)), ("data",))):
+        jax.jit(lambda x, key: _initial(Euler(), process, grid, x, key)).trace(sample, key)
