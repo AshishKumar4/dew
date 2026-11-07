@@ -14,6 +14,8 @@ registers a program takes are its warpgroups' entry share alone (`registers`), t
 (addresses and counters) left to a per-launch rule once a liveness model prices its branch
 (`resources.producer_floor`)."""
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 from collections.abc import Callable
@@ -711,14 +713,38 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
     operands_in_registers = False
     products_overlap = False  # each product is awaited where its value is read (`summed`)
 
+    def product_scratch(self, consumers: int) -> tuple:
+        # A consumer's widest accumulator and widest 16-bit register operand side by side, and its barrier.
+        widest = self.widest_product
+        return (accumulator_columns(self.rows, widest * consumers),
+                operand_columns(self.rows, widest * consumers, jnp.bfloat16),
+                plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True))
+
+    @contextlib.contextmanager
+    def products_in(self, refs):
+        token = _PRODUCTS.set(refs)
+        try:
+            yield
+        finally:
+            _PRODUCTS.reset(token)
+
+    def _scratch(self):
+        """This consumer's accumulator, operand and barrier of the program's product scratch."""
+        found = _PRODUCTS.get()
+        if found is None:
+            raise ValueError(f"{self.name}'s products take the program's scratch (`product_scratch`)")
+        accumulators, operands, barriers = found
+        consumer = lax.axis_index("wg")
+        widest = self.widest_product
+        return (accumulators.at[:, pl.ds(consumer * widest, widest)],
+                operands.at[:, pl.ds(consumer * widest, widest)], barriers.at[consumer])
+
     def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
         del interpret
-
-        def run(tmem, done):
-            issue(Accumulator(tmem, shape))
-            return _awaited(tmem, done)
-
-        return pl.run_scoped(run, accumulator_columns(*shape), plgpu.Barrier(orders_tensor_core=True))
+        accumulators, _, done = self._scratch()
+        tmem = accumulators.at[:, pl.ds(0, shape[1])]
+        issue(Accumulator(tmem, shape))
+        return _awaited(tmem, done)
 
     def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
                  ) -> Accumulator:
@@ -730,19 +756,15 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
     def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
         # Each part written into tensor memory and its product issued from there (the TS form), awaited
         # before the part's tensor memory is given back.
+        _, operands, done = self._scratch()
         for formed in parts:
             part = mosaic.unscaled_part(formed)
-
-            def run(tmem, done, acc=acc, part=part):
-                plgpu.async_store_tmem(tmem, part)
-                plgpu.commit_tmem()
-                self.products(acc, Accumulator(tmem, part.shape, dtype=part.dtype), rhs, interpret)
-                plgpu.tcgen05_commit_arrive(done)
-                plgpu.barrier_wait(done)
-
-            pl.run_scoped(run, operand_columns(*part.shape, part.dtype),
-                          plgpu.Barrier(orders_tensor_core=True))
-            acc = dataclasses.replace(acc, accumulate=True)
+            tmem = operands.at[:, pl.ds(0, part.shape[1])]
+            plgpu.async_store_tmem(tmem, part)
+            plgpu.commit_tmem()
+            acc = self.products(acc, Accumulator(tmem, part.shape, dtype=part.dtype), rhs, interpret)
+            plgpu.tcgen05_commit_arrive(done)
+            plgpu.barrier_wait(done)
         return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
@@ -760,24 +782,19 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
     def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
         # Its products done (a commit awaited), its value read, `value` added, written back.
         del interpret
-
-        def run(done):
-            plgpu.tcgen05_commit_arrive(done)
-            plgpu.barrier_wait(done)
-            plgpu.async_store_tmem(_tensor_memory(acc), _read(_tensor_memory(acc)) + value)
-            plgpu.commit_tmem()
-
-        pl.run_scoped(run, plgpu.Barrier(orders_tensor_core=True))
+        _, _, done = self._scratch()
+        plgpu.tcgen05_commit_arrive(done)
+        plgpu.barrier_wait(done)
+        plgpu.async_store_tmem(_tensor_memory(acc), _read(_tensor_memory(acc)) + value)
+        plgpu.commit_tmem()
         return dataclasses.replace(acc, accumulate=True)
 
     def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
-        def run(done):
-            plgpu.tcgen05_commit_arrive(done)
-            plgpu.barrier_wait(done)
-            plgpu.async_store_tmem(_tensor_memory(acc), scale(_read(_tensor_memory(acc))))
-            plgpu.commit_tmem()
-
-        pl.run_scoped(run, plgpu.Barrier(orders_tensor_core=True))
+        _, _, done = self._scratch()
+        plgpu.tcgen05_commit_arrive(done)
+        plgpu.barrier_wait(done)
+        plgpu.async_store_tmem(_tensor_memory(acc), scale(_read(_tensor_memory(acc))))
+        plgpu.commit_tmem()
         return self.register_products(dataclasses.replace(acc, accumulate=True), parts, rhs, interpret)
 
     def settled(self, pending: int = 0) -> None:
@@ -796,6 +813,9 @@ class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
 
 CHUNKS = Tcgen05Chunks()
 """tcgen05's bundle for the recurrence's 64-row chunks."""
+
+_PRODUCTS: contextvars.ContextVar[tuple | None] = contextvars.ContextVar("products", default=None)
+"""The program's product scratch while it is traced (`Tcgen05ChunksIssuer.products_in`)."""
 
 
 def _read(tmem) -> jax.Array:

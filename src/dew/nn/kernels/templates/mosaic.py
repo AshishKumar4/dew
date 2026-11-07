@@ -17,6 +17,7 @@ streams each operand through a `Ring` whose counter runs across tiles, and takes
 """
 
 import abc
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -1341,6 +1342,20 @@ class Issuer[Accumulator](abc.ABC):
     @abc.abstractmethod
     def column(self) -> plgpu_core.SomeLayout:
         """A column vector's layout: the accumulator's reduced over its rows."""
+
+    def product_scratch(self, consumers: int) -> tuple:
+        """The memory a program's products take where the issuer scopes each product's accumulator itself
+        (tcgen05's chunks: tensor memory and a tensor-core barrier, a consumer each), allocated at the
+        program's scope, which a role's own scope may not allocate (Mosaic GPU's thread axis); none where
+        its products need none."""
+        del consumers
+        return ()
+
+    @contextlib.contextmanager
+    def products_in(self, refs):
+        """Within the block, the program's product scratch (`product_scratch`'s, scoped) its products take."""
+        del refs
+        yield
 
     def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
         """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
