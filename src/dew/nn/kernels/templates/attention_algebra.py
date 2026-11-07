@@ -1268,13 +1268,32 @@ def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | No
 
 
 def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p: jax.Array,
-           multiplier: jax.Array | None = None, chunk: int | None = None) -> tuple[jax.Array, ...]:
+           multiplier: jax.Array | None = None, chunk: int | None = None, bound: float = 1.0
+           ) -> tuple[jax.Array, ...]:
     """Weights `p` narrowed to the values' dtype times the tile's `value`s, as the mainloop's `dot`, a
-    `chunk` of keys at a time (`products_of`); with a dropout `multiplier`, the dropped weights
-    `p * multiplier` narrowed at the scale `weights_parts` gives them."""
+    `chunk` of keys at a time (`products_of`); with a dropout `multiplier` (at most `bound`), the dropped
+    weights `p * multiplier` as `dropped_parts` narrows them."""
     if multiplier is not None:
-        return products_of(weights_parts(p * multiplier, value.dtype), value, dot, chunk)
+        return products_of(dropped_parts(p * multiplier, value.dtype, bound), value, dot, chunk)
     return products_of((narrow(p, value.dtype),), value, dot, chunk)
+
+
+def dropped_parts(weights: jax.Array, dtype, bound: float) -> Parts:
+    """A forward's dropped weights `p * multiplier` (fp32, unnormalized, `p` at most 1 and the draw's
+    multiplier `bound`) narrowed for their product with values of `dtype`: as they are where `bound` is
+    within the dtype's range (`drops_in_place`), each as exact as the reference's (`attention.reference`
+    narrows the normalized `p / total * multiplier`, no larger), so a mainloop's sums take them in place;
+    else (fp16 past a rate of 1 - 2^-16) at the power-of-two scale `weights_parts` gives them, which their
+    product takes back."""
+    if drops_in_place(dtype, bound):
+        return (narrow(weights, dtype),)
+    return weights_parts(weights, dtype)
+
+
+def drops_in_place(dtype, bound: float) -> bool:
+    """Whether a forward's dropped weights, at most the draw's multiplier `bound`, narrow to `dtype` as they
+    are (`dropped_parts`): `bound` within its largest finite value."""
+    return bound <= float(jnp.finfo(dtype).max)
 
 
 def products_of(parts: Parts, value: jax.Array, dot: Callable[[jax.Array, jax.Array], jax.Array],
@@ -1338,7 +1357,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         # The weights the walk accumulates dropped where the call drops (`_times`' parts); the denominator
         # the undropped weights'.
         parts = ((narrow(p, value.dtype),) if multiplier is None
-                 else weights_parts(p * multiplier, value.dtype))
+                 else dropped_parts(p * multiplier, value.dtype, keys.coords.drop.bound))
         # The denominator before the product, so the tile's fp32 weights die at their narrowing and hold no
         # registers through it (FS-4324-PEAK1: on an A100 they held 64 a thread past P·V, its peak 299 at
         # 128 x 64, where FlashAttention 2's sums them before; its bits the same either way).
@@ -1347,7 +1366,8 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         acc = keys.accumulate(state.acc, lambda acc: keys.coords.queries(factor, acc) * acc, parts, value)
         return Partial(acc, m, total)
     assert not keys.coords.keys_first, "a tile held keys first takes the plain walk's mainloop sums"
-    times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk_of(spec))
+    times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk_of(spec),
+                              bound=keys.coords.drop.bound)
     return stepped(state, m, factor, p, times(p), held, times)
 
 
@@ -1364,9 +1384,10 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
     and the backward read."""
     at_anchor = keys.coords.k_pos == expand(anchor.key, keys.logits)
     others, own_tile = anchor_split(narrow(p, dtype), at_anchor)
-    if multiplier is None:
+    drop = keys.coords.drop
+    if multiplier is None or drop is None:
         return (others,), others, own_tile, anchor
-    parts = weights_parts(jnp.where(at_anchor, 0.0, p) * multiplier, dtype)
+    parts = dropped_parts(jnp.where(at_anchor, 0.0, p) * multiplier, dtype, drop.bound)
     # The anchor's multiplier by its query's vector and its key's, no unit axis (a Mosaic program's lowers
     # none beside a tile).
     anchor_draw = drawn(keys.coords, keys.coords.query_places(), anchor.key)

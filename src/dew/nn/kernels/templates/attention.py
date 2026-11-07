@@ -787,6 +787,11 @@ class Dropout:
         return Draw((self.seed[0], self.seed[1]), self.rows[row], self.heads[head], self.rate, self.queries,
                     self.keys)
 
+    @property
+    def bound(self) -> float:
+        """The multiplier a kept entry takes, every draw's (`Draw.bound`)."""
+        return 1.0 / (1.0 - self.rate)
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
