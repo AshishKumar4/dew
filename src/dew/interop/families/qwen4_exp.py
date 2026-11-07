@@ -39,6 +39,7 @@ from dew.interop.families.qwen import (
     _QWEN_MOE_LEAVES,
     FUSED_EXPERTS,
     _qwen_hybrid_config,
+    _qwen_moe_export,
     _qwen_moe_mixture,
     qwen_hybrid_export,
 )
@@ -217,10 +218,9 @@ def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
     mixers = {kind: model.kind_of(kind).mixer for kind in dict.fromkeys(model.per_layer_types)}
     qsa = [mixer for mixer in mixers.values() if isinstance(mixer, QSAAttentionMixer)]
     delta = [mixer for mixer in mixers.values() if isinstance(mixer, GatedDeltaNetMixer)]
-    mixture = model.mixture
     # The hybrid block's own fields (`qwen_hybrid_export`), its delta net's and its rotary's fraction.
     hybrid = qwen_hybrid_export(model)
-    if len(qsa) + len(delta) != len(mixers) or len(qsa) > 1 or len(delta) > 1 or mixture is None:
+    if len(qsa) + len(delta) != len(mixers) or len(qsa) > 1 or len(delta) > 1 or model.mixture is None:
         raise ValueError("a qwen4_exp_text config states one QSA attention, one gated delta net and routed "
                          f"experts in every layer; this model's layers are {list(mixers.values())}")
     fields: dict[str, object] = {
@@ -230,9 +230,8 @@ def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
         **({name: getattr(qsa[0], name) for name in _QSA_FIELDS} if qsa else {}), 'indexer_kv_heads': 1,
         **({'output_gate_type': delta[0].output_gate_type,
             **{name: hybrid[name] for name in LINEAR_FIELDS}} if delta else {}),
-        'num_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
-        'moe_intermediate_size': mixture.expert_features,
-        'shared_expert_intermediate_size': mixture.shared_features, 'norm_topk_prob': mixture.norm_topk_prob,
+        # Its routed and shared experts, every layer routed (`_qwen_moe_export`).
+        **_qwen_moe_export(model, stated_normalization=True, scheduled=False),
         'mtp_num_hidden_layers': 0, 'ple_layer_ids': [],
         # The class reads its rotary's width from its rope record (`_qwen35_rope`).
         'rope_parameters': {'rope_type': 'default', 'rope_theta': model.rope_theta,

@@ -108,14 +108,17 @@ type Handed = jax.Array | np.ndarray | Shared
 
 
 def taken(leaf: Handed | np.generic) -> jax.Array:
-    """A simulator's array as a JAX array: a device array through DLPack, on the device it is held on and
-    without a copy where the producer allows it; a NumPy array copied to the default device, as a
-    learner reads it."""
+    """A simulator's array as a JAX array of its own: another framework's through DLPack onto the device it
+    is held on, a NumPy array onto the default device, each copied, since a simulator may write its next
+    step into the same buffer (a GPU simulator's fixed outputs) and a rollout keeps every step it records;
+    a JAX array, which nothing writes again, as it is. A lent buffer is read in place and copied by a
+    program of JAX's own, which completes before the simulator is called again: `from_dlpack(copy=True)`
+    left XLA:CPU aliasing a 64-byte-aligned host buffer, whose next step then overwrote the recorded one."""
     if isinstance(leaf, jax.Array):
         return leaf
     if isinstance(leaf, np.ndarray | np.generic):
-        return jnp.asarray(leaf)
-    return jax.dlpack.from_dlpack(leaf)
+        return jnp.array(leaf, copy=True)
+    return jax.block_until_ready(jnp.array(jax.dlpack.from_dlpack(leaf), copy=True))
 
 
 @overload

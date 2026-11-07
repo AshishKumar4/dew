@@ -180,12 +180,24 @@ class MiMoProcessor:
 
     def apply_chat_template(self, conversation: Sequence[Mapping[str, object]],
                             **kwargs: JSON) -> str | Sequence[int] | Mapping[str, object]:
-        from dew.interop.processors import hosts
+        """The tokenizer's template over `conversation`; asked for its tokens as named fields
+        (`tokenize`, `return_dict`), the template's text and its image parts' images through this
+        processor's own call, as a release's processor reads a chat (`dew.interop.processors.chat_images`)."""
+        from dew.interop.processors import chat_images, hosts
 
         tokenizer = self.tokenizer
         if not hosts(tokenizer):
             raise TypeError("MiMo-V2.6's tokenizer lacks a host processor operation")
-        return tokenizer.apply_chat_template(conversation, **kwargs)
+        if not (kwargs.get("tokenize") and kwargs.get("return_dict")):
+            return tokenizer.apply_chat_template(conversation, **kwargs)
+        options = {name: value for name, value in kwargs.items()
+                   if name not in ("tokenize", "return_dict", "return_tensors")}
+        text = tokenizer.apply_chat_template(conversation, tokenize=False, **options)
+        if not isinstance(text, str):
+            raise TypeError("MiMo-V2.6's chat template must render text")
+        images = [_rgb(image) for image in chat_images(conversation, type(self).__name__)]
+        return self(text=text, images=images,
+                    return_tensors=_records.text(kwargs.get("return_tensors", "np"), "return_tensors"))
 
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]:
         return self.tokenizer.batch_decode(sequences, skip_special_tokens=skip_special_tokens)

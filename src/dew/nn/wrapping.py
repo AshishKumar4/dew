@@ -32,8 +32,6 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
-
     from dew._records import JSON
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -71,12 +69,6 @@ class DecoderWrapper(nn.Module):
     @property
     def vocab_size(self) -> int:
         return self._decoder.vocab_size
-
-    @nn.nowrap
-    def fixed_routers(self) -> Mapping[str, Callable[[tuple[str, ...]], bool]]:
-        """Its decoder's (`ExpertRouted`), each over the paths under the field that holds it."""
-        return {name: (lambda path, owns=owns: path[:1] == (self.wraps,) and owns(path[1:]))
-                for name, owns in self._decoder.fixed_routers().items()}
 
     @property
     def max_seq_len(self) -> int:
