@@ -21,7 +21,7 @@ from dew.nn.dropout import Dropout
 from .attention import scaled_dot_product_attention
 from .flops import cross_attention_flops, projection_flops, self_attention_flops
 from .norms import LayerNorm, RMSNorm
-from .precision import float32_dot_general
+from .precision import at_least_fp32, float32_dot_general
 from .rope import rotate
 from .sharding import HEADS, KV_HEADS, constrain, split_positions
 
@@ -376,11 +376,11 @@ def stage_attention(stage: Stage, channels: int, attention_impl: AttentionImpl, 
     """Build the block a `Stage` describes, at the stage's channel count.
 
     A stage that names no dtype or precision takes the model's, and a model
-    that names no dtype attends in fp32.
+    that names no dtype attends in at least fp32 (`TransformerBlock`).
     """
     return TransformerBlock(
         heads=stage.heads, dim_head=channels // stage.heads,
-        dtype=stage.dtype or dtype or jnp.float32,
+        dtype=stage.dtype or dtype,
         attention_impl=attention_impl, use_projection=stage.use_projection,
         use_self_and_cross=stage.use_self_and_cross,
         precision=stage.precision or precision,
@@ -426,13 +426,16 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, context=None):
+        """The block over `x`, computed in its `dtype`, or, where it names none, in at least fp32 of the
+        input's: a bf16 input attends in fp32, a float64 one in float64."""
         channels = x.shape[-1]
+        dtype = self.dtype or at_least_fp32(x.dtype)
         if self.norm_inputs:
-            x = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
+            x = RMSNorm(epsilon=self.norm_epsilon, dtype=dtype)(x)
 
         def project(features: int, name: str):
             return Dense(features=features, use_bias=False, precision=self.precision,
-                         dtype=self.dtype, name=name, dot_general=float32_dot_general)
+                         dtype=dtype, name=name, dot_general=float32_dot_general)
 
         if self.use_projection:
             inner_dim = self.heads * self.dim_head
@@ -446,7 +449,7 @@ class TransformerBlock(nn.Module):
             name='Attention',
             precision=self.precision,
             use_bias=False,
-            dtype=self.dtype,
+            dtype=dtype,
             first_attention="self" if self.use_self_and_cross else "none",
             only_pure_attention=self.only_pure_attention,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
