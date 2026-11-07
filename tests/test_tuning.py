@@ -1,5 +1,5 @@
-"""The kernel configs' whole path: a step's launches found in its lowered
-program, keyed by bucketed shape, resolved from a pin, a stored pick or a
+"""The kernel configs' whole path: a step's launches recorded as it traces,
+keyed by bucketed shape, resolved from a pin, a stored pick or a
 heuristic, stored and read back in a fresh process, and measured once on a
 GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
@@ -18,6 +18,7 @@ import tokamax
 from lane_environment import DETERMINISTIC_OPS
 from process_support import READ_ONLY, REPO_ROOT, fresh, keeping_picks, run_pool
 from reference_error import equations
+from tuned import recorded
 
 from dew.nn.activations import gated_product
 from dew.nn.kernels import generation, norm_swiglu, tuning
@@ -110,8 +111,8 @@ print(json.dumps([found, tuning.settled(tuning.tune(lambda: step().lower(*operan
 
 
 def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
-    """The four launches of a norm seam and SwiGLU step are found in its
-    lowered program, keyed with their token axis at a power of two. Each
+    """The four launches of a norm seam and SwiGLU step are recorded as it
+    traces (`tuning.seen`), keyed with their token axis at a power of two. Each
     takes its heuristic, a pinned config of its type (one of another type
     raises, naming the config and why), and in a fresh
     process reading picks as an opt-in tuning run does (`tuning.reading`)
@@ -123,9 +124,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     work on a GPU.
     A process under deterministic ops reads none of them and launches its
     heuristics, the same in every process while other runs store picks."""
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
-        thirteen = tokamax.autotuning.get_bound_args(step(), *operands(13))
+    found, thirteen = recorded(step(), *operands(15)), recorded(step(), *operands(13))
     ops = {type(ba.op): ba for ba in found}
     assert set(ops) == {norm_swiglu.RmsForward, norm_swiglu.RmsBackward, norm_swiglu.SwigluForward,
                         norm_swiglu.SwigluBackward}
@@ -159,17 +158,12 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
     # A plain norm's pick beside them: a launch with no branch, which the seam's nearest search passes over.
-    with tuning.launches():
-        [alone] = tokamax.autotuning.get_bound_args(jax.jit(plain), operands(15)[0], operands(15)[2])
+    [alone] = recorded(plain, operands(15)[0], operands(15)[2])
     picks = tuning.dumps_picks(jax.devices()[0].device_kind, (
         *((ba, tuning.Timings({picked[type(ba.op)]: timing})) for ba in found),
         (alone, tuning.Timings({norm_swiglu.RowsConfig(16, 8): timing}))))
-    # Stored as every checkout writes its picks: each op as its picks name it, without the device check
-    # a describing launch bypasses (`tuning._identity`).
-    written = json.loads(picks)
-    assert all(entry["op"]["fields"]["bypass_device_check"] is False for entry in written["data"])
     flags = f"{keeping_picks()} {READ_ONLY}".strip()
-    [path] = fresh(STORED, with_foreign(json.dumps(written)), cache_dir=tmp_path / "cache", flags=flags)
+    [path] = fresh(STORED, with_foreign(picks), cache_dir=tmp_path / "cache", flags=flags)
     assert path.startswith(str(tmp_path / "cache" / "autotune" / "jaxlib-")) and path.endswith(".json")
     stored, tuned = fresh(READ, cache_dir=tmp_path / "cache", flags=flags)
     heuristics = {str(rows): launches(step(), *operands(rows)) for rows in (13, 15, 40)}
@@ -186,27 +180,25 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     assert repeatable != stored
 
 
-def test_a_lowering_records_each_launch_it_traces_as_a_lowering_made_to_describe_it_reads_it():
-    """A step's lowering records each launch whose config picks decide as it traces it (`seen`),
-    keyed as tokamax's description of it in a lowering made to read it is (`launches`), and again in
-    a lowering whose trace was cached before: a step needs no lowering of its own to be tuned."""
-    def keyed(op, ba):
-        return type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items()))
-
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
-    described = sorted(keyed(ba.op, ba) for ba in found)
-    function = step()
-    function.lower(*operands(15))
-    for _ in range(2):
+def test_a_lowering_records_each_launch_it_traces_again_where_its_trace_was_cached():
+    """A step's lowering records each launch whose config picks decide as it traces it (`seen`), and
+    a lowering whose trace was cached before records the same launches as a fresh step's: a step needs
+    no lowering of its own to be tuned."""
+    def recorded_by(function) -> list:
         with tuning.seen() as found:
             function.lower(*operands(15))
-        assert sorted(keyed(op, ba) for op, ba in found) == described
+        return sorted((type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items())))
+                      for op, ba in found)
+
+    fresh_step = recorded_by(step())
+    function = step()
+    function.lower(*operands(15))
+    assert fresh_step and recorded_by(function) == recorded_by(function) == fresh_step
 
 
-def test_a_launch_is_resolved_and_described_without_asking_a_traced_array_for_its_devices(monkeypatch):
+def test_a_launch_is_resolved_and_recorded_without_asking_a_traced_array_for_its_devices(monkeypatch):
     """Each launch of a step's lowering, the plain one and the one that
-    describes its launches to `tune`, reads its config and its GPU model
+    records its launches for `tune` (`seen`), reads its config and its GPU model
     without asking a traced array for its devices. That question raises an
     error whose message walks the whole trace so far to say where the array
     came from, once per array of each launch: quadratic in the step, it was
@@ -219,7 +211,7 @@ def test_a_launch_is_resolved_and_described_without_asking_a_traced_array_for_it
         made(self, *args, **kwargs)
 
     monkeypatch.setattr(jax.errors.ConcretizationTypeError, "__init__", counted)
-    with tuning.launches():
+    with tuning.seen():
         step().lower(*operands(15))
     step().lower(*operands(15))
     assert raised == []
@@ -366,8 +358,7 @@ def only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_launc
     path, untouched = fresh(TRAINED, "2048", cache_dir=tmp_path / "cache", flags=inherited)
     assert untouched is None
     # Another checkout's launch, which the pass reads past and keeps.
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    found = recorded(step(), *operands(15))
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
     seed = tuning.dumps_picks(jax.devices()[0].device_kind,
@@ -407,9 +398,7 @@ def a_config_failing_for_more_than_its_shared_memory_stops_the_measurement():
     memory: measuring the launch propagates the error, where the tuner had counted it one more
     failed config and kept the others' fastest; a ValueError too, which the tuner refuses only where
     CUPTI read none of a config's kernels (row 4446)."""
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
-    [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+    [norm] = [ba for ba in recorded(step(), *operands(15)) if type(ba.op) is norm_swiglu.RmsForward]
     broken_config = sorted(norm.autotuning_configs, key=repr)[0]
     fields = {field.name: getattr(norm.op, field.name) for field in dataclasses.fields(norm.op) if field.init}
     for failure in (KernelBug, KernelRefusal):
@@ -433,9 +422,7 @@ def a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
     """A profile capture holds CUPTI, which takes one subscriber: measuring a launch beside it times
     no config, returns each as failed, so the launch keeps its heuristic, and leaves CUPTI to the
     capture without raising; once the capture ends, the same launch measures every config."""
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
-    [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+    [norm] = [ba for ba in recorded(step(), *operands(15)) if type(ba.op) is norm_swiglu.RmsForward]
     jax.profiler.start_trace(str(tmp_path / "trace"))
     try:
         beside = tuning._measured(norm.op, norm)
@@ -451,11 +438,10 @@ import json, sys
 import jax
 import tokamax
 from test_tuning import operands, step
+from tuned import recorded
 from dew import _cache
 from dew.nn.kernels import norm_swiglu, tuning
-with tuning.launches():
-    found = tokamax.autotuning.get_bound_args(step(), *operands(15))
-[norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+[norm] = [ba for ba in recorded(step(), *operands(15)) if type(ba.op) is norm_swiglu.RmsForward]
 timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                metadata={})
 config = norm_swiglu.RowsConfig(*json.loads(sys.argv[1]))
