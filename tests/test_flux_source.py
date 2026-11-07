@@ -23,8 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, unpacked
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import GateFailure, as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, flux_path, read_transformer
@@ -164,64 +163,149 @@ def pipeline_record(source):
     return json.loads((source / "flux_transformer.json").read_text())["pipeline"]
 
 
-def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipeline_record):
-    """The conditioner composes what `encode_prompt` composes.
+WORDS = ("a", "red", "green", "blue", "cat", "bird", "dog", "tiny", "photo", "of", "tall", "tree")
+"""The words a drawn prompt is made of, every one in the pipeline's tokenizers."""
+PIPELINE_SEEDS = 8
+"""The pipeline sites' declared seeds, sized by `seeds_for` paired as each check confirmed them."""
 
-    Flux reads its T5 tower's states as the sequence and its CLIP tower's
-    pooled row unprojected, and its pipeline routes `prompt` to CLIP and
-    `prompt_2` to T5. The two slots carry different words, so a native
-    encoder that crossed them or projected the pooled row would not land here.
+
+def prompts(indices: np.ndarray) -> list[dict[str, str]]:
+    """A draw's prompts: each row's words in `WORDS` for its CLIP slot (`text`) and its T5 slot
+    (`second`)."""
+    def words(slot):
+        return " ".join(WORDS[index] for index in slot)
+    return [{"text": words(row[0]), "second": words(row[1])} for row in np.asarray(indices)]
+
+
+def prompt_draw(seed: int) -> tuple[np.ndarray]:
+    """Two rows' prompts as word indices, three words in each slot, the slots apart."""
+    return (np.random.default_rng([185, seed]).integers(0, len(WORDS), (2, 2, 3)).astype(np.int32),)
+
+
+@pytest.fixture(scope="module")
+def pipelines(source):
+    """The saved pipeline Diffusers loads in float32, and in float64 inside `float64`."""
+    import torch
+    from diffusers import FluxPipeline
+
+    from tools.torch_precision import float64
+
+    def read(dtype):
+        return FluxPipeline.from_pretrained(source / "pipeline", torch_dtype=dtype, local_files_only=True)
+
+    narrow = read(torch.float32)
+    with float64():
+        wide = read(torch.float64)
+    for pipe in (narrow, wide):
+        pipe.set_progress_bar_config(disable=True)
+    return narrow, wide
+
+
+def source_arms(pipe, run, *, wide: bool):
+    """`run(pipe, *inputs)` as given under `torch.no_grad`, inside `float64` for the `wide` pipeline, its
+    tensors returned as NumPy arrays."""
+    import contextlib
+
+    import torch
+
+    from tools.torch_precision import float64
+
+    @as_given
+    def given(*inputs):
+        with float64() if wide else contextlib.nullcontext(), torch.no_grad():
+            return jax.tree.map(lambda out: out.numpy() if isinstance(out, torch.Tensor) else out,
+                                run(pipe, *inputs))
+    return given
+
+
+def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipeline_record, pipelines):
+    """The conditioner composes what `encode_prompt` composes, on par with it over drawn prompts (check 1),
+    its float64 run the truth.
+
+    Flux reads its T5 tower's states as the sequence and its CLIP tower's pooled row unprojected, and its
+    pipeline routes `prompt` to CLIP and `prompt_2` to T5. The two slots carry different words, so a native
+    encoder that crossed them fails the same check.
     """
+    import torch
+
     from dew.interop.pretrained import Pretrained
 
-    with np.load(source / "flux_transformer.npz") as arrays:
-        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32",
-                                 attention_impl="xla")
-        encoder = loaded.inputs.conditions["conditioning"].encoder
-        params = loaded.variables["encoders"]["conditioning"]
-        condition = encoder.encode(params, encoder.tokenize(pipeline_record["prompts"]))
-        assert condition.context.shape == arrays["pipeline.context"].shape
-        for key in ("context", "pooled"):
-            assert_as_exact_as_the_reference(getattr(condition, key), arrays[f"pipeline.{key}"],
-                                             arrays[f"pipeline.fp64.{key}"], key)
-        # The distilled guidance rides in as a model input, at the value the
-        # pipeline defaults to, and guidance is not two branches here.
-        assert condition.guidance is not None
-        np.testing.assert_allclose(np.asarray(condition.guidance),
-                                   np.full(2, pipeline_record["default_guidance"]), atol=0)
-        crossed = encoder.encode(params, encoder.tokenize(
-            [{"text": row["second"], "second": row["text"]} for row in pipeline_record["prompts"]]))
-        with pytest.raises(AssertionError):
-            assert_as_exact_as_the_reference(crossed.context, arrays["pipeline.context"],
-                                             arrays["pipeline.fp64.context"], "crossed")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    encoder = loaded.inputs.conditions["conditioning"].encoder
+    params = loaded.variables["encoders"]["conditioning"]
+
+    def encoded(rows):
+        condition = encoder.encode(params, encoder.tokenize(rows))
+        return {"context": condition.context, "pooled": condition.pooled}
+
+    def encode_prompt(pipe, indices):
+        rows = prompts(indices)
+        embeds, pooled, _ = pipe.encode_prompt(
+            prompt=[row["text"] for row in rows], prompt_2=[row["second"] for row in rows],
+            device=torch.device("cpu"), num_images_per_prompt=1, max_sequence_length=512)
+        return {"context": embeds, "pooled": pooled}
+
+    narrow, wide = pipelines
+    reference = source_arms(narrow, encode_prompt, wide=False)
+    truth = source_arms(wide, encode_prompt, wide=True)
+    assert_as_exact(as_given(lambda indices: encoded(prompts(indices))), reference, prompt_draw,
+                    "Flux prompt encoding", seeds=PIPELINE_SEEDS, truth_fn=truth)
+    # The distilled guidance rides in as a model input, at the value the pipeline defaults to, and guidance
+    # is not two branches here.
+    condition = encoder.encode(params, encoder.tokenize(prompts(prompt_draw(0)[0])))
+    np.testing.assert_array_equal(np.asarray(condition.guidance),
+                                  np.full(2, pipeline_record["default_guidance"]))
+    crossed = as_given(lambda indices: encoded([{"text": row["second"], "second": row["text"]}
+                                                for row in prompts(indices)]))
+    with pytest.raises(GateFailure):
+        assert_as_exact(crossed, reference, prompt_draw, "crossed Flux prompt encoding",
+                        seeds=PIPELINE_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("streamed", [False, True])
-def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record, streamed):
-    """`Pretrained.load().text_to_image()` reproduces the source's own call.
+def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record, pipelines, streamed):
+    """`Pretrained.load().text_to_image()` reproduces the source's own call, on par with it over drawn
+    prompts and starting latents (check 1), its float64 run the truth.
 
-    Nothing is passed in: the directory's declared pipeline carries the step
-    count, the guidance the transformer embeds and the sigma seed its call
-    lays out, and its own mu for this latent's packed token count. Loaded
-    whole or streamed onto a mesh (tests/test_pipeline_streaming.py).
+    Nothing is passed in: the directory's declared pipeline carries the step count, the guidance the
+    transformer embeds and the sigma seed its call lays out, and its own mu for this latent's packed token
+    count. Loaded whole or streamed onto a mesh (tests/test_pipeline_streaming.py).
     """
+    import torch
+
     from dew.interop.pretrained import Pretrained
     from dew.training import MeshSpec
 
-    with np.load(source / "flux_transformer.npz") as arrays:
-        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla",
-                                 **({"mesh": MeshSpec()} if streamed else {}))
-        task = loaded.text_to_image()
-        assert task.steps == pipeline_record["default_steps"]
-        assert task.guidance is None and pipeline_record["true_cfg"] == 1.0
-        rows = pipeline_record["size"] // 4
-        initial = unpacked(arrays["pipeline.x_T"], rows, rows)
-        prepared = task.prepare(pipeline_record["prompts"], initial=initial, key=0)
-        walked = task(prepared, key=jax.random.PRNGKey(0)).host()
-        images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
-        for key, value in (("latents", packed(np.asarray(walked.latents))), ("images", images)):
-            assert_as_exact_as_the_reference(value, arrays[f"pipeline.{key}"], arrays[f"pipeline.fp64.{key}"],
-                                             key)
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla",
+                             **({"mesh": MeshSpec()} if streamed else {}))
+    task = loaded.text_to_image()
+    assert task.steps == pipeline_record["default_steps"]
+    assert task.guidance is None and pipeline_record["true_cfg"] == 1.0
+    size = pipeline_record["size"]
+    rows = size // 4
+
+    def draw(seed):
+        latents = np.random.default_rng([223, seed]).standard_normal((2, rows * rows, 64))
+        return (*prompt_draw(seed), latents.astype(np.float32))
+
+    @as_given
+    def walked(indices, latents):
+        prepared = task.prepare(prompts(indices), initial=unpacked(latents, rows, rows), key=0)
+        walk = task(prepared, key=jax.random.PRNGKey(0)).host()
+        return {"latents": packed(np.asarray(walk.latents)),
+                "images": np.clip(np.asarray(walk.images) / 2 + 0.5, 0.0, 1.0)}
+
+    def called(pipe, indices, latents):
+        rows_given = prompts(indices)
+        options = {"prompt": [row["text"] for row in rows_given],
+                   "prompt_2": [row["second"] for row in rows_given], "height": size, "width": size,
+                   "latents": torch.from_numpy(latents).to(pipe.dtype)}
+        return {"latents": pipe(**options, output_type="latent").images,
+                "images": pipe(**options, output_type="np").images}
+
+    narrow, wide = pipelines
+    assert_as_exact(walked, source_arms(narrow, called, wide=False), draw, "Flux pipeline walk",
+                    seeds=PIPELINE_SEEDS, truth_fn=source_arms(wide, called, wide=True))
 
 
 def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_path):
