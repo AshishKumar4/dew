@@ -27,7 +27,7 @@ from dew.data.dataset import Checkpointable, DataPartition, RampedStream, rows_o
 from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
-from dew.nn.kernels.options import Placements, owned_program
+from dew.nn.kernels.options import OuterProgram, Placements, owned_program
 from dew.nn.sharding import microbatched
 from dew.objectives.base import Initializer
 from dew.state import TrainState, apart, together
@@ -305,6 +305,28 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
     (its frozen tree, `apart`, wherever its init moves them), are placed there
     as they are, the same arrays where they are placed already, and kept: no
     copy of them is made."""
+    where, takes = _placements(held, variables, shardings, mesh, shared)
+    # A copy of an array already on the devices: device_put can reuse a
+    # buffer the target shares with the source, which donation would free.
+    shared = shared or {}
+    owned = jax.tree.map(lambda leaf: leaf if id(leaf) in shared or not isinstance(leaf, jax.Array)
+                         else leaf.copy(), held)
+    return _split(takes, jax.device_put(owned, where))
+
+
+def held_shapes[Held](held: Held, variables: Variables, shardings: Placement[Variables], mesh: Mesh,
+                      shared: Mapping[int, NamedSharding] | None = None) -> tuple[Held, Held]:
+    """`placed_held`'s two trees as the shapes, dtypes and placements of their arrays, none placed: what a
+    start compiled ahead lowers over (`start_lowered`)."""
+    where, takes = _placements(held, variables, shardings, mesh, shared)
+    return _split(takes, jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(
+        np.shape(leaf), leaf.dtype, sharding=sharding), held, where))
+
+
+def _placements[Held](held: Held, variables: Variables, shardings: Placement[Variables], mesh: Mesh,
+                      shared: Mapping[int, NamedSharding] | None) -> tuple[Held, Held]:
+    """Where each leaf of `held` goes (`placed_held`), and whether the state takes it over: a leaf of a
+    variable's path and shape, placed where the state keeps it, that `shared` does not keep as it is."""
     shared = shared or {}
     kept = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
         jax.tree_util.tree_leaves_with_path(variables), jax.tree.leaves(shardings), strict=True)}
@@ -319,16 +341,17 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
                                    (None, None))
         return sharding if shape == np.shape(leaf) else None
 
-    # A copy of an array already on the devices: device_put can reuse a
-    # buffer the target shares with the source, which donation would free.
-    owned = jax.tree.map(lambda leaf: leaf if id(leaf) in shared or not isinstance(leaf, jax.Array)
-                         else leaf.copy(), held)
-    placed = jax.device_put(owned, jax.tree_util.tree_map_with_path(
-        lambda path, leaf: shared.get(id(leaf)) or variable(path, leaf) or replicated, held))
-    keep = {id(placed_leaf) for leaf, placed_leaf in zip(jax.tree.leaves(held), jax.tree.leaves(placed),
-                                                         strict=True) if id(leaf) in shared}
-    taken = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: None if variable(path, leaf) is None or id(leaf) in keep else leaf, placed)
+    where = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: shared.get(id(leaf)) or variable(path, leaf) or replicated, held)
+    takes = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: variable(path, leaf) is not None and id(leaf) not in shared, held)
+    return where, takes
+
+
+def _split[Held](takes: Held, placed: Held) -> tuple[Held, Held]:
+    """`placed` as the leaves the state takes over (`takes`) and the rest, each tree None where the other
+    holds a leaf."""
+    taken = jax.tree.map(lambda take, leaf: leaf if take else None, takes, placed)
     return taken, jax.tree.map(lambda one, leaf: leaf if one is None else None, taken, placed,
                                is_leaf=lambda leaf: leaf is None)
 
@@ -340,11 +363,50 @@ def taking_over[Held, Result](function: Callable[[Held, jax.Array], Result], tak
     output takes those and JAX only warns of a donation it cannot use. They are freed as the caller drops
     them."""
 
+    return functools.partial(start_program(function, shardings), taken, kept)
+
+
+def start_program[Held, Result](function: Callable[[Held, jax.Array], Result], shardings: Placements
+                                ) -> OuterProgram:
+    """The program `taking_over` runs, over the held tree as its two trees and the key: one program
+    whichever arrays or shapes it is lowered over (`start_lowered`)."""
     def joined(taken: Held, kept: Held, key: jax.Array) -> Result:
         return function(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
                                      is_leaf=lambda leaf: leaf is None), key)
 
-    return functools.partial(owned_program(joined, out_shardings=shardings, donate_argnums=0), taken, kept)
+    return owned_program(joined, out_shardings=shardings, donate_argnums=0)
+
+
+def _rest(initial_state: Callable[[Initializer, jax.Array], TrainState], built: list[int]
+          ) -> Callable[[Initializer, jax.Array], tuple[TrainState, tuple[jax.Array, ...]]]:
+    """A fresh state's moving tree and the frozen leaves its init builds (`built`, by their index among the
+    frozen tree's leaves), the ones it passes through left out: what `placed_start` compiles where its init
+    passes some through."""
+    def rest(tree: Initializer, draw: jax.Array) -> tuple[TrainState, tuple[jax.Array, ...]]:
+        state, own = apart(initial_state(tree, draw))
+        leaves = jax.tree.leaves(own)
+        return state, tuple(leaves[index] for index in built)
+
+    return rest
+
+
+def start_lowered(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
+                  key: jax.ShapeDtypeStruct, abstract: TrainState, shardings: Placement[TrainState],
+                  through: Mapping[int, int], mesh: Mesh) -> jax.stages.Lowered:
+    """The program `placed_start` runs to build a fresh state on `mesh`, lowered over the shapes of its
+    arguments (`held_shapes`, `key`'s): what a run compiled ahead compiles of its start, whose devices
+    compile none of it (`dew.training.ahead.AheadOfTime.starts`)."""
+    moving, frozen = apart(shardings)
+    if frozen is None or not through:
+        taken, kept = held_shapes(initializer, abstract.variables, shardings.variables, mesh)
+        return start_program(initial_state, shardings).lower(taken, kept, key)
+    inputs = jax.tree.leaves(initializer)
+    where, _ = jax.tree.flatten(frozen)
+    taken, kept = held_shapes(initializer, abstract.variables, shardings.variables, mesh,
+                              shared={id(inputs[given]): where[index] for index, given in through.items()})
+    built = [index for index in range(len(where)) if index not in through]
+    return start_program(_rest(initial_state, built), (moving, tuple(where[index] for index in built))
+                         ).lower(taken, kept, key)
 
 
 def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
@@ -386,13 +448,8 @@ def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
     placed = jax.tree.leaves(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
                                           is_leaf=lambda leaf: leaf is None))
     built = [index for index in range(len(where)) if index not in through]
-
-    def rest(tree: Initializer, draw: jax.Array) -> tuple[TrainState, tuple[jax.Array, ...]]:
-        state, own = apart(initial_state(tree, draw))
-        leaves = jax.tree.leaves(own)
-        return state, tuple(leaves[index] for index in built)
-
-    state, made = taking_over(rest, taken, kept, (moving, tuple(where[index] for index in built)))(key)
+    state, made = taking_over(_rest(initial_state, built), taken, kept,
+                              (moving, tuple(where[index] for index in built)))(key)
     drawn = dict(zip(built, made, strict=True))
 
     def leaf(index: int) -> jax.Array:

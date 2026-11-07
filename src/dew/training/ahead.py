@@ -70,7 +70,7 @@ from dew.nn.kernels.generation import (
     routes,
     tpu,
 )
-from dew.nn.kernels.options import owned_program, program_digest
+from dew.nn.kernels.options import owned_program, program_digest, taking
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
@@ -79,6 +79,8 @@ from dew.training.profiling import pgle_runs
 if TYPE_CHECKING:
     from dew.checkpoints import Resume
     from dew.data.dataset import DataPartition, Loader
+    from dew.training._fit import Start
+    from dew.training.planning import Planned
     from dew.training.trainer import Trainer
 
 _log = logging.getLogger(__name__)
@@ -263,6 +265,27 @@ class AheadOfTime:
     """Each kernel its routes lowered another in place of, as this host lowers no such kernel (`substituted`:
     FlashAttention without its wheel, cuDNN with no GPU attached): where any, the program is not the one the
     target's GPU runs, which a measure of the target's compile reads as unsupported (tools/perf_gate.py)."""
+    starts: dict[str, Executable] = dataclasses.field(default_factory=dict)
+    """The programs a run builds its fresh state with before its first step and that step's own copies of
+    its weights (`dew.training.distributed.start_lowered`, the narrowed copies), compiled for the target
+    beside the step, by their programs' digests (`program_digest`): a run handed the step runs each of
+    these as compiled here (`taking`), so its devices compile nothing before and at its first step, its
+    placement included (Main, 11-07: an attention step compiled ahead still compiled its placement on the
+    GPU, 5-7 s)."""
+
+    def taking(self) -> contextlib.AbstractContextManager[None]:
+        """The block a run handed this step builds its start and its first step's copies in: each program
+        of `starts` that it lowers runs as compiled here, loaded onto this process's devices as the step
+        is (`loaded`), where it would have compiled it (`dew.nn.kernels.options.taking`)."""
+        def load(executable: Executable) -> Callable[[], jax.stages.Compiled]:
+            def loaded() -> jax.stages.Compiled:
+                found = jax.devices()
+                if self.built is not None:
+                    self.built.held(found)
+                return executable.loaded(found)
+            return loaded
+
+        return taking({digest: load(executable) for digest, executable in self.starts.items()})
 
     @property
     def peak_bytes(self) -> int:
@@ -752,6 +775,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     with assumed(on), uncached() if on_tpus else contextlib.nullcontext(), routes() as taken:
         target = gpu_target()
         planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity, frontier)
+        starts = started(trainer, start, planned)
     if missing := substituted(taken):
         _log.warning("the step compiled ahead for %s holds kernels this host cannot lower: %s", generation,
                      "; ".join(missing))
@@ -770,4 +794,31 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices)),
-        refusals=report.refused_launches(), sampled=sampled, substituted=tuple(missing))
+        refusals=report.refused_launches(), sampled=sampled, substituted=tuple(missing), starts=starts)
+
+
+def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned
+                             ) -> dict[str, Executable]:
+    """The programs a run of `trainer` compiles before and at its first step besides the step, compiled for
+    the target over their arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement
+    (`start_lowered`), for a run that starts afresh, and the first step's narrowed copies of its weights
+    where the plan reads some (`narrowed`). Each by its program's digest, through the kernel templates'
+    reports as every compile is."""
+    from dew.training.distributed import start_lowered
+    from dew.training.narrow import narrowed
+
+    lowered = []
+    if start.resume is None and not trainer.host_master:
+        key = jax.ShapeDtypeStruct(start.key.shape, start.key.dtype)
+        lowered.append(start_lowered(trainer._staged_start, start.initializer, key, start.abstract,
+                                     start.shardings, start.through, trainer.device_mesh))
+    candidate = planned.candidate
+    if candidate.copies:
+        # The variables as the run's first step holds them, placed as its start placed them.
+        variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                                             sharding=sharding),
+                                 start.abstract.variables, start.shardings.variables)
+        lowered.append(owned_program(lambda variables: narrowed(variables, candidate.copies),
+                                     *trainer.objective.towers(),
+                                     out_shardings=candidate.shardings.compute).lower(variables))
+    return {program_digest(each): Executable.of(report.compiled(each)) for each in lowered}

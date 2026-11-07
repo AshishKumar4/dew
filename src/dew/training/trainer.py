@@ -620,6 +620,11 @@ class Trainer(Generic[Loss, Effects]):
         """
         return self._placed(self._started(), positioned=True)
 
+    def _taking(self) -> contextlib.AbstractContextManager[None]:
+        """The block a run builds its start and its first step's copies in: a run handed a step compiled
+        ahead runs the programs compiled with it as compiled (`AheadOfTime.taking`), compiling none."""
+        return contextlib.nullcontext() if self._ahead is None else self._ahead.taking()
+
     def _started(self, resume: Resume = "auto") -> Start:
         """What placing the state reads before it places anything: the objective's held tree and
         the key, resolved once, so that the shapes and the values are the same inputs through the
@@ -646,7 +651,13 @@ class Trainer(Generic[Loss, Effects]):
                 ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """The state `start` describes on the mesh, fresh or restored, with its shardings and, where
         `positioned`, the data position a resume continues from; `fit` reads that alone, before it
-        places the state (`Checkpoints.position`), and restores the state alone."""
+        places the state (`Checkpoints.position`), and restores the state alone. A run handed a step
+        compiled ahead builds it with the programs compiled with the step (`_taking`)."""
+        with self._taking():
+            return self._placing(start, positioned=positioned)
+
+    def _placing(self, start: Start, *, positioned: bool
+                 ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         initializer, key, abstract, shardings, resume = (start.initializer, start.key, start.abstract,
                                                          start.shardings, start.resume)
         checkpoints = self.checkpoints
@@ -1021,7 +1032,8 @@ class Trainer(Generic[Loss, Effects]):
                     narrowing = owned_program(lambda variables: narrowed(variables, candidate.copies),
                                               *self.objective.towers(),
                                               out_shardings=candidate.shardings.compute)
-                    current = dataclasses.replace(current, compute=narrowing(current.variables))
+                    with self._taking():
+                        current = dataclasses.replace(current, compute=narrowing(current.variables))
                 held, staged = current.window, self._ramp or self._stage_starts
                 if window > 1 and self.step is None and (held is None or (staged and not held.replays(
                         candidate.prepared.window))):

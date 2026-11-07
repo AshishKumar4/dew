@@ -43,6 +43,36 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, 
                    layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, inspection=inspection)
 
 
+def test_a_program_compiled_ahead_runs_in_place_of_compiling():
+    """A program compiled ahead over its arguments' shapes runs where a call of it lowers that program
+    (`dew.nn.kernels.options.taking`, by its digest): the call compiles nothing and answers as the program
+    compiled for it does; a call of another program compiles its own (Main 11-07: a run compiled ahead
+    compiled its placement on the GPU)."""
+    from dew.nn.kernels.options import owned_program, program_digest, taking
+
+    devices = jax.devices()[:1]
+    placed = jax.sharding.SingleDeviceSharding(devices[0])
+    built = owned_program(lambda values: values * 2 + 1, out_shardings=placed)
+    shapes = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed)
+    lowered = built.lower(shapes)
+    compiled = lowered.compile()
+    loads = []
+
+    def loaded():
+        loads.append(True)
+        return compiled
+
+    values = jax.device_put(jnp.arange(4, dtype=jnp.float32), placed)
+    with taking({program_digest(lowered): loaded}), Compiles(None) as compiles:
+        answered = owned_program(lambda values: values * 2 + 1, out_shardings=placed)(values)
+    assert [program.name for program in compiles.programs if program.kind == "compiled"] == []
+    assert loads == [True]
+    np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
+    with taking({program_digest(lowered): loaded}), Compiles(None) as compiles:
+        owned_program(lambda values: values * 3, out_shardings=placed)(values)
+    assert [program.kind for program in compiles.programs].count("compiled") == 1
+
+
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
     """A compile-only GPU with stated memory takes the run's own fit search, whose one fitting
     program is the saved executable, not another compile outside the report. The report records
@@ -57,6 +87,9 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert tuple(trainer.device_mesh.devices.flat) == compile_only_gpus("sm90", 1, 2**30)
     assert trainer.state_mesh is trainer.device_mesh and trainer.state_mesh is not original_state_mesh
     assert compiles.count == 1
+    # Its fresh state's build and placement compiled beside the step, for a run handed it to compile none of
+    # it on its GPU (`AheadOfTime.starts`).
+    assert ahead.starts
     plan = record(ahead.plan, "plan")
     (probe,) = listed(plan["probes"], "probes", read=record, what="probes")
     assert probe["fits"] is True and probe["temp"] == ahead.temp_bytes
