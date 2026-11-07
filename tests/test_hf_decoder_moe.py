@@ -342,15 +342,17 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
     params = dict(flatten_dict(dict(dense.variables["params"])))
     banks = flatten_dict(dict(placed.variables[QUANTIZATION]),
                          is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
+    sharded = 0
     for path, bank in banks.items():
         experts = params[path].sharding.spec[0]
         assert experts is not None
         for leaf in (bank.words, bank.scales, bank.scale):
             # A leaf under the layout's least sharded size stays whole, as a dense one does
-            # (`Layout.min_shard`); the words, a bank's bulk, are past it.
+            # (`Layout.min_shard`): the gate-up banks' words are past it.
             first = None if leaf.size < Layout().min_shard else experts
             assert (tuple(leaf.sharding.spec) or (None,))[0] == first, (path, leaf.shape, leaf.sharding)
-        assert bank.words.size >= Layout().min_shard
+            sharded += first is not None
+    assert sharded
 
     def draw(seed: int):
         return (jax.random.randint(jax.random.key(seed), (2, 8), 0, PACKED_CONFIG["vocab_size"]),)
