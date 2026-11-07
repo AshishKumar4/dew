@@ -1408,11 +1408,11 @@ def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own():
 
 
 def test_an_epoch_over_phases_of_other_batches_counts_each_phases_steps_in_its_own_rows():
-    """A pass over one corpus read by phases of 8, then 4 records a step, the second from step 2, takes
-    its first 16 records in two steps and the other 48 in twelve (`Loader.stages`, `steps_through`), as a
-    ramp's stages count theirs: fourteen, where counting every step in the first phase's batch took
-    eight."""
-    corpus = Pipeline(Memory(Indexed(1, 64))).shuffle(0)
+    """A pass over one corpus of 64 records read on by phases of 8, then 4 records a step, the second from
+    step 2, takes its first 16 records in two steps and the other 48 in twelve (`Loader.stages`,
+    `steps_through`), as a ramp's stages count theirs: fourteen, where counting every step in the first
+    phase's batch took eight."""
+    corpus = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
     loader = compile(phases((corpus.batch(8), 2), (corpus.batch(4), None)), read="memory", loading=READ)
     assert loader.steps_per_epoch == 14
 
