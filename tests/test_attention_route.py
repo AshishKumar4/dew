@@ -19,8 +19,9 @@ import numpy as np
 import pytest
 from attention_oracle import attention_terms, kept
 from flax import linen as nn
+from float64_terms import float64_terms
 from jax.sharding import Mesh, PartitionSpec
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, widened, with_gradients
 from sharded import MOVES, assert_runs_per_shard
 from test_attention_template import (
     DTYPES,
@@ -506,12 +507,18 @@ def an_fp16_call_on_an_h100_is_on_par(case):
 def _terms(case: dict):
     """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps (its
     spans as a mask, `case_keep`), under its sinks and softcap, a function of a draw `(query, key, value,
-    sinks, dout)`; the sinks' gradient its own size."""
+    sinks, dout)`; the sinks' gradient, where the case has sinks, its float64 truth's own terms
+    (`float64_terms` of the reference path), as `attention_on_par` sizes it."""
     keep = case_keep(case)[:, None]
 
     def terms(query, key, value, sinks, dout):
-        return (*attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap")),
-                None)
+        found = attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap"))[:4]
+        if sinks is None:
+            # The sinks' gradient, which a call without sinks holds as None.
+            return (*found, None)
+        with jax.enable_x64(new_val=True):
+            truth = float64_terms(pulled("reference", case), *widened((query, key, value, sinks, dout)))[1]
+        return (*found, truth[4])
 
     return terms
 
