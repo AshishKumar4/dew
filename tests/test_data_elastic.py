@@ -741,7 +741,8 @@ def test_a_ramped_elastic_read_that_keeps_its_short_last_batch_cuts_it_alike_on_
     ramp = Ramp(start=4, increment=4, samples=16)
 
     def steps(index, readers):
-        chain = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(30)))).batch(
+        # One pass: a training read without a repeat reads on without end.
+        chain = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(30)))).repeat(1).batch(
             BATCH, drop_remainder=False).elastic()
         return list(ramped(compile(chain, loading=READ, seed=3), ramp).train(DataPartition(index, readers)))
 
