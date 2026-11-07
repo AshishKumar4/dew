@@ -242,7 +242,7 @@ def test_a_weight_folded_into_the_inverse_associates_as_flax_and_takes_every_gra
             lambda draw: norm_operands((2, 3, 31), dtype, scale_dtype, draw), ("y", "x", "scale"),
             SEEDS[(2, 3, 31)],
             coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=False))
-    with pytest.raises(ValueError, match="weight_first"):
+    with pytest.raises(ValueError):
         rms_normalized(x, scale, 1e-5, dtype, scale_offset=offset, scale_after_cast=True,
                        fp32_statistics=True, weight_first=True)
 

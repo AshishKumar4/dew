@@ -1430,6 +1430,13 @@ class Issuer[Accumulator](abc.ABC):
         allocates."""
         return () if products is None else self.product_shared(self.product_scratch(*products))
 
+    def product_addresses(self, products: tuple | None) -> int:
+        """The unaligned shared-memory words `Family.scoped`'s `products` keep beside what they hold
+        (`resources.Scope.addresses`): none, but where the issuer keeps its products in tensor memory, whose
+        allocation keeps its address in one (`resources.TMEM_ADDRESS_BYTES`)."""
+        del products
+        return 0
+
     def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
         """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
         `shape` (zero), its value once they are done: a register accumulator's, which a family whose
@@ -1793,23 +1800,12 @@ class Transport[Allocated, Opened](abc.ABC):
         tables of integers its programs read an element at a time (a grouped schedule's), which a GPU reads
         from global memory and a TPU from its scalar memory."""
 
-    def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
+    def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
         (`streams`), and what it returns. With `after_walks`, allocations no walk reads, `body` takes
         `after` too: `after(fn)` runs `fn(*refs)` of them once a role's walks have ended, in a scope of their
         own where the family scopes its walks apart (`walks_scoped`: the walks' slots reused, as
-        `resources.Scope.after` counts them), the program's otherwise. With `products`, `(consumers,
-        widths, lefts)`, the issuer's product scratch (`product_scratch`) is scoped beside `allocations`,
-        `body` traced within it (`products_in`), where the issuer keeps any; `product_held` its account."""
-        scratch = () if products is None else self.product_scratch(*products)
-        if scratch:
-            inner = body
-
-            def body(*refs, **named):
-                with self.products_in(refs[-1]):
-                    return inner(*refs[:-1], **named)
-
-            allocations = (*allocations, scratch)
+        `resources.Scope.after` counts them), the program's otherwise."""
         if not after_walks:
             return self.program_scoped(body, *allocations, streams=streams)
         if self.walks_scoped:
@@ -2189,6 +2185,20 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         (`resources.consumer_registers`). Each stages its share of the multiprocessor's shared memory
         (`resources.program_shared`), which may hold no tile at that many."""
         return resources.register_programs(self, consumers, registers)
+
+    def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
+        """`Transport.scoped`, and with `products`, `(consumers, widths, lefts)`, the issuer's product scratch
+        (`product_scratch`) scoped beside `allocations`, `body` traced within it (`products_in`), where the
+        issuer keeps any; `product_held` its account."""
+        scratch = () if products is None else self.product_scratch(*products)
+        if not scratch:
+            return super().scoped(body, *allocations, streams=streams, after_walks=after_walks)
+
+        def within(*refs, **named):
+            with self.products_in(refs[-1]):
+                return body(*refs[:-1], **named)
+
+        return super().scoped(within, *allocations, scratch, streams=streams, after_walks=after_walks)
 
 
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):

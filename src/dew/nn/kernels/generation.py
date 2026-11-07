@@ -16,6 +16,7 @@ import dataclasses
 import functools
 import inspect
 import logging
+import os
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
@@ -1288,6 +1289,14 @@ def gpu_placed() -> bool:
     GPU host, so it makes none."""
     import jax
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
+
+
+def host_memory_share() -> int:
+    """A CPU device's share of its host's physical memory, in bytes: the host's over the process's local
+    devices, which share it (a forced count of CPU devices among them)."""
+    import jax
+
+    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // max(1, jax.local_device_count())
 
 
 def backend() -> str:
