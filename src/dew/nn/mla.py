@@ -330,11 +330,11 @@ class MultiHeadLatentAttention(LinearProducts):
     """
 
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
-                                                 "position_bias"})
+                                                 "key_valid", "position_bias"})
     """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a dense layer's pairwise mask or key
-    runs, the key positions they are read at and a position bias, on an uncached call, as the standard
-    attention reads them; an indexed layer narrows its keys by the documents, the rows' validity and
-    its own selection alone, and refuses them (`_check_call`)."""
+    runs, the key positions they are read at, its keys' validity and a position bias, on an uncached call,
+    as the standard attention reads them; an indexed layer narrows its keys by the documents, the rows'
+    validity and its own selection alone, and refuses them (`_check_call`)."""
 
     emb_features: int
     num_heads: int
@@ -795,14 +795,20 @@ class MultiHeadLatentAttention(LinearProducts):
         groups = {name: jnp.asarray(getattr(metadata, name), jnp.int32) for name in self._group_fields()
                   if metadata is not None and getattr(metadata, name) is not None}
         window = self.sliding_window if causal or self.bidirectional_window else None
-        if own is None and not (groups or window is not None or self.attention_chunk is not None):
+        # The keys the call marks out (`AttentionMetadata.key_valid`), hidden from every query beside the
+        # rows' own validity.
+        keys = None if metadata is None else metadata.key_valid
+        if own is None and keys is None and not (groups or window is not None
+                                                 or self.attention_chunk is not None):
             return None, False
         if own is not None:
+            # The call's own visibility replaces the layer's, its keys' validity with it (`CallVisibility`).
             mask, runs, window, key_places = own.mask, own.runs, own.window, own.key_places
-            causal, segment_ids, groups, valid, places = False, None, {}, None, key_places
+            causal, segment_ids, groups, valid, places = False, None, {}, own.valid, key_places
         else:
             mask = runs = None
             key_places = places
+            valid = keys if valid is None else valid if keys is None else valid & keys
         return dense_visibility(mask, segment_ids, causal, window, valid, runs, places, key_places, length,
                                 length, self.attention_chunk, **groups), own is not None
 
