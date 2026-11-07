@@ -204,10 +204,10 @@ def input_masked(q, k, v):
     return jax.nn.dot_product_attention(q, k, v, mask=mask, implementation="xla")
 
 
-SPELLINGS = {"jax.nn causal, grouped": (jax_attention(causal=True), 2),
-             "jax.nn, grouped": (jax_attention(causal=False), 2),
-             "flax causal": (flax_attention(causal=True), 4), "flax": (flax_attention(causal=False), 4)}
-"""Each plain program's attention and its key heads over 4 query heads."""
+SPELLINGS = {"jax.nn causal, grouped": (jax_attention(causal=True), 2, True),
+             "jax.nn, grouped": (jax_attention(causal=False), 2, False),
+             "flax causal": (flax_attention(causal=True), 4, True), "flax": (flax_attention(causal=False), 4, False)}
+"""Each plain program's attention, its key heads over 4 query heads, and whether it is causal."""
 
 
 def _attention_routes(trace) -> list[str]:
@@ -223,12 +223,12 @@ def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
     `dew.jit` on an H100 runs the kernel Dew's selector gives the call (FlashAttention, or the template a call
     names), where the program as written runs XLA's; on this host, its output and gradients under the
     template (its portable mainloop) on par with the program as written (check 1)."""
-    from attention_oracle import attention_on_par
+    from attention_oracle import attention_on_par, kept
     from contract_support import normal_drawn
 
     import dew
 
-    attend, key_heads = SPELLINGS[spelling]
+    attend, key_heads, causal = SPELLINGS[spelling]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),
               *(jax.ShapeDtypeStruct((2, 128, key_heads, 64), jnp.bfloat16),) * 2)
     with generation.assumed("sm90"):
@@ -239,7 +239,7 @@ def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
     draw = normal_drawn(37, (2, 64, 4, 32), (2, 64, key_heads, 32), (2, 64, key_heads, 32), (2, 64, 4, 32),
                         dtype=jnp.bfloat16)
     with generation.chosen(attention="template"):
-        attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {spelling}")
+        attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {spelling}", keep=kept(64, 64, causal=causal))
 
 
 def test_a_plain_programs_attention_under_a_mask_of_its_inputs_stays_as_written():
