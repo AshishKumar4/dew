@@ -28,10 +28,12 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 from dew.nn.protocols import StagedStacks
 
+from .. import in_backward
 from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
 from ..kv_cache import cache_at_layer, cache_from_layer
@@ -402,6 +404,9 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             x, written = step(run, x, None if inputs is None else inputs.layer(0), store)
             if store is not None:
                 store.update(written)
+        elif _updates_in_backward(run, specs[first], train=train, decode=decode, fetching=fetching,
+                                  periodic=periodic, store=store, inputs=inputs):
+            x = _updated_in_backward(run, x, attention_metadata=attention_metadata)
         else:
             # A longer run's layers share keys or own them, so they only read the store: a provider
             # is always a run of one (`run_stack`).
@@ -438,6 +443,48 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                            length=repeats, metadata_params={nn.PARTITION_NAME: None})(
                 run, x, jnp.arange(repeats))
     return x
+
+
+def _updates_in_backward(run: nn.Module, spec: LayerSpec, *, train: bool, decode: bool, fetching: bool,
+                         periodic: bool, store, inputs) -> bool:
+    """Whether a scanned run updates in its backward (`dew.nn.in_backward`): inside a step's plan, a
+    training forward of a run of like layers that holds its parameters as the plan's state does, writes
+    nothing but its output (no cache, routing statistics or probes: `WRITTEN`), reads no store, per-layer
+    input or host bank, and runs under no interceptor (an adapter's, a quantizer's), whose scope a layer
+    applied on its own would leave."""
+    current = in_backward.plan()
+    if current is None or not train or decode or fetching or periodic or store is not None:
+        return False
+    if inputs is not None or spec.routed or spec.hash_routed or INTERCEPTED.value:
+        return False
+    if QUANTIZED_TRACE.value is not None:
+        return False
+    held = run.variables
+    if LAYER_ROWS in held or any(name not in held for name in (*current.moments, in_backward.NORMS)):
+        return False
+    return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates"))
+
+
+def _updated_in_backward(run: nn.Module, x, *, attention_metadata):
+    """A scanned run as `dew.nn.in_backward.scanned_run` computes it: each layer the run's own module
+    applied on its row of the run's weights, its dropout drawn from a key of its own."""
+    held = run.variables
+    current = in_backward.plan()
+    assert current is not None
+    weights = held["params"]
+    count = jax.tree.leaves(weights)[0].shape[0]
+    keys = jax.random.split(run.make_rng("dropout"), count) if run.has_rng("dropout") else None
+    alone = run.clone(parent=None)
+
+    def layer(weights_i, carry, key, metadata):
+        rngs = None if key is None else {"dropout": key}
+        return alone.apply({"params": weights_i}, carry, train=True, decode=False, kv_store=None,
+                           per_layer_input=None, attention_metadata=metadata, rngs=rngs)
+
+    return in_backward.scanned_run(
+        run.path, layer, weights, held.get(in_backward.MASTERS),
+        {name: held[name] for name in current.moments}, held[in_backward.NORMS], x, keys,
+        (attention_metadata,))
 
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
