@@ -227,6 +227,27 @@ def test_heads_narrower_than_a_warpgroup_step_as_their_float64_form(hooks):
                     truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
 
 
+def test_a_decode_token_over_three_warpgroups_of_keys_reads_its_last_keys():
+    """A decode token over 384 keys (three warpgroups', which `fits` takes), its query, key and memory
+    nonzero on the last 128 alone: the launch's output and state the float64 step's (check 1, its sums over
+    the keys each held subtree's, `_summed_keys`). The top subtree alone dropped those 128 keys, the output
+    zero (audit 2026-11-07, A18)."""
+    hooks = recurrence.Hooks(decay='scalar')
+    last = (np.arange(384) >= 256).astype(np.float32)
+
+    def confined(seed: int) -> tuple[recurrence.Step]:
+        (given,) = draw(hooks, seed, key_width=384)
+        return (dataclasses.replace(given, query=given.query * last, key=given.key * last,
+                                    state=given.state * last[:, None]),)
+
+    (given,) = confined(0)
+    out = recurrence.step(hooks, given)[0]
+    assert float(jnp.max(jnp.abs(out[0]))) > 0.0
+    assert_as_exact(jax.jit(functools.partial(recurrence.step, hooks)), summed(hooks), confined,
+                    'a token over 384 keys, its last 128 alone', seeds=8,
+                    truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
+
+
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=str)
 def test_a_bf16_state_steps_as_its_float64_form(hooks):
     """A bf16 state is read and stepped in fp32 and written once, rounded stochastically by
