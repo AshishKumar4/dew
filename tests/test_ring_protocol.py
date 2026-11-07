@@ -19,7 +19,7 @@ from dew.nn.kernels.templates import mosaic_sm90
 
 BLOCK = (64, 64)
 
-BOUNDS = {"stages": (1, 2, 3, 4), "consumers": (1, 2, 3), "tiles": ((3,), (2, 0, 3), (1, 4)),
+BOUNDS = {"stages": (1, 2, 3, 4), "consumers": (1, 2), "tiles": ((3,), (2, 0, 3), (1, 4)),
           "in_flight": (0, 1), "unrolled": (False, True)}
 """The checked bounds: a ring's slots, its consumer warpgroups (the family's most, `Wgmma.consumers`), each
 persistent tile's steps (an empty tile among them, its walk inactive), a step's products in flight past it,

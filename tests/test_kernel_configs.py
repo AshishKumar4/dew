@@ -528,7 +528,7 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
             if every_consumer_count:
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
-                for consumers in sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)}):
+                for consumers in sorted({1, family.consumers}):
                     # Each consumer keeps its share of the derived tile's rows, else the tile's rows split
                     # among them where its registers hold no more (mma.sync's one-consumer tile, two of
                     # whose shares no consumer holds), at as many of its stages as the block holds (a
@@ -733,7 +733,7 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
     cases = _contract_cases(generation_name)
-    counts = sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)})
+    counts = sorted({1, family.consumers})
     expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))

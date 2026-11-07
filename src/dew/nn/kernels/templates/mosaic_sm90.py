@@ -187,10 +187,7 @@ class Wgmma(WgmmaIssuer, mosaic.RingFamily):
     (`mosaic.RingFamily`), multicast across a pair of multiprocessors where a cluster shares a ring's
     blocks."""
 
-    # Three consumers beside the producer, 504 of a lane's 512 registers raised (160 each, the producer's 24):
-    # FlashAttention 3's d64 forward's 192-row tile (hopper's tile_size_fwd_sm90, row 1299), which a
-    # derivation trying every count up to it takes where it holds.
-    consumers = 3
+    consumers = 2
     cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
 
 
