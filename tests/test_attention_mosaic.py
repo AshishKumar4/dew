@@ -1772,11 +1772,13 @@ Blackwell's mma.sync fed by TMA (`bundles.MmaFed`) runs the mainloop too, but de
 
 BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
-BACKWARD_GATE += [(generation_name, width, False, hooks) for generation_name in GATED for width in (64, 128)
+BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name in GATED
+                  for width in (64, 128) for accurate in (False, True)
                   for hooks in BACKWARD_HOOKS if hooks != "none"]
 """The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
 call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
-whole (row 2281: its live set beside the step's)."""
+whole, in each form (row 2281: its live set beside the step's; FS-A100CHECK1d: the accurate form under a
+row-indexed hook failed an A100's layout inference, a case no fast-form gate lowered)."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):
