@@ -271,8 +271,9 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
     zero = jnp.zeros((piece.columns.size,), jnp.float32)
     group = _group(head, piece.columns.size)
     # The walk's tokens a whole number of turns: those past the block's last K-1 add only to tokens no
-    # program here owns.
-    unrolled = _unrolled(UNROLLED)
+    # program here owns. A turn's tokens hold their inputs and output gradients a vector each, so fewer a
+    # wider vector: eight tokens of eight channels spilled 2140 bytes a thread (the conv's resource gate).
+    unrolled = min(UNROLLED, 2 * UNROLLED // (piece.columns.size // scan.THREADS))
     steps = -(-(tokens + count - 1) // unrolled) * unrolled
     last = piece.start + steps - 1
 
