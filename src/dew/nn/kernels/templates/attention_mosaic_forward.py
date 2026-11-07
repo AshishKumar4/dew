@@ -94,8 +94,8 @@ def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype
     """`_launch`'s outputs' types: a peak walk's maxima and anchor keys; a training walk's status, residual
     rows, anchor keys and split sums; else its status and output `[B, S·Qp, H, Dv]` (a split launch's slices
     along its query axis), and its finished rows where it `finishes`. A split launch that `merges` its slices
-    gives their status, its merged output `[B, Qp, H, Dv]` and finished rows `[2, B, H, Qp]`, and the slices'
-    states its merge read (`algebra.slice_state`: `[B, S, Qp, H, Dv]` and `[2, B, H, S, Qp]` fp32)."""
+    gives their status, its merged output `[B, Qp, H, Dv]` and finished rows `[2, B, H, Qp]`; the slices'
+    states its merge reads are a workspace it takes in place (`_Read.slots`), no output."""
     rows_out = splits * queries
     # A plain launch that `flags` its rows states their rewalk and their block's beside their maxima
     # (`_Flags`).
@@ -104,8 +104,7 @@ def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype
         out_type = (status_type, jax.ShapeDtypeStruct((batch, queries, heads, value_width), out_dtype))
         if finishes:
             out_type += (jax.ShapeDtypeStruct((2, batch, heads, queries), jnp.float32),)
-        return (*out_type, jax.ShapeDtypeStruct((batch, splits, queries, heads, value_width), jnp.float32),
-                jax.ShapeDtypeStruct((2, batch, heads, splits, queries), jnp.float32))
+        return out_type
     if peaks:
         return (jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32),
                 jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32))
@@ -484,7 +483,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     if into is not None:
         assert flags is not None, "an in-place rewalk is of live rows"
         return (), None, flags
-    status, _, *finished = launched[0][:-2] if merges else launched[0]
+    status, _, *finished = launched[0]
     out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
                         out_dtype or q.dtype, split)
     if stated and len(blocks) == 1:
@@ -822,6 +821,11 @@ class _Read(NamedTuple):
     into: tuple | None = None
     """A masked launch's outputs held in place (`_launch`'s `into`): the plain launch's, refs it writes its
     rows `kept` into, every other row left as it was."""
+    slots: tuple | None = None
+    """A merging launch's slices' states its merge reads (`_Block.merging`, `[B, S, Qp, H, Dv]` and
+    `[2, B, H, S, Qp]` fp32): refs its kernel writes in place, a workspace written only where slices share
+    a row block (`Family.fixed_up`), never declared outputs, which would be left partly unwritten
+    (NSNAN-2)."""
     kept: jax.Array | None = None
     """The rows a launch `into` the plain launch's outputs writes (`[B, H, S·Qp]` int32, nonzero at a row it
     keeps): the rows it walks, the plain launch's bits at every other row."""
@@ -906,8 +910,8 @@ class _Block(NamedTuple):
     def merging(self, written: tuple, finishes: bool) -> tuple:
         """Its views in a launch that merges its slices (`_out_types`' `merges`): its slice's status, the
         merged output's and (where the launch `finishes` them) finished rows' at its rows unsliced, and every
-        slice's state at its rows (`algebra.Partial` of views `[S, bq, Dv]` and `[S, bq]`), which its
-        merge's slots are (`Family.fixed_up`)."""
+        slice's state at its rows (`algebra.Partial` of views `[S, bq, Dv]` and `[S, bq]`, of the slots
+        `_Read.slots` holds, which `written` ends with), which its merge's slots are (`Family.fixed_up`)."""
         status_ref, out_ref, *rest = written
         row, sliced, head = self.rows
         at = pl.ds(self.first, sliced.size)
@@ -1686,9 +1690,17 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     block = (None if column_width is None or column_blocks > 1
              else jnp.full((1,), (columns or 0) // column_width, jnp.int32))
     target = generation.gpu_target()
+    slots = None
+    if merges and splits > 1:
+        # Its slices' states their merge reads, a workspace started uninitialized (`lax.empty`: XLA's
+        # AllocateBuffer on a GPU, no memset), as no slot is read before its slice writes it (`_Read.slots`).
+        batch, padded, heads = query.shape[:3]
+        width = (column_width or value.shape[-1]) * column_blocks
+        slots = (jax.new_ref(lax.empty((batch, splits, padded, heads, width), jnp.float32)),
+                 jax.new_ref(lax.empty((2, batch, heads, splits, padded), jnp.float32)))
     return _launched(query, key, value,
                      _Read(spans, hooked, guard, anchors, None if table is None else table[0],
-                           None if walks is None else walks.blocks, sources, block, into, keeping),
+                           None if walks is None else walks.blocks, sources, block, into, slots, keeping),
                      hooks=jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), hooks),
                      spec=spec, tiles=tiles, family=family, training=training, interpret=interpret,
                      peaks=peaks, out_dtype=None if out_dtype is None else jnp.dtype(out_dtype),
@@ -1831,7 +1843,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                streamed, block.first, read.spans, read.hooked, (row, head), hooks=hooks,
                                interpret=interpret)
                 return
-            written = (None, *read.into) if in_place else refs.written
+            written = ((None, *read.into) if in_place
+                       else (*refs.written, *read.slots) if merges else refs.written)
             # A block of the columns writes its own of the output's, the whole call's in place.
             columns_at = (pl.ds(column * value_width, value_width)
                           if column is not None and (column_blocks > 1 or in_place) else None)
