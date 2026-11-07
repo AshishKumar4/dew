@@ -572,8 +572,9 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
     other operand or its source, its result that product's output or a value made of it by up to three (a
     layout, a cast); a value the region reads beside them a bias where it is floating and a mask where it is
     boolean, a mask of constants alone folded into the region (`_canonical`); each scalar constant a softcap,
-    or none, the call causal or not, and its softmax in float32 or in its operands' dtype, each tried. Its declaration is the call's portable path, Flax's
-    reference attention op for op (`implementation='reference'`)."""
+    or none, the call causal or not, and its softmax in float32 or in its operands' dtype, each tried. Its
+    declaration is the call's portable path, Flax's reference attention op for op
+    (`implementation='reference'`)."""
     anchor = index.jaxpr.eqns[place].outvars[0]
     logits = _nearest_product(index, _backward(index, anchor), upstream=True)
     weighed = _nearest_product(index, _forward(index, anchor), upstream=False)
