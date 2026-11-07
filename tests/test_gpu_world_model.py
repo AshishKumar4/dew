@@ -25,9 +25,11 @@ def tutorial_function(name: str):
     """The function `name` tutorial 12 defines, as its notebook's cell defines it: its clips are the
     tutorial's own, drawn by its code."""
     for cell in json.loads(TUTORIAL.read_text())["cells"]:
-        if cell["cell_type"] != "code":
+        # The cell that defines it, read as Python: another may hold the notebook's own magics (`%pip`).
+        source = "".join(cell["source"])
+        if cell["cell_type"] != "code" or f"def {name}(" not in source:
             continue
-        for node in ast.parse("".join(cell["source"])).body:
+        for node in ast.parse(source).body:
             if isinstance(node, ast.FunctionDef) and node.name == name:
                 scope = {"np": np}
                 exec(compile(ast.Module([node], []), str(TUTORIAL), "exec"), scope)
