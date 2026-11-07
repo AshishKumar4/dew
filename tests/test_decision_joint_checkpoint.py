@@ -513,7 +513,9 @@ def test_a_trained_joint_task_on_a_multimodal_backbone_exports_and_reloads_as_it
     planned from the model it trained (`PretrainedDecoder.from_model` of its `MultimodalTransformer`),
     its head and layout beside it, and the release loads back as the task its bundle is, every weight and
     answer the bundle's as a load serves it, its projections packed (`Decide.of`), bit for bit (row
-    4525). The trained task itself holds them unpacked, as a run trains them, one program apart."""
+    4525). The trained task itself holds them unpacked, as a run trains them, and placed on the run's
+    mesh, each a program apart: the bundle is compared over its weights as the release writes them, on
+    the host."""
     from dew.decision.sources import PretrainedDecision
 
     objective, state, asked = joint_runs["objective"], joint_runs["state"], joint_runs["asked"]
@@ -521,7 +523,8 @@ def test_a_trained_joint_task_on_a_multimodal_backbone_exports_and_reloads_as_it
     trained.save_pretrained(tmp_path / "exported")
     assert json.loads((tmp_path / "exported" / "config.json").read_text())["model_type"] == "qwen3_5"
     reloaded = Decide.from_pretrained(tmp_path / "exported", attention_impl="xla")
-    served = Decide.of(PretrainedDecision.of(trained))
+    served = Decide.of(PretrainedDecision.of(replace(trained, variables=jax.tree.map(np.asarray,
+                                                                                    trained.variables))))
     assert reloaded.model == served.model and reloaded.layout == served.layout
     assert jax.tree.structure(reloaded.variables) == jax.tree.structure(served.variables)
     for written, held in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(served.variables),
