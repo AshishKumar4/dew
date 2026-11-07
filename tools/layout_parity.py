@@ -1065,6 +1065,7 @@ class Judge:
                 self._ahead.move_to_end(at)
             else:
                 self._ahead[at] = self._pool.submit(both, at)
+        concurrent.futures.wait(self._ahead.values())
         for pair in self._ahead.values():
             pair.result()
         finished = [at for at, pair in self._ahead.items() if pair.done()]
