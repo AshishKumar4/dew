@@ -148,9 +148,10 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype):
     assert scanned <= plain, (scanned, plain)
 
 
-PLANNED_SEEDS = 8
+PLANNED_SEEDS = 256
 """Check 1's declared seeds for the scanned steps updating in their backward against a layer at a time's,
-sized by `seeds_for` on armada."""
+sized by `seeds_for` paired on armada (256 for each update): the two arms share every draw's state and
+batch."""
 
 
 @pytest.mark.mesh(devices=8)
