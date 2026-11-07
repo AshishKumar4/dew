@@ -1005,7 +1005,10 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # (`gradient.pulled`) beside both products, and a dropping call's multipliers (`algebra.drawn`): the
         # fused launch at 64 x 64 and width 128 under a softcap spilled 104 bytes where its slopes priced a
         # phase of their own, 246 registers (softcap2).
-        held = [logits] * slopes + ([logits] if dropped else [])
+        # fp16's parts formed one at a time at the running scale, the scaled tile beside each
+        # (`algebra.running_parts`).
+        held = ([logits] * slopes + ([logits] if dropped else [])
+                + ([logits] if jnp.dtype(dtype) == jnp.dtype(jnp.float16) else []))
         return resources.live_registers(family, carried, products + held, pullback + held, dq_tile,
                                         *fragments) + statistics
     queries = block_q // config.consumers if split else block_q
@@ -1121,9 +1124,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 or (config.staged_logits and not keys_first)):
             return False
         dtype = ba.arguments["query"].dtype
-        # The one launch stages its weights and score cotangents for its products (`mosaic.staged`), which
-        # fp16's scaled parts (`product.Scaled`) take no power of two back through: bf16 alone.
-        sixteen = jnp.dtype(dtype) == jnp.dtype(jnp.float16)
+        # The one launch stages its weights and score cotangents for its products (`mosaic.staged`): fp16's
+        # as two parts at the walk's running scale (`attention_mosaic_fused._sixteen_step`), queries first
+        # each consumer its own keys alone (row 3886: its two launches 4.1 times the bf16 step on an H100).
+        sixteen = jnp.dtype(dtype) == jnp.dtype(jnp.float16) and not (
+            config.queries_first and not config.shared_keys)
         if (config.fused and (self.accurate or hooked or sixteen)) or not super().legal(ba, config, target):
             return False
         family = bundle_of(config, dtype)
