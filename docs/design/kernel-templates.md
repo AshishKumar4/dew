@@ -25,13 +25,13 @@ Three templates, attention, linear recurrence and GEMM, replace every hand kerne
 - **Comparison.** CONTRIBUTING.md defines the two optimization measures. §1 defines template comparisons at the derived kernel, on operator rows and the model step.
 - **Fast by default, accurate one option away.** The default is the fastest form that passes the gate on ordinary inputs and stays finite at adversarial ones: attention's base-2 fold and its fast backward (FlashAttention's arithmetic, with the anchored D for dQ). The accurate forms hold 1.5× and no merging at adversarial inputs too: a run records its choice in its numerics (`trainer.precision`, whose `ACCURATE` also runs float32 throughout and multiplies every product that states no precision at "highest"), and code takes it in a block (`generation.run_precision(ACCURATE)`, or the forms alone, `generation.run_precision(Numerics(forms='accurate'))`). Deterministic mode is one flag away.
 - **Fusion is the payoff.** Hooks, and JAX's Pallas fuser (`jax.experimental.pallas.fuser`, through `kernels/fused_gemm.py`), pull neighbouring operations into the kernel: norms, activations, gating, routing weights, biases, LoRA's low-rank product. That is what makes a template more than XLA or a fixed vendored kernel can be. Gaps in the fuser are fixed in Dew's JAX fork.
-- **Every accelerator.** Each template targets every supported NVIDIA and TPU family, with one scoreboard GPU per family. PLAN.md sets accelerator build order. The maintainers' operating rules set landing and qualification timing. Hardware availability does not block writing or landing kernel work.
+- **Every accelerator, built in parallel.** Each template targets every supported NVIDIA and TPU family, built at once through the shared interfaces rather than one generation after another, with one scoreboard GPU per family. The maintainers' operating rules set landing and qualification timing. Hardware availability does not block writing or landing kernel work.
 
 ## 1. The bar, with the comparison defined
 
 There are three templates: attention, linear recurrence and GEMM. Each one meets five requirements:
 
-1. **It is the fastest:** at every shape it serves, on every generation it claims (§6: sm80, sm86, sm89, sm90, sm100, sm120 and TPU), it meets or beats the best existing kernel at that shape, measured in one session on one GPU of that generation. A modest peak-memory increase is allowed for a clear speedup when both numbers are reported.
+1. **It is the fastest:** at every shape it serves, on every generation it claims (§6: sm80, sm86, sm89, sm90, sm100, sm120 and TPU), it meets or beats the best existing kernel at that shape, measured in one session on one GPU of that generation.
    - The row is measured **at the kernel the template derives,** end to end: preprocessing, merges and hook gradients included. A named config that measures faster is shown beside it, as a defect of the derivation.
    - Every row names its comparator's mode (deterministic or atomic, D form, precision) and the template's.
 2. **It is the most general:** it covers every row of its coverage table (§12). Any row marked a non-goal needs the owner's sign-off.
@@ -420,7 +420,7 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
 
 ## 11. How it gets built
 
-Build independent pieces in parallel within PLAN.md's dependency order. Follow the maintainers' operating rules for landing. Accuracy, stability and scoreboard evidence qualify the claimed target and replacement cells.
+Built in parallel: every family at once, through the shared interfaces. Follow the maintainers' operating rules for landing. Accuracy, stability and scoreboard evidence (compute time and peak memory against the named comparators) qualify the claimed target and replacement cells.
 
 **Risks retired first, as measurements:**
 1. sm80 attention backward against FA2. Today no Pallas Triton backward is within 2× of FA2 (10.0 vs 4.3 ms). Profile jax's Pallas backward against FA2 at the same tiles.
