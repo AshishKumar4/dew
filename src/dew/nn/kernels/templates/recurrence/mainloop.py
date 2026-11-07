@@ -71,7 +71,7 @@ def bundle_dtype(dtype) -> jnp.dtype:
 def family_of(dtype=jnp.bfloat16) -> mosaic.Family | None:
     """The bundle of the device's instruction family for a call of `dtype` (`bundles.of`), None where the
     mainloop has none (a CPU's)."""
-    return bundles.of(generation.device_generation(), bundle_dtype(dtype), chunks=True)
+    return bundles.of(generation.device_generation(), bundle_dtype(dtype))
 
 CHUNK = 64
 """Tokens a chunk, fla's."""
@@ -744,7 +744,11 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         return recorded
 
     def entry(*arrays):
-        def scoped(staged, *, streams):
+        def scoped(staged, products, *, streams):
+            with family.products_in(products):
+                return run(staged, streams=streams)
+
+        def run(staged, *, streams):
             *staged, lands = staged
             keys = _landing_keys(landing, family)
             lands = {name: lands[keys[name]] for name in landing}
@@ -782,12 +786,14 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
             family.persist(streams["walked"], (tiles,), schedule, issue, finish, consumers=1, axis="programs",
                            outputs=(), interpret=call.interpret)
 
+        # The products' own memory where the family's issuer scopes each (`Issuer.product_scratch`).
+        products = family.product_scratch(consumers)
         if persistent:
-            family.scoped(scoped, staging, streams=streams)
+            family.scoped(scoped, staging, products, streams=streams)
         else:
             # An empty program scopes nothing (Mosaic GPU's interpreter takes a scope's allocations in turn).
             at = {axis: lax.axis_index(axis) for axis in grid_names}
-            pl.when(live(at, arrays))(lambda: family.scoped(scoped, staging, streams=streams))
+            pl.when(live(at, arrays))(lambda: family.scoped(scoped, staging, products, streams=streams))
 
     entry.__name__ = name
 
@@ -815,7 +821,7 @@ def _solving(call: Call) -> mosaic.Family:
     (JS-fed5-h100-d82eeb171). Interpreted, the interpreter's (`bundles.INTERPRETED`)."""
     if call.interpret:
         return call.family
-    layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype), chunks=True)
+    layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype))
     return max((call.family, *layouts), key=lambda layout: layout.programs(1))
 
 
