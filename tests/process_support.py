@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import http.server
-import itertools
 import json
 import os
 import re
@@ -275,11 +274,17 @@ def raised(done: subprocess.CompletedProcess) -> dict[str, list[str]]:
     printed. A refusal's test reads its error here, where its exit status alone a crash would pass."""
     lines = [re.sub(r"^\[\d+\] ", "", line) for line in (done.stdout + "\n" + done.stderr).splitlines()]
     found: dict[str, list[str]] = {}
-    for previous, line in itertools.pairwise(lines):
-        named, _, message = line.partition(": ")
-        # An error's type, a class's name (`ValueError`, `dew.mesh.LayoutRefused`), at the line's start.
-        if previous.startswith("  ") and re.fullmatch(r"(\w+\.)*[A-Z]\w*[a-z]\w*", named):
-            found.setdefault(named, []).append(message)
+    within = False
+    for line in lines:
+        if line == "Traceback (most recent call last):":
+            within = True
+        elif within and line and not line.startswith(" "):
+            # The traceback's closing line, past its frames: its error's type, any class's dotted name
+            # (`ValueError`, `socket.gaierror`, `grpc._channel._InactiveRpcError`), and its message.
+            within = False
+            named, _, message = line.partition(": ")
+            if re.fullmatch(r"(\w+\.)*\w+", named):
+                found.setdefault(named, []).append(message)
     return found
 
 

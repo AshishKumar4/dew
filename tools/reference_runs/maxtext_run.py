@@ -30,7 +30,16 @@ from pathlib import Path
 os.environ.setdefault("DECOUPLE_GCLOUD", "TRUE")
 
 import jax
-from common import WorkloadWork, attach_xplane_profile, host, peak_flops, throughput, write_record
+from common import (
+    WorkloadWork,
+    attach_xplane_profile,
+    device_memory,
+    host,
+    peak_flops,
+    stated_peak_gib,
+    throughput,
+    write_record,
+)
 
 
 def arguments(argv=None) -> argparse.Namespace:
@@ -130,9 +139,7 @@ def main() -> None:
         "maxtext_tflops_per_device": [row.get("perf/per_device_tflops_per_sec") for row in timed],
         "mfu": None if peak_rate is None else work.training_flops_per_step * len(seconds)
             / sum(seconds) / (peak_rate * devices),
-        # A device's figure it does not state is None, never a 0 it did not measure.
-        "memory": {"peak_allocated_bytes": [s.get("peak_bytes_in_use") for s in stats],
-                   "bytes_limit": [s.get("bytes_limit") for s in stats]},
+        "memory": device_memory(stats),
     }
     if args.profile_steps:
         attach_xplane_profile(record, workdir, args.profile_steps,
@@ -141,7 +148,7 @@ def main() -> None:
     write_record(args.out, record)
     print(json.dumps({"tokens_per_s": rate["tokens_per_s"], "step_ms": rate["step_ms_mean"],
                       "mfu": record["mfu"],
-                      "peak_gib": max(record["memory"]["peak_allocated_bytes"]) / 2**30}, indent=1))
+                      "peak_gib": stated_peak_gib(record["memory"]["peak_allocated_bytes"])}, indent=1))
 
 
 if __name__ == "__main__":

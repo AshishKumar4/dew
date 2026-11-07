@@ -22,6 +22,7 @@ from common import (
     peak_flops,
     run_arguments,
     sha256,
+    stated_peak_gib,
     steps_for,
     throughput,
     trim_trace,
@@ -221,4 +222,4 @@ def finish(args: argparse.Namespace, place: Ranks, result: dict | None, traced: 
     print(json.dumps({"first_loss": result["loss"][0], "last_loss": result["loss"][-1],
                       "tokens_per_s": result["throughput"]["tokens_per_s"],
                       "step_ms": result["throughput"]["step_ms_mean"], "mfu": result["mfu"],
-                      "peak_gib": max(result["memory"]["peak_allocated_bytes"]) / 2**30}, indent=1))
+                      "peak_gib": stated_peak_gib(result["memory"]["peak_allocated_bytes"])}, indent=1))

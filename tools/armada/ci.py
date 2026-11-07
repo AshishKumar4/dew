@@ -414,17 +414,14 @@ class Reading:
     def cut(self, name: str, count: int) -> list[list[str]]:
         """File `name`'s tests cut into `count` groups (`members`), the record parted by file once a reading
         and each cut once (train 662's plan: 3,620 group keys each parsed the record, a minute of two)."""
-        if self.durations is None:
-            self.durations = {}
-            for node, seconds in durations_record().items():
-                self.durations.setdefault(node.split("::")[0], {})[node] = seconds
-        if (name, count) not in self.cuts:
-            held = sites(name)
-            recorded = {node: seconds for node, seconds in self.durations.get(name, {}).items()
-                        if session.test_name(node) not in held}
-            ordered = sorted(recorded)
-            self.cuts[(name, count)] = session.cut(ordered, [recorded[node] for node in ordered], count)
-        return self.cuts[(name, count)]
+        # Under the lock: the plan's threads share a reading (train 679: a half-parted record cut empty).
+        with self.lock:
+            if self.durations is None:
+                self.durations = parted_record()
+            if (name, count) not in self.cuts:
+                own = own_tests(name, self.durations.get(name, {}))
+                self.cuts[(name, count)] = session.cut(list(own), list(own.values()), count)
+            return self.cuts[(name, count)]
 
     def part(self, path: str) -> bytes:
         """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`contents`)."""
@@ -789,19 +786,24 @@ RECORD_TRIES = 4
 
 
 def recorded_tests() -> dict[str, list[float]]:
-    """Each file's tests' times in tests/test_durations.json, in node-id order, but its check-1 sites',
-    which run in tasks of their own (`sites`), and those of one shared setup one weight at the first one's
-    place (`session.units`), as a cut takes them."""
-    nodes: dict[str, list[str]] = {}
-    held: dict[str, dict[str, Mark]] = {}
+    """Each file's tests' times recorded (`own_tests`), one shared setup's one weight (`session.units`)."""
+    found = {name: own_tests(name, tests) for name, tests in parted_record().items()}
+    return {name: session.unit_seconds(list(own), list(own.values())) for name, own in found.items() if own}
+
+
+def parted_record() -> dict[str, dict[str, float]]:
+    """The durations record by test file, each file's tests in node-id order."""
+    parted: dict[str, dict[str, float]] = {}
     record = durations_record()
     for node in sorted(record):
-        name = node.split("::")[0]
-        if name not in held:
-            held[name] = sites(name)
-        if session.test_name(node) not in held[name]:
-            nodes.setdefault(name, []).append(node)
-    return {name: session.unit_seconds(own, [record[node] for node in own]) for name, own in nodes.items()}
+        parted.setdefault(node.split("::")[0], {})[node] = record[node]
+    return parted
+
+
+def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
+    """Of file `name`'s recorded `tests`, those but its check-1 sites', which run apart (`sites`)."""
+    held = sites(name)
+    return {node: seconds for node, seconds in tests.items() if session.test_name(node) not in held}
 
 
 def durations_record() -> dict[str, float]:
@@ -810,10 +812,8 @@ def durations_record() -> dict[str, float]:
 
 
 def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
-    """The node ids of test file `name`'s recorded tests that split.py cuts into group `split` ("G/N"):
-    the file's entries in the durations record in node-id order, but its check-1 sites', which its groups set
-    aside (`selected`), cut by their seconds (`session.cut`), a shared setup's tests together; as `reading`
-    cuts them, once a reading (`Reading.cut`)."""
+    """The node ids split.py cuts into group `split` ("G/N") of test file `name`'s recorded tests but its
+    sites' (`own_tests`), by their seconds, a shared setup's together, once a reading (`Reading.cut`)."""
     index, count = (int(part) for part in split.split("/"))
     return (Reading() if reading is None else reading).cut(name, count)[index - 1]
 
