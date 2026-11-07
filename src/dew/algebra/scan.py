@@ -266,8 +266,12 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
         decayed = h * decay[:, None]
         correction = jnp.sum(c[:, None] * decayed, axis=0)
-        h = decayed + b[:, None] * (u - strength * correction)[None, :]
-        return h, jnp.sum(q[:, None] * h, axis=0) + r
+        written = u - strength * correction
+        h = decayed + b[:, None] * written[None, :]
+        # Contract the reader before the outer product: its state tangent can exceed float32 while the
+        # scaled reader's contraction is finite, including a query's forward-over-reverse derivative.
+        output = jnp.sum(q[:, None] * decayed, axis=0) + jnp.sum(q * b) * written + r
+        return h, output
 
     carried = at_least_fp32(h.dtype)
     h, outputs = lax.scan(token, h.astype(carried), (exponent, B, U, s, C, Q, R))
