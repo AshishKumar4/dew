@@ -35,3 +35,12 @@ def sides_extended(sides: Sequence[jax.Array], axes_of: Sequence[tuple[str, ...]
     `extent`, as the rows are; one that follows no rows as it is."""
     return tuple(rows_extended(side, axes.index('rows'), extent) if 'rows' in axes else side
                  for side, axes in zip(sides, axes_of, strict=True))
+
+
+def scattered(outs, scatter: jax.Array | None):
+    """`outs` (one output or a tuple), each row `i` written at row `scatter[i]` (a product's `scatter`, a
+    permutation, so every row is written once), as XLA's program and a launch's stores give them; as they
+    are without one."""
+    if scatter is None:
+        return outs
+    return jax.tree.map(lambda out: jnp.zeros_like(out).at[scatter].set(out, unique_indices=True), outs)
