@@ -924,8 +924,8 @@ def test_a_hooked_launchs_keyed_configs_are_its_derived_ones(launch):
 
 def test_a_pin_the_mosaic_program_cannot_take_is_illegal():
     """A config a pin or a stored pick names is held to the tiles a program takes (`whole_tiles`) as a
-    derived one is: a 32-query tile under wgmma's 64-row roles, or three consumers where the family's walks
-    take two, is not legal, so a pin of it is refused before any launch."""
+    derived one is: an 8-query tile under a family's 16- or 64-row products, or three consumers where the
+    family's walks take two at most, is not legal, so a pin of it is refused before any launch."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call(SHAPES["interpreted"], 128, 128, residuals=template.Kept.NONE)
@@ -934,7 +934,7 @@ def test_a_pin_the_mosaic_program_cannot_take_is_illegal():
         rows, tokens, _, _ = SHAPES["interpreted"]
         arrays = [jnp.zeros(ba.arguments[name].shape, ba.arguments[name].dtype)
                   for name in ("query", "key", "value")]
-        for config in (dataclasses.replace(derived, block_q=32), dataclasses.replace(derived, consumers=3)):
+        for config in (dataclasses.replace(derived, block_q=8), dataclasses.replace(derived, consumers=3)):
             assert not op.legal(ba, config, target)
             with pytest.raises(tuning.Unpinnable), _pinned(config):
                 attention_mosaic.forward(*arrays, template.spans(tokens, tokens, rows, causal=True),

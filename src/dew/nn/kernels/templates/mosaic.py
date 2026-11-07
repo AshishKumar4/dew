@@ -2019,7 +2019,11 @@ class Transport[Allocated, Opened](abc.ABC):
             pl.when(program != first)(lambda: left(partials))
             pl.when(program == first)(lambda: left(opening))
             last = arrived(ready.at[gathered - 1], gathered - first)
-            pl.when(last == 1)(lambda: combined(read(opening, first)))
+            # The first program's partial its own value where it arrives last, so the running value keeps
+            # its accumulator's layout whichever program merges.
+            first_partial = jax.tree.map(lambda own, left: jnp.where(program == first, own, left), summed,
+                                         read(opening, first))
+            pl.when(last == 1)(lambda: combined(first_partial))
 
 
 class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allocated, Opened]):
