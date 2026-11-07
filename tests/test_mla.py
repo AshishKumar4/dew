@@ -1010,7 +1010,8 @@ def test_a_windowed_dense_mla_decodes_as_it_prefills():
 
 def test_a_mla_model_reads_key_runs_as_their_pairwise_mask():
     """Through a decoder, whose block refuses a call field its mixer does not read, an mla model's
-    logits under key runs are its logits under a pairwise mask of their union, bit for bit."""
+    logits under key runs are its logits under a pairwise mask of their union, bit for bit, and with its
+    keys' validity, under that mask less the invalid keys, its causal mask less them where they come alone."""
     model = mla_model(CONFIG["v3"])
     length = 9
     ids = jax.random.randint(jax.random.key(2), (2, length), 0, 37)
@@ -1023,6 +1024,19 @@ def test_a_mla_model_reads_key_runs_as_their_pairwise_mask():
     by_runs = model.apply(params, ids, attention_key_runs=jnp.asarray(runs))
     by_mask = model.apply(params, ids, attention_pairwise_mask=jnp.asarray(rule))
     np.testing.assert_array_equal(np.asarray(by_runs), np.asarray(by_mask))
+    # A key the call marks invalid inside a visible run is hidden from every query, as the pairwise mask
+    # without it hides it (audit A11): the runs' call keeps its keys' validity.
+    valid = np.ones((2, length), bool)
+    valid[:, 4] = False
+    by_valid_runs = model.apply(params, ids, attention_key_runs=jnp.asarray(runs),
+                                attention_key_valid=jnp.asarray(valid))
+    by_valid_mask = model.apply(params, ids, attention_pairwise_mask=jnp.asarray(rule & valid[:, None, :]))
+    np.testing.assert_array_equal(np.asarray(by_valid_runs), np.asarray(by_valid_mask))
+    # Alone, the keys' validity narrows the layer's own causality.
+    causal = np.broadcast_to(np.tril(np.ones((length, length), bool)), (2, length, length))
+    np.testing.assert_array_equal(
+        np.asarray(model.apply(params, ids, attention_key_valid=jnp.asarray(valid))),
+        np.asarray(model.apply(params, ids, attention_pairwise_mask=jnp.asarray(causal & valid[:, None, :]))))
 
 
 def masked_losses(model, variables, tokens, keep, counted):
