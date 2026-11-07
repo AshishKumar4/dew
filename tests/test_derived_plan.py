@@ -17,7 +17,7 @@ from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.objectives.lm import LMObjective
 from dew.telemetry.compiles import Compiles
 from dew.training import MeshSpec, Trainer
-from dew.training.planning import PlanRefused
+from dew.training.planning import MODEL_MISS, PlanRefused
 
 
 def deep(remat=None, split: int | None = 1):
@@ -174,7 +174,7 @@ def bare_search(objective):
     the test's to set (`judged_at`), and a compile it asks raises `Asked` naming the rung it asked at."""
     from dew.training.planning import FitSearch
 
-    def asked(split, narrow, footprint=None):
+    def asked(split, narrow, footprint=None, derived=True):
         raise Asked(search.remat_rung())
 
     search = FitSearch(lower=asked, options=lambda candidate: None, objective=objective,
@@ -191,7 +191,7 @@ def test_a_step_lowered_afresh_past_a_spilled_kernel_traces_its_footprint_again(
 
     handed = []
     search = bare_search(deep(split=None).objective)
-    search.lower = lambda split, narrow, footprint: handed.append(footprint)
+    search.lower = lambda split, narrow, footprint, derived: handed.append(footprint)
     derived = Footprint(residuals=1, gradients=2, held=3)
     search.footprints[search.candidate_key(1, narrow=False)] = derived
     search.lowering(1)
@@ -318,7 +318,8 @@ def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monke
     recomputation needs, the run hears a miss for its first compile and one for each it judged so. Whether
     a head policy past that compile then fits the room, a plan, or none does, a refusal, is the
     compiler's schedule's: under XLA:CPU's memory-optimized schedule the head tiled, its gradient taken
-    in the backward, fits it (7263045940), under its default none did; the misses are told either way."""
+    in the backward, fits it (7263045940), under its default none did; the misses are told either way,
+    each warning marked with the probe it names (`MODEL_MISS`), read whatever its wording (A40)."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     free(monkeypatch, LIMIT)
     sizing = deep(REMAT_POLICIES["full"])
@@ -335,12 +336,12 @@ def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monke
             compiled(trainer)
         except PlanRefused as error:
             refused = error
-    missed = [record for record in caplog.records if "model miss" in record.getMessage()]
+    missed = [vars(record)[MODEL_MISS] for record in caplog.records if MODEL_MISS in vars(record)]
     probes = [probe.record() for probe in refused.probes] if refused else trainer.plan["probes"]
     judged = [probe for probe in probes
               if probe["derived_headroom"] is not None and (probe["derived_headroom"] >= 0) != probe["fits"]]
     assert compiles.count >= 1 and probes[0]["fits"] == (compiled_need < derived)
-    assert missed and len(missed) == len(judged)
+    assert missed and len(missed) == len(judged) and all(missed)
 
 
 GATE_LAYERS = {

@@ -15,7 +15,7 @@ transformers 5 ships no Flax CLIP, so a Flax text tower is read through its
 PyTorch twin alone, and the Flax pipelines themselves cannot be built here.
 
 `flax_unet` is the declared Flax UNet as a JAX function, `unet_predictor` runs the
-declared UNet (Flax or PyTorch) on the host, and `denoiser_prediction` a
+declared UNet (Flax or PyTorch) on the host, and `denoiser` a
 declared PyTorch denoiser, in float32 or in float64 (`torch_precision.float64`
 for PyTorch, x64 and `flax_precision.float64` for Flax), for a forward the
 caller holds Dew's to by tests/reference_error.py's rule.
@@ -179,29 +179,30 @@ def unet_predictor(export: Path, *, wide: bool = False):
                                         for value in given(sample, timestep, context, pooled, time_ids))))
 
         return predict
-    with precision(wide):
-        unet = load(export, "unet", torch.float64 if wide else torch.float32)
-
-    def predict(sample, timestep, context, pooled=None, time_ids=None):
+    def call(unet, tensor, sample, timestep, context, pooled=None, time_ids=None):
         sample, times, context, pooled, time_ids = given(sample, timestep, context, pooled, time_ids)
-        added = None if pooled is None else {"text_embeds": torch.from_numpy(pooled),
-                                             "time_ids": torch.from_numpy(time_ids)}
-        with precision(wide), torch.no_grad():
-            output = unet(torch.from_numpy(np.ascontiguousarray(np.moveaxis(sample, -1, 1))),
-                          torch.from_numpy(times), encoder_hidden_states=torch.from_numpy(context),
-                          added_cond_kwargs=added).sample
+        added = None if pooled is None else {"text_embeds": tensor(pooled), "time_ids": tensor(time_ids)}
+        output = unet(tensor(np.ascontiguousarray(np.moveaxis(sample, -1, 1))), tensor(times),
+                      encoder_hidden_states=tensor(context), added_cond_kwargs=added).sample
         return np.moveaxis(output.numpy(), 1, -1)
 
-    return predict
+    return denoiser(export, call, wide=wide)
 
 
-def denoiser_prediction(export: Path, call, *, wide: bool = False) -> np.ndarray:
-    """`call(model, tensor)` on the declared PyTorch denoiser, in float32 or
-    (`wide`) float64: `tensor` turns an array into a tensor of the model's
-    dtype, and `call` returns the prediction as an array."""
+def denoiser(export: Path, call, *, wide: bool = False):
+    """The declared PyTorch denoiser, loaded once in float32 or (`wide`)
+    float64, as a function of a draw's inputs: `call(model, tensor, *inputs)`
+    on it, `tensor` turning an array into a tensor of the model's dtype, and
+    `call` returning the prediction as an array."""
     [name] = [name for name in weighted_components(export) if name in DENOISERS]
     dtype = torch.float64 if wide else torch.float32
     with precision(wide):
         model = load(export, name, dtype)
-        with torch.no_grad():
-            return np.asarray(call(model, lambda value: torch.from_numpy(np.asarray(value)).to(dtype)))
+
+    def predict(*inputs):
+        def tensor(value):
+            return torch.from_numpy(np.asarray(value)).to(dtype)
+
+        with precision(wide), torch.no_grad():
+            return np.asarray(call(model, tensor, *inputs))
+    return predict

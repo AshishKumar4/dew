@@ -314,10 +314,10 @@ def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algor
 def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(recorded, forms, stated,
                                                                              tmp_path):
     """A Muon run saved while its options named the Newton-Schulz precision by a matmul level loads with
-    that level's dot algorithm (`config.earlier_newton_schulz`): bfloat16 the run's numerics' own in their
-    fast forms, none stated, and stated where the run's forms are accurate, whose own is float32 (row
-    2753), a run saved before its trainer held a precision policy accurate by its `attention_form`
-    among them; tensorfloat32 and float32 their algorithms, whose Muon builds."""
+    that level's dot algorithm (`dew.config.earlier.earlier_newton_schulz`): bfloat16 the run's numerics'
+    own in their fast forms, none stated, and stated where the run's forms are accurate, whose own is
+    float32 (row 2753), a run saved before its trainer held a precision policy accurate by its
+    `attention_form` among them; tensorfloat32 and float32 their algorithms, whose Muon builds."""
     from run_kinds import lm
 
     from dew.config import RunConfig
@@ -446,6 +446,35 @@ def test_a_head_expanded_projection_orthogonalizes_its_flattened_head_side():
     assert_updates_as(muon_solver(), optax.contrib.muon(LR), dit_params(), [query, out],
                       "the head-expanded projections", flatten=flattened)
 
+
+
+def test_a_16_mixed_dits_first_muon_step_stays_finite():
+    """A DiT's first step under 16-mixed (float16 compute, `Numerics("16-mixed")`) with Muon: its output
+    projection starts at zero (dit.py, `final_proj`), so every matrix before it has a zero gradient, which
+    the Newton-Schulz iteration normalizes by its norm plus optax's 1e-8. The iteration runs in bfloat16
+    for a 16-bit compute dtype (`iteration_dtype`), where that sum is no zero, so the zero updates stay zero
+    and every parameter after the step is finite, the output projection's update among them."""
+    model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1,
+                      dtype=jnp.float16)
+    params = dit_params()
+    images = jax.random.normal(jax.random.key(1), (2, 8, 8, 3))
+    times, targets = jnp.full((2,), 0.5), jax.random.normal(jax.random.key(2), (2, 8, 8, 3))
+
+    def loss(params):
+        return jnp.mean(jnp.square(model.apply(params, images, times).astype(jnp.float32) - targets))
+
+    grads = jax.grad(loss)(params)
+    query = ('params', 'dit_block_0', 'attention', 'to_q', 'kernel')
+    assert not np.any(np.asarray(functools.reduce(lambda tree, key: tree[key], query, grads)))
+    solver = OptimConfig(optimizer="muon", learning_rate=LR).build(10)
+    with run_precision(Numerics("16-mixed")):
+        updates, _ = solver.update(grads, solver.init(params), params)
+    stepped = optax.apply_updates(params, updates)
+    for path, leaf in jax.tree_util.tree_leaves_with_path(stepped):
+        assert np.all(np.isfinite(np.asarray(leaf))), jax.tree_util.keystr(path)
+    assert not np.any(np.asarray(functools.reduce(lambda tree, key: tree[key], query, updates)))
+    projection = ('params', 'output', 'final_proj', 'kernel')
+    assert np.any(np.asarray(functools.reduce(lambda tree, key: tree[key], projection, updates)))
 
 
 def test_a_schedule_that_marks_no_rate_is_its_own_shape():

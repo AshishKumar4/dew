@@ -12,6 +12,7 @@ import contextvars
 import dataclasses
 import functools
 import importlib
+import math
 from collections.abc import Callable
 from typing import Literal, get_args
 
@@ -66,7 +67,16 @@ from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
-from .precision import asks_default_precision, at_least_fp32, capped_logits, float32_einsum
+from .precision import (
+    asks_default_precision,
+    at_least_fp32,
+    at_precision,
+    capped_logits,
+    configurable_precision,
+    configured_precision,
+    exact_products,
+    float32_einsum,
+)
 from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
@@ -553,42 +563,18 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         block_groups = image_groups = None
     if sliding_window is None:
         places = None
-    spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
-               "key_runs": key_runs,
-               "places": places}
-    if any(x is not None for x in spanned.values()) and shards > 1:
-        # Only a single device's template reads groups, key validity and places; across sequence shards the
-        # call's spans are the mask they mean, its causality, window, documents, key lengths and starts among
-        # them. On one device a route other than the template's takes them so (`_attention_kernel`).
-        mask = visibility_mask(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
-                               key_value_seq_lengths, key_value_seq_starts, **spanned)
-        causal, sliding_window, segment_ids, block_groups, image_groups = False, None, None, None, None
-        key_value_seq_lengths = key_value_seq_starts = key_valid = key_runs = places = None
-        implementation = kernel_for_materialized_mask(
-            implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
-    if (isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
-            and shards > 1):
-        # Only a single device's kernels read documents aligned to their last keys; elsewhere they
-        # are the mask they mean.
-        aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
-        mask = aligned if mask is None else jnp.logical_and(aligned, mask)
-        causal, sliding_window, segment_ids = False, None, None
-    if key_value_seq_starts is not None and shards > 1:
-        # Only a single device's decode kernel reads starts; elsewhere they are the mask they mean.
-        mask = with_key_starts(mask, key_value_seq_starts, key.shape[-3])
-        key_value_seq_starts = None
+    if shards > 1:
+        spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
+                   "key_runs": key_runs, "places": places}
+        causal, sliding_window, mask, key_value_seq_lengths, materialized = _sequence_sharded(
+            query.shape[-3], key.shape[-3], causal=causal, sliding_window=sliding_window, mask=mask,
+            segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts,
+            spanned=spanned)
+        if materialized:
+            implementation = kernel_for_materialized_mask(
+                implementation, query, key, dtype=dtype, precision=precision,
+                force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     words = template.dropout_seed(dropout_rng) if dropping else None
-    if shards > 1 and segment_ids is not None:
-        # The exchanges split an explicit mask along the sequence and have no
-        # split for the ids, so the documents travel as the mask they stand
-        # for, with causality and the window folded in beside them.
-        mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window,
-                                       with_documents(mask, segment_ids))
-        causal, sliding_window, segment_ids = False, None, None
-        implementation = kernel_for_materialized_mask(
-            implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
@@ -705,32 +691,40 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     elif implementation == 'flash':
         out = flash_attention(query, key, value, causal, sliding_window, sinks, segment_ids, max_segments)
     elif implementation == 'decode':
-        starts = key_value_seq_starts
+        # The keys' lengths and starts are the callbacks' operands, not their closure: a closed-over integer
+        # tracer stayed in a nested derivative's call as a constant no lowering takes (a paged decode's
+        # forward over reverse, M-DD-13b: "No constant handler for type DynamicJaxprTracer").
+        rest = {name: x for name, x in (("starts", key_value_seq_starts), ("sinks", sinks)) if x is not None}
 
-        def decoded(query, key, value, *sunk):
+        def decoded(query, key, value, lengths, *given):
+            held = dict(zip(rest, given, strict=True))
+
             # A Pallas call has no partitioning rule: each shard decodes its own rows and heads.
             def attend(query, key, value, lengths, starts=None, sinks=None):
                 return decode_attention.attend(query, key, value, lengths, starts, softcap=softcap,
                                                sinks=sinks)
 
             rows = ("activation_batch",)
-            return on_attention_shards(attend, query, key, value, lengths=(key_value_seq_lengths, rows),
-                              starts=(starts, rows), sinks=(sunk[0] if sunk else None, ("activation_heads",)))
+            return on_attention_shards(attend, query, key, value, lengths=(lengths, rows),
+                                       starts=(held.get("starts"), rows),
+                                       sinks=(held.get("sinks"), ("activation_heads",)))
 
-        def folded(query, key, value, *sunk):
-            visible = with_key_starts(with_key_lengths(None, key_value_seq_lengths, key.shape[-3]), starts,
+        def folded(query, key, value, lengths, *given):
+            held = dict(zip(rest, given, strict=True))
+            visible = with_key_starts(with_key_lengths(None, lengths, key.shape[-3]), held.get("starts"),
                                       key.shape[-3])
-            if not sunk and softcap is None:
+            if "sinks" not in held and softcap is None:
                 return folded_attention(query, key, value, visible)
             # The folded form has neither; the reference path computes both over the same keys.
-            return reference_attention(query, key, value, mask=visible, sinks=sunk[0] if sunk else None,
+            return reference_attention(query, key, value, mask=visible, sinks=held.get("sinks"),
                                        softcap=softcap)
 
         # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
         # sinks among its operands, at the kernel's arithmetic: IEEE products for fp32 operands
         # (`decode_attention`), its 16-bit products summed in fp32 otherwise.
-        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]),
-                                     precision="highest" if query.dtype == jnp.float32 else None)
+        kernel_precision = "highest" if query.dtype == jnp.float32 else None
+        out = forward_differentiable(decoded, folded, query, key, value, key_value_seq_lengths,
+                                     *rest.values(), precision=kernel_precision)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.
@@ -768,6 +762,12 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
 
 
 FORWARD_MODE = contextvars.ContextVar("forward_mode_attention", default=False)
+
+REVERSE_ONLY = ('cudnn', 'triton', 'flash', 'tpu', 'template')
+"""The kernels that define their reverse-mode derivative alone (`jax.custom_vjp`), its backward traced after
+the call: forward mode takes theirs from the reference path (`forward_differentiable`), and a call's stated
+precision is held over that backward (`at_precision`). The others are JAX's own products (xla) or state
+their own (decode), which their tangents and transposes keep."""
 
 
 @contextlib.contextmanager
@@ -860,7 +860,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             primal = 'template' if template_infers(query.dtype, query.shape[-1], causal) else 'xla'
             return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks,
                                           primal_alone=True)
-        if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu', 'template'):
+        if not FORWARD_MODE.get() or resolved not in REVERSE_ONLY:
             return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
         def fused(query, key, value, bias, sinks):
@@ -983,26 +983,43 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     if implementation not in ('decode', 'template'):
         mask = with_key_starts(mask, starts, key.shape[-3])
         starts = None
-    return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
-                            implementation, softcap=softcap, sinks=sinks,
-                            segment_ids=segment_ids, max_segments=max_segments,
-                            key_value_seq_lengths=lengths, key_value_seq_starts=starts,
-                            block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
-                            key_runs=key_runs,
-                            places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-                            dropout_places=dropout_places)
+
+    def fused(query, key, value, bias, sinks):
+        return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
+                                implementation, softcap=softcap, sinks=sinks,
+                                segment_ids=segment_ids, max_segments=max_segments,
+                                key_value_seq_lengths=lengths, key_value_seq_starts=starts,
+                                block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
+                                key_runs=key_runs,
+                                places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
+                                dropout_places=dropout_places)
+    # A kernel whose products take no precision of their own (jax.nn's xla attention, Pallas dots: the
+    # template's portable mainloop, splash and its flash fallback) multiplies at the call's stated
+    # precision: a reverse-only kernel's backward, traced after the call, held at it too (`at_precision`),
+    # and JAX's own products by the forward's scope alone, which their tangents and transposes keep, so
+    # forward mode differentiates them as written. A stated default is a floor the run's configured
+    # precision meets, and a kernel that states its own keeps it.
+    if implementation in REVERSE_ONLY and not asks_default_precision(precision):
+        return at_precision(precision)(fused)(query, key, value, bias, sinks)
+    with configured_precision(precision):
+        return fused(query, key, value, bias, sinks)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits: bool = False) -> bool:
     """Whether a call asks for arithmetic only the reference path performs.
 
     The four are what every fused kernel's requirements refuse
-    (`attention_kernels`' arithmetic requirement): a matmul precision other
-    than DEFAULT (a higher one, a dot algorithm or a preset of one), a
+    (`attention_kernels`' arithmetic requirement): a matmul precision, stated
+    or the run's configured one, that whole products of the query's dtype
+    with fp32 sums do not compute (`exact_products`: a dot algorithm that
+    narrows the operands or widens them; any level, a 16-bit operand's
+    exact products at 'highest' among them) or that no config names (a
+    pair, a dot algorithm: `configurable_precision`), which a fused kernel
+    whose products take none of their own runs at (`_attention_kernel`), a
     softmax outside fp32, a compute dtype other than the inputs', and logits
     formed from queries and keys widened to at least fp32 (`wide_logits`).
     """
-    return (not asks_default_precision(precision)
+    return (not exact_products(precision, query.dtype) or not configurable_precision(precision)
             or not force_fp32_for_softmax
             or (dtype is not None and jnp.dtype(dtype) != query.dtype)
             or wide_logits)
@@ -1031,7 +1048,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
     case = AttentionCase(
-        queries=q_len, keys=kv_len, heads=query.shape[-2], kv_heads=key.shape[-2],
+        queries=q_len, keys=kv_len, rows=math.prod(query.shape[:-3]), heads=query.shape[-2],
+        kv_heads=key.shape[-2],
         head_dim=query.shape[-1], dtype=jnp.dtype(query.dtype), key_dtype=jnp.dtype(key.dtype),
         causal=bool(causal), window=sliding_window,
         documents=None if segment_ids is None else 'cross' if cross else 'own',
@@ -1093,6 +1111,33 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
         # it, a decode choice `chosen` names overriding both.
         return select(DECODE, case, preference=('decode', 'xla', 'reference'))
     return select(DECODE, case, {'auto': None, 'cudnn': 'cudnn'}[implementation])
+
+
+def _sequence_sharded(queries: int, keys: int, *, causal, sliding_window, mask, segment_ids, lengths, starts,
+                      spanned: dict):
+    """A call's visibility as the sequence exchange takes it (`sequence_parallel_attention`: its causality, a
+    window, a mask and key lengths alone): a single device's template reads block groups, key validity,
+    runs and places, and its kernels documents aligned to their last keys and the keys' starts; across
+    sequence shards each is the mask it means, its causality, window, documents, key lengths and starts
+    among them where `spanned` holds any (`visibility_mask`). The exchanges split an explicit mask along the
+    sequence and have no split for the ids, so the documents travel as the mask they stand for, causality
+    and the window folded in beside them. Returns the causality, window, mask and key lengths it takes, and
+    whether it materialized a mask its kernel must take (`kernel_for_materialized_mask`)."""
+    if any(x is not None for x in spanned.values()):
+        mask = visibility_mask(queries, keys, causal, sliding_window, mask, segment_ids, lengths, starts,
+                               **spanned)
+        return False, None, mask, None, True
+    if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None):
+        aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
+        mask = aligned if mask is None else jnp.logical_and(aligned, mask)
+        causal, sliding_window, segment_ids = False, None, None
+    if starts is not None:
+        mask = with_key_starts(mask, starts, keys)
+    if segment_ids is not None:
+        documents = with_documents(mask, segment_ids)
+        mask = combined_attention_mask(queries, keys, causal, sliding_window, documents)
+        return False, None, mask, lengths, True
+    return causal, sliding_window, mask, lengths, False
 
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,

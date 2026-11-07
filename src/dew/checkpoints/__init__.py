@@ -88,7 +88,7 @@ from dew._coordination import broadcast_from_process_zero, from_every_process, s
 from dew._files import write_atomically
 from dew._hashing import fmix32
 from dew._records import JSON, duration, json_value, record, share, text
-from dew.batch import PARAMETER_ROOTS, Variables
+from dew.batch import PARAMETER_ROOTS, Variables, under_roots
 from dew.checkpoints._payloads import (
     _NEEDS,
     MODEL,
@@ -710,18 +710,20 @@ def _from_tree_record(recorded: JSON):
 
 
 def _table_record(table: Mapping[str, np.ndarray]) -> JSON:
-    return {name: {"dtype": str(np.asarray(value).dtype), "shape": list(np.shape(value)),
-                   "hex": np.ascontiguousarray(value).tobytes().hex()} for name, value in table.items()}
+    """A position table as the JSON a holder hands every process (`_from_holder`): the bytes the artifact
+    codec encodes a mapping of arrays in (`dew.data.sources.codec`), each array's dtype, shape and bytes
+    its own, as hex (A10: a second array record beside the codec)."""
+    from dew.data.sources.codec import encode
+
+    return encode(dict(table)).hex()
 
 
 def _from_table_record(recorded: JSON) -> dict[str, np.ndarray]:
-    table = {}
-    for name, value in record(recorded, "table").items():
-        entry = record(value, name)
-        flat = np.frombuffer(bytes.fromhex(_records.text(entry["hex"], "hex")),
-                             np.dtype(_records.text(entry["dtype"], "dtype")))
-        table[name] = flat.reshape(_records.integers(entry["shape"], "shape"))
-    return table
+    """The position table `_table_record` recorded."""
+    from dew.data.sources.codec import decode
+
+    table = record(decode(bytes.fromhex(_records.text(recorded, "table"))), "table")
+    return {name: np.asarray(value) for name, value in table.items()}
 
 
 class _RankedSteps(preservation.PreservationPolicy):
@@ -1832,10 +1834,8 @@ class Checkpoints:
         target = resolve_dtype(param_dtype)
         selected = set()
         if target is not None:
-            roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
             selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(template["variables"])[0]
-                        if jnp.issubdtype(leaf.dtype, jnp.floating) and
-                        any(path[:len(root)] == root for root in roots)}
+                        if jnp.issubdtype(leaf.dtype, jnp.floating) and under_roots(path, parameter_roots)}
         typed = jax.tree_util.tree_map_with_path(
             lambda path, leaf, sharding: jax.ShapeDtypeStruct(
                 leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),

@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import http.server
-import itertools
 import json
 import os
 import re
@@ -15,6 +14,7 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
+from typing import NamedTuple
 
 import pytest
 from lane_environment import MESH_DEVICES, without_deterministic_ops
@@ -125,6 +125,49 @@ def owned(command: Sequence[str], environment: Mapping[str, str]) -> subprocess.
     (tools/armada/child_groups.py's `start`): its lifeline kills it as its owner dies, however it dies."""
     return groups.start(command, cwd=REPO_ROOT, env=dict(environment), stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT, text=True)
+
+
+class Relayed(NamedTuple):
+    """A relayed child's exit and its merged output (`relayed`)."""
+
+    returncode: int
+    output: str
+
+
+def said(line: str) -> None:
+    """`line` on this process's stdout at once: a rank's log, where its gang runs with -s."""
+    print(line, end="", flush=True)
+
+
+def relayed(command: Sequence[str], environment: Mapping[str, str], *, timeout: float,
+            sink: Callable[[str], None] = said) -> Relayed:
+    """`command` as an owned group (`owned`), every line it writes passed to `sink` as it comes and kept, its
+    exit and output once it ends: a rank of a gang that runs with -s logs how far its child got though the
+    gang's deadline kill it (row 4686: trains 670 and 671's lost gangs logged nothing of their children). One
+    that runs past `timeout` is aborted for its faulthandler stacks, which pass through too, its group ended,
+    and the test failed with its output's tail."""
+    process = owned(command, environment)
+    kept: list[str] = []
+
+    def relay() -> None:
+        for line in process.stdout or ():
+            sink(line)
+            kept.append(line)
+
+    reader = threading.Thread(target=relay, daemon=True)
+    reader.start()
+    try:
+        process.wait(timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(process.pid, signal.SIGABRT)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(60)
+        terminate(process)
+        reader.join(60)
+        pytest.fail(f"{' '.join(command)} did not end within {timeout:.0f} s\n{''.join(kept)[-12000:]}")
+    reader.join(60)
+    return Relayed(process.returncode, "".join(kept))
 
 
 def start_process(command: Sequence[str], devices: int, *,
@@ -275,11 +318,17 @@ def raised(done: subprocess.CompletedProcess) -> dict[str, list[str]]:
     printed. A refusal's test reads its error here, where its exit status alone a crash would pass."""
     lines = [re.sub(r"^\[\d+\] ", "", line) for line in (done.stdout + "\n" + done.stderr).splitlines()]
     found: dict[str, list[str]] = {}
-    for previous, line in itertools.pairwise(lines):
-        named, _, message = line.partition(": ")
-        # An error's type, a class's name (`ValueError`, `dew.mesh.LayoutRefused`), at the line's start.
-        if previous.startswith("  ") and re.fullmatch(r"(\w+\.)*[A-Z][a-z]\w*", named):
-            found.setdefault(named, []).append(message)
+    within = False
+    for line in lines:
+        if line == "Traceback (most recent call last):":
+            within = True
+        elif within and line and not line.startswith(" "):
+            # The traceback's closing line, past its frames: its error's type, any class's dotted name
+            # (`ValueError`, `socket.gaierror`, `grpc._channel._InactiveRpcError`), and its message.
+            within = False
+            named, _, message = line.partition(": ")
+            if re.fullmatch(r"(\w+\.)*\w+", named):
+                found.setdefault(named, []).append(message)
     return found
 
 

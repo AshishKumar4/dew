@@ -108,6 +108,10 @@ def test_examples_independent_of_their_batch_pass_and_a_batch_statistic_is_refus
     # Refused at the reversal, whose mean sums its rows in another order, or by check 1 over the parts.
     with pytest.raises(AssertionError):
         assert_examples_independent(lambda x: x - jnp.mean(x, axis=0), draw, "batch mean", seeds=8, parts=3)
+    # A batch maximum is the same whatever the rows' order, so the reversal holds it bit for bit: the parts
+    # alone refuse it, each part's maximum its own.
+    with pytest.raises(AssertionError):
+        assert_examples_independent(lambda x: x - jnp.max(x, axis=0), draw, "batch maximum", seeds=8, parts=3)
 
 
 def test_a_run_restarted_midstream_ends_where_one_run_ends_and_hidden_state_is_refused():

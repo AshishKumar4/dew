@@ -19,6 +19,7 @@ that grow its tiles most for finiteness, and its fast backward's decay gradient 
 or gradient the template refuses (`Mosaic.eligible`, `Mosaic.trains`) is checked refused and skipped, a
 refusal and not numerical coverage (row 1968: the suite held only the portable arms)."""
 
+import contextlib
 import dataclasses
 import functools
 
@@ -116,10 +117,14 @@ def fla_recorded(hooks) -> bool:
     return hooks.delta and hooks.decay != 'none' and hooks.gates is None
 
 
+@contextlib.contextmanager
 def under(forms: str | None):
-    """The run's numerics under `forms`, the run's own where None."""
+    """The run's numerics under `forms`, the run's own where None; the fast forms at the default product
+    precision they round at (`rounds_products`; the suite's lanes configure 'highest')."""
     numerics = generation.numerics()
-    return generation.run_precision(numerics if forms is None else dataclasses.replace(numerics, forms=forms))
+    with (generation.run_precision(numerics if forms is None else dataclasses.replace(numerics, forms=forms)),
+          jax.default_matmul_precision('default') if forms == 'fast' else contextlib.nullcontext()):
+        yield
 
 
 def template_trains(operands: Chunk, hooks) -> bool:

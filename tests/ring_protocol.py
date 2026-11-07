@@ -45,6 +45,8 @@ import jax
 import numpy as np
 from jax.extend import core as jcore
 
+from dew.nn.programs import called
+
 THREAD_AXIS = "wg"
 """The axis a launch's warpgroups are indexed along (`mosaic.kernel`'s `thread_name`)."""
 
@@ -92,8 +94,9 @@ class _Interpreter:
         name, params = equation.primitive.name, equation.params
         if name == "axis_index":
             return [np.int32(self.thread if params["axis_name"] == THREAD_AXIS else 0)]
-        if name in ("jit", "pjit", "custom_jvp_call", "custom_vjp_call", "closed_call", "remat"):
-            inner = params.get("jaxpr") or params.get("call_jaxpr") or params.get("fun_jaxpr")
+        # A call's program, read where every reader reads it (`dew.nn.programs.called`).
+        inner = called(equation)
+        if inner is not None:
             closed = inner if isinstance(inner, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(inner, ())
             return self.run(closed.jaxpr, closed.consts, values)
         if name == "cond":

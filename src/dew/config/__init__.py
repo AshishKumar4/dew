@@ -50,8 +50,10 @@ from dew._cache import dew_cache_dir
 from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
-from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
+from dew._records import JSON, duration, is_share, recorded_duration
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
+from dew.config.earlier import earlier_option_writing, earlier_run
+from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
@@ -395,7 +397,7 @@ class SourceOptions:
     `trains` the paper's recipe unless "all"; None for none."""
     scan_layers: bool = False
     """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
-    (`Pretrained.load`'s `scan_layers`): a decode step's program grows with the period, not the depth."""
+    (`Pretrained.load`'s `scan_layers`): a step's program grows with the period, not the depth."""
     param_dtype: str | None = None
     """The dtype the source's parameters are stored in, its checkpoint's own as 'auto'; None stores a
     source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
@@ -479,7 +481,8 @@ class TrainerConfig:
     """Stop after the loss has scored this many targets across all microbatches, including before a
     resume.
 
-    Uses the counter reported as `train/tokens`, without padding. The final
+    Counts the tokens committed updates trained on, reported as `train/committed_tokens`, without
+    padding. The final
     microbatch may cross the budget. With `steps`, `epochs` or `examples`, the
     first cap reached ends the run. A token-only run needs a constant learning
     rate or a schedule with its own explicit step horizon.
@@ -676,8 +679,11 @@ class TrainerConfig:
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
     Only a process with the GPU to itself measures, and the picks persist beside
-    the compilation cache for every later run. Unset, such a launch runs the
-    nearest measured shape's config or its heuristic, and the run says how many.
+    the compilation cache for every later run that sets it too. It measures Dew's
+    own launches (the kernel templates, `attention_impl="template"`); tokamax's
+    flash kernel (`"triton"`) runs at tokamax's heuristic config, unmeasured.
+    Unset, nothing is measured or read: every launch takes the config it derives
+    from the GPU's facts (row 4837).
     """
 
     def accumulating(self, dataset: Loader) -> Self:
@@ -978,7 +984,7 @@ def _chain_label(chain: Dataset | None) -> str:
     return str(calls[-1]).rpartition(":")[2].rpartition(".")[2] if calls else "data"
 
 
-_CHAINS = ("data", "validation")
+CHAINS = ("data", "validation")
 """A run's fields that hold chains, which its record writes through the data's codec (`_chain_record`)."""
 
 
@@ -1050,218 +1056,11 @@ def _reads_back(fields: Mapping[str, object]) -> bool:
     if fields.get("data") is None:
         return False
     try:
-        for name in _CHAINS:
+        for name in CHAINS:
             _read_chain(name, fields.get(name))
     except ValueError:
         return False
     return True
-
-
-def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record (its run.json, `{"class": ..., "fields": ...}`) with its fields in the shapes
-    Dew writes now, every earlier shape of a saved run read here and nowhere else (`RunConfig.load`,
-    `check_resume`). A record written before its trainer held a precision policy (`dew.nn.precision.
-    Numerics`, ledger 2500) reads as its main trained it (train 328's review): its trainer's
-    `attention_form` as the policy's `forms`; a loaded checkpoint's `pretrained_param_dtype`, and a
-    decision's `param_dtype`, as the storage of the source alone (`SourceOptions.param_dtype`), the head
-    and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
-    `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
-    (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
-    decision run's option text as its rows wrote it (`earlier_option_text`); its data plan version as the
-    one it read by (`earlier_data_plan`); a chain's store under the
-    fields its class renamed since, by today's names (`dew.data.records.earlier_chains`).
-    A configuration written today that names the earlier knobs is refused by name, as any field its class
-    does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
-    (ledger 1552)."""
-    return records.earlier_chains(earlier_data_plan(earlier_option_text(earlier_profile(
-        earlier_newton_schulz(earlier_trainer(record))))), _CHAINS)
-
-
-def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record that states no data plan version (`RunConfig.data_plan_version`): one a Dew
-    wrote while the field was `data_plan` states it there, None where the run was trained in Python,
-    which that Dew compiled at version 9; one written before either, under version 8, which read a
-    mixture's corpora shuffled by one seed in one permutation, reads by 8 (row 3840). Carried to 1.0
-    (ledger 1552)."""
-    named = registry.class_record(record)
-    if named is None or named[0] not in registry.runs or "data_plan_version" in named[1]:
-        return record
-    fields = {name: value for name, value in named[1].items() if name != "data_plan"}
-    landed = named[1].get("data_plan", 8)
-    return {**record, "fields": {**fields, "data_plan_version": 9 if landed is None else landed}}
-
-
-def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record of a class that states how its rows write a choice's option (`option_text`,
-    `dew.decision.DecisionRunConfig`) where it states none: its rows wrote each option's key beside its
-    description, as every layout did before the field (`QuestionLayout.option_text`), so it reads
-    `named`. Carried to 1.0 (ledger 1552)."""
-    named = registry.class_record(record)
-    if named is None or named[0] not in registry.runs or "option_text" in named[1]:
-        return record
-    run_class = registry.runs[named[0]]
-    if not (isinstance(run_class, type) and dataclasses.is_dataclass(run_class)) or "option_text" not in {
-            field.name for field in dataclasses.fields(run_class)}:
-        return record
-    return {**record, "fields": {**named[1], "option_text": "named"}}
-
-
-def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoints) -> Mapping[str, object]:
-    """A saved decision run's record (`earlier_run`'s) whose option text is None, which a Dew before row
-    3867 recorded where the run left it to its layout: the writing the layout its last checkpoint in
-    `checkpoints` (its tiers, as the run keeps them) records wrote (`dew.decision.layout.layout_writing`),
-    so a resume writes its rows as it did, whatever a later Dew's layout leaves; as it is where no
-    checkpoint records one (a run that trained no step, or a layout no record described), whose writing
-    its build resolves again (`RunConfig.check_resume`). Carried to 1.0 (ledger 1552)."""
-    named = registry.class_record(record)
-    if named is None or "option_text" not in named[1] or named[1]["option_text"] is not None:
-        return record
-    from dew.decision.layout import Layout, layout_writing
-    from dew.inference.tasks import saved_artifact
-
-    step = checkpoints.latest
-    artifact = None if step is None else saved_artifact(checkpoints, step)
-    laid = None if artifact is None else artifact.get("layout")
-    if not isinstance(laid, Mapping):
-        return record
-    writing = layout_writing(registry.from_record(Layout, laid))
-    return {**record, "fields": {**named[1], "option_text": writing}}
-
-
-def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record with its decision segments and its trainer's numerics in today's shapes
-    (`earlier_run`), its optimizer's as it was."""
-    fields = record.get("fields")
-    segments = fields.get("segments") if isinstance(fields, Mapping) else None
-    if isinstance(fields, Mapping) and isinstance(segments, list):
-        # A decision run's row of segments, each component in today's fields (`earlier_fields`): the
-        # segments alone, where a layout's components are, never a field of data a row holds.
-        migrated = earlier_fields(_records.json_value(segments, "segments"))
-        assert isinstance(migrated, list)
-        fields = {**fields, "segments": migrated}
-        record = {**record, "fields": fields}
-    if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
-        return record
-    trainer, fields = dict(fields["trainer"]), dict(fields)
-    stated = {name: fields.pop(name) for name in ("pretrained_param_dtype", "param_dtype") if name in fields}
-    if "precision" in trainer:
-        if "attention_form" in trainer or stated:
-            raise ValueError(f"a saved run records {sorted({'attention_form'} & set(trainer) | set(stated))} "
-                             "beside its trainer's precision, which holds them now")
-        return record
-    if "attention_form" not in trainer and "dynamic_scale" not in trainer and not stated:
-        return record
-    policy: dict[str, object] = {"dtypes": {"compute": earlier_compute(record)}}
-    if "attention_form" in trainer:
-        policy["forms"] = trainer.pop("attention_form")
-    stored = next(iter(stated.values()), None)
-    # The storage named a loaded checkpoint's alone, which a run that loads none never read.
-    if stored is not None and fields.get("pretrained") is not None:
-        source = fields.get("source")
-        fields["source"] = {**(source if isinstance(source, Mapping) else {}), "param_dtype": stored}
-    return {**record, "fields": {**fields, "trainer": {**trainer, "precision": policy}}}
-
-
-EARLIER_CAPTURE = ("host_tracer_level", "python_tracer_level", "activity_cap")
-"""The capture options a profile window held as its own fields until it held its capture's
-(`dew.training.ProfileWindow.capture`, row 2932)."""
-
-
-def earlier_profile(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record whose trainer's profile window states its capture's options as its own fields
-    (`EARLIER_CAPTURE`), with them its capture's, as it captured with them; and one saved before a run's
-    own window was its `run_profile` (row 4255): its window naming no directory (PF01 to train 610's) as
-    its `run_profile`, its steps, warmup and capture kept, and no window at all as none of its own, as it
-    traced none. A window that states its capture beside them is as it was, its fields refused by name.
-    Carried to 1.0 (ledger 1552)."""
-    fields = record.get("fields")
-    trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
-    inner = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else None
-    window = inner.get("profile") if isinstance(inner, Mapping) else None
-    stated = window.get("fields", window) if isinstance(window, Mapping) else None
-    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(inner, Mapping):
-        return record
-    own_window = isinstance(stated, Mapping) and stated.get("directory", "") is None
-    if "run_profile" not in inner and "profile" in inner and (window is None or own_window):
-        # Saved before a run's own window was its `run_profile`: no window traced none, and a window
-        # naming no directory was the run's own, its steps, warmup and capture its own's (its reports
-        # none, a run's own window's trace and manifest alone).
-        own = ({name: stated[name] for name in ("steps", "warmup", "capture") if name in stated}
-               if isinstance(stated, Mapping) else None)
-        inner = {**inner, "profile": None, "run_profile": own}
-        trainer = {**trainer, "fields": inner} if "fields" in trainer else inner
-        return {**record, "fields": {**fields, "trainer": trainer}}
-    if (not isinstance(window, Mapping) or not isinstance(stated, Mapping) or "capture" in stated
-            or not set(EARLIER_CAPTURE) & set(stated)):
-        return record
-    capture = {name: stated[name] for name in EARLIER_CAPTURE if name in stated}
-    stated = {**{name: value for name, value in stated.items() if name not in EARLIER_CAPTURE},
-              "capture": capture}
-    window = {**window, "fields": stated} if "fields" in window else stated
-    inner = {**inner, "profile": window}
-    trainer = {**trainer, "fields": inner} if "fields" in trainer else inner
-    return {**record, "fields": {**fields, "trainer": trainer}}
-
-
-EARLIER_NS_PRECISIONS = {"bfloat16": None, "tensorfloat32": "TF32_TF32_F32", "float32": "F32_F32_F32"}
-"""A Muon or M3 run's `ns_precision` as it was recorded while it named a matmul precision level (ledger
-2637), by the dot algorithm it names now: bfloat16 the run's numerics' own (None), the others their
-algorithms."""
-
-
-def earlier_newton_schulz(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record whose optimizer's options name Muon's Newton-Schulz precision by an earlier
-    level's name (`EARLIER_NS_PRECISIONS`), with it named as a dot algorithm, or dropped where it was the
-    numerics' own: bfloat16 is the fast forms' own, and stated as `BF16_BF16_F32` where the run's forms
-    are accurate (`saved_forms`), whose own is float32 (row 2753). Carried to 1.0 (ledger 1552)."""
-    fields = record.get("fields")
-    optim = fields.get("optim") if isinstance(fields, Mapping) else None
-    inner = optim.get("fields", optim) if isinstance(optim, Mapping) else None
-    opts = inner.get("optimizer_opts") if isinstance(inner, Mapping) else None
-    named = opts.get("ns_precision") if isinstance(opts, Mapping) else None
-    if not isinstance(fields, Mapping) or not isinstance(optim, Mapping) or not isinstance(inner, Mapping) \
-            or not isinstance(opts, Mapping) or named not in EARLIER_NS_PRECISIONS:
-        return record
-    trainer = fields.get("trainer")
-    accurate = isinstance(trainer, Mapping) and saved_forms(trainer) == "accurate"
-    algorithm = "BF16_BF16_F32" if named == "bfloat16" and accurate else EARLIER_NS_PRECISIONS[named]
-    opts = {name: value for name, value in opts.items() if name != "ns_precision"}
-    opts = opts if algorithm is None else {**opts, "ns_precision": algorithm}
-    inner = {**inner, "optimizer_opts": opts}
-    optim = {**optim, "fields": inner} if "fields" in optim else inner
-    return {**record, "fields": {**fields, "optim": optim}}
-
-
-def saved_forms(trainer: Mapping[str, object]) -> str:
-    """The forms a saved trainer's numerics name, in today's shapes (`earlier_trainer`): its precision's,
-    a preset's name or a `Numerics` record; the fast ones where it names none."""
-    precision = trainer.get("precision")
-    if isinstance(precision, str):
-        return numerics_of(precision).forms
-    if isinstance(precision, Mapping):
-        return from_record(Numerics, precision).forms
-    return "fast"
-
-
-def earlier_compute(record: Mapping[str, object]) -> str:
-    """The dtype a run saved before its numerics computed in: its model's stated dtype, where it states
-    one; else bfloat16 where it loaded a language model or a diffusion pipeline, as those mains loaded
-    them; else float32, Flax's own for a model drawn fresh and a decision run's backbone."""
-    from dew.config.diffusion import DiffusionRunConfig
-    from dew.config.lm import LMRunConfig
-
-    fields = record.get("fields")
-    assert isinstance(fields, Mapping)
-    model = fields.get("model")
-    stated = model.get("fields", {}).get("dtype") if isinstance(model, Mapping) else None
-    if isinstance(stated, str):
-        return stated
-    named = record.get("class")
-    kind = registry.runs[named] if isinstance(named, str) else None
-    loads = fields.get("pretrained") is not None and isinstance(kind, type) and issubclass(
-        kind, LMRunConfig | DiffusionRunConfig)
-    return "bfloat16" if loads else "float32"
-
 
 
 def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | None:
@@ -1352,6 +1151,12 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     return held
 
 
+def _without(record: Mapping[str, JSON], names: tuple[str, ...]) -> dict[str, JSON]:
+    """`record` without a field of `names` wherever it nests one: a wrapper's language model's, a decision
+    run's backbone's among them (`_records.without_fields`)."""
+    return {key: _records.without_fields(value, names) for key, value in record.items() if key not in names}
+
+
 def _holds(config: "RunConfig", path: str) -> bool:
     """Whether `config` holds every record along the dotted `path` up to its field: false past an optional
     record it holds none of (a teacher of None)."""
@@ -1434,6 +1239,11 @@ class RunConfig:
     and scores, and, in a kind of run that adds them, how it previews. Every other field says what
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
+
+    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers",)
+    """The model and source fields, by name, that say how a model's layers execute and not what they
+    compute or store: a decoder's runs under one scan or a layer at a time hold the same layers on disk
+    (`layers_N`) and compute the same step, so a run resumes under either (`check_resume`)."""
 
     BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
@@ -1534,20 +1344,20 @@ class RunConfig:
         their chains' records (`dew.data.records.encode`), and a chain the
         codec cannot describe is `{"unrecorded": reason}`.
         """
-        return {**self._fields_record(), **{name: _chain_record(getattr(self, name)) for name in _CHAINS}}
+        return {**self._fields_record(), **{name: _chain_record(getattr(self, name)) for name in CHAINS}}
 
     def unrecorded(self) -> list[str]:
         """Why each of the run's chains is not recorded, none where its record can rebuild them all:
         a run built in Python with a step the record cannot describe trains as built, and its
         run.json, which says why, refuses to rebuild it."""
-        return [reason for name in _CHAINS for reason in _unrecorded(getattr(self, name))]
+        return [reason for name in CHAINS for reason in _unrecorded(getattr(self, name))]
 
     def _fields_record(self) -> dict[str, JSON]:
         """The record of every field but the chains (`to_dict`), which an override of the others
         writes without encoding the chains."""
         with registry.recording():
             return {field.name: to_record(getattr(self, field.name), declared_type(type(self), field.name))
-                    for field in dataclasses.fields(self) if field.name not in _CHAINS}
+                    for field in dataclasses.fields(self) if field.name not in CHAINS}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
@@ -1558,7 +1368,7 @@ class RunConfig:
         main's fields reads as its checkpoint's record does."""
         from dew.inference.tasks import earlier_model
 
-        rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        rest = {name: value for name, value in values.items() if name not in CHAINS}
         trainer = rest.get("trainer")
         fields = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else {}
         stop = fields.get("stop")
@@ -1571,7 +1381,7 @@ class RunConfig:
         # record does (`earlier_model`, ledger 2423).
         if isinstance(rest.get("model"), Mapping):
             rest["model"] = earlier_model({"model": rest["model"]})["model"]
-        chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
+        chains = {name: _read_chain(name, values[name]) for name in CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 
     def override(self, point: Mapping[str, JSON]) -> Self:
@@ -1586,7 +1396,7 @@ class RunConfig:
         row batch) are one point; each path is placed in this config, so a path
         under `model` names an argument of the model this config holds.
         """
-        chained = {path: value for path, value in point.items() if path.partition(".")[0] in _CHAINS}
+        chained = {path: value for path, value in point.items() if path.partition(".")[0] in CHAINS}
         record = self._fields_record()
         for path, value in point.items():
             if path in chained:
@@ -1596,7 +1406,7 @@ class RunConfig:
             for group in groups:
                 node = _within(node, group)
             node[field] = value
-        chains = _overridden({name: getattr(self, name) for name in _CHAINS}, chained)
+        chains = _overridden({name: getattr(self, name) for name in CHAINS}, chained)
         # Built once, every field of the point in place, so its checks read the run it describes.
         return dataclasses.replace(type(self).from_dict(record), **chains)
 
@@ -1614,7 +1424,7 @@ class RunConfig:
             if not equals:
                 raise ValueError(f"{assignment!r} sets no value; write path=value, as trainer.steps=2000")
             # A chain's setting is read against its call's signature (`dew.data.records.override`).
-            point[path] = (_flag_json_or_text(text) if path.partition(".")[0] in _CHAINS
+            point[path] = (_flag_json_or_text(text) if path.partition(".")[0] in CHAINS
                            else _parsed(path, text, _placed(self, path)[1]))
         return self.override(point)
 
@@ -1667,8 +1477,11 @@ class RunConfig:
 
     def built_fresh(self) -> None:
         """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
-        `Pretrained.load` builds of a source (`source_keywords`) reaches nothing such a run builds."""
-        if self.source != SourceOptions():
+        `Pretrained.load` builds of a source (`source_keywords`) reaches nothing such a run builds. How
+        its layers execute (`EXECUTED`), which a saved run records whatever its source, is no such word."""
+        unsourced = SourceOptions()
+        executed = {name: getattr(unsourced, name) for name in self.EXECUTED if hasattr(unsourced, name)}
+        if dataclasses.replace(self.source, **executed) != unsourced:
             raise ValueError(f"--source says what a run builds of the source it loads, and this "
                              f"{type(self).__name__} loads none: its model is built from --model, whose "
                              "own fields say it; or start the run from a source")
@@ -1693,7 +1506,8 @@ class RunConfig:
         if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        before, now = recorded._fields_record(), self._fields_record()
+        before, now = (_without(record, self.EXECUTED)
+                       for record in (recorded._fields_record(), self._fields_record()))
         # A field the saved run left to its build and its record holds unresolved, which no checkpoint
         # states either (`earlier_option_writing`), is the one this build resolves (`BUILT`).
         unresolved = {path for path in self.BUILT if "." not in path and before.get(path) is None}
@@ -1716,7 +1530,7 @@ class RunConfig:
         named = registry.class_record(saved)
         if named is None or registry.runs[named[0]] is not type(self):
             return None
-        return type(self).from_dict({name: value for name, value in named[1].items() if name not in _CHAINS})
+        return type(self).from_dict({name: value for name, value in named[1].items() if name not in CHAINS})
 
     @staticmethod
     def _saved_record(directory: str, checkpoints: Checkpoints) -> Mapping[str, object] | None:
@@ -1849,13 +1663,21 @@ class RunConfig:
         earlier shape of a saved run is (`earlier_run`), and its data plan version, where it resumes no
         run that recorded one, this Dew's (`PLAN_VERSIONS`): the one place a run's version is resolved,
         on each path a run trains by (`prepare`, and `readied`, which a run trained in Python reaches
-        alone), before its data compiles or its record is written. Its other fields as they are where it
-        resumes no run (`TrainerConfig.resumes`) or leaves none to its build."""
+        alone), before its data compiles or its record is written; and, resolving every field (no
+        `paths`), as `prepare` does before it builds them, each class it names, its model's and its
+        objective's, with every argument it leaves unstated as the saved run recorded it
+        (`_defaulted_as`), so a default changed since resumes the run as it trained (row 2938); an
+        objective built already is compared as built (`check_resume`). Its other fields as they are where
+        it resumes no run (`TrainerConfig.resumes`)."""
         trainer = self.trainer
         built = self.BUILT if paths is None else paths
         unset = [path for path in built if _holds(self, path) and _recorded_at(self, path) is None]
         run = self
-        if unset and trainer.name is not None and trainer.resume != "never" and trainer.resumes():
+        # The classes' defaults are resolved where the run builds its objective and model from them
+        # (`prepare`, every field), never where they are built already (`readied`'s data plan version).
+        defaulting = paths is None
+        if ((unset or defaulting) and trainer.name is not None and trainer.resume != "never"
+                and trainer.resumes()):
             with trainer.checkpoints(trainer.name) as checkpoints:
                 saved = self._saved_record(trainer.directory(trainer.name), checkpoints)
             recorded = None if saved is None else self._saved_as(saved)
@@ -1863,9 +1685,23 @@ class RunConfig:
             if recorded is not None:
                 run = self.override({path: _recorded_at(recorded, path) for path in unset
                                      if _holds(recorded, path)})
+                run = run._defaulted_as(recorded) if defaulting else run
         if "data_plan_version" in built and run.data_plan_version is None:
             run = dataclasses.replace(run, data_plan_version=PLAN_VERSIONS[-1])
         return run
+
+    def _defaulted_as(self, recorded: Self) -> Self:
+        """This run with each class it names (`Registered`: its model, its objective) that `recorded`, the
+        saved run it resumes, names too, defaulting every argument it leaves unstated as `recorded` did:
+        the defaults a run records are the ones it trained under (`Registered.defaults`), and an argument
+        the class gained since keeps the default it takes now."""
+        changed = {}
+        for field in dataclasses.fields(self):
+            mine, theirs = getattr(self, field.name), getattr(recorded, field.name, None)
+            if isinstance(mine, Registered) and isinstance(theirs, Registered) and mine.name == theirs.name:
+                kept = {name: value for name, value in theirs.defaults.items() if name not in mine.fields}
+                changed[field.name] = dataclasses.replace(mine, defaults={**mine.defaults, **kept})
+        return dataclasses.replace(self, **changed) if changed else self
 
     def build_run(self) -> Prepared:
         """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
@@ -2433,6 +2269,6 @@ def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | No
     return dataclasses.replace(start, model=looped)
 
 
-__all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "RunConfig", "SourceOptions",
-           "TrainerConfig",
+__all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "Release", "RunConfig",
+           "SourceOptions", "TrainerConfig",
            "flag_selected", "looping"]

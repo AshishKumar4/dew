@@ -61,7 +61,9 @@ class Derived(NamedTuple):
     (the carry, and a chunk's outputs from the state entering it); its `backward(tiles, state, d_state,
     d_outputs)` is a chunk's adjoint: the cotangent of the state entering it and of each of its operands, from
     the state entering it and the cotangents of the state leaving it and of its outputs (a reduction's
-    backward is a declaration of its own, None here). A reduction's `slots(shapes)` names each carried state's
+    backward is a declaration of its own, None here), the derivative of its `replay(tiles, h)`, the chunk
+    walked token by token from the state `h` entering it: its outputs and the state leaving it, which forward
+    mode differentiates too. A reduction's `slots(shapes)` names each carried state's
     role (`max`, `sum`, `contraction`: the reduction that made it) and shape in the state's order, so a
     template holds each where its mainloop holds that value; its `step(state, tiles, product=, stepped=,
     outputs=)` takes a mainloop's own matrix product (`evaluator`) and its own step (`stepped(states,
@@ -86,6 +88,7 @@ class Derived(NamedTuple):
     backward: Callable | None = None
     prepare: Callable = lambda tiles: tiles
     slots: Callable | None = None
+    replay: Callable | None = None
 
 
 class Program(Protocol):
@@ -216,8 +219,8 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
             default = branches[-1]
             operands = [read(atom) for atom in equation.invars[1:]]
             outs = evaluated_inline(default.jaxpr, default.consts, operands)
-        elif equation.primitive.name in ("jit", "pjit", "closed_call"):
-            called = equation.params.get("jaxpr") or equation.params["call_jaxpr"]
+        elif (called := programs.called(equation)) is not None:
+            # A call's program (`dew.nn.programs.called`), its constants with it.
             outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])
         elif equation.primitive.name in PLACEMENTS:
             # Its values its operands': a tile a walk reads is placed already.

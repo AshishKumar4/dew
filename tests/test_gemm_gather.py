@@ -1,5 +1,6 @@
 """The GEMM template's gathered rows (row 1376): a grouped product whose rows are read from the tokens where a
-table says, a mixture of experts' sort fused into the rows' loads (`mosaic_gpu.gmm`'s `gather`)."""
+table says, a mixture of experts' sort fused into the rows' loads (`mosaic_gpu.gmm`'s `gather`), and a kernel
+gradient's operands read so (`mosaic_gpu.tgmm`'s)."""
 
 import dataclasses
 import functools
@@ -109,6 +110,140 @@ def test_a_gathered_product_lowers_for_cuda(paired):
     with generation.assumed("sm90"):
         jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
                                 jax.ShapeDtypeStruct((2, 4, 512, 256), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((2048,), jnp.int32)).lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.parametrize("splits", [1, 2])
+def test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_says(splits):
+    """`a_gathered_kernel_gradient_is_its_gathered_rows_gradient` on an H100, interpreted; a gathered operand
+    beside a prologue on the rows, and on mma.sync (no producer warpgroup), refused."""
+    with generation.assumed("sm90"):
+        tokens, cotangent, table = a_gathered_kernel_gradient_is_its_gathered_rows_gradient(
+            grouped_matmul.INTERPRETED, splits)
+        with pytest.raises(ValueError):
+            mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
+                            tiles=mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
+                            out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
+                            gather=(table, None), prologue=lambda rows: rows)
+    with generation.assumed("sm80"), pytest.raises(ValueError):
+        mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
+                        tiles=mosaic_gpu.Tiles(128, 128, 32, 3, 1, family="mma.sync"), out_dtype=jnp.float32,
+                        multiprocessors=4, interpret=grouped_matmul.INTERPRETED, gather=(table, None))
+
+
+def a_gathered_kernel_gradient_is_its_gathered_rows_gradient(interpret=False, splits: int = 1) -> tuple:
+    """A kernel gradient's gathered operands (`mosaic_gpu.tgmm`'s `gather`, row 1376: the tokens a mixture of
+    experts' slots read, and a scattered product's cotangent at its slots), bitwise the same tile's gradient
+    of the rows gathered first, the tokens' rows alone and both operands', its groups ragged, one empty, rows
+    past them, its depth split or not, at 257 rows (a table padded to whole steps, an ungathered operand to
+    8 rows). Integers, every sum exact. Its tokens, cotangent and table."""
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma', splits=splits)
+    sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
+    rng = np.random.default_rng(11)
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(200, 256)), jnp.bfloat16)
+    table = rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 107)]))
+    table = jnp.asarray(table, jnp.int32)
+    cotangent = jnp.asarray(rng.integers(-3, 4, size=(257, 128)), jnp.bfloat16)
+    slots = jnp.asarray(rng.permutation(257), jnp.int32)
+    gradient = jax.jit(functools.partial(mosaic_gpu.tgmm, group_sizes=sizes, tiles=tiles,
+                                         out_dtype=jnp.float32, multiprocessors=4 if interpret else 132,
+                                         interpret=interpret))
+    for tables, rows, columns in (((table, None), tokens[table], cotangent),
+                                  ((table, slots), tokens[table], cotangent[slots])):
+        np.testing.assert_array_equal(np.asarray(gradient(tokens, cotangent, gather=tables)),
+                                      np.asarray(gradient(rows, columns)))
+    return tokens, cotangent, table
+
+
+def test_a_gathered_kernel_gradients_key_meets_its_table_and_rows_at_one_count():
+    """A gathered kernel gradient's key (`_GroupedLaunch.keyed`, the call a tuning run materializes and
+    times) buckets its table as it buckets its ungathered operand's rows, 500 to 512 each, so the launch it
+    measures takes its own operands; the gathered tokens keep a count of their own."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    with generation.assumed("sm90"):
+        launch = grouped_matmul.MosaicTgmm()
+        table = jax.ShapeDtypeStruct((500,), jnp.int32)
+        ba = launch.bind(bf16((100, 256)), bf16((500, 128)), jax.ShapeDtypeStruct((4,), jnp.int32), (),
+                         (table, None), out_dtype="float32", interpret=False)
+        keyed = launch.keyed(ba).arguments
+    assert keyed["gather"][0].shape == (512,) and keyed["gather"][1] is None
+    assert keyed["cotangent"].shape[0] == 512 and keyed["tokens"].shape[0] == 128
+
+
+def test_a_gathered_kernel_gradient_lowers_for_cuda():
+    """A kernel gradient of gathered tokens and a scattered product's cotangent on a compile-only H100
+    lowers through Mosaic GPU: each operand's ring its producer's cp.async gather (`gathered.Ring`, a step's
+    rows by the gradient's depth or width)."""
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+    sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
+
+    def gathered(tokens, cotangent, table, slots):
+        return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=tiles, out_dtype=jnp.float32,
+                               multiprocessors=132, interpret=False, gather=(table, slots))
+
+    with generation.assumed("sm90"):
+        jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((2048, 256), jnp.bfloat16),
+                                *(jax.ShapeDtypeStruct((2048,), jnp.int32),) * 2).lower(
+                                    lowering_platforms=("cuda",))
+
+
+def test_a_blackwells_gathered_product_reads_its_rows_by_its_load_warps_gathers():
+    """`a_blackwells_gathered_product_is_its_gathered_rows_product` on an sm100, interpreted (each row a copy
+    where the GPU's load warp gathers four)."""
+    with generation.assumed("sm100"):
+        a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu=True)
+
+
+def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu: bool = False):
+    """A gathered, scattered grouped product on a Blackwell GPU (row 1376): tcgen05's bundle takes it (its
+    load warp's TMA four-row gathers, `gathered.Committed`), its value bitwise the product of the rows
+    gathered first and put at their slots after. Integers, every sum exact in the bf16 output."""
+    from dew.nn.kernels import gemm
+
+    rng = np.random.default_rng(13)
+    tokens = jnp.asarray(rng.integers(-1, 2, size=(200, 256)), jnp.bfloat16)
+    matrices = jnp.asarray(rng.integers(-1, 2, size=(3, 256, 256)), jnp.bfloat16)
+    table = jnp.asarray(rng.integers(0, 200, 384), jnp.int32)
+    slots = jnp.asarray(rng.permutation(384), jnp.int32)
+    sizes = jnp.asarray([128, 0, 200], jnp.int32)
+    options = {"out_dtype": jnp.bfloat16, "precision": "default", "interpret_on_cpu": interpret_on_cpu}
+    derived, original = [], mosaic_gpu.gmm
+
+    def recorded(*args, tiles, **kwargs):
+        derived.append(tiles)
+        return original(*args, tiles=tiles, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(mosaic_gpu, "gmm", recorded)
+        got = jax.jit(lambda: gemm.gemm(tokens, matrices, sizes, gather=table, scatter=slots, **options))()
+        assert {tile.family for tile in derived} == {"tcgen05"}
+        apart = jax.jit(lambda: gemm.gemm(tokens[table], matrices, sizes, **options))()
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.zeros_like(apart).at[slots].set(apart)))
+
+
+def test_a_blackwells_gathered_product_lowers_for_cuda():
+    """A gathered grouped product on a compile-only B200 lowers through Mosaic GPU on tcgen05's bundle: its
+    load warp's TMA four-row gathers into the swizzled ring (`gathered.tma_rows`), each slot released by its
+    products' commit. A gathered block-scaled product is refused: its loads read the rows' scales in the
+    rows' order, not gathered."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+    refused = functools.partial(mosaic_gpu._tables_refused, jnp.zeros((256,), jnp.int32), None, tiles,
+                                mosaic_sm100.RINGS, prologue=None, dense=False, transpose_lhs=False)
+    refused(block_scaled=False)
+    with pytest.raises(ValueError):
+        refused(block_scaled=True)
+    sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
+
+    def gathered(tokens, matrices, table):
+        return mosaic_gpu.gmm(tokens, matrices, sizes, tiles=tiles, transpose_rhs=False,
+                              out_dtype=jnp.bfloat16, multiprocessors=148, interpret=False, gather=table)
+
+    with generation.assumed("sm100"):
+        jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((4, 512, 256), jnp.bfloat16),
                                 jax.ShapeDtypeStruct((2048,), jnp.int32)).lower(lowering_platforms=("cuda",))
 
 

@@ -252,16 +252,10 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     (ids,) = draw(0)
     ours = np.asarray(loaded.model.apply(loaded.variables, ids))
     loaded.save(tmp_path / "export")
-    exports = [tmp_path / "export"]
-    if name == "nemotron-h-tiny":
-        # Nemotron-H writes its hybrid pattern only from its source (`preserve_source_layout`):
-        # written from the model alone, the export refuses rather than drop the pattern.
-        with pytest.raises(ValueError):
-            PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
-    else:
-        # Written from the model and its variables alone too, as a trained run exports.
-        PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
-        exports.append(tmp_path / "from_model")
+    # Written from the model and its variables alone too, as a trained run exports: Nemotron-H's hybrid
+    # pattern among its fields (`nemotron_h.CONFIG`).
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
+    exports = [tmp_path / "export", tmp_path / "from_model"]
     for export in exports:
         again = Pretrained.load(export, dtype="float32", attention_impl="reference")
         reloaded = np.asarray(again.model.apply(again.variables, ids))
@@ -557,6 +551,10 @@ _YARN_SOURCES = (
     # The Nemotron-H releases that carry their own remote code name the head width attention_head_dim.
     ("nemotron-h-tiny", lambda config: {**_without("head_dim")(config),
                                         "attention_head_dim": config["head_dim"]}),
+    # NemotronHConfig reads a legacy name over the field's own where a config states both
+    # (configuration_nemotron_h.py:145-162).
+    ("nemotron-h-tiny", lambda config: {**config, "mamba_n_groups": config["n_groups"],
+                                        "n_groups": 2 * config["n_groups"]}),
     ("llada-tiny", _without("n_kv_heads", "head_dim")),
     # Glm4MoeConfig fills an absent factor with half the head, the fixture's own.
     ("glm4-moe-tiny", lambda config: {**_without("partial_rotary_factor")(config),
@@ -589,6 +587,17 @@ def test_a_config_whose_class_names_no_value_for_an_unstated_field_is_refused(na
     read at another family's default."""
     with pytest.raises(ValueError):
         fp32_decoder(_respelled(name, tmp_path, edit))
+
+
+def test_a_deepseek_config_that_routes_no_layer_reads_its_routers_fields_to_no_effect():
+    """A DeepSeek V3 config whose dense layers are every layer routes none, as DeepseekV3DecoderLayer
+    builds it: its experts' and router's fields, the serialized training ones among them, describe nothing
+    it computes and read to no effect."""
+    config = json.loads((FIXTURES / "deepseek-v3-tiny" / "config.json").read_text())
+    dense = translate_config({**config, "first_k_dense_replace": config["num_hidden_layers"],
+                              "norm_topk_prob": True, "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+                              "aux_loss_alpha": 0.001, "seq_aux": True})
+    assert dense["mixture"] is None
 
 
 def test_a_dense_llada_config_without_a_base_rotates_at_its_classs_10000(tmp_path):

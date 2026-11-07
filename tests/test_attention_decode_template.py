@@ -57,6 +57,18 @@ def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64):
     return draw
 
 
+def _operands(query_shape: tuple[int, ...], keys: int):
+    """A draw of bf16 queries `query_shape` `[rows, T, 8, 64]` and two rows' keys and values over `keys`, two
+    heads 64 wide."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], query_shape, jnp.bfloat16)
+        key, value = (jax.random.normal(stream, (2, keys, 2, 64), jnp.bfloat16) for stream in streams[1:])
+        return query, key, value
+
+    return draw
+
+
 @INTERPRETS
 @pytest.mark.parametrize("hook", HOOKS)
 @pytest.mark.parametrize("call", CALLS)
@@ -179,12 +191,7 @@ def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_inter
     decode at fp32's edges)."""
     keys = 4096
     spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, 0], jnp.int32))
-
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        query = jax.random.normal(streams[0], (2, 1, 8, 64), jnp.bfloat16)
-        key, value = (jax.random.normal(stream, (2, keys, 2, 64), jnp.bfloat16) for stream in streams[1:])
-        return query, key, value
+    draw = _operands((2, 1, 8, 64), keys)
 
     def ours(query, key, value):
         with generation.assumed("sm90"):
@@ -212,14 +219,8 @@ def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted():
     def reference(query, key, value):
         return template.reference(query, key[sources], value[sources], spans)
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        query = jax.random.normal(streams[0], (3, 4, 8, 64), jnp.bfloat16)
-        key, value = (jax.random.normal(stream, (2, KEYS, 2, 64), jnp.bfloat16) for stream in streams[1:])
-        return query, key, value
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode over a work list's rows",
-                    seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _operands((3, 4, 8, 64), KEYS),
+                    "template decode over a work list's rows", seeds=SEEDS)
 
 
 @INTERPRETS
