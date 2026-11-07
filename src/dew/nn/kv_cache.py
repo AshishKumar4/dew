@@ -683,8 +683,7 @@ class KVStore:
                 else not _converts(self.layout.quantized)):
             return False
         if self.layout.page_size is None:
-            family = attention_mosaic_program.bundle(generation.gpu_target().generation, query.dtype,
-                                                     query.shape[1] * query.shape[2] // pool.shape[2])
+            family = attention_mosaic_program.bundle(generation.gpu_target().generation, query.dtype)
             return family is not None
         case = PagedCase(heads=query.shape[2], kv_heads=pool.shape[0], head_dim=query.shape[3],
                          value_dim=self._get(self.payloads[-1][0]).shape[-1], dtype=query.dtype,

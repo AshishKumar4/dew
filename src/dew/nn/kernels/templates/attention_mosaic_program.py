@@ -24,9 +24,6 @@ from dew.nn.kernels.templates import (
     bundles,
     layout,
     mosaic,
-    mosaic_sm80,
-    mosaic_sm90,
-    mosaic_tpu,
     operands,
     resources,
 )
@@ -47,16 +44,6 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.programs import CALLS, equations
-
-QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name, mosaic_sm80.Mma.name,
-                       mosaic_tpu.MXU.name})
-"""The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
-feed their own rings (`mosaic_sm90.FED`); mma.sync's staged by cp.async (an A100's: every launch it derives
-compiles spill-free, the resource gate's sm80 cases, `GATED`; row 2078: check 1 held there,
-ET-2078-A100CHECK3); and a TPU core's MXU (`mosaic_tpu.MXU`: every launch written against the family's
-seams, its forward, training forward and backward on par interpreted for a v5e). mma.sync's fed bundle
-(`bundles.MmaFed`, consumer Blackwell's) takes a launch of fewer rows than a role's (`few_rows`) until its
-gate holds."""
 
 
 def few_rows(family: mosaic.Family, rows: int | None) -> bool:
@@ -79,19 +66,21 @@ def fewer_rows(family: mosaic.Family) -> tuple[int, ...]:
                  if family.role_rows % rows == 0 and family.specialized(rows, rows) != family)
 
 
-def qualified(family: mosaic.Family, rows: int | None = None) -> bool:
-    """Whether the attention mainloop runs a launch of `rows` rows on `family`: a qualified bundle
-    (`QUALIFIED`), or one taking them at tiles of fewer rows than its role's (`few_rows`)."""
-    return family.name in QUALIFIED or few_rows(family, rows)
+def qualified(family: mosaic.Family) -> bool:
+    """Whether the attention mainloop runs on `family`: one whose consumers issue their products
+    (`Family.issues_in_consumers`), whose walk's softmax and its rescales run between them in the registers
+    that hold them (wgmma's, mma.sync's, a TPU core's MXU); not tcgen05's, one warp issuing them into tensor
+    memory, which the Blackwell template walks (`attention_blackwell`)."""
+    return family.issues_in_consumers
 
 
-def bundle(generation_name: str | None, dtype, rows: int | None = None) -> mosaic.Family | None:
-    """The bundle the attention mainloop runs on a device of `generation_name` for operands of `dtype` and a
-    launch of `rows` rows: the shared registry's (`bundles.of`) where attention is qualified on it
-    (`qualified`); None elsewhere, whose calls another mainloop takes by legality."""
+def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
+    """The bundle the attention mainloop runs on a device of `generation_name` for operands of `dtype`: the
+    shared registry's (`bundles.of`) where attention is qualified on it (`qualified`); None elsewhere, whose
+    calls another mainloop takes by legality."""
     # Every launch of the mainloop is written against the family's seams, a TPU core's among them (`tpu`).
     family = None if generation_name is None else bundles.of(generation_name, dtype, tpu=True)
-    return family if family is not None and qualified(family, rows) else None
+    return family if family is not None and qualified(family) else None
 
 
 def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tuple[mosaic.Family, ...]:
@@ -102,7 +91,7 @@ def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tupl
     if generation_name is None:
         return ()
     return tuple(family for family in bundles.layouts(generation_name, dtype, rows, tpu=True)
-                 if qualified(family, rows))
+                 if qualified(family))
 
 
 def query_rows(family: mosaic.Family, dtype, rows: int) -> int:
