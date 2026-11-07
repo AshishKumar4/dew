@@ -63,9 +63,16 @@ from dew.interop.pipeline_assembly import (
     text_components,
 )
 from dew.interop.processors import Processor, hosts
-from dew.interop.release import load_settings, release_record
+from dew.interop.release import load_settings, with_rounding
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
-from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
+from dew.interop.saved_sources import (
+    RunPipeline,
+    native_release,
+    native_source,
+    pinned_run,
+    pipeline_of_run,
+    released_source,
+)
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.interop.wrappers import corrected
@@ -87,7 +94,6 @@ from dew.registry import (
     record_fields,
     resolve_dtype,
     towers,
-    trust_sources,
     trusts_source,
 )
 from dew.sampling.text import Sampling, with_ids_of
@@ -96,6 +102,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.inference.tasks import SavedRun, TaskSettings
+    from dew.interop.releases import ReleasePlan
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.attention import AttentionImpl
@@ -474,10 +481,9 @@ class Pretrained:
              step: int | str | None = None, ema: bool | None = None) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
-        `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
-        projector weights keep their usual internal paths, and a wrapper's variables
-        join under its existing component names. Processor files are loaded only when
-        the source has them.
+        `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and projector weights keep
+        their usual internal paths, and a wrapper's variables join under its existing component names.
+        Processor files are loaded only when the source has them.
 
         `dtype` sets the compute dtype, and `param_dtype` separately sets the storage
         dtype of floating parameters: BF16 over FP32 master weights unless stated, or an exported
@@ -555,8 +561,37 @@ class Pretrained:
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
         A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
-        name_or_dir, trust_remote_code = _released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
-                                                          mesh=mesh, layout=layout)
+        name_or_dir, trust_remote_code = released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
+                                                         mesh=mesh, layout=layout)
+        if native_release(name_or_dir):
+            # A run's native release builds the model its run recorded (`saved_sources.native_source`).
+            return native_source(cls, name_or_dir, mesh=mesh, layout=layout, dtype=dtype,
+                                 param_dtype=param_dtype, on_host=on_host, building={
+                "attention_impl": attention_impl != "auto", "max_seq_len": max_seq_len, "revision": revision,
+                "subfolder": subfolder, "gguf_file": gguf_file, "single_file": single_file,
+                "dduf_file": dduf_file, "fallback": fallback, "text_only": text_only,
+                "modeling_overrides": modeling_overrides or None, "prediction_depths": prediction_depths,
+                "dex": dex, "precision": precision, "scan_layers": scan_layers})
+        return cls._from_family(
+            name_or_dir, trust_remote_code, dtype=dtype, param_dtype=param_dtype,
+            attention_impl=attention_impl, max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,
+            gguf_file=gguf_file, single_file=single_file, dduf_file=dduf_file, fallback=fallback, mesh=mesh,
+            layout=layout, on_host=on_host, weights=weights, modeling_overrides=modeling_overrides,
+            text_only=text_only, prediction_depths=prediction_depths, dex=dex, precision=precision,
+            scan_layers=scan_layers)
+
+
+    @classmethod
+    def _from_family(cls, name_or_dir: str | Path, trust_remote_code: bool, *,
+                     dtype: DTypeLike | None, param_dtype: DTypeLike | Literal["auto"] | None,
+                     attention_impl: AttentionImpl, max_seq_len: int | None, revision: str | None,
+                     subfolder: str | None, gguf_file: str | None, single_file: str | None,
+                     dduf_file: str | None, fallback: str | None, mesh: MeshSpec | Mesh | None,
+                     layout: Layout | None, on_host: bool, weights: bool,
+                     modeling_overrides: Mapping[str, object] | None, text_only: bool,
+                     prediction_depths: int | None, dex: DifferentialExtension | None,
+                     precision: Numerics | str | None, scan_layers: bool) -> Self:
+        """`load` of a source a family's loader reads, its every option as `load` states it."""
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
@@ -566,16 +601,17 @@ class Pretrained:
             sources.SourceReference(str(name_or_dir), revision, subfolder, remote_code=trust_remote_code),
             selected, fallback,
             modeling_overrides)
-        loading = load_settings(reference.directory(directory), numerics, dtype, param_dtype)
+        loading = load_settings(reference.directory(directory), numerics, dtype, param_dtype, max_seq_len)
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file, single_file=single_file,
             dduf_file=dduf_file, placed=placed, streaming=streaming or not weights, weights=weights,
             dtype=loading.dtype, param_dtype=loading.param_dtype, attention_impl=attention_impl,
-            max_seq_len=max_seq_len, overrides=modeling_overrides, trust_remote_code=trust_remote_code,
-            text_only=text_only, prediction_depths=prediction_depths)
+            max_seq_len=loading.max_seq_len, overrides=modeling_overrides,
+            trust_remote_code=trust_remote_code, text_only=text_only, prediction_depths=prediction_depths)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
+        loaded = replace(loaded, model=with_rounding(loaded.model, loading.rounds))
         extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
                                         or reference.subfolder is not None), dex, placed, scan_layers)
         return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
@@ -747,39 +783,37 @@ class Pretrained:
                 "no quantized tensors to write back in it")
         return quantization
 
+    def parts(self, variables: Mapping[str, object] | None = None
+              ) -> dict[str, tuple[Mapping[str, object], Mapping[str, np.ndarray]]]:
+        """`export`'s tensors by the folder of the release that holds them, each with its config: the
+        source's own config.json as published at the root (""), and a bundle's folders each their own
+        (`DecoderFamily.wrapper_folders`), so the release loads as the source did."""
+        tensors = self.export(variables)
+        folders = {decoder_parts.folder_config(folder): folder for folder in _folders(self.config)
+                   if decoder_parts.folder_config(folder) in self.config}
+        root = {key: value for key, value in self.config.items() if key not in folders}
+        parts: dict[str, tuple[Mapping[str, object], Mapping[str, np.ndarray]]] = {
+            "": (root, _folder_part(tensors, "") if folders else tensors)}
+        for key, folder in folders.items():
+            parts[folder] = (dict(_records.record(self.config[key], key)),
+                             _folder_part(tensors, decoder_parts.folder_name(folder, "")))
+        return parts
+
+    def release_plan(self, variables: Mapping[str, object] | None = None) -> ReleasePlan:
+        """This bundle's release (`dew.interop.releases.bundle_plan`), which `save` writes."""
+        from dew.interop.releases import bundle_plan
+
+        return bundle_plan(self, variables)
+
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write `export`'s tensors, the source's own config.json as published, and its tokenizer files,
-        and the source's own Python modules a load ran (`code`), so the directory loads as the source
-        did.
+        """Write its release (`release_plan`): `export`'s tensors, the source's own config.json as published,
+        and its tokenizer files, and the source's own Python modules a load ran (`code`), so the directory
+        loads as the source did.
 
         The tensors are written in shards of at most `max_shard_size`.
         """
-        from dew.interop.safetensors_io import save_hf_layout
-        values = self.variables if variables is None else variables
-        destination = Path(directory)
-        # Either half may refuse the bundle, each before it writes a file, as may the source's code.
-        tensors = self.export(values)
-        modules = {} if self.code is None else sources.code_modules(self.code)
-        decoders.save_export_assets(destination,
-                                    tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
-                                    generation_config=dict(self.generation_config),
-                                    named=self.names_tokenizer,
-                                    release=None if self.settings is None else release_record(
-                                        self.settings, self.numerics, self.model, values))
-        for name, module in sorted(modules.items()):
-            written = destination / name
-            written.parent.mkdir(parents=True, exist_ok=True)
-            written.write_bytes(module.read_bytes())
-        # A bundle's folders each get their own tensors and config back (`DecoderFamily.wrapper_folders`).
-        folders = {decoder_parts.folder_config(folder): folder for folder in _folders(self.config)
-                   if decoder_parts.folder_config(folder) in self.config}
-        for key, folder in folders.items():
-            save_hf_layout(_folder_part(tensors, decoder_parts.folder_name(folder, "")),
-                           dict(_records.record(self.config[key], key)), destination / folder, max_shard_size)
-        save_hf_layout(_folder_part(tensors, "") if folders else tensors,
-                       {key: value for key, value in self.config.items() if key not in folders},
-                       destination, max_shard_size)
+        self.release_plan(variables).write(directory, max_shard_size=max_shard_size)
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
                     private: bool = False, commit_message: str = "Upload dew export",
@@ -1341,28 +1375,6 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
                          source=source if media or gguf_path is None else None,
                          directory=directory if media else None)
     return None
-
-
-def _released_source(name_or_dir: str | Path, asked: bool | None, **release) -> tuple[str | Path, bool]:
-    """The source a load reads, itself or a saved run's release (`released_run`), and whether the load
-    runs its own code (`_runs_code`): a trusted run's release is trusted with it, as the processor's
-    record names the release."""
-    runs = _runs_code(str(name_or_dir), asked)
-    released = released_run(name_or_dir, **release)
-    if runs and released != name_or_dir:
-        trust_sources((str(released),))
-    return released, runs
-
-
-def _runs_code(name: str, asked: bool | None) -> bool:
-    """Whether a load of `name` runs the source's own code: as `asked`, or, where None, as the process
-    trusts the source (`dew.registry.trusts_source`). A load asked to run it trusts the source for the
-    process, so a processor reloaded from its record runs that code too (`load_processor`)."""
-    if asked is None:
-        return trusts_source(name)
-    if asked:
-        trust_sources((name,))
-    return asked
 
 
 def load_processor(source: sources.SourceReference, model: nn.Module) -> Processor | None:
