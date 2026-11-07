@@ -765,7 +765,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
                                            transforms=mosaic.swizzle_transforms(jnp.bfloat16, PADDED))
                                 for _ in range(consumers)),
                 "lefts": {_left_key(depth, dtype): tuple(
-                    plgpu.SMEM((self.rows, depth), dtype, transforms=mosaic.swizzle_transforms(dtype, depth))
+                    plgpu.SMEM((self.rows, depth), dtype,
+                               transforms=mosaic.swizzle_transforms(dtype, mosaic.swizzle_for(dtype, depth)))
                     for _ in range(consumers)) for depth, dtype in dict.fromkeys(lefts)},
                 "done": plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True)}
 
