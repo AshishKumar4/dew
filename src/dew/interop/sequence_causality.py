@@ -36,7 +36,7 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.nn.nested import nested
-from dew.nn.programs import CALLS, CUMULATIVE, ENTRYWISE, KEYS, REDUCTIONS, bodies, jax_name
+from dew.nn.programs import CALLS, CUMULATIVE, ENTRYWISE, KEYS, REDUCTIONS, bodies, jax_name, on_host
 
 CAUSAL_ATTENTION = "causal attention"
 """The rule of a program tier 3's attention runs (`torchax_fallback._dew_attention`, `attested`), causal
@@ -129,9 +129,10 @@ def causality_refusal(closed: core.Jaxpr, tokens: int, length: int,
     held[tokens] = Reads(1, np.arange(length, dtype=np.int64))
     walk = _Walk(length)
     consts = [np.asarray(const) if _small_integer(const) else None for const in closed.consts]
-    # The values it evaluates (indices, their tests) computed now, also where a trace encloses the walk
-    # (a program proven as it is traced, `torchax_fallback.TorchGraph`).
-    with jax.ensure_compile_time_eval():
+    # The values it evaluates (indices, their tests) computed now on this host, also where a trace and its
+    # mesh enclose the walk (a program proven as it is traced, `torchax_fallback.TorchGraph`; a compile-only
+    # mesh's devices run nothing here: `programs.on_host`).
+    with on_host():
         outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
     for index in positional:
         output = outputs[index]

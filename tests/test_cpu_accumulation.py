@@ -293,7 +293,9 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     (`widened_reduction`), traces a platform choice in a process running Dew's test setting
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
     no float64 beside a float32 computation, and no platform choice (ledger 3197: a bias's gradient
-    included). Each is traced afresh, as a process with either setting traces it."""
+    included); but a float32 dense product, which a library's CPU sums no worse than a vectorized dot
+    (`dew.nn.pairwise`, row 4863: its platform choice, and a batch's float64 sum, are the library's
+    own). Each is traced afresh, as a process with either setting traces it."""
     from dew.nn.precision import divided
     from dew.nn.protocols import OutputTable
     from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -316,8 +318,14 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
         return any(var.aval.dtype == jnp.float64 for equation in found
                    for var in (*equation.invars, *equation.outvars) if hasattr(var, "aval"))
 
-    def chosen(found) -> bool:
-        return any(equation.primitive.name == "platform_index" for equation in found)
+    def choices(found) -> int:
+        return sum(equation.primitive.name == "platform_index" for equation in found)
+
+    # The platform choices a library's layer makes of its products alone (row 4863): those of the same
+    # layer with no bias, whose gradient sums no bias.
+    unbiased = Dense(2, use_bias=False)
+    products = choices(traced(jax.grad(lambda params: jnp.sum(unbiased.apply({"params": params}, lhs))),
+                              unbiased.init(jax.random.key(0), lhs)["params"]))
 
     sites = {
         "product": traced(lambda a, b: float32_dot_general(a, b, (((1,), (0,)), ((), ()))), lhs, rhs),
@@ -327,11 +335,15 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
             states, OutputTable(table, vocab_major=True), targets, 1, tile=None)[0], states, table),
     }
     for name, found in sites.items():
-        assert chosen(found) == wide, name
+        if wide:
+            assert choices(found), name
+        else:
+            assert choices(found) == {"product": 1, "bias": products}.get(name, 0), name
+        # Four rows of three: the product's few rows sum blocked and pairwise in float32 (`pairwise._summed`).
         assert float64(found) == wide, name
     # A float64 division is the plain division under either setting.
     with jax.enable_x64(new_val=True):
-        assert not chosen(traced(divided, np.ones(3, np.float64), np.float64(3.0)))
+        assert not choices(traced(divided, np.ones(3, np.float64), np.float64(3.0)))
 
 
 def test_a_narrow_bias_beside_a_wide_product_sums_its_wide_cotangent_before_it_rounds():

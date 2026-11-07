@@ -32,6 +32,7 @@ from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, host_rows, local_rows, mesh_of, request_key
 from dew.nn.kernels.options import program
+from dew.nn.programs import on_host
 from dew.objectives.base import OMITTED, Omitted
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
@@ -1110,7 +1111,8 @@ def _default_grid(process: Process, count: int) -> tuple[float, ...]:
 def _initial(solver, process, grid, x_T, key):
     """The solver's state before a walk's first step, on the concrete `grid`: its checks and tables
     read the grid's values, so this small program is a grid's own and the walk's is every grid's."""
-    with jax.ensure_compile_time_eval():
+    # The grid made on this host, whatever mesh the walk's trace holds (`programs.on_host`).
+    with on_host():
         times = jnp.asarray(grid, jnp.float32)
     return solver.init(x_T, times, process, key=key)
 
