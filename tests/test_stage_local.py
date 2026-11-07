@@ -688,7 +688,7 @@ def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
     model = decoder(scan_layers=True)
     base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
-    batch = shard_batch(token_rows(VOCAB, BATCH, SEQ + 1), MeshSpec(fsdp=2).build(jax.devices()))
+    batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
     stepped = []
     for stage_local in (True, False):
         run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables,

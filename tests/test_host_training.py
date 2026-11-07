@@ -468,7 +468,8 @@ for _ in range(steps):
 jax.block_until_ready(state)
 window = events[before:]
 if directory != "-":
-    trainer.checkpoints.save(int(state.step), state)
+    # Saved on its stored layers, as a run saves it: a one-stage scan's step holds its runs stacked.
+    trainer.checkpoints.save(int(state.step), trainer.stored(state))
     trainer.checkpoints.wait()
 print(json.dumps({"started": started, "step": int(state.step),
                   "leaves": [np.asarray(leaf, np.float64).tolist() for leaf in jax.tree.leaves(

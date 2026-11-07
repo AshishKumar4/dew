@@ -244,7 +244,7 @@ def test_a_scanned_checkpoints_remat_rungs_climb(name):
     the ladder as one a layer at a time does: each rung keeps fewer residual bytes than the rung below it,
     its policy reaching the scan's body, where a rung read before the body traced saved alike (row 4097)."""
     source = loaded(name)
-    _climbs_and_restores(source.model.clone(scan_layers=True), source.variables, (tokens(name),),
+    _climbs_and_restores(source.model.with_scanned_layers(), source.variables, (tokens(name),),
                          method="logits")
 
 
