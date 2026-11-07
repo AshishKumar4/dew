@@ -398,36 +398,86 @@ def _norms_written(fn, *shapes):
     return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(found)
 
 
+def residual_rms(x, branch, w):
+    """A pre-norm block's seam as a plain program writes it: the stream `x + branch`, its RMSNorm, and the
+    stream read on after it."""
+    stream = x + branch
+    return widened_rms(stream, w) + stream
+
+
+def gated_rms(x, gate, w):
+    """Qwen3-Next's gated RMSNorm as a plain program writes it: fp32 statistics, the weight, then the gate's
+    SiLU, cast once."""
+    widened = x.astype(jnp.float32)
+    inverse = jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + 1e-6)
+    return (widened * inverse * w.astype(jnp.float32) * jax.nn.silu(gate.astype(jnp.float32))).astype(x.dtype)
+
+
+def packed_swiglu(gate_up):
+    """A packed gate|up projection's SwiGLU as a plain program writes it: its two halves sliced out."""
+    return jax.nn.silu(gate_up[..., 0, :]) * gate_up[..., 1, :]
+
+
+def _own_norm(*, offset: bool, after_cast: bool):
+    from dew.nn.norms import rms_normalized
+
+    return lambda x, w: rms_normalized(x, w, 1e-6, x.dtype, scale_offset=offset, scale_after_cast=after_cast,
+                                       fp32_statistics=True)
+
+
+def _own_residual(x, branch, w):
+    from dew.nn.norms import stream_rms_normalized
+
+    stream, normed = stream_rms_normalized(x, branch, w, 1e-6, x.dtype, scale_offset=False,
+                                           scale_after_cast=False, fp32_statistics=True)
+    return normed + stream
+
+
+def _own_gated(x, gate, w):
+    from dew.nn.norms import gated_rms_normalized
+
+    return gated_rms_normalized(x, gate, w, 1e-6, x.dtype, "silu")
+
+
+def _own_swiglu(gate, up):
+    from dew.nn.activations import gated_product
+
+    return gated_product("swiglu")(gate, up)
+
+
+def _own_packed(gate_up):
+    from dew.nn.activations import packed_gated_product
+
+    return packed_gated_product("swiglu")(gate_up)
+
+
+ROWS, WEIGHT, PACKED = (256, 1024), (1024,), (256, 2, 1024)
 NORM_FORMS = {
-    "flax RMSNorm": (flax_rms, {"scale_offset": False, "scale_after_cast": False}),
-    "plain RMSNorm": (widened_rms, {"scale_offset": False, "scale_after_cast": False}),
-    "Gemma RMSNorm": (offset_rms, {"scale_offset": True, "scale_after_cast": True}),
-    "SwiGLU": (gated_product_of, None),
+    "flax RMSNorm": (flax_rms, _own_norm(offset=False, after_cast=False), (ROWS, WEIGHT)),
+    "plain RMSNorm": (widened_rms, _own_norm(offset=False, after_cast=False), (ROWS, WEIGHT)),
+    "Gemma RMSNorm": (offset_rms, _own_norm(offset=True, after_cast=True), (ROWS, WEIGHT)),
+    "residual RMSNorm": (residual_rms, _own_residual, (ROWS, ROWS, WEIGHT)),
+    "gated RMSNorm": (gated_rms, _own_gated, (ROWS, ROWS, WEIGHT)),
+    "SwiGLU": (gated_product_of, _own_swiglu, (ROWS, ROWS)),
+    "packed SwiGLU": (packed_swiglu, _own_packed, (PACKED,)),
 }
-"""Each plain program's fused norm, and how Dew's own RMSNorm weighs it (None: Dew's SwiGLU)."""
+"""Each plain program's fused norm, Dew's own call of it, and its operands' shapes."""
 
 
 @pytest.mark.parametrize("form", list(NORM_FORMS))
 def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
-    """A plain program's RMSNorm (Flax's, a plain one, Gemma's offset weight after the cast) or SwiGLU,
-    compiled through `dew.jit` on an H100, runs the kernel Dew's own norm routes the call to (none where that
-    is XLA's arithmetic), where the program as written runs XLA's; on this host, its output and gradients on
-    par with the program as written (check 1)."""
+    """A plain program's RMSNorm (Flax's, a plain one, Gemma's offset weight after the cast, a residual
+    stream's read on after it, Qwen3-Next's gated one) or SwiGLU (two projections, or one packed one's
+    halves), compiled through `dew.jit` on an H100, runs the kernel Dew's own call routes it to (none where
+    that is XLA's arithmetic), where the program as written runs XLA's; on this host, its output and
+    gradients on par with the program as written (check 1)."""
     from contract_support import normal_drawn
     from reference_error import assert_as_exact, with_gradients
 
     import dew
-    from dew.nn.activations import gated_product
-    from dew.nn.norms import rms_normalized
 
-    program, weighed = NORM_FORMS[form]
-    rows = jax.ShapeDtypeStruct((256, 1024), jnp.bfloat16)
-    shapes = (rows, rows) if weighed is None else (rows, jax.ShapeDtypeStruct((1024,), jnp.bfloat16))
-
-    def own(x, w):
-        if weighed is None:
-            return gated_product("swiglu")(x, w)
-        return rms_normalized(x, w, 1e-6, x.dtype, fp32_statistics=True, **weighed)
+    program, own, sizes = NORM_FORMS[form]
+    shapes = [jax.ShapeDtypeStruct(size, jnp.bfloat16) for size in sizes]
 
     def fused(trace) -> list[str]:
         with generation.routes() as found:
@@ -439,8 +489,8 @@ def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
         assert not fused(lambda: jax.jit(program).trace(*shapes))
         expected = set(fused(lambda: jax.jit(own).trace(*shapes)))
         assert set(fused(lambda: dew.jit(program).trace(*shapes))) == expected
-    sizes = [shape.shape for shape in shapes]
-    draw = normal_drawn(43, *sizes, sizes[0], dtype=jnp.bfloat16)
+    output = jax.eval_shape(program, *shapes).shape
+    draw = normal_drawn(43, *sizes, output, dtype=jnp.bfloat16)
     written, found = _norms_written(program, *shapes)
     assert found == 1
     assert_as_exact(jax.jit(with_gradients(lambda *x: written(*x)[0])), jax.jit(with_gradients(program)),
