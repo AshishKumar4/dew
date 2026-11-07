@@ -78,7 +78,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post64: Pallas Mosaic GPU keeps each kernel it lowers under a key of all
+- Dew requires its JAX build 0.12.0.1.post65: a host callback returns its results at its program's lowered
+  precision, so a float64 callback compiled under `jax.enable_x64` and run on another thread keeps float64;
+  post64: Pallas Mosaic GPU keeps each kernel it lowers under a key of all
   the lowering reads, which another process reads back (a 400-op kernel's 43-46 s lowering about 1 s), and
   Dew's compilation cache keeps those lowerings beside its compiled programs (`<cache>/pallas`); post62:
   Pallas's Mosaic GPU interpreter runs a block-scaled tcgen05 MMA,
