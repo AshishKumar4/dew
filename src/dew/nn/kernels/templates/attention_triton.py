@@ -223,9 +223,11 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     def written(walked):
         if flag_refs:
             # A training walk's weighted values are its split sums joined, where they overflow.
-            state = walked if isinstance(walked, algebra.Partial) else walked[0]
+            if isinstance(walked, algebra.Partial):
+                state, weighted = walked, walked.acc
+            else:
+                state, weighted = walked[0], algebra.joined(walked, rows).acc
             flag_refs[0][...] = state.m
-            weighted = algebra.joined(walked, rows).acc if training else walked.acc
             flag_refs[1][...] = algebra.overflowed(weighted).astype(jnp.float32)
         out, m, denominator, *kept = finished(spec, walked)
         out_ref[...] = out.astype(out_ref.dtype)
