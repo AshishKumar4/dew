@@ -11,9 +11,9 @@ an activation, a router's top-k, whether the head is the embedding's own paramet
 semantics are the source's own, never a guess from its names or shapes. A module no known part matches,
 or two parts that state one field differently, leave the decoder to tier 3 (`Unassembled`, naming it).
 
-The renamings map the source's module paths onto the canonical ones `decoder_parts.dew_path` reads
-(`Assembly.weight_path`), so a renamed checkpoint loads by its structure. `dew.interop.verify` confirms
-an assembly on its shrunken probe before any weight downloads.
+The renamings map the source's module paths onto the canonical ones the shared table reads
+(`DECODER_ROUTES`, `Assembly.weight_path`), so a renamed checkpoint loads by its structure.
+`dew.interop.verify` confirms an assembly on its shrunken probe before any weight downloads.
 """
 
 from __future__ import annotations
@@ -27,10 +27,11 @@ from types import FunctionType, MethodType
 from typing import TYPE_CHECKING
 
 from dew import _records
-from dew.interop import decoder_parts, sources
+from dew.interop import decoder_config, decoder_parts, sources
 from dew.interop.code_identity import Renaming, matched_class, same_code
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import ACTIVATIONS, PLAIN_SPELLING, DecoderFields
+from dew.interop.layouts import Table, Unwritten
 from dew.interop.unread import Stored, held
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, NormSpec
@@ -1581,6 +1582,15 @@ _STACKED_EXPERTS: decoder_parts.Leaves = {
     f'mlp.experts.{name}': ('mlp', 'experts', name, 'kernel') for name in decoder_parts.MOE_SHARED}
 """The canonical experts, each projection one tensor over every expert (`decoder_parts.FUSED_EXPERTS`)."""
 
+_CANONICAL = decoder_parts.spelled((), layer_leaves={
+    **_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES, **decoder_parts.XIELU_LEAVES,
+    **decoder_parts.MAMBA_LEAVES, **decoder_parts.GATED_NORM_LEAVES})
+"""The canonical names' routes, the shared decoder's and the parts' own leaves beside them."""
+
+_DEPTH_COPIES = Table(*decoder_parts.prediction_copies('model.layers.{depth}.',
+                                                        {'depth': decoder_parts.DEPTH}, declared=False))
+"""A release's prediction depths' copies of the trunk's table and head (`decoder_parts.prediction_copies`)."""
+
 
 def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     """The decoder family a type verified from parts loads through (`dew.interop.verify`): `assembly`'s
@@ -1592,7 +1602,7 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     assembled from that code has none (`prediction_depths` trims them before any is read). Only a depth's
     own tensors (`decoder_parts.PREDICTION_LEAVES`, `PREDICTION_STEP_END`) and its block's, a name a trunk
     layer's part holds, are so; its copies of the trunk's table and head are the trunk's
-    (`decoder_parts.prediction_copy_path`: `hf_decoders` checks each against it, and an export writes it
+    (`decoder_parts.prediction_copies`: `hf_decoders` checks each against it, and an export writes it
     from the trunk's leaf)."""
     def translated(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
         used.update(hf_config)
@@ -1602,9 +1612,9 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         depth = decoder_parts.layer_depth(name, config)
         if depth is not None and depth < assembly.depths:
             tail = name.split('.', 3)[3]
-            copy = decoder_parts.prediction_copy_path(tail, config)
+            copy = _DEPTH_COPIES.read(name, config)
             if copy is not None:
-                return copy
+                return copy.path
             own = {**decoder_parts.PREDICTION_LEAVES, **decoder_parts.PREDICTION_STEP_END}
             last = _records.integer(config['num_layers'], 'num_layers') - 1
             if tail in own or assembly.canonical(f'model.layers.{last}.{tail}') is not None:
@@ -1612,9 +1622,10 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         canonical = assembly.canonical(name)
         if canonical is None:
             raise ValueError(f"the checkpoint's {name!r} is held by no part of the assembled decoder")
-        leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES, **decoder_parts.XIELU_LEAVES,
-                  **decoder_parts.MAMBA_LEAVES, **decoder_parts.GATED_NORM_LEAVES}
-        path = decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
+        found = _CANONICAL.read(canonical, config)
+        if found is None:
+            raise ValueError(f"unknown tensor name {canonical!r}")
+        path = found.path
         parts = canonical.split('.', 4)
         if path is not None and len(parts) == 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
             branch = assembly.branches.get(int(parts[2]), {}).get(parts[3])
@@ -1638,6 +1649,10 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         return prepared
 
     return decoder_parts.DecoderFamily(
-        (model_type,), translated, lambda fields: False, model_type, 'ForCausalLM', lambda model: {},
-        preserve_source_layout=True, weight_path=weight_path, packed=assembly.packed,
+        (model_type,),
+        decoder_config.read_only(translated, f"{model_type} is read through the registered families' parts "
+                                             "and is written as none of them"),
+        lambda fields: False, model_type, 'ForCausalLM',
+        preserve_source_layout=True, routes=Unwritten(weight_path),
+        packed=assembly.packed,
         tied_head_names=assembly.tied, prediction_depth=decoder_parts.layer_depth, prepare=prepare)

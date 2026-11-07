@@ -12,7 +12,7 @@ from pathlib import Path
 import grain.python as grain
 import numpy as np
 import pytest
-from data_support import Questioned, WideDraw
+from data_support import LATEST, Questioned, WideDraw
 from sampling_gate import assert_draws_as_declared
 
 from dew.batch import EXAMPLES_CONSUMED
@@ -22,9 +22,6 @@ from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Pipeline, Rejected
 from dew.data.plan import PLAN_VERSIONS, Manifest
-
-LATEST = PLAN_VERSIONS[-1]
-"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -318,7 +315,6 @@ def fetched_generation(chain, directory):
     manifest publication records, filled once through the cache."""
     from dew.data.analysis import _cache_manifest
     from dew.data.compile import _prepared
-    from dew.data.plan import PLAN_VERSIONS
 
     (prepared,) = _prepared((chain,), "indexed", provision=False)
     source = prepared.source
@@ -1104,10 +1100,10 @@ class Keep:
         return row
 
 
-def test_show_prints_the_chain_as_written_then_the_records_and_leaves_a_reader_where_it_was(capsys):
-    """`show` prints the store and each verb as the chain wrote it, a preset's expanded steps and
-    a verb that drops or expands records under its own name, then the first records as a reader
-    makes them; a reader open beside it reads on as one never shown would."""
+def test_show_leaves_a_reader_where_it_was():
+    """`show` of a chain, a preset's expanded steps and a verb that drops or expands records among them,
+    reads its first records from a reader of its own: a reader open beside it reads on as one never shown
+    would (18:00 audit, row 4644: what it prints is for a person, not a contract)."""
     from dew.data import presets
 
     pictures = Memory([{"image": np.full((8, 8, 3), index, np.uint8), "label": index % 2}
@@ -1118,26 +1114,14 @@ def test_show_prints_the_chain_as_written_then_the_records_and_leaves_a_reader_w
     try:
         next(reader)
         chain.show(count=1)
+        Memory(rows("a", 4)).named("a").flat_map(Twice(), batched=True, batch_size=2).filter_map(
+            Keep()).loading(READ).show(count=1)
         rest, expected = next(reader), (next(untouched), next(untouched))[1]
         for name in expected:
             np.testing.assert_array_equal(np.asarray(rest[name]), np.asarray(expected[name]))
     finally:
         reader.close()
         untouched.close()
-    lines = capsys.readouterr().out.splitlines()
-    written = [line.strip() for line in lines[:6]]
-    assert written[0].startswith("Memory")
-    assert [line.split("(")[0] for line in written[1:]] == [
-        ".filter_map", ".map", ".random_map", ".batch", ".map"]
-    assert "DecodeImage" in written[1] and "Resize" in written[2] and "AugmentationKey" in written[3]
-    assert written[4] == ".batch(2)" and "DeviceAugment" in written[5] and "device" in written[5]
-    assert "uint8[2, 4, 4, 3]" in "".join(lines[6:])
-
-    grouped = Memory(rows("a", 4)).named("a").flat_map(Twice(), batched=True, batch_size=2)
-    grouped.filter_map(Keep()).loading(READ).show(count=1)
-    lines = capsys.readouterr().out.splitlines()
-    assert lines[1].strip() == ".flat_map(Twice(), batched=True, batch_size=2)"
-    assert lines[2].strip().startswith(".filter_map(Keep")
 
 
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():

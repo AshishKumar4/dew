@@ -13,9 +13,11 @@ The native transformer takes channels-last latents and Dew's model time,
 which is the timestep the source's pipeline passes, and returns the flow the
 source returns. Dew in float32 is held to tests/reference_error.py's rule,
 within twice the reference's own RMS distance from float64. Observed on CPU
-(Dew's RMS error over the reference's): published forward 1.01, gradients
-1.01; variant forward 0.96, gradients 0.99; in bfloat16, 1.26 and 0.99
-against the source's own bfloat16 run. The truth is float64 throughout:
+(Dew's RMS error over the reference's, Diffusers 0.39.0's recording): the
+forward 1.02 published and 1.01 variant; in bfloat16, 1.18 and 1.13 against
+the source's own bfloat16 run. The variant names `qk_norm` None, which
+Diffusers norms across heads from 0.35.0 on as Dew does (`WanTransformer`).
+The truth is float64 throughout:
 Dew run in float64 with a float64 rotary table lands 3e-16 (RMS) from it.
 
 The pipeline walk composes the UMT5 encoder, the transformer, UniPC and the
@@ -305,26 +307,29 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
 
     # Diffusers' own classes read the export: every component cleanly, the
     # pipeline whole, and its transformer recomputes the trained flow.
-    from one_draw import assert_as_exact_as_the_reference
+    from diffusion_support import assert_export_recomputes
 
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
     config = json.loads((export / "transformer" / "config.json").read_text())
-    rng = np.random.default_rng(7)
-    latents = rng.standard_normal((1, 2, 4, 6, config["in_channels"])).astype(np.float32)
-    context = rng.standard_normal((1, 5, config["text_dim"])).astype(np.float32)
     times = np.asarray([500.0], np.float32)
-    trained = pipeline.model.apply({"params": state.variables["params"]}, jnp.asarray(latents),
-                                   jnp.asarray(times), DenoisingCondition(jnp.asarray(context)))
+    forward = jax.jit(lambda latents, context: pipeline.model.apply(
+        {"params": state.variables["params"]}, latents, jnp.asarray(times), DenoisingCondition(context)))
 
-    def call(model, tensor):
+    def draw(seed):
+        """A latent video and a prompt's context of the transformer's widths, their values drawn."""
+        rng = np.random.default_rng([7, seed])
+        return (rng.standard_normal((1, 2, 4, 6, config["in_channels"])).astype(np.float32),
+                rng.standard_normal((1, 5, config["text_dim"])).astype(np.float32))
+
+    def call(model, tensor, latents, context):
         output = model(hidden_states=tensor(np.moveaxis(latents, -1, 1)), timestep=tensor(times),
                        encoder_hidden_states=tensor(context)).sample
         return channels_last(output.numpy())
 
-    assert_as_exact_as_the_reference(np.asarray(trained), consumer.denoiser_prediction(export, call),
-                                     consumer.denoiser_prediction(export, call, wide=True), "trained Wan")
+    assert_export_recomputes(forward, lambda wide: consumer.denoiser(export, call, wide=wide), draw,
+                             "trained Wan")
 
 
 def test_an_unchanged_sample_cannot_exceed_its_sources_measured_float64_error():
