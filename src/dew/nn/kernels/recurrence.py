@@ -162,31 +162,27 @@ def salted_bf16(state, key, value):
 def update(state, query, key, value, decay, write, *, delta: bool):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` its decay per key dimension `[...,
     Dk]` or a head's `[..., 1]` (`exp(g)`) and `write` the write gate `[..., 1]`, a head's one: its output
-    `[..., Dv]` and the updated state.
-    Under a decay a key dimension the output reads the updated state, `q^T S'`. Under a head's, it reads
-    the state output-side, `g (q^T S) + (q . (beta k)) c` with the correction `c = v - g (k^T S)`: the
-    chunked form's reading (`recurrence_algebra.chunk_output`), the decay rounded once a sum, so its
-    rounding is a scale of the read, which a gated RMS norm after it cancels as it cancels the chunked
-    form's; read from `S' = g S + (beta k) c^T`, each entry's own rounding of `g S` put a gated delta net's
-    decode tokens 1.30 to 1.38 times the chunked form's distance from float64 through its output norm, its
-    draws to 6.3 times (qwen35-tiny's widths, probes/decode_vs_chunk.py; 1.01 read output-side).
+    `[..., Dv]` and the updated state `S' = g S + (beta k) c^T`, `c = v - (g k)^T S` the delta rule's
+    correction.
+    The output reads the state before its update, `(g q)^T S + (q . (beta k)) c`, `q^T S'` as the chunked
+    form reads it (`recurrence_algebra.chunk_output`): from `S'`, each entry's own rounding of `g S` put a
+    gated delta net's decode tokens 1.30 to 1.38 times the chunked form's distance from float64 through its
+    gated RMS norm, its draws to 6.3 times (qwen35-tiny's widths, probes/decode_vs_chunk.py; 1.00 so). The
+    decay scales the query and key before their sums, so a read is finite wherever `S'` is (its sum after
+    them overflowed near fp32's largest, the decode step's contract).
     The write gate scales the key before any sum it enters (`beta k`, as the chunk form and fla write it):
     the one-pass form `(q decay)^T S + (q . k) write (v - (k decay)^T S)` overflowed where `q^T S'` stays
     finite, its `q . k` past fp32's largest at keys and queries of 2^80 against a write of 2^-80 (rows 1859
     and 1962), and the write's transpose, `(beta k) . q` against the output's cotangent, takes the gate
     before the sum: after it, `k . q` past fp32's largest at keys and queries of 2^63 put an infinite value
     gradient where the chunk form's was finite (ledger 2470)."""
-    written = key * write
-    if decay.shape[-1] == 1:
-        def read(x):
-            return jnp.sum(x[..., :, None] * state, axis=-2)
+    def read(x):
+        return jnp.sum(x[..., :, None] * state, axis=-2)
 
-        corrected = value - decay * read(key) if delta else value
-        updated = state * decay[..., :, None] + written[..., :, None] * corrected[..., None, :]
-        return decay * read(query) + jnp.sum(query * written, axis=-1, keepdims=True) * corrected, updated
-    corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
+    written = key * write
+    corrected = value - read(key * decay) if delta else value
     updated = state * decay[..., :, None] + written[..., :, None] * corrected[..., None, :]
-    return jnp.sum(query[..., :, None] * updated, axis=-2), updated
+    return read(query * decay) + jnp.sum(query * written, axis=-1, keepdims=True) * corrected, updated
 
 
 def _held(updated, key, value, dtype):
