@@ -54,7 +54,7 @@ class Ring(mosaic.Ring):
         slot = mosaic.opaque(turn.slot)
         plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.Layout.WG_SPLAT(())))(
             lambda ctx, barrier, parity: barrier_of(barrier).wait_parity(splat_value(parity)))(
-                self.full.at[pl.ds(slot, 1)], jnp.asarray(turn.parity, jnp.int32))
+                self.full.at[pl.ds(slot, 1)], jnp.asarray(turn.parity, jnp.bool_))
         return self.smem.at[slot]
 
 

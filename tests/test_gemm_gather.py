@@ -64,3 +64,23 @@ def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False):
 
     assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "a gathered grouped product", seeds=SEEDS,
                     truth_fn=functools.partial(plain, wide=jnp.float64))
+
+
+@pytest.mark.parametrize("paired", [False, True])
+def test_a_gathered_product_lowers_for_cuda(paired):
+    """A gathered grouped product on a compile-only H100 lowers through Mosaic GPU: its producer's
+    cp.async gather and its load barriers' lane-level arrivals and parity waits (`gathered.Ring`), plain and
+    paired."""
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
+    sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
+    product = functools.partial(mosaic_gpu.gmm, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
+                                out_dtypes=(jnp.bfloat16,) * 2 if paired else None, multiprocessors=132,
+                                interpret=False)
+
+    def gathered(tokens, matrices, table):
+        return product(tokens, matrices[0], sizes, gather=table, paired=matrices[1] if paired else None)
+
+    with generation.assumed("sm90"):
+        jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((2, 4, 512, 256), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((2048,), jnp.int32)).lower(lowering_platforms=("cuda",))

@@ -1344,6 +1344,10 @@ class _Decoding:
     def decode(self, index, slots, interpret: bool):
         """Step `index`'s stage of words and scales (`slots`'), this consumer's share of it, decoded into
         its buffer, which it returns."""
+        if self.consumers > 1:
+            # A tile's first step restarts the buffers' rotation (`index` is the tile's own): every consumer
+            # has drained its last tile's products, which read them, before any decodes into them.
+            pl.when(index == 0)(self.met)
         buffer = self.buffers.at[index % self.buffers.shape[0]]
         columns = buffer.shape[0] // self.consumers
         mine = pl.ds(self.wg * columns, columns) if self.consumers > 1 else pl.ds(0, buffer.shape[0])

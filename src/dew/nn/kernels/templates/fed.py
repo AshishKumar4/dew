@@ -9,7 +9,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import resources
-from dew.nn.kernels.templates.mosaic import Ring, RingFamily, viewed
+from dew.nn.kernels.templates.mosaic import Ring, RingFamily
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,7 +41,7 @@ class Feed:
 
     def load(self, index) -> None:
         for name, ring in self.rings.items():
-            view = viewed(self.views[name], ring.block, index - self.origin)
+            view = ring.viewed(self.views[name], index - self.origin)
             ring.load(ring.turn(index - self.first), view)
 
     def primed(self) -> None:
@@ -77,6 +77,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     loads are each program's producer's)."""
     cluster = 1
     feeds_itself = True
+    gathers_rows = False  # a consumer's `Feed` loads its rings, no producer warpgroup to gather a step's rows
     loader = 0
     """The consumer that issues the loads."""
 
