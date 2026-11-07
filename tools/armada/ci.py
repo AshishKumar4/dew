@@ -103,7 +103,6 @@ refused (`report`), its coverage partial. A target well under CI's keeps tasks s
 import argparse
 import ast
 import concurrent.futures
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -1507,39 +1506,39 @@ def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
     has exited (`record`); how collection found each file (executed.py); pytest's report; the files the
-    durations record does not wholly name (split.py); and where its stacks are dumped at its deadline, its
-    process id beside them (executed.py)."""
-    log, collection, report, unrecorded, stacks = (out.with_name(f"{out.name}.{suffix}") for suffix in (
-        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "stacks"))
-    for stale in (report, log, collection, unrecorded, stacks, stacks.with_name(f"{stacks.name}.pid")):
+    durations record does not wholly name (split.py); and its process id, whose stacks are read at its
+    deadline (executed.py, `dumped`)."""
+    log, collection, report, unrecorded, pid = (out.with_name(f"{out.name}.{suffix}") for suffix in (
+        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "pid"))
+    for stale in (report, log, collection, unrecorded, pid):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
-    return log, collection, report, unrecorded, stacks
+    return log, collection, report, unrecorded, pid
 
 
-DUMP_SECONDS = 2.0
-"""How long a task past its deadline gives its pytest's dump of its stacks before the interrupt, which would
-unwind the frames the dump walks (a dump the interrupt overtook ended its process in a segmentation fault);
-faulthandler writes one in milliseconds."""
+DUMP_SECONDS = 10.0
+"""How long py-spy gets to read a stalled pytest's stacks (`dumped`): it stops the process and reads every
+thread's frames out of its memory, in under a second for a test's threads (0.14 s on armada, 2026-11-07)."""
 
 
-def dumped(done: subprocess.Popen, stacks: Path) -> str:
-    """Every thread's stack of a task's pytest past its deadline, as faulthandler wrote them to `stacks`
-    (executed.py): SIGUSR2 sent to pytest itself, the id executed.py wrote beside them once it registered
-    the dump, and `DUMP_SECONDS` for it, which ends early where pytest ends; none where pytest never
-    registered it."""
-    pid = stacks.with_name(f"{stacks.name}.pid")
+def dumped(pid: Path, reader: Path) -> str:
+    """Every thread's stack of a task's pytest past its deadline, its Python frames and the native ones under
+    them, read from outside it by `reader` (py-spy, the task environment's) while it is stopped: nothing runs
+    in the stalled process, so one stalled in the interpreter, or in native code holding the GIL or not (an
+    XLA compile, a wait on a device, a collective), says where it stood alike (row 4828). pytest's id is the
+    one executed.py wrote to `pid` as it loaded; none where it never loaded."""
     if not pid.is_file():
         return ""
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(int(pid.read_text()), signal.SIGUSR2)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        done.wait(DUMP_SECONDS)
-    return stacks.read_text(errors="replace")
+    try:
+        read = subprocess.run([str(reader), "dump", "--native", "--pid", pid.read_text()],
+                              capture_output=True, text=True, timeout=DUMP_SECONDS)
+    except subprocess.TimeoutExpired:
+        return f"py-spy read no stacks of pytest in {DUMP_SECONDS:.0f} s"
+    return read.stdout or f"py-spy read no stacks of pytest: {read.stderr.strip()}"
 
 
 def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: float, grace: float,
-               stacks: Path) -> tuple[int, str, bool, str, set[str] | None, set[str]]:
+               pid: Path, reader: Path) -> tuple[int, str, bool, str, set[str] | None, set[str]]:
     """A task's pytest `command` run to its `deadline`: its exit code, output, whether it passed the deadline,
     its threads' stacks then (`dumped`), the data files it opened (`watched`), none where its group
     outlived the kill, and the checkout's files it wrote (`watched.changed`). pytest leads its own process
@@ -1567,7 +1566,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
         done.wait(deadline)
     except subprocess.TimeoutExpired:
         # Every thread's stack as pytest stands at its deadline, before the interrupt below.
-        expired, dump = True, dumped(done, stacks)
+        expired, dump = True, dumped(pid, reader)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
@@ -1613,7 +1612,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    log, collection, report, unrecorded, stacks = task_files(out)
+    log, collection, report, unrecorded, pid = task_files(out)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["coverage", "run"]
@@ -1629,12 +1628,14 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     command = [*session.pytest_command(run, tests, split, release), *(["-p", "progress"] if resumes else [])]
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_UNRECORDED": str(unrecorded), "DEW_STACKS": str(stacks),
+                                              "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
+                                              "DEW_STACKS_READER": str(os.getpid()),
                                               **({progress.SET_ASIDE: str(aside)} if resumes else {})})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    returncode, output, expired, dump, opened, wrote = ran_pytest(command, environment, deadline, grace,
-                                                                  stacks)
+    # The task environment's py-spy (the test extra), which reads a stalled pytest's stacks (`dumped`).
+    returncode, output, expired, dump, opened, wrote = ran_pytest(command, environment, deadline, grace, pid,
+                                                                  Path(f".venv-{python}/bin/py-spy"))
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
