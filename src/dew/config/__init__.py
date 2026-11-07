@@ -479,8 +479,7 @@ class TrainerConfig:
     """Stop after the loss has scored this many targets across all microbatches, including before a
     resume.
 
-    Counts the tokens committed updates trained on, reported as `train/committed_tokens`, without
-    padding. The final
+    Uses the counter reported as `train/tokens`, without padding. The final
     microbatch may cross the budget. With `steps`, `epochs` or `examples`, the
     first cap reached ends the run. A token-only run needs a constant learning
     rate or a schedule with its own explicit step horizon.

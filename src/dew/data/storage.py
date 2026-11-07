@@ -35,7 +35,6 @@ from dew._cache import dew_cache_dir
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record, text
 from dew.data.retention import LocalRetention, evictable, read_pin
-from dew.data.shared import SharedMapping
 
 
 class PreconditionFailed(FileExistsError):
@@ -392,55 +391,21 @@ def _counted(counts: object) -> dict[str, float]:
     return {str(name): float(value) for name, value in counts.items()}
 
 
-type Held = Mapping[str, Held] | Sequence[Held] | str | int | float | bool | None
-"""A reader's position as it holds it: JSON's values, its records any mapping (a mix's `SharedMapping`)."""
-
-
-class PositionText:
-    """A reader's positions written as JSON (`json.dumps`'s text), each a value a JSON config carries
-    (`dew._records.json_value`), its mirror counters emptied (`MIRRORED`, `MIRRORS`: a read's metrics, not its
-    place): each value a shared mapping holds (a mix's
-    members' positions and counts, `dew.data.shared.SharedMapping`, each a snapshot never written once held)
-    written once and its text written again while the next position holds that same value, so a mix of a
-    thousand members writes the members a read moved, not every member's position and counts each batch
-    (row 4740: 163 ms and 2.3 MB a batch at 1,126 members, the prefetch thread holding the GIL). One reader
-    owns one, writing its positions on one thread."""
-
-    def __init__(self) -> None:
-        self._held: dict[int, tuple[Held, str]] = {}
-
-    def __call__(self, state: Held) -> bytes:
-        kept: dict[int, tuple[Held, str]] = {}
-        text = self._text(state, kept)
-        # The values the last position held alone: whatever the next holds that this one did not is new.
-        self._held = kept
-        return text.encode()
-
-    def _text(self, value: Held, kept: dict[int, tuple[Held, str]]) -> str:
-        if value is None or isinstance(value, (bool, int, float, str)):
-            return json.dumps(value)
-        if isinstance(value, (list, tuple)):
-            return "[" + ", ".join(self._text(entry, kept) for entry in value) + "]"
-        if isinstance(value, SharedMapping):
-            return "{" + ", ".join(f"{json.dumps(text(name, 'data position record key'))}: "
-                                   f"{self._shared(entry, kept)}" for name, entry in value.items()) + "}"
-        if isinstance(value, Mapping):
-            emptied = dict(value)
-            if isinstance(emptied.get(MIRRORED), Mapping):
+def without_mirrors(state: JSON) -> JSON:
+    """A position, as JSON, with the mirror counters it carries emptied: a read's metrics, not its place,
+    which a saved position keeps none of (`carried_mirrors`); the position itself as it is."""
+    match state:
+        case dict():
+            emptied = {key: without_mirrors(value) for key, value in state.items()}
+            if isinstance(state.get(MIRRORED), dict):
                 emptied[MIRRORED] = {"process": "saved", "counts": {}}
-            if isinstance(emptied.get(MIRRORS), Mapping):
+            if isinstance(state.get(MIRRORS), dict):
                 emptied[MIRRORS] = {}
-            return "{" + ", ".join(f"{json.dumps(text(name, 'data position record key'))}: "
-                                   f"{self._text(entry, kept)}" for name, entry in emptied.items()) + "}"
-        raise ValueError(f"data position={value!r}: this field is not a value a JSON config carries")
-
-    def _shared(self, value: Held, kept: dict[int, tuple[Held, str]]) -> str:
-        """`value`'s text, a shared mapping's: the text it was written as while a position held it last."""
-        held = kept.get(id(value)) or self._held.get(id(value))
-        if held is None or held[0] is not value:
-            held = (value, self._text(value, kept))
-        kept[id(value)] = held
-        return held[1]
+            return emptied
+        case list():
+            return [without_mirrors(value) for value in state]
+        case _:
+            return state
 
 
 # Registered as this module loads, which reads no configuration, so `dewcache::` URLs open through
