@@ -413,7 +413,14 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             repeats = count // len(run.specs) if periodic else count
 
             def scanned(layer, carry, per_layer_input, *, store=store, step=step):
-                return step(layer, carry, per_layer_input, store)[0], None
+                # The iteration's layer of the run behind a barrier, so the cast its products take is the
+                # layer's: XLA hoists a cast of each iteration's slice out of the loop as one cast of the
+                # whole stacked run, a copy of it held through the step (row 4098).
+                def body(layer, carry, per_layer_input):
+                    return step(layer, carry, per_layer_input, store)[0]
+                return nn.map_variables(body, 'params', trans_in_fn=jax.lax.optimization_barrier,
+                                        init=layer.is_initializing(), mutable=False)(
+                    layer, carry, per_layer_input), None
 
             if rows:
                 policy = _rows_recomputed(remat)
