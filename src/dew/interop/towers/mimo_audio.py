@@ -7,11 +7,12 @@ import numpy as np
 
 from dew import _records
 from dew.batch import Variables
+from dew.data.processors import LogMel
 from dew.interop.decoder_parts import folder_name
 from dew.interop.layouts import Unwritten
 from dew.interop.unread import Stored, held
 from dew.interop.weights import Tree, checkpoint_dtype, insert, placed
-from dew.nn.mimo_audio import MiMoAudio
+from dew.nn.mimo_audio import MiMoAudio, MiMoAudioTokenizer
 from dew.registry import Record
 
 from .common import TowerLayout
@@ -200,6 +201,14 @@ def translate_mimo_audio_weights(tokenizer: Mapping[str, np.ndarray], encoder: M
              **{name if name.startswith("speech_embeddings.") else f"audio_encoder.{name}": tensor
                 for name, tensor in encoder.items()}}
     return _LAYOUT.variables(named, param_dtype)[0]
+
+def tokenizer_mel(tokenizer: MiMoAudioTokenizer) -> LogMel:
+    """The log mel frames `tokenizer`'s encoder reads, as the release computes them: torchaudio's
+    MelSpectrogram at the tokenizer's rate, window and hop with magnitudes, floored at 1e-7
+    (MiMo-Audio-Tokenizer's `mel_spectrogram`)."""
+    return LogMel(tokenizer.sampling_rate, tokenizer.nfft, tokenizer.hop_length, tokenizer.window_size,
+                  tokenizer.n_mels, tokenizer.fmin, tokenizer.fmax)
+
 
 TOWERS = {MiMoAudio: MIMO_AUDIO}
 """Where each of these tower kinds' tensors sit in a media checkpoint (`dew.interop.towers.tower_layout`)."""
