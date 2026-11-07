@@ -72,7 +72,7 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
 
     index = Index(jaxpr)
     attention = [region for region in attention_regions.regions(index)
-                 if _decided(jaxpr, region.places, _read(jaxpr, region.places), (region.output,),
+                 if _decided(jaxpr, region.places, _read(jaxpr, region.places), region.outputs,
                              lambda region=region: attention_regions.taken(region))]
     held = {place for region in attention for place in region.places}
     products = [region for region in _regions(index) if not held & set(region.places)
@@ -80,11 +80,11 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
                              lambda region=region: _takes(fused_gemm, jaxpr, region))]
     held |= {place for region in products for place in region.places}
     norms = [region for region in norm_regions.regions(index) if not held & set(region.places)
-             and _decided(jaxpr, region.places, _read(jaxpr, region.places), (region.output,),
+             and _decided(jaxpr, region.places, _read(jaxpr, region.places), region.outputs,
                           lambda region=region: norm_regions.taken(region))]
     if not attention and not products and not norms:
         return jaxpr
-    written = [Written(region.places, region.operands, (region.output,), region.places[-1],
+    written = [Written(region.places, region.operands, region.outputs, region.places[-1],
                        module.written(region))
                for module, found in ((attention_regions, attention), (norm_regions, norms))
                for region in found]

@@ -119,6 +119,11 @@ class Attention(NamedTuple):
         """The values the call reads: the query, key and value, then the mask and bias where given."""
         return (self.query, self.key, self.value, *(var for var in (self.mask, self.bias) if var is not None))
 
+    @property
+    def outputs(self) -> tuple[jcore.Var, ...]:
+        """The value the call makes: the second product's."""
+        return (self.output,)
+
 
 def regions(index) -> list[Attention]:
     """Every attention region of the body `index` reads (`fusion.Index`; the module's account), the first
