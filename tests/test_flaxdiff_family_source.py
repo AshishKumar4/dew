@@ -18,11 +18,8 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 import pytest
-from interop_support import recorded_gradients
-from one_draw import assert_as_exact_as_the_reference
 from reference_runs import assert_as_exact_as_recorded
 from torch_layout import node
 
@@ -237,31 +234,8 @@ def pipeline_arms(case: str):
     return FIXTURES / f"{case.replace('/', '-')}.npz", drawing(case), computing(case), OUTPUTS
 
 
-ONE_DRAW = "unet_3d/variant"
-"""The case its recording over seeds did not resolve within 512 seeds (row 4763), held by the one-draw rule
-on main's recorded draw (`unet_3d-variant-one-draw.npz`, FlaxDiff's run of it in float32 and float64)."""
-RECORDED = [case for case in CASES if case != ONE_DRAW]
-
-
-@pytest.mark.parametrize("case", RECORDED)
+@pytest.mark.parametrize("case", CASES)
 def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(case):
     """Dew's output and gradients as exact as FlaxDiff's float32 against float64 (check 1)."""
     fixture, draw, dew, _ = pipeline_arms(case)
     assert_as_exact_as_recorded(fixture, site(case), FAMILY_SEEDS[case], draw, dew, f"FlaxDiff {case}")
-
-
-def test_the_unet3d_variant_is_as_exact_as_flaxdiffs_on_its_recorded_draw():
-    """The UNet3D variant's output and every gradient, Dew's run (`computing`) on its recorded draw, as near
-    FlaxDiff's float64 run as FlaxDiff's float32 run is (the one-draw rule, row 4752)."""
-    with np.load(FIXTURES / "unet_3d-variant-one-draw.npz") as stored:
-        part = dict(stored)
-    names = sorted(LAYOUT[ONE_DRAW]["params"])
-    inputs = {**{f"param.{name}": part[f"param.{name}"].view(ml_dtypes.bfloat16).astype(np.float32)
-                 for name in names},
-              **{name: part[name] for name in ("image", "text", "times", "probe")}}
-    found = jax.jit(lambda drawn: computing(ONE_DRAW)(jnp.float32, drawn))(inputs)
-    for leaf in ("output", "gradients"):
-        reference, truth = ((part[f"{precision}.output"] if leaf == "output"
-                             else recorded_gradients(part.__getitem__, precision, ("image", "text"), names))
-                            for precision in ("fp32", "fp64"))
-        assert_as_exact_as_the_reference(np.asarray(found[leaf]), reference, truth, f"{ONE_DRAW} {leaf}")
