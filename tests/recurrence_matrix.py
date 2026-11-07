@@ -5,8 +5,7 @@ Its cells run generation.CHOICES' `gated_delta_rule` and `ssd`. Each takes the c
 (`recurrence_chunk.chunk`) of a form, forward and backward in one program as a layer's training step takes
 them, with the kernel the cell names (`generation.chosen`):
 - the recurrence template ('mosaic_gpu');
-- the portable math ('xla');
-- its derived forms ('derived', the delta rule's).
+- the portable math ('xla', the template's plain-JAX mainloop).
 
 Its output, final memory and every operand's gradient are held to its reference's (check 1): the form's
 port where it takes the call, fla's kernels for the delta rule's forms ('fla'), mamba_ssm's for the rated scan
@@ -44,11 +43,11 @@ PORTS = {"gated_delta_rule": "fla", "ssd": "pallas"}
 CHOICES = frozenset({"gated_delta_rule", "ssd"})
 """The generation.CHOICES entries the family's cells run (row 184): the chunked op's selectors'."""
 
-KERNELS = {"gated_delta_rule": frozenset({"mosaic_gpu", "xla", "derived", "fla"}),
+KERNELS = {"gated_delta_rule": frozenset({"mosaic_gpu", "xla", "fla"}),
            "ssd": frozenset({"mosaic_gpu", "xla", "pallas", "tpu"})}
 """The kernels each choice's cells run under test (row 4513), each taken by its route (the cell asserts it):
-the template, the portable math and its derived forms, each port held to the portable math, and the rated
-scan's TPU kernel on the TPU tier (a v6e or a v5e, as the tier's Colab TPU is)."""
+the template, the portable math (its plain-JAX mainloop), each port held to the portable math, and the
+rated scan's TPU kernel on the TPU tier (a v6e or a v5e, as the tier's Colab TPU is)."""
 
 
 def _op(hooks) -> str:
