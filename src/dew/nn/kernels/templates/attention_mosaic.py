@@ -749,6 +749,14 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         phases.append([logits] * 2 + [bits])
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
+    if scopes_products(family):
+        # Its products read back from tensor memory in its layout and converted to the walk's, both live
+        # at once (tcgen05's chunks, `Tcgen05ChunksIssuer.summed`): the logits a second time in each phase
+        # holding them, and the weighted values' product beside the sums it adds into (a B200's 64 x 64
+        # forward on three consumers, width 64, priced 126 of 160 and spilled 20 bytes; 64 x 128 132 and
+        # 184, et-h1need).
+        phases = [[*phase, logits] for phase in phases]
+        phases.append([(block_q, value_width, jnp.float32)] * 2)
     depth = value_width if width is None else width
     products = _products(family, dtype, (block_q, depth, block_k, [logits], False, True),
                          (block_q, block_k, value_width, [weights], True, False), narrow=tiles.narrow,
