@@ -327,7 +327,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         family.roles(consumers, consumer, producer)
 
     stages = min(program.tiles.stages, q_steps)
-    reduced = reducing(family, consumers, walk.spec.score_mod)  # a score hook's warpgroups' scratch
+    # A score hook's warpgroups' scratch, or fp16's running scale's (`staged_parts`).
+    reduced = reducing(family, consumers, walk.spec.score_mod, scaled=staged_parts(query.dtype) > 1)
     stats_streamed = streamed_statistics(family, program.tiles, width, query.dtype, stages, reduced=reduced)
     typed = stores_typed(family, program.tiles, width, query.dtype, stages, grouped=grouped, reduced=reduced)
     scoped, rings, after = _fused_allocations(family, program.tiles, width, query.dtype, stages,

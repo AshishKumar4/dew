@@ -52,7 +52,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     guarded_columns,
     guarded_tiles,
 )
-from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, stores_typed
+from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, staged_parts, stores_typed
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     Tiles,
@@ -1279,11 +1279,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dkv_family = bundle_of(config.dkv, dtype)
         q_stages = min(config.stages, padded_q // config.block_q)
         if config.queries_first:
-            # The fused launch reduces across no warps but a score hook's (`reducing`), its statistics and D
-            # its operands and its sums its products' (an A100's at 64 x 64 reserves no reduction scratch,
-            # its lowering's 114,688 bytes the model's without it, et-fused80).
+            # The fused launch reduces across no warps but a score hook's and fp16's running scale's
+            # (`reducing`), its statistics and D its operands and its sums its products' (an A100's at
+            # 64 x 64 reserves no reduction scratch, its lowering's 114,688 bytes the model's without it,
+            # et-fused80).
             # The fused launch's dK and dV in the operands' dtype where it stores them so (`stores_typed`).
-            reduced = reducing(family, config.consumers, self.score_mod)
+            reduced = reducing(family, config.consumers, self.score_mod, scaled=staged_parts(dtype) > 1)
             allocations = (_coop_allocations if config.shared_keys
                            else functools.partial(_fused_allocations, reduced=reduced))
             typed = {} if config.shared_keys else {"typed": stores_typed(
