@@ -422,7 +422,7 @@ def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
 
     program, weighed = NORM_FORMS[form]
     rows = jax.ShapeDtypeStruct((256, 1024), jnp.bfloat16)
-    shapes = (rows, rows) if weighed is None else (rows, jax.ShapeDtypeStruct((1024,), jnp.float32))
+    shapes = (rows, rows) if weighed is None else (rows, jax.ShapeDtypeStruct((1024,), jnp.bfloat16))
 
     def own(x, w):
         if weighed is None:
