@@ -12,7 +12,7 @@ import jax.numpy as jnp
 
 from dew.batch import Coordinates
 
-from ..inputs import AttentionMetadata, CrossContext, coordinates_of, numbered_blocks
+from ..inputs import AttentionMetadata, CrossContext, check_tree, coordinates_of, numbered_blocks
 from ..progress import Progress
 
 if TYPE_CHECKING:
@@ -24,7 +24,7 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
                   coordinates: Coordinates | None = None,
                   conditioning: Mapping[str, jax.Array] | None = None, *,
                   whole_blocks: bool = False, progress: Progress | None = None,
-                  key_valid=None) -> AttentionMetadata | None:
+                  key_valid=None, tree: tuple[int, ...] | None = None) -> AttentionMetadata | None:
     """What `model`'s layers read beside the residual, None for a call that
     carries none of it: the tokens' layout `hidden_and_mtp_inputs`
     converted (`coordinates`), the token ids a hash router selects by,
@@ -58,6 +58,11 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
         raise ValueError(
             "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
             "call would attend across documents; prefill each document into a row of its own")
+    if tree is not None:  # N-gram hashes and routing blocks read the tokens in their order.
+        routed = model.mixture is not None and model.mixture.routing_block is not None
+        positions = None if coordinates is None else coordinates.positions
+        check_tree(tree, tokens.shape[1], decode=decode, ordered=model.engram is not None or routed,
+                   positioned=positions is not None or rotary_positions is not None)
     engram_ids = (None if model.engram is None else model.engram_hashes(tokens, coordinates, decode,
                                                                       media_mask))
     if context is not None and context.segments is not None:
@@ -73,7 +78,7 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
         block)
     if (coordinates is None and image_groups is None and block_groups is None and rotary_positions is None
             and pairwise_mask is None and key_positions is None and key_runs is None and key_valid is None
-            and not model.hash_layers
+            and tree is None and not model.hash_layers
             and engram_ids is None and media_mask is None and admitted is None and blocks is None
             and context is None and (progress is None or progress.updates is None)):
         return None
@@ -88,5 +93,5 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
         # pipeline's microbatches slice (`run_pipeline`).
         progress=None if progress is None or progress.updates is None else jnp.broadcast_to(
             jnp.asarray(progress.updates, jnp.int32), tokens.shape[:1]),
-        routing_block=block,
+        routing_block=block, tree_parents=tree,
         whole_blocks=whole_blocks and block_groups is not None)

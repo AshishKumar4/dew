@@ -607,6 +607,12 @@ class AttentionMetadata:
     context: CrossContext | None = None
     progress: jax.Array | None = None
     routing_block: int | None = struct.field(pytree_node=False, default=None)
+    tree_parents: tuple[int, ...] | None = struct.field(pytree_node=False, default=None)
+    """A cached call over a tree of candidate tokens (tree speculative decoding's verify block): each call
+    token's parent among the call's tokens, earlier than it, -1 for the row's last cached token
+    (`check_tree`). A token reads its ancestors' keys and states alone: attention masks it by the call's
+    `key_runs`, a recurrent mixer advances each token from its parent's state, and a mixer that reads no
+    tree refuses one (`MIXING`)."""
     whole_blocks: bool = struct.field(pytree_node=False, default=False)
     """Whether each block of `block_groups` is its document's whole run of real tokens, as its producer
     states it (a decision row read whole, `QuestionLayout.split` 'whole'): a layer that reads blocks
@@ -623,15 +629,36 @@ class AttentionMetadata:
         return self.coordinates is not None and self.coordinates.right_padded
 
 
-MIXING = ("pairwise_mask", "key_positions", "key_runs", "key_valid", "position_bias", "admitted")
+def check_tree(parents: tuple[int, ...], length: int, *, decode: bool, positioned: bool,
+               ordered: bool) -> None:
+    """Refuse a tree call (`AttentionMetadata.tree_parents`) no layer could read as its paths: outside a
+    cached call, of another length than its `length` tokens, with a parent not before its child,
+    branching where the call does not state its tokens' positions (`positioned`: coordinates or rotary
+    positions, each token's its depth, which its index is on a chain alone), or in a model that reads the
+    call's tokens in their order before its mixers see the tree (`ordered`: n-gram hashes, routing
+    blocks)."""
+    if not decode or len(parents) != length or any(not -1 <= parent < index
+                                                   for index, parent in enumerate(parents)):
+        raise ValueError(f"a tree is a cached call's, each of its {length} tokens' parent an earlier one "
+                         f"or -1 for the row's cache, got {parents}")
+    if not positioned and any(parent != index - 1 for index, parent in enumerate(parents)):
+        raise ValueError("a branching tree states its tokens' positions, each its depth on its path "
+                         "(coordinates or attention_rotary_positions)")
+    if ordered:
+        raise ValueError("a tree call is read along its paths by the mixers alone; this model's n-gram "
+                         "hashes or routing blocks read its tokens in their order")
+
+
+MIXING = ("pairwise_mask", "key_positions", "key_runs", "key_valid", "position_bias", "admitted",
+          "tree_parents")
 """The `AttentionMetadata` fields that say which tokens a mixer lets each token
 read, or how much: a call's own mask, or its keys' runs, and the key positions
-it is read by, an additive bias, a server's mixed layout. A mixer runs a call that sets one only
-where it reads it (`MixerCall`). The rest describe the tokens themselves, which
-a mixer reads as far as its form uses them: their coordinates, rotary
-positions, and image and block groups, which only attention that sees an image
-or a block whole reads, and the ids the block reads for its feed-forward and
-n-gram lookup."""
+it is read by, an additive bias, a server's mixed layout, a tree's parents. A
+mixer runs a call that sets one only where it reads it (`MixerCall`). The rest
+describe the tokens themselves, which a mixer reads as far as its form uses
+them: their coordinates, rotary positions, and image and block groups, which
+only attention that sees an image or a block whole reads, and the ids the block
+reads for its feed-forward and n-gram lookup."""
 
 TOKENWISE = frozenset(MIXING)
 """The `MIXING` fields a mixer that reads no other token holds to: every one,
