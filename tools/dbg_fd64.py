@@ -7,12 +7,19 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 import flaxdiff_family_worker as w
 import test_flaxdiff_family_source as t
 
+mode = sys.argv[2] if len(sys.argv) > 2 else "baseline"
+if mode == "fixed":
+    w.FOURIER = "jnp.asarray(freqs, dtype=jnp.float64) * self.scale"
+print("K MODE", mode)
 case = sys.argv[1].replace("-", "/", 1)
 _, cls, config, _, _ = t.CASES[case]
 inputs = t.drawing(case)(0)
 params = {k.removeprefix("param."): jnp.asarray(v, jnp.float64) for k,v in inputs.items() if k.startswith("param.")}
 image, times, text = (jnp.asarray(inputs[k], jnp.float64) for k in ("image", "times", "text"))
 mods = w.flaxdiff(True)
+freqs = np.asarray(mods["common"].FourierEmbedding(features=config["emb_features"]).bind({}).freqs)
+table = np.asarray(t.LAYOUT[case]["fourier"], np.float64)
+print("K FOURIER_TABLE",float(np.sqrt(np.mean((freqs-table)**2))),float(np.linalg.norm(freqs-table)/np.linalg.norm(table)))
 refmodel = getattr(mods[t.CASES[case][0]], cls)(**config)
 reftree = unflatten_dict({tuple(k.split("/")):v for k,v in params.items()})
 refout, refstate = refmodel.apply({"params":reftree}, image,times,text, capture_intermediates=True, mutable=["intermediates"])
