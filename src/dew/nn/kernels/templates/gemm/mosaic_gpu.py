@@ -59,7 +59,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.algebra import bits
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
-from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, sides_extended, sides_padded
+from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, scattered, sides_extended, sides_padded
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -449,10 +449,9 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     blocks = {'rows': (lhs_block, dtype), **matrix,
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **(_scale_blocks(block_m, block_n) if step_scaled else {}),
-              # An MX product's rows' and matrix's E8M0 scales, a step's tiles of each (`gmm`'s `mx_scales`).
-              **({'a_scales': ((block_m // 128, block_k // 128, 32, 16), jnp.float8_e8m0fnu),
-                  'b_scales': ((block_n // 128, block_k // 128, 32, 16), jnp.float8_e8m0fnu)}
-                 if block_scaled else {}),
+              # A block-scaled product's rows' and matrix's scales, a step's tiles of each (`gmm`'s
+              # `mx_scales`), four scales a tile's row (`block_format`).
+              **(_scale_tiles(block_m, block_n, block_k, dtype) if block_scaled else {}),
               **{f'side_{i}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i]) for i in stepped}}
     sides = family.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
                                      _typed(side))
@@ -466,6 +465,26 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
                                 held['fixed_barriers'], decoded),
                        tuple((part, jnp.dtype(out)) for out in dtypes))
+
+
+def block_format(dtype) -> tuple[jnp.dtype, int]:
+    """Dew: a block-scaled product's scale dtype and the depths one scale covers, by its operands' `dtype`
+    (`gmm`'s `mx_scales`): NVFP4's (E2M1 operands) an E4M3 scale every 16 (tcgen05's `scale_vec::4X`,
+    `kind::mxf4nvf4`); MXFP8's (FP8 operands) an E8M0 scale every 32 (OCP MX, `scale_vec::1X`)."""
+    if jnp.dtype(dtype) == jnp.dtype(jnp.float4_e2m1fn):
+        return jnp.dtype(jnp.float8_e4m3fn), 16
+    return jnp.dtype(jnp.float8_e8m0fnu), 32
+
+
+def _scale_tiles(block_m: int, block_n: int, block_k: int, dtype) -> dict:
+    """Dew: a block-scaled step's scale streams (`gmm_allocations`'): its rows' and its matrix's columns'
+    scales in `tcgen05.scales_layout`'s tiles, `[128-row tiles, scale tiles, 32, 16]`, a tile four scales of
+    each of 128 rows, so a step of `block_k` depths takes `block_k` over four blocks' depths of them
+    (`block_format`)."""
+    scale, per = block_format(dtype)
+    depth_tiles = block_k // (4 * per)
+    return {'a_scales': ((block_m // 128, depth_tiles, 32, 16), scale),
+            'b_scales': ((block_n // 128, depth_tiles, 32, 16), scale)}
 
 
 def _scale_blocks(block_m: int, block_n: int) -> dict:
@@ -521,7 +540,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         paired: jax.Array | None = None, exact_sums: bool = False,
         transpose_lhs: bool = False, first: jax.Array | None = None,
         scales: jax.Array | None = None, step_scales: tuple | None = None, mx_scales: tuple | None = None,
-        gather: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
+        gather: jax.Array | None = None, scatter: jax.Array | None = None
+        ) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
     routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`.
@@ -543,11 +563,10 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     is multiplied by its rows' scales and its group's scales of its columns, `c` columns a scale, before it
     is added (`grouped_matmul.step_scaled`: DeepSeek-V3's blockwise FP8, row 4518); its step is 128 deep,
     with no hooks, pair, packed matrix or split. With `mx_scales`, an MX product (`_mx_refused`; row 4519).
-    With `gather` (int32 `[rows]`), the product's row `i` is `lhs[gather[i]]`: a mixture of experts' tokens
-    in their own order, the router's sort fused into the rows' loads (row 1376), each step's rows gathered by
-    the producer warpgroup (`gathered.Ring`; interpreted, a copy a row at its slot's swizzled row,
-    `Ring.parts`), on a family that gathers rows (`Family.gathers_rows`), with no prologue, transposed rows
-    or dense call.
+    With `gather` (int32 `[rows]`), row `i` is `lhs[gather[i]]`, read where it lies by the producer
+    (`gathered.Ring`; interpreted, `Ring.parts`); with `scatter` (int32 `[rows]`, a permutation), row `i`
+    lands at the outputs' row `scatter[i]`, once (`mosaic.Scattered`): a mixture of experts' sort and its
+    undoing fused into the loads and the stores (row 1376), each refused as `_tables_refused` says.
 
 Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` (a cooperative
     tile's consumer, half its rows) in its shared memory stage before the warpgroup MMA reads it;
@@ -558,8 +577,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     block_n, block_k = tiles.block_n, tiles.block_k
     if transpose_lhs and (not dense or prologue is not None):
         raise ValueError("a transposed lhs is a dense call's without a prologue")
-    k, rows = lhs.shape if transpose_lhs else lhs.shape[::-1]
-    matrices, k2, n = rhs.shape
+    (k, rows), (matrices, k2, n) = lhs.shape if transpose_lhs else lhs.shape[::-1], rhs.shape
     # A dense call's one matrix is its one group, its sizes unread (a TPU core's dense launch passes none).
     g = matrices if group_sizes is None else group_sizes.shape[0]
     if transpose_rhs:
@@ -570,14 +588,15 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         _packed_taken(rhs, scales, tiles, transpose_rhs=transpose_rhs, hooked=(prologue, epilogue, paired),
                       transpose_lhs=transpose_lhs, depth=k2, width=n)
     _gmm_refused(rhs, tiles, (rows, k, matrices, k2, n), dense=dense, first=first, paired=paired)
-    _gather_refused(gather, tiles, family_of(tiles, lhs.dtype), prologue=prologue, dense=dense,
+    _tables_refused(gather, scatter, tiles, family_of(tiles, lhs.dtype), prologue=prologue, dense=dense,
                     transpose_lhs=transpose_lhs)
     rows = rows if gather is None else gather.shape[0]
     accumulators = 1 if paired is None else 2
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     if k == 0:
-        outs = _of_no_depth((rows, n), group_sizes, accumulators, epilogue, epilogue_operands, epilogue_axes,
-                            dtypes)
+        # A scattered product's rows where its table says, as its stores put them.
+        outs = scattered(_of_no_depth((rows, n), group_sizes, accumulators, epilogue, epilogue_operands,
+                                      epilogue_axes, dtypes), scatter)
         return outs if out_dtypes else outs[0]
     plain = all(each is None for each in (prologue, epilogue, paired, scales)) and not transpose_lhs
     _mx_refused(mx_scales, tiles, family_of(tiles, lhs.dtype), transpose_rhs=transpose_rhs,
@@ -597,8 +616,9 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     # 0.33 ms of Llama 3 8B gate_up's 2.69 ms input gradient). A dense call's tiles start at whole row
     # tiles, so it reads to its last tile's end alone, no copy where its rows fill whole tiles: on an A100
     # that copy was 0.094 ms of Llama 3 8B o's 1.52 ms forward (BC-A100-EXTENT-AB1, 6% of its time).
-    lhs, gather, m, extent = _walked_rows(lhs, gather, tiles, transpose_lhs=transpose_lhs, dense=dense,
-                                          bounded=family_of(tiles, lhs.dtype).bounded_loads and not interpret)
+    lhs, gather, scatter, m, extent = _walked_rows(
+        lhs, gather, scatter, tiles, transpose_lhs=transpose_lhs, dense=dense,
+        bounded=family_of(tiles, lhs.dtype).bounded_loads and not interpret)
     row_tile = tiles.block_m * tiles.cluster
     table = None if dense else _grouped_table(group_sizes, m, row_tile, first)
     per = 1
@@ -624,7 +644,8 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
                          sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired, tail=tail,
                          exact_sums=exact_sums, transpose_lhs=transpose_lhs, scales=scales,
-                         step_scales=step_scales, scale_per=per, mx_scales=mx_scales, gather=gather)
+                         step_scales=step_scales, scale_per=per, mx_scales=mx_scales, gather=gather,
+                         scatter=scatter)
     if tiles.splits > 1:
         # Each run's fp32 partial, summed in its order (the same sums every call) and rounded once.
         total = functools.reduce(jnp.add, tuple(outs[0]))
@@ -698,11 +719,9 @@ def launched(family: mosaic.Family, multiprocessors: int, walked: int, tail: tai
                       'dense', 'tail', 'exact_sums', 'transpose_lhs', 'scale_per'))
 def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple, dense: bool = False,
-                  transpose_lhs: bool = False,
-                  paired: jax.Array | None = None, tail: tail_of.Tail | None = None,
-                  exact_sums: bool = False, scales: jax.Array | None = None,
-                  step_scales: tuple | None = None, scale_per: int = 1,
-                  mx_scales: tuple | None = None, gather: jax.Array | None = None) -> tuple:
+                  transpose_lhs: bool = False, paired: jax.Array | None = None, tail=None,
+                  exact_sums: bool = False, scales: jax.Array | None = None, step_scales: tuple | None = None,
+                  scale_per: int = 1, mx_scales: tuple | None = None, gather=None, scatter=None) -> tuple:
     """Dew: `gmm` on its instruction family's bundle (`family_of`): `tiles.warpgroups` consumer roles, each
     its share of the rows by all the columns, one MMA a step (two: CUTLASS's cooperative split, 2-7% faster
     on every H100 scoreboard row than halving the columns), persistent over the tiles in a planar snake,
@@ -739,9 +758,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     def body(*gmems):
         table_gmem, gmems = (None, gmems) if dense else (gmems[0], gmems[1:])
         (lhs_gmem, *matrix_gmems), refs = gmems[:1 + len(streamed)], gmems[1 + len(streamed):]
-        (scale_gmems, mx_gmems, gather_gmem), refs = _scale_refs(refs, step_scales, mx_scales, gather)
+        (scale_gmems, mx_gmems, gather_gmem, scatter_gmem), refs = _scale_refs(refs, step_scales, mx_scales,
+                                                                                 gather, scatter)
         prologue_gmems, side_gmems, o_gmems = _split(refs, len(prologue_operands), len(epilogue_operands))
-        o_gmems, workspace = (o_gmems, None) if tail is None else (o_gmems[:-1], o_gmems[-1])
+        o_gmems, workspace = _outputs(o_gmems, tail, scatter_gmem, bool(interpret))
         ready = None if tail is None else family.partials_ready((multiprocessors, consumers), bool(interpret))
         meetings = _meetings(family, tiles, grid[0] * grid[1], multiprocessors, consumers, bool(interpret))
 
@@ -807,7 +827,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     workspace = () if tail is None else (
         jax.ShapeDtypeStruct((multiprocessors, 2, consumers, *part), jnp.float32),)
     operands = (lhs, rhs, *(() if paired is None else (paired,)), *(() if scales is None else (scales,)),
-                *(step_scales or ()), *(mx_scales or ()), *(() if gather is None else (gather,)))
+                *(step_scales or ()), *(mx_scales or ()), *(() if gather is None else (gather,)),
+                *(() if scatter is None else (scatter,)))
     kernel = family.kernel(body, out_type=(*out_type, *workspace),
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
@@ -825,7 +846,9 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
     the other programs' are added (`mosaic.Family.fixed_up`)."""
     group, row_start, ni, _, gathered, program, split, _ = tile
     # A depth split's run stores its partial in its own slice of each output.
-    o_gmems = o_gmems if split is None else tuple(o_gmem.at[split] for o_gmem in o_gmems)
+    o_gmems = o_gmems if split is None else tuple(
+        dataclasses.replace(o_gmem, ref=o_gmem.ref.at[split]) if isinstance(o_gmem, mosaic.Scattered)
+        else o_gmem.at[split] for o_gmem in o_gmems)
     # This consumer's share of the tile: its first row, and its group's rows there.
     part_row, column = row_start + wg * part[0], ni * part[1]
     first, stored = _stored_rows(group, part_row, part[0], m, dense=dense, row_tile=row_tile)
@@ -933,15 +956,16 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
 
 def _gmm_split_refused(tiles: Tiles, k: int, n: int, step_scales, *, dense: bool, exact_sums: bool,
                        hooked: bool, plain: bool) -> None:
-    """Dew: `gmm`'s refusal of a depth split but a dense product's of no hooks, pair or exact sums, each run
-    some steps, of step scales but on an exactly summed product of no hook, pair, packed matrix or split
-    (`_step_scaled_takes`), and of a met walk (`Tiles.raster`) but a dense product's of no exact sums,
-    split or cluster, whose steps are its own (`_met`)."""
+    """Dew: `gmm`'s refusal of a depth split but a product's of no hooks, pair or exact sums, each run some
+    steps (a grouped one's runs over each tile its group's rows, the rows past every group's zeros in every
+    run, so their partials sum to the product: a decode step's experts, row 3622), of step scales but on an
+    exactly summed product of no hook, pair, packed matrix or split (`_step_scaled_takes`), and of a met walk
+    (`Tiles.raster`) but a dense product's of no exact sums, split or cluster, whose steps are its own
+    (`_met`)."""
     if tiles.raster and (not dense or exact_sums or tiles.splits > 1 or tiles.cluster > 1):
         raise ValueError(f"a met walk is a dense product's of no exact sums, split or cluster, not {tiles}")
-    if tiles.splits > 1 and (not dense or hooked or exact_sums or not split_runs(k // tiles.block_k,
-                                                                                  tiles.splits)):
-        raise ValueError(f"a depth split is a dense product's of no hooks, pair or exact sums, each run some "
+    if tiles.splits > 1 and (hooked or exact_sums or not split_runs(k // tiles.block_k, tiles.splits)):
+        raise ValueError(f"a depth split is a product's of no hooks, pair or exact sums, each run some "
                          f"steps, not {tiles} of a {k}-deep one")
     if step_scales is not None and not _step_scaled_takes(step_scales, tiles, k, n, exact_sums=exact_sums,
                                                           plain=plain):
@@ -969,10 +993,11 @@ def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: 
 
 
 def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs: bool, plain: bool) -> None:
-    """Dew: `gmm`'s refusal of an MX product (`mx_scales`: the rows' and the matrices' E8M0 scales, one every
-    32 depths, tiled as `tcgen05.scales_layout` lays them out, `[rows / 128, depth / 128, 32, 16]` and
-    `[groups, width / 128, depth / 128, 32, 16]`; FP8 rows times a K-major FP8 matrix, each 32 depths of each
-    scaled in the products, `mosaic.Issuer.scaled_products`) it does not take: but on a family whose
+    """Dew: `gmm`'s refusal of a block-scaled product (`mx_scales`: the rows' and the matrices' scales, one
+    every block of depths, `block_format`'s, tiled as `tcgen05.scales_layout` lays them out, `[rows / 128,
+    scale tiles, 32, 16]` and `[groups, width / 128, scale tiles, 32, 16]`; FP8 or E2M1 rows times a K-major
+    matrix of theirs, each block of each scaled in the products, `mosaic.Issuer.scaled_products`) it does
+    not take: but on a family whose
     products take block scales, its matrix K-major, with no hook, pair, packed matrix, step scales,
     transposed rows, exact sums or split, its tile whole 128s of rows, columns and depth (the scales'
     tiles), each group's rows whole 128-row tiles (the caller's)."""
@@ -980,17 +1005,28 @@ def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs
         return
     if not (family.takes_block_scales and transpose_rhs and plain and tiles.splits == 1
             and tiles.block_m % 128 == 0 and tiles.block_n % 128 == 0 and tiles.block_k % 128 == 0):
-        raise ValueError(f"an MX product runs on a family whose products take block scales ({family.name}'s "
-                         f"do not, or its call or {tiles} is not one it takes)")
+        raise ValueError(f"a block-scaled product runs on a family whose products take block scales "
+                         f"({family.name}'s do not, or its call or {tiles} is not one it takes)")
 
 
-def _scale_refs(refs: tuple, step_scales, mx_scales, gather) -> tuple:
-    """Dew: a `gmm` kernel's step scales', MX scales' (each two) and gather table's references, leading the
-    rest in that order (None where the call has none), and the references after them."""
+def _outputs(o_gmems: tuple, tail, scatter_gmem, interpret: bool) -> tuple:
+    """Dew: a `gmm` kernel's outputs, each `mosaic.Scattered` through `scatter_gmem` where the call has one,
+    and a balanced tail's workspace (the last reference; None without a tail)."""
+    o_gmems, workspace = (o_gmems, None) if tail is None else (o_gmems[:-1], o_gmems[-1])
+    if scatter_gmem is not None:
+        o_gmems = tuple(mosaic.Scattered(o_gmem, scatter_gmem, interpret) for o_gmem in o_gmems)
+    return o_gmems, workspace
+
+
+def _scale_refs(refs: tuple, step_scales, mx_scales, gather, scatter) -> tuple:
+    """Dew: a `gmm` kernel's step scales', MX scales' (each two), gather table's and scatter table's
+    references, leading the rest in that order (None where the call has none), and the references after
+    them."""
     step, refs = (refs[:2], refs[2:]) if step_scales is not None else (None, refs)
     mx, refs = (refs[:2], refs[2:]) if mx_scales is not None else (None, refs)
     gathered, refs = (refs[0], refs[1:]) if gather is not None else (None, refs)
-    return (step, mx, gathered), refs
+    scattered, refs = (refs[0], refs[1:]) if scatter is not None else (None, refs)
+    return (step, mx, gathered, scattered), refs
 
 
 def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
@@ -1019,31 +1055,39 @@ def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Arr
     return jnp.concatenate([table, jnp.minimum(table[:, :1], g - 1) + first], axis=1)
 
 
-def _walked_rows(lhs, gather, tiles: Tiles, *, transpose_lhs: bool, dense: bool, bounded: bool) -> tuple:
+def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, dense: bool,
+                 bounded: bool) -> tuple:
     """Dew: `gmm`'s rows as its schedule walks them: `lhs`, or a gathered product's table (`gather`, a pad
     reading row 0 of the tokens, which stay as they are), padded to whole TMA rows (`m` of them) and
-    extended to the schedule's extent where the family's loads past the rows are not zeros (`bounded`):
-    `(lhs, gather, m, extent)`. A table is always extended: its threads read a tile's entries by plain
-    loads, which no TMA bounds (a gathered product's last tile read past an unextended table on a GH200,
-    CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
+    extended to the schedule's extent where the family's loads past the rows are not zeros (`bounded`),
+    and a scattered product's table to the extent, its padded and extended rows stored nowhere
+    (`mosaic.Scattered`): `(lhs, gather, scatter, m, extent)`. A table is always extended: its threads
+    read a tile's entries by plain loads, which no TMA bounds (a gathered product's last tile read past an
+    unextended table on a GH200, CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
     row_axis = 1 if transpose_lhs else 0
     walked, axis = (lhs, row_axis) if gather is None else (gather, 0)
     walked = rows_padded(walked, axis, TMA_ROWS)
     m = walked.shape[axis]
     row_tile = tiles.block_m * tiles.cluster
-    extent = (m if bounded and gather is None else -(-m // row_tile) * row_tile if dense
+    tabled = gather is not None or scatter is not None
+    extent = (m if bounded and not tabled else -(-m // row_tile) * row_tile if dense
               else row_extent(m, row_tile))
     walked = rows_extended(walked, axis, extent)
-    return (walked, None, m, extent) if gather is None else (lhs, walked, m, extent)
+    if scatter is not None:
+        scatter = jnp.pad(scatter.astype(jnp.int32), (0, extent - scatter.shape[0]), constant_values=-1)
+    return (walked, None, scatter, m, extent) if gather is None else (lhs, walked, scatter, m, extent)
 
 
-def _gather_refused(gather, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
+def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
                     transpose_lhs: bool) -> None:
     """Dew: `gmm`'s refusal of a gathered product (`gather`) but on a family that gathers rows
-    (`Family.gathers_rows`), of no prologue, transposed rows or dense call."""
+    (`Family.gathers_rows`), of no prologue, transposed rows or dense call, and of a scattered one
+    (`scatter`) but a grouped call's on such a family (its stores `mosaic.staged_rows`')."""
     if gather is not None and (prologue is not None or dense or transpose_lhs or not family.gathers_rows):
         raise ValueError(f"a gathered product's rows are a ring family's gather, with no prologue, "
                          f"transposed rows or dense call, not {tiles}'s")
+    if scatter is not None and (dense or not family.gathers_rows):
+        raise ValueError(f"scattered rows are a grouped call's on a ring family, not {tiles}'s")
 
 
 def _gmm_refused(rhs, tiles: Tiles, extents: tuple, *, dense: bool, first, paired) -> None:
@@ -1863,7 +1907,7 @@ def handoff_steps(tiles: Tiles, target) -> float:
 
 def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, itemsizes: tuple[int, int],
                 multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
-                launch_seconds: float | None) -> int:
+                launch_seconds: float | None, partial_rows: int | None = None) -> int:
     """Dew: the slices a contraction of `rows` splits into at `tiles` (`Tiles.splits`: a kernel gradient's,
     `tgmm`, and a swapped decode product's, `gmm`), from the call's extents and the device's facts. Over a
     wave (`multiprocessors` x `tiles.programs`) and `rows` in steps a group (on average), the busiest program
@@ -1871,8 +1915,10 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
     shares of the operands (`rows` of `depth` and of `width` at `itemsizes` bytes, each read once) at its
     share of `bandwidth` (that of the multiprocessors the programs keep busy, over the programs in flight);
     the walk takes the longer of the two. A split adds the time its fp32 partials take written and read back
-    (2s + 1 passes over the output at `bandwidth`, in steps of `step_seconds`) and the launch their sum adds
-    (`launch_seconds`, the part's measured launch in a program, row 3613; none where unmeasured). The split
+    (2s + 1 passes over the output, `partial_rows` of it where they hold fewer than its `groups` x
+    `depth`: a decode step's experts' few rows, at `bandwidth`, in steps of `step_seconds`) and the launch
+    their sum adds (`launch_seconds`, the part's measured launch in a program, row 3613; none where
+    unmeasured). The split
     is the s of the shortest walk, the least of equal ones, each slice keeping at least the ring's stages and
     one more on average and some steps (`split_runs`, as `gmm`'s runs share them); one where the device
     states no rate or the call no whole tile. A bounded comparison over the facts, no table, no timing:
@@ -1895,7 +1941,8 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
         rate = bandwidth * min(programs, multiprocessors) / multiprocessors / min(programs, wave)
         streamed = waves * operand_bytes / programs / rate / step_seconds
         passes = 0 if splits == 1 else 2 * splits + 1
-        partials = passes * groups * depth * width * 4 / bandwidth / step_seconds
+        held = groups * depth if partial_rows is None else partial_rows
+        partials = passes * held * width * 4 / bandwidth / step_seconds
         # A split runs its partials' launch and XLA's sum of them where the unsplit call runs one launch.
         launches = 0 if splits == 1 or launch_seconds is None else launch_seconds / step_seconds
         return max(busiest, streamed) + partials + launches

@@ -694,26 +694,30 @@ def test_the_tuners_group_sizes_route_every_row(groups):
     assert sizes.sum() == 300 and (sizes >= 0).all() and (groups == 1 or sizes[0] == 0), sizes
 
 
-def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order():
+@pytest.mark.parametrize("scattered", [False, True])
+def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order(scattered):
     """`gemm.gemm`'s `gather` (row 1376) on a CPU (XLA's program): the projection of `tokens[gather]`, its
     value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a token
-    no slot reads zero) bitwise the projection of the rows gathered first, plain and paired; a gathered
-    dense or stacked call is refused."""
+    no slot reads zero) bitwise the projection of the rows gathered first, plain and paired; `scattered`,
+    each row written at its entry of a permutation (`scatter`), bitwise those rows put there after, its
+    cotangents read back through it; a gathered dense or stacked call, and a scattered dense one, refused."""
     from dew.nn.kernels import gemm
 
     rng = np.random.default_rng(3)
     tokens = jnp.asarray(rng.normal(size=(40, 64)), jnp.float32)
     table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
+    slots = jnp.asarray(rng.permutation(72), jnp.int32) if scattered else None
     matrices = jnp.asarray(rng.normal(size=(2, 3, 64, 32)) / 8, jnp.float32)
     sizes = jnp.asarray([20, 0, 44], jnp.int32)
 
     def fused(tokens, first, second):
         return gemm.gemm(tokens, first, sizes, out_dtype=jnp.float32, out_dtypes=(jnp.float32,) * 2,
-                         paired=second, gather=table)
+                         paired=second, gather=table, scatter=slots)
 
     def apart(tokens, first, second):
-        return gemm.gemm(tokens[table], first, sizes, out_dtype=jnp.float32, out_dtypes=(jnp.float32,) * 2,
+        outs = gemm.gemm(tokens[table], first, sizes, out_dtype=jnp.float32, out_dtypes=(jnp.float32,) * 2,
                          paired=second)
+        return outs if slots is None else tuple(jnp.zeros_like(out).at[slots].set(out) for out in outs)
 
     operands = (tokens, matrices[0], matrices[1])
     tangents = tuple(jnp.asarray(rng.normal(size=operand.shape), jnp.float32) for operand in operands)
@@ -729,3 +733,6 @@ def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order():
             stack = matrices if "layer" in refused else matrices[0]
             gemm.gemm(tokens, stack, arguments.pop("group_sizes"), out_dtype=jnp.float32, gather=table,
                       **arguments)
+    with pytest.raises(ValueError):
+        gemm.gemm(tokens, matrices[0, 0], None, out_dtype=jnp.float32,
+                  scatter=jnp.arange(40, dtype=jnp.int32))
