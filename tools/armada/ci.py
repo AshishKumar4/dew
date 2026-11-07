@@ -119,7 +119,6 @@ import sys
 import threading
 import time
 import tomllib
-import types
 import xml.etree.ElementTree as ET
 from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
@@ -217,8 +216,8 @@ file on a Genoa host, 1.0 on a Turin one)."""
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
-HARNESS = "tools/armada/"
-"""The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
+
+
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
           "src/dew/_cleanup.py", "tools/armada/split.py", "tools/armada/executed.py",
           "tools/armada/followed.py", "tools/armada/lifetime.py", "tools/armada/watched.py",
@@ -285,8 +284,8 @@ def shared(python: str) -> str:
     digest = hashlib.sha256(python.encode())
     # A conftest.py, which pytest loads by its path for every test beside and below it, and a package's
     # __init__.py; a helper module is the input of each run that imported a module of its name, which it
-    # would shadow (followed.py's `shadowing`, `looked_up`), so a helper of a new name reruns no file
-    # (owner, 2026-10-29: train 315's one new helper under tests/ reran all 2490 tasks).
+    # would shadow (followed.py's `shadowing`, digests.py's `looked_up`), so a helper of a new name reruns
+    # no file (owner, 2026-10-29: train 315's one new helper under tests/ reran all 2490 tasks).
     for path in sorted(Path("tests").rglob("*.py")):
         if "__pycache__" not in path.parts and path.name in ("conftest.py", "__init__.py"):
             digest.update(str(path).encode())
@@ -295,16 +294,17 @@ def shared(python: str) -> str:
     # listers' and probers' alone, as a run records every probe it makes (followed.py's `PROBES`;
     # 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures). A build's output and a fetched
     # payload, which a planner's checkout lacks, are not named: they are their build's and their manifest's
-    # (`built`, FETCHED, `contents`), whose names are.
+    # (`digests.built`, FETCHED, `digests.contents`), whose names are.
     for root in ("tests", "src"):
         for path in sorted(Path(root).rglob("*")):
-            if (path.is_file() and path.suffix != ".py" and not built(path) and FIXTURES not in path.parents
-                    and not path.with_name(path.name + FETCHED).is_file()):
+            if (path.is_file() and path.suffix != ".py" and not digests.built(path)
+                    and digests.FIXTURES not in path.parents
+                    and not path.with_name(path.name + digests.FETCHED).is_file()):
                 digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
-        digest.update(name.encode() + (code_of(name) if name.endswith(".py") else contents(name)))
+        digest.update(name.encode() + (code_of(name) if name.endswith(".py") else digests.contents(name)))
     return digest.hexdigest()
 
 
@@ -313,88 +313,6 @@ def lane_inputs(python: str) -> str:
     and this file, which sets the environment, share and deadline each file runs under on a GPU, where a
     CPU task's are the session's."""
     return hashlib.sha256((shared(python) + code_of(__file__).hex()).encode()).hexdigest()
-
-
-FIXTURES = Path("tests/fixtures")
-"""The tests' fixtures: each its openers', listers' and probers' input alone (`shared`), and a native reader's
-directories up to it (`native_inputs`)."""
-FETCHED = ".fetched.json"
-"""A fetched fixture's manifest's suffix, beside the payload it pins (tools/fetched_fixtures.py)."""
-
-
-def built(path: Path) -> bool:
-    """Whether `path` is a build's output, never an input: compiled bytecode, or an editable install's
-    metadata (setuptools' <name>.egg-info), which a task's environment writes into its checkout and a
-    planner's lacks; or a directory holding nothing else, as a package a commit deleted leaves its bytecode
-    in a checkout the environment's snapshot carries across commits, which a planner's clean tree lacks (train
-    636: src/dew/cli/, its __pycache__ alone, listed in src/dew's entries, keyed every task's rows apart from
-    their plan's, and two tasks ran 120 kept rows each past their deadline)."""
-    if "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts):
-        return True
-    return path.is_dir() and not path.is_symlink() and all(
-        entry.name.startswith(".") or built(entry) for entry in path.iterdir())
-
-
-def contents(name: str) -> bytes:
-    """The hash of file `name`'s bytes, of directory `name`'s entries' names but its hidden ones and a
-    build's (`built`), or b"missing". A fetched fixture's payload is the digest its manifest pins, whether
-    it is downloaded here or not, so a planner that never fetches it keys it as a task does. An execution
-    limit a run read (followed.py's `LIMITS`: "limit:cpu", "limit:memory") is the one binding this process
-    (host.py's `limit`): a row green on 4 vCPUs is not reused on 8, nor on a planner, which reads its own (row
-    1998, 2026-10-28). A path a run probed (followed.py's `PROBED`: "probe:" and the path) is what a
-    probe answers of it (`probed`), never its bytes, which no probe reads. An import's search of a checkout
-    directory for a name (followed.py's `LOOKUP`) is what that search finds there (`looked_up`)."""
-    if name.startswith("limit:"):
-        return hashlib.sha256(host().limit(name).encode()).digest()
-    if name.startswith(followed.PROBED):
-        return probed(Path(name.removeprefix(followed.PROBED)))
-    if name.startswith(followed.LOOKUP):
-        return looked_up(Path(name.removeprefix(followed.LOOKUP)))
-    if followed.CODE in name:
-        path, _, executed = name.partition(followed.CODE)
-        if not Path(path).is_file():
-            return b"missing"
-        return code_of(path) if executed == followed.WHOLE else unit(path, executed)
-    path = Path(name)
-    manifest = path.parent / (path.name + FETCHED)
-    if path.name and manifest.is_file():
-        return bytes.fromhex(json.loads(manifest.read_text())["sha256"])
-    if path.is_file():
-        return hashlib.sha256(path.read_bytes()).digest()
-    if path.is_dir():
-        entries = sorted(entry.name for entry in path.iterdir()
-                         if not entry.name.startswith(".") and not built(entry))
-        return hashlib.sha256("\n".join(entries).encode()).digest()
-    return b"missing"
-
-
-def probed(path: Path) -> bytes:
-    """What an existence or size probe (followed.py's `PROBES`) answers of `path`: missing, a directory, or a
-    file, whether it executes and, but for a Python module (its code its runners' input, `code_unit`), its
-    size; never its bytes or times (train 668: a probed helper's comment edit re-keyed its 458 probers)."""
-    if path.is_dir():
-        return b"directory"
-    if not path.is_file():
-        return b"missing"
-    stat = path.stat()
-    size = "" if path.suffix == ".py" else f" {stat.st_size}"
-    return f"file{size} {int(bool(stat.st_mode & 0o111))}".encode()
-
-
-def looked_up(looked: Path) -> bytes:
-    """What an import of name `looked.name` finds in directory `looked.parent`: the entries there of that
-    name, a module of any suffix (source, bytecode, an extension) or a package, and a package's __init__ of
-    any suffix, which decides whether it is a regular package or a namespace's portion; none of any other
-    name (train 668: a module added under nn/backbones re-keyed the 589 rows that imported its siblings)."""
-    directory = looked.parent
-    if not directory.is_dir():
-        return b"missing"
-    found = sorted(entry.name for entry in directory.iterdir() if not built(entry) and (
-        entry.name == looked.name or entry.name.startswith(f"{looked.name}.")))
-    if looked.is_dir() and not looked.is_symlink():
-        found += sorted(f"{looked.name}/{entry.name}" for entry in looked.iterdir()
-                        if entry.name.partition(".")[0] == "__init__" and not built(entry))
-    return hashlib.sha256("\n".join(found).encode()).digest()
 
 
 @dataclasses.dataclass
@@ -424,7 +342,7 @@ class Reading:
             return self.cuts[(name, count)]
 
     def part(self, path: str) -> bytes:
-        """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`contents`)."""
+        """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`digests.contents`)."""
         found = self.parts.get(path)
         if found is None:
             with self.lock:
@@ -436,7 +354,7 @@ class Reading:
     def read(self, path: str) -> bytes:
         module, _, executed = path.partition(followed.CODE)
         if not executed or executed == followed.WHOLE or not Path(module).is_file():
-            return contents(path)
+            return digests.contents(path)
         if module not in self.modules:
             self.modules[module] = units(module)
         found = self.modules[module]
@@ -467,58 +385,25 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
 def inputs(name: str, depends: list[str]) -> list[str]:
     """What test file `name`'s key covers, given that its run executed or read `depends`: those, its own code
     whole (followed.py's `WHOLE`), and the import lookups that found each module it executed under src/ or
-    tools/ (`lookups`): a module or package of its name added beside one it imported (which shadows it), or an
-    __init__.py added to a namespace package on the way to one, which executes as the import passes, changes
-    its key; a module of another name added beside it does not, unless an import its run tried and failed
-    looks for that name (followed.py's `missed`). tools/ is searched so, as a test puts it, or a directory
-    under it, on sys.path and imports a tool by its name; src/'s own entries every key covers (`shared`). The
+    tools/ (`digests.lookups`): a module or package of its name added beside one it imported (which
+    shadows it), or an __init__.py added to a namespace package on the way to one, which executes as the
+    import passes, changes its key; a module of another name added beside it does not, unless an import its
+    run tried and failed looks for that name (followed.py's `missed`). tools/ is searched so, as a test puts
+    it, or a directory under it, on sys.path and imports a tool by its name; src/'s own entries every key
+    covers (`shared`). The
     harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
     import of a test's, so their lookups are none of its inputs (the maintainer, 2026-10-29: train 296's one
     added tool reran 1,794 of 1,795; train 668: one module added to nn/backbones re-keyed 589 rows)."""
     own = f"{name}{followed.CODE}{followed.WHOLE}"
-    return sorted({own, *(path for path in depends if not built_input(path)),
-                   *(looked for path in depends for looked in lookups(path.partition(followed.CODE)[0]))})
-
-
-@functools.cache
-def lookups(path: str) -> tuple[str, ...]:
-    """The import lookups that find module `path` under src/ or tools/ (followed.py's `LOOKUP`), its own name
-    in its directory and each package's name on the way down to it, none for any other path. A function of
-    the path's text alone, kept: a plan asks it of each of a row's ~3,000 inputs for every row."""
-    if not path.startswith(("src/", "tools/")) or not path.endswith(".py") or path.startswith(HARNESS):
-        return ()
-    module = Path(path)
-    found = module.parent if module.name == "__init__.py" else module.with_suffix("")
-    # src/'s own entries every key covers (`shared`); tools' own lookup, a namespace package's at the root, a
-    # row keys (train 672's review: a tools/__init__.py added re-keyed none of its 69 importers' rows).
-    return tuple(f"{followed.LOOKUP}{step}" for step in (found, *found.parents)
-                 if step.parts and step.parts[0] in ("src", "tools") and step != Path("src"))
-
-
-@functools.cache
-def built_input(path: str) -> bool:
-    """Whether input `path` (a file, a unit of one, or a probe of one) is a build's output (`built`). A
-    build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
-    (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files). Kept, as
-    `packages` is."""
-    named = path.removeprefix(followed.PROBED).removeprefix(followed.LOOKUP)
-    return built(Path(named.partition(followed.CODE)[0]))
-
-
-@functools.cache
-def host() -> types.ModuleType:
-    """host.py beside this file, loaded by its path, as this file puts nothing on sys.path."""
-    spec = importlib.util.spec_from_file_location("dew_host", Path(__file__).with_name("host.py"))
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return sorted({own, *(path for path in depends if not digests.built_input(path)),
+                   *(looked for path in depends
+                     for looked in digests.lookups(path.partition(followed.CODE)[0]))})
 
 
 def cpu_class() -> str:
     """This host's CPU microarchitecture, the one class the records, the tests' compilation cache and
-    the shared XLA bundles key it by (`host`)."""
-    return host().cpu_class()
+    the shared XLA bundles key it by (`digests.host`)."""
+    return digests.host().cpu_class()
 
 
 def device_class(network: bool = False) -> str:
@@ -1771,11 +1656,11 @@ def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
     (`watched`: an open no Python process recorded, as a tokenizer's Rust code makes): a native reader's
     probe beside what it opened is no record's, as followed.py's `PROBES` are Python's. The fetched store
     is none: its payloads are content-addressed, and a planner, which never downloads them, keys them as a
-    task does (`contents`)."""
-    store = FIXTURES / "fetched"
-    return {str(parent) for name in opened - recorded if FIXTURES in (path := Path(name)).parents
+    task does (`digests.contents`)."""
+    store = digests.FIXTURES / "fetched"
+    return {str(parent) for name in opened - recorded if digests.FIXTURES in (path := Path(name)).parents
             and store != path and store not in path.parents
-            for parent in path.parents if parent == FIXTURES or FIXTURES in parent.parents}
+            for parent in path.parents if parent == digests.FIXTURES or digests.FIXTURES in parent.parents}
 
 
 def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[str] | None:
