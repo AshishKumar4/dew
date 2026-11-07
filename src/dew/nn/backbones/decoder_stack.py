@@ -404,8 +404,8 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             x, written = step(run, x, None if inputs is None else inputs.layer(0), store)
             if store is not None:
                 store.update(written)
-        elif _updates_in_backward(run, specs[first], train=train, decode=decode, fetching=fetching,
-                                  periodic=periodic, store=store, inputs=inputs):
+        elif _updates_in_backward(run, run.specs if periodic else (specs[first],), train=train,
+                                  decode=decode, fetching=fetching, store=store, inputs=inputs):
             x = _updated_in_backward(run, x, attention_metadata=attention_metadata, remat=remat)
         else:
             # A longer run's layers share keys or own them, so they only read the store: a provider
@@ -445,17 +445,17 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
     return x
 
 
-def _updates_in_backward(run: nn.Module, spec: LayerSpec, *, train: bool, decode: bool, fetching: bool,
-                         periodic: bool, store, inputs) -> bool:
+def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: bool, decode: bool,
+                         fetching: bool, store, inputs) -> bool:
     """Whether a scanned run updates in its backward (`dew.nn.in_backward`): inside a step's plan, a
-    training forward of a run of like layers that holds its parameters as the plan's state does, writes
-    nothing but its output (no cache, routing statistics or probes: `WRITTEN`), reads no store, per-layer
-    input or host bank, and runs under no interceptor (an adapter's, a quantizer's), whose scope a layer
-    applied on its own would leave."""
+    training forward of a run of like layers, or of a period's layers repeated, that holds its parameters
+    as the plan's state does, writes nothing but its output (no cache, routing statistics or probes:
+    `WRITTEN`), reads no store, per-layer input or host bank, routes no layer (`specs`), and runs under no
+    interceptor (an adapter's, a quantizer's), whose scope a layer applied on its own would leave."""
     current = in_backward.plan()
-    if current is None or not train or decode or fetching or periodic or store is not None:
+    if current is None or not train or decode or fetching or store is not None:
         return False
-    if inputs is not None or spec.routed or spec.hash_routed or INTERCEPTED.value:
+    if inputs is not None or any(spec.routed or spec.hash_routed for spec in specs) or INTERCEPTED.value:
         return False
     if QUANTIZED_TRACE.value is not None:
         return False
@@ -493,8 +493,8 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
 
     return in_backward.scanned_run(
         run.path, layer, weights, held.get(in_backward.MASTERS),
-        {name: held[name] for name in current.moments}, held[in_backward.NORMS], x, keys,
-        (attention_metadata,))
+        {name: held[name] for name in current.moments}, in_backward.norms_of(held[in_backward.NORMS]), x,
+        keys, (attention_metadata,))
 
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],

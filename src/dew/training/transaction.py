@@ -343,16 +343,15 @@ def _at(tree, path: tuple[str, ...]):
 
 
 def _stage_runs(params: Variables, path: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
-    """The paths of the runs a one-stage scanned state holds stacked whole (`dew.training.stages`): each
-    under a `stages` subtree whose leaves lead with a stage axis of one; a run of a repeated period, held by
-    position of its period (`layers_0`, ...), updates as before."""
+    """The paths of the runs a one-stage scanned state holds stacked (`dew.training.stages`), whether
+    whole or by position of a repeated period: each under a `stages` subtree whose leaves lead with a stage
+    axis of one."""
     found = []
     for name, child in params.items():
         if not isinstance(child, Mapping):
             continue
         if name == "stages" and all(np.shape(leaf)[:1] == (1,) for leaf in jax.tree.leaves(child)):
-            found += [(*path, name, run) for run, layers in child.items()
-                      if not all(str(key).startswith("layers_") for key in layers)]
+            found += [(*path, name, run) for run in child]
         else:
             found += _stage_runs(child, (*path, name))
     return found
@@ -1126,9 +1125,12 @@ class Transaction:
 
         norms = {}
         for path in runs:
-            count = jax.tree.leaves(_at(params, path))[0].shape[1]
-            norms = merge(norms, _nested(path, {"sumsq": jnp.zeros((1, count), jnp.float32),
-                                                "nonfinite": jnp.zeros((1, count), jnp.float32)}))
+            run = _at(params, path)
+            count = jax.tree.leaves(run)[0].shape[1]
+            zeros = jnp.zeros((1, count), jnp.float32)
+            held = {"sumsq": zeros, "nonfinite": zeros}
+            periodic = all(str(key).startswith("layers_") for key in run)
+            norms = merge(norms, _nested(path, {in_backward.PERIOD_NORMS: held} if periodic else held))
         read = {**dict(zip(names, copies, strict=True)), in_backward.NORMS: norms}
         if state.compute is not None:
             read[in_backward.MASTERS] = params
@@ -1160,8 +1162,9 @@ class Transaction:
             moments=tuple(functools.reduce(merge, [_nested(path, _at(cotangents[name], path))
                                                    for path in handled], {})
                           for name in planned.plan.moments),
-            sumsq=sum((jnp.sum(_at(norms, path)["sumsq"]) for path in handled), jnp.zeros((), jnp.float32)),
-            nonfinite=sum((jnp.sum(_at(norms, path)["nonfinite"]) for path in handled),
+            sumsq=sum((jnp.sum(in_backward.norms_of(_at(norms, path))["sumsq"]) for path in handled),
+                      jnp.zeros((), jnp.float32)),
+            nonfinite=sum((jnp.sum(in_backward.norms_of(_at(norms, path))["nonfinite"]) for path in handled),
                           jnp.zeros((), jnp.float32)))
         zeros = functools.reduce(merge, [_nested(path, jax.tree.map(jnp.zeros_like, _at(gradient, path)))
                                          for path in handled], {})

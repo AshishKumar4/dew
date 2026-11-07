@@ -88,6 +88,19 @@ def gated(due: jax.Array) -> Iterator[None]:
         _GATE.reset(token)
 
 
+PERIOD_NORMS = "layers_0"
+"""Where a run of a repeated period holds its norms (`NORMS`): under its period's first position, the key
+its other collections hold that position's layers under, so a reader of a stage-local state's first layer
+reads it as one of them (`CausalTransformer.first_layer_shapes`)."""
+
+
+def norms_of(tree) -> dict[str, jax.Array]:
+    """A run's norms (`NORMS`) as `scanned_run` writes them: a periodic run's from under its first position
+    (`PERIOD_NORMS`)."""
+    held = tree.get(PERIOD_NORMS, tree)
+    return {"sumsq": held["sumsq"], "nonfinite": held["nonfinite"]}
+
+
 def plan() -> InBackward | None:
     """The open plan, None outside one."""
     return _PLAN.get()
