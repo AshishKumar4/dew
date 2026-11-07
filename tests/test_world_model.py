@@ -230,8 +230,11 @@ def test_a_tokenizers_patches_are_each_frames_row_major_pixels_whatever_its_lead
     np.testing.assert_array_equal(np.asarray(tokenizer._unpatchify(jnp.asarray(patches))), np.asarray(frames))
 
 
-SQUARE_UNITS = 64
-"""The held-out clips the moving squares' reconstruction is judged over (`learning_gate.units_for`)."""
+SQUARE_UNITS = 8
+"""The held-out clips the moving squares' reconstruction is judged over: `learning_gate.units_for` of a
+pilot over 64 held-out clips (armada at eab3c68e11), its contrasts' means and spreads 0.495 and 0.015 for
+lighting the squares, 0.5 and 0.0002 for the dark background, 0.124 and 0.003 for the error below the mean
+frame's."""
 
 
 def reconstructed(tokenizer, variables, clips: np.ndarray, mean: np.ndarray) -> dict[str, np.ndarray]:

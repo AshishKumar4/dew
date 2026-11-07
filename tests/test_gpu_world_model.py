@@ -21,7 +21,10 @@ pytestmark = pytest.mark.gpu(reason="tutorial 12's tokenizer at its own scale, 8
 
 TUTORIAL = Path(__file__).parent.parent / "tutorials" / "12-world-models.ipynb"
 BALL_UNITS = 32
-"""The held-out clips tutorial 12's reconstruction is judged over (`learning_gate.units_for`)."""
+"""The held-out clips tutorial 12's reconstruction is judged over: four times `learning_gate.units_for`'s 8
+for the moving squares' pilot (`test_world_model.SQUARE_UNITS`), whose reconstruction lit 99% of its
+shapes, where the balls' at 8,000 updates correlate 0.976 with their frames, so a closer margin is still
+judged."""
 
 
 def tutorial_function(name: str):
