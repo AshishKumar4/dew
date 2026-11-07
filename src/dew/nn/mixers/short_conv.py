@@ -16,7 +16,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.linear import DepthwiseConv1d, held_conv1d
+from dew.nn.linear import DepthwiseConv1d, call_tree, held_conv1d, tree_conv
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.scatter import gather_positions
@@ -36,9 +36,10 @@ class GatedShortConv(nn.Module):
     bias product, its code zeroing a padded slot's input before them alone. Parameter names are the
     checkpoint's (`conv/weight` the `[D, 1, K]` taps)."""
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a convolution reads the K-1
-    tokens before each of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
+    of its attention beside it (`dew.nn.linear.call_tree`): a convolution reads the K-1 tokens before each of
+    its document, on a tree the K-1 on its path (`tree_conv`)."""
 
     emb_features: int
     kernel: int = 3
@@ -101,6 +102,15 @@ class GatedShortConv(nn.Module):
             if not allocated:
                 # The allocation-only call (`open_kv_cache`'s dummy token) consumes nothing.
                 return self.out_proj(jnp.zeros_like(mixed))
+        given = call.metadata  # A tree call's parents, and its attention's runs and places beside them.
+        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
+        if tree is not None:
+            # Each token over its path, from the held history; the cache left as it was for the replay.
+            if held is None:
+                raise ValueError("a tree call reads a row's cache, which a decode call allocates first")
+            convolved = tree_conv(mixed, taps, bias, held.value, tree, valid=valid, dtype=mixed.dtype,
+                                  activation=False)
+            return self.out_proj(gate_out * checkpoint_name(convolved, 'conv'))
         if started is not None:
             started.value = started.value | (jnp.ones((batch,), bool) if valid is None
                                              else jnp.asarray(valid, bool).any(axis=1))
