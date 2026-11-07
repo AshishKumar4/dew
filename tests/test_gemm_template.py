@@ -657,21 +657,23 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
                 lowering_platforms=("cuda",))
 
 
+@pytest.mark.parametrize("transpose_rhs", [False, True])
 @pytest.mark.parametrize("rows", [1, 8, 32])
-def test_an_amperes_decode_product_splits_its_depth_over_the_wave(rows):
-    """An A100 decode step's dense product over a 2048 x 2048 matrix (row 483's input gradient) derives a
-    swapped tile whose depth splits until its programs fill most of the wave (`mosaic_gpu.split_count`
-    pricing the matrix's stream): its steps priced at their MMA alone, it walked 12 programs on 108
-    multiprocessors at 2.8-3.0x XLA's time (M-NS-12)."""
+def test_an_amperes_decode_product_splits_its_depth_over_the_wave(rows, transpose_rhs):
+    """An A100 decode step's dense product over a 2048 x 2048 matrix (row 483's input gradient), the matrix
+    lying either way, derives a swapped tile of at most `SWAPPED_ROWS` rows whose depth splits until its
+    programs fill most of the wave (`mosaic_gpu.split_count` pricing the matrix's stream): its steps priced
+    at their MMA alone, it walked 12 programs on 108 multiprocessors at 2.8-3.0x XLA's time (M-NS-12)."""
     launch = grouped_matmul.MosaicGmm()
     bound = launch.bind(jax.ShapeDtypeStruct((rows, 2048), jnp.bfloat16),
                         jax.ShapeDtypeStruct((1, 2048, 2048), jnp.bfloat16),
-                        jax.ShapeDtypeStruct((1,), jnp.int32), out_dtype="bfloat16", trans_rhs=True,
+                        jax.ShapeDtypeStruct((1,), jnp.int32), out_dtype="bfloat16", trans_rhs=transpose_rhs,
                         interpret=False, dense=True)
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         tile = launch.derived(bound, target)
         assert tile is not None and tile.swapped and launch.legal(bound, tile, target), tile
+    assert tile.block_m <= grouped_matmul.SWAPPED_ROWS, tile
     programs = 2048 // tile.block_m * -(-rows // tile.block_n) * tile.splits
     assert programs >= target.multiprocessors // 2, (tile, programs)
 
