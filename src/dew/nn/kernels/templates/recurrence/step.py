@@ -57,6 +57,15 @@ def fits(shape: tuple[int, ...], whole: bool) -> bool:
     return key_width % scan.THREADS == 0 and tiles and (not whole or value_width == scan.THREADS)
 
 
+def _halves(key_width: int) -> int:
+    """The warpgroups a program's keys split between: two halves where the keys are a power of two of whole
+    turns (`UNROLLED`) each, each half's sums a subtree of XLA's pairwise order, the two joined at its top
+    (`_joined`); else one. One warpgroup walking a head's 128 keys alone, a row's token held one program a
+    head, a gated delta net's step took an A100's 28 us against the Triton step's 17 at one row (M-JS-20)."""
+    whole = key_width & (key_width - 1) == 0 and key_width >= 2 * UNROLLED
+    return 2 if whole else 1
+
+
 def serves(hooks: recurrence.Hooks, operands: recurrence.Step) -> bool:
     """Whether a token of `hooks` and `operands` steps here (`fits`); a one-tap conv's is taken before any
     launch (`recurrence.step`)."""
@@ -91,14 +100,15 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
     active = (jnp.ones((rows,), jnp.int32) if operands.active is None
               else jnp.asarray(operands.active).astype(jnp.int32))
     names = tuple(given)
-    block = _block(value_width)
+    block, halves = _block(value_width), _halves(key_width)
 
     def entry(active_ref, *refs):
         inputs = dict(zip(names, refs[:len(names)], strict=True))
-        state_out, *moved, out_ref, vectors, exchanged = refs[len(names):]
+        state_out, *moved, out_ref, vectors, exchanged, partials, joined = refs[len(names):]
+        half = lax.axis_index("wg") if halves > 1 else 0
         _program(hooks, inputs, active_ref, state_out, moved[0] if moved else None, out_ref,
-                 (vectors, exchanged), block=block, group=value_heads // key_heads,
-                 key_heads=key_heads, interpret=interpret)
+                 (vectors, exchanged.at[half], _Halves(halves, half, partials, joined)), block=block,
+                 group=value_heads // key_heads, key_heads=key_heads, interpret=interpret)
 
     history = ((jax.ShapeDtypeStruct(given['held'].shape, given['held'].dtype),) if hooks.conv is not None
                else ())
@@ -106,11 +116,54 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
                 jax.ShapeDtypeStruct((rows, value_heads, value_width), out_dtype))
     launched = mosaic.kernel(entry, out_type=out_type,
                              grid=(rows, value_heads // block.heads, value_width // block.columns),
-                             grid_names=("rows", "heads", "columns"), warpgroups=1, interpret=interpret,
-                             family=family.name, name="recurrence_step",
-                             scratch=(plgpu.SMEM((block.heads, 3, key_width), jnp.float32), scan.scratch()))
+                             grid_names=("rows", "heads", "columns"), warpgroups=halves,
+                             interpret=interpret, family=family.name, name="recurrence_step",
+                             scratch=(plgpu.SMEM((block.heads, 3, key_width), jnp.float32),
+                                      plgpu.SMEM((halves, 2, scan.THREADS // scan.WARP), jnp.float32),
+                                      plgpu.SMEM((3, halves, block.heads, block.columns), jnp.float32),
+                                      plgpu.Barrier(num_arrivals=halves, num_barriers=3)))
     state_out, *moved, out = launched(active, *given.values())
     return out, moved[0] if moved else None, state_out
+
+
+@dataclasses.dataclass(frozen=True)
+class _Halves:
+    """A program's warpgroups each walking `count`'s share of the keys, this one the `index`-th
+    (`_halves`): the sums over its keys joined through `partials` `[3, halves, heads, columns]`, each a turn
+    of its own barrier of `joined` (a pass's sums, `_joined`)."""
+
+    count: int
+    index: object
+    partials: object
+    joined: object
+
+    def first(self, effect) -> None:
+        """`effect()` by the first half alone (a store both halves would make alike)."""
+        if self.count == 1:
+            effect()
+        else:
+            pl.when(self.index == 0)(effect)
+
+    def keys(self, key_width: int) -> tuple:
+        """This half's first key and its keys' count."""
+        span = key_width // self.count
+        return self.index * span, span
+
+    def joined_sums(self, part: jax.Array, slot: int, layout, interpret: bool) -> jax.Array:
+        """`part`, this half's sum over its keys `[heads, columns]`, joined with the other half's: their sum
+        the earlier half's on the left, XLA's pairwise order's top (each half a subtree of it)."""
+        if self.count == 1:
+            return part
+        plgpu.store(self.partials.at[slot, self.index], part, optimized=False)
+        mosaic.synced(interpret)
+        plgpu.barrier_arrive(self.joined.at[slot])
+        plgpu.barrier_wait(self.joined.at[slot])
+        halves = [plgpu.load(self.partials.at[slot, h], layout=layout, optimized=False)
+                  for h in range(self.count)]
+        total = halves[0]
+        for other in halves[1:]:
+            total = total + other
+        return total
 
 
 @dataclasses.dataclass(frozen=True)
@@ -158,7 +211,7 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
     """A program's token (`step`): its queries, keys and values (the conv's, `_Conv`, where the prologue
     takes one), each head's key vectors staged, its block of the state stepped, its output and state stored,
     and the conv's history moved; an idle row's state and history copied and its output zeros."""
-    vectors, exchanged = scratch
+    vectors, exchanged, halves = scratch
     first = lax.axis_index("heads") * block.heads
     heads = tuple(first + index for index in range(block.heads))
     token = _Token(lax.axis_index("rows"), first, heads, tuple(head // group for head in heads),
@@ -177,22 +230,25 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
         else:
             windows = conv.windows()
             convolved = conv.convolved(windows)
-            conv.write([window[1:] for window in windows])
+            halves.first(lambda: conv.write([window[1:] for window in windows]))
             keyed = [convolved[1 + 2 * p:3 + 2 * p] for p in range(block.heads)]
             # The block's heads' values, a thread a channel as the block lays them (`_Block.layout`).
             value = convolved[0].reshape(block.heads, block.columns)
         writes = [_staged(hooks, inputs, token, p, keyed[p][0], keyed[p][1], vectors, exchanged,
                           interpret=interpret) for p in range(block.heads)]
         mosaic.synced(interpret)
-        out = _stepped(hooks, state_ref, state_out, value, vectors, token.per_head(writes), token)
+        out = _stepped(hooks, state_ref, state_out, value, vectors, token.per_head(writes), token, halves,
+                       interpret=interpret)
         out = _epilogue(hooks, inputs, token, out, value, exchanged, interpret=interpret)
-        token.stored(out_ref, out)
+        halves.first(lambda: token.stored(out_ref, out))
 
     @pl.when(active_ref[token.row] == 0)
     def _():
-        _walked_keys(key_width, lambda k: token.tile(state_ref, k),
-                     lambda k, tile: token.stored(state_out, tile, k))
-        token.stored(out_ref, jnp.zeros((block.heads, block.columns), jnp.float32))
+        start, span = halves.keys(key_width)
+        _walked_keys(span, lambda k: token.tile(state_ref, start + k),
+                     lambda k, tile: token.stored(state_out, tile, start + k))
+        zeros = jnp.zeros((block.heads, block.columns), jnp.float32)
+        halves.first(lambda: token.stored(out_ref, zeros))
         if conv is not None:
             conv.write(conv.held())
 
@@ -353,21 +409,24 @@ def _softplus(x):
     return jnp.maximum(x, 0.0) + jnp.where(u == 1.0, y, jnp.log(u) * (y / (u - 1.0)))
 
 
-def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
+def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, halves: _Halves, *,
+             interpret: bool):
     """`recurrence.update` over the block's column of the state, read from `state_ref` and written to
     `state_out` as it is held (`recurrence._held`): its sums over the keys (the decayed query's and key's
     reads of the state and the query's product with the written key) one pass over the state, its update
     another, the output `(g q)^T S + (q . (beta k)) c`. Each key dimension's vectors are read from `vectors`
-    as each head's scalars (`_key_entry`) and each sum over the keys a pairwise tree (`_summed_keys`). Every
-    key's entry held at once, a 128-key column spilled 1260 to 1276 bytes a thread (sm80, sm90; the fused
-    step's compile, jsf-r06j)."""
-    key_width = state_ref.shape[2]
+    as each head's scalars (`_key_entry`) and each sum over the keys a pairwise tree (`_summed_keys`), the
+    program's warpgroups each walking a share of the keys, their sums joined (`_Halves`). Every key's entry
+    held at once, a 128-key column spilled 1260 to 1276 bytes a thread (sm80, sm90; the fused step's
+    compile, jsf-r06j)."""
+    start, span = halves.keys(state_ref.shape[2])
+    layout = token.block.layout
 
     def entry(which, k):
-        return _key_entry(vectors, token, which, k)
+        return _key_entry(vectors, token, which, start + k)
 
     def row(k):
-        return token.tile(state_ref, k)
+        return token.tile(state_ref, start + k)
 
     def terms(k, tile):
         # The query's product with the written key a head's scalar, laid over the block as the sums' others
@@ -376,7 +435,9 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
                  jnp.zeros_like(tile) + entry(0, k) * (entry(1, k) * write))
         return (*found, (entry(1, k) * entry(2, k)) * tile) if hooks.delta else found
 
-    read, aligned, *keyed = _summed_keys(key_width, row, terms, value, count=3 if hooks.delta else 2)
+    sums = _summed_keys(span, row, terms, value, count=3 if hooks.delta else 2)
+    read, aligned, *keyed = (halves.joined_sums(part, slot, layout, interpret)
+                             for slot, part in enumerate(sums))
     corrected = value - keyed[0] if hooks.delta else value
 
     def updated(k, tile):
@@ -386,9 +447,9 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
         keyed_k = jnp.zeros_like(entry_k) + entry(1, k)
         kept = (recurrence.salted_bf16(entry_k, keyed_k, value) if state_out.dtype == jnp.bfloat16
                 else entry_k)
-        token.stored(state_out, kept, k)
+        token.stored(state_out, kept, start + k)
 
-    _walked_keys(key_width, row, updated)
+    _walked_keys(span, row, updated)
     return read + aligned * corrected
 
 
