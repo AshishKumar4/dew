@@ -5,8 +5,7 @@ from collections.abc import Callable, Mapping
 def capture_active() -> bool:
     from jax._src import profiler
 
-    session = profiler._profile_state.session
-    return session is not None and session.active
+    return profiler._profile_state.session is not None
 
 
 class TrainerProbe:
