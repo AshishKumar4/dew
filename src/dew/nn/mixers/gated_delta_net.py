@@ -22,6 +22,8 @@ class GatedDeltaNetMixer(MixerBase):
     """
 
     residuals = DELTA_RULE_RESIDUALS
+    # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
+    packed_cache = True
 
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 32
