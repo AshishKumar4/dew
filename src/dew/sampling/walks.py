@@ -13,6 +13,7 @@ from jax.typing import ArrayLike
 from dew.diffusion.discrete import DiscreteDenoiser
 from dew.diffusion.process import Denoiser
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.programs import on_host
 from dew.sampling.guidance import Guidance, Walk, pair_of
 from dew.sampling.solvers import RowKeys, RowSolver, Solver
 
@@ -114,7 +115,7 @@ def sample[StateT, RecordT](
     # A process whose model predicts over an interval reads, at each step,
     # the interval to the next grid point.
     spanned = denoise if isinstance(denoise, Denoiser) and denoise.process.interval else None
-    with jax.ensure_compile_time_eval():
+    with on_host():
         if times is None:
             assert steps is not None
             times = process.times(steps)
@@ -138,7 +139,7 @@ def sample[StateT, RecordT](
         return pair_of(walk.at(guided, count)(x_T, jnp.full((batch,), times[0])))[0] if final_denoise else x_T
 
     if initial is None:
-        with jax.ensure_compile_time_eval():
+        with on_host():
             initial = solver.init(x_T, times, process, key=key)
 
     def scanned[ReadT](read: Callable[[jax.Array, StateT, jax.Array], ReadT]) -> tuple[jax.Array, ReadT]:

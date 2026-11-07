@@ -409,6 +409,7 @@ dew.config.SourceOptions
   attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
   dex: Annotated[dew.nn.dex.DifferentialExtension, PrimitiveConstructorSpec] | None = None
   scan_layers: bool = False
+  packed_experts: bool = False
   param_dtype: str | None = None
   step: int | str | None = None
   ema: bool | None = None

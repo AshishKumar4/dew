@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Write the fixture of llama.cpp reading a decoder Dew exports.
+"""Write the fixture of llama.cpp reading a decoder Dew exports, and the pieces its drawn site's worker
+(tools/llama_cpp_worker.py) runs.
 
 llama.cpp v0.5.0 (ggml-org/llama.cpp at 7fe450e19305b828c199d602c23a8337aaa1f03b,
 its source archive checked against its SHA-256) converts the export with its
 own convert_hf_to_gguf.py to an F32 GGUF, and libllama, built from the same
-source for the CPU, computes the logits of every position of fixed ids with
+source for the CPU, computes the logits of every position of drawn ids with
 an F32 KV cache, flash attention off, on one thread. transformers runs the
 export in float64 (`torch_precision.float64`) for the truth both
 are measured from.
@@ -36,13 +37,14 @@ which transformers parses the tokenizer.
     PYTHONPATH=src python tools/llama_cpp_reference.py consume DIR \\
         ~/.cache/dew/reference-venvs/llama-cpp-t5/bin/python
 
-`consume` fetches and builds llama.cpp under ~/.cache/dew/upstream (cmake,
-ninja and a C++ compiler) and writes tests/fixtures/llama_cpp/reference.npz:
-the ids, llama.cpp's float32 logits, transformers' float64 ones, the
-SHA-256 of the export's config, generation config and weights (the weights
-by contents, as tools/lora_export_reference.py's `digest` hashes them), and
-the vocabulary the GGUF carries (its pieces by id, and its unknown,
-beginning and end ids), read back with the pinned gguf-py.
+`consume` fetches llama.cpp under ~/.cache/dew/upstream, converts the export
+and writes tests/fixtures/llama_cpp/reference.npz: the SHA-256 of the
+export's config, generation config and weights (the weights by contents, as
+tools/lora_export_reference.py's `digest` hashes them), and the vocabulary
+the GGUF carries (its pieces by id, and its unknown, beginning and end ids),
+read back with the pinned gguf-py. The logits over drawn ids are
+tools/llama_cpp_worker.py's, which builds libllama (cmake, ninja and a C++
+compiler) with the logits program (`build`, `llama_logits`).
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -63,7 +66,6 @@ ARCHIVE_SHA256 = "a6861d549427f814dc591c439e08206f67ffaba0248344d421589abf18199e
 FIELDS = {"vocab_size": 384, "emb_features": 64, "num_layers": 2, "num_heads": 4, "num_kv_heads": 2,
           "mlp_features": 128, "max_seq_len": 64, "qk_norm": False, "tie_embeddings": False}
 SEED = 61
-IDS = (np.arange(3, 3 + 24 * 7, 7) % FIELDS["vocab_size"]).astype(np.int32)
 DIGESTED = ("config.json", "generation_config.json", "model.safetensors")
 """The files Dew writes itself. The tokenizer files are transformers' own
 serialization, which the tokenizers release decides, so what the GGUF
@@ -78,7 +80,7 @@ The converter writes every tensor into a single file that the runtime maps.
 """
 SPECIALS = ("<unk>", "<s>", "</s>")
 
-# The logits of every position of IDS, as float32 rows, from libllama's C API.
+# The logits of every position of the ids file, as float32 rows, from libllama's C API.
 PROGRAM = r"""
 #include "llama.h"
 #include <cstdio>
@@ -248,40 +250,49 @@ def gguf_vocabulary(source: Path, gguf: Path) -> tuple[np.ndarray, np.ndarray]:
     return pieces, np.asarray([fields[key].contents() for key in SPECIAL_KEYS], np.int64)
 
 
-def consume(directory: Path, converter_python: str) -> None:
+def converted(source: Path, export_dir: Path, gguf: Path, python: str) -> None:
+    """The export converted to an F32 GGUF at `gguf` by llama.cpp's own convert_hf_to_gguf.py, run by
+    `python`."""
+    subprocess.run([python, str(source / "convert_hf_to_gguf.py"), str(export_dir), "--outtype", "f32",
+                    "--outfile", str(gguf)], check=True, capture_output=True)
+
+
+def llama_logits(program: Path, gguf: Path, ids: np.ndarray) -> np.ndarray:
+    """libllama's float32 logits at every position of `ids` `[1, T]`, through the logits program."""
+    with tempfile.TemporaryDirectory() as scratch:
+        given, made = Path(scratch) / "ids.bin", Path(scratch) / "logits.bin"
+        given.write_bytes(np.asarray(ids[0], np.int32).tobytes())
+        subprocess.run([str(program), str(gguf), str(given), str(made)], check=True, capture_output=True)
+        return np.fromfile(made, np.float32).reshape(1, ids.shape[1], FIELDS["vocab_size"])
+
+
+def float64_model(export_dir: Path):
+    """transformers' float64 model of the export (`torch_precision.float64`), the truth both arms are
+    measured from."""
     import torch
-    import transformers
     from transformers import AutoModelForCausalLM
 
-    from tools.reference_source import saved_fixture
     from tools.torch_precision import float64
 
-    source = fetch()
-    program = build(source)
-    export_dir, gguf = directory / "export", directory / "model-f32.gguf"
-    subprocess.run([converter_python, str(source / "convert_hf_to_gguf.py"), str(export_dir),
-                    "--outtype", "f32", "--outfile", str(gguf)], check=True)
-    (directory / "ids.bin").write_bytes(IDS.tobytes())
-    subprocess.run([str(program), str(gguf), str(directory / "ids.bin"), str(directory / "logits.bin")],
-                   check=True, capture_output=True)
-    theirs = np.fromfile(directory / "logits.bin", np.float32).reshape(1, IDS.size, FIELDS["vocab_size"])
     with float64():
-        model = AutoModelForCausalLM.from_pretrained(export_dir, dtype=torch.float64,
-                                                     attn_implementation="eager").eval()
-        with torch.no_grad():
-            truth = model(torch.from_numpy(IDS[None]).long()).logits.numpy()
+        return AutoModelForCausalLM.from_pretrained(export_dir, dtype=torch.float64,
+                                                    attn_implementation="eager").eval()
+
+
+def consume(directory: Path, converter_python: str) -> None:
+    from tools.reference_source import saved_fixture
+
+    source = fetch()
+    export_dir, gguf = directory / "export", directory / "model-f32.gguf"
+    converted(source, export_dir, gguf, converter_python)
     converter = subprocess.run([converter_python, "-c", "import torch, transformers; "
                                 "print(torch.__version__, transformers.__version__)"],
                                check=True, capture_output=True, text=True).stdout.split()
     meta = {"digests": digests(export_dir), "llama.cpp": COMMIT, "converter torch": converter[0],
-            "converter transformers": converter[1], "truth transformers": transformers.__version__,
-            "truth torch": torch.__version__}
+            "converter transformers": converter[1]}
     pieces, special = gguf_vocabulary(source, gguf)
-    arrays = {"ids": IDS[None], "llama_cpp.fp32": theirs, "transformers.fp64": truth, "gguf.pieces": pieces,
-              "gguf.special": special}
-    saved_fixture(FIXTURE / "reference.npz", arrays, meta)
-    gap = float(np.sqrt(np.mean((theirs - truth) ** 2)))
-    print(f"{FIXTURE / 'reference.npz'}: llama.cpp off float64 by {gap:.3g} (rms)")
+    saved_fixture(FIXTURE / "reference.npz", {"gguf.pieces": pieces, "gguf.special": special}, meta)
+    print(f"{FIXTURE / 'reference.npz'}: {meta}")
 
 
 def main() -> None:
