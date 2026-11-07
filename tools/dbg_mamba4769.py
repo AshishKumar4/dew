@@ -1,5 +1,8 @@
 import sys; sys.path[:0]=["src","tests","."]
 import os, inspect, urllib.request, json, time
+if sys.argv[1].startswith(('gate','stagesgate')):
+ os.environ['DEW_WIDE_CPU_ARITHMETIC']='1'
+ os.environ['XLA_FLAGS']=os.environ.get('XLA_FLAGS','')+' --xla_allow_excess_precision=false'
 print('K START',sys.argv,flush=True)
 try:
  r=urllib.request.urlopen('https://huggingface.co/AntonV/mamba2-130m-hf/resolve/05e8773fc4ac1cd067e8a18a5c45372ce5178405/config.json',timeout=30)
@@ -14,11 +17,16 @@ from dew.interop import Pretrained
 from dew.nn.mixers.mamba2 import Mamba2
 from ssd_support import mamba2_layer_params
 name='AntonV/mamba2-130m-hf';rev='05e8773fc4ac1cd067e8a18a5c45372ce5178405'
-torch.set_num_threads(2)
+torch.set_num_threads(1 if sys.argv[1].startswith(('gate','stagesgate')) else 2)
 jax.config.update('jax_enable_x64',True)
 mode=sys.argv[1]
 direct=mode.endswith('_direct')
 if direct:mode=mode[:-7]
+if mode.startswith(('gate','stagesgate')):
+ from dew.nn.precision import FP32_SUMS
+ jax.config.update('jax_default_matmul_precision',FP32_SUMS)
+ if mode in ('gate','gate_actual'):mode='control'
+if mode.startswith('stageswide'):os.environ['DEW_WIDE_CPU_ARITHMETIC']='1'
 if mode=='source':
  for obj in [getattr(mm.Mamba2Mixer,'torch_forward',mm.Mamba2Mixer.forward),mm.mamba2_chunk_scan,mm.segment_sum]:
   print('K SOURCE',obj.__name__,inspect.getfile(obj),flush=True)
@@ -69,14 +77,19 @@ if mode in ('control','fixed','control_dyn','dense4','densewide','denseplain','w
   loaded=SimpleNamespace(model=model,variables=variables)
  else:loaded=Pretrained.load(name,revision=rev,dtype='float32',param_dtype='float32',attention_impl='xla')
  print('K LOAD_DONE',time.time(),flush=True)
- run=jax.jit(loaded.model.apply)
+ print('K ARITHMETIC',os.environ.get('DEW_WIDE_CPU_ARITHMETIC'),jax.config.jax_default_matmul_precision,os.environ.get('XLA_FLAGS'),flush=True)
+ actual=sys.argv[1]=='gate_actual'
+ run=jax.jit(lambda x:loaded.model.apply(loaded.variables,x)) if actual else jax.jit(loaded.model.apply)
+ errors=[]
  for seed in range(16):
   drawn=np.random.default_rng([242,seed]).choice(tokens,size=ids.shape).astype(np.int32)
   with torch.no_grad():
    b=source(torch.from_numpy(drawn.astype(np.int64)),use_cache=False).logits.numpy()
    with float64():t=twin(torch.from_numpy(drawn.astype(np.int64)),use_cache=False).logits.numpy()
-  a=np.asarray(run(loaded.variables,jnp.asarray(drawn)))
+  a=np.asarray(run(jnp.asarray(drawn)) if actual else run(loaded.variables,jnp.asarray(drawn)))
   emit(str(seed),a,b,t)
+  errors.append((rms(a-t),rms(b-t)))
+ print('K POOLED',float(np.linalg.norm(np.asarray(errors)[:,0])/np.linalg.norm(np.asarray(errors)[:,1])),flush=True)
  sys.exit()
 if mode=='layers' or mode.startswith('stages'):
  drawn=np.random.default_rng([242,0]).choice(tokens,size=ids.shape).astype(np.int32)
