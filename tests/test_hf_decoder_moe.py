@@ -257,7 +257,7 @@ def _mxfp4_gpt_oss(directory: Path) -> Path:
     from safetensors.numpy import load_file, save_file
 
     dense = {key: value for key, value in PACKED_CONFIG.items() if key != "quantization_config"}
-    model = translate_config(dense).value()
+    model = translate_config(dense).value
     variables = nn.unbox(model.init(jax.random.key(0), np.zeros((1, 4), np.int32)))
     PretrainedDecoder.from_model(model, variables).save(directory / "dense")
     packed = {}
