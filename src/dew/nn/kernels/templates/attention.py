@@ -132,10 +132,14 @@ def _runs(query_ids: jax.Array | None, key_ids: jax.Array | None, batch: int, qu
     def row(wanted, held):
         order = jnp.argsort(held, stable=True)
         ordered = held[order]
-        # Each search's log2(K) steps unrolled into one program (`dew.nn.documents._searched`).
+        # Each search one sort of the keys' and queries' ids together, no loop: a loop's log2(K) trips ran
+        # as a GPU launch each (M-DD-10: a speculative verify of 4 queries over 4096 keys 284 us against its
+        # 22 us attention), and unrolled, their gathers chained into `_searched`'s unrolled steps, which XLA:CPU
+        # took past four minutes to compile a decode step over a paged pool (tests/test_kv_cache.py's greedy
+        # decodes, red at ce05446f953; either unrolled alone, or this sort, 15 to 30 s).
         return (order.astype(jnp.int32),
-                jnp.searchsorted(ordered, wanted, side="left", method="scan_unrolled").astype(jnp.int32),
-                jnp.searchsorted(ordered, wanted, side="right", method="scan_unrolled").astype(jnp.int32))
+                jnp.searchsorted(ordered, wanted, side="left", method="sort").astype(jnp.int32),
+                jnp.searchsorted(ordered, wanted, side="right", method="sort").astype(jnp.int32))
 
     return jax.vmap(row)(query_ids, key_ids)
 
