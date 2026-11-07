@@ -145,9 +145,9 @@ def witnessed(query, key, value, kept, *, interpret: bool, records=None) -> dict
 
 
 def certified(query, key, value, spans, *, interpret: bool):
-    """The certify launch's tiles and records (`attention_mosaic.certified`): interpreted, at a Hopper's tiles,
-    the target an interpreted launch derives its config for (`generation.assumed`); natively, on a device whose
-    mainloop runs the call, its test skipped with the mainloop's own reason where it declines it
+    """The certify launch's tiles and records (`attention_mosaic.certified`): interpreted, at a Hopper's
+    tiles, the target an interpreted launch derives its config for (`generation.assumed`); natively, on a
+    device whose mainloop runs the call, its test skipped with the mainloop's own reason where it declines it
     (`attention_mosaic.forward_declined`: an Ampere's, whose family the mainloop does not yet qualify)."""
     import pytest
 
