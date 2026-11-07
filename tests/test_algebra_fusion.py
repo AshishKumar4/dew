@@ -314,14 +314,21 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
         attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}",
                          truth=lambda *x: attend(*(a.astype(jnp.float64) for a in x)))
 
-def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None):
+def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None,
+                root=None):
     """Causal softmax attention as a program writes it out (its products as einsums, a causal where, the
     safe softmax), each keyword a way it computes something other than attention: a finite fill keeping the
     future keys' weight, logits truncated or narrowed through `logits_cast`, a maximum's initial value above
     the logits, each row divided by another row's sum (heads and rows swapped in its broadcast), the sum
-    narrowed through `sum_cast` (to float16, where 65536 keys' sum overflows)."""
+    narrowed through `sum_cast` (to float16, where 65536 keys' sum overflows), the queries divided by a
+    `root` near sqrt(D) but not it (Flax's division, its divisor another scale)."""
     def attend(q, k, v):
-        s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+        if root is not None:
+            # Flax's: the queries divided before the product, no scale after it.
+            s = jnp.einsum("bthd,bshd->bhts", q / jnp.float32(root).astype(q.dtype), k,
+                           preferred_element_type=jnp.float32)
+        else:
+            s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
         if logits_cast is not None:
             s = s.astype(logits_cast).astype(jnp.float32)
         s = jnp.where(jnp.tril(jnp.ones(s.shape[-2:], bool)), s, fill)
@@ -342,17 +349,52 @@ def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows
                                                   ("initial above", {"initial": 1e30}),
                                                   ("another row's sum", {"other_rows": True}),
                                                   ("logits narrowed", {"logits_cast": jnp.float16}),
-                                                  ("sum narrowed", {"sum_cast": jnp.float16})])
+                                                  ("sum narrowed", {"sum_cast": jnp.float16}),
+                                                  ("attention by a root", {"root": 32 ** 0.5}),
+                                                  ("attention by a root", {"root": 32 ** 0.5,
+                                                                           "dtype": jnp.float32}),
+                                                  ("a root near sqrt(D)", {"root": 32 ** 0.5 * 1.0005,
+                                                                           "dtype": jnp.float32})])
 def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
-    """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100; written out with
+    """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100, scaled after its
+    product or its queries divided by sqrt(D) before it (Flax's); written out with
     any step computing otherwise (a finite fill, truncated or narrowed logits, an initial maximum above the
-    logits, a row normalized by another's sum, a sum narrowed past its range), it stays as written, XLA's."""
+    logits, a row normalized by another's sum, a sum narrowed past its range, a divisor near sqrt(D) but not
+    it, in float32, where bfloat16 holds no value that near), it stays as written, XLA's."""
     import dew
 
-    shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), jnp.bfloat16),) * 3
+    options = dict(options)
+    shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), options.pop("dtype", jnp.bfloat16)),) * 3
     with generation.assumed("sm90"):
         routes = _attention_routes(lambda: dew.jit(written_out(**options)).trace(*shapes))
-    assert bool(routes) == (variant == "attention"), routes
+    assert bool(routes) == (variant in ("attention", "attention by a root")), routes
+
+
+@pytest.mark.parametrize("order", [("xla", "template"), ("template", "xla")],
+                         ids=["xla first", "template first"])
+def test_a_bodys_attention_takes_each_scopes_kernel_choice(order):
+    """Written-out attention inside a scanned body of a program held as a jaxpr, which every trace of it
+    binds again as the same body, traced through `dew.jit` under one kernel choice and then another, in
+    either order: each trace takes its own scope's choice, the template's kernel under
+    `attention="template"` and none under `attention="xla"`, not the body the earlier scope rewrote."""
+    from jax.extend.core import jaxpr_as_fun
+
+    import dew
+
+    attend = written_out()
+
+    def layers(q, k, v):
+        def one(carried, _):
+            return attend(carried, k, v), None
+        return jax.lax.scan(one, q, None, length=2)[0]
+
+    shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), jnp.bfloat16),) * 3
+    held = jaxpr_as_fun(jax.make_jaxpr(layers)(*shapes))
+    with generation.assumed("sm90"):
+        for choice in order:
+            with dew.kernels.use(attention=choice):
+                routes = _attention_routes(lambda: dew.jit(held).trace(*shapes))
+            assert bool(routes) == (choice == "template"), (choice, routes)
 
 
 def flax_rms(x, w):
@@ -377,25 +419,23 @@ def offset_rms(x, w):
 
 
 def gated_product_of(a, b):
-    """A gated MLP's product as a plain program writes it."""
-    return jax.nn.silu(a) * b
+    """A gated MLP's product as a plain program writes Dew's (torch's) math: the activation in float32,
+    rounded once to the gate's dtype, then times the up projection."""
+    return jax.nn.silu(a.astype(jnp.float32)).astype(a.dtype) * b
 
 
 def _norms_written(fn, *shapes):
     """`fn` with each RMSNorm and SwiGLU the compile point takes on an H100 written as Dew's norm
-    (`norm_regions`), decided under the H100 and written on this host, whose norms run their portable
+    (`recognize.recognized`), decided under the H100 and written on this host, whose norms run their portable
     arithmetic: what the compile point's rewrite computes, run here."""
     from jax.extend.core import jaxpr_as_fun
 
-    from dew.algebra import fusion, norm_regions
+    from dew.algebra import fusion, recognize
 
     closed = jax.make_jaxpr(fn)(*shapes)
     with generation.assumed("sm90"):
-        found = [region for region in norm_regions.regions(fusion.Index(closed.jaxpr))
-                 if norm_regions.taken(region)]
-    written = [fusion.Written(region.places, region.operands, region.outputs, region.places[-1],
-                              norm_regions.written(region)) for region in found]
-    return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(found)
+        written = recognize.recognized(closed.jaxpr, fusion.Index(closed.jaxpr))
+    return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(written)
 
 
 def residual_rms(x, branch, w):
@@ -414,8 +454,10 @@ def gated_rms(x, gate, w):
 
 
 def packed_swiglu(gate_up):
-    """A packed gate|up projection's SwiGLU as a plain program writes it: its two halves sliced out."""
-    return jax.nn.silu(gate_up[..., 0, :]) * gate_up[..., 1, :]
+    """A packed gate|up projection's SwiGLU as a plain program writes Dew's math (`gated_product_of`): its
+    two halves sliced out."""
+    gate = gate_up[..., 0, :]
+    return jax.nn.silu(gate.astype(jnp.float32)).astype(gate.dtype) * gate_up[..., 1, :]
 
 
 def _own_norm(*, offset: bool, after_cast: bool):
@@ -512,6 +554,11 @@ _named_silu.__name__ = "silu"
 
 
 NEAR_NORMS = {
+    "statistics in bfloat16, the widening dropped": lambda x, w: (
+        x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1e-6) * w.astype(x.dtype)),
+    "the weight applied before the statistic": lambda x, w: (
+        _rows_inverse(x * w.astype(x.dtype))[:, None] * x.astype(jnp.float32)).astype(x.dtype),
+    "a SwiGLU whose sigmoid rounds to bfloat16": lambda x, w: jax.nn.silu(x) * (x * w.astype(x.dtype)),
     "columns scaled by the rows' statistics":
         lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[None, :]).astype(x.dtype),
     "a weight along the rows":
@@ -522,18 +569,157 @@ NEAR_NORMS = {
     "its own sum as the weight": lambda x, w: (
         x.astype(jnp.float32) * _rows_inverse(x)[:, None]
         * jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1)[None, :]).astype(x.dtype),
+    "a weight rounded to bf16 before it weighs": lambda x, w: (
+        x.astype(jnp.float32) * _rows_inverse(x)[:, None]
+        * (w.astype(jnp.float32) * 1.001).astype(jnp.bfloat16).astype(jnp.float32)).astype(x.dtype),
 }
 """Programs a norm's recogniser reads almost as an RMSNorm or SwiGLU and computes otherwise (a square row,
 so every axis has the feature axis's extent)."""
+
+
+@pytest.mark.parametrize("width", [256, 256.001])
+def test_a_norm_is_its_mean_over_the_rows_width_alone(width):
+    """A row's sum of squares over its width is its mean, which the compile point writes as Dew's norm; over
+    a divisor near the width, closer than any output of the row's dtype shows, it is no norm, and the
+    compile point writes none."""
+    def program(x, w):
+        widened = x.astype(jnp.float32)
+        inverse = jax.lax.rsqrt(jnp.sum(jnp.square(widened), axis=-1, keepdims=True) / width + 1e-6)
+        return (widened * inverse * w.astype(jnp.float32)).astype(x.dtype)
+
+    _, found = _norms_written(program, jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                              jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    assert found == (width == 256)
+
+
+def _two_results(x):
+    """Two rows of one shape from one nested program: one equation making both."""
+    return jax.jit(lambda x: (x * 2, x * 3))(x)
+
+
+def _norm_of(rows, w):
+    widened = rows.astype(jnp.float32)
+    return (widened * jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + 1e-6)
+            * w.astype(jnp.float32)).astype(rows.dtype)
+
+
+def _first_normed(x, w):
+    a, b = _two_results(x)
+    return _norm_of(a, w), a, b
+
+
+def _second_normed(x, w):
+    a, b = _two_results(x)
+    return _norm_of(b, w), a, b
+
+
+def _divided_by(divisor):
+    """A norm-shaped program whose statistic divides by `divisor`, a constant array it closes over."""
+    held = jnp.asarray([divisor], jnp.float32)
+
+    def program(x, w):
+        widened = x.astype(jnp.float32)
+        mean = jnp.sum(widened * widened, axis=-1, keepdims=True) * held
+        return (widened * jax.lax.rsqrt(mean + 1e-6) * w.astype(jnp.float32)).astype(x.dtype)
+    return program
+
+
+def _permuted_statistic(x, w):
+    """A row normalized by the statistic of its elements read in another order."""
+    swapped = jax.lax.reshape(x, x.shape, dimensions=(1, 0))
+    widened, other = x.astype(jnp.float32), swapped.astype(jnp.float32)
+    inverse = jax.lax.rsqrt(jnp.mean(other * other, axis=-1, keepdims=True) + 1e-6)
+    return (widened * inverse * w.astype(jnp.float32)).astype(x.dtype)
+
+
+def _stream_read_early(x, branch, w):
+    """A residual stream another value reads before its norm does."""
+    stream = x + branch
+    early = jnp.sin(stream)
+    return early, _norm_of(stream, w)
+
+
+WRITTEN_AS_PROGRAMS = {
+    "the first of two results normed": (_first_normed, 1),
+    "the second of two results normed": (_second_normed, 1),
+    "a statistic over the width": (_divided_by(1 / 256), 1),
+    "a statistic over twice the width": (_divided_by(2 / 256), 0),
+    "a statistic of the elements in another order": (_permuted_statistic, 0),
+}
+"""Programs the compile point writes, each with the norms it writes in it: the same structure apart only
+in which result is normed or in a constant it closes over, each weighed for its own (row 4783's review)."""
+
+
+@pytest.mark.parametrize("name", list(WRITTEN_AS_PROGRAMS))
+def test_the_compile_point_writes_a_program_by_its_own_values(name):
+    """Each program (`WRITTEN_AS_PROGRAMS`), written after the others in either order, writes the norms it
+    holds and computes what it does as written, bit for bit: a region is the call's only where the call
+    computes the region's own arithmetic."""
+    from contract_support import normal_drawn
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    names = list(WRITTEN_AS_PROGRAMS)
+    for other in (*names[names.index(name) + 1:], *names[:names.index(name)]):
+        _norms_written(WRITTEN_AS_PROGRAMS[other][0], *shapes)
+    program, norms = WRITTEN_AS_PROGRAMS[name]
+    written, found = _norms_written(program, *shapes)
+    assert found == norms
+    x, w = normal_drawn(4783, (256, 256), (256,), dtype=jnp.bfloat16)
+    for ours, theirs in zip(jax.tree.leaves(written(x, w)), jax.tree.leaves(program(x, w)), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+def test_a_stream_read_before_its_norm_computes_as_written():
+    """A residual stream another value reads before its norm, compiled through the rewrite, computes as
+    written bit for bit: the stream's sum stays where its first reader needs it."""
+    from contract_support import normal_drawn
+
+    rows = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+    shapes = (rows, rows, jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    written, _ = _norms_written(_stream_read_early, *shapes)
+    x, branch, w = normal_drawn(4784, (256, 256), (256, 256), (256,), dtype=jnp.bfloat16)
+    for ours, theirs in zip(written(x, branch, w), _stream_read_early(x, branch, w), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+def test_a_norm_of_a_stopped_row_passes_no_gradient_to_it():
+    """A norm of a row whose gradient the program stops, rewritten, passes the row no gradient, as written."""
+    from contract_support import normal_drawn
+
+    def program(x, w):
+        return _norm_of(jax.lax.stop_gradient(x), w).astype(jnp.float32).sum()
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.float32), jax.ShapeDtypeStruct((256,), jnp.float32))
+    written, _ = _norms_written(program, *shapes)
+    x, w = normal_drawn(4785, (256, 256), (256,))
+    assert not np.any(np.asarray(jax.grad(written)(x, w)))
+
+
+def test_a_gate_less_a_negative_zero_keeps_its_sign_as_written():
+    """A SwiGLU whose gate is the program's `g - (-0.0)`, at a gate of -0.0, computes as written bit for
+    bit: subtracting a negative zero makes a negative zero positive, which no rewrite drops."""
+    def program(g, u):
+        gate = g - jnp.asarray(-0.0, g.dtype)
+        return gated_product_of(gate, u)
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),) * 2
+    written, _ = _norms_written(program, *shapes)
+    g = jnp.full((256, 256), -0.0, jnp.bfloat16)
+    u = jnp.ones((256, 256), jnp.bfloat16)
+    np.testing.assert_array_equal(np.signbit(np.asarray(written(g, u))),
+                                  np.signbit(np.asarray(program(g, u))))
 
 
 @pytest.mark.parametrize("program", list(NEAR_NORMS))
 def test_a_plain_program_near_a_norm_computes_as_written(program):
     """A program whose arithmetic resembles an RMSNorm or SwiGLU without being one (the statistics or the
     weight laid along another axis, a nested program only named silu, a mean scaled by zero, the region's own
-    sum read as its weight), compiled through `dew.jit` on an H100, computes what it does as written: its
-    output and gradients on par with the program's (check 1), whatever of it the compile point writes as
-    Dew's norm (an unweighted RMSNorm inside it, its product with another axis's weight left as written)."""
+    sum read as its weight, a weight rounded by a cast the norm would drop, its statistics left in bfloat16,
+    the weight applied to the row before its statistic, a SwiGLU rounding its sigmoid and each product to
+    bfloat16 where Dew's rounds once after a float32 activation), compiled through `dew.jit` on an H100,
+    computes what it does as written: its output and gradients on par with the program's (check 1),
+    whatever of it the compile point writes as Dew's norm (an unweighted RMSNorm inside it, its product with
+    another axis's weight left as written)."""
     from contract_support import normal_drawn
     from reference_error import assert_as_exact, with_gradients
 
