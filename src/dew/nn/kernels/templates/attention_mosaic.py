@@ -1339,9 +1339,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # Fewer rows a consumer for a call with no score hook: a hook's parameters and pullback tiles laid out
         # at a role's rows, sliced at fewer, fail to lower (an A100's accurate dQ under a temperature at 32 x
         # 32: "slice size (32) ... divisible by the tile size (64)", acchook3; FS-A100CHECK1d's row-indexed).
-        for rows in (None, *(fewer_rows(family) if self.score_mod is None else ())):
-            walks = extents if rows is None else functools.partial(_sides, rows)
-            for columns in (1, 2, 4):
+        # Whole columns at fewer rows before a column split at the role's: a split recomputes each step's
+        # score products once a share, where fewer rows keep the work and halve the tile (an A100's
+        # bf16 backward 128 wide at 32 x 32 whole took 0.82 to 0.88 of 64 x 64 in two shares, 1 x 8192
+        # causal 36.1 against 41.7 ms; M-ET-29b, W91-a100).
+        for columns in (1, 2, 4):
+            for rows in (None, *(fewer_rows(family) if self.score_mod is None else ())):
+                walks = extents if rows is None else functools.partial(_sides, rows)
                 for staged in (False, True):
                     def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
                               ) -> BackwardTiles:
