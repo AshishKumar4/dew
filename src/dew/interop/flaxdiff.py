@@ -57,7 +57,6 @@ tokens after (`scan_projection`)."""
 def scan_projection(kernel: np.ndarray, patch_size: int) -> np.ndarray:
     """FlaxDiff's scan-order projection kernel (`SCAN_PROJECTION`) as Dew's patch convolution's,
     `[p, p, C, D]`: the same matrix reshaped."""
-    kernel = np.asarray(kernel)
     return kernel.reshape(patch_size, patch_size, -1, kernel.shape[-1])
 
 _HYBRID_MOVED = {"time_embed": ("conditioning", "time_embed"),
