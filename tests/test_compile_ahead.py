@@ -201,6 +201,35 @@ def admitted(tmp_path_factory):
 
 
 @pytest.mark.shared_setup("admitted")
+def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_over_its_own_gpus(tmp_path):
+    """A host's GPUs, serialized as their topology (`get_attached_topology(...).serialize()`, here of
+    compile-only H100s at a stated 40 GiB) and read back elsewhere (`host_gpus`), are the GPUs XLA compiles
+    for: a program compiled over them keys the persistent cache with the host's own platform version and
+    topology fingerprint, as over the devices serialized, where a canonical target of the generation
+    (`compile_only_gpus`, its memory unstated) keys another entry."""
+    from jax._src import cache_key, compiler
+    from jax.experimental import topologies
+
+    from dew.training.ahead import compile_only_gpus, host_gpus
+
+    host = compile_only_gpus("sm90", 2, 40 * 2**30)
+    serialized = tmp_path / "topology.bin"
+    serialized.write_bytes(topologies.TopologyDescription(list(host)).serialize())
+
+    def key(devices) -> str:
+        lowered = jax.jit(lambda x: x * 2 + 1).trace(jax.ShapeDtypeStruct(
+            (8, 128), jnp.float32, sharding=jax.sharding.SingleDeviceSharding(devices[0]))).lower()
+        backend = devices[0].client
+        options = compiler.get_compile_options(num_replicas=1, num_partitions=1,
+                                               device_assignment=[[devices[0]]], backend=backend)
+        return cache_key.get(lowered.compiler_ir("stablehlo"), np.array(devices[:1]), options, backend)
+
+    read = host_gpus("sm90", serialized, 2)
+    assert [device.device_kind for device in read] == [device.device_kind for device in host]
+    assert key(read) == key(host)
+    assert key(read) != key(compile_only_gpus("sm90", 2))
+
+
 def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
     plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""

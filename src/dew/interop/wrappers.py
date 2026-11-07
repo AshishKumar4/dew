@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import jax.numpy as jnp
 
 from dew import _records
+from dew._records import JSON
 from dew.interop.decoder_parts import ExportRefused
 from dew.interop.layouts import ConfigLayout, SourceLayout, Unwritable
 from dew.interop.safetensors_io import LazyTensors
@@ -216,13 +217,33 @@ def _refuse_lossy(wrapper: MultimodalTransformer, config: Mapping[str, object]) 
         raise ExportRefused(f"the {wrapper.family} config written for this model does not read back: "
                             f"{error}") from error
     hf_decoders.refuse_rebuilt(wrapper.language_model, language, wrapper.family)
-    ours, theirs = ({name: value for name, value in record_fields(held, MultimodalTransformer).items()
-                     if name not in ("language_model", "precision", "dtype")}
+    ours, theirs = ({name: _computed(value)
+                     for name, value in record_fields(held, MultimodalTransformer).items()
+                     if name != "language_model" and name not in hf_decoders.NUMERICS_FIELDS}
                     for held in (wrapper, rebuilt))
     lost = sorted(name for name in ours.keys() | theirs.keys() if ours.get(name) != theirs.get(name))
     if lost:
         raise ExportRefused(f"{lost} would not survive an export as {wrapper.family}: its config reads back "
                             f"{', '.join(f'{name}={theirs.get(name)!r}' for name in lost)}")
+
+
+def _computed(record: JSON) -> JSON:
+    """A part's `record` as what it computes: every class record in it without its numerics fields
+    (`hf_decoders.NUMERICS_FIELDS`), which a decoder's comparison skips too (`refuse_rebuilt`). A wrapper
+    computes its parts in its own numerics (`dew.nn.multimodal._conditioner_modules`), so a projection
+    built in a run's dtype is the computation its family writes (row 4776's review)."""
+    from dew.interop.hf_decoders import NUMERICS_FIELDS
+
+    match record:
+        case {"class": str(), "fields": dict() as fields}:
+            return {**record, "fields": {name: _computed(value) for name, value in fields.items()
+                                         if name not in NUMERICS_FIELDS}}
+        case dict():
+            return {key: _computed(value) for key, value in record.items()}
+        case list():
+            return [_computed(value) for value in record]
+        case _:
+            return record
 
 
 def _tree(tree: Mapping[str, object], name: str) -> Mapping[str, object]:
