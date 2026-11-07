@@ -142,18 +142,20 @@ def supported(case: dict[str, str]) -> bool:
 
 CASES = (
     ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'),
-    ('sm90', 'kimi delta attention', 'xla', 'float32', 'packed'),
-    ('sm80', 'rated scan', 'pallas', 'bfloat16', 'packed'),
-    ('sm80', 'gated delta net', 'fla', 'float32', 'one'),
-    ('sm90', 'rated scan', 'pallas', 'float32', 'one'),
-    ('sm80', 'kimi delta attention', 'xla', 'bfloat16', 'one'),
-    ('sm90', 'gated delta net', 'fla', 'bfloat16', 'packed'),
-    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'packed'),
-    ('sm80', 'kimi delta attention', 'mosaic_gpu', 'bfloat16', 'one'),
-    ('sm90', 'gated delta net', 'xla', 'bfloat16', 'one'),
+    ('sm80', 'kimi delta attention', 'xla', 'bfloat16', 'packed'),
+    ('sm90', 'rated scan', 'pallas', 'bfloat16', 'packed'),
     ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'),
+    ('sm80', 'gated delta net', 'fla', 'bfloat16', 'packed'),
+    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'),
+    ('sm90', 'gated delta net', 'xla', 'bfloat16', 'one'),
+    ('sm90', 'kimi delta attention', 'mosaic_gpu', 'bfloat16', 'packed'),
+    ('sm80', 'rated scan', 'pallas', 'bfloat16', 'one'),
     ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'),
 )
+"""The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
+(`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change), under
+the suite's lane environment: at its 'highest' an fp32 training call is served by the portable math alone,
+the reference."""
 
 TPU_CASES = (
     ('v6e', 'rated scan', 'tpu', 'bfloat16', 'one'),
@@ -163,8 +165,6 @@ TPU_CASES = (
     ('v5e', 'rated scan', 'tpu', 'bfloat16', 'one'),
 )
 """The TPU cells' cases (`kernel_matrix.covering("recurrence_tpu")`)."""
-"""The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
-(`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change)."""
 
 
 def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> None:
