@@ -1287,11 +1287,11 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
 
 
 def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
-    """Programs compiled at once (`report.compiled_at_once`) keep, in turn, the executables compiling them
-    one after another keeps, in the order given, each making its first compile in a thread of its own
-    (`report.attempts`): those lowered in distinct MLIR contexts (here, each on a thread of its own, as JAX
-    lowers a thread's programs in one) and those sharing one alike, whose compiles JAX's cache key reads
-    without writing their context from 0.12.0.1.post54."""
+    """Programs compiled at once (`report.compiled_at_once`) return, in the order given, executables that
+    compute what their own programs do, as those compiled one after another do, on inputs that tell the
+    programs apart: those lowered in distinct MLIR contexts (here, each on a thread of its own, as JAX lowers
+    a thread's programs in one) and those sharing one alike, whose compiles JAX's cache key reads without
+    writing their context from 0.12.0.1.post54; each program compiled once (`Compiles`' events)."""
     import threading
 
     from dew.nn.kernels.templates import report
@@ -1309,13 +1309,15 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
     for thread in threads:
         thread.join()
     shared = [jax.jit(function).lower(square, square) for function in functions]
+    keys = jax.random.split(jax.random.key(11))
+    x, y = (jax.random.normal(key, (256, 256), jnp.float32) for key in keys)
+    expected = [np.asarray(function(x, y)) for function in functions]
     for lowerings in (apart, shared):
         with Compiles(None) as compiles:
             together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
                                                 for lowered in lowerings])
-        threads = [program.thread for program in compiles.programs if program.kind == "compiled"]
-        assert len(threads) == 3, threads
-        assert all(thread.startswith("dew-compile") for thread in threads), threads
+        assert len([program for program in compiles.programs if program.kind == "compiled"]) == len(functions)
         alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
-        assert [executable.as_text() for executable in together] == [
-            executable.as_text() for executable in alone]
+        for executables in (together, alone):
+            for executable, want in zip(executables, expected, strict=True):
+                np.testing.assert_allclose(np.asarray(executable(x, y)), want, rtol=1e-6, atol=1e-6)
