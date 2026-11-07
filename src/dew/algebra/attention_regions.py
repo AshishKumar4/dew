@@ -29,19 +29,18 @@ Dew's kernels do, on par with the program's own (check 1), not bitwise.
 
 from __future__ import annotations
 
-import contextlib
 import itertools
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import mesh as mesh_lib
+from jax._src.core import ShapedArray, Tracer
 from jax.extend import core as jcore
 
-from dew.nn.programs import jax_name
+from dew.nn.programs import host_evaluated, jax_name
 
 MASK_ENTRIES = 1 << 26
 """The most entries a mask is evaluated at to read whether it is causal; a larger one keeps its region
@@ -176,7 +175,7 @@ def written(region: Attention) -> Callable:
 def _q_free(region: Attention) -> list[int]:
     """q's free axes, in order: neither its width nor an axis it shares with k."""
     shared = [q for q, _, _ in region.shared]
-    return [a for a in range(region.query.aval.ndim) if a != region.query_width and a not in shared]
+    return [a for a in range(_shaped(region.query).ndim) if a != region.query_width and a not in shared]
 
 
 def _laid_mask(region: Attention, mask: jax.Array) -> jax.Array:
@@ -184,7 +183,7 @@ def _laid_mask(region: Attention, mask: jax.Array) -> jax.Array:
     to the logits' shape along its axes (`Attention.mask_axes`), then moved to the product's order
     (`Attention.perm`)."""
     mask = mask if mask.dtype == jnp.bool_ else mask != 0
-    query, key = region.query.aval.shape, region.key.aval.shape
+    query, key = _shaped(region.query).shape, _shaped(region.key).shape
     product = ([query[q] for q, _, _ in region.shared] + [query[a] for a in _q_free(region)]
                + [key[region.key_axis]])
     logits = tuple(product[region.perm[i]] for i in range(len(product)))
@@ -214,7 +213,7 @@ def taken(region: Attention) -> bool:
     from dew.nn.kernels import generation
     from dew.nn.kernels.selection import KernelRefused
 
-    shapes = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in region.operands]
+    shapes = [jax.ShapeDtypeStruct(_shaped(var).shape, _shaped(var).dtype) for var in region.operands]
     with generation.routes(alone=True) as found:
         try:
             jax.eval_shape(written(region), *shapes)
@@ -235,7 +234,7 @@ class Graph:
         # The body's constants (jax.nn's mask positions, an iota it closed over) by their values.
         self._constants: dict[jcore.Var, np.ndarray | None] = {
             var: np.asarray(value) for var, value in index.consts.items()
-            if not isinstance(value, jax.core.Tracer)
+            if not isinstance(value, Tracer)
             and math.prod(getattr(var.aval, "shape", ())) <= MASK_ENTRIES}
 
     def made(self, atom, *names: str):
@@ -297,6 +296,14 @@ PLACEMENTS = frozenset({"sharding_constraint", "reshard", "mesh_cast", "device_p
 itself (`_outputs`)."""
 
 
+def _shaped(atom) -> ShapedArray:
+    """`atom`'s abstract value, an array's: every value a region reads is one."""
+    aval = atom.aval
+    if not isinstance(aval, ShapedArray):
+        raise TypeError(f"an attention region reads arrays, not {aval}")
+    return aval
+
+
 def _evaluated(eqn: jcore.JaxprEqn, inputs: list, index: int) -> np.ndarray | None:
     """`eqn`'s output `index` over concrete `inputs`, evaluated on this host's CPU (a compile-only mesh's
     devices run nothing, `_outputs`); None in a process whose platforms hold no CPU (`jax_platforms`), so a
@@ -304,51 +311,38 @@ def _evaluated(eqn: jcore.JaxprEqn, inputs: list, index: int) -> np.ndarray | No
     platforms = jax.config.jax_platforms
     if platforms and "cpu" not in platforms.split(","):
         return None
-    return _outputs(eqn, inputs)[index]
+    made = _outputs(eqn, inputs)
+    return None if made is None else made[index]
 
 
-def _outputs(eqn: jcore.JaxprEqn, inputs: list) -> list[np.ndarray]:
+def _outputs(eqn: jcore.JaxprEqn, inputs: list) -> list[np.ndarray] | None:
     """`eqn`'s outputs over concrete `inputs` on this host's CPU, the placement it states dropped, which
     changes no value: a placing primitive's outputs its inputs (`PLACEMENTS`), a nested jit's body
     evaluated an equation at a time (its shardings its traced mesh's), another primitive bound without its
-    output's sharding, outside the mesh the program traces under (`_meshless`)."""
+    output's sharding (`dew.nn.programs.host_evaluated`); None where this host cannot read an input."""
     if eqn.primitive.name in PLACEMENTS:
         return [np.asarray(value) for value in inputs]
     if eqn.primitive.name in ("jit", "pjit"):
         closed = eqn.params["jaxpr"]
         return _interpreted(closed.jaxpr, closed.consts, inputs)
-    params = {name: None if name in ("sharding", "out_sharding") else value
-              for name, value in eqn.params.items()}
-    with jax.ensure_compile_time_eval(), _meshless(), jax.default_device(jax.devices("cpu")[0]):
-        made = eqn.primitive.bind(*inputs, **params)
-    return [np.asarray(value) for value in (made if eqn.primitive.multiple_results else [made])]
+    made = host_evaluated(eqn.primitive, inputs, eqn.params)
+    return None if made is None else [np.asarray(value) for value in made]
 
 
-def _interpreted(jaxpr: jcore.Jaxpr, consts, inputs: list) -> list[np.ndarray]:
-    """`jaxpr`'s outputs over concrete `consts` and `inputs`, each equation's by `_outputs`."""
+def _interpreted(jaxpr: jcore.Jaxpr, consts, inputs: list) -> list[np.ndarray] | None:
+    """`jaxpr`'s outputs over concrete `consts` and `inputs`, each equation's by `_outputs`; None where one
+    is none."""
     env = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, inputs, strict=True))
 
     def read(atom):
         return atom.val if isinstance(atom, jcore.Literal) else env[atom]
 
     for eqn in jaxpr.eqns:
-        env.update(zip(eqn.outvars, _outputs(eqn, [read(atom) for atom in eqn.invars]), strict=True))
+        made = _outputs(eqn, [read(atom) for atom in eqn.invars])
+        if made is None:
+            return None
+        env.update(zip(eqn.outvars, made, strict=True))
     return [np.asarray(read(atom)) for atom in jaxpr.outvars]
-
-
-@contextlib.contextmanager
-def _meshless() -> Iterator[None]:
-    """No mesh in context, abstract or concrete: a step traced under its devices' mesh (`jax.set_mesh`, a
-    compile-only TPU topology's) places an eager primitive's operands on that mesh's devices, which run
-    nothing, where the default device places them on this host's CPU. `jax.set_mesh(None)` says the same
-    but refuses to run under a trace, which a program's rewrite may be."""
-    abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
-    concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
-    try:
-        yield
-    finally:
-        mesh_lib.device_context.set_local(concrete)
-        mesh_lib.abstract_mesh_context_manager.set_local(abstract)
 
 
 def _matched(graph: Graph, exp_place: int) -> Attention | None:
@@ -395,7 +389,7 @@ def _matched(graph: Graph, exp_place: int) -> Attention | None:
     places += logits_places
     first, query, key, query_width, key_width, layout, softcap, factor, bias, moved = _scaled_product(
         graph, scaled, places)
-    if first is None:
+    if first is None or query_width is None or key_width is None:
         return None
     # The logits' axes as the product lays them: through the layout before the bias (`moved`), then the
     # one before the softmax (`perm`).
@@ -466,19 +460,19 @@ def _back_to_rows(eqns, chain: list[int], labels: list[int], value, axis: int) -
     scalar), reaches `value` laid along the softmax's axes again: each of its axes but `axis` the same axis,
     `axis` a broadcast one. A sum or maximum broadcast to another row's place (`[None, :]` of a reduced
     vector) does not."""
-    labels = list(labels)
+    held: list[int | None] = list(labels)
     for place in chain:
         eqn = eqns[place]
         name = jax_name(eqn.primitive)
         if name == "transpose":
-            labels = [labels[d] for d in eqn.params["permutation"]]
+            held = [held[d] for d in eqn.params["permutation"]]
         elif name == "broadcast_in_dim":
             laid: list[int | None] = [None] * len(eqn.params["shape"])
             for source, target in enumerate(eqn.params["broadcast_dimensions"]):
-                laid[int(target)] = labels[source]
-            labels = laid
+                laid[int(target)] = held[source]
+            held = laid
     rank = value.aval.ndim
-    return len(labels) == rank and all(labels[a] == (None if a == axis else a) for a in range(rank))
+    return len(held) == rank and all(held[a] == (None if a == axis else a) for a in range(rank))
 
 
 def _normalized(graph: Graph, exponential, axis: int, places: list[int]) -> int | None:
@@ -564,7 +558,7 @@ def _laid(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
     the output axis it is laid along (`broadcast_in_dim`'s dimensions), and through a transpose, for each
     output axis the input axis it reads (an input of the output's rank: its permutation); None where it
     reaches the select otherwise."""
-    atom, axes = inner.invars[index], tuple(range(inner.invars[index].aval.ndim))
+    atom, axes = inner.invars[index], tuple(range(_shaped(inner.invars[index]).ndim))
     for eqn in inner.eqns:
         if atom not in eqn.invars:
             continue
@@ -576,7 +570,7 @@ def _laid(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
             permutation = tuple(int(d) for d in eqn.params["permutation"])
             axes = tuple(axes[d] for d in permutation)
         elif name == "select_n":
-            return axes if atom.aval.ndim == rank or index == 0 else None
+            return axes if _shaped(atom).ndim == rank or index == 0 else None
         elif (name == "ne" and index == 0
               and any(isinstance(v, jcore.Literal) and v.val == 0 for v in eqn.invars)):
             pass  # a float mask's predicate, x != 0: the mask's value read as booleans (`_unmasked`'s astype)
@@ -602,7 +596,7 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
             inner = graph.uncast(kept, [], widening)
             transposed = graph.made(inner, "transpose")
             inner = _capped(graph, inner if transposed is None else eqns[transposed].invars[0], [])[1]
-            if (isinstance(other, jcore.Var) and other.aval.shape == atom.aval.shape
+            if (isinstance(other, jcore.Var) and _shaped(other).shape == _shaped(atom).shape
                     and _product_of(graph, inner)):
                 # The bias as the program holds it, its widening for the add the region's (jax.nn's), and
                 # the logits laid out again before it, the transpose the region's.
@@ -651,7 +645,10 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
     else:
         # The default scale times a power of two, which the call's query takes exactly: the program's scale
         # that factor over sqrt(D) as its own constant holds it, not near it.
-        ratio = float(graph.constant(scale)) * math.sqrt(width)
+        stated = graph.constant(scale)
+        if stated is None:
+            return nothing
+        ratio = float(stated) * math.sqrt(width)
         factor = 2.0 ** round(math.log2(ratio)) if ratio > 0 else 0.0
         if factor == 0.0 or not graph.holds(scale, factor / math.sqrt(width)):
             return nothing

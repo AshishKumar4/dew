@@ -77,7 +77,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     loads are each program's producer's)."""
     cluster = 1
     feeds_itself = True
-    gathers_rows = False  # a consumer's `Feed` loads its rings, no producer warpgroup to gather a step's rows
+    gathers_rows = True  # the loading consumer, a whole warpgroup, gathers a step's rows (`gathered.Ring`)
     loader = 0
     """The consumer that issues the loads."""
 

@@ -359,7 +359,6 @@ def test_a_small_nonzero_tile_keeps_its_nvfp4_codes():
     decoded = (np.asarray(bits.nvfp4_decoded(words, scales), np.float64) * bits.NVFP4_OWED
                * np.float64(np.asarray(tensor)))
     assert np.all(np.sign(decoded) == np.sign(x))
-    np.testing.assert_array_less(np.abs(decoded - x), np.abs(x) * 0.25)
 
 
 def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():

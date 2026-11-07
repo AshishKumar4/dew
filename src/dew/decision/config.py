@@ -146,8 +146,8 @@ class DecisionRunConfig(DecoderRunConfig):
     None keeps the layout's own, a release's named and a fresh head's described, which its record holds
     as the build resolved it (`layout_writing`); a run that leaves it None and resumes takes the saved
     run's (`BUILT`, `RunConfig.resumed`). A run saved before this field reads `named`, as it ran, and one
-    whose record holds None the writing its checkpoint's layout states (`dew.config.earlier_option_text`,
-    `earlier_option_writing`). A joint row
+    whose record holds None the writing its checkpoint's layout states
+    (`dew.config.earlier.earlier_option_text`, `earlier_option_writing`). A joint row
     names each option by its key beside its description in its schema, the named writing, and has no
     other."""
     segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None

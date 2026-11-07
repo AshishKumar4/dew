@@ -464,8 +464,9 @@ class Chunk(Expr):
 def _identities(corrects: bool, scalar: bool):
     """The identities of the module's account, `wy` where tokens correct the state. A `scalar` decay's
     memory is read and then decayed, `(Q h) exp(G)`, as the template's output (`recurrence_algebra.
-    chunk_output`): a memory past fp32's range reads infinite, where its queries decayed first would read a
-    finite, wrong value (ledger 2344). A decay a key's decays each key before the read."""
+    chunk_output`): a memory past fp32's range reads finite, within 2.5 times the fp32 recurrence's distance
+    from float64 (1.50e-1 at 2^124 against its 6.1e-2), where its queries decayed first read six times it
+    (ledger 2344, 12e501086c8). A decay a key's decays each key before the read."""
     values = Chunk.token("U")
     given, other, lower, left, right = vars_("given other lower left right", Chunk)
     h = Chunk.entering()

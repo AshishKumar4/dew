@@ -23,7 +23,7 @@ from jax.core import ShapedArray
 
 from dew._devices import xla_flag
 from dew.algebra.terms import parameter_key, parameters_key
-from dew.nn.programs import bodies, called, computed, inlined, named, opaque, platform_branch
+from dew.nn.programs import bodies, called, computed, host_evaluated, inlined, named, opaque, platform_branch
 
 VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
@@ -445,18 +445,16 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
             reading.append(equation)
             needed.update(value for value in equation.invars if computed(value))
     # The evaluator computes on the host, outside any mesh a plan for compile-only devices sets.
-    with jax.set_mesh(None), jax.ensure_compile_time_eval():
-        for equation in reversed(reading):
-            operands = list(map(read, equation.invars))
-            if named(equation.primitive) == "dot_general" and len(operands) == 3:
-                # A product with its bias, as the derivation reads a sum XLA's GEMM computes
-                # (`biased`): the product of the first two, plus the third.
-                *operands, bias = operands
-                out = equation.primitive.bind(*operands, **equation.params) + bias
-            else:
-                out = equation.primitive.bind(*operands, **equation.params)
-            values.update(zip(equation.outvars, out if equation.primitive.multiple_results else [out],
-                              strict=True))
+    for equation in reversed(reading):
+        operands = list(map(read, equation.invars))
+        if named(equation.primitive) == "dot_general" and len(operands) == 3:
+            # A product with its bias, as the derivation reads a sum XLA's GEMM computes (`biased`): the
+            # product of the first two, plus the third.
+            *operands, bias = operands
+            out = [host_evaluated(equation.primitive, operands, equation.params)[0] + bias]
+        else:
+            out = host_evaluated(equation.primitive, operands, equation.params)
+        values.update(zip(equation.outvars, out, strict=True))
     return [int(read(offset)) for offset in offsets]
 
 

@@ -140,6 +140,32 @@ def dq_sums(formed: Callable, q: jax.Array, do: jax.Array, m: jax.Array, anchor:
     return sums._replace(dq=forms.finish(state, shapes=shapes)[0])
 
 
+def fused_sums(formed: Callable, k_tile: jax.Array, v_tile: jax.Array, lo, hi, dq: jax.Array,
+               add_dq: Callable, *, hooked: bool, grad_scale: float, how: algebra.Recompute,
+               dot: Callable[[jax.Array, jax.Array], jax.Array]):
+    """A one-pass backward program's sums (the fast form's one launch, FlashAttention's): `dkv_sums`' walk of
+    one key block over its query tiles `lo` to `hi`, each tile's own dQ (the derived forms' first output,
+    walked keys first) added into the carried `dq` by `add_dq(index, dq, tile)` as it is formed, so dQ,
+    dK and dV come from one recomputation of each tile's weights and cotangents. dK, dV `[bk, ...]` and
+    `dq`."""
+    forms = derived_backward(grad_scale, "rows", hooked, dropped=False, how=how, accurate=False,
+                             anchored=True, normalized_values=v_tile.dtype == jnp.bfloat16)
+
+    def tiles_of(index):
+        tiles, _, _ = formed(index)
+        return {**tiles, "k": k_tile, "values": v_tile}
+
+    def step(index, carry):
+        sums, dq = carry
+        sums, (tile,) = forms.step(sums, tiles_of(index), product=dot, outputs=(0,))
+        return sums, add_dq(index, dq, tile)
+
+    shapes = {name: (value.shape, value.dtype) for name, value in tiles_of(lo).items()}
+    sums, dq = jax.lax.fori_loop(lo, hi, step, (forms.init(shapes), dq))
+    dk, dv = forms.finish(sums, shapes=shapes)[1:3]
+    return dk, dv, dq
+
+
 def dkv_sums(formed: Callable, k_tile: jax.Array, v_tile: jax.Array, lo, hi, pulled: Callable, hooks, *,
              hooked: bool, dropped: bool, grad_scale: float, how: algebra.Recompute, accurate: bool,
              score_kinds: tuple[Kind, ...], dot: Callable[[jax.Array, jax.Array], jax.Array]):

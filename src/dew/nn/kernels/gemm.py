@@ -50,7 +50,7 @@ from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
 from dew.nn.kernels.templates.product import declared
 from dew.nn.precision import at_least_fp32, refuse_recipe
-from dew.nn.sharding import seen_whole
+from dew.nn.sharding import explicit_spec, seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 """The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
@@ -273,9 +273,12 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # dtype, summed in `wide`: a bf16 product is exact in fp32 either way, where operands widened first
         # made the GPU's product an fp32 one (an sm120's 4096-token gate_up weight gradient 5.91 ms against
         # 2.72 for the bf16 product).
+        # A sum over rows an Explicit axis splits lands whole (`ragged_placement`), the depth and width placed
+        # as the rows' and the cotangent's columns are.
         return jax.lax.ragged_dot_general(
             lhs, rhs.astype(lhs.dtype), group_sizes, _CONTRACTED_ROWS,
-            precision=precision, preferred_element_type=wide).astype(out_dtype)
+            precision=precision, preferred_element_type=wide,
+            out_sharding=grouped_matmul.ragged_placement((None, (lhs, 1), (rhs, 1)))).astype(out_dtype)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays, tables)
 
@@ -706,6 +709,8 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     if refusal is not None:
         generation.route("blockwise_fp8", kernel="unquantized", preferred=recipe.recipe, refusal=refusal)
         return None
+    if (placed := explicit_spec(rows)) is not None and placed.spec[0] is not None:
+        return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias, placed=placed)
     stacked = matrix if matrix.ndim == 3 else matrix[None]
     groups, count = stacked.shape[0], rows.shape[0]
     sizes = (jnp.full((1,), count, jnp.int32) if group_sizes is None
@@ -729,6 +734,31 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     if bias is not None:
         out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(jnp.float32), out)
     return out.astype(out_dtype)
+
+
+def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, placed) -> jax.Array:
+    """`recipe_projection` of rows an Explicit mesh axis splits (row 4854): each device's rows its own
+    projection (`jax.shard_map` over the axes splitting the rows), laid in whole 128-row blocks of its own
+    as a data-parallel recipe quantizes them, the matrix and bias whole on every device and their
+    gradients summed over the devices (shard_map's transpose). A grouped projection's sizes count the
+    rows of all devices together, so no device's rows are whole groups: refused."""
+    if group_sizes is not None:
+        raise ValueError("a recipe's experts take their rows whole: an Explicit mesh axis splits these, "
+                         "and their groups' sizes count every device's rows")
+    from dew.mesh import mesh_axes
+
+    split = jax.sharding.PartitionSpec(placed.spec[0], None)
+    whole = jax.sharding.PartitionSpec()
+
+    def projected(rows, matrix, *bias):
+        return recipe_projection(rows, matrix, out_dtype=out_dtype, bias=bias[0] if bias else None)
+
+    # The recipe's own loops start their sums typed for no device (`grouped_matmul.step_scaled`'s carry), so
+    # the program is not checked for the devices' varying values (`check_vma`); each device's rows are its
+    # own by the specs, and the whole operands' gradients sum over the devices as shard_map transposes them.
+    return jax.shard_map(projected, mesh=placed.mesh, in_specs=(split, whole, *(whole,) * (bias is not None)),
+                         out_specs=split, axis_names=frozenset(mesh_axes(placed.spec[0])), check_vma=False)(
+        rows, matrix, *(() if bias is None else (bias,)))
 
 
 def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -884,38 +914,47 @@ measured requirement no receipt has met yet; else the decoded operands' product 
 
 
 def mxfp8_product(lhs: MxFp8, matrices: MxFp8, group_blocks: jax.Array, *, out_dtype,
-                  interpret_on_cpu: bool = False) -> jax.Array:
+                  interpret_on_cpu: bool = False, gather: jax.Array | None = None) -> jax.Array:
     """Each group's rows of `lhs` (`[rows, depth]`) times its matrix of `matrices` (`[groups, width, depth]`,
     K-major), both MXFP8 (`MxFp8`): each value its code times its 32 depths' scale, every product exact in
     fp32, summed in fp32 and rounded once to `out_dtype` (row 4519). Group `g` holds `group_blocks[g]` whole
     128-row blocks, in order (the block scales' tiles), the rows past them zero. Its selector (`MXFP8`) runs
     the template on Blackwell's block-scaled tensor cores where named (`mosaic_gpu.gmm`'s `mx_scales`), else
-    the decoded operands' product in XLA."""
-    return _block_scaled(lhs, matrices, group_blocks, MXFP8, interpret_on_cpu).astype(out_dtype)
+    the decoded operands' product in XLA. `gather`, int32 `[rows]`, makes the rows `lhs`'s rows at its entries
+    (`gemm`'s `gather`, a mixture of experts' tokens): their codes read where they lie, their scales by the
+    same table (`_block_scaled`)."""
+    return _block_scaled(lhs, matrices, group_blocks, MXFP8, interpret_on_cpu, gather).astype(out_dtype)
 
 
-def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, interpret: bool) -> jax.Array:
+def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, interpret: bool,
+                  gather: jax.Array | None = None) -> jax.Array:
     """A block-scaled grouped product summed in fp32 (`mxfp8_product`'s, `nvfp4_block_product`'s): `op`
     selects the template on Blackwell's block-scaled tensor cores (`mosaic_gpu.gmm`'s `mx_scales`, the
     operands' `codes` and their block `scales`, `mosaic_gpu.block_format`'s) where named and planned, else
     the operands' block-scaled values (`decoded`: each exact in bfloat16 and in TF32, so DEFAULT's products
-    are exact) summed as XLA sums fp32 products."""
+    are exact) summed as XLA sums fp32 products. Gathered rows (`gather`) are the template's gather
+    (tcgen05's load warp's, row 1376) and their block scales the same table's rows of `lhs.scales`, gathered
+    as every call's scales are laid out anew for the products (`_scales_tiled`), a sixteenth or a
+    thirty-second of the rows' bytes (row 4851)."""
     sizes = (group_blocks * mosaic_gpu.STEP_SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicMxGmm()
     abstract = jax.ShapeDtypeStruct
-    tile = _planned(launch, launch.bind(abstract(lhs.codes.shape, lhs.codes.dtype),
+    rows = (lhs.codes.shape[0] if gather is None else gather.shape[0], lhs.codes.shape[1])
+    tile = _planned(launch, launch.bind(abstract(rows, lhs.codes.dtype),
                                         abstract(matrices.codes.shape, matrices.codes.dtype),
                                         abstract(sizes.shape, jnp.int32), out_dtype='float32', trans_rhs=True,
                                         interpret=interpret))
     if selection.select(op, MxCase(tile)).kernel != 'mosaic_gpu':
-        return grouped_matmul.xla_ragged_dot(lhs.decoded(), jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
+        values = lhs.decoded() if gather is None else lhs.decoded()[gather]
+        return grouped_matmul.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
     assert tile is not None, "the selector names the template where it plans a tile"
+    scales = lhs.scales if gather is None else lhs.scales[gather]
     summed = mosaic_gpu.gmm(lhs.codes, matrices.codes, sizes, tiles=tile, transpose_rhs=True,
                             out_dtype=jnp.float32, multiprocessors=launch._launched(tile, interpret),
-                            interpret=grouped_matmul.INTERPRETED if interpret else False,
-                            mx_scales=(_scales_tiled(lhs.scales), _scales_tiled(matrices.scales)))
+                            interpret=grouped_matmul.INTERPRETED if interpret else False, gather=gather,
+                            mx_scales=(_scales_tiled(scales), _scales_tiled(matrices.scales)))
     assert isinstance(summed, jax.Array), "an unpaired product has one output"
     return summed
 
@@ -1039,14 +1078,15 @@ requirement no receipt has met yet; else the decoded operands' product in XLA.""
 
 
 def nvfp4_block_product(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax.Array, *, out_dtype,
-                        interpret_on_cpu: bool = False) -> jax.Array:
+                        interpret_on_cpu: bool = False, gather: jax.Array | None = None) -> jax.Array:
     """Each group's rows of `lhs` (`[rows, depth]`) times its matrix of `matrices` (`[groups, width,
     depth]`, K-major), both NVFP4 (`NvFp4Block`): each code times its sixteen depths' scale, every product
     exact in fp32, summed in fp32, times both tensor scales, rounded once to `out_dtype`. Group `g` holds
     `group_blocks[g]` whole 128-row blocks, in order (the block scales' tiles). Its selector
     (`NVFP4_BLOCK_OP`) runs the template on Blackwell's block-scaled tensor cores where named
-    (`mosaic_gpu.gmm`'s `mx_scales`, `kind::mxf4nvf4`), else the decoded operands' product in XLA."""
-    summed = _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu)
+    (`mosaic_gpu.gmm`'s `mx_scales`, `kind::mxf4nvf4`), else the decoded operands' product in XLA; `gather`
+    as `mxfp8_product`'s."""
+    summed = _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, gather)
     return (summed * (lhs.scale * matrices.scale)).astype(out_dtype)
 
 
@@ -1236,7 +1276,13 @@ def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype
     (`recipe_projection`), as matrices: a dense projection's free rows against its kernel's contracted
     axes, a batched one's (a grouped output projection's, DeepSeek V4's `o_a_proj`) each batch member a
     group of rows against its own matrix, the result in `dot_general`'s order (batch, `lhs`'s free axes,
-    `rhs`'s); None where `recipe_projection` takes none of it."""
+    `rhs`'s); None where `recipe_projection` takes none of it, and where the run trains in no recipe before
+    any operand is laid out as matrices: an operand an explicit mesh axis splits takes no reshape that does
+    not state where its rows lie."""
+    from dew.nn.precision import recipe_role
+
+    if recipe_role() is None:
+        return None
     (contracted, against), (batched, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
     free = [axis for axis in range(lhs.ndim) if axis not in contracted + batched]
     free_rhs = [axis for axis in range(rhs.ndim) if axis not in against + batched_rhs]
