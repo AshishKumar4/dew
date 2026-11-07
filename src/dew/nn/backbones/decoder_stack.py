@@ -19,6 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Concatenate, NamedTuple
 
 import jax
+import jax.extend
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -396,29 +397,32 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
         else:
             # A longer run's layers share keys or own them, so they only read the store: a provider
             # is always a run of one (`run_stack`).
-            def scanned(layer, carry, per_layer_input, *, store=store, step=step):
-                return step(layer, carry, per_layer_input, store)[0], None
+            # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
+            # reading its row in place, by the iteration's index the carry counts, into the collections they
+            # join (`_rows_joined`), recomputed in the backward (`_ROWS_RECOMPUTED`); every other collection
+            # scans its stacked layers.
+            rows = tuple(run.variables.get(LAYER_ROWS, {}))
+
+            def scanned(layer, carry, per_layer_input, *, store=store, step=step, rows=rows):
+                x, index = carry
+                if not rows:
+                    return (step(layer, x, per_layer_input, store)[0], index + 1), None
+
+                def read(layer, x, per_layer_input, index):
+                    return nn.map_variables(
+                        lambda layer, x, per_layer_input: step(layer, x, per_layer_input, store)[0],
+                        (LAYER_ROWS, *rows), trans_in_fn=functools.partial(_rows_joined, index=index),
+                        init=False, mutable=False)(layer, x, per_layer_input)
+                return (nn.remat(read, policy=_ROWS_RECOMPUTED, prevent_cse=False)(
+                    layer, x, per_layer_input, index), index + 1), None
 
             repeats = count // len(run.specs) if periodic else count
-            # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
-            # reading its row in place into the collections they join (`_rows_joined`), recomputed in the
-            # backward (`_ROWS_RECOMPUTED`); every other collection scans its stacked layers.
-            rows = tuple(run.variables.get(LAYER_ROWS, {}))
-            if rows:
-                def scanned(layer, carry, per_layer_input, index, *, scanned=scanned, rows=rows):
-                    def read(layer, carry, per_layer_input, index):
-                        return nn.map_variables(scanned, (LAYER_ROWS, *rows),
-                                                trans_in_fn=functools.partial(_rows_joined, index=index),
-                                                init=False, mutable=False)(layer, carry, per_layer_input)
-                    return nn.remat(read, policy=_ROWS_RECOMPUTED, prevent_cse=False)(
-                        layer, carry, per_layer_input, index)
             # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
             # axis, which the run's view cuts off again per layer (`_rows`).
-            x, _ = nn.scan(scanned, variable_axes={nn.DenyList(LAYER_ROWS) if rows else True: 0},
-                           variable_broadcast=LAYER_ROWS if rows else False, split_rngs={True: True},
-                           in_axes=(2, 0) if rows else 2, length=repeats,
-                           metadata_params={nn.PARTITION_NAME: None})(
-                run, x, inputs, *((jnp.arange(repeats),) if rows else ()))
+            (x, _), _ = nn.scan(scanned, variable_axes={nn.DenyList(LAYER_ROWS) if rows else True: 0},
+                                variable_broadcast=LAYER_ROWS if rows else False, split_rngs={True: True},
+                                in_axes=2, length=repeats,
+                                metadata_params={nn.PARTITION_NAME: None})(run, (x, jnp.int32(0)), inputs)
     return x
 
 
