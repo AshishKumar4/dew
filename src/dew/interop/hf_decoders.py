@@ -1460,8 +1460,12 @@ def export_config(model) -> Mapping[str, object]:
     return written
 
 
-_RUNTIME_FIELDS = frozenset({
-    'parent', 'name', 'dtype', 'precision', 'force_fp32_for_softmax', 'attention_impl', 'kv_cache', 'remat',
+NUMERICS_FIELDS = frozenset({'dtype', 'precision'})
+"""A module's fields that say in what numbers it computes, not what: a decoder's, and every part of a
+wrapper's (its towers, projections), which no export's config reads back as fields."""
+
+_RUNTIME_FIELDS = NUMERICS_FIELDS | frozenset({
+    'parent', 'name', 'force_fp32_for_softmax', 'attention_impl', 'kv_cache', 'remat',
     'scan_layers', 'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
     'initializer_range', 'depth_scaled_init', 'max_seq_len', 'mask_token_id', 'layer_scalar',
     'scale_after_cast'})

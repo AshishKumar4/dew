@@ -35,6 +35,35 @@ def test_row_plan_preserves_resident_rows_padding_and_random_keys():
     np.testing.assert_array_equal(jax.random.key_data(keys), jax.random.key_data(expected_keys))
 
 
+@pytest.mark.parametrize("wide", [False, True], ids=["x32", "x64"])
+@pytest.mark.parametrize("offset", [0, 7])
+def test_a_seeds_key_is_jaxs_own_and_compiles_nothing(wide, offset):
+    """A run's seed's key is the one JAX makes of it (`jax.random.key`), word for word, with x64 on and
+    off and under a configured seed offset (`jax_random_seed_offset`), made on the host: no program
+    compiles for it, as a run compiled ahead compiles none of its start on its devices (Main 11-07: the
+    seed's two programs compiled on the GPU)."""
+    import jax
+
+    from dew.nn.inputs import request_key
+    from dew.telemetry.compiles import Compiles
+
+    seeds = [0, 1, 42, 2**31 - 1, -1, -2**31, *([2**40 + 3, 2**63 - 1, -2**63] if wide else [])]
+    previous = jax.config.jax_random_seed_offset
+    jax.config.update("jax_random_seed_offset", offset)
+    try:
+        with jax.enable_x64(new_val=wide):
+            for seed in seeds:
+                with Compiles(None) as compiles:
+                    made = request_key(seed)
+                assert [program.kind for program in compiles.programs].count("compiled") == 0
+                expected = jax.random.key(seed)
+                np.testing.assert_array_equal(np.asarray(jax.random.key_data(made)),
+                                              np.asarray(jax.random.key_data(expected)), err_msg=str(seed))
+                assert jax.random.key_impl(made) == jax.random.key_impl(expected)
+    finally:
+        jax.config.update("jax_random_seed_offset", previous)
+
+
 def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
     """A request key placed replicated over the mesh derives its rows without
     a host round trip: a pool's key arrives this way, and folding the placed

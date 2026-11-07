@@ -1421,15 +1421,10 @@ class _LineIterator(grain.DatasetIterator):
         self._opened = True
         self.names = _header(self.file) if self.kind == "csv" else None
         if self.names is None and shard.start:
-            begin = _line_start(self.file, shard.start, shard.stop)
-            if shard.stop is not None and begin >= shard.stop:
-                raise ValueError(
-                    f"no line of {shard.uri} starts in its bytes {shard.start} to {shard.stop}: one "
-                    f"record runs through all {shard.stop - shard.start} of them, longer than "
-                    f"shard_bytes={source.shard_bytes}, and the range would read nothing. Read it with "
-                    "shard_bytes of at least its longest record, or provision it (`dew data "
-                    "provision`) to read it record by record")
-            self.file.seek(begin)
+            # A range reads the records that start in it, each whole: one that a longer record runs
+            # through starts none, which the range that record starts in reads (`_lines`), so it reads
+            # none (row 1828).
+            self.file.seek(_line_start(self.file, shard.start, shard.stop))
         self.records = _lines(self.kind, self.file, self.names, shard.stop)
 
     def __next__(self) -> Batch:
