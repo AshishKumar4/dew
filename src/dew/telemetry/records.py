@@ -26,7 +26,15 @@ _log = logging.getLogger(__name__)
 
 
 _NONFINITE = {'NaN': math.nan, '+Inf': math.inf, '-Inf': -math.inf}
-"""The spellings `tracker_json` writes a nonfinite number in, and the number each reads back as."""
+"""The spellings `tracker_json` writes a nonfinite number in, and the number each reads back as: the one
+declaration both directions read (A23)."""
+
+
+def _spelling(value: float) -> str:
+    """`_NONFINITE`'s spelling of the nonfinite `value`: NaN's by its category, which no comparison of a
+    NaN finds, an infinity's by its sign."""
+    return next(spelling for spelling, number in _NONFINITE.items()
+                if (math.isnan(number) and math.isnan(value)) or number == value)
 
 
 def reported_number(value: object, key: str) -> float:
@@ -35,12 +43,13 @@ def reported_number(value: object, key: str) -> float:
     if isinstance(value, str) and value in _NONFINITE:
         return _NONFINITE[value]
     if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"{key}={value!r}: a report's number is a JSON number, NaN, +Inf or -Inf")
+        raise ValueError(f"{key}={value!r}: a report's number is a JSON number or one of "
+                         f"{', '.join(_NONFINITE)}")
     return float(value)
 
 
 def tracker_json(value: object) -> JSON:
-    """JSON values, with nonfinite numbers encoded as 'NaN', '+Inf', '-Inf'.
+    """JSON values, with nonfinite numbers encoded in `_NONFINITE`'s spellings.
 
     These strings preserve valid infinite metrics (for example perfect PSNR)
     without emitting invalid JSON numbers. No arbitrary objects are stringified.
@@ -48,8 +57,7 @@ def tracker_json(value: object) -> JSON:
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
-        return value if math.isfinite(value) else ('NaN' if math.isnan(value) else
-                                                   '+Inf' if value > 0 else '-Inf')
+        return value if math.isfinite(value) else _spelling(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {field.name: tracker_json(getattr(value, field.name))
                 for field in dataclasses.fields(value)}
