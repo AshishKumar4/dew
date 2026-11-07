@@ -135,6 +135,33 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
 
 
+def test_a_task_states_the_same_key_in_every_plan_that_cuts_it_whatever_its_name_and_weight(ci, tmp_path,
+                                                                                           monkeypatch):
+    """Armada keeps a task's recorded use under the key its entry states (its `keyOf`), so a task the next
+    plan cuts again from new timings, under a new name and weight, packs on what it used and not on its
+    class's estimate (2026-11-07: no record of a task matched the next plan's, a quarter of each container's
+    CPU used): one key for one task's rows across plans, a key for each of a plan's tasks, and another for
+    the same rows run another way (the cache off), whose use is its own."""
+    for name in ("test_heavy", "test_light", "test_measured"):
+        (tmp_path / "tests" / f"{name}.py").write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0,
+         "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 25.0}))
+
+    def keys(timings: dict) -> dict[tuple[str, ...], tuple[str, float]]:
+        return {tuple(entry["rows"]): (entry["key"], entry["weight"])
+                for entry in ci.plan(120.0, timings) if entry["python"] == "3.12"}
+
+    before = keys({"files": {"3.12:tests/test_measured.py": 40.0, "3.12:tests/test_light.py": 30.0}})
+    after = keys({"files": {"3.12:tests/test_measured.py": 45.0, "3.12:tests/test_light.py": 20.0}})
+    assert set(before) == set(after) and len({key for key, _ in before.values()}) == len(before)
+    assert {rows: key for rows, (key, _) in before.items()} == {rows: key for rows, (key, _) in after.items()}
+    assert any(before[rows][1] != after[rows][1] for rows in before)
+    monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    cold = keys({"files": {"3.12:tests/test_measured.py": 40.0, "3.12:tests/test_light.py": 30.0}})
+    assert set(cold) == set(before) and all(cold[rows][0] != before[rows][0] for rows in before)
+
+
 def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
         ci, tmp_path, monkeypatch):
     """Each collect task holds at most the target's seconds of files at the slowest per-file rate armada
