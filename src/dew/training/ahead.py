@@ -158,6 +158,27 @@ def _compile_only_gpus(generation: str, count: int, capacity: int | None,
     return tuple(topology.devices[:count])
 
 
+def host_gpus(topology: str | Path, count: int) -> tuple:
+    """`count` compile-only devices of the GPUs a host serialized its own topology of
+    (`jax.experimental.topologies.get_attached_topology("cuda").serialize()`, written to `topology`), none
+    attached: XLA compiles over them as over that host's GPUs, the SKU's memory, clocks and multiprocessors
+    its own, so a program compiled here keys the persistent cache as that host's compile of it does (its
+    backend's platform version and topology fingerprint are the host's) and the host's run reads it. A
+    canonical target (`compile_only_gpus`) keys another entry: an A100's 80 GB against a 40 GB host's."""
+    from jax._src import xla_bridge
+    from jax._src.lib import xla_client
+
+    # The CUDA plugin's PJRT API, which a serialized topology deserializes through, initialized with no
+    # client and no GPU, as JAX does for a topology it makes (`xla_bridge.make_pjrt_topology`).
+    xla_bridge._discover_and_register_pjrt_plugins()
+    if not xla_client.pjrt_plugin_initialized("cuda"):
+        xla_client.initialize_pjrt_plugin("cuda")
+    devices = topologies.TopologyDescription.deserialize(Path(topology).read_bytes()).devices
+    if len(devices) < count:
+        raise ValueError(f"the topology at {topology} holds {len(devices)} GPUs, not {count}")
+    return tuple(devices[:count])
+
+
 @dataclasses.dataclass(frozen=True)
 class Executable:
     """A program compiled ahead, serialized, and the trees of its inputs and outputs, as
@@ -590,12 +611,16 @@ class AheadTarget:
     path: str
     capacity_gib: float | None = None
     frontier: bool = False
+    """Whether the report lists each rung above the plan that fits at fewer microbatches than every plan
+    before it (`compile_ahead`, `FitSearch.above`)."""
     multiprocessors: int | None = None
     """The multiprocessors of the GPU of `generation` it compiles for (an H100 PCIe's 114, an L40S's 142),
     where it is not the generation's own (`built_target`): what the step's launches derive for and a GPU
     loading it must have (`BuildTarget`). A TPU topology states its own."""
-    """Whether the report lists each rung above the plan that fits at fewer microbatches than every plan
-    before it (`compile_ahead`, `FitSearch.above`)."""
+    topology: str | None = None
+    """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole:
+    their memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A dew-ops
+    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
 
     @property
     def capacity(self) -> int | None:
@@ -603,8 +628,18 @@ class AheadTarget:
         return None if self.capacity_gib is None else int(self.capacity_gib * 2**30)
 
     def compile_only(self) -> tuple:
-        """The compile-only devices the run's mesh is built over: the TPU topology's, which must hold
-        `devices`, or `devices` GPUs of the generation at the stated capacity."""
+        """The compile-only devices the run's mesh is built over: the host's own GPUs where it names their
+        `topology` (`host_gpus`), the TPU topology's, which must hold `devices`, or `devices` GPUs of the
+        generation at the stated capacity."""
+        if self.topology is not None:
+            if self.capacity_gib is not None or self.multiprocessors is not None:
+                raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set no "
+                                 "capacity or multiprocessors with it")
+            devices = host_gpus(self.topology, self.devices)
+            if (found := gpu_target(devices[0].device_kind).generation) != gpu_target(self.generation).generation:
+                raise ValueError(f"the topology at {self.topology} holds {devices[0].device_kind} GPUs "
+                                 f"({found}), not {self.generation}")
+            return devices
         if ":" not in self.generation:
             return compile_only_gpus(self.generation, self.devices, self.capacity, self.multiprocessors)
         if self.multiprocessors is not None:
