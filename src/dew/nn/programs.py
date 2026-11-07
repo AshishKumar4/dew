@@ -218,14 +218,21 @@ def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | Non
     time, on its CPU, outside any mesh a program traces under and without the outputs' stated shardings
     (`_on_host`); None where an operand is an array this process cannot read whole (one laid across another
     process's devices), or an operand or output is of an extended dtype (a PRNG key, which no host array
-    holds), neither a constant of this host. The one evaluator of a program's constants, the compile
-    point's and a compiled program's plan alike."""
-    if any((isinstance(value, jax.Array) and not value.is_fully_addressable) or _extended(value)
-           for value in operands):
+    holds), or the primitive runs per device of a mesh it names (a shard_map's body sees one shard, and the
+    host holds no mesh to run it over), none a constant of this host. A call with a derivative rule of its own
+    (custom_jvp_call, custom_vjp_call) is its primal body, interpreted: a constant has no derivative, and its
+    bind takes its rules as functions, not the equation's jaxprs. The one evaluator of a program's constants,
+    the compile point's and a compiled program's plan alike."""
+    if "mesh" in params or any((isinstance(value, jax.Array) and not value.is_fully_addressable)
+                               or _extended(value) for value in operands):
         return None
     params = {name: None if name in ("sharding", "out_sharding") else value for name, value in params.items()}
+    body = params.get("call_jaxpr")
     with _on_host():
-        made = primitive.bind(*operands, **params)
+        if isinstance(body, jcore.ClosedJaxpr):
+            made = jax.core.eval_jaxpr(body.jaxpr, body.consts, *operands)
+        else:
+            made = primitive.bind(*operands, **params)
     made = list(made) if primitive.multiple_results else [made]
     return None if any(map(_extended, made)) else made
 
@@ -244,7 +251,9 @@ def _on_host() -> Iterator[None]:
     abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
     concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
     try:
-        with jax.ensure_compile_time_eval(), jax.default_device(jax.devices("cpu")[0]):
+        # This process's own CPU: the pool's first device may be another process's, which this one
+        # cannot read back.
+        with jax.ensure_compile_time_eval(), jax.default_device(jax.local_devices(backend="cpu")[0]):
             yield
     finally:
         mesh_lib.device_context.set_local(concrete)
