@@ -15,7 +15,6 @@ from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.recurrence.mainloop import (
-    CHUNK,
     PARTS,
     Call,
     Operand,
@@ -42,36 +41,36 @@ def zero_padded(x, axis: int, size: int):
     return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
 
 
-def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None):
-    """A call's tokens a chunk at a time: `(chunks, taken [chunks], sequences [N, 5], laid, unlaid)`, each
+def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, *, chunk: int):
+    """A call's tokens `chunk` at a time: `(chunks, taken [chunks], sequences [N, 5], laid, unlaid)`, each
     chunk's tokens, each sequence's first chunk, chunks, row and whether it begins and ends its row
     (`_states`), and the maps from `[B, T, ...]` to the chunks' rows `[chunks * C, ...]` (a chunk's rows past
     its tokens zero) and back. An aligned call's chunks are its rows' own, unmoved."""
     tokens = batch * length
-    if starts is None and length % CHUNK == 0:
-        chunks = tokens // CHUNK
-        sequences = np.stack([np.arange(batch) * (length // CHUNK), np.full(batch, length // CHUNK),
+    if starts is None and length % chunk == 0:
+        chunks = tokens // chunk
+        sequences = np.stack([np.arange(batch) * (length // chunk), np.full(batch, length // chunk),
                               np.arange(batch), np.ones(batch), np.ones(batch)], 1)
 
-        return (chunks, jnp.full((chunks,), CHUNK, jnp.int32), jnp.asarray(sequences, jnp.int32),
+        return (chunks, jnp.full((chunks,), chunk, jnp.int32), jnp.asarray(sequences, jnp.int32),
                 lambda x: x.reshape(tokens, *x.shape[2:]), lambda x: x.reshape(batch, length, *x.shape[1:]))
     if starts is None:
-        spans = chunked_launch.sequences(batch, length, chunk=CHUNK)
+        spans = chunked_launch.sequences(batch, length, chunk=chunk)
     else:
         documents = length if max_segments is None else max_segments
         spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * (documents + 1), firsts),
-                                         chunk=CHUNK)
+                                         chunk=chunk)
     table, seqs = jnp.asarray(spans.chunks), jnp.asarray(spans.spans)
     chunks, taken = table.shape[0], table[:, 1]
     first, count = seqs[:, 0], seqs[:, 1]
-    sizes = -(-count // CHUNK)
+    sizes = -(-count // chunk)
     live = count > 0
     sequences = jnp.stack([jnp.cumsum(sizes) - sizes, sizes, first // length, live & (first % length == 0),
                            live & ((first + count) % length == 0)], 1).astype(jnp.int32)
-    place = jnp.arange(CHUNK)
+    place = jnp.arange(chunk)
     real = (place[None, :] < taken[:, None]).reshape(-1)
     index = jnp.where(real, (table[:, :1] + place[None, :]).reshape(-1), tokens)
-    rows = jnp.zeros((tokens,), jnp.int32).at[index].set(jnp.arange(chunks * CHUNK, dtype=jnp.int32),
+    rows = jnp.zeros((tokens,), jnp.int32).at[index].set(jnp.arange(chunks * chunk, dtype=jnp.int32),
                                                          mode="drop")
 
     def laid(x):
@@ -244,8 +243,9 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     if starts is not None:
         starts = jnp.asarray(starts, bool)
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
-    chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
-    rows = chunks * CHUNK
+    chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts,
+                                                     chunk=tiles.chunk)
+    rows = chunks * tiles.chunk
     given = Operand(rows, _parts(dtype, family, rounded), dtype)
     # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
     # port is its reference). Without it, a `rounded` call's (the SSD's under the run's fast forms, which its
@@ -258,7 +258,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # float64).
     held = given if delta or rounded else Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                interpret, generation.gpu_target(), ranged=ranged,
+                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged,
                 factored=not per_key or (floor is not None and algebra.factored_range(floor)))
     beta = laid(beta).reshape(rows, heads).T
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
@@ -271,7 +271,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         scores, *system, hi, lo = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves)
     else:
         # A decay a head's a head's row of vectors `[HV, R]`.
-        hi, lo = (x.reshape(rows, heads).T for x in algebra.prefix(decays.reshape(chunks, CHUNK, -1)))
+        hi, lo = (x.reshape(rows, heads).T for x in algebra.prefix(decays.reshape(chunks, call.chunk, -1)))
     if per_key and delta and kept is not None:
         # The forward's inverse, weights, memories and corrected values given (`kept`): its scores and gated
         # keys alone formed again, the weighted launch without the delta rule's system.
