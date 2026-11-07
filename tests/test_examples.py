@@ -259,6 +259,22 @@ def test_train_flowers_tpu_smoke_samples_a_grid_and_scores_it(tmp_path):
     assert (tmp_path / "checkpoints" / "smoke" / "run.json").is_file()
 
 
+def test_train_masked_lm_smoke_trains_its_run_and_reads_it_back_as_a_masked_generator(tmp_path):
+    """A run written in Python through the public API alone, as a script trains one: `LMRunConfig.run()`
+    trains the masked LM its four steps and records it, and the run directory loads back with
+    `dew.pipeline` as a masked generator, which scores the held-out split and unmasks a continuation of
+    each prompt."""
+    smoke("train_masked_lm", tmp_path)
+
+    report = json.loads((tmp_path / "result.json").read_text())
+    assert len(logged_losses(tmp_path / "checkpoints" / "mdlm-json")) == 4
+    assert report["held_out"] and all(np.isfinite(value) for value in report["held_out"].values())
+    # Each sample its prompt and the continuation the run unmasked after it.
+    prompts = ("The cat", "A small boat")
+    assert all(len(sample) > len(prompt) for sample, prompt in zip(report["samples"], prompts, strict=True))
+    assert (tmp_path / "checkpoints" / "mdlm-json" / "run.json").is_file()
+
+
 def test_sft_diffusion_gemma_images_smoke_trains_on_two_splits_and_captions_the_third(tmp_path):
     """The image-reading run's arc: the train and validation splits train it,
     with random crops and flips, every step's loss finite and its weights moved
