@@ -1,4 +1,4 @@
-"""float32 dense products on a CPU, summed blocked and pairwise (row 4863).
+"""float32 dense products on a CPU, summed no worse than a vectorized dot sums them (row 4863).
 
 XLA's CPU dot sums each output's float32 products as one sequential FMA chain (all 15 of a llama
 decoder's dense sites matched it output for output, row 4735's receipts), so its rounding path grows
@@ -9,8 +9,11 @@ of `depth / partials` FMAs and `log2(partials)` adds. Here the contraction is sp
 block a dot of its own (XLA's chain, `block` FMAs long), and the blocks' sums are added as a pairwise
 tree (`log2(blocks)` adds): the block is the longest power of two whose path is no longer than the
 CPU's own vectorized accumulation (`contraction_block`), read from the CPU's vector lanes and its FMA
-latency. A product's gradients are products too, each blocked over its own contraction (`_matmul`'s
-reverse pass). On another platform the product is XLA's own (`accumulated`'s `platform_dependent`).
+latency. Its partial sums move `depth / block` outputs' bytes, so where the rows are many a product sums
+in float64 instead, each fp32 product exact and the sum rounded once, which moves the operands' bytes
+converted (`_summed` chooses by the bytes each moves). A product's gradients are products too, each summed
+over its own contraction (`_matmul`'s reverse pass). On another platform the product is XLA's own
+(`accumulated`'s `platform_dependent`).
 """
 
 import functools
@@ -85,6 +88,31 @@ def _tree(parts: jax.Array) -> jax.Array:
     return parts[:, 0]
 
 
+def _summed(a: jax.Array, b: jax.Array, precision) -> jax.Array:
+    """`a @ b` of `[batch, rows, depth]` and `[batch, depth, columns]` float32 arrays, its products summed
+    no worse than a vectorized dot on this CPU sums them, by whichever costs the CPU fewer bytes moved:
+    blocked and pairwise (`_blocked`), whose blocks' sums write and read `depth / block` partial outputs,
+    `8 depth rows columns / block` bytes; or in float64 (`_wide`), each fp32 product exact and their sum
+    rounded once (`precision.float64_sum`, Dew's own wide test arithmetic), which converts the operands,
+    `12 depth (rows + columns)` bytes, at half the lanes. The
+    first is the cheaper while the rows are fewer than about one and a half blocks (a decode step's, a short
+    batch's), the second past them: measured on armada's EPYC (NS4863-PROF2) the blocked sum took 0.55-0.67
+    of XLA's time at 1-16 rows of 1024-4096 deep, 5-11 times it at 256 rows, where the float64 sum took 2.7
+    to 4.1 times it, with a fifth the error. A product whose declared algorithm narrows its operands takes the
+    blocked sum, which keeps the declaration."""
+    from dew.nn.precision import exact_products, float64_sum
+
+    rows, depth, columns = a.shape[1], a.shape[2], b.shape[2]
+    # A declared algorithm that narrows the operands (TF32's, fp16's) is the blocks' own: a float64 sum
+    # multiplies them whole (`exact_products`).
+    if (8 * depth * rows * columns // contraction_block(max(depth, 1)) <= 12 * depth * (rows + columns)
+            or not exact_products(precision, jnp.float32)):
+        return _blocked(a, b, precision)
+
+    return float64_sum(functools.partial(jax.lax.dot_general, dimension_numbers=(((2,), (1,)), ((0,), (0,)))),
+                       a, b, dtype=jnp.float32)
+
+
 def _blocked(a: jax.Array, b: jax.Array, precision) -> jax.Array:
     """`a @ b` of `[batch, rows, depth]` and `[batch, depth, columns]` float32 arrays, the depth in blocks
     (`contraction_block`), each block's dot XLA's own, their sums added as a tree (`_tree`); a zero
@@ -122,11 +150,11 @@ def _matmul(a: jax.Array, b: jax.Array, precision) -> jax.Array:
 
     def pulled(saved, operands, cotangent, live):
         left, right = operands
-        gradients = {0: lambda: _blocked(cotangent, jnp.swapaxes(right, 1, 2), precision),
-                     1: lambda: _blocked(jnp.swapaxes(left, 1, 2), cotangent, precision)}
+        gradients = {0: lambda: _summed(cotangent, jnp.swapaxes(right, 1, 2), precision),
+                     1: lambda: _summed(jnp.swapaxes(left, 1, 2), cotangent, precision)}
         return tuple(gradients[index]() for index in live)
 
-    summed = functools.partial(_blocked, precision=precision)
+    summed = functools.partial(_summed, precision=precision)
     product = contracted("test_a_cpu_pairwise_dense_product_holds_every_order")(
         linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True,
                        kind=Protected()))

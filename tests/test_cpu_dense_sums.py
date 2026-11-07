@@ -1,7 +1,7 @@
-"""A CPU's float32 dense products summed blocked and pairwise (`dew.nn.pairwise`, row 4863): the block each
-contraction takes from the CPU's facts, the products a dense layer forms taking it in fixed float32 sums,
-and its error against float64, forward and both gradients, below XLA's one-chain sum and within a
-vectorized dot's."""
+"""A CPU's float32 dense products summed no worse than a vectorized dot (`dew.nn.pairwise`, row 4863): the
+block each contraction takes from the CPU's facts, the sum each product takes by the bytes it moves (blocked
+and pairwise, or in float64), the products a dense layer forms taking it in fixed float32 sums, and their
+error against float64, forward and both gradients, on par with a vectorized dot's."""
 
 import functools
 
@@ -53,6 +53,39 @@ def test_a_pairwise_product_takes_every_dot_generals_axes_and_bounds_its_partial
         # A workspace of a block's sums of 64 columns: five runs of the columns.
         patched.setattr(pairwise, "workspace_bytes", lambda: 8 * 64 * 64 * 4)
         np.testing.assert_array_equal(np.asarray(pairwise._blocked(a, b, None)), np.asarray(whole))
+
+
+def test_a_product_sums_blocked_where_its_rows_are_few_and_in_float64_where_many():
+    """`_summed`'s choice by the bytes each sum moves: a decode row and a short batch blocked and pairwise
+    (`_blocked`'s partial sums the fewer bytes), a batch past about one and a half blocks in float64
+    (`precision.float64_sum`: the operands converted the fewer); at 128 deep (two-product blocks with
+    AVX-512's lanes) one row blocked and four in float64. Each is bitwise the arm it chose; a declared
+    algorithm narrowing the operands (fp16's) the blocked sum's at any rows."""
+    rng = np.random.default_rng(4863)
+
+    def chosen(rows, depth, columns):
+        a = jnp.asarray(rng.standard_normal((1, rows, depth)), jnp.float32)
+        b = jnp.asarray(rng.standard_normal((1, depth, columns)), jnp.float32)
+        got = np.asarray(pairwise._summed(a, b, None))
+        if np.array_equal(got, np.asarray(pairwise._blocked(a, b, None))):
+            return "blocked"
+        np.testing.assert_array_equal(got, np.asarray(precision.float64_sum(
+            functools.partial(jax.lax.dot_general, dimension_numbers=(((2,), (1,)), ((0,), (0,)))), a, b,
+            dtype=jnp.float32)))
+        return "float64"
+
+    block = pairwise.contraction_block(4096)
+    columns = max(512, 4 * block)
+    assert chosen(1, 4096, columns) == chosen(block, 4096, columns) == "blocked"
+    assert chosen(4 * block, 4096, columns) == "float64"
+    if pairwise.contraction_block(128) == 2:
+        assert (chosen(1, 128, 128), chosen(4, 128, 128)) == ("blocked", "float64")
+    # A declared algorithm narrowing the operands keeps them narrowed: the blocks', whatever the rows.
+    a = jnp.full((1, 256, 128), 1.0001, jnp.float32)
+    b = jnp.ones((1, 128, 96), jnp.float32)
+    narrowed = np.asarray(pairwise._summed(a, b, jax.lax.DotAlgorithmPreset.F16_F16_F16))
+    np.testing.assert_array_equal(narrowed, np.asarray(pairwise._blocked(
+        a, b, jax.lax.DotAlgorithmPreset.F16_F16_F16)))
 
 
 @pytest.mark.parametrize("depth", [64, 128, 1024])
