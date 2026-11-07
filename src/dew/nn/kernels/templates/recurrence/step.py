@@ -355,13 +355,12 @@ def _softplus(x):
 
 def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
     """`recurrence.update` over the block's column of the state, read from `state_ref` and written to
-    `state_out` as it is held (`recurrence._held`): under a decay a key dimension the output `q^T S'`, its
-    delta rule's correction a pass of its own, which reads the state again; under a head's (or none) the
-    output read output-side, `g (q^T S) + (q . (beta k)) c` with `c = v - g (k^T S)`, the sums one pass over
-    the state and its update another. Each key dimension's vectors are read from `vectors` as each head's
-    scalars (`_key_entry`) and each sum over the keys a pairwise tree (`_summed_keys`). Every key's entry
-    held at once, a 128-key column spilled 1260 to 1276 bytes a thread (sm80, sm90; the fused step's
-    compile, jsf-r06j)."""
+    `state_out` as it is held (`recurrence._held`): its sums over the keys (the decayed query's and key's
+    reads of the state and the query's product with the written key) one pass over the state, its update
+    another, the output `(g q)^T S + (q . (beta k)) c`. Each key dimension's vectors are read from `vectors`
+    as each head's scalars (`_key_entry`) and each sum over the keys a pairwise tree (`_summed_keys`). Every
+    key's entry held at once, a 128-key column spilled 1260 to 1276 bytes a thread (sm80, sm90; the fused
+    step's compile, jsf-r06j)."""
     key_width = state_ref.shape[2]
 
     def entry(which, k):
@@ -370,37 +369,27 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token):
     def row(k):
         return token.tile(state_ref, k)
 
-    def stored(k, entry_k):
+    def terms(k, tile):
+        # The query's product with the written key a head's scalar, laid over the block as the sums' others
+        # are (warpgroup semantics broadcast no scalar implicitly).
+        found = ((entry(0, k) * entry(2, k)) * tile,
+                 jnp.zeros_like(tile) + entry(0, k) * (entry(1, k) * write))
+        return (*found, (entry(1, k) * entry(2, k)) * tile) if hooks.delta else found
+
+    read, aligned, *keyed = _summed_keys(key_width, row, terms, value, count=3 if hooks.delta else 2)
+    corrected = value - keyed[0] if hooks.delta else value
+
+    def updated(k, tile):
+        entry_k = tile * entry(2, k) + (entry(1, k) * write) * corrected
         # Held as `recurrence._held` holds it: bf16 rounded stochastically, salted by its key and value, the
         # key's entry laid over the block as the entry is (a scalar's bit cast lowers to no vector).
-        keyed = jnp.zeros_like(entry_k) + entry(1, k)
-        kept = (recurrence.salted_bf16(entry_k, keyed, value) if state_out.dtype == jnp.bfloat16
+        keyed_k = jnp.zeros_like(entry_k) + entry(1, k)
+        kept = (recurrence.salted_bf16(entry_k, keyed_k, value) if state_out.dtype == jnp.bfloat16
                 else entry_k)
         token.stored(state_out, kept, k)
 
-    if hooks.decay != 'vector':
-        decay = entry(2, 0)
-        read, keyed, aligned = _summed_keys(key_width, row, lambda k, tile: (
-            entry(0, k) * tile, entry(1, k) * tile, entry(0, k) * (entry(1, k) * write)), value, count=3)
-        corrected = value - decay * keyed if hooks.delta else value
-
-        def updated(k, tile):
-            stored(k, tile * decay + (entry(1, k) * write) * corrected)
-
-        _walked_keys(key_width, row, updated)
-        return decay * read + aligned * corrected
-
-    corrected = value
-    if hooks.delta:
-        corrected = value - _summed_keys(key_width, row, lambda k, tile: (entry(1, k) * entry(2, k)) * tile,
-                                         value)
-
-    def written(k, tile):
-        entry_k = tile * entry(2, k) + (entry(1, k) * write) * corrected
-        stored(k, entry_k)
-        return entry(0, k) * entry_k
-
-    return _summed_keys(key_width, row, written, value)
+    _walked_keys(key_width, row, updated)
+    return read + aligned * corrected
 
 
 UNROLLED = 16

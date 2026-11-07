@@ -336,8 +336,8 @@ def test_the_skip_takes_forward_and_reverse_mode():
 @pytest.mark.parametrize('per_key', [True, False], ids=['a decay a key dimension', "a head's decay"])
 @pytest.mark.parametrize('delta', [False, True], ids=['no delta rule', 'the delta rule'])
 def test_a_step_reads_its_updated_state(delta, per_key):
-    """A token's output (`recurrence.update`: `q^T S'` under a decay a key dimension, read output-side
-    under a head's), with the delta rule and without: finite where the one-pass form's `(q . k) (write v)`
+    """A token's output (`recurrence.update`, `(g q)^T S + (q . (beta k)) c`), under a decay a key dimension
+    and a head's, with the delta rule and without: finite where the one-pass form's `(q . k) (write v)`
     overflowed, an fp32 key and query of 2^80 on one state channel against a write of 2^-80 and a value of 1
     from a zero state with no decay, whose updated state is 1 there and its readout exactly 2^80 (rows 1859
     and 1962): the write gate scales the key before any sum."""
