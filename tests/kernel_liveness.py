@@ -633,13 +633,13 @@ class _Pass:
     def _streamed(self, op, name: str) -> bool:
         if not _elementwise(op, name):
             return False
-        dependencies = {a for operand in op.operands
-                        for a in self.atoms.of.get(operand, ()) if a is not None}
-        runs = {self.run[p] for p in self._read(op.operands) if p in self.run}
-        # Materialize growing expressions instead of retaining all their leaves
-        # through later consumers. Within one product run its accumulator leaves
-        # must coexist anyway; keep its epilogue deferred so it needs no extra
-        # output tile beside those already held to the run's last product.
+        # An elementwise result read past more atoms than its own lanes is computed into its own registers:
+        # streamed, a running sum's every earlier term stayed live (the solve's 2-lane sums grew to 27 atoms,
+        # the model 330 registers where ptxas took 121; the intra launch 318 where it took 248 with no spill,
+        # census90 at 3b3a2bc644). Within one product run its accumulators are live to the run's last product
+        # anyway, so its epilogue streams on them.
+        dependencies = {a for operand in op.operands for a in self.atoms.of.get(operand, ()) if a is not None}
+        runs = {self.run[product] for product in self._read(op.operands) if product in self.run}
         if len(runs) != 1 and len(dependencies) > len(self._lanes(op.results[0].type)):
             return False
         if self.compiler is not None and not self.compiler.streams_transcendentals:
