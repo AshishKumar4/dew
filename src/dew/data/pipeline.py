@@ -878,10 +878,10 @@ class Mixture:
 @dataclasses.dataclass(frozen=True)
 class Phases:
     """Pipelines a run reads one after another, each to its end (`ends`). Every phase batches alike, as
-    compiling phases refuses otherwise (`dew.data.compile`): a phase's end on the step clock is counted
-    in steps of the first phase's batch, which phases of other batches would misplace (row 3940); each
-    phase's own steps counted toward its end would let them differ, which no phase does yet (row
-    4812)."""
+    compiling phases refuses otherwise (`dew.data.compile`): the phases compile to one loader, the first
+    phase's, whose batch the run reads, and on the step clock a phase's end is counted in steps of that
+    batch, which phases of other batches would misplace (row 3940); a loader that carries each phase's
+    batch, and each phase's own steps counted toward its end, would let them differ (row 4812)."""
 
     pipelines: tuple[Pipeline, ...]
     ends: tuple[int | None, ...]

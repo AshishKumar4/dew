@@ -679,9 +679,11 @@ class TrainerConfig:
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
     Only a process with the GPU to itself measures, and the picks persist beside
-    the compilation cache for every later run that sets it too. It measures Dew's
-    own launches (the kernel templates, `attention_impl="template"`); tokamax's
-    flash kernel (`"triton"`) runs at tokamax's heuristic config, unmeasured.
+    the compilation cache for every later run that sets it too, each pick read for
+    its own launch alone. It measures each of Dew's own launches that declares
+    variants to time (the kernel templates, `attention_impl="template"`, the norms,
+    SwiGLU and decode attention); tokamax's flash kernel (`"triton"`) runs at
+    tokamax's heuristic config, unmeasured.
     Unset, nothing is measured or read: every launch takes the config it derives
     from the GPU's facts (row 4837).
     """
