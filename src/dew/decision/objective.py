@@ -145,6 +145,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         """Each packed row's own length, not its window's."""
         return _rows(batch, self.spans_in_context)[0]
 
+    def row_tokens(self, batch: Batch) -> int | None:
+        """Each window's width, read from its shape: the most its packed rows' lengths sum to, which a
+        window's `scored_tokens` counts. A run with a token budget or cadence bounds its committed tokens
+        by it without reading its token clock off the devices after every step, which stopped its steps
+        running ahead of the devices (row 4740)."""
+        return int(np.shape(batch["segments"])[-1])
+
     def model_flops(self, model, batch: Batch) -> float:
         """One backbone pass, its cross-attention over each row's context where rows carry one
         (`CrossAttending.cross_flops`), plus the head's real question/option geometry. Forming the
