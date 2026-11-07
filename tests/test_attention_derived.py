@@ -189,7 +189,8 @@ def forward_rows(form: str):
     return run
 
 
-def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.PLAIN):
+def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.PLAIN,
+                     normalized_values: bool = False):
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
     unseen, and D about no anchor (its whole `delta`), each step's products the template's CPU mainloop's
@@ -199,10 +200,11 @@ def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.
     contraction over a key tile's every query at once, no mainloop's schedule, erred 1.63 times the
     template's in dV). The `accurate` form's under the accurate numerics, no key its query's anchor; its
     weights recomputed in `how`'s units (raw products scaled after their difference, their maximum the raw
-    one, or an exact largest weight)."""
-    forms = derive.derive(attention_backward_algebra.backward_declaration(scale=SCALE, walked=along, how=how,
-                                                                          accurate=accurate),
-                          accurate=accurate, saturation=SATURATION)
+    one, or an exact largest weight); dV's operands the normalized weights against dO where
+    `normalized_values` (bf16's order, `softmax_gradients`)."""
+    forms = derive.derive(attention_backward_algebra.backward_declaration(
+        scale=SCALE, walked=along, how=how, accurate=accurate, normalized_values=normalized_values),
+        accurate=accurate, saturation=SATURATION)
     seen = seen_of(form)
     rows_of = forward_rows(form)
     tiles = LENGTH // BLOCK
@@ -251,14 +253,17 @@ def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.
     return run
 
 
+@pytest.mark.parametrize("normalized_values", [False, True], ids=["scaled-dout", "normalized-weights"])
 @pytest.mark.parametrize("walked", ["keys", "rows"], ids=["queries-first", "keys-first"])
 @pytest.mark.parametrize("form", list(SPANS))
-def test_the_derived_backward_is_on_par_in_every_cell(form, walked):
+def test_the_derived_backward_is_on_par_in_every_cell(form, walked, normalized_values):
     """The backward's derived forms on par against the float64 gradients (check 1) in every cell: the backward
     declaration's forms, walked queries first or keys first as a mainloop schedules them
-    (`derived_backward`), held to XLA's gradients in float32 (`xla_backward`)."""
-    assert_as_exact(jax.jit(derived_backward(form, walked)), jax.jit(xla_backward(form)), backward_draw,
-                    f"attention backward {form} {walked}", seeds=16)
+    (`derived_backward`), dV's operands either order (`softmax_gradients`' `normalized_values`), held to
+    XLA's gradients in float32 (`xla_backward`)."""
+    assert_as_exact(jax.jit(derived_backward(form, walked, normalized_values=normalized_values)),
+                    jax.jit(xla_backward(form)), backward_draw, f"attention backward {form} {walked}",
+                    seeds=16)
 
 
 @pytest.mark.parametrize("how", [algebra.PLAIN, algebra.Recompute(factor=SCALE),
