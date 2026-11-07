@@ -407,7 +407,7 @@ def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
     @pl.loop(0, jnp.where(active, steps, 0))
     def _(step):
         for name, ring in rings.items():
-            ring.load(ring.turn(counter + step), viewed(views[name], ring.block, step))
+            ring.load(ring.turn(counter + step), ring.viewed(views[name], step))
 
 
 def streamed(rings: tuple, views, lo, hi, *, adds: tuple | None = None) -> None:
@@ -831,6 +831,14 @@ class Ring:
         """Step `counter`'s turn (traced, or a Python int)."""
         return Turn.of(counter, self.stages)
 
+    def initialized(self) -> None:
+        """The ring's barriers ready, by every warpgroup before the roles split: Pallas's own, allocated
+        initialized."""
+
+    def viewed(self, view: tuple, step):
+        """Step `step`'s source of the stream's view (`viewed`), as `load` takes it."""
+        return viewed(view, self.block, step)
+
     def load(self, turn: Turn, view) -> None:
         """The producer's load of `turn`'s step from `view`, once its slot is free: released by the last
         rotation's step, whose parity is the other; `Pieces` each into its part of the slot's rows, one
@@ -844,8 +852,26 @@ class Ring:
             return
         rows = self.block[0] // len(view)
         for index, piece in enumerate(view):
-            plgpu.copy_gmem_to_smem(piece, self.smem.at[slot, pl.ds(index * rows, rows)], self.full.at[slot],
-                                    collective_axes=self.multicast)
+            for source, destination in self.parts(slot, index * rows, piece):
+                plgpu.copy_gmem_to_smem(source, destination, self.full.at[slot],
+                                        collective_axes=self.multicast)
+
+    def parts(self, slot, start: int, piece) -> list[tuple]:
+        """A piece's copies into `slot`'s rows from `start` (`load`), each a source and its destination: the
+        slot's rows as its transforms index them, where they are whole tiles of rows (`TILE_ROWS`) or the slot
+        is plain; else, a row's alone (a gathered stream's, `Rows` of one row), each of its tiles' columns
+        into the slot's physical row at the slot's swizzle. TMA swizzles a row by its shared-memory address
+        (the CUDA programming guide's swizzle pointer offset: a 128-byte-aligned row swizzled as the row of
+        the pattern it lies at), so the row lands as its tile's row does."""
+        rows = piece.shape[0]
+        match self.smem.transforms if isinstance(self.smem, state_types.TransformedRef) else ():
+            case (plgpu_core.UnswizzleRef() as unswizzled, plgpu_core.UntilingTransform(tiling=(tile, width)),
+                  ) if rows % tile:
+                physical = state_types.TransformedRef(self.smem.ref, (unswizzled,))
+                return [(piece.at[pl.ds(row, 1), pl.ds(column * width, width)],
+                         physical.at[slot, (start + row) // tile, column, pl.ds((start + row) % tile, 1)])
+                        for row in range(rows) for column in range(self.block[1] // width)]
+        return [(piece, self.smem.at[slot, pl.ds(start, rows)])]
 
     def acquire(self, turn: Turn):
         """A consumer's wait for `turn`'s load: its slot. Each load is waited for by each consumer, as every
@@ -1605,6 +1631,11 @@ class Transport[Allocated, Opened](abc.ABC):
     operand's parts, `Pieces`), where cp.async's are a table's runs alone (`mosaic.Rows`, a paged call's
     pages: `mosaic_sm80._run`)."""
 
+    gathers_rows: bool = False
+    """Whether its producer warpgroup gathers a step's rows from a table (a gathered stream's `Rows` of one
+    row: `gathered.Ring`, its threads' cp.async copies; a ring family's); where not (mma.sync's pipeline, no
+    producer of its own), a gathered call is not its launch's."""
+
     copies_vectors: bool = True
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
     warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple
@@ -2084,6 +2115,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     (`Issuer`) its walks read the home of (`accumulated`, `settled`)."""
     bounded_loads = True
     fixes_up = True
+    gathers_rows = True
     # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).
     warpgroup_reduction_scratch = 2048
     stores_through_registers = False
@@ -2126,21 +2158,28 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         roles(lax.axis_index("wg"), consumers, consumer, producer)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None) -> dict:
-        return {name: ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
-                           swizzle=(swizzles or {}).get(name), copies=(copies or {}).get(name, 1))
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
+                gathered: tuple[str, ...] = ()) -> dict:
+        from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `Ring`
+
+        return {name: gathered_rows.ring(shape, dtype, stages, consumers=consumers) if name in gathered
+                else ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
+                          swizzle=(swizzles or {}).get(name), copies=(copies or {}).get(name, 1))
                 for name, (shape, dtype) in blocks.items()}
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:
+        from dew.nn.kernels.templates import gathered  # it builds on `Ring`
+
         del views
-        return {name: Ring(**scoped) for name, scoped in allocated.items()}
+        # A gathered stream's load barriers are shared memory of its own (`gathered.ring`).
+        return {name: (Ring if isinstance(scoped['full'].dtype, plgpu_core.BarrierType) else gathered.Ring)(
+                    **scoped) for name, scoped in allocated.items()}
 
     def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
         rings = tuple(streams.values())
 
         def tiles(index):
-            return tuple(viewed(views[name], ring.block, index)
-                         for name, ring in zip(streams, rings, strict=True))
+            return tuple(ring.viewed(views[name], index) for name, ring in zip(streams, rings, strict=True))
 
         streamed(rings, tiles, lo, hi, adds=adds)
 
@@ -2157,6 +2196,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
+        for ring_ in rings.values():
+            ring_.initialized()
         staging = self.output_staging(outputs, consumers)
 
         def producer():

@@ -961,6 +961,38 @@ def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
     _assert_launches("sm90", "nvfp4 16 rows", functools.partial(_nvfp4_projected, 16, None), 1, "dew_gmm")
 
 
+def test_a_hoppers_nvfp4_prefill_shares_its_stage_decode():
+    """An NVFP4 projection at a prefill's 4096 rows on a compile-only H100, its packed kernel named: its
+    consumers share each stage's decode, each its share of the columns, meeting at a named barrier
+    (`mosaic_gpu._shared_decode`, row 3621's prefill), which ptxas compiles (`kernel_compile.Expected`)."""
+    _assert_launches("sm90", "nvfp4 4096 rows", functools.partial(_nvfp4_projected, 4096, "packed"), 1,
+                     "dew_gmm")
+
+
+def _gathered_projection():
+    """An expert projection of gathered rows (`gemm.gemm`'s `gather`: Qwen3-30B-A3B's gate|up, 2048 deep and
+    768 wide, eight experts, 1024 tokens of top-2 slots), its tokens read where they lie."""
+    from dew.nn.kernels import gemm
+
+    sizes = jnp.full((8,), 256, jnp.int32)
+
+    def product(tokens, table, first, second):
+        return gemm.gemm(tokens, first, sizes, out_dtype=jnp.bfloat16, out_dtypes=(jnp.bfloat16,) * 2,
+                         paired=second, gather=table)
+
+    return product, (jax.ShapeDtypeStruct((1024, 2048), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((2048,), jnp.int32),
+                     *(jax.ShapeDtypeStruct((8, 2048, 768), jnp.bfloat16),) * 2)
+
+
+def test_a_hoppers_gathered_projection_runs_the_template_producers_gather():
+    """A paired expert projection of gathered rows on a compile-only H100 (row 1376): its own cell
+    ('grouped forward gathered', which no old route reads), its program launching the template's grouped
+    product, whose producer warpgroup gathers each step's rows by cp.async into the swizzled ring
+    (`gathered.Ring`), which ptxas compiles (`kernel_compile.Expected`, its route evidence)."""
+    _assert_launches("sm90", "gathered projection", _gathered_projection, 4, "dew_gmm")
+
+
 def _blockwise_gradient():
     """A blockwise-scaled FP8 MoE projection's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`: 2048
     deep, 768 wide, eight experts of 4 to 12 whole 128-row blocks) through the template named."""
