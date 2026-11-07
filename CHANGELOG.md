@@ -7,6 +7,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Phases (`dew.data.phases`, `dew.data.schedule`) may each read batches of their own: a phase's end on the
+  step clock is the records of the phases before it and its own steps in its own rows, each batch steps a
+  program of its own, and under accumulation a phase of another batch than the one before it begins where
+  an update does, refused where it would begin inside one. They were refused unless every phase
+  batched alike.
 - Every release Dew writes is planned once and written once (`dew.interop.releases.ReleasePlan`): `dew
   export`, `Pretrained.save`, `Decide.save_pretrained` and `SavedModel.save_pretrained` each write a plan of
   a model part, a decision head's files, the task's assets and one release record, and `export` returns the
