@@ -222,6 +222,45 @@ def laid_projection(dtype):
     return run
 
 
+def test_a_recipe_projection_of_rows_an_explicit_axis_splits_is_each_devices_own():
+    """Row 4854: under the 'fp8' numerics, a dense projection of rows an Explicit data axis splits over eight
+    devices (`gemm.recipe_projection`, through a layer's product too: `gemm.dot_general`'s
+    `_recipe_general`) runs each device's rows apart (`gemm._projected_apart`, `jax.shard_map`), each laid
+    in whole 128-row blocks of its own: its value and the rows' gradient bitwise each device's rows'
+    projection alone, the matrix's gradient their gradients' sum. Integers, so every quantization and sum is
+    exact whatever adds them. A grouped projection of split rows is refused."""
+    from dew.distributed.placement import MeshSpec
+    from dew.nn.precision import projection_role
+
+    rng = np.random.default_rng(29)
+    rows = jnp.asarray(rng.integers(-3, 4, size=(8, 128, 256)), jnp.float32)
+    matrix = jnp.asarray(rng.integers(-3, 4, size=(256, 256)), jnp.float32)
+    cotangent = jnp.asarray(rng.integers(-3, 4, size=(8, 128, 256)), jnp.float32)
+    numbers = (((2,), (0,)), ((), ()))
+
+    def pulled(rows, matrix, cotangent):
+        with generation.run_precision(FP8), projection_role("mlp"):
+            value, pull = jax.vjp(lambda r, m: gemm.dot_general(jax.lax.dot_general)(r, m, numbers), rows,
+                                  matrix)
+            return (value, *pull(cotangent))
+
+    alone = [jax.jit(pulled)(rows[i:i + 1], matrix, cotangent[i:i + 1]) for i in range(8)]
+    mesh = MeshSpec(explicit=("data",)).build(jax.devices()[:8])
+    with jax.set_mesh(mesh):
+        split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None, None))
+        value, d_rows, d_matrix = jax.jit(pulled)(jax.device_put(rows, split), matrix,
+                                                  jax.device_put(cotangent, split))
+        assert jax.typeof(value).sharding.spec[0] == "data"
+        flat = jax.device_put(rows.reshape(1024, 256),
+                              jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None)))
+        with pytest.raises(ValueError), generation.run_precision(FP8), projection_role("experts"):
+            gemm.recipe_projection(flat, matrix[None], jnp.asarray([1024], jnp.int32), out_dtype=jnp.float32)
+    each = [[np.asarray(leaf) for leaf in leaves] for leaves in alone]
+    np.testing.assert_array_equal(np.asarray(value), np.concatenate([leaves[0] for leaves in each]))
+    np.testing.assert_array_equal(np.asarray(d_rows), np.concatenate([leaves[1] for leaves in each]))
+    np.testing.assert_array_equal(np.asarray(d_matrix), np.sum([leaves[2] for leaves in each], axis=0))
+
+
 @pytest.mark.parametrize("role", ["mlp", "experts"])
 def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role):
     """A projection the 'fp8' numerics take (`gemm.recipe_projection`, which a layer of the role hands its
