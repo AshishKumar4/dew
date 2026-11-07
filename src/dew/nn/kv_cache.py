@@ -583,35 +583,21 @@ class KVStore:
         keys = self._read("cached_key", "key_scale")
         return keys, keys if self.keys_as_values else self._read("cached_value", "value_scale")
 
-    def write_places(self, places: jax.Array, positions: jax.Array) -> None:
-        """Keep the tokens' `places` `[rows, tokens]` at their slots `positions`, where their keys go."""
-        self._write(PLACES, functools.partial(self._written, values=places[..., None].astype(jnp.int32),
-                                              positions=positions))
+    def write_slots(self, name: str, values: jax.Array, positions: jax.Array) -> None:
+        """Keep the tokens' `values` `[rows, tokens]` of the one-head leaf `name` (`PLACES`, `DOCUMENTS`,
+        a `GROUPS` field's) at their slots `positions`, where their keys go."""
+        self._write(name, functools.partial(self._written, values=values[..., None].astype(jnp.int32),
+                                            positions=positions))
 
     def read_places(self) -> jax.Array:
         """Every slot's kept place, `[rows, capacity]`."""
-        return self._read_slots(PLACES)
-
-    def write_documents(self, documents: jax.Array, positions: jax.Array) -> None:
-        """Keep the tokens' `documents` `[rows, tokens]` at their slots `positions`, where their keys go."""
-        self._write(DOCUMENTS, functools.partial(self._written, values=documents[..., None].astype(jnp.int32),
-                                                 positions=positions))
-
-    def read_documents(self) -> jax.Array:
-        """Every slot's kept document, `[rows, capacity]`, 0 where none was written."""
-        return self._read_slots(DOCUMENTS)
-
-    def write_groups(self, name: str, groups: jax.Array, positions: jax.Array) -> None:
-        """Keep the tokens' groups of field `name` `[rows, tokens]` at their slots `positions`, where their
-        keys go (`GROUPS`)."""
-        self._write(GROUPS[name], functools.partial(self._written, values=groups[..., None].astype(jnp.int32),
-                                                    positions=positions))
+        return self.read_slots(PLACES)
 
     def read_groups(self, name: str) -> jax.Array:
         """Every slot's kept group of field `name`, `[rows, capacity]`."""
-        return self._read_slots(GROUPS[name])
+        return self.read_slots(GROUPS[name])
 
-    def _read_slots(self, name: str) -> jax.Array:
+    def read_slots(self, name: str) -> jax.Array:
         """Every slot's entry of the one-head leaf `name`, `[rows, capacity]`."""
         held = self._get(name)
         return (held if self.layout.page_size is None else self._gathered(held))[..., 0]
@@ -641,7 +627,7 @@ class KVStore:
         leaves += [(GROUPS[field], held[:, None].astype(jnp.int32)) for field, held in (groups or {}).items()]
         # Each token continues its row's last document (`Append.documents`; a serving row holds one), its
         # row's largest kept, the row's first 1: a reduction a row, no slot of it a token.
-        last = jnp.max(self.read_documents(), axis=-1)
+        last = jnp.max(self.read_slots(DOCUMENTS), axis=-1)
         leaves.append((DOCUMENTS, jnp.maximum(last[jnp.clip(rows, 0, last.shape[0] - 1)], 1)[:, None]))
         size = self.layout.page_size
         # A paged pool's scales `[heads, pages, page]` written as its groups are, a dense cache's head-major
@@ -1172,7 +1158,7 @@ class Append:
         pages then carry.
         """
         if self.allocated:
-            self.store.write_places(jnp.broadcast_to(places, self.positions.shape), self.positions)
+            self.store.write_slots(PLACES, jnp.broadcast_to(places, self.positions.shape), self.positions)
         return self.store.read_places()
 
     def documents(self, segments: jax.Array | None) -> jax.Array:
@@ -1183,15 +1169,15 @@ class Append:
         later call reads its own document's keys alone (`dew.nn.mixers.attention`), and a call never names
         a document before the row's last: one whose state a recurrent layer no longer holds."""
         if self.allocated:
-            held = self.store.read_documents()
+            held = self.store.read_slots(DOCUMENTS)
             slots = jnp.arange(held.shape[-1])[None, :]
             first = jnp.min(jnp.where(self.positions >= 0, self.positions, held.shape[-1]), axis=-1,
                             keepdims=True)
             last = jnp.max(jnp.where(slots < first, held, 0), axis=-1, keepdims=True)
-            own = (self.positions >= 0).astype(jnp.int32) if segments is None else jnp.asarray(segments,
-                                                                                               jnp.int32)
-            self.store.write_documents(jnp.where(own > 0, jnp.maximum(last, 1) + own - 1, 0), self.positions)
-        return self.store.read_documents()
+            own = jnp.asarray(self.positions >= 0 if segments is None else segments, jnp.int32)
+            numbered = jnp.where(own > 0, jnp.maximum(last, 1) + own - 1, 0)
+            self.store.write_slots(DOCUMENTS, numbered, self.positions)
+        return self.store.read_slots(DOCUMENTS)
 
     def groups(self, name: str, groups: jax.Array | None) -> jax.Array:
         """Store the call's tokens' groups of field `name` `[rows, tokens]` beside their keys, -1 where it
@@ -1199,7 +1185,7 @@ class Append:
         earlier keys by them, and a layer sharing these keys reads them too."""
         if self.allocated:
             written = jnp.full(self.positions.shape, -1, jnp.int32) if groups is None else groups
-            self.store.write_groups(name, written, self.positions)
+            self.store.write_slots(GROUPS[name], written, self.positions)
         return self.store.read_groups(name)
 
 
