@@ -41,49 +41,17 @@ def half_squared_over(value, mean, variance):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_a_transitions_quadratic_term_holds_every_order(edge):
-    """`flow._half_mahalanobis` (a custom JVP whose tangent is the plain formula's, scaled to range): every
-    order finite wherever float64 is a normal float32, past where the plain formula overflows, at values,
-    means and variances near float32's ends, a value equal to its mean among them (ledger 2383); there,
-    at zero, at one and near float32's least normal, under tangents of their own scales, the second
-    forward derivative and the gradient's forward derivative are the plain formula's, |t|**2 / v and
-    t / v, exactly (each a power of two)."""
-    from dew.sampling import flow
-
-    value, mean = normal_draw(2283, (3, 4), (3, 4), scale=EDGES[edge])
-    value = value.at[0].set(mean[0])
-    variance = positive_draw(2284, (3,), EDGES[edge])
-    direction = (*normal_draw(2285, (3, 4), (3, 4), scale=EDGES[edge]),
-                 positive_draw(2286, (3,), EDGES[edge]))
-    (cotangent,) = normal_draw(2287, (3,))
-    assert_contract(flow._half_mahalanobis, (value, mean, variance), direction, cotangent,
-                    f"a transition's quadratic term {edge}", truth_fn=half_squared_over)
-
-    unit = jnp.ones((1,), jnp.float32)
-    for level, scale in ((0.0, 1.0), (1.0, 2.0**10), (2.0**-100, 2.0**-40)):
-        at, along = jnp.full((1, 3), level, jnp.float32), jnp.full((1, 3), scale, jnp.float32)
-
-        def term(value, at=at):
-            return flow._half_mahalanobis(value, at, unit)
-
-        def moved(value, term=term, along=along):
-            return jax.jvp(term, (value,), (along,))[1]
-
-        np.testing.assert_array_equal(np.asarray(jax.jvp(moved, (at,), (along,))[1]), [3 * scale**2])
-        gradient = jax.grad(lambda value, term=term: term(value).sum())
-        np.testing.assert_array_equal(np.asarray(jax.jvp(gradient, (at,), (along,))[1]),
-                                      np.full((1, 3), scale))
-
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_a_transitions_kl_holds_every_order(edge):
-    """`GaussianTransition.kl` (`flow._gaussian_kl`, a custom JVP whose tangent is one linear map: its
-    forward mode `_kl_tangent`'s, its reverse mode `_kl_pullback`'s, each formed in range): every order
-    finite wherever float64 is a normal float32 and the KL as written is, in the mean, the reference and
-    the variance, a forward derivative of its gradient included (ledger 2383)."""
+def test_a_transitions_quadratic_term_and_kl_hold_every_order(edge):
+    """`GaussianTransition.kl` and the quadratic term of its `log_prob`, one map (`flow._gaussian_kl`, a
+    custom JVP whose tangent is one linear map: its forward mode `_kl_tangent`'s, its reverse mode
+    `_kl_pullback`'s, each formed in range): every order finite wherever float64 is a normal float32 and the
+    term as written is, in the mean, the reference and the variance, past where the plain formula
+    overflows, a value equal to its mean among them, a forward derivative of its gradient included (ledger
+    2383)."""
     from dew.sampling import flow
 
     mean, reference = normal_draw(2288, (3, 4), (3, 4), scale=EDGES[edge])
+    mean = mean.at[0].set(reference[0])
     variance = positive_draw(2289, (3,), EDGES[edge])
     direction = (*normal_draw(2290, (3, 4), (3, 4), scale=EDGES[edge]),
                  positive_draw(2291, (3,), EDGES[edge]))
@@ -94,6 +62,36 @@ def test_a_transitions_kl_holds_every_order(edge):
 
     assert_contract(kl, (mean, reference, variance), direction, cotangent, f"a transition's KL {edge}",
                     truth_fn=half_squared_over, plain_fn=half_squared_over)
+
+
+@pytest.mark.parametrize(("level", "scale"), [(0.0, 1.0), (1.0, 2.0**10), (2.0**-100, 2.0**-40),
+                                              (2.0**-120, 2.0**10), (2.0**100, 2.0**100)])
+def test_a_transitions_quadratic_term_differentiates_exactly_at_a_tangent_far_from_its_operands(level,
+                                                                                               scale):
+    """The quadratic term `|value - mean|**2 / 2` (`flow._gaussian_kl` at a unit variance), at a value equal
+    to its mean `level` under tangents of `scale`, far from its operands' scale among them (ledger 3331: a
+    mean of 2**-120 under a tangent of 2**10, the old rule's second derivative infinite; a mean of 2**100
+    under 2**100): its second forward derivative and its gradient's forward derivative the plain formula's,
+    |t|**2 and t, exactly (each a power of two times three or one); at a variance of 2**100 its first
+    derivative along the value, 2**100 from its mean, 3 t 2**100 / 2**100, exactly."""
+    from dew.sampling import flow
+
+    unit = jnp.ones((1,), jnp.float32)
+    at, along = jnp.full((1, 3), level, jnp.float32), jnp.full((1, 3), scale, jnp.float32)
+
+    def term(value):
+        return flow._gaussian_kl(value, at, unit)
+
+    def moved(value):
+        return jax.jvp(term, (value,), (along,))[1]
+
+    np.testing.assert_array_equal(np.asarray(jax.jvp(moved, (at,), (along,))[1]), [3 * scale**2])
+    gradient = jax.grad(lambda value: term(value).sum())
+    np.testing.assert_array_equal(np.asarray(jax.jvp(gradient, (at,), (along,))[1]), np.full((1, 3), scale))
+    wide = jnp.full((1,), 2.0**100, jnp.float32)
+    first = jax.jvp(lambda value: flow._gaussian_kl(value, jnp.zeros((1, 3), jnp.float32), wide),
+                    (jnp.full((1, 3), 2.0**100, jnp.float32),), (along,))[1]
+    np.testing.assert_array_equal(np.asarray(first), [3 * scale])
 
 
 @pytest.mark.parametrize("edge", EDGES)
