@@ -678,8 +678,11 @@ class TrainerConfig:
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
     Only a process with the GPU to itself measures, and the picks persist beside
-    the compilation cache for every later run. Unset, such a launch runs the
-    nearest measured shape's config or its heuristic, and the run says how many.
+    the compilation cache for every later run that sets it too. It measures Dew's
+    own launches (the kernel templates, `attention_impl="template"`); tokamax's
+    flash kernel (`"triton"`) runs at tokamax's heuristic config, unmeasured.
+    Unset, nothing is measured or read: every launch takes the config it derives
+    from the GPU's facts (row 4837).
     """
 
     def accumulating(self, dataset: Loader) -> Self:
