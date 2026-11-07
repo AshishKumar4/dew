@@ -25,6 +25,33 @@ token recurrence keeps finite, as fla's chunked form's do at the same entries (`
 H100: ledger 2470), which that edge compares it with in place of the recurrence."""
 
 
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_run_updating_in_its_backward_moves_as_its_step_would(edge):
+    """A scanned run that updates its weights in its backward (`dew.nn.in_backward.scanned_run`, a rule whose
+    weights' cotangent is the step's new weights, row 4796), over three layers of a tanh projection and an
+    SGD step: its primal and its one reverse pass finite wherever its float64 run is a normal float32. It
+    runs inside a step alone, which takes it once in reverse: no other order (`REVERSE_ONLY`)."""
+    from dew.nn import in_backward
+
+    def update(path, index, gradient, weights, moments):
+        return jax.tree.map(lambda w, g: w - 0.5 * g, weights, gradient), {}
+
+    def layer(weights, x, key, metadata):
+        return jnp.tanh(x @ weights["kernel"])
+
+    def run(kernel, x):
+        norms = {"sumsq": jnp.zeros((3,), kernel.dtype), "nonfinite": jnp.zeros((3,), kernel.dtype)}
+        with in_backward.planned(in_backward.InBackward(update=update, moments=())):
+            return in_backward.scanned_run(("layers_0_2",), layer, {"kernel": kernel}, None, {}, norms, x,
+                                           None, (None,))
+
+    kernel, x = normal_draw(4796, (3, 4, 4), (2, 4), scale=EDGES[edge])
+    direction = normal_draw(4797, (3, 4, 4), (2, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(4798, (2, 4))
+    assert_contract(run, (kernel, x), direction, cotangent, f"a run updating in its backward {edge}",
+                    without=REVERSE_ONLY)
+
+
 INTERPRETED = jax.default_backend() != "gpu"
 """The ported kernels interpret off a GPU."""
 
