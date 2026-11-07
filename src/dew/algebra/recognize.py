@@ -281,6 +281,10 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
     return [read(atom) for atom in jaxpr.outvars]
 
 
+VALUE_IDENTITIES = frozenset({"stop_gradient", "name"})
+"""The equations whose value is their operand's (a gradient's stop, a checkpoint's name), which `_normal`
+reads through: what they change is a derivative or a schedule, never the value compared."""
+
 NARROW = {jnp.dtype(jnp.bfloat16): (8, 7), jnp.dtype(jnp.float16): (5, 10)}
 """The narrow floats, by the exponent and mantissa bits `reduce_precision` rounds a float32 to them by."""
 
@@ -296,11 +300,14 @@ writes a kernel for."""
 def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]) -> list:
     """`equation` bound over `operands` in the form recognition compares (`_canonical`): a square a value
     times itself, bit for bit; a narrow float's elementwise equation (`ROUNDED_ONCE`) its float32 one
-    rounded once to the narrow dtype; a float32 rounded to a narrow float's digits in place
+    rounded once to the narrow dtype; a gradient's stop or a checkpoint's name its operand
+    (`VALUE_IDENTITIES`); a float32 rounded to a narrow float's digits in place
     (`reduce_precision`) a round trip through that dtype; a value widened exactly and rounded back to its
     own dtype that value itself (`widened`, each exact widening's result by its source). Every other
     equation as it is."""
     name = jax_name(equation.primitive)
+    if name in VALUE_IDENTITIES:
+        return list(operands)
     if name == "convert_element_type":
         return [_converted(operands[0], equation.params["new_dtype"], widened)]
     if name == "square" or (name == "integer_pow" and equation.params.get("y") == 2):
@@ -565,7 +572,7 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
     other operand or its source, its result that product's output or a value made of it by up to three (a
     layout, a cast); a value the region reads beside them a bias where it is floating and a mask where it is
     boolean, a mask of constants alone folded into the region (`_canonical`); each scalar constant a softcap,
-    or none, and the call causal or not, each tried. Its declaration is the call's portable path, Flax's
+    or none, the call causal or not, and its softmax in float32 or in its operands' dtype, each tried. Its declaration is the call's portable path, Flax's
     reference attention op for op (`implementation='reference'`)."""
     anchor = index.jaxpr.eqns[place].outvars[0]
     logits = _nearest_product(index, _backward(index, anchor), upstream=True)
@@ -638,12 +645,14 @@ def _attention_candidates(q, k, v, output, extra, softcaps) -> Iterator[Candidat
 
     dtype = output.aval.dtype
     boolean = extra is not None and extra.aval.dtype == jnp.bool_
-    for causal, softcap in itertools.product((False, True), softcaps):
-        def attend(query, key, value, *given, causal=causal, softcap=softcap, implementation='auto'):
+    for causal, softcap, wide in itertools.product((False, True), softcaps, (True, False)):
+        def attend(query, key, value, *given, causal=causal, softcap=softcap, wide=wide,
+                   implementation='auto'):
             extra_ = given[0] if given else None
             return scaled_dot_product_attention(
                 query, key, value, implementation=implementation, causal=causal, softcap=softcap,
-                mask=extra_ if boolean else None, bias=None if boolean else extra_).astype(dtype)
+                force_fp32_for_softmax=wide, mask=extra_ if boolean else None,
+                bias=None if boolean else extra_).astype(dtype)
 
         operands = (q, k, v, *([extra] if extra is not None else []))
         yield Candidate(operands, (output,), attend, functools.partial(attend, implementation='reference'),
