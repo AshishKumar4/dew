@@ -964,21 +964,17 @@ def test_scanned_dropout_uses_the_supplied_rng():
 
 def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     """GLM-5-Next's first three layers (Kimi Delta Attention, a dense MLP,
-    hyper-connections) scan as one run under `scan_layers`. The scanned
-    forward is the unrolled one's, call after call. On XLA:CPU it was off by
-    8.7, 10.1 or NaN depending on the process, exact without jit and on a
-    GPU: the compiled program is identical across processes, so the bad
-    values came from its run (the chunked rule's workaround)."""
+    hyper-connections) scan as one run under `scan_layers`: the scanned
+    forward is the unrolled one's. XLA:CPU once ran this scan's chunk loop
+    from an uninitialized carry (row 1701), off by 8.7, 10.1 or NaN in about
+    60% of compilations; at the current build 96 compilations ran right with
+    no barrier (jsf-1701)."""
     loaded = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
     unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
     scanned = dataclasses.replace(loaded.model, scan_layers=True)
-    # Each compilation drew the fault afresh, about 60% of the time, so the
-    # scan compiles eight times over: a regression shows in 99% of runs.
-    for _ in range(8):
-        jax.clear_caches()
-        got = np.asarray(jax.jit(scanned.apply)(loaded.variables, tokens), np.float64)
-        assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
+    got = np.asarray(jax.jit(scanned.apply)(loaded.variables, tokens), np.float64)
+    assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
 
 
 def fetched_layer_states():
