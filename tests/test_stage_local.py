@@ -710,6 +710,29 @@ def test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own():
                                       np.asarray(jax.tree.leaves(on_host(received.variables["params"])[name])[0]))
 
 
+@pytest.mark.mesh(devices=8)
+def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_does_not_scan():
+    """A one-stage state a scanned periodic stack holds (sliding and full attention alternating, each
+    position of the period stacked under the run) reads back onto its layers for the same stack that does
+    not scan, its parameters and every moment alike, period and all."""
+    kinds = {"layer_types": ("sliding_attention", "full_attention") * 2,
+             "kinds": {"sliding_attention": {"window": 4}}}
+    optimizer = OptimConfig(optimizer="adamw", learning_rate=1e-2, optimizer_opts=SMOOTH)
+    scanned = trainer(decoder(scan_layers=True, **kinds), optimizer, MeshSpec(fsdp=2), 8)
+    scanned.validate(steps=1)
+    batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
+    state, _, _ = scanned.place()
+    moved = scanned.compile(state, batch)(state, batch)[0]
+    assert "stages" in moved.variables["params"]
+    looped = trainer(decoder(scan_layers=False, **kinds), optimizer, MeshSpec(fsdp=2), 8)
+    looped.validate(steps=1)
+    received = looped.staged(moved)
+    for mine, theirs in zip(jax.tree.leaves(on_host((received.variables, received.opt_state))),
+                            jax.tree.leaves(on_host(((stored := scanned.stored(moved)).variables,
+                                                     stored.opt_state))), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
+
+
 ROWS_SEEDS = 8
 """Check 1's declared seeds for a frozen base read where it lies against one stacked each step."""
 
