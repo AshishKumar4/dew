@@ -19,9 +19,11 @@ layout `jax.lax.ragged_dot` takes and the `expert` mesh axis shards.
 """
 
 import contextlib
+import contextvars
+import dataclasses
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -32,7 +34,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
-from dew.batch import leaves_by_path
+from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
@@ -64,12 +66,96 @@ SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 # 'mosaic_gpu', 'cutlass'); 'auto' is the kernels where they run the call, else XLA
 # (`expert_projection`, through the GEMM template).
 GROUPED_MATMULS = ('auto', 'xla', 'pallas')
-EXPERT_DISPATCHES = ('global', 'exchange')
+EXPERT_DISPATCHES = ('auto', 'global', 'exchange')
+
+
+def exchanges(num_experts: int, shards: int) -> bool:
+    """Whether `num_experts` experts over `shards` expert shards exchange their tokens: an expert axis
+    greater than one that divides them, each shard holding whole experts."""
+    return shards > 1 and not num_experts % shards
+
+
+def resolved_dispatch(dispatch: str, num_experts: int, shards: int) -> str:
+    """The dispatch `dispatch` names for `num_experts` experts over `shards` expert shards: 'auto' the
+    exchange where they exchange (`exchanges`), the global dispatch anywhere else, either other as named."""
+    if dispatch == 'auto':
+        return 'exchange' if exchanges(num_experts, shards) else 'global'
+    return dispatch
 
 # What a router writes and reads, by name. Its choices, scores and log partitions are sown under
 # `ROUTER_COLLECTION` where a caller opens it, and its balancing bias is a variable of
 # `EXPERT_BIAS_COLLECTION`, which the step that balances the load rewrites (`dew.objectives.routing`).
 ROUTER_COLLECTION = 'router'
+
+@dataclasses.dataclass
+class FixedRouters:
+    """What a `fixed_routers` block finds of a trace: the module paths of the routers whose expert weight is
+    fixed whatever they score (`weighs_one`) and whose scores' parameters the trace differentiates
+    (`trained`), and the module paths of the routers whose statistics a term of its loss reads, a balance
+    loss or a z-loss (`balanced`), each where its routing was sown."""
+
+    trained: list[tuple[str, ...]] = dataclasses.field(default_factory=list)
+    balanced: set[tuple[str, ...]] = dataclasses.field(default_factory=set)
+
+
+_FIXED: contextvars.ContextVar[FixedRouters | None] = contextvars.ContextVar("dew_fixed_routers",
+                                                                            default=None)
+"""The open `fixed_routers` block's findings, None outside one."""
+
+
+@contextlib.contextmanager
+def fixed_routers() -> Iterator[FixedRouters]:
+    """Within the block, find the fixed routers a trace trains and whether its loss balances them
+    (`FixedRouters`), each as it reports itself (`fixed_router`, `balancing`): no term of a loss but a
+    balance loss or a z-loss reaches a fixed router's scores (`dew.objectives.routing.refuse_fixed_routers`).
+    A router is trained where the trace differentiates its parameters, whatever path a stack, a pipeline
+    or a bank stores them under; a frozen one, a distillation's teacher's among them, is not."""
+    found = FixedRouters()
+    token = _FIXED.set(found)
+    try:
+        yield found
+    finally:
+        _FIXED.reset(token)
+
+
+def weighs_one(top_k: int, normalized: bool, weight_sum_min: float | None = None, *,
+               single_softmax: bool = False) -> bool:
+    """Whether a router's weight is 1 whatever it scores: one expert's weight renormalized over itself
+    (`top_k` 1, `normalized`), softmax's or a sigmoid's alike (a sigmoid's over itself plus its tiny epsilon),
+    unless a floor on the weights' sum (`weight_sum_min`) keeps a small score small; or a softmax over a
+    single expert (`single_softmax`), normalized or not."""
+    return (top_k == 1 and normalized and not weight_sum_min) or single_softmax
+
+
+@contracted("test_a_routers_differentiation_report_holds_every_order")
+@functools.partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _differentiated[Tree](report: Callable[[], None], tree: Tree) -> Tree:
+    """`tree` itself, calling `report` where a trace differentiates it: JAX traces a custom tangent rule
+    only for a differentiated input."""
+    return tree
+
+
+@_differentiated.defjvp
+def _reported(report, primals, tangents):
+    report()
+    return primals[0], tangents[0]
+
+
+def fixed_router(path: tuple[str, ...], params: jax.Array | Variables) -> None:
+    """Report the router at module `path`, whose weight is fixed (`weighs_one`), to the open `fixed_routers`
+    block, as trained where its trace differentiates `params`, the parameters its scores read
+    (`_differentiated`)."""
+    found = _FIXED.get()
+    if found is not None:
+        _differentiated(functools.partial(found.trained.append, tuple(path)), params)
+
+
+def balancing(routers: Iterable[tuple[str, ...]]) -> None:
+    """Report to the open `fixed_routers` block that a term of the loss reads the statistics of `routers`,
+    each by the module path its routing was sown at."""
+    found = _FIXED.get()
+    if found is not None:
+        found.balanced.update(tuple(router) for router in routers)
 ROUTER_INDICES = 'indices'
 ROUTER_SCORES = 'scores'
 ROUTER_LOG_Z = 'log_z'
@@ -371,6 +457,9 @@ class Router(nn.Module):
             self.sow(ROUTER_COLLECTION, ROUTER_SCORES, scores)
             # The router z-loss squares each position's log partition.
             self.sow(ROUTER_COLLECTION, ROUTER_LOG_Z, jax.nn.logsumexp(logits, axis=-1))
+        if weighs_one(self.top_k, self.normalize_weights, self.weight_sum_min,
+                      single_softmax=self.num_experts == 1 and self.score_function == 'softmax'):
+            fixed_router(self.path, self.kernel)
         if (self.normalize_weights and self.score_function == 'softmax' and not self.bias_in_weights
                 and not self.weight_sum_min):
             weights = renormalized_softmax(logits, indices)
@@ -703,7 +792,11 @@ def expert_dispatch[Parameters](
     scales each expert's input instead, as Llama 4 does. `x` is
     `[batch, length, width]` or `[tokens, width]`.
 
-    `dispatch='global'` routes the tokens where they are, in a `shard_map` that
+    `dispatch='auto'`, the default, is `'exchange'` on an expert mesh axis greater
+    than one that divides the experts, where the experts stay in place, and
+    `'global'` on any other (ledger 1711: on a 4-way expert mesh, global
+    gathered 200,704 bytes of eight experts' weights a step, exchange moved
+    4,096). `dispatch='global'` routes the tokens where they are, in a `shard_map` that
     holds them as the residual stream does, so each device runs its own rows
     through every expert on device-local rows, as the Pallas kernels need
     (MaxText's `sparse_matmul_route_and_compute`). `'exchange'` is expert
@@ -725,8 +818,8 @@ def expert_dispatch[Parameters](
         raise ValueError(f"routing {indices.shape} does not describe tokens {x.shape}")
     mesh = jax.sharding.get_abstract_mesh()
     shards = mesh.shape.get(EXPERT_AXIS, 1)
-    if dispatch == 'exchange' and not initializing and (
-            shards <= 1 or num_experts % shards):
+    dispatch = resolved_dispatch(dispatch, num_experts, shards)
+    if dispatch == 'exchange' and not initializing and not exchanges(num_experts, shards):
         raise LayoutRefused("exchange dispatch needs an expert mesh axis greater than one "
                          "that divides num_experts")
     capacity = None
@@ -945,15 +1038,19 @@ def _exchange_shard[Parameters](
     skew. Every device learns the whole exchange's counts, each device's slots for
     each expert, from one gather of its own (`all_gather`), and so where its rows
     land on each shard, where theirs come back, and each received row's expert,
-    as a device sends a shard its rows expert by expert. A shard receives at most
-    every device's slots dropless, or what a capacity lets each device's sequences
-    keep for it, the receiving buffer's static size.
+    as a device sends a shard its rows expert by expert. Each exchange is a round
+    of at most a balanced share a pair of devices (`share`, a device's slots over the
+    shards, or what a capacity lets it keep for one shard where that is fewer): a
+    shard's receiving buffer holds every device's share once, the most a balanced
+    routing sends it, and a skewed routing's overflow takes further rounds, as many
+    as its largest run needs, each projected and sent back before the next.
     """
     top_k = indices.shape[-1]
     tokens = x.reshape(-1, x.shape[-1])
     slots, per_shard = indices.size, num_experts // shards
     # The most slots one device sends one shard.
     most = slots if capacity is None else min(slots, math.prod(indices.shape[:-2]) * per_shard * capacity)
+    share = min(most, -(-slots // shards))
     order = jnp.argsort(indices.ravel())
     experts = indices.ravel()[order]
     rows = order // top_k
@@ -962,32 +1059,53 @@ def _exchange_shard[Parameters](
         send = send * input_weights.ravel()[order][:, None].astype(send.dtype)
     # Every device's slots for every expert, `[sender, expert]` (a dropped slot's sentinel expert sorts last
     # and is sent to no shard), its slots for every shard, `[sender, receiver]`, and where each run starts on
-    # its sender and lands on its receiver: after the runs every earlier device sends the same receiver.
+    # its sender: after its runs for every earlier shard.
     counts = jax.lax.all_gather(jnp.bincount(experts, length=num_experts + 1)[:num_experts].astype(jnp.int32),
                                 EXPERT_AXIS, tiled=False)
     table = counts.reshape(shards, shards, per_shard).sum(-1)
     me = jax.lax.axis_index(EXPERT_AXIS)
     sent_from = jnp.cumsum(table, axis=1) - table
-    landed_at = jnp.cumsum(table, axis=0) - table
-    received_from = table[:, me]
-    received = jax.lax.ragged_all_to_all(
-        send, jnp.zeros((shards * most, tokens.shape[-1]), send.dtype), sent_from[me], table[me],
-        landed_at[me], received_from, axis_name=EXPERT_AXIS)
-    # A received row's expert on this shard, each sender's run its experts' counts in order; the buffer past
-    # what arrived holds the sentinel.
-    mine = jax.lax.dynamic_slice_in_dim(counts, me * per_shard, per_shard, axis=1)
-    received_ids = jnp.repeat(jnp.tile(jnp.arange(per_shard, dtype=experts.dtype), shards), mine.ravel(),
-                              total_repeat_length=shards * most)
-    received_ids = jnp.where(jnp.arange(shards * most) < received_from.sum(), received_ids, per_shard)
-    permutation = jnp.argsort(received_ids)
-    groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
-    computed = project(received[permutation], groups, received_ids[permutation], parameters)[
-        jnp.argsort(permutation)]
-    computed = jnp.where((received_ids < per_shard)[:, None], computed, 0).astype(output_dtype)
-    # Each sender's rows back where it sent them from: this shard's runs, each where it landed here.
-    returned = jax.lax.ragged_all_to_all(
-        computed, jnp.zeros((slots, computed.shape[-1]), output_dtype), landed_at[:, me], received_from,
-        sent_from[:, me], table[me], axis_name=EXPERT_AXIS)
+    # This shard's experts' slots on each sender, whose run to it they make in order.
+    ends = jnp.cumsum(jax.lax.dynamic_slice_in_dim(counts, me * per_shard, per_shard, axis=1), axis=1)
+    rounds = -(-jnp.max(table) // share)
+    regions = jnp.arange(shards, dtype=jnp.int32) * share
+
+    def exchanged(start: int | jax.Array, returned: jax.Array | None) -> jax.Array:
+        """One round: each sender's next `share` rows of its run to every shard, from `start` into it,
+        projected there and sent back into `returned`, or, for the first round, into rows of the projection's
+        own width (a value expert's need not be its input's)."""
+        sending = jnp.clip(table[me] - start, 0, share)
+        receiving = jnp.clip(table[:, me] - start, 0, share)
+        # A sender's rows land in its own region of the buffer, `share` rows a sender.
+        received = jax.lax.ragged_all_to_all(
+            send, jnp.zeros((shards * share, tokens.shape[-1]), send.dtype), sent_from[me] + start, sending,
+            jnp.full((shards,), me * share, jnp.int32), receiving, axis_name=EXPERT_AXIS)
+        # A received row's expert on this shard, by where it sits in its sender's run; the region past what
+        # arrived holds the sentinel.
+        place = start + jnp.arange(share, dtype=jnp.int32)
+        received_ids = jax.vmap(lambda bounds: jnp.searchsorted(bounds, place, side='right'))(ends)
+        received_ids = jnp.where(jnp.arange(share) < receiving[:, None], received_ids, per_shard).ravel()
+        permutation = jnp.argsort(received_ids)
+        groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
+        computed = project(received[permutation], groups, received_ids[permutation].astype(experts.dtype),
+                           parameters)[jnp.argsort(permutation)]
+        computed = jnp.where((received_ids < per_shard)[:, None], computed, 0).astype(output_dtype)
+        if returned is None:
+            returned = jnp.zeros((slots, computed.shape[-1]), output_dtype)
+        # Each sender's rows back where it sent them from.
+        return jax.lax.ragged_all_to_all(computed, returned, regions, receiving, sent_from[:, me] + start,
+                                         sending, axis_name=EXPERT_AXIS)
+
+    def round_of(index, returned):
+        # Every device takes the same rounds, from the gathered table.
+        return jax.lax.cond(index < rounds, lambda held: exchanged(index * share, held), lambda held: held,
+                            returned)
+
+    returned = exchanged(0, None)
+    # The most rounds any routing takes, a device's every slot sent to one shard; a capacity's bound past
+    # the balanced share alone takes further ones.
+    if most > share:
+        returned = jax.lax.fori_loop(1, -(-most // share), round_of, returned)
     # The rows in slot order; a dropped slot's, sent nowhere, stays zero.
     return returned[jnp.argsort(order)].reshape(*indices.shape, returned.shape[-1])
 
@@ -1037,7 +1155,7 @@ class ExpertMLP(nn.Module):
     out_features: int
     activation: GatedActivation = 'swiglu'
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     swiglu_limit: float | None = None
     scale_inputs: bool = False
@@ -1142,7 +1260,7 @@ class SparseMLP(nn.Module):
     out_features: int
     activation: GatedActivation = 'swiglu'
     implementation: str = 'auto'
-    dispatch: str = 'global'
+    dispatch: str = 'auto'
     capacity_factor: float | None = None
     score_function: str = 'softmax'
     normalize_weights: bool = True
