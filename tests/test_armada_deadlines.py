@@ -56,6 +56,27 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     assert "(most recent call first)" in interrupted["output"] and "stalled_reading" in interrupted["output"]
 
 
+def test_a_task_past_its_deadline_says_where_a_thread_stalled_in_native_code_was(ci, tmp_path):
+    """A pytest whose main thread is stalled in native code at its deadline, never returning to the
+    interpreter to run a Python signal handler (as an XLA compile, a wait on a device or a collective holds
+    it), still says where every thread stood: a thread of its own takes the signal and writes the stacks
+    (row 4828)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_stalls_natively.py": (
+        "import ctypes\n\n"
+        "libc = ctypes.CDLL(None)\n"
+        "# A mutex its own thread locks again waits in the kernel for good, without the GIL (ctypes lets it go),\n"
+        "# and no signal wakes it.\n"
+        "held = ctypes.create_string_buffer(64)\n"
+        "libc.pthread_mutex_lock(held)\n\n\n"
+        "def stalled_natively():\n    libc.pthread_mutex_lock(held)\n\n\n"
+        "stalled_natively()\n\n\ndef test_never():\n    pass\n")})
+    ci.task("3.12", ["tests/test_stalls_natively.py"], "", tmp_path / "rows.json", 3.0, cache="off", grace=5.0)
+    [interrupted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
+    assert interrupted["kind"] == "deadline"
+    assert "(most recent call first)" in interrupted["output"] and "stalled_natively" in interrupted["output"]
+
+
 def test_a_stack_dump_asked_over_and_over_never_kills_a_pytest_whose_threads_run(ci, tmp_path):
     """The dump a task asks of its pytest past its deadline (executed.py's SIGUSR2) never kills it, however a
     running thread's frames change under it: asked three thousand times over threads recursing as a test runs,
