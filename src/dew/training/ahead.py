@@ -808,9 +808,10 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
     a run that starts afresh, the first step's narrowed copies of its weights where the plan reads some
     (`narrowed`), and what its steps run on their results, each called as the run calls it, over the
     step's results' shapes (`collecting`): an accumulating window's first allocation (`Trainer._window_of`),
-    a split step's whole (`whole_step`), its counters (`bookkeep`), its log's copies (`copied`) and its
-    logged tokens' sum (`added_tokens`). Each by its program's digest, through the kernel templates'
-    reports as every compile is. Its evaluations compile on its devices still (row 4752)."""
+    a split step's whole (`whole_step`), its counters (`bookkeep`), a sampled step's latest sample
+    (`latest`), its log's copies (`copied`) and its logged tokens' sum (`added_tokens`). Each by its
+    program's digest, through the kernel templates' reports as every compile is. Its evaluations compile
+    on its devices still (row 4752)."""
     from dew.training.distributed import start_lowered
     from dew.training.narrow import narrowed
 
@@ -850,21 +851,27 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     calls them over shapes (`collecting`), by digest: `started`'s last part."""
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
-    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied
+    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
     from dew.training.planning import whole_step
 
     candidate, split = planned.candidate, planned.split
     placed = placed_shapes(start.abstract, start.shardings)
     window = split * trainer.accumulation
+    frozen = apart(placed)[1]
+    # A sampled step's results hold its summaries (`Committed.inspected`), which its programs read too.
+    steps = [planned.executable] + ([] if planned.sampled is None else [planned.sampled.executable])
     with collecting() as collected:
-        if window > 1 and trainer.step is None:
+        if trainer._builds_window(placed, candidate, window):
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
-        moving, loss, aux, finite, accepted, committed = shapes_of(planned.executable.out_info)
-        if split > 1:
-            loss, aux, finite, accepted, committed = whole_step(
-                [(loss, aux, finite, accepted, committed)] * split)
-        book = book_shapes(loss)
-        counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))
-        added_tokens(counted.tokens, counted.tokens)
-        copied(together(moving, apart(placed)[1]))
+        for step in steps:
+            moving, loss, aux, finite, accepted, committed = shapes_of(step.out_info)
+            if split > 1:
+                loss, aux, finite, accepted, committed = whole_step(
+                    [(loss, aux, finite, accepted, committed)] * split)
+            book = book_shapes(loss)
+            counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))
+            if committed is not None and committed.inspected is not None:
+                latest((committed.count, committed.inspected), (committed.count, committed.inspected))
+            added_tokens(counted.tokens, counted.tokens)
+            copied(together(moving, frozen))
     return collected

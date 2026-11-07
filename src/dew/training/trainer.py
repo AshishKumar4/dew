@@ -866,15 +866,22 @@ class Trainer(Generic[Loss, Effects]):
                 tokens=jnp.zeros((2,), jnp.uint32) if TOKENS in batch else None)
 
         pending = jax.eval_shape(allocate)
-        # A state that holds no window has filled none: its step is not read (a fresh one's, as shapes ahead).
-        filled = None if shape_only or state.accumulation is None else int(state.microstep) % window
-        if kept_window(state.accumulation, pending, filled):
+        # The microbatches the state's window holds are read only where it is replaced (`kept_window`).
+        if kept_window(state.accumulation, pending,
+                       None if shape_only else lambda: int(state.microstep) % window):
             return state
         if not shape_only:
             placement = self.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
             # Allocate on the final shards, without a replicated window-sized temporary.
             pending = owned_program(allocate, out_shardings=placement)()
         return dataclasses.replace(state, accumulation=pending)
+
+    def _builds_window(self, state: TrainState, candidate: Candidate, window: int) -> bool:
+        """Whether a step of `window` microbatches over `state` builds its window first (`_window_of`): a
+        state that holds none, or a ramp's stage whose window replays other shapes."""
+        held, staged = state.window, self._ramp or self._stage_starts
+        return window > 1 and self.step is None and (
+            held is None or (bool(staged) and not held.replays(candidate.prepared.window)))
 
     def _window_of(self, state: TrainState, candidate: Candidate, window: int) -> TrainState:
         """`state` with the accumulation `window` microbatches of `candidate`'s pool in, empty, on its shards
@@ -1044,9 +1051,7 @@ class Trainer(Generic[Loss, Effects]):
                                               out_shardings=candidate.shardings.compute)
                     with self._taking():
                         current = dataclasses.replace(current, compute=narrowing(current.variables))
-                held, staged = current.window, self._ramp or self._stage_starts
-                if window > 1 and self.step is None and (held is None or (staged and not held.replays(
-                        candidate.prepared.window))):
+                if self._builds_window(current, candidate, window):
                     # The window, and with it the split, is the state's from here on.
                     current = dataclasses.replace(self._window_of(current, candidate, window),
                                                   window_size=jax.device_put(np.int32(window)))

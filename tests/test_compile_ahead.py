@@ -94,6 +94,29 @@ def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_w
     np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
 
 
+def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_its_own(tmp_path):
+    """A run whose checkpoint holds a part-filled accumulation window compiles its step ahead: the state it
+    resumes holds its window, so it builds none ahead, and its count of microbatches, a shape there, is
+    never read (row 4752's review: it was read as a number and compiling ahead raised TypeError)."""
+    from dew.checkpoints import Checkpoints
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    def accumulating(**mesh):
+        model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
+        return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), **mesh,
+                       layout=Layout(min_shard=TINY_SHARD), accumulation=2,
+                       checkpoints=Checkpoints(str(tmp_path / "run")))
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    run = accumulating()
+    run.fit(batch, steps=1, checkpoint_every=1)
+    run.checkpoints.wait()
+    assert run.checkpoints.accumulation_template(1) is not None
+    ahead = compile_ahead(accumulating(mesh=MeshSpec().build(compile_only_gpus("sm90", 1))), batch,
+                          capacity=2**30)
+    assert ahead.starts
+
+
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
     """A compile-only GPU with stated memory takes the run's own fit search, whose one fitting
     program is the saved executable, not another compile outside the report. The report records

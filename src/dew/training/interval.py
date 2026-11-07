@@ -249,13 +249,8 @@ class Interval:
         if committed is not None and committed.inspected is not None:
             # The latest sample that committed: a sampled step whose window did not commit holds zeros,
             # which keep the one before, chosen on the device, the whole vector at once.
-            if self.inspected is None:
-                self.inspected = (committed.count, committed.inspected)
-            else:
-                fresh = committed.count > 0
-                count, held = self.inspected
-                self.inspected = (jnp.where(fresh, committed.count, count), jax.tree.map(
-                    lambda new, old: jnp.where(fresh, new, old), committed.inspected, held))
+            sampled = (committed.count, committed.inspected)
+            self.inspected = sampled if self.inspected is None else latest(sampled, self.inspected)
         self.book = bookkeep(*booked(self.book, self.fresh, loss, finite, committed, aux))
 
     def streak(self) -> jax.Array | None:
@@ -401,6 +396,15 @@ class TokenClock:
 
 
 @program
+def latest(sampled: tuple[jax.Array, Summaries], kept: tuple[jax.Array, Summaries]
+           ) -> tuple[jax.Array, Summaries]:
+    """The latest sample that committed, as a commit count and its summaries: `sampled`, a step's, where
+    its window committed, else `kept`, the one before, chosen on the device, the whole vector at once."""
+    fresh = sampled[0] > 0
+    return jax.tree.map(lambda new, old: jnp.where(fresh, new, old), sampled, kept)
+
+
+@program
 def added_tokens(left: jax.Array, right: jax.Array) -> jax.Array:
     return _TokenCount.add(left, right)
 
@@ -424,8 +428,10 @@ def copied(state: TrainState) -> tuple[jax.Array | None, jax.Array | None]:
     """`held`'s copies of the learning rate `state`'s optimizer state holds (`dew.optim.learning_rate`,
     under DiLoCo its groups') and its loss scale, which a log reads: the run's call and a run compiled
     ahead's alike (`dew.training.ahead.started`)."""
-    return held(learning_rate(rated(state)), None if state.scale is None else state.scale.scale,
-                grouped=state.inner is not None)
+    rate, scale = learning_rate(rated(state)), None if state.scale is None else state.scale.scale
+    if rate is None and scale is None:
+        return None, None
+    return held(rate, scale, grouped=state.inner is not None)
 
 
 @runtime_checkable
