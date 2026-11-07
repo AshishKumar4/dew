@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import jax
@@ -146,7 +146,7 @@ from .decoder_stack import (
     split_stages,
     stored_by_stage,
 )
-from .layer_names import fixed_router_owners, group_layers, layer_index
+from .layer_names import group_layers, layer_index
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, run_period, scan_groups
 from .looping import run_loop
 
@@ -2336,11 +2336,6 @@ class CausalTransformer(LinearProducts):
     def prediction_kind(self, types: Sequence[str]) -> str:
         """A prediction depth's mixer kind: `mtp_layer_type`, else full attention, else the first layer's."""
         return self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
-
-    @nn.nowrap
-    def fixed_routers(self) -> Mapping[str, Callable[[tuple[str, ...]], bool]]:
-        """Its routers whose weights are fixed, and their parameters (`layer_names.fixed_router_owners`)."""
-        return fixed_router_owners(self)
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:

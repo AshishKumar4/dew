@@ -254,11 +254,12 @@ def qwen_hybrid_export(model: CausalTransformer) -> Mapping[str, object]:
             'partial_rotary_factor': model.partial_rotary_factor or 1.0}
 
 
-def _qwen_moe_export(model: CausalTransformer, *, scheduled: bool) -> Mapping[str, object]:
+def _qwen_moe_export(model: CausalTransformer, *, stated_normalization: bool,
+                     scheduled: bool) -> Mapping[str, object]:
     """`_qwen_moe_mixture` backwards: the routed experts' count, top-k and width, the shared expert's
-    width, and, where the family `scheduled` them (`_sparse_step_layers`), their renormalization and the
-    layers they route, every one counted from one beside the dense ones (`mlp_only_layers`); none for a
-    model with no mixture."""
+    width, their renormalization where the family's config states it (`norm_topk_prob`), and, where the
+    family `scheduled` them (`_sparse_step_layers`), the layers they route, every one counted from one
+    beside the dense ones (`mlp_only_layers`); none for a model with no mixture."""
     mixture = model.mixture
     if mixture is None:
         return {}
@@ -266,7 +267,8 @@ def _qwen_moe_export(model: CausalTransformer, *, scheduled: bool) -> Mapping[st
     return {'num_experts': mixture.experts, 'num_experts_per_tok': mixture.top_k,
             'moe_intermediate_size': mixture.expert_features,
             'shared_expert_intermediate_size': mixture.shared_features,
-            **({'norm_topk_prob': mixture.norm_topk_prob, 'decoder_sparse_step': 1,
+            **({'norm_topk_prob': mixture.norm_topk_prob} if stated_normalization else {}),
+            **({'decoder_sparse_step': 1,
                 'mlp_only_layers': [index for index in range(model.num_layers) if index not in routed]}
                if scheduled else {})}
 
@@ -419,7 +421,8 @@ def _qwen35_moe_export(model: CausalTransformer) -> Mapping[str, object]:
     """The `qwen3_5_moe_text` fields the generic export writes none of: the hybrid block's
     (`qwen_hybrid_export`), its routed and shared experts (`_qwen_moe_export`, every layer routed and
     renormalized, as Qwen3_5MoeTopKRouter always does) and its prediction depth."""
-    return {**qwen_hybrid_export(model), **_qwen_moe_export(model, scheduled=False),
+    return {**qwen_hybrid_export(model),
+            **_qwen_moe_export(model, stated_normalization=False, scheduled=False),
             'mtp_num_hidden_layers': model.num_nextn_predict_layers}
 
 
@@ -427,7 +430,7 @@ def _qwen3_next_export(model: CausalTransformer) -> Mapping[str, object]:
     """The `qwen3_next` fields the generic export writes none of: the hybrid block's (`qwen_hybrid_export`),
     its routed and shared experts and the layers they route (`_qwen_moe_export`), and its prediction
     depth."""
-    return {**qwen_hybrid_export(model), **_qwen_moe_export(model, scheduled=True),
+    return {**qwen_hybrid_export(model), **_qwen_moe_export(model, stated_normalization=True, scheduled=True),
             'num_nextn_predict_layers': model.num_nextn_predict_layers}
 
 
