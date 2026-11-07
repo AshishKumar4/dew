@@ -527,7 +527,8 @@ def saved_artifact(checkpoints: Checkpoints, step: int) -> Mapping[str, object] 
     """The inference declaration `step` of `checkpoints` records, in the shapes Dew writes now
     (`earlier_shapes`); None where its objective declares none. The one reader of a step's declaration:
     a saved run's (`SavedRun.at`) and the option writing its run record reads from it
-    (`dew.config.earlier_option_writing`). The packages it trusts are imported first, by its reader."""
+    (`dew.config.earlier.earlier_option_writing`). The packages it trusts are imported first, by its
+    reader."""
     record = checkpoints.artifact(step)
     return None if record is None else earlier_shapes(named_fields(record, 'checkpoint artifact'))
 

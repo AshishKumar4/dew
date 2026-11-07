@@ -77,7 +77,7 @@ class CausalTokenizer(nn.Module):
     (`_grid`), beside the learned vectors each patch adds after its masking, so a masked patch keeps its
     place; and RMS-normalizes the latents before the squeeze. "learned" is the learned vectors alone,
     added before a patch is masked, no normalization: the tokenizer runs were saved with before
-    (`dew.config.earlier_tokenizer_positions`), whose latents carried no place a decoder could read
+    (`dew.config.earlier.earlier_tokenizer_positions`), whose latents carried no place a decoder could read
     and reconstructed the mean frame (row 4669)."""
 
     frame: tuple[int, int, int]
