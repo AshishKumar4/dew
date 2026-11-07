@@ -1353,6 +1353,11 @@ class Issuer[Accumulator](abc.ABC):
     product. Where not (tcgen05's: one warp issues them, the tensor core reading each stage as loaded), a
     call needing that is not a template's launch's there."""
 
+    takes_register_left: bool = True
+    """Whether its product takes its left operand from a consumer's registers (`register_products`: wgmma's
+    RS form, mma.sync's fragments); a family without it takes a register value staged into a shared tile
+    first (`staged`, tcgen05's issuers)."""
+
     takes_pairs: bool = True
     """Whether a launch on it takes a paired product whole, its model pricing the second accumulator beside
     the first in a consumer's registers (`column_registers`); where not (tcgen05's, whose accumulators stay
