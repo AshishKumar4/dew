@@ -94,13 +94,14 @@ def checkout(name: str, root: str) -> bool:
 
 
 def code_unit(code: types.CodeType, root: str) -> str:
-    """How a record names code object `code` of a checkout file run under `root`: a test file or conftest
-    whole, as its text is the run's; else the file, CODE, and the unit holding the code (ci.py's `units`): the
-    outermost function it lies in, by its qualified name, whose text holds every function and class nested in
-    it, or `TOP`, a module's or a class's body, or a lambda or a generator expression outside any function,
-    whose text the module's top level holds."""
+    """How a record names code object `code` of a checkout file run under `root`: a test file whole, as its
+    text is the run's; else, a conftest among them, the file, CODE, and the unit holding the code (ci.py's
+    `units`): the outermost function it lies in, by its qualified name, whose text holds every function and
+    class nested in it, or `TOP`, a module's or a class's body, or a lambda or a generator expression outside
+    any function, whose text the module's top level holds. A conftest's fixture or hook is so the input of the
+    files whose runs ran it alone (row 4385: every file's key held the whole of tests/conftest.py)."""
     name = code.co_filename[len(root):]
-    if Path(name).name.startswith("test_") or Path(name).name == "conftest.py":
+    if Path(name).name.startswith("test_"):
         return f"{name}{CODE}{WHOLE}"
     unit = code.co_qualname.split(".<locals>", 1)[0]
     body = not code.co_flags & OPTIMIZED
@@ -213,9 +214,9 @@ body lacks: the child imports no more of the standard library than it must."""
 TOP = "<module>"
 """The unit of a module's top level: all its text but its functions' bodies (ci.py's `units`)."""
 WHOLE = "<file>"
-"""The unit of a test file or a conftest a run executed: its code whole, no comment, docstring or position
-of it (ci.py's `code_of`), as the run's tests are all of it; a read of its text, an `inspect` or a
-traceback's, is its bytes'."""
+"""The unit of a test file a run executed: its code whole, no comment, docstring or position of it (ci.py's
+`code_of`), as the run's tests are all of it; a read of its text, an `inspect` or a traceback's, is its
+bytes'."""
 LOOKUP = "lookup:"
 """What an import's search of a checkout directory for a name is recorded under (`missed`), the directory
 and the name: ci.py's `contents` keys the entries there an import of the name finds (a module, a package, an

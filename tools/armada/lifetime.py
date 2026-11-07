@@ -117,9 +117,9 @@ def started(code, offset):
     name = code.co_filename
     if not followed.checkout(name, root):
         return sys.monitoring.DISABLE
+    # A conftest's fixtures and hooks as any module's functions: each file's run that ran one keys it, so no
+    # event of it is turned off after its first owner's (`followed.code_unit`).
     write(owner(), followed.code_unit(code, root))
-    if Path(name).name == "conftest.py":
-        return sys.monitoring.DISABLE
     if code.co_name == "<module>":
         # Each module body sees every reader it calls, however many bodies called it before.
         sys.monitoring.restart_events()

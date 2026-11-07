@@ -303,6 +303,10 @@ def shared(python: str) -> str:
                 digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
+    # This file's code that decides which tests a row's run holds and how pytest is called (`selected`,
+    # `pytest_command`): a change to either changes what a green row means (row 2558).
+    for selecting in ("selected", "pytest_command"):
+        digest.update(digests.unit(__file__, selecting))
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + (code_of(name) if name.endswith(".py") else digests.contents(name)))
     return digest.hexdigest()
@@ -1261,14 +1265,15 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
 
 
 def targeted(python: str, arguments: list[str], report: Path, tests: Sequence[str] = (),
-             split: str = "") -> int:
+             split: str = "", whole: bool = False) -> int:
     """pytest's exit status on `arguments` (files, node ids and options) and `tests` in `split`'s group, run
     as a CI task runs them (`session.pytest_run`, `selection`, `site_environment`): a lane's targeted run
     (tmp/run_tests.py) and the gangs select as CI does, and an option of their own (a `-m` after CI's)
-    chooses instead. A file's group sets aside its sites as CI's does (`selected`), which run in their own
+    chooses instead; with `whole`, as main's whole run does, so a bisect of its red whole_suite cell runs it
+    (row 4230). A file's group sets aside its sites as CI's does (`selected`), which run in their own
     tasks alone (2026-11-02: a targeted group ran a site's every seed itself, 2233 s against CI's 8)."""
     site = SITE.fullmatch(split)
-    run = selected(session.pytest_run(python, report), network=False, site=site is not None)
+    run = selected(session.pytest_run(python, report), network=False, whole=whole, site=site is not None)
     return subprocess.run([*run, *arguments, *selection(list(tests), split)],
                           env=session.pytest_environment(site_environment(site)), check=False).returncode
 
@@ -2270,6 +2275,8 @@ def main() -> int:
     selecting.add_argument("--tests", default="", help="the files --split's group is of, space-separated")
     selecting.add_argument("--split", default="",
                            help="--tests' group as CI names it: 1/3, a check-1 site's test or its draws")
+    selecting.add_argument("--whole", action="store_true",
+                           help="select as main's whole run does, its whole_suite cells too (a bisect)")
     selecting.add_argument("arguments", nargs=argparse.REMAINDER,
                            help="after --, pytest's own: files, node ids and options")
     measuring = operations.add_parser("coverage")
@@ -2342,7 +2349,7 @@ def main() -> int:
     if args.operation == "pytest":
         # argparse keeps the `--` that sets pytest's arguments apart from these.
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-        return targeted(args.python, arguments, args.report, args.tests.split(), args.split)
+        return targeted(args.python, arguments, args.report, args.tests.split(), args.split, args.whole)
     if args.operation == "gpu-lane":
         if args.tests is None and not args.network:
             parser.error("gpu-lane names its --tests; only the network lane (--network) takes every file "
