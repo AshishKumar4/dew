@@ -348,6 +348,20 @@ def test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_it
     np.testing.assert_array_equal(decoded, rounded * np.repeat(least, 16, axis=0))
 
 
+def test_a_small_nonzero_tile_keeps_its_nvfp4_codes():
+    """A tile of small normal values, whose largest over 6 * 448 is no normal fp32, quantizes to codes that
+    decode to the values' rounding (`bits.nvfp4_quantized`, then `nvfp4_decoded` times `NVFP4_OWED` and the
+    tensor scale): nonzero, each within e2m1's half step of its value, not a tile erased by its scale's
+    underflow."""
+    x = np.full((32, 8), np.float32(3e-36))
+    x[::2] *= np.float32(-0.5)
+    words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(x))
+    decoded = (np.asarray(bits.nvfp4_decoded(words, scales), np.float64) * bits.NVFP4_OWED
+               * np.float64(np.asarray(tensor)))
+    assert np.all(np.sign(decoded) == np.sign(x))
+    np.testing.assert_array_less(np.abs(decoded - x), np.abs(x) * 0.25)
+
+
 def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():
     """A truth table over one value and the immediate (`BitOp.LOGIC` with one operand) runs as PTX writes it
     and the synthesizer proves it, `lop3.b32 d, a, imm, imm`, under every table (row 4647): each result

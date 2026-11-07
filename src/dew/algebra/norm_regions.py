@@ -159,26 +159,28 @@ def _rms(graph: Graph, place: int) -> Norm | None:
         return None
     # The mean, its kept axis laid before or after its division (`jnp.mean`'s keepdims after the sum).
     mean = _unkept(graph, graph.uncast(mean, places, widening), places)
+    # The width divides the sum (`jnp.mean`'s) or its reciprocal multiplies it, held exactly below.
     scaled = graph.made(mean, "div")
     if scaled is not None:
         summed, width = eqns[scaled].invars
-        width = graph.constant(width)
+        reciprocal = False
     else:
         scaled = graph.made(mean, "mul")
         if scaled is None:
             return None
-        inverse_width, summed = _constant_beside(graph, eqns[scaled].invars)
-        width = None if inverse_width is None or inverse_width <= 0 else 1 / inverse_width
+        width, summed = _constant_atom_beside(graph, eqns[scaled].invars)
+        reciprocal = True
     if summed is None:
         return None
     reduced = graph.made(_unkept(graph, graph.uncast(summed, places, widening), places), "reduce_sum")
-    if width is None or np.ndim(width) != 0 or reduced is None:
+    if reduced is None:
         return None
     places += [scaled, reduced]
     squared = eqns[reduced].invars[0]
     row = _squared(graph, squared, places)
     if (row is None or tuple(eqns[reduced].params["axes"]) != (row.aval.ndim - 1,)
-            or not np.isclose(float(width), row.aval.shape[-1]) or np.dtype(row.aval.dtype).itemsize < 4):
+            or not graph.holds(width, 1 / row.aval.shape[-1] if reciprocal else row.aval.shape[-1])
+            or np.dtype(row.aval.dtype).itemsize < 4):
         return None
     # The statistics laid back along the row and multiplied into it, a weight beside them where Flax's is.
     along = _along_row(graph, reduced, place, row, places)
@@ -212,10 +214,17 @@ def _rms(graph: Graph, place: int) -> Norm | None:
 def _constant_beside(graph: Graph, operands) -> tuple[float | None, object]:
     """`(c, other)` where one of a binary equation's `operands` is a constant scalar `c`; `(None, None)`
     else."""
+    atom, other = _constant_atom_beside(graph, operands)
+    return (None, None) if atom is None else (float(graph.constant(atom)), other)
+
+
+def _constant_atom_beside(graph: Graph, operands) -> tuple[object, object]:
+    """`(c, other)` where one of a binary equation's `operands` is the constant scalar `c` (the atom,
+    its value `graph.constant`'s); `(None, None)` else."""
     for constant, other in (operands, operands[::-1]):
         value = graph.constant(constant)
         if value is not None and np.ndim(value) == 0 and graph.constant(other) is None:
-            return float(value), other
+            return constant, other
     return None, None
 
 
@@ -421,6 +430,11 @@ def _row_weight(graph: Graph, atom, width: int, places: list[int]) -> tuple[jcor
         place = graph.made(atom, *LAYOUTS, "add")
         if place is None:
             break
+        if (jax_name(eqns[place].primitive) == "convert_element_type"
+                and not widening(eqns[place].invars[0].aval.dtype, atom.aval.dtype)):
+            # A cast that rounds the weight is part of the program's math, which the written norm would drop
+            # (row A4: a weight of 1.001 cast to bf16 is 1 there, 1.001 written).
+            return None
         if jax_name(eqns[place].primitive) == "add":
             one, inner = _constant_beside(graph, eqns[place].invars)
             if one != 1.0 or offset:

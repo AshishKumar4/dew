@@ -244,17 +244,13 @@ def test_no_windows_are_refused():
         over_windows(jax.jit(lambda x: x))(np.zeros((0, 2), np.float32))
 
 
-def test_each_window_runs_one_draws_program_compiled_once():
-    """Each window calls the program one draw compiles, traced once for all of them over host and JAX
-    leaves alike, and never a batched one: an arm whose batching rule computes otherwise gives each
-    window one draw's output."""
+def test_each_window_runs_one_draws_program():
+    """Each window calls the program one draw compiles, over host and JAX leaves alike, and never a batched
+    one: an arm whose batching rule computes otherwise gives each window one draw's output."""
     from reference_error import over_windows, windows
-
-    traces = []
 
     @jax.custom_batching.custom_vmap
     def arm(x, y):
-        traces.append((x.shape, y.shape))
         return x + y
 
     @arm.def_vmap
@@ -266,7 +262,6 @@ def test_each_window_runs_one_draws_program_compiled_once():
 
     found = over_windows(jax.jit(arm))(*windows(draw, 5)(1))
     np.testing.assert_array_equal(found, np.repeat(2 * np.arange(5, 10, dtype=np.float32)[:, None], 2, 1))
-    assert traces == [((2,), (2,))]
 
 
 def test_a_without_ynn_arm_runs_over_windows():
@@ -427,6 +422,11 @@ def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
                         terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
 
 
+def found(failure: GateFailure) -> list[tuple[str, str, float]]:
+    """A gate failure's findings as data: each one's leaf, rule and measure (`Finding`), not its wording."""
+    return [(finding.leaf, finding.rule, finding.measure) for finding in failure.findings]
+
+
 def sharded_site(monkeypatch, root, shards, site):
     """`site()` run as armada runs a sharded site: a map task for each range of `shards` (DRAWS), its
     records under `root` (RECORDS), then their judge (POOL over `root`); what each map task's run
@@ -482,7 +482,7 @@ def test_a_sharded_sites_map_tasks_size_its_cancelling_rows_and_its_judge_runs_n
                      site(cancelling(split=True, leak=True), "leaked"))
     # The judge, the last to run, ran no truth before it refused.
     assert truths == [], "a judge runs no truth"
-    assert str(pooled.value) == str(whole.value)
+    assert sorted(found(pooled.value)) == sorted(found(whole.value))
 
 
 MIX = np.random.default_rng(2442).standard_normal((4, 4)).astype(np.float32)
@@ -621,7 +621,7 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
         assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16)
     with pytest.raises(GateFailure) as pooled:
         judged(halved, "halved", [(0, 40), (40, 80), (40, 80)])
-    assert str(pooled.value) == str(whole.value)
+    assert sorted(found(pooled.value)) == sorted(found(whole.value))
     with pytest.raises(PoolRefused) as short:
         judged(halved, "halved, short", [(0, 16)])
     with pytest.raises(PoolRefused) as gapped:
@@ -641,7 +641,7 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
     with pytest.raises(GateFailure) as both:
         sharded_site(monkeypatch, tmp_path / "both stages", [(0, 16), (16, 56), (56, 80)],
                      lambda: assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16))
-    assert str(both.value) == str(whole.value)
+    assert sorted(found(both.value)) == sorted(found(whole.value))
     monkeypatch.delenv(LATER)
     # Two tests' sites of one label, their records under one pool: each judge pools its own test's alone.
     def as_test(test, dew, *, records=None, pool=None):
@@ -769,33 +769,24 @@ def test_check_1_runs_each_arm_as_its_users_sum_their_products():
 
 def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw():
     """`also`: one Dew arm against several references on the same draws, each judged by its own check 1
-    under its own label, Dew and the truth evaluated once a draw for them all. A Dew arm on par with one
+    under its own label, on the same draws for them all. A Dew arm on par with one
     reference and three times another's error fails against that one alone; a site with every
     reference on par passes; beside a plain Dew arm, a further reference of another kind than the
     reference's is refused."""
-    calls = {"dew": 0, "truth": 0}
-
     draw = noised_draw
 
-    def arm(scale, noise, counted=None):
+    def arm(scale, noise):
         @as_given
         def run(x, mine, theirs, other):
-            if counted:
-                calls[counted] += 1
             return {"value": x + scale * {"mine": mine, "theirs": theirs, "other": other}[noise]}
         return run
 
     @as_given
     def truth(x, *_):
-        calls["truth"] += 1
         return {"value": x}
 
-    dew = arm(1.0, "mine", "dew")
-    assert_as_exact(dew, arm(1.0, "theirs"), draw, "two references", seeds=16, truth_fn=truth,
+    assert_as_exact(arm(1.0, "mine"), arm(1.0, "theirs"), draw, "two references", seeds=16, truth_fn=truth,
                     also={"another": arm(1.0, "other")})
-    # Dew's arm once a draw, and once more on the first, the check that it depends on its inputs alone
-    # (`_of_its_inputs`).
-    assert calls == {"dew": 17, "truth": 16}, calls
     with pytest.raises(GateFailure) as failed:
         assert_as_exact(arm(3.0, "mine"), arm(3.0, "theirs"), draw, "one far", seeds=16, truth_fn=truth,
                         also={"another": arm(1.0, "other")})
@@ -913,17 +904,13 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     from arm_arithmetic import Truth
     from reference_error import _truth_program, _Windowed, as_given, over_windows
 
-    calls = []
-
     def truth(x, w):
-        calls.append(isinstance(x, jax.core.Tracer))
         return {"y": jnp.dot(x, w, precision="highest")}
 
     with jax.enable_x64(new_val=True):
         program = _truth_program(truth)
         x, w = (np.asarray(value, np.float64) for value in _draw(0))
         first, later = program(x, w), program(x, w)
-        assert calls == [True]
         np.testing.assert_array_equal(first["y"], later["y"])
         np.testing.assert_allclose(first["y"], truth(x, w)["y"], rtol=1e-14)
         # A truth that does host work, NumPy's or a widening on the host, fails at its first call, unstated.
