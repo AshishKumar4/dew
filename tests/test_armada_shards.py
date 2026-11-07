@@ -106,9 +106,9 @@ def entry_task(ci, monkeypatch, entry: dict, out: Path, artifacts: Path | None =
     return ci.main()
 
 
-def planned(ci, target: float = 300.0) -> dict[str, dict]:
-    """The plan's 3.12 entries by their task names."""
-    return {entry["name"]: entry for entry in ci.plan(target, {}) if entry["python"] == "3.12"}
+def planned(ci, target: float = 300.0, timings: dict | None = None) -> dict[str, dict]:
+    """The plan's 3.12 entries by their task names, under armada's measures `timings` (none by default)."""
+    return {entry["name"]: entry for entry in ci.plan(target, timings or {}) if entry["python"] == "3.12"}
 
 
 def runs(root: Path) -> list[int]:
@@ -168,8 +168,32 @@ def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_
         {"tests/test_site.py::test_light": 1.0, "tests/test_site.py::test_site": 2.0}))
     spans = [(0, 4), (4, 12), (12, 20)]
     names = [ci.site_task("3.12", "tests/test_site.py", "test_site", span) for span in spans]
-    weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {"rows": {names[0]: 40.0}})}
+    weighed = {entry["name"]: entry["weight"] for entry in ci.plan(100.0, {"rows": {names[0]: 40.0}})}
     assert [weighed[name] for name in names] == [40.0, 80.0, 80.0]
+
+
+def test_a_sites_map_tasks_its_measured_rate_puts_past_the_target_are_cut_finer_never_coarser(ci, tmp_path):
+    """A site whose measured rate puts a map task of its declared cut past the target is cut finer: as many
+    units a task as the target holds at that rate, each weighed at it, its later stage later still; one
+    whose rate fits the target keeps its declared cut, and none is cut coarser than declared (row 4376: a
+    64-seed shard of test_recurrence_template_stability ran 966 s, the train's critical path, where every
+    other group took 256 s or less)."""
+    site_checkout(tmp_path)
+    first = ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))
+
+    def maps(target: float, seconds: float) -> list[tuple[str, float, bool]]:
+        return [(entry["split"], entry["weight"], entry.get("later", False))
+                for entry in ci.plan(target, {"rows": {first: seconds}})
+                if entry["python"] == "3.12" and ".draws-" in entry["split"]]
+
+    # 4 seeds in 40 s: 10 s a seed, 3 a task within 30 s.
+    assert maps(30.0, 40.0) == [
+        ("test_site.draws-0-3", 30.0, False), ("test_site.draws-3-4", 10.0, False),
+        *((f"test_site.draws-{start}-{min(start + 3, 20)}", 10.0 * (min(start + 3, 20) - start), True)
+          for start in range(4, 20, 3))]
+    # 4 seeds in 4 s fit a task of the declared 8 within the target, and of no more.
+    assert [split for split, _, _ in maps(30.0, 4.0)] == [
+        "test_site.draws-0-4", "test_site.draws-4-12", "test_site.draws-12-20"]
 
 
 def test_a_site_whose_map_tasks_armada_has_no_measure_of_weighs_the_target_not_its_judges_record(
@@ -476,12 +500,13 @@ def cached_checkout(ci, tmp_path: Path, monkeypatch, cache_worker, site: str) ->
     return out
 
 
-def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool) -> None:
+def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool, target: float = 300.0,
+               timings: dict | None = None) -> None:
     """Site `site`'s run as armada runs it with the test cache on, each task recording its rows: its map
     tasks, its later ones too where `later` (its judge's first stage asked for them), then its judge over
-    those, and the file's own row."""
+    those, and the file's own row, as the plan for `target` under armada's measures `timings` cuts them."""
     out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker, site)
-    entries = list(planned(ci).values())
+    entries = list(planned(ci, target, timings).values())
     [judge] = [entry for entry in entries if "after" in entry]
     inputs = tmp_path / ".verdict/inputs"
     drawn = [entry for name in judge["after"] for entry in entries
@@ -527,6 +552,21 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
     maps = [entry for entry in ran if "after" not in entry]
     assert {ci.session.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
     assert maps and set(again["after"]) == {entry["name"] for entry in maps}
+
+
+def test_a_judge_after_a_cut_finer_than_declared_is_kept_on_what_its_map_tasks_drew(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A site cut finer than its mark declares (its measured rate past the target, `cut_draws`) is judged over
+    the map tasks that ran, and its judge keys on their inputs whatever their spans, so it is kept whole as a
+    judge after its declared cut is, and a module only its draws ran, changed, plans it again (the review of
+    row 4376: a judge read its declared cut's map tasks alone, found none, and kept no key)."""
+    first = ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))
+    run_cached(ci, tmp_path, monkeypatch, cache_worker, SITE, later=True, target=30.0,
+               timings={"rows": {first: 40.0}})
+    # 10 s a seed: 3 a task within 30 s, 8 map tasks where the declared cut makes 3.
+    assert runs(tmp_path) == [1, 8, 1]
+    ran = replanned_once_its_draws_change(ci, tmp_path)
+    assert {ci.session.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
 
 
 def test_a_judge_green_on_its_first_stage_is_kept_though_its_later_map_tasks_never_ran(
