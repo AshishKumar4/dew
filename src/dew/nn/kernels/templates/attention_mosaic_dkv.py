@@ -641,7 +641,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
 
         producer = functools.partial(_dkv_producer, walk, streams, views, streamed, dq_ref, (row, head),
                                      fused_stages, width)
-        return family.roles(consumers, consumer, producer)
+        return family.scheduled(consumers, consumer, producer)
 
     scoped, rings = _dkv_allocations(family, program.tiles, width, value_width, query.dtype, stages=stages,
                                      columns=program.tiles.columns, tiled=tiled)

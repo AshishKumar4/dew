@@ -198,7 +198,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def register_budget(self, config: Config) -> int:
         """A consumer thread's share of the registers (`Family.registers`): the family's roles share the
-        file (`mosaic.roles`)."""
+        file (`mosaic.Schedule`)."""
         # A consumer's budget is its family's, whatever the operands' dtype (`mosaic.Family.registers`).
         return bundle_of(config, jnp.bfloat16).registers(config.consumers)
 

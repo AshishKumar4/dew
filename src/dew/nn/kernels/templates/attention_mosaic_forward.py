@@ -1810,7 +1810,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         def producer():
             family.stream(streams, views, *streamed)
 
-        family.roles(consumers, consumer, producer)
+        family.scheduled(consumers, consumer, producer)
 
     entry = functools.partial(_entry, program, layout, body, (scoped, rings), column_blocks=column_blocks,
                               queries=queries, walk_rows=walk_rows)

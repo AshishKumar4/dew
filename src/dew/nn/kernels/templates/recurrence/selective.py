@@ -206,7 +206,7 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
                 family.stream(given, once_views, 0, 1)
                 family.stream(walked, views, 0, scan.chunks)
 
-            family.roles(1, consumer, producer)
+            family.scheduled(1, consumer, producer)
 
         family.scoped(body, allocations, streams=streams)
 
