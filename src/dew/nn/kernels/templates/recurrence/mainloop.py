@@ -558,10 +558,9 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     family = call.family
     staged, landed = _roles_staged(staging, landing, consumers)
     staged = (*staged, _landed(landed, family))
-    # The products' shared memory and barriers where the family keeps them (`Issuer.product_scratch`, which
-    # `launch_kernel` scopes beside the staging).
-    products = family.product_shared(family.product_scratch(consumers,
-                                                            _product_widths(blocks, staging, call.chunk)))
+    # The products' shared memory and barriers where the family keeps them (`Issuer.product_held`, of the
+    # scratch `launch_kernel` scopes beside the staging).
+    products = family.product_held((consumers, _product_widths(blocks, staging, call.chunk), ()))
 
     def allocations(depth: int) -> dict:
         opened = {"walked": family.streams(blocks, depth, consumers, swizzles=swizzles)}
@@ -761,10 +760,6 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         return recorded
 
     def entry(*arrays):
-        def scoped(staged, products, *, streams):
-            with family.products_in(products):
-                return run(staged, streams=streams)
-
         def run(staged, *, streams):
             *staged, lands = staged
             keys = _landing_keys(landing, family)
@@ -782,15 +777,15 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
             if walked is not None:
                 family.run(streams["walked"], walked, call.interpret)
 
-        # The products' own memory where the family's issuer keeps each (`Issuer.product_scratch`): a
+        # The products' own memory where the family's issuer keeps each (`Family.scoped`'s `products`): a
         # product's width is one of its tiles' (its streams', its staging's) or the chunk's.
-        products = family.product_scratch(consumers, _product_widths(blocks, staging, call.chunk))
+        products = (consumers, _product_widths(blocks, staging, call.chunk), ())
         if persistent:
-            family.scoped(scoped, staging, products, streams=streams)
+            family.scoped(run, staging, streams=streams, products=products)
         else:
             # An empty program scopes nothing (Mosaic GPU's interpreter takes a scope's allocations in turn).
             at = {axis: lax.axis_index(axis) for axis in grid_names}
-            pl.when(live(at, arrays))(lambda: family.scoped(scoped, staging, products, streams=streams))
+            pl.when(live(at, arrays))(lambda: family.scoped(run, staging, streams=streams, products=products))
 
     entry.__name__ = name
 

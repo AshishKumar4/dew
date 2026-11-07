@@ -1164,26 +1164,24 @@ def _chunks_products(x, w, *, interpret):
     def body(x_gmem, w_gmem, ss_gmem, staged_gmem, carried_gmem):
         allocated = family.streams({'x': ((rows, CHUNK_DEPTH), jnp.bfloat16),
                                     'w': ((CHUNK_DEPTH, columns), jnp.bfloat16)}, 2, 1)
-        scratch = family.product_scratch(1, (columns,), lefts=((CHUNK_DEPTH, jnp.bfloat16),))
 
-        def scope(products, *, streams):
-            with family.products_in(products):
-                rings = family.opened(streams)
-                views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
+        def scope(*, streams):
+            rings = family.opened(streams)
+            views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
 
-                def step(index, slots, carry, accumulators):
-                    del index
-                    held, ones = family.tile_of(slots['x']), jnp.ones((rows, columns), jnp.float32)
-                    ss_gmem[...] = family.product(slots['x'], slots['w'], (rows, columns),
-                                                  interpret=interpret)
-                    staged_gmem[...] = family.registers_product(held, slots['w'], interpret)
-                    carried_gmem[...] = family.register_products(ones, (held,), slots['w'], interpret)
-                    return carry, accumulators
+            def step(index, slots, carry, accumulators):
+                del index
+                held, ones = family.tile_of(slots['x']), jnp.ones((rows, columns), jnp.float32)
+                ss_gmem[...] = family.product(slots['x'], slots['w'], (rows, columns), interpret=interpret)
+                staged_gmem[...] = family.registers_product(held, slots['w'], interpret)
+                carried_gmem[...] = family.register_products(ones, (held,), slots['w'], interpret)
+                return carry, accumulators
 
-                family.roles(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
-                             lambda: family.stream(rings, views, 0, 1))
+            family.roles(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
+                         lambda: family.stream(rings, views, 0, 1))
 
-        family.scoped(scope, scratch, streams=allocated)
+        # The issuer's scratch, its staged left operand's tile among it (`Family.scoped`'s `products`).
+        family.scoped(scope, streams=allocated, products=(1, (columns,), ((CHUNK_DEPTH, jnp.bfloat16),)))
 
     out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
     return family.kernel(body, out_type=(out, out, out), grid=(1,), grid_names=("programs",), consumers=1,

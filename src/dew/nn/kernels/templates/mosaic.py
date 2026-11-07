@@ -1424,6 +1424,12 @@ class Issuer[Accumulator](abc.ABC):
         del refs
         yield
 
+    def product_held(self, products: tuple | None) -> tuple:
+        """What `Family.scoped`'s `products` (`(consumers, widths, lefts)`) hold in shared memory
+        (`product_shared` of `product_scratch`): a launch's account of them, from the one tuple its scope
+        allocates."""
+        return () if products is None else self.product_shared(self.product_scratch(*products))
+
     def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
         """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
         `shape` (zero), its value once they are done: a register accumulator's, which a family whose
@@ -1787,12 +1793,23 @@ class Transport[Allocated, Opened](abc.ABC):
         tables of integers its programs read an element at a time (a grouped schedule's), which a GPU reads
         from global memory and a TPU from its scalar memory."""
 
-    def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
+    def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
         (`streams`), and what it returns. With `after_walks`, allocations no walk reads, `body` takes
         `after` too: `after(fn)` runs `fn(*refs)` of them once a role's walks have ended, in a scope of their
         own where the family scopes its walks apart (`walks_scoped`: the walks' slots reused, as
-        `resources.Scope.after` counts them), the program's otherwise."""
+        `resources.Scope.after` counts them), the program's otherwise. With `products`, `(consumers,
+        widths, lefts)`, the issuer's product scratch (`product_scratch`) is scoped beside `allocations`,
+        `body` traced within it (`products_in`), where the issuer keeps any; `product_held` its account."""
+        scratch = () if products is None else self.product_scratch(*products)
+        if scratch:
+            inner = body
+
+            def body(*refs, **named):
+                with self.products_in(refs[-1]):
+                    return inner(*refs[:-1], **named)
+
+            allocations = (*allocations, scratch)
         if not after_walks:
             return self.program_scoped(body, *allocations, streams=streams)
         if self.walks_scoped:
