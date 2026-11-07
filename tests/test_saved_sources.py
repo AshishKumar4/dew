@@ -75,8 +75,8 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     joint = ["--pretrained", str(QWEN_TINY), "head:joint-shape", "--head.width", "16",
-             "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2", "--head.feedforward", "32",
-             "--max-len", "256"]
+             "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
+             "--head.feedforward", "32", "--max-len", "256"]
     first = DecisionRunConfig.cli(joint, default=decision(tmp_path, drawn=False))
     state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
