@@ -40,6 +40,7 @@ from dew.distributed.batches import (
     with_host,
 )
 from dew.distributed.placement import MeshSpec
+from dew.nn.kernels.options import program
 from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
 from dew.training.cadence import Counted
 from dew.training.tracker import Tracker, write_artifact
@@ -529,8 +530,15 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
 def _folded(key: jax.Array, word: int) -> jax.Array:
     """`jax.random.fold_in(key, word)`, the host integer placed beside the
     key by name rather than moved there implicitly by the fold: on the key's
-    devices, or uncommitted with an uncommitted key."""
-    return jax.random.fold_in(key, jax.device_put(np.uint32(word), key.sharding if key.committed else None))
+    devices, or uncommitted with an uncommitted key. Folded by a program of
+    Dew's (`_fold`), as every program a run runs is, so one compiled ahead
+    runs in its place (`dew.nn.kernels.options.taking`)."""
+    return _fold(key, jax.device_put(np.uint32(word), key.sharding if key.committed else None))
+
+
+@program
+def _fold(key: jax.Array, word: jax.Array) -> jax.Array:
+    return jax.random.fold_in(key, word)
 
 
 def _score_split(objective: Objective[Loss, Effects], variables: Variables, batches,

@@ -883,6 +883,13 @@ class Trainer(Generic[Loss, Effects]):
         return window > 1 and self.step is None and (
             held is None or (bool(staged) and not held.replays(candidate.prepared.window)))
 
+    def _schedule_step(self, state: TrainState) -> np.ndarray:
+        """The step `state`'s schedules read, as training reads it (`Transaction`: a window of window_size
+        microbatches is `accumulation` steps), on the host, where an evaluation reads its clocks
+        (`Evaluation.run`), in its clock's dtype: no program runs it on the devices."""
+        microstep = np.asarray(state.microstep)
+        return microstep * microstep.dtype.type(self.accumulation) // np.asarray(state.window_size)
+
     def _window_of(self, state: TrainState, candidate: Candidate, window: int) -> TrainState:
         """`state` with the accumulation `window` microbatches of `candidate`'s pool in, empty, on its shards
         (`windowed`): what a run's first step of a window builds, and a run compiled ahead compiles
@@ -2339,7 +2346,7 @@ class Trainer(Generic[Loss, Effects]):
               nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
             evaluation = Evaluation.run(
                 self.objective, params, reader, metrics=metrics, key=key,
-                step=state.step, schedule_step=state.microstep * self.accumulation // state.window_size,
+                step=state.step, schedule_step=self._schedule_step(state),
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
                 warm=warm, updates=state.updates,
                 # A cooldown branch's beside the run's at the step it branched at (`COOLDOWN`).
