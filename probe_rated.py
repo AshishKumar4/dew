@@ -68,7 +68,12 @@ def normalized(values, *, reverse=False, restarts=None):
 
 
 original_decays = scan._decays_value
-for mode in ("barrier",):
+original_compensated = scan._compensated
+modes = sys.argv[1].split(",") if len(sys.argv) > 1 and sys.argv[1] != "x" else ("barrier",)
+for mode in modes:
+    scan._decays_value = original_decays
+    scan._compensated = original_compensated
+    scan._decays_rule.cache_clear()
     if mode == "split":
         scan._decays_value = split_decays
         scan._decays_rule.cache_clear()
