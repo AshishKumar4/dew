@@ -191,7 +191,7 @@ def test_a_step_lowered_afresh_past_a_spilled_kernel_traces_its_footprint_again(
 
     handed = []
     search = bare_search(deep(split=None).objective)
-    search.lower = lambda split, narrow, footprint: handed.append(footprint)
+    search.lower = lambda split, narrow, footprint, derived: handed.append(footprint)
     derived = Footprint(residuals=1, gradients=2, held=3)
     search.footprints[search.candidate_key(1, narrow=False)] = derived
     search.lowering(1)
