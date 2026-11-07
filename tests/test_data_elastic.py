@@ -741,9 +741,10 @@ def test_a_ramped_elastic_read_that_keeps_its_short_last_batch_cuts_it_alike_on_
     ramp = Ramp(start=4, increment=4, samples=16)
 
     def steps(index, readers):
-        # One pass: a training read without a repeat reads on without end.
-        chain = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(30)))).repeat(1).batch(
-            BATCH, drop_remainder=False).elastic()
+        # One pass (a training read without a repeat reads on without end) of the odd ids of 60, a filter's,
+        # so the read's position is its order's (`elastic`), no record count.
+        chain = (Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(60)))).repeat(1)
+                 .filter(odd).batch(BATCH, drop_remainder=False).elastic())
         return list(ramped(compile(chain, loading=READ, seed=3), ramp).train(DataPartition(index, readers)))
 
     def places(batch):
@@ -753,9 +754,13 @@ def test_a_ramped_elastic_read_that_keeps_its_short_last_batch_cuts_it_alike_on_
     whole = [places(batch) for batch in steps(0, 1)]
     # The ramp's steps: 4 records at first, its stages growing to the read's batch.
     assert [len(step) for step in whole[:3]] == [4, 4, 4] and len(whole[-1]) == BATCH
+    one = (Pipeline(Memory(({"id": np.int64(1)},))).repeat(1).filter(odd)
+           .batch(BATCH, drop_remainder=False).elastic())
+    opened = ramped(compile(one, loading=READ, seed=3), ramp).train(DataPartition(0, count))
+    assert _position.ramped(opened.get_state()) is not None
     shares = [[places(batch) for batch in steps(index, count)] for index in range(count)]
     assert {len(share) for share in shares} == {len(whole)}
-    assert sum(row is not None for step in whole for row in step) == 30
+    assert sorted(row for step in whole for row in step if row is not None) == list(range(1, 60, 2))
     for at, step in enumerate(whole):
         assert [step[place] for place in range(len(step))] == [
             shares[place % count][at][place // count] for place in range(len(step))]
