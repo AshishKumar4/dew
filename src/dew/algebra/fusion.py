@@ -66,7 +66,7 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     from dew.nn.kernels import fused_gemm
 
     attention = [region for region in attention_regions.regions(jaxpr)
-                 if _decided(jaxpr, region.places, (region.query, region.key, region.value), (region.output,),
+                 if _decided(jaxpr, region.places, _read(jaxpr, region.places), (region.output,),
                              lambda region=region: attention_regions.taken(region))]
     held = {place for region in attention for place in region.places}
     products = [region for region in _regions(jaxpr) if not held & set(region.places)
@@ -79,6 +79,13 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     written += [Written(region.places, region.inputs, region.outputs, region.at,
                         _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm)) for region in products]
     return _spliced(jaxpr, written)
+
+
+def _read(jaxpr: jcore.Jaxpr, places: Sequence[int]) -> tuple[jcore.Var, ...]:
+    """The values the equations at `places` read that none of them makes, in the order they are read."""
+    made = {var for place in places for var in jaxpr.eqns[place].outvars}
+    return tuple(dict.fromkeys(var for place in places for var in jaxpr.eqns[place].invars
+                               if isinstance(var, jcore.Var) and var not in made))
 
 
 def _fusing(replay: Callable, fused_gemm) -> Callable:
