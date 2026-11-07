@@ -901,10 +901,8 @@ def keys_gated_carried(state, keys: TileLoad, values, gate, decay, dtype, issue:
 
 
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
-    """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
-    memory's decay `exp2(g_last)`."""
-    gated = corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
-    return gated, raised(last, last_lo)
+    """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves."""
+    return corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
 
 
 def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issue: Issue, *,

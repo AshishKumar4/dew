@@ -1760,14 +1760,17 @@ def final_memory_landing(call: Call, bv: int) -> tuple[dict, tuple]:
     return ({}, (final,)) if call.family.walks_scoped else ({"final": final}, ())
 
 
-def _prefetched(family: mosaic.Family, chunk: int, prefix: tuple, beta_ref, head, n) -> tuple:
-    """`_states`' chunk `n`'s prefix under a decay a head: its rows' halves and its last's, a row's vectors
-    (Mosaic GPU's warpgroup lowering bitcasts no scalar, which `algebra.raised` does), and its write gates
-    where `beta_ref` is given (without the delta rule)."""
+def _prefetched(call: Call, prefix: tuple, beta_ref, head, n) -> tuple:
+    """`_states`' chunk `n`'s prefix under a decay a head: its last's halves as the chunk's rows' vectors and
+    as a key slice's (`Call.block`: the memory's decay across the chunk), Mosaic GPU's warpgroup lowering
+    bitcasting no scalar (which `algebra.raised` does), its rows' halves, and its write gates where `beta_ref`
+    is given (without the delta rule)."""
+    chunk, family = call.chunk, call.family
     span, last = pl.ds(n * chunk, chunk), n * chunk + chunk - 1
-    ends = tuple(jnp.full((chunk,), ref[head, last]) for ref in prefix)
+    ends, memory = (tuple(jnp.full((rows,), ref[head, last]) for ref in prefix)
+                    for rows in (chunk, call.block))
     rows = tuple(family.rows_of(ref.at[head, span]) for ref in prefix)
-    return ends, rows, None if beta_ref is None else family.rows_of(beta_ref.at[head, span])
+    return ends, rows, None if beta_ref is None else family.rows_of(beta_ref.at[head, span]), memory
 
 
 def _keys_gated_write(call: Call, slots, keys: Operand, values: Operand, loaded, state, issue, role: int,
@@ -1776,12 +1779,12 @@ def _keys_gated_write(call: Call, slots, keys: Operand, values: Operand, loaded,
     row gated by its write gate and decay to the chunk's end, the values as they are
     (`algebra.keys_gated_carried`), from `loaded` (`_states`' prefetch, a step ahead)."""
     assert loaded is not None, "a decay a head's walk prefetches its prefix"
-    (ending, ending_low), (gate, low), betas = loaded
+    (ending, ending_low), (gate, low), betas, memory = loaded
     ends = algebra.range_decay(ending, ending_low, gate, low) * betas
     return algebra.keys_gated_carried(
         state, lambda i: stream_tile(slots, "keys", keys, columns=pl.ds(i * call.block, call.block)),
         stream_tile(slots, "values", values, columns=pl.ds(role * bv, bv)), ends,
-        [algebra.raised(ending, ending_low)[:, None]] * (call.width // call.block), call.held.dtype, issue)
+        [algebra.raised(*memory)[:, None]] * (call.width // call.block), call.held.dtype, issue)
 
 
 def _gated_write(call: Call, corrected, loaded, prefix: tuple, last, head) -> tuple:
@@ -1796,9 +1799,9 @@ def _gated_write(call: Call, corrected, loaded, prefix: tuple, last, head) -> tu
         return corrected, [algebra.raised(*(family.rows_of(ref.at[last, span]) for ref in prefix))[:, None]
                            for span in columns]
     assert loaded is not None, "a decay a head's walk prefetches its prefix"
-    (ending, ending_low), (gate, low), _ = loaded
-    gated, decayed = algebra.scalar_write(corrected, ending, gate, ending_low, low)
-    return gated, [decayed[:, None]] * slices
+    (ending, ending_low), (gate, low), _, memory = loaded
+    return (algebra.scalar_write(corrected, ending, gate, ending_low, low),
+            [algebra.raised(*memory)[:, None]] * slices)
 
 
 def _last_write(call: Call, keys: Operand, k_ref, row, final_token, key_columns, columns, gated) -> tuple:
@@ -1893,8 +1896,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
         chunks = family.opened(streams["walked"], views)
         entering = family.opened(streams["once"], initial_views)
 
-        prefetch = functools.partial(_prefetched, family, call.chunk, (hi_ref, lo_ref),
-                                     None if delta else beta_ref, h)
+        prefetch = functools.partial(_prefetched, call, (hi_ref, lo_ref), None if delta else beta_ref, h)
         # Each key slice of the memory and, where stored, the corrected values, a store each in flight.
         before_store = walk_stores(family, width // call.block + int(stores_corrected))
 
@@ -2063,7 +2065,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
                                         for i in range(slices)})
         chunks = family.opened(streams["walked"], views)
         entering = family.opened(streams["once"], initial_views)
-        prefetch = functools.partial(_prefetched, family, call.chunk, (hi_ref, lo_ref), beta_ref, h)
+        prefetch = functools.partial(_prefetched, call, (hi_ref, lo_ref), beta_ref, h)
         # The output a store each step in flight (`walk_stores`).
         before_store = walk_stores(family, 1)
 
@@ -2074,7 +2076,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
             return functools.partial(_scan_step, lands, issue, scratch, scored, walked + role * bv, role)
 
         def _scan_step(lands, issue, scratch, scored, column, role, n, slots, state, accumulators, loaded):
-            (_, _), (gate, low), betas = loaded
+            _, (gate, low), betas, _ = loaded
             span, last = pl.ds(n * chunk, chunk), n * chunk + chunk - 1
             # The prefix as a column's vectors for the chunk's own pairs' decays and, where the write gate
             # takes the keys' side, the write gates for the scores' columns (`_output`'s prologue's): read in
