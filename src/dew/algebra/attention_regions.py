@@ -53,6 +53,11 @@ def _widening(source: np.dtype, target: np.dtype) -> bool:
     return source == target or (np.dtype(source).name, np.dtype(target).name) in WIDENINGS
 
 
+def _floating(source: np.dtype, target: np.dtype) -> bool:
+    """A cast between floats (the weights rounded once to the values' dtype for their product)."""
+    return all(jnp.issubdtype(dtype, jnp.floating) for dtype in (source, target))
+
+
 class Attention(NamedTuple):
     """A region's equations (their places, in order), its query, key and value operands as the program holds
     them, and the call written for it (`written`): whether causal, and the product's axes as the fold reads
