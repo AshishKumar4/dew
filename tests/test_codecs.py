@@ -102,22 +102,23 @@ def test_mxfp4_decodes_into_its_kept_dtype_as_float32_then_a_cast_does(param_dty
 
 @pytest.mark.parametrize("spread", [0, 17, 18])
 def test_mxfp4_experts_reexpress_as_nvfp4_exactly_within_e4m3s_powers(spread):
-    """An MXFP4 bank's experts as NVFP4's parts (`mxfp4_as_nvfp4`): each value its E2M1 code times its
-    16-value block's E4M3 scale times its expert's power of two, exactly the MXFP4 decode, where an expert's
-    group powers spread by at most E4M3's 17 (an all-zero group's none, its scale byte any); past it, none."""
+    """An MXFP4 bank's experts as NVFP4's parts with no value decoded (`mxfp4_tensor_powers`,
+    `mxfp4_as_nvfp4`): each value its E2M1 nibble's times its 16-value block's E4M3 scale times its expert's
+    power of two, exactly the MXFP4 decode, where an expert's group powers spread by at most E4M3's 17 (an
+    all-zero group's 0x00 byte none), a slice of its experts its own; past it, none."""
     rng = np.random.default_rng(0x4516)
     blocks = rng.integers(0, 256, (3, 5, 4, codecs.GROUP // 2), dtype=np.uint8)
     scales = (100 + rng.integers(0, spread + 1, (3, 5, 4))).astype(np.uint8)
     scales[:, 0, 0], scales[:, 0, 1] = 100, 100 + spread
     blocks[1, 2, 3], scales[1, 2, 3] = 0, 0
-    parts = codecs.mxfp4_as_nvfp4(blocks, scales)
+    powers = codecs.mxfp4_tensor_powers(scales)
     if spread > 17:
-        assert parts is None
+        assert powers is None
         return
-    assert parts is not None
-    codes, block, tensor = parts
-    values = codes * np.repeat(block.astype(np.float32), 16, axis=1) * tensor[:, None, None]
-    np.testing.assert_array_equal(values, codecs.dequantize_mxfp4(blocks, scales))
+    assert powers is not None
+    nibbles, block, tensor = codecs.mxfp4_as_nvfp4(blocks[1:], scales[1:], powers[1:])
+    values = codecs.E2M1[nibbles] * np.repeat(block.astype(np.float32), 16, axis=1) * tensor[:, None, None]
+    np.testing.assert_array_equal(values, codecs.dequantize_mxfp4(blocks[1:], scales[1:]))
 
 
 def test_a_group_rounding_past_the_largest_power_of_two_is_refused():
