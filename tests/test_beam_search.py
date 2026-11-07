@@ -70,7 +70,7 @@ PROMPT = [1, 2, 3]
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 
-BEAM_SEEDS = {"llama-tiny": 8, "qwen3-tiny": 8}
+BEAM_SEEDS = {"llama-tiny": 32, "qwen3-tiny": 32}
 """Each checkpoint's declared seeds, sized by `seeds_for` paired over margin-cleared draws (`beam_draw`)."""
 PROMPTS, LENGTH, NEW_TOKENS, WIDTH = 3, 6, 6, 3
 SETTINGS = ((1.0, False), (0.0, True), (2.0, "never"), (-1.0, False))

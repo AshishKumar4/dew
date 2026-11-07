@@ -42,6 +42,7 @@ from interop_support import clearing_selections, fixture_ids, transformers_arms,
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
+from selection_margins import NARROW_MARGIN
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
 from dew.nn.inputs import ModelInputs
@@ -74,7 +75,8 @@ def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     reference, truth = transformers_arms(narrow, lambda model, ids: model(ids, use_cache=False).logits,
                                          source=source)
     assert_as_exact(lambda ids: pretrained.model.apply(pretrained.variables, ids).astype(jnp.float32),
-                    reference, draw, f"{name} {dtype}", seeds=DECODER_SEEDS[dtype].get(name, 8), truth_fn=truth)
+                    reference, draw, f"{name} {dtype}", seeds=DECODER_SEEDS[dtype].get(name, 8),
+                    truth_fn=truth)
 
 
 BIAS_SEEDS = {"qwen2-tiny": 64, "llama-tiny": 32}
