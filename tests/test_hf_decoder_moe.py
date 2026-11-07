@@ -352,6 +352,29 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
     assert_as_exact(logits(placed), logits(held), draw, "placed packed GPT-OSS", seeds=4)
 
 
+def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
+    """An MXFP4 GPT-OSS loaded packed with its layers scanned (`packed_experts` with `scan_layers`, row
+    4861): the scan stacks each bank's three leaves as it stacks a dense matrix and slices a layer's back,
+    so its logits and their gradient are the unscanned packed load's bit for bit."""
+    import tempfile
+
+    source = _mxfp4_gpt_oss(Path(tempfile.mkdtemp()))
+    scanned, plain = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=True,
+                                      scan_layers=scan) for scan in (True, False))
+    tokens = jax.random.randint(jax.random.key(0), (2, 8), 0, PACKED_CONFIG["vocab_size"])
+
+    def loss(loaded):
+        return jax.jit(jax.value_and_grad(
+            lambda params: jnp.sum(loaded.model.apply({**loaded.variables, "params": params}, tokens) ** 2)))(
+                loaded.variables["params"])
+
+    # A scan is how the model runs, its stored tree the same (`Pretrained.load`'s `Scanning`).
+    (scanned_loss, scanned_grad), (plain_loss, plain_grad) = loss(scanned), loss(plain)
+    np.testing.assert_array_equal(np.asarray(scanned_loss), np.asarray(plain_loss))
+    jax.tree.map(lambda left, right: np.testing.assert_array_equal(np.asarray(left), np.asarray(right)),
+                 scanned_grad, plain_grad)
+
+
 def test_an_mxfp4_gpt_oss_whose_experts_are_no_whole_stages_loads_packed_as_it_loads_dense():
     """The tiny MXFP4 fixture's experts, 32 deep, are no whole NVFP4 stages: loaded packed, each stays
     dense, the load its dense load leaf for leaf, nothing held in `QUANTIZATION`."""
