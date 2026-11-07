@@ -65,13 +65,14 @@ def test_a_task_past_its_deadline_says_where_a_thread_stalled_in_native_code_was
     written(tmp_path, {"test_stalls_natively.py": (
         "import ctypes\n\n"
         "libc = ctypes.CDLL(None)\n"
-        "# A mutex its own thread locks again waits in the kernel for good, without the GIL (ctypes lets it go),\n"
-        "# and no signal wakes it.\n"
+        "# A mutex its own thread locks again waits in the kernel for good, without the GIL\n"
+        "# (ctypes lets it go), and no signal wakes it.\n"
         "held = ctypes.create_string_buffer(64)\n"
         "libc.pthread_mutex_lock(held)\n\n\n"
         "def stalled_natively():\n    libc.pthread_mutex_lock(held)\n\n\n"
         "stalled_natively()\n\n\ndef test_never():\n    pass\n")})
-    ci.task("3.12", ["tests/test_stalls_natively.py"], "", tmp_path / "rows.json", 3.0, cache="off", grace=5.0)
+    ci.task("3.12", ["tests/test_stalls_natively.py"], "", tmp_path / "rows.json", 3.0, cache="off",
+            grace=5.0)
     [interrupted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
     assert interrupted["kind"] == "deadline"
     assert "(most recent call first)" in interrupted["output"] and "stalled_natively" in interrupted["output"]
