@@ -53,6 +53,7 @@ from safetensors.numpy import load_file
 from selection_margins import NARROW_MARGIN
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
+from dew.nn.inputs import ModelInputs
 from dew.nn.kernels import generation
 from dew.nn.precision import ACCURATE
 
@@ -172,12 +173,45 @@ def assert_biases_sum_as_torch(name):
                     seeds=BIAS_SEEDS[name], truth_fn=torch_gradients(wide, float64))
 
 
+def routed_canvas_draw(config, draw):
+    """`draw`, redrawn until Dew's float64 run of the denoiser routes every token it reads, the prompt's
+    prefill and the canvas's, by bfloat16's margin (`selection_margins.NARROW_MARGIN`, testing.md's
+    selection rule): its routed experts' bfloat16 choices flip apart from the truth's otherwise, each
+    flip a heavy tail of both arms' errors (a draw's log ratios spread 1.0 unconditioned)."""
+    from selection_margins import NARROW_MARGIN, capturing, clearing, margin
+
+    fields = adapter.translate_config(adapter.text_config(config))
+    with jax.enable_x64(new_val=True):
+        model = adapter.build(config, dtype="float64", attention_impl="xla")
+        variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
+
+    def routed(prompt, canvas, *rest):
+        conditioning = {"self_conditioning_logits": rest[0]} if rest and rest[0].ndim == 3 else {}
+        media = ({"image_indices": jnp.where(prompt == 60, 0, -1)}, {"pixel_values": rest[0]}) \
+            if rest and rest[0].ndim != 3 else ()
+        inputs = ModelInputs(jnp.asarray(prompt), *media)
+        empty = model.apply(variables, prompt.shape[0], method=model.init_cache,
+                            mutable=["cache"])[1]["cache"]
+        _, prefilled = capturing(model, {**variables, "cache": empty}, inputs, mutable=["cache"],
+                                 method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()))
+        cache = prefilled.pop("cache")
+        _, canvased = capturing(model, {**variables, "cache": cache}, jnp.asarray(canvas), **conditioning)
+        return min(margin(fields, prefilled, "prefill"), margin(fields, canvased, "canvas"))
+
+    def clears(drawn) -> bool:
+        with jax.enable_x64(new_val=True):
+            return routed(*drawn) > NARROW_MARGIN
+
+    return lambda seed: clearing(draw, clears, tries=256)(seed)
+
+
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
     """DiffusionGemma's shared text tree with routed experts, a sliding and a full layer, self-conditioning
     and the vision conditioner in bfloat16: each canvas forward tests/test_block_diffusion.py holds in
     float32 (bare, self-conditioned, image-conditioned), Dew's bfloat16 canvas logits on par with
     transformers' own bfloat16 forward over drawn prompts, canvases, previous logits and pixels
-    (`canvas_draw`), both measured from the float64 twin of the stored float32 weights (check 1)."""
+    (`canvas_draw`) whose routing the float64 run decides by bfloat16's margin (`routed_canvas_draw`), both
+    measured from the float64 twin of the stored float32 weights (check 1)."""
     import torch
 
     config = json.loads((WORKFLOW / "config.json").read_text())
@@ -199,8 +233,8 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
              "image_logits": canvas_draw(reference["image_prompt"], reference["canvas"], 64,
                                          pixels=reference["pixels"])}
     for name, draw in draws.items():
-        assert_as_exact(dew, reference_arm, draw, f"workflow {name} bfloat16", seeds=CANVAS_SEEDS,
-                        truth_fn=truth)
+        assert_as_exact(dew, reference_arm, routed_canvas_draw(config, draw), f"workflow {name} bfloat16",
+                        seeds=CANVAS_SEEDS, truth_fn=truth)
 
 
 def bfloat16(bits: np.ndarray) -> jax.Array:
