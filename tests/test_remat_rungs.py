@@ -234,6 +234,20 @@ def test_a_checkpoints_remat_rungs_climb_and_restore(name):
     _climbs_and_restores(source.model, source.variables, (tokens(name),), method="logits")
 
 
+SCANNED = ("qwen35-tiny", "qwen35-native-tiny", "qwen35-blocks-tiny", "qwen38-moe-tiny")
+"""Hybrid checkpoints whose decoders scan by period, a gated delta net's rung read in the scan's body."""
+
+
+@pytest.mark.parametrize("name", SCANNED)
+def test_a_scanned_checkpoints_remat_rungs_climb(name):
+    """A decoder that scans its runs (`scan_layers`, a period of delta nets and attention one body) climbs
+    the ladder as one a layer at a time does: each rung keeps fewer residual bytes than the rung below it,
+    its policy reaching the scan's body, where a rung read before the body traced saved alike (row 4097)."""
+    source = loaded(name)
+    _climbs_and_restores(source.model.with_scanned_layers(), source.variables, (tokens(name),),
+                         method="logits")
+
+
 @pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_top_rung_steps_its_forward_as_it_does(name):
     source = loaded(name)

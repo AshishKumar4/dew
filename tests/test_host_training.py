@@ -195,6 +195,8 @@ def test_decoder_scan_training_keeps_the_original_logical_state():
         state, _, _ = trainer.place()
         step = trainer.compile(state, data)
         state, *_ = step(state, data)
+        # A device layout's step holds the scan's run stacked (`StageLocal`); stored, it is the logical state.
+        state = trainer.stored(state)
         assert "layers_0" in state.variables["params"] and "layers_1" in state.variables["params"]
         assert "layers_0_1" not in state.variables["params"]
         states.append(state)
@@ -351,14 +353,15 @@ def test_companion_pool_uses_one_global_optimizer_reduction(tmp_path):
 # bound below qualifies these cases numerically and settles nothing about that
 # failure. Leaves nothing moves are compared exactly.
 def updated(objective, batch, layout, *, optimizer=None, checkpoints=None, steps=1):
-    """`steps` compiled updates of one objective under one placement."""
+    """`steps` compiled updates of one objective under one placement, the state on its stored layers
+    (`Trainer.stored`: a device layout's one-stage scan holds its runs stacked)."""
     trainer = Trainer(objective, optax.adam(.01) if optimizer is None else optimizer,
                       key=jax.random.key(5), layout=layout, checkpoints=checkpoints)
     state, _, _ = trainer.place()
     step = trainer.compile(state, batch)
     for _ in range(steps):
         state, *_ = step(state, batch)
-    return state
+    return trainer.stored(state)
 
 
 def tokens(width=9):
@@ -465,7 +468,8 @@ for _ in range(steps):
 jax.block_until_ready(state)
 window = events[before:]
 if directory != "-":
-    trainer.checkpoints.save(int(state.step), state)
+    # Saved on its stored layers, as a run saves it: a one-stage scan's step holds its runs stacked.
+    trainer.checkpoints.save(int(state.step), trainer.stored(state))
     trainer.checkpoints.wait()
 print(json.dumps({"started": started, "step": int(state.step),
                   "leaves": [np.asarray(leaf, np.float64).tolist() for leaf in jax.tree.leaves(
